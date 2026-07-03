@@ -5,10 +5,44 @@ import time
 import httpx
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+MODELS_URL = "https://openrouter.ai/api/v1/models"
 
 # Per-request cap. Slow models are a data point in a comparison bench,
 # but past 30s the run is more useful failed than pending.
 REQUEST_TIMEOUT_S = 30.0
+
+# Boot must not hang on pricing; the bench works offline, cost display
+# is the only thing a failed fetch costs.
+PRICES_TIMEOUT_S = 10.0
+
+
+async def fetch_prices(client: httpx.AsyncClient) -> dict:
+    """Fetch per-token USD prices for all OpenRouter models.
+
+    Returns {model_id: {"prompt": float, "completion": float}}, or an
+    empty dict on any failure. Never raises: the caller runs this at
+    startup and a pricing outage must not stop the bench from booting.
+    """
+    try:
+        response = await client.get(MODELS_URL, timeout=PRICES_TIMEOUT_S)
+        if response.status_code != 200:
+            return {}
+        entries = response.json()["data"]
+    except (httpx.HTTPError, ValueError, LookupError, TypeError):
+        return {}
+
+    prices = {}
+    for entry in entries:
+        # Prices arrive as strings in USD per token. Skip entries with
+        # missing or malformed pricing rather than losing the whole map.
+        try:
+            prices[entry["id"]] = {
+                "prompt": float(entry["pricing"]["prompt"]),
+                "completion": float(entry["pricing"]["completion"]),
+            }
+        except (KeyError, TypeError, ValueError):
+            continue
+    return prices
 
 
 async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:

@@ -339,6 +339,9 @@ function fillColumn(ui, result) {
   if (result.prompt_tokens != null && result.completion_tokens != null) {
     ui.meta.append(badge(result.prompt_tokens + " in / " + result.completion_tokens + " out"));
   }
+  if (result.cost_usd != null) {
+    ui.meta.append(badge("$" + result.cost_usd.toFixed(6)));
+  }
   if (result.error != null) {
     ui.col.classList.add("error");
     ui.body.textContent = result.error;
@@ -349,12 +352,17 @@ function fillColumn(ui, result) {
   }
 }
 
-async function runOne(prompt, model, promptId, ui) {
+async function runOne(prompt, model, promptId, groupId, ui) {
   try {
     const resp = await fetch("/compare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: prompt, models: [model], prompt_id: promptId }),
+      body: JSON.stringify({
+        prompt: prompt,
+        models: [model],
+        prompt_id: promptId,
+        group_id: groupId,
+      }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
@@ -377,8 +385,19 @@ runBtn.addEventListener("click", async () => {
   // land first. Columns are created up front so order tracks the checkbox
   // list, not response arrival.
   const columns = models.map(makeColumn);
+  // One group per Run click so the N per-model requests land as one
+  // history entry. A failed create degrades to ungrouped runs rather
+  // than blocking: grouping is bookkeeping, the comparison is the
+  // product.
+  let groupId = null;
+  try {
+    const resp = await fetch("/groups", { method: "POST" });
+    if (resp.ok) groupId = (await resp.json()).id;
+  } catch (err) {
+    // Deliberately swallowed; see above.
+  }
   await Promise.allSettled(
-    models.map((model, i) => runOne(prompt, model, promptId, columns[i]))
+    models.map((model, i) => runOne(prompt, model, promptId, groupId, columns[i]))
   );
   running = false;
   updateRunState();
@@ -418,9 +437,42 @@ async function loadHistory() {
     models.className = "hmodels";
     models.textContent = run.models.join(", ");
     row.append(time, text, models);
-    row.addEventListener("click", () => showRun(run.id));
+    row.addEventListener("click", () =>
+      run.type === "group" ? showGroup(run.id) : showRun(run.id)
+    );
     historyList.append(row);
   }
+}
+
+async function showGroup(groupId) {
+  let group;
+  try {
+    const resp = await fetch("/groups/" + groupId);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    group = await resp.json();
+  } catch (err) {
+    runLabelEl.textContent =
+      "failed to load comparison #" + groupId + ": " + err.message;
+    return;
+  }
+  resultsEl.replaceChildren();
+  runLabelEl.textContent =
+    "Historical comparison #" + group.id + " from " +
+    group.created_at.slice(0, 19).replace("T", " ") + " UTC";
+  // Columns in checkbox (MODELS) order, matching the live layout. Runs
+  // persist in completion order, so run order alone would shuffle
+  // columns between replays; models gone from the const keep run order
+  // at the end.
+  const results = group.runs.flatMap(r => r.results);
+  const rank = m => {
+    const i = MODELS.indexOf(m);
+    return i === -1 ? MODELS.length : i;
+  };
+  results.sort((a, b) => rank(a.model) - rank(b.model));
+  for (const result of results) {
+    fillColumn(makeColumn(result.model), result);
+  }
+  window.scrollTo({ top: 0 });
 }
 
 async function showRun(runId) {

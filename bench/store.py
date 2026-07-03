@@ -19,9 +19,14 @@ CREATE TABLE IF NOT EXISTS prompts (
     text TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS groups (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
     prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
+    group_id INTEGER NULL REFERENCES groups(id),
     prompt_text TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -33,9 +38,18 @@ CREATE TABLE IF NOT EXISTS results (
     latency_ms REAL,
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
-    error TEXT
+    error TEXT,
+    cost_usd REAL
 );
 """
+
+# Columns added after a table first shipped. CREATE IF NOT EXISTS skips
+# existing tables entirely, so pre-existing DBs need an explicit ALTER;
+# this list is the whole migration story.
+MIGRATIONS = [
+    ("runs", "group_id", "INTEGER NULL REFERENCES groups(id)"),
+    ("results", "cost_usd", "REAL"),
+]
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -46,11 +60,19 @@ def connect(path: str) -> sqlite3.Connection:
     event loop thread today, but the flag keeps a future sync endpoint
     or executor hop from crashing on an sqlite thread check.
     """
-    conn = sqlite3.connect(path, check_same_thread=False)
+    # uri=True lets tests hand in shared in-memory databases via
+    # file: URIs; sqlite treats anything not starting with "file:" as a
+    # plain filename, so normal paths and ":memory:" are unaffected.
+    conn = sqlite3.connect(path, check_same_thread=False, uri=True)
     conn.row_factory = sqlite3.Row
     # Off by default in sqlite; without it ON DELETE SET NULL is inert.
     conn.execute("PRAGMA foreign_keys = ON")
     conn.executescript(SCHEMA)
+    for table, column, decl in MIGRATIONS:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    conn.commit()
     return conn
 
 
@@ -89,11 +111,25 @@ def delete_prompt(conn: sqlite3.Connection, prompt_id: int) -> bool:
     return cur.rowcount > 0
 
 
+def create_group(conn: sqlite3.Connection) -> int:
+    with conn:
+        cur = conn.execute("INSERT INTO groups (created_at) VALUES (?)", (_now(),))
+    return cur.lastrowid
+
+
+def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    return row is not None
+
+
 def save_run(
     conn: sqlite3.Connection,
     prompt_text: str,
     results: list[dict],
     prompt_id: int | None = None,
+    group_id: int | None = None,
 ) -> int:
     """Insert a run and its results atomically. Returns the run id.
 
@@ -102,15 +138,16 @@ def save_run(
     """
     with conn:
         cur = conn.execute(
-            "INSERT INTO runs (prompt_id, prompt_text, created_at) VALUES (?, ?, ?)",
-            (prompt_id, prompt_text, _now()),
+            "INSERT INTO runs (prompt_id, group_id, prompt_text, created_at)"
+            " VALUES (?, ?, ?, ?)",
+            (prompt_id, group_id, prompt_text, _now()),
         )
         run_id = cur.lastrowid
         conn.executemany(
             """INSERT INTO results
                (run_id, model, response_text, latency_ms, prompt_tokens,
-                completion_tokens, error)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                completion_tokens, error, cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -120,6 +157,9 @@ def save_run(
                     r["prompt_tokens"],
                     r["completion_tokens"],
                     r["error"],
+                    # .get: results built before the cost feature (and store
+                    # tests that predate it) carry no cost_usd key.
+                    r.get("cost_usd"),
                 )
                 for r in results
             ],
@@ -128,11 +168,17 @@ def save_run(
 
 
 def list_runs(conn: sqlite3.Connection) -> list[dict]:
-    """All runs, most recent first, each with the models it touched."""
+    """History entries, newest first.
+
+    Runs sharing a group collapse into one group entry, emitted at the
+    position of the group's newest run so ordering stays newest-first
+    across both kinds. Ungrouped rows (all pre-grouping history) stay
+    as individual run entries.
+    """
     runs = [
         dict(r)
         for r in conn.execute(
-            "SELECT id, prompt_id, prompt_text, created_at FROM runs ORDER BY id DESC"
+            "SELECT id, group_id, prompt_text, created_at FROM runs ORDER BY id DESC"
         ).fetchall()
     ]
     # Second query instead of GROUP_CONCAT: keeps model order tied to
@@ -140,9 +186,48 @@ def list_runs(conn: sqlite3.Connection) -> list[dict]:
     models_by_run: dict[int, list[str]] = {}
     for row in conn.execute("SELECT run_id, model FROM results ORDER BY id"):
         models_by_run.setdefault(row["run_id"], []).append(row["model"])
+    group_created = {
+        row["id"]: row["created_at"]
+        for row in conn.execute("SELECT id, created_at FROM groups")
+    }
+
+    members: dict[int, list[dict]] = {}
+    for run in reversed(runs):
+        if run["group_id"] is not None:
+            members.setdefault(run["group_id"], []).append(run)
+
+    entries = []
+    emitted: set[int] = set()
     for run in runs:
-        run["models"] = models_by_run.get(run["id"], [])
-    return runs
+        gid = run["group_id"]
+        if gid is None:
+            entries.append(
+                {
+                    "type": "run",
+                    "id": run["id"],
+                    "created_at": run["created_at"],
+                    "prompt_text": run["prompt_text"],
+                    "models": models_by_run.get(run["id"], []),
+                }
+            )
+        elif gid not in emitted:
+            emitted.add(gid)
+            runs_asc = members[gid]
+            entries.append(
+                {
+                    "type": "group",
+                    "id": gid,
+                    "created_at": group_created.get(gid, runs_asc[0]["created_at"]),
+                    "prompt_text": runs_asc[0]["prompt_text"],
+                    "models": [
+                        m
+                        for r in runs_asc
+                        for m in models_by_run.get(r["id"], [])
+                    ],
+                    "run_ids": [r["id"] for r in runs_asc],
+                }
+            )
+    return entries
 
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
@@ -154,10 +239,28 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
         return None
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
-                  completion_tokens, error
+                  completion_tokens, error, cost_usd
            FROM results WHERE run_id = ? ORDER BY id""",
         (run_id,),
     ).fetchall()
     out = dict(run)
     out["results"] = [dict(r) for r in results]
+    return out
+
+
+def get_group(conn: sqlite3.Connection, group_id: int) -> dict | None:
+    """The group's runs with full results, run order by id."""
+    row = conn.execute(
+        "SELECT id, created_at FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    run_ids = [
+        r["id"]
+        for r in conn.execute(
+            "SELECT id FROM runs WHERE group_id = ? ORDER BY id", (group_id,)
+        )
+    ]
+    out = dict(row)
+    out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out

@@ -13,6 +13,13 @@ FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
 )
 
+# Hand-built price cache injected in place of the startup pricing fetch.
+# The fixture's usage block is 13 in / 8 out, so model/alpha costs
+# 13 * 1e-6 + 8 * 2e-6 = 2.9e-5 USD.
+TEST_PRICES = {
+    "model/alpha": {"prompt": 1e-06, "completion": 2e-06},
+}
+
 
 @pytest.fixture
 def client(monkeypatch, tmp_path):
@@ -22,6 +29,13 @@ def client(monkeypatch, tmp_path):
     # Per-test database so tests never touch bench.db in the repo and
     # never see each other's runs.
     monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    # The lifespan fetches pricing at startup, which happens outside any
+    # per-test respx router, so stub it here instead of mocking HTTP.
+    async def fake_fetch_prices(client):
+        return dict(TEST_PRICES)
+
+    monkeypatch.setattr("bench.main.fetch_prices", fake_fetch_prices)
     with TestClient(app) as c:
         yield c
 
@@ -74,6 +88,89 @@ def test_compare_one_model_erroring_does_not_sink_the_other(client):
     assert ok["response_text"] == "still fine"
     assert broken["error"] is not None
     assert broken["response_text"] is None
+
+
+@respx.mock
+def test_group_flow_collapses_comparison_into_one_history_entry(client):
+    def route(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(200, json=response_for(model, f"reply from {model}"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    group_id = client.post("/groups").json()["id"]
+    first = client.post(
+        "/compare",
+        json={"prompt": "hi", "models": ["model/alpha"], "group_id": group_id},
+    ).json()
+    second = client.post(
+        "/compare",
+        json={"prompt": "hi", "models": ["model/beta"], "group_id": group_id},
+    ).json()
+
+    entries = client.get("/runs").json()["runs"]
+    assert len(entries) == 1
+    entry = entries[0]
+    assert entry["type"] == "group"
+    assert entry["id"] == group_id
+    assert entry["models"] == ["model/alpha", "model/beta"]
+    assert entry["run_ids"] == [first["run_id"], second["run_id"]]
+
+    detail = client.get(f"/groups/{group_id}").json()
+    assert [r["id"] for r in detail["runs"]] == [first["run_id"], second["run_id"]]
+    assert detail["runs"][0]["results"] == first["results"]
+    assert detail["runs"][1]["results"] == second["results"]
+
+    assert client.get("/groups/9999").status_code == 404
+
+
+@respx.mock
+def test_stale_group_id_degrades_to_ungrouped(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    resp = client.post(
+        "/compare", json={"prompt": "hi", "models": ["model/a"], "group_id": 12345}
+    )
+
+    assert resp.status_code == 200
+    entries = client.get("/runs").json()["runs"]
+    assert len(entries) == 1
+    assert entries[0]["type"] == "run"
+
+
+@respx.mock
+def test_cost_computed_from_price_cache(client):
+    def route(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        if model == "model/limited":
+            return httpx.Response(429, json={"error": "rate limited"})
+        return httpx.Response(200, json=response_for(model, "hello"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    results = client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha", "model/unpriced", "model/limited"],
+        },
+    ).json()["results"]
+
+    priced, unpriced, errored = results
+    # Fixture usage is 13 in / 8 out against TEST_PRICES for model/alpha.
+    assert priced["cost_usd"] == pytest.approx(2.9e-05)
+    assert unpriced["cost_usd"] is None
+    # 429: tokens are None, so cost must be None rather than zero.
+    assert errored["cost_usd"] is None
+
+    # Persisted cost matches what /compare returned.
+    entries = client.get("/runs").json()["runs"]
+    detail = client.get(f"/runs/{entries[0]['id']}").json()
+    assert [r["cost_usd"] for r in detail["results"]] == [
+        priced["cost_usd"],
+        None,
+        None,
+    ]
 
 
 def test_index_serves_html(client):

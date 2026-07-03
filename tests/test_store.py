@@ -78,3 +78,103 @@ def test_list_runs_most_recent_first_with_models(db):
     assert [r["id"] for r in runs] == [second, first]
     assert runs[0]["models"] == ["b/two", "c/three"]
     assert runs[1]["models"] == ["a/one"]
+
+
+OLD_SCHEMA = """
+CREATE TABLE prompts (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
+    prompt_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE results (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model TEXT NOT NULL,
+    response_text TEXT,
+    latency_ms REAL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    error TEXT
+);
+"""
+
+
+def test_connect_upgrades_pre_grouping_schema():
+    # Shared-cache in-memory URI: the keeper connection holds the DB
+    # alive while store.connect opens a second connection to the same
+    # in-memory database, exactly like reopening an old bench.db file.
+    uri = "file:pre_grouping_upgrade?mode=memory&cache=shared"
+    keeper = sqlite3.connect(uri, uri=True)
+    keeper.executescript(OLD_SCHEMA)
+    keeper.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES (?, ?)",
+        ("legacy prompt", "2026-01-01T00:00:00+00:00"),
+    )
+    keeper.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'old/model', 'hi')"
+    )
+    keeper.commit()
+
+    conn = store.connect(uri)
+    try:
+        run_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)")}
+        result_cols = {row[1] for row in conn.execute("PRAGMA table_info(results)")}
+        assert "group_id" in run_cols
+        assert "cost_usd" in result_cols
+
+        # Legacy rows survive and render as ungrouped run entries.
+        entries = store.list_runs(conn)
+        assert len(entries) == 1
+        assert entries[0]["type"] == "run"
+        assert entries[0]["prompt_text"] == "legacy prompt"
+        assert entries[0]["models"] == ["old/model"]
+        legacy = store.get_run(conn, entries[0]["id"])
+        assert legacy["results"][0]["cost_usd"] is None
+
+        # New-style grouped writes work on the upgraded database.
+        group_id = store.create_group(conn)
+        store.save_run(conn, "new prompt", [make_result()], group_id=group_id)
+        entries = store.list_runs(conn)
+        assert [e["type"] for e in entries] == ["group", "run"]
+    finally:
+        conn.close()
+        keeper.close()
+
+
+def test_list_runs_groups_collapse_and_order_newest_first(db):
+    lone_before = store.save_run(db, "ungrouped early", [make_result(model="a/one")])
+    group_id = store.create_group(db)
+    r1 = store.save_run(db, "grouped", [make_result(model="b/two")], group_id=group_id)
+    r2 = store.save_run(db, "grouped", [make_result(model="c/three")], group_id=group_id)
+    lone_after = store.save_run(db, "ungrouped late", [make_result(model="d/four")])
+
+    entries = store.list_runs(db)
+
+    assert [e["type"] for e in entries] == ["run", "group", "run"]
+    assert entries[0]["id"] == lone_after
+    assert entries[1]["id"] == group_id
+    assert entries[1]["models"] == ["b/two", "c/three"]
+    assert entries[1]["run_ids"] == [r1, r2]
+    assert entries[2]["id"] == lone_before
+
+
+def test_get_group_returns_runs_with_results_in_id_order(db):
+    group_id = store.create_group(db)
+    r1 = store.save_run(db, "p", [make_result(model="b/two")], group_id=group_id)
+    r2 = store.save_run(db, "p", [make_result(model="c/three")], group_id=group_id)
+
+    group = store.get_group(db, group_id)
+
+    assert group["id"] == group_id
+    assert [r["id"] for r in group["runs"]] == [r1, r2]
+    assert group["runs"][0]["results"][0]["model"] == "b/two"
+    assert store.get_group(db, 999) is None
+    assert store.group_exists(db, group_id) is True
+    assert store.group_exists(db, 999) is False

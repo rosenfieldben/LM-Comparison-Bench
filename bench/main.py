@@ -1,10 +1,12 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
@@ -12,7 +14,9 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from bench import store
-from bench.models import run_model
+from bench.models import fetch_prices, run_model
+
+logger = logging.getLogger(__name__)
 
 
 class CompareRequest(BaseModel):
@@ -23,6 +27,9 @@ class CompareRequest(BaseModel):
     # Optional link back to a saved prompt so history can show where a
     # run came from. The run stores its own prompt_text either way.
     prompt_id: int | None = None
+    # Optional grouping id so the N per-model requests of one comparison
+    # land as one history entry.
+    group_id: int | None = None
 
 
 class ModelResult(BaseModel):
@@ -32,6 +39,7 @@ class ModelResult(BaseModel):
     prompt_tokens: int | None
     completion_tokens: int | None
     error: str | None
+    cost_usd: float | None
 
 
 class CompareResponse(BaseModel):
@@ -55,15 +63,29 @@ class PromptList(BaseModel):
     prompts: list[Prompt]
 
 
-class RunSummary(BaseModel):
+class RunEntry(BaseModel):
+    type: Literal["run"]
     id: int
     created_at: str
     prompt_text: str
     models: list[str]
 
 
+class GroupEntry(BaseModel):
+    type: Literal["group"]
+    id: int
+    created_at: str
+    prompt_text: str
+    models: list[str]
+    run_ids: list[int]
+
+
 class RunList(BaseModel):
-    runs: list[RunSummary]
+    runs: list[GroupEntry | RunEntry]
+
+
+class GroupCreated(BaseModel):
+    id: int
 
 
 class RunDetail(BaseModel):
@@ -72,6 +94,12 @@ class RunDetail(BaseModel):
     prompt_text: str
     prompt_id: int | None
     results: list[ModelResult]
+
+
+class GroupDetail(BaseModel):
+    id: int
+    created_at: str
+    runs: list[RunDetail]
 
 
 @asynccontextmanager
@@ -89,6 +117,14 @@ async def lifespan(app: FastAPI):
         headers={"Authorization": f"Bearer {api_key}"}
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    # One pricing snapshot per boot. Failure is tolerated: the bench must
+    # work offline, cost just renders as unavailable for the session.
+    app.state.prices = await fetch_prices(app.state.client)
+    if not app.state.prices:
+        logger.warning(
+            "OpenRouter pricing fetch failed or returned nothing; "
+            "cost display is unavailable this session"
+        )
     yield
     await app.state.client.aclose()
     app.state.db.close()
@@ -104,6 +140,21 @@ async def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
 
 
+def cost_usd(result: dict, prices: dict) -> float | None:
+    """Cost of one result, or None when tokens or pricing are unknown."""
+    price = prices.get(result["model"])
+    if (
+        price is None
+        or result["prompt_tokens"] is None
+        or result["completion_tokens"] is None
+    ):
+        return None
+    return (
+        result["prompt_tokens"] * price["prompt"]
+        + result["completion_tokens"] * price["completion"]
+    )
+
+
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict:
     # gather preserves input order, which the frontend relies on to map
@@ -112,14 +163,37 @@ async def compare(request: CompareRequest) -> dict:
     results = await asyncio.gather(
         *(run_model(request.prompt, m, app.state.client) for m in request.models)
     )
-    # A stale prompt_id (deleted in another tab) must not sink the run:
-    # the upstream calls already happened and prompt_text is the source
-    # of truth, so drop the link rather than error.
+    # Cost is a boundary concern: run_model stays a pure OpenRouter call
+    # and the price snapshot lives on app.state. Computed before save_run
+    # so history carries the cost as priced at run time.
+    for result in results:
+        result["cost_usd"] = cost_usd(result, app.state.prices)
+    # A stale prompt_id or group_id (deleted or bogus) must not sink the
+    # run: the upstream calls already happened and prompt_text is the
+    # source of truth, so drop the link rather than error.
     prompt_id = request.prompt_id
     if prompt_id is not None and store.get_prompt(app.state.db, prompt_id) is None:
         prompt_id = None
-    run_id = store.save_run(app.state.db, request.prompt, list(results), prompt_id)
+    group_id = request.group_id
+    if group_id is not None and not store.group_exists(app.state.db, group_id):
+        group_id = None
+    run_id = store.save_run(
+        app.state.db, request.prompt, list(results), prompt_id, group_id
+    )
     return {"results": list(results), "run_id": run_id}
+
+
+@app.post("/groups", response_model=GroupCreated, status_code=201)
+async def create_group() -> dict:
+    return {"id": store.create_group(app.state.db)}
+
+
+@app.get("/groups/{group_id}", response_model=GroupDetail)
+async def group_detail(group_id: int) -> dict:
+    group = store.get_group(app.state.db, group_id)
+    if group is None:
+        raise HTTPException(404, "no such group")
+    return group
 
 
 @app.get("/prompts", response_model=PromptList)
