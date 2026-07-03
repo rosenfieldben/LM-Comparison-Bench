@@ -76,3 +76,48 @@ async def test_missing_usage_block_yields_none_tokens(client):
     assert result["response_text"] == "Hello there, friend, warm greetings!"
     assert result["prompt_tokens"] is None
     assert result["completion_tokens"] is None
+
+
+@respx.mock
+async def test_content_parts_list_flattens_to_text(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["choices"][0]["message"]["content"] = [
+        {"type": "text", "text": "Hello "},
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}},
+        {"type": "text", "text": "world"},
+    ]
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["response_text"] == "Hello world"
+
+
+@respx.mock
+async def test_content_parts_with_no_text_becomes_empty_response_error(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["choices"][0]["message"]["content"] = [
+        {"type": "image_url", "image_url": {"url": "https://x/y.png"}}
+    ]
+    body["choices"][0]["finish_reason"] = "stop"
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == "empty response (finish_reason: stop)"
+
+
+@respx.mock
+async def test_non_dict_usage_does_not_raise(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["usage"] = "n/a"
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["response_text"] == "Hello there, friend, warm greetings!"
+    assert result["prompt_tokens"] is None
+    assert result["completion_tokens"] is None

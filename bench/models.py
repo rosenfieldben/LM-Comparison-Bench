@@ -60,17 +60,33 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
         result["error"] = "malformed response from OpenRouter"
         return result
 
-    if content:
+    if isinstance(content, list):
+        # Content-parts shape (multimodal providers). Flatten to plain text:
+        # response_text is str or None by contract, and a raw list would
+        # crash the sqlite bind in save_run and roll back the whole run.
+        content = "".join(
+            part.get("text", "")
+            for part in content
+            if isinstance(part, dict)
+        )
+
+    if isinstance(content, str) and content:
         result["response_text"] = content
     else:
         # Some providers return 200 with null content on refusals. Surface
         # that as an error so every result carries either text or an error,
-        # a contract the frontend relies on to pick a render state.
+        # a contract the frontend relies on to pick a render state. Non-str
+        # oddities land here too rather than leaking into response_text.
         finish_reason = choice.get("finish_reason") or "unknown"
         result["error"] = f"empty response (finish_reason: {finish_reason})"
 
     # Some providers omit usage. Report None rather than guessing counts.
-    usage = data.get("usage") or {}
+    # isinstance instead of `or {}`: a truthy non-dict like "n/a" would
+    # pass the truthiness guard and raise on .get, and this function must
+    # never raise.
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
     result["prompt_tokens"] = usage.get("prompt_tokens")
     result["completion_tokens"] = usage.get("completion_tokens")
     return result
