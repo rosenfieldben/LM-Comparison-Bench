@@ -261,3 +261,38 @@ async def test_stream_malformed_chunk_yields_error_with_partial_text(client):
     result = events[-1]["result"]
     assert result["response_text"] == "Hel"
     assert result["error"] == "malformed stream from OpenRouter"
+
+
+@respx.mock
+async def test_null_text_content_part_does_not_raise(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["choices"][0]["message"]["content"] = [{"type": "text", "text": None}]
+    body["choices"][0]["finish_reason"] = "stop"
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == "empty response (finish_reason: stop)"
+
+
+@respx.mock
+async def test_stream_null_text_content_part_does_not_raise(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                delta_chunk("Hi "),
+                delta_chunk([{"type": "text", "text": None}]),
+                delta_chunk([{"type": "text", "text": "there"}]),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert [e["type"] for e in events] == ["delta", "delta", "done"]
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hi there"
+    assert result["error"] is None

@@ -539,6 +539,17 @@ function closeDiffPanel() {
   diffBody.replaceChildren();
 }
 
+// Arming deliberately survives history replay (that is what makes
+// live-vs-historical diffs possible), but not a new Run: its columns
+// supersede the comparison the armed result came from, and a later
+// toggle would silently diff against a vanished column.
+function disarmDiff() {
+  if (armedDiff !== null) {
+    armedDiff.btn.classList.remove("armed");
+    armedDiff = null;
+  }
+}
+
 function openDiff(a, b) {
   diffTitle.textContent = a.label + " vs " + b.label;
   const ta = tokenizeDiff(a.result.response_text);
@@ -663,6 +674,7 @@ runBtn.addEventListener("click", async () => {
   runLabelEl.textContent = "";
   // A new comparison replaces the columns a shown diff came from.
   closeDiffPanel();
+  disarmDiff();
   running = true;
   updateRunState();
   // One request per model instead of one batch: /compare returns only when
@@ -741,6 +753,10 @@ async function showGroup(groupId) {
     return;
   }
   resultsEl.replaceChildren();
+  // The panel would otherwise keep showing a diff of columns that no
+  // longer exist; the ARMED side stays, by design, for cross-replay
+  // diffing.
+  closeDiffPanel();
   runLabelEl.textContent =
     "Historical comparison #" + group.id + " from " +
     group.created_at.slice(0, 19).replace("T", " ") + " UTC";
@@ -776,6 +792,7 @@ async function showRun(runId) {
   // Same column renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too.
   resultsEl.replaceChildren();
+  closeDiffPanel();
   runLabelEl.textContent =
     "Historical run #" + run.id + " from " +
     run.created_at.slice(0, 19).replace("T", " ") + " UTC";

@@ -360,3 +360,19 @@ def test_stream_endpoint_errored_stream_still_persists(client):
     persisted = detail["results"][0]
     assert persisted["error"] == "request failed: ReadError"
     assert persisted["response_text"] == "par"
+
+
+@respx.mock
+def test_string_token_counts_yield_none_cost_not_500(client):
+    body = response_for("model/alpha", "hello")
+    # Some providers have been seen reporting counts as strings; cost
+    # must degrade to None instead of raising in the multiplication.
+    body["usage"] = {"prompt_tokens": "13", "completion_tokens": "8"}
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    assert resp.status_code == 200
+    result = resp.json()["results"][0]
+    assert result["cost_usd"] is None
+    assert result["response_text"] == "hello"
