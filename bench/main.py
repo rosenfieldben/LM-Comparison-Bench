@@ -154,12 +154,17 @@ async def index() -> FileResponse:
 
 
 def cost_usd(result: dict, prices: dict) -> float | None:
-    """Cost of one result, or None when tokens or pricing are unknown."""
+    """Cost of one result, or None when tokens or pricing are unknown.
+
+    isinstance rather than a None check: a provider reporting token
+    counts as strings would otherwise raise in the multiplication and
+    sink the whole request after the upstream calls already happened.
+    """
     price = prices.get(result["model"])
     if (
         price is None
-        or result["prompt_tokens"] is None
-        or result["completion_tokens"] is None
+        or not isinstance(result["prompt_tokens"], (int, float))
+        or not isinstance(result["completion_tokens"], (int, float))
     ):
         return None
     return (

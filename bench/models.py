@@ -55,10 +55,14 @@ def _flatten_content(content) -> str | None:
     the sqlite bind in save_run and roll back the whole run.
     """
     if isinstance(content, list):
+        # isinstance on the value, not .get with a default: a part with
+        # an explicit null text ({"text": null}) returns None from .get
+        # (the default only covers missing keys) and would crash the
+        # join, escaping the never-raises contract.
         content = "".join(
-            part.get("text", "")
+            part["text"]
             for part in content
-            if isinstance(part, dict)
+            if isinstance(part, dict) and isinstance(part.get("text"), str)
         )
     if isinstance(content, str) and content:
         return content

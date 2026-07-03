@@ -56,11 +56,62 @@
   }
   .col.error { background: #fdf3f2; border-color: #d9a09a; }
   .col-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 0.4rem;
     font-weight: 600;
     font-size: 0.9rem;
     margin-bottom: 0.4rem;
     word-break: break-all;
   }
+  .diff-toggle {
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 400;
+    padding: 0.05rem 0.45rem;
+    border: 1px solid #aaa;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .diff-toggle.armed { background: #35507a; border-color: #35507a; color: #fff; }
+  #diff-panel {
+    margin-top: 1.2rem;
+    border: 1px solid #b8c4d8;
+    border-radius: 6px;
+    background: #fff;
+  }
+  #diff-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.5rem 0.7rem;
+    border-bottom: 1px solid #e2e7ef;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+  #diff-close {
+    font: inherit;
+    font-size: 0.8rem;
+    font-weight: 400;
+    padding: 0.15rem 0.6rem;
+    border: 1px solid #aaa;
+    border-radius: 4px;
+    background: #fff;
+    cursor: pointer;
+  }
+  #diff-body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    padding: 0.7rem;
+  }
+  #diff-body del { background: #fbdcd9; color: #7a1f18; text-decoration: line-through; }
+  #diff-body ins { background: #d9f0d9; color: #1c5c1c; text-decoration: none; }
   .meta { margin-bottom: 0.5rem; min-height: 1.3em; }
   .badge {
     display: inline-block;
@@ -134,6 +185,13 @@
 <button id="run" disabled>Run</button>
 <div id="run-label"></div>
 <div id="results"></div>
+<div id="diff-panel" hidden>
+  <div id="diff-header">
+    <span id="diff-title"></span>
+    <button id="diff-close" type="button">Close</button>
+  </div>
+  <div id="diff-body"></div>
+</div>
 <details id="history">
   <summary>History</summary>
   <div id="history-list"></div>
@@ -322,7 +380,9 @@ function makeColumn(model) {
   col.className = "col";
   const header = document.createElement("div");
   header.className = "col-header";
-  header.textContent = model;
+  const name = document.createElement("span");
+  name.textContent = model;
+  header.append(name);
   const meta = document.createElement("div");
   meta.className = "meta";
   const body = document.createElement("div");
@@ -330,7 +390,7 @@ function makeColumn(model) {
   body.textContent = "running...";
   col.append(header, meta, body);
   resultsEl.append(col);
-  return { col, meta, body };
+  return { col, header, meta, body };
 }
 
 function addBadges(ui, result) {
@@ -362,14 +422,176 @@ function applyError(ui, error) {
   ui.body.append(msg);
 }
 
-function fillColumn(ui, result) {
+function fillColumn(ui, result, sourceLabel) {
   ui.body.classList.remove("loading");
   addBadges(ui, result);
   // textContent on purpose: model output is untrusted and must never be
   // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
   ui.body.textContent = result.response_text != null ? result.response_text : "";
   applyError(ui, result.error);
+  registerDiffable(ui, result, sourceLabel);
 }
+
+// ---- Diff view. Pure functions first (tokenize, lcs, render) so a JS
+// ---- harness could test them later; DOM wiring below.
+
+// Past this many word tokens the O(n*m) LCS table would freeze the
+// tab, so the panel shows a notice instead.
+const DIFF_TOKEN_LIMIT = 4000;
+
+function tokenizeDiff(text) {
+  // Capturing split keeps whitespace; each token is a word plus its
+  // trailing whitespace so reconstruction preserves original spacing
+  // and line breaks. The LCS compares the word alone (key), so a moved
+  // line break does not mark the word itself as changed.
+  const parts = text.split(/(\s+)/);
+  const tokens = [];
+  for (const part of parts) {
+    if (part === "") continue;
+    if (/^\s+$/.test(part) && tokens.length > 0) {
+      tokens[tokens.length - 1].raw += part;
+    } else if (/^\s+$/.test(part)) {
+      tokens.push({ raw: part, key: "" });
+    } else {
+      tokens.push({ raw: part, key: part });
+    }
+  }
+  return tokens;
+}
+
+function diffTokens(a, b) {
+  // Classic LCS table with backtrack. O(n*m) is fine at bench scale
+  // behind DIFF_TOKEN_LIMIT, and forty lines of understandable code
+  // beat an optimal but opaque algorithm in a hand-maintained file.
+  const n = a.length;
+  const m = b.length;
+  const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      dp[i][j] = a[i - 1].key === b[j - 1].key
+        ? dp[i - 1][j - 1] + 1
+        : Math.max(dp[i - 1][j], dp[i][j - 1]);
+    }
+  }
+  const ops = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (a[i - 1].key === b[j - 1].key) {
+      // Common text takes B's spacing so the merged view flows like
+      // the newer response.
+      ops.push({ op: "same", raw: b[j - 1].raw });
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      ops.push({ op: "del", raw: a[i - 1].raw });
+      i -= 1;
+    } else {
+      ops.push({ op: "ins", raw: b[j - 1].raw });
+      j -= 1;
+    }
+  }
+  while (i > 0) { ops.push({ op: "del", raw: a[i - 1].raw }); i -= 1; }
+  while (j > 0) { ops.push({ op: "ins", raw: b[j - 1].raw }); j -= 1; }
+  return ops.reverse();
+}
+
+function renderDiff(ops, container) {
+  container.replaceChildren();
+  // Adjacent tokens with the same op merge into one node: fewer DOM
+  // nodes and the del/ins tint reads as one span per changed region.
+  let run = null;
+  function flush() {
+    if (run === null) return;
+    if (run.op === "same") {
+      container.append(document.createTextNode(run.text));
+    } else {
+      // createElement plus textContent only: model output stays
+      // untrusted in diff form, exactly as in the columns.
+      const el = document.createElement(run.op === "del" ? "del" : "ins");
+      el.textContent = run.text;
+      container.append(el);
+    }
+    run = null;
+  }
+  for (const o of ops) {
+    if (run !== null && run.op === o.op) {
+      run.text += o.raw;
+    } else {
+      flush();
+      run = { op: o.op, text: o.raw };
+    }
+  }
+  flush();
+}
+
+const diffPanel = document.getElementById("diff-panel");
+const diffTitle = document.getElementById("diff-title");
+const diffBody = document.getElementById("diff-body");
+// Armed side of a pending diff. Holds the result data, not just the
+// element: history replay replaces the columns, and surviving that is
+// what makes live-vs-historical diffs possible.
+let armedDiff = null;
+
+function closeDiffPanel() {
+  diffPanel.hidden = true;
+  diffTitle.textContent = "";
+  diffBody.replaceChildren();
+}
+
+// Arming deliberately survives history replay (that is what makes
+// live-vs-historical diffs possible), but not a new Run: its columns
+// supersede the comparison the armed result came from, and a later
+// toggle would silently diff against a vanished column.
+function disarmDiff() {
+  if (armedDiff !== null) {
+    armedDiff.btn.classList.remove("armed");
+    armedDiff = null;
+  }
+}
+
+function openDiff(a, b) {
+  diffTitle.textContent = a.label + " vs " + b.label;
+  const ta = tokenizeDiff(a.result.response_text);
+  const tb = tokenizeDiff(b.result.response_text);
+  if (ta.length > DIFF_TOKEN_LIMIT || tb.length > DIFF_TOKEN_LIMIT) {
+    diffBody.textContent = "responses too large to diff";
+  } else {
+    renderDiff(diffTokens(ta, tb), diffBody);
+  }
+  diffPanel.hidden = false;
+}
+
+function registerDiffable(ui, result, sourceLabel) {
+  // Error-only columns have nothing to diff; partial text (the 4b
+  // both-text-and-error contract) is diffable and labeled as such.
+  if (result.response_text == null || sourceLabel == null) return;
+  const label = sourceLabel + (result.error != null ? " (partial)" : "");
+  const btn = document.createElement("button");
+  btn.className = "diff-toggle";
+  btn.type = "button";
+  btn.textContent = "diff";
+  btn.addEventListener("click", () => {
+    if (armedDiff !== null && armedDiff.btn === btn) {
+      btn.classList.remove("armed");
+      armedDiff = null;
+      return;
+    }
+    if (armedDiff === null) {
+      armedDiff = { btn: btn, result: result, label: label };
+      btn.classList.add("armed");
+      return;
+    }
+    openDiff(armedDiff, { btn: btn, result: result, label: label });
+    // The armed button may already be detached (replaced results);
+    // removing the class is harmless either way.
+    armedDiff.btn.classList.remove("armed");
+    armedDiff = null;
+  });
+  ui.header.append(btn);
+}
+
+document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
 
 async function runOne(prompt, model, promptId, groupId, ui) {
   // Deltas append to a dedicated text node: appendData is a pure text
@@ -395,6 +617,7 @@ async function runOne(prompt, model, promptId, groupId, ui) {
     if (textNode === null) ui.body.textContent = "";
     addBadges(ui, result);
     applyError(ui, result.error);
+    registerDiffable(ui, result, model + " (live)");
   }
 
   try {
@@ -434,7 +657,12 @@ async function runOne(prompt, model, promptId, groupId, ui) {
   } catch (err) {
     // Network death mid-stream lands here; partial text stays visible
     // through the same error rendering as a server-reported failure.
-    finish({ error: "request failed: " + err.message });
+    // The streamed text is folded into the synthetic result so the
+    // column stays diffable on its partial text.
+    finish({
+      error: "request failed: " + err.message,
+      response_text: textNode !== null ? textNode.data : null,
+    });
   }
 }
 
@@ -444,6 +672,9 @@ runBtn.addEventListener("click", async () => {
   const models = checkedModels();
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
+  // A new comparison replaces the columns a shown diff came from.
+  closeDiffPanel();
+  disarmDiff();
   running = true;
   updateRunState();
   // One request per model instead of one batch: /compare returns only when
@@ -522,6 +753,10 @@ async function showGroup(groupId) {
     return;
   }
   resultsEl.replaceChildren();
+  // The panel would otherwise keep showing a diff of columns that no
+  // longer exist; the ARMED side stays, by design, for cross-replay
+  // diffing.
+  closeDiffPanel();
   runLabelEl.textContent =
     "Historical comparison #" + group.id + " from " +
     group.created_at.slice(0, 19).replace("T", " ") + " UTC";
@@ -536,7 +771,10 @@ async function showGroup(groupId) {
   };
   results.sort((a, b) => rank(a.model) - rank(b.model));
   for (const result of results) {
-    fillColumn(makeColumn(result.model), result);
+    fillColumn(
+      makeColumn(result.model), result,
+      result.model + ", comparison #" + group.id
+    );
   }
   window.scrollTo({ top: 0 });
 }
@@ -554,11 +792,12 @@ async function showRun(runId) {
   // Same column renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too.
   resultsEl.replaceChildren();
+  closeDiffPanel();
   runLabelEl.textContent =
     "Historical run #" + run.id + " from " +
     run.created_at.slice(0, 19).replace("T", " ") + " UTC";
   for (const result of run.results) {
-    fillColumn(makeColumn(result.model), result);
+    fillColumn(makeColumn(result.model), result, result.model + ", run #" + run.id);
   }
   window.scrollTo({ top: 0 });
 }

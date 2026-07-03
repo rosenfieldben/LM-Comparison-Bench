@@ -90,6 +90,20 @@ Other endpoints:
   comparisons or `{type: "run", ...}` for legacy ungrouped rows
 - `GET /runs/{id}` returns a full run with results
 
+## Diff view
+
+Any two rendered result columns can be diffed: live against live,
+historical against historical, or one of each (arm a live column,
+open a History entry, then toggle a column there). Each column with
+response text has a small "diff" toggle in its header; the first
+toggle arms it, the second opens the diff panel below the results.
+The diff is word-level (LCS, computed in the page, no libraries):
+deletions from the left source render red, insertions from the right
+render green, shared text flows plain. A column holding partial text
+plus an error is diffable on its partial text and labeled
+"(partial)". Responses beyond 4000 word tokens show a size notice
+instead of freezing the tab.
+
 ## Tests
 
 ```sh
@@ -118,3 +132,12 @@ changes:
 - Kill wifi (or the server) mid-stream: the streaming column must
   enter the error state with its partial text retained above the
   error message, not hang or go blank.
+- Diff two live columns from similar prompts ("write a haiku about
+  rain" on two models): common words flow plain, unique words tinted.
+- Diff a live column against the same model's historical run of the
+  same prompt: mostly plain text, sparse red and green.
+- Diff a partial-error column: works, header says "(partial)".
+- Paste-bomb: diff a very long response against a short one; the
+  size notice appears and the tab does not freeze.
+- Injection: prompt a model to output raw HTML tags, diff it, and
+  confirm the tags render as literal text inside the tinted spans.
