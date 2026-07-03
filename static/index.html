@@ -77,14 +77,58 @@
     word-break: break-word;
   }
   .body.loading { color: #999; font-style: italic; }
+  #prompt-bar {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+    margin-bottom: 0.6rem;
+  }
+  #prompt-bar select, #prompt-bar button {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid #aaa;
+    border-radius: 6px;
+    background: #fff;
+  }
+  #prompt-bar button:disabled { opacity: 0.45; }
+  #prompt-msg { font-size: 0.85rem; color: #a33; }
+  #run-label { margin-top: 1rem; font-size: 0.85rem; color: #888; }
+  #history { margin-top: 1.5rem; }
+  #history summary { cursor: pointer; color: #555; }
+  .hrow {
+    display: flex;
+    gap: 1rem;
+    padding: 0.45rem 0.3rem;
+    border-bottom: 1px solid #eee;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .hrow:hover { background: #f0efec; }
+  .hrow .htime { color: #888; white-space: nowrap; }
+  .hrow .hprompt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hrow .hmodels { color: #777; white-space: nowrap; }
 </style>
 </head>
 <body>
 <h1>LM Comparison Bench</h1>
+<div id="prompt-bar">
+  <select id="saved-prompts">
+    <option value="">Saved prompts...</option>
+  </select>
+  <button id="save-prompt" type="button">Save prompt</button>
+  <button id="delete-prompt" type="button" disabled>Delete</button>
+  <span id="prompt-msg"></span>
+</div>
 <textarea id="prompt" rows="4" placeholder="Prompt to send to every checked model"></textarea>
 <div id="models"></div>
 <button id="run" disabled>Run</button>
+<div id="run-label"></div>
 <div id="results"></div>
+<details id="history">
+  <summary>History</summary>
+  <div id="history-list"></div>
+</details>
 
 <script>
 // Hand-edited for now. A /models endpoint is a later phase; churn on this
@@ -100,7 +144,18 @@ const promptEl = document.getElementById("prompt");
 const modelsEl = document.getElementById("models");
 const runBtn = document.getElementById("run");
 const resultsEl = document.getElementById("results");
+const runLabelEl = document.getElementById("run-label");
+const savedSelect = document.getElementById("saved-prompts");
+const saveBtn = document.getElementById("save-prompt");
+const deleteBtn = document.getElementById("delete-prompt");
+const promptMsg = document.getElementById("prompt-msg");
+const historyEl = document.getElementById("history");
+const historyList = document.getElementById("history-list");
 let running = false;
+// Sent with /compare so a run links back to its saved prompt. Cleared
+// the moment the textarea is edited: the text no longer matches the
+// library entry, so the link would lie.
+let selectedPromptId = null;
 
 for (const model of MODELS) {
   const label = document.createElement("label");
@@ -119,8 +174,79 @@ function checkedModels() {
 function updateRunState() {
   runBtn.disabled =
     running || promptEl.value.trim() === "" || checkedModels().length === 0;
+  deleteBtn.disabled = savedSelect.value === "";
 }
-promptEl.addEventListener("input", updateRunState);
+promptEl.addEventListener("input", () => {
+  selectedPromptId = null;
+  savedSelect.value = "";
+  updateRunState();
+});
+
+async function loadPrompts(selectId) {
+  const resp = await fetch("/prompts");
+  const data = await resp.json();
+  savedSelect.replaceChildren(new Option("Saved prompts...", ""));
+  for (const p of data.prompts) {
+    const opt = new Option(p.name, String(p.id));
+    opt.dataset.text = p.text;
+    savedSelect.append(opt);
+  }
+  savedSelect.value = selectId != null ? String(selectId) : "";
+  updateRunState();
+}
+
+savedSelect.addEventListener("change", () => {
+  promptMsg.textContent = "";
+  const opt = savedSelect.selectedOptions[0];
+  if (savedSelect.value === "") {
+    selectedPromptId = null;
+  } else {
+    selectedPromptId = Number(savedSelect.value);
+    promptEl.value = opt.dataset.text;
+  }
+  updateRunState();
+});
+
+saveBtn.addEventListener("click", async () => {
+  promptMsg.textContent = "";
+  if (promptEl.value.trim() === "") {
+    promptMsg.textContent = "nothing to save: prompt is empty";
+    return;
+  }
+  const name = window.prompt("Name for this prompt:");
+  if (!name || !name.trim()) return;
+  const resp = await fetch("/prompts", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name: name.trim(), text: promptEl.value }),
+  });
+  if (resp.status === 409) {
+    promptMsg.textContent = "a prompt with that name already exists";
+    return;
+  }
+  if (!resp.ok) {
+    promptMsg.textContent = "save failed: HTTP " + resp.status;
+    return;
+  }
+  const saved = await resp.json();
+  selectedPromptId = saved.id;
+  await loadPrompts(saved.id);
+});
+
+deleteBtn.addEventListener("click", async () => {
+  const opt = savedSelect.selectedOptions[0];
+  if (savedSelect.value === "") return;
+  if (!window.confirm(`Delete saved prompt "${opt.textContent}"? Run history is kept.`)) return;
+  const resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+  if (!resp.ok && resp.status !== 404) {
+    promptMsg.textContent = "delete failed: HTTP " + resp.status;
+    return;
+  }
+  selectedPromptId = null;
+  await loadPrompts(null);
+});
+
+loadPrompts(null);
 
 function badge(text) {
   const span = document.createElement("span");
@@ -163,12 +289,12 @@ function fillColumn(ui, result) {
   }
 }
 
-async function runOne(prompt, model, ui) {
+async function runOne(prompt, model, promptId, ui) {
   try {
     const resp = await fetch("/compare", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt: prompt, models: [model] }),
+      body: JSON.stringify({ prompt: prompt, models: [model], prompt_id: promptId }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const data = await resp.json();
@@ -180,8 +306,10 @@ async function runOne(prompt, model, ui) {
 
 runBtn.addEventListener("click", async () => {
   const prompt = promptEl.value;
+  const promptId = selectedPromptId;
   const models = checkedModels();
   resultsEl.replaceChildren();
+  runLabelEl.textContent = "";
   running = true;
   updateRunState();
   // One request per model instead of one batch: /compare returns only when
@@ -190,11 +318,63 @@ runBtn.addEventListener("click", async () => {
   // list, not response arrival.
   const columns = models.map(makeColumn);
   await Promise.allSettled(
-    models.map((model, i) => runOne(prompt, model, columns[i]))
+    models.map((model, i) => runOne(prompt, model, promptId, columns[i]))
   );
   running = false;
   updateRunState();
 });
+
+// History loads on expand rather than page load: it is the rarely used
+// half of the page and a stale list is worse than a slightly later one.
+historyEl.addEventListener("toggle", () => {
+  if (historyEl.open) loadHistory();
+});
+
+async function loadHistory() {
+  historyList.replaceChildren();
+  const resp = await fetch("/runs");
+  if (!resp.ok) {
+    historyList.textContent = "failed to load history: HTTP " + resp.status;
+    return;
+  }
+  const data = await resp.json();
+  if (data.runs.length === 0) {
+    historyList.textContent = "no runs yet";
+    return;
+  }
+  for (const run of data.runs) {
+    const row = document.createElement("div");
+    row.className = "hrow";
+    const time = document.createElement("span");
+    time.className = "htime";
+    time.textContent = run.created_at.slice(0, 19).replace("T", " ");
+    const text = document.createElement("span");
+    text.className = "hprompt";
+    text.textContent = run.prompt_text;
+    const models = document.createElement("span");
+    models.className = "hmodels";
+    models.textContent = run.models.join(", ");
+    row.append(time, text, models);
+    row.addEventListener("click", () => showRun(run.id));
+    historyList.append(row);
+  }
+}
+
+async function showRun(runId) {
+  const resp = await fetch("/runs/" + runId);
+  if (!resp.ok) return;
+  const run = await resp.json();
+  // Same column renderer as a live run so the textContent and
+  // null-content guarantees hold for stored data too.
+  resultsEl.replaceChildren();
+  runLabelEl.textContent =
+    "Historical run #" + run.id + " from " +
+    run.created_at.slice(0, 19).replace("T", " ") + " UTC";
+  for (const result of run.results) {
+    fillColumn(makeColumn(result.model), result);
+  }
+  window.scrollTo({ top: 0 });
+}
 </script>
 </body>
 </html>
