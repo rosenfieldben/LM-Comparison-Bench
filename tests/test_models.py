@@ -296,3 +296,40 @@ async def test_stream_null_text_content_part_does_not_raise(client):
     result = events[-1]["result"]
     assert result["response_text"] == "Hi there"
     assert result["error"] is None
+
+
+@respx.mock
+async def test_stream_error_frame_surfaces_upstream_message(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                delta_chunk("Hel"),
+                sse({"error": {"code": 502, "message": "upstream model crashed"}}),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["error"] == "upstream error: upstream model crashed"
+    assert result["response_text"] == "Hel"
+
+
+@respx.mock
+async def test_stream_error_frame_with_code_only(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([sse({"error": {"code": 429}}), DONE_MARKER]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["error"] == "upstream error: 429"
+    assert result["response_text"] is None
+    assert result["ttft_ms"] is None

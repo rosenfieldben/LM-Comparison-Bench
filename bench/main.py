@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sqlite3
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
@@ -173,6 +174,20 @@ def cost_usd(result: dict, prices: dict) -> float | None:
     )
 
 
+def resolve_links(db, prompt_id: int | None, group_id: int | None):
+    """Degrade stale prompt or group links to None instead of erroring.
+
+    By the time links are checked the upstream calls already happened
+    and prompt_text is the source of truth, so a deleted or bogus id
+    must not sink the run.
+    """
+    if prompt_id is not None and store.get_prompt(db, prompt_id) is None:
+        prompt_id = None
+    if group_id is not None and not store.group_exists(db, group_id):
+        group_id = None
+    return prompt_id, group_id
+
+
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict:
     # gather preserves input order, which the frontend relies on to map
@@ -186,15 +201,9 @@ async def compare(request: CompareRequest) -> dict:
     # so history carries the cost as priced at run time.
     for result in results:
         result["cost_usd"] = cost_usd(result, app.state.prices)
-    # A stale prompt_id or group_id (deleted or bogus) must not sink the
-    # run: the upstream calls already happened and prompt_text is the
-    # source of truth, so drop the link rather than error.
-    prompt_id = request.prompt_id
-    if prompt_id is not None and store.get_prompt(app.state.db, prompt_id) is None:
-        prompt_id = None
-    group_id = request.group_id
-    if group_id is not None and not store.group_exists(app.state.db, group_id):
-        group_id = None
+    prompt_id, group_id = resolve_links(
+        app.state.db, request.prompt_id, request.group_id
+    )
     run_id = store.save_run(
         app.state.db, request.prompt, list(results), prompt_id, group_id
     )
@@ -204,29 +213,69 @@ async def compare(request: CompareRequest) -> dict:
 @app.post("/compare/stream")
 async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     async def events():
-        async for event in stream_model(
-            request.prompt, request.model, app.state.client
-        ):
-            if event["type"] != "done":
-                yield "data: " + json.dumps(event) + "\n\n"
-                continue
-            result = event["result"]
-            result["cost_usd"] = cost_usd(result, app.state.prices)
-            # Same stale-link treatment as /compare, and persistence
-            # happens even for errored streams: a failed stream is
-            # still history.
-            prompt_id = request.prompt_id
-            if prompt_id is not None and store.get_prompt(app.state.db, prompt_id) is None:
-                prompt_id = None
-            group_id = request.group_id
-            if group_id is not None and not store.group_exists(app.state.db, group_id):
-                group_id = None
-            run_id = store.save_run(
-                app.state.db, request.prompt, [result], prompt_id, group_id
-            )
-            yield "data: " + json.dumps(
-                {"type": "done", "result": result, "run_id": run_id}
-            ) + "\n\n"
+        # Server-side observation of the stream, enough to reconstruct
+        # a result if the client disconnects before the done event: a
+        # stream the user watched happen is still history.
+        parts: list[str] = []
+        start = time.perf_counter()
+        first_delta_ms: float | None = None
+        handled = False
+        try:
+            async for event in stream_model(
+                request.prompt, request.model, app.state.client
+            ):
+                if event["type"] != "done":
+                    if first_delta_ms is None:
+                        first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
+                    parts.append(event["text"])
+                    yield "data: " + json.dumps(event) + "\n\n"
+                    continue
+                handled = True
+                result = event["result"]
+                result["cost_usd"] = cost_usd(result, app.state.prices)
+                prompt_id, group_id = resolve_links(
+                    app.state.db, request.prompt_id, request.group_id
+                )
+                # The response is already on the wire by now, so a
+                # persistence failure has no clean HTTP error to use:
+                # degrade to run_id null in the done event and log,
+                # instead of corrupting the stream tail.
+                try:
+                    run_id = store.save_run(
+                        app.state.db, request.prompt, [result], prompt_id, group_id
+                    )
+                except Exception:
+                    logger.exception("failed to persist streamed run")
+                    run_id = None
+                yield "data: " + json.dumps(
+                    {"type": "done", "result": result, "run_id": run_id}
+                ) + "\n\n"
+        finally:
+            # A client disconnect cancels this generator at a yield
+            # before the done branch ever runs. Persist what the server
+            # saw (no awaits or yields are legal here, sqlite is sync,
+            # so this is safe during unwinding) rather than silently
+            # dropping a run whose deltas already reached the browser.
+            if not handled:
+                aborted = {
+                    "model": request.model,
+                    "response_text": "".join(parts) or None,
+                    "latency_ms": round((time.perf_counter() - start) * 1000, 1),
+                    "prompt_tokens": None,
+                    "completion_tokens": None,
+                    "error": "stream aborted before completion",
+                    "cost_usd": None,
+                    "ttft_ms": first_delta_ms,
+                }
+                try:
+                    prompt_id, group_id = resolve_links(
+                        app.state.db, request.prompt_id, request.group_id
+                    )
+                    store.save_run(
+                        app.state.db, request.prompt, [aborted], prompt_id, group_id
+                    )
+                except Exception:
+                    logger.exception("failed to persist aborted streamed run")
 
     return StreamingResponse(events(), media_type="text/event-stream")
 

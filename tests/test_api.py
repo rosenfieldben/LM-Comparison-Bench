@@ -264,13 +264,20 @@ from stream_helpers import DONE_MARKER, ChunkStream, sse
 
 
 def stream_events(client, body):
-    events = []
+    # Parse by SSE frame boundaries, exactly as the browser client does,
+    # not line by line: a regression in the blank-line frame separator
+    # must fail here rather than pass unnoticed.
     with client.stream("POST", "/compare/stream", json=body) as resp:
         assert resp.status_code == 200
         assert resp.headers["content-type"].startswith("text/event-stream")
-        for line in resp.iter_lines():
-            if line.startswith("data:"):
-                events.append(json.loads(line[5:]))
+        raw = resp.read().decode()
+    frames = raw.split("\n\n")
+    assert frames[-1] == "", "every SSE event must end with a blank-line separator"
+    events = []
+    for frame in frames[:-1]:
+        data_lines = [l for l in frame.split("\n") if l.startswith("data:")]
+        assert len(data_lines) == 1, f"expected exactly one data line per frame: {frame!r}"
+        events.append(json.loads(data_lines[0][5:]))
     return events
 
 
@@ -376,3 +383,53 @@ def test_string_token_counts_yield_none_cost_not_500(client):
     result = resp.json()["results"][0]
     assert result["cost_usd"] is None
     assert result["response_text"] == "hello"
+
+
+@respx.mock
+async def test_client_disconnect_persists_partial_run(client):
+    # Drive the endpoint's generator directly and close it after one
+    # delta: aclose() raises GeneratorExit at the yield, the same
+    # mechanism a Starlette client disconnect triggers.
+    from bench.main import StreamCompareRequest, compare_stream
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    resp = await compare_stream(
+        StreamCompareRequest(prompt="hi", model="model/alpha")
+    )
+    gen = resp.body_iterator
+    first = await gen.__anext__()
+    assert json.loads(first.removeprefix("data: "))["type"] == "delta"
+    await gen.aclose()
+
+    entries = client.get("/runs").json()["runs"]
+    assert len(entries) == 1
+    detail = client.get(f"/runs/{entries[0]['id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["error"] == "stream aborted before completion"
+    assert persisted["response_text"] == "Hel"
+    assert persisted["ttft_ms"] is not None
+    assert persisted["cost_usd"] is None
+
+
+@respx.mock
+def test_stream_persistence_failure_degrades_to_null_run_id(client, monkeypatch):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr("bench.store.save_run", boom)
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    # The stream must stay intact: full deltas, a done event with the
+    # result, and run_id degraded to null instead of a broken tail.
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["run_id"] is None
+    assert done["result"]["response_text"] == "Hello"
