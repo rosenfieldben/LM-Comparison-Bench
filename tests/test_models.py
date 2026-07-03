@@ -377,3 +377,38 @@ async def test_fetch_catalog_failure_reports_not_fetched(client):
     respx.get(MODELS_URL).mock(side_effect=httpx.ConnectError("offline"))
     catalog = await fetch_catalog(client)
     assert catalog == {"fetched": False, "models": [], "prices": {}}
+
+
+from bench.models import MAX_TOKENS
+
+
+@respx.mock
+async def test_run_model_sends_explicit_max_tokens(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["max_tokens"] == MAX_TOKENS
+
+
+@respx.mock
+async def test_stream_model_sends_explicit_max_tokens(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["max_tokens"] == MAX_TOKENS
