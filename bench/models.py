@@ -12,6 +12,13 @@ MODELS_URL = "https://openrouter.ai/api/v1/models"
 # but past 30s the run is more useful failed than pending.
 REQUEST_TIMEOUT_S = 30.0
 
+# Explicit token budget on every call. Without one, provider default
+# caps apply, and reasoning models can exhaust them on hidden reasoning
+# before any visible output (finish_reason: length with empty content).
+# 4096 is generous enough for visible output, small enough to cap
+# runaway cost on any single bench call.
+MAX_TOKENS = 4096
+
 # Boot must not hang on pricing; the bench works offline, cost display
 # is the only thing a failed fetch costs.
 PRICES_TIMEOUT_S = 10.0
@@ -121,6 +128,7 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": MAX_TOKENS,
     }
 
     start = time.perf_counter()
@@ -201,6 +209,7 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": MAX_TOKENS,
         "stream": True,
         # Without this the final chunk carries no usage block and token
         # counts (and therefore cost) would be lost on streamed runs.
