@@ -412,3 +412,40 @@ async def test_stream_model_sends_explicit_max_tokens(client):
     await collect("hi", "deepseek/deepseek-chat", client)
 
     assert seen["max_tokens"] == MAX_TOKENS
+
+
+from bench.models import REASONING_MAX_TOKENS
+
+
+@respx.mock
+async def test_run_model_caps_reasoning_tokens(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["reasoning"] == {"max_tokens": REASONING_MAX_TOKENS}
+    assert seen["reasoning"]["max_tokens"] < seen["max_tokens"]
+
+
+@respx.mock
+async def test_stream_model_caps_reasoning_tokens(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["reasoning"] == {"max_tokens": REASONING_MAX_TOKENS}
+    assert seen["reasoning"]["max_tokens"] < seen["max_tokens"]
