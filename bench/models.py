@@ -12,12 +12,12 @@ MODELS_URL = "https://openrouter.ai/api/v1/models"
 # but past 30s the run is more useful failed than pending.
 REQUEST_TIMEOUT_S = 30.0
 
-# Explicit token budget on every call. Without one, provider default
-# caps apply, and reasoning models can exhaust them on hidden reasoning
-# before any visible output (finish_reason: length with empty content).
-# 4096 is generous enough for visible output, small enough to cap
-# runaway cost on any single bench call.
-MAX_TOKENS = 4096
+# Reasoning models spend thousands of hidden tokens before visible
+# output and max_tokens covers both, so the budget must dwarf a
+# plausible reasoning burn. 16384 keeps worst-case cost per call
+# around a dollar on the priciest models while ending the
+# empty-response truncations that 4096 caused.
+MAX_TOKENS = 16384
 
 # Boot must not hang on pricing; the bench works offline, cost display
 # is the only thing a failed fetch costs.
@@ -298,3 +298,4 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
         return
 
     yield done(None)
+
