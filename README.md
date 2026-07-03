@@ -33,7 +33,14 @@ The app refuses to boot if `OPENROUTER_API_KEY` is unset.
 
 Runs and saved prompts persist to an SQLite file. Set `BENCH_DB` to
 choose its path; the default is `./bench.db` in the working
-directory.
+directory. Older bench.db files are upgraded in place at startup
+(missing columns are added; existing rows are untouched and legacy
+ungrouped runs keep rendering as before).
+
+Cost per result is computed from OpenRouter's price list, fetched
+once at startup. If that fetch fails (offline, outage), the bench
+still boots and runs; cost just shows as unavailable for the
+session.
 
 ## Usage
 
@@ -64,8 +71,12 @@ Other endpoints:
   a duplicate name
 - `DELETE /prompts/{id}` removes a prompt; runs that used it keep
   their text, only the link is cleared
-- `GET /runs` lists run history, most recent first, prompt text
-  truncated to 80 chars
+- `POST /groups` creates a grouping id so one comparison's per-model
+  requests land as a single history entry
+- `GET /groups/{id}` returns a group's runs with full results
+- `GET /runs` lists history, most recent first, prompt text truncated
+  to 80 chars; entries are either `{type: "group", ...}` for grouped
+  comparisons or `{type: "run", ...}` for legacy ungrouped rows
 - `GET /runs/{id}` returns a full run with results
 
 ## Tests
