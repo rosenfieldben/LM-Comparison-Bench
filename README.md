@@ -14,9 +14,13 @@ export OPENROUTER_API_KEY=sk-or-...
 uvicorn bench.main:app
 ```
 
-Then open http://localhost:8000. The model list is the MODELS const
-at the top of the script block in `static/index.html`; IDs must match
-https://openrouter.ai/models exactly.
+Then open http://localhost:8000. Manage the model lineup with the
+built-in picker: "Add model" opens a search over OpenRouter's catalog
+(by name or id), each lineup row has a remove control, and the lineup
+persists in this browser's localStorage (clearing browser storage
+resets it to the four defaults). The catalog is fetched once at boot,
+same as pricing; restart the app to refresh it. On an offline boot
+the picker falls back to adding models by exact id.
 
 ## Setup
 
@@ -81,6 +85,10 @@ history.
 
 Other endpoints:
 
+- `GET /models` returns the boot-time catalog snapshot as
+  `{"models": [...], "fetched": bool}`; `fetched` false means the
+  boot fetch failed, which is how the picker tells an offline boot
+  from an empty catalog
 - `GET /prompts` lists saved prompts
 - `POST /prompts` with `{"name": ..., "text": ...}` saves one; 409 on
   a duplicate name
@@ -123,8 +131,9 @@ changes:
 
 - Run with 2 models checked: both columns show a loading state, then
   fill in independently, fastest first.
-- Run with an intentionally bad model string in the MODELS const:
-  that column shows the error state (red tint), others unaffected.
+- Add an intentionally bad model id via the picker's exact-id path
+  and run it: that column shows the error state (red tint), others
+  unaffected.
 - Run with a prompt that produces multi-line output (e.g. "write a
   haiku"): line breaks survive in the response column.
 - Save a prompt, reload the page, pick it from the dropdown, replay
@@ -145,3 +154,7 @@ changes:
   size notice appears and the tab does not freeze.
 - Injection: prompt a model to output raw HTML tags, diff it, and
   confirm the tags render as literal text inside the tinted spans.
+- Picker: search for a model by a name fragment, add it, run it,
+  remove it, then reload the page and confirm the lineup survived.
+- Boot with wifi off: the search row says the catalog is unavailable
+  and the exact-id input still adds a model to the lineup.

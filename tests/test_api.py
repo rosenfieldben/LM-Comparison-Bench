@@ -13,11 +13,31 @@ FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
 )
 
-# Hand-built price cache injected in place of the startup pricing fetch.
-# The fixture's usage block is 13 in / 8 out, so model/alpha costs
+# Hand-built catalog injected in place of the startup fetch. The
+# fixture's usage block is 13 in / 8 out, so model/alpha costs
 # 13 * 1e-6 + 8 * 2e-6 = 2.9e-5 USD.
 TEST_PRICES = {
     "model/alpha": {"prompt": 1e-06, "completion": 2e-06},
+}
+TEST_CATALOG = {
+    "fetched": True,
+    "models": [
+        {
+            "id": "model/alpha",
+            "name": "Alpha",
+            "context_length": 128000,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+        },
+        {
+            "id": "model/bare",
+            "name": None,
+            "context_length": None,
+            "prompt_price": None,
+            "completion_price": None,
+        },
+    ],
+    "prices": TEST_PRICES,
 }
 
 
@@ -30,12 +50,12 @@ def client(monkeypatch, tmp_path):
     # never see each other's runs.
     monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
 
-    # The lifespan fetches pricing at startup, which happens outside any
-    # per-test respx router, so stub it here instead of mocking HTTP.
-    async def fake_fetch_prices(client):
-        return dict(TEST_PRICES)
+    # The lifespan fetches the catalog at startup, which happens outside
+    # any per-test respx router, so stub it here instead of mocking HTTP.
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
 
-    monkeypatch.setattr("bench.main.fetch_prices", fake_fetch_prices)
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
     with TestClient(app) as c:
         yield c
 
@@ -433,3 +453,43 @@ def test_stream_persistence_failure_degrades_to_null_run_id(client, monkeypatch)
     assert done["type"] == "done"
     assert done["run_id"] is None
     assert done["result"]["response_text"] == "Hello"
+
+
+def test_models_endpoint_returns_catalog_with_pricing(client):
+    body = client.get("/models").json()
+
+    assert body["fetched"] is True
+    alpha = body["models"][0]
+    assert alpha["id"] == "model/alpha"
+    assert alpha["name"] == "Alpha"
+    assert alpha["context_length"] == 128000
+    assert alpha["prompt_price"] == 1e-06
+    assert alpha["completion_price"] == 2e-06
+    # Entries with missing metadata survive as None rather than vanish.
+    bare = body["models"][1]
+    assert bare["id"] == "model/bare"
+    assert bare["name"] is None
+    assert bare["context_length"] is None
+    assert bare["prompt_price"] is None
+
+
+def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    with TestClient(app) as c:
+        body = c.get("/models").json()
+        assert body == {"models": [], "fetched": False}
+
+        with respx.mock:
+            respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+            resp = c.post("/compare", json={"prompt": "hi", "models": ["model/a"]})
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["response_text"] is not None
+        # No price cache on an offline boot: cost is unavailable, not wrong.
+        assert result["cost_usd"] is None
