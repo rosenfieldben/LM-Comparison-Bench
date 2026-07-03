@@ -1,8 +1,9 @@
 # LM Comparison Bench
 
 Send one prompt to multiple models via OpenRouter and compare the
-results side by side in the browser. No persistence, no streaming,
-no cost display yet.
+results side by side in the browser. Prompts can be saved as a
+reusable library and every run lands in SQLite history for later
+replay. No streaming, no cost display yet.
 
 ## Setup
 
@@ -16,6 +17,10 @@ export OPENROUTER_API_KEY=sk-or-...
 ```
 
 The app refuses to boot if `OPENROUTER_API_KEY` is unset.
+
+Runs and saved prompts persist to an SQLite file. Set `BENCH_DB` to
+choose its path; the default is `./bench.db` in the working
+directory.
 
 ## Usage
 
@@ -36,7 +41,19 @@ curl -X POST localhost:8000/compare \
 
 Results come back in the same order as the requested models. A model
 that errors or times out gets its `error` field set without affecting
-the other models in the run.
+the other models in the run. Every `/compare` call is persisted and
+returns a `run_id`.
+
+Other endpoints:
+
+- `GET /prompts` lists saved prompts
+- `POST /prompts` with `{"name": ..., "text": ...}` saves one; 409 on
+  a duplicate name
+- `DELETE /prompts/{id}` removes a prompt; runs that used it keep
+  their text, only the link is cleared
+- `GET /runs` lists run history, most recent first, prompt text
+  truncated to 80 chars
+- `GET /runs/{id}` returns a full run with results
 
 ## Tests
 
@@ -55,3 +72,6 @@ changes:
   that column shows the error state (red tint), others unaffected.
 - Run with a prompt that produces multi-line output (e.g. "write a
   haiku"): line breaks survive in the response column.
+- Save a prompt, reload the page, pick it from the dropdown, replay
+  it against one model. Open History, click the old run, and confirm
+  it renders identically to a live run (plus the historical banner).
