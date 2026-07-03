@@ -1,6 +1,7 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import json
 import logging
 import os
 import sqlite3
@@ -10,11 +11,11 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from bench import store
-from bench.models import fetch_prices, run_model
+from bench.models import fetch_prices, run_model, stream_model
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,18 @@ class ModelResult(BaseModel):
     completion_tokens: int | None
     error: str | None
     cost_usd: float | None
+    # Time to first content delta. Only the streaming path measures it;
+    # the default keeps /compare results (which never carry the key) valid.
+    ttft_ms: float | None = None
+
+
+class StreamCompareRequest(BaseModel):
+    prompt: str = Field(min_length=1)
+    # One model per streaming request, mirroring the frontend's
+    # per-model fetch pattern: independent columns are the product.
+    model: str = Field(min_length=1)
+    prompt_id: int | None = None
+    group_id: int | None = None
 
 
 class CompareResponse(BaseModel):
@@ -181,6 +194,36 @@ async def compare(request: CompareRequest) -> dict:
         app.state.db, request.prompt, list(results), prompt_id, group_id
     )
     return {"results": list(results), "run_id": run_id}
+
+
+@app.post("/compare/stream")
+async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
+    async def events():
+        async for event in stream_model(
+            request.prompt, request.model, app.state.client
+        ):
+            if event["type"] != "done":
+                yield "data: " + json.dumps(event) + "\n\n"
+                continue
+            result = event["result"]
+            result["cost_usd"] = cost_usd(result, app.state.prices)
+            # Same stale-link treatment as /compare, and persistence
+            # happens even for errored streams: a failed stream is
+            # still history.
+            prompt_id = request.prompt_id
+            if prompt_id is not None and store.get_prompt(app.state.db, prompt_id) is None:
+                prompt_id = None
+            group_id = request.group_id
+            if group_id is not None and not store.group_exists(app.state.db, group_id):
+                group_id = None
+            run_id = store.save_run(
+                app.state.db, request.prompt, [result], prompt_id, group_id
+            )
+            yield "data: " + json.dumps(
+                {"type": "done", "result": result, "run_id": run_id}
+            ) + "\n\n"
+
+    return StreamingResponse(events(), media_type="text/event-stream")
 
 
 @app.post("/groups", response_model=GroupCreated, status_code=201)

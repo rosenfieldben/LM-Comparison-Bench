@@ -64,6 +64,17 @@ that errors or times out gets its `error` field set without affecting
 the other models in the run. Every `/compare` call is persisted and
 returns a `run_id`.
 
+The browser UI streams responses token by token via
+`POST /compare/stream` with `{"prompt": ..., "model": ...}` (one
+model per request) plus optional `prompt_id` and `group_id`. The
+response is SSE-formatted (`data: {...}` lines): `delta` events carry
+text chunks, then one `done` event carries the full result and its
+`run_id`. Streamed results include `ttft_ms` (time to first token),
+which is the metric streaming exists to reveal; `latency_ms` alone
+hides it. One deliberate contract amendment: a result can carry BOTH
+partial `response_text` AND an `error` when a stream dies partway.
+The partial text renders above the error, live and on replay.
+
 Other endpoints:
 
 - `GET /prompts` lists saved prompts
@@ -101,3 +112,9 @@ changes:
 - Save a prompt, reload the page, pick it from the dropdown, replay
   it against one model. Open History, click the old run, and confirm
   it renders identically to a live run (plus the historical banner).
+- Watch a slow model paint token by token next to an already
+  finished fast one; the ttft badge should be visibly smaller than
+  the latency badge on streamed columns.
+- Kill wifi (or the server) mid-stream: the streaming column must
+  enter the error state with its partial text retained above the
+  error message, not hang or go blank.

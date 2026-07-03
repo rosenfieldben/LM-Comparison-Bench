@@ -39,7 +39,8 @@ CREATE TABLE IF NOT EXISTS results (
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
     error TEXT,
-    cost_usd REAL
+    cost_usd REAL,
+    ttft_ms REAL
 );
 """
 
@@ -49,6 +50,7 @@ CREATE TABLE IF NOT EXISTS results (
 MIGRATIONS = [
     ("runs", "group_id", "INTEGER NULL REFERENCES groups(id)"),
     ("results", "cost_usd", "REAL"),
+    ("results", "ttft_ms", "REAL"),
 ]
 
 
@@ -146,8 +148,8 @@ def save_run(
         conn.executemany(
             """INSERT INTO results
                (run_id, model, response_text, latency_ms, prompt_tokens,
-                completion_tokens, error, cost_usd)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                completion_tokens, error, cost_usd, ttft_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -157,9 +159,11 @@ def save_run(
                     r["prompt_tokens"],
                     r["completion_tokens"],
                     r["error"],
-                    # .get: results built before the cost feature (and store
-                    # tests that predate it) carry no cost_usd key.
+                    # .get: results from paths that predate a column (the
+                    # non-streaming path never sets ttft_ms, older tests
+                    # carry no cost_usd) persist as NULL.
                     r.get("cost_usd"),
+                    r.get("ttft_ms"),
                 )
                 for r in results
             ],
@@ -239,7 +243,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
         return None
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
-                  completion_tokens, error, cost_usd
+                  completion_tokens, error, cost_usd, ttft_ms
            FROM results WHERE run_id = ? ORDER BY id""",
         (run_id,),
     ).fetchall()
