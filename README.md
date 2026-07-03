@@ -5,6 +5,19 @@ results side by side in the browser. Prompts can be saved as a
 reusable library and every run lands in SQLite history for later
 replay. No streaming, no cost display yet.
 
+## Daily use
+
+```sh
+cd LM-Comparison-Bench
+source .venv/bin/activate
+export OPENROUTER_API_KEY=sk-or-...
+uvicorn bench.main:app
+```
+
+Then open http://localhost:8000. The model list is the MODELS const
+at the top of the script block in `static/index.html`; IDs must match
+https://openrouter.ai/models exactly.
+
 ## Setup
 
 Requires Python 3.12.
@@ -63,7 +76,9 @@ Other endpoints:
 
 No network access needed; all OpenRouter calls are mocked.
 
-The page has no JS test harness. Verify it by eyeball after UI
+The page has no JS test harness. During frontend eyeball
+verification, run `uvicorn bench.main:app --reload` so index.html
+edits are picked up without restarts. Verify by eyeball after UI
 changes:
 
 - Run with 2 models checked: both columns show a loading state, then
