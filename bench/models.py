@@ -19,6 +19,15 @@ REQUEST_TIMEOUT_S = 30.0
 # empty-response truncations that 4096 caused.
 MAX_TOKENS = 16384
 
+# Cap on the hidden reasoning share of MAX_TOKENS. Without it a
+# reasoning model at its default effort can burn the entire budget
+# thinking and return nothing visible (finish_reason: length with
+# 16384 out and empty content, observed with real keys). 4096 leaves
+# real thinking room while guaranteeing three quarters of the budget
+# stays available for visible output. A fixed cap rather than an
+# effort level keeps models comparable at their own defaults below it.
+REASONING_MAX_TOKENS = 4096
+
 # Boot must not hang on pricing; the bench works offline, cost display
 # is the only thing a failed fetch costs.
 PRICES_TIMEOUT_S = 10.0
@@ -129,6 +138,9 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
+        # OpenRouter normalizes this across providers and ignores it
+        # for models without reasoning support.
+        "reasoning": {"max_tokens": REASONING_MAX_TOKENS},
     }
 
     start = time.perf_counter()
@@ -210,6 +222,9 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
+        # Same normalization note as run_model: ignored by models
+        # without reasoning support.
+        "reasoning": {"max_tokens": REASONING_MAX_TOKENS},
         "stream": True,
         # Without this the final chunk carries no usage block and token
         # counts (and therefore cost) would be lost on streamed runs.
