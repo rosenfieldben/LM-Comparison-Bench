@@ -73,6 +73,12 @@ def test_compare_one_model_erroring_does_not_sink_the_other(client):
     assert broken["response_text"] is None
 
 
+def test_index_serves_html(client):
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+
+
 def test_compare_rejects_empty_prompt(client):
     resp = client.post("/compare", json={"prompt": "", "models": ["model/alpha"]})
     assert resp.status_code == 422

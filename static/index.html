@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LM Comparison Bench</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: #fafaf8;
+    color: #222;
+    max-width: 1400px;
+    margin: 0 auto;
+    padding: 1.5rem;
+  }
+  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
+  #prompt {
+    width: 100%;
+    font: inherit;
+    padding: 0.6rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    resize: vertical;
+  }
+  #models {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 1.2rem;
+    margin: 0.8rem 0;
+  }
+  #models label { cursor: pointer; font-size: 0.95rem; }
+  #run {
+    font: inherit;
+    padding: 0.5rem 1.6rem;
+    border: 1px solid #888;
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+  }
+  #run:disabled { opacity: 0.45; cursor: default; }
+  #results {
+    display: flex;
+    gap: 0.8rem;
+    margin-top: 1.2rem;
+    align-items: stretch;
+  }
+  .col {
+    /* Equal-width columns regardless of content, so 2 to 5 all line up. */
+    flex: 1 1 0;
+    min-width: 0;
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    background: #fff;
+    padding: 0.7rem;
+  }
+  .col.error { background: #fdf3f2; border-color: #d9a09a; }
+  .col-header {
+    font-weight: 600;
+    font-size: 0.9rem;
+    margin-bottom: 0.4rem;
+    word-break: break-all;
+  }
+  .meta { margin-bottom: 0.5rem; min-height: 1.3em; }
+  .badge {
+    display: inline-block;
+    font-size: 0.75rem;
+    background: #eee;
+    border-radius: 4px;
+    padding: 0.1rem 0.4rem;
+    margin-right: 0.4rem;
+  }
+  .body {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.85rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .body.loading { color: #999; font-style: italic; }
+</style>
+</head>
+<body>
+<h1>LM Comparison Bench</h1>
+<textarea id="prompt" rows="4" placeholder="Prompt to send to every checked model"></textarea>
+<div id="models"></div>
+<button id="run" disabled>Run</button>
+<div id="results"></div>
+
+<script>
+// Hand-edited for now. A /models endpoint is a later phase; churn on this
+// list is rare enough that editing a const beats an extra network call.
+const MODELS = [
+  "deepseek/deepseek-chat",
+  "z-ai/glm-4.6",
+  "mistralai/mistral-small",
+  "anthropic/claude-sonnet-4.6",
+];
+
+const promptEl = document.getElementById("prompt");
+const modelsEl = document.getElementById("models");
+const runBtn = document.getElementById("run");
+const resultsEl = document.getElementById("results");
+let running = false;
+
+for (const model of MODELS) {
+  const label = document.createElement("label");
+  const box = document.createElement("input");
+  box.type = "checkbox";
+  box.value = model;
+  box.addEventListener("change", updateRunState);
+  label.append(box, " " + model);
+  modelsEl.append(label);
+}
+
+function checkedModels() {
+  return [...modelsEl.querySelectorAll("input:checked")].map(b => b.value);
+}
+
+function updateRunState() {
+  runBtn.disabled =
+    running || promptEl.value.trim() === "" || checkedModels().length === 0;
+}
+promptEl.addEventListener("input", updateRunState);
+
+function badge(text) {
+  const span = document.createElement("span");
+  span.className = "badge";
+  span.textContent = text;
+  return span;
+}
+
+function makeColumn(model) {
+  const col = document.createElement("div");
+  col.className = "col";
+  const header = document.createElement("div");
+  header.className = "col-header";
+  header.textContent = model;
+  const meta = document.createElement("div");
+  meta.className = "meta";
+  const body = document.createElement("div");
+  body.className = "body loading";
+  body.textContent = "running...";
+  col.append(header, meta, body);
+  resultsEl.append(col);
+  return { col, meta, body };
+}
+
+function fillColumn(ui, result) {
+  ui.body.classList.remove("loading");
+  if (result.latency_ms != null) {
+    ui.meta.append(badge(Math.round(result.latency_ms) + " ms"));
+  }
+  if (result.prompt_tokens != null && result.completion_tokens != null) {
+    ui.meta.append(badge(result.prompt_tokens + " in / " + result.completion_tokens + " out"));
+  }
+  if (result.error != null) {
+    ui.col.classList.add("error");
+    ui.body.textContent = result.error;
+  } else {
+    // textContent on purpose: model output is untrusted and must never be
+    // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
+    ui.body.textContent = result.response_text;
+  }
+}
+
+async function runOne(prompt, model, ui) {
+  try {
+    const resp = await fetch("/compare", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt: prompt, models: [model] }),
+    });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    const data = await resp.json();
+    fillColumn(ui, data.results[0]);
+  } catch (err) {
+    fillColumn(ui, { error: "request failed: " + err.message });
+  }
+}
+
+runBtn.addEventListener("click", async () => {
+  const prompt = promptEl.value;
+  const models = checkedModels();
+  resultsEl.replaceChildren();
+  running = true;
+  updateRunState();
+  // One request per model instead of one batch: /compare returns only when
+  // its slowest model finishes, and the bench exists to watch fast models
+  // land first. Columns are created up front so order tracks the checkbox
+  // list, not response arrival.
+  const columns = models.map(makeColumn);
+  await Promise.allSettled(
+    models.map((model, i) => runOne(prompt, model, columns[i]))
+  );
+  running = false;
+  updateRunState();
+});
+</script>
+</body>
+</html>

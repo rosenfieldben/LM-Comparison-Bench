@@ -1,8 +1,8 @@
 # LM Comparison Bench
 
-Send one prompt to multiple models via OpenRouter and get structured
-results back for side-by-side evaluation. Backend only for now: no
-persistence, no streaming, no frontend.
+Send one prompt to multiple models via OpenRouter and compare the
+results side by side in the browser. No persistence, no streaming,
+no cost display yet.
 
 ## Setup
 
@@ -18,6 +18,13 @@ export OPENROUTER_API_KEY=sk-or-...
 The app refuses to boot if `OPENROUTER_API_KEY` is unset.
 
 ## Usage
+
+Open http://localhost:8000 in a browser. Type a prompt, check the
+models to compare, hit Run. Each column fills in as its model
+responds. The model list is a hand-edited const at the top of the
+script block in `static/index.html`.
+
+Or hit the API directly:
 
 ```sh
 curl -X POST localhost:8000/compare \
@@ -38,3 +45,13 @@ the other models in the run.
 ```
 
 No network access needed; all OpenRouter calls are mocked.
+
+The page has no JS test harness. Verify it by eyeball after UI
+changes:
+
+- Run with 2 models checked: both columns show a loading state, then
+  fill in independently, fastest first.
+- Run with an intentionally bad model string in the MODELS const:
+  that column shows the error state (red tint), others unaffected.
+- Run with a prompt that produces multi-line output (e.g. "write a
+  haiku"): line breaks survive in the response column.

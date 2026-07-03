@@ -54,10 +54,20 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
 
     try:
         data = response.json()
-        result["response_text"] = data["choices"][0]["message"]["content"]
+        choice = data["choices"][0]
+        content = choice["message"]["content"]
     except (ValueError, LookupError, TypeError):
         result["error"] = "malformed response from OpenRouter"
         return result
+
+    if content:
+        result["response_text"] = content
+    else:
+        # Some providers return 200 with null content on refusals. Surface
+        # that as an error so every result carries either text or an error,
+        # a contract the frontend relies on to pick a render state.
+        finish_reason = choice.get("finish_reason") or "unknown"
+        result["error"] = f"empty response (finish_reason: {finish_reason})"
 
     # Some providers omit usage. Report None rather than guessing counts.
     usage = data.get("usage") or {}

@@ -3,9 +3,11 @@
 import asyncio
 import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from bench.models import run_model
@@ -50,6 +52,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
+
+INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
+
+
+@app.get("/", include_in_schema=False)
+async def index() -> FileResponse:
+    return FileResponse(INDEX_HTML)
 
 
 @app.post("/compare", response_model=CompareResponse)
