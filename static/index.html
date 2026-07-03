@@ -83,7 +83,7 @@
     align-items: center;
     margin-bottom: 0.6rem;
   }
-  #prompt-bar select, #prompt-bar button {
+  #prompt-bar select, #prompt-bar button, #prompt-bar input {
     font: inherit;
     font-size: 0.9rem;
     padding: 0.3rem 0.6rem;
@@ -91,6 +91,8 @@
     border-radius: 6px;
     background: #fff;
   }
+  #name-row { display: inline-flex; gap: 0.4rem; }
+  #name-row[hidden] { display: none; }
   #prompt-bar button:disabled { opacity: 0.45; }
   #prompt-msg { font-size: 0.85rem; color: #a33; }
   #run-label { margin-top: 1rem; font-size: 0.85rem; color: #888; }
@@ -117,6 +119,11 @@
     <option value="">Saved prompts...</option>
   </select>
   <button id="save-prompt" type="button">Save prompt</button>
+  <span id="name-row" hidden>
+    <input id="prompt-name" type="text" placeholder="Name for this prompt">
+    <button id="confirm-save" type="button">OK</button>
+    <button id="cancel-save" type="button">Cancel</button>
+  </span>
   <button id="delete-prompt" type="button" disabled>Delete</button>
   <span id="prompt-msg"></span>
 </div>
@@ -183,8 +190,15 @@ promptEl.addEventListener("input", () => {
 });
 
 async function loadPrompts(selectId) {
-  const resp = await fetch("/prompts");
-  const data = await resp.json();
+  let data;
+  try {
+    const resp = await fetch("/prompts");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    data = await resp.json();
+  } catch (err) {
+    promptMsg.textContent = "failed to load prompts: " + err.message;
+    return;
+  }
   savedSelect.replaceChildren(new Option("Saved prompts...", ""));
   for (const p of data.prompts) {
     const opt = new Option(p.name, String(p.id));
@@ -207,37 +221,83 @@ savedSelect.addEventListener("change", () => {
   updateRunState();
 });
 
-saveBtn.addEventListener("click", async () => {
+const nameRow = document.getElementById("name-row");
+const nameInput = document.getElementById("prompt-name");
+const confirmSave = document.getElementById("confirm-save");
+const cancelSave = document.getElementById("cancel-save");
+
+function closeNameRow() {
+  nameRow.hidden = true;
+  nameInput.value = "";
+  saveBtn.disabled = false;
+}
+
+saveBtn.addEventListener("click", () => {
   promptMsg.textContent = "";
   if (promptEl.value.trim() === "") {
     promptMsg.textContent = "nothing to save: prompt is empty";
     return;
   }
-  const name = window.prompt("Name for this prompt:");
-  if (!name || !name.trim()) return;
-  const resp = await fetch("/prompts", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ name: name.trim(), text: promptEl.value }),
-  });
-  if (resp.status === 409) {
-    promptMsg.textContent = "a prompt with that name already exists";
-    return;
+  nameRow.hidden = false;
+  saveBtn.disabled = true;
+  nameInput.focus();
+});
+
+async function submitSave() {
+  const name = nameInput.value.trim();
+  // Empty name is a no-op, mirroring the old cancelled-dialog behavior:
+  // the row stays open so the user can type or explicitly cancel.
+  if (!name) return;
+  try {
+    const resp = await fetch("/prompts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name, text: promptEl.value }),
+    });
+    if (resp.status === 409) {
+      // Row stays open on conflict so the name can be edited and retried.
+      promptMsg.textContent = "a prompt with that name already exists";
+      return;
+    }
+    if (!resp.ok) {
+      promptMsg.textContent = "save failed: HTTP " + resp.status;
+      return;
+    }
+    const saved = await resp.json();
+    closeNameRow();
+    selectedPromptId = saved.id;
+    await loadPrompts(saved.id);
+  } catch (err) {
+    promptMsg.textContent = "save failed: " + err.message;
   }
-  if (!resp.ok) {
-    promptMsg.textContent = "save failed: HTTP " + resp.status;
-    return;
+}
+
+confirmSave.addEventListener("click", submitSave);
+cancelSave.addEventListener("click", () => {
+  promptMsg.textContent = "";
+  closeNameRow();
+});
+nameInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    e.preventDefault();
+    submitSave();
+  } else if (e.key === "Escape") {
+    promptMsg.textContent = "";
+    closeNameRow();
   }
-  const saved = await resp.json();
-  selectedPromptId = saved.id;
-  await loadPrompts(saved.id);
 });
 
 deleteBtn.addEventListener("click", async () => {
   const opt = savedSelect.selectedOptions[0];
   if (savedSelect.value === "") return;
   if (!window.confirm(`Delete saved prompt "${opt.textContent}"? Run history is kept.`)) return;
-  const resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+  let resp;
+  try {
+    resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+  } catch (err) {
+    promptMsg.textContent = "delete failed: " + err.message;
+    return;
+  }
   if (!resp.ok && resp.status !== 404) {
     promptMsg.textContent = "delete failed: HTTP " + resp.status;
     return;
@@ -332,12 +392,15 @@ historyEl.addEventListener("toggle", () => {
 
 async function loadHistory() {
   historyList.replaceChildren();
-  const resp = await fetch("/runs");
-  if (!resp.ok) {
-    historyList.textContent = "failed to load history: HTTP " + resp.status;
+  let data;
+  try {
+    const resp = await fetch("/runs");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    data = await resp.json();
+  } catch (err) {
+    historyList.textContent = "failed to load history: " + err.message;
     return;
   }
-  const data = await resp.json();
   if (data.runs.length === 0) {
     historyList.textContent = "no runs yet";
     return;
@@ -361,9 +424,15 @@ async function loadHistory() {
 }
 
 async function showRun(runId) {
-  const resp = await fetch("/runs/" + runId);
-  if (!resp.ok) return;
-  const run = await resp.json();
+  let run;
+  try {
+    const resp = await fetch("/runs/" + runId);
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    run = await resp.json();
+  } catch (err) {
+    runLabelEl.textContent = "failed to load run #" + runId + ": " + err.message;
+    return;
+  }
   // Same column renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too.
   resultsEl.replaceChildren();

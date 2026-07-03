@@ -114,11 +114,21 @@ def test_compare_persists_run_and_history_reflects_it(client):
     assert len(runs) == 1
     assert runs[0]["id"] == compare["run_id"]
     assert runs[0]["models"] == ["model/alpha", "model/beta"]
-    assert runs[0]["prompt_text"] == "x" * 80
+    assert runs[0]["prompt_text"] == "x" * 80 + "..."
 
     detail = client.get(f"/runs/{compare['run_id']}").json()
     assert detail["prompt_text"] == long_prompt
     assert detail["results"] == compare["results"]
+
+
+@respx.mock
+def test_runs_short_prompt_is_not_marked_truncated(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    client.post("/compare", json={"prompt": "short prompt", "models": ["model/a"]})
+
+    runs = client.get("/runs").json()["runs"]
+    assert runs[0]["prompt_text"] == "short prompt"
 
 
 def test_create_duplicate_prompt_yields_409(client):

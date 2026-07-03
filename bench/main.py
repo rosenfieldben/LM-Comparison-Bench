@@ -145,8 +145,11 @@ async def remove_prompt(prompt_id: int) -> Response:
 @app.get("/runs", response_model=RunList)
 async def get_runs() -> dict:
     runs = store.list_runs(app.state.db)
+    # Append a marker only when a cut happened, so API consumers can tell
+    # a short prompt from a truncated one.
     for run in runs:
-        run["prompt_text"] = run["prompt_text"][:80]
+        if len(run["prompt_text"]) > 80:
+            run["prompt_text"] = run["prompt_text"][:80] + "..."
     return {"runs": runs}
 
 
