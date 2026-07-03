@@ -1,0 +1,27 @@
+{
+  "id": "gen-1751500123-Xk3mQpR7vNwB2aZd",
+  "provider": "DeepSeek",
+  "model": "deepseek/deepseek-chat",
+  "object": "chat.completion",
+  "created": 1751500123,
+  "choices": [
+    {
+      "logprobs": null,
+      "finish_reason": "stop",
+      "native_finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "Hello there, friend, warm greetings!",
+        "refusal": null,
+        "reasoning": null
+      }
+    }
+  ],
+  "system_fingerprint": null,
+  "usage": {
+    "prompt_tokens": 13,
+    "completion_tokens": 8,
+    "total_tokens": 21
+  }
+}
