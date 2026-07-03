@@ -16,7 +16,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from bench import store
-from bench.models import fetch_prices, run_model, stream_model
+from bench.models import fetch_catalog, run_model, stream_model
 
 logger = logging.getLogger(__name__)
 
@@ -102,6 +102,21 @@ class GroupCreated(BaseModel):
     id: int
 
 
+class CatalogModel(BaseModel):
+    id: str
+    name: str | None
+    context_length: int | None
+    prompt_price: float | None
+    completion_price: float | None
+
+
+class CatalogResponse(BaseModel):
+    models: list[CatalogModel]
+    # Lets the frontend tell an offline boot from an empty catalog and
+    # switch to the exact-id fallback instead of a dead search box.
+    fetched: bool
+
+
 class RunDetail(BaseModel):
     id: int
     created_at: str
@@ -131,13 +146,15 @@ async def lifespan(app: FastAPI):
         headers={"Authorization": f"Bearer {api_key}"}
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
-    # One pricing snapshot per boot. Failure is tolerated: the bench must
-    # work offline, cost just renders as unavailable for the session.
-    app.state.prices = await fetch_prices(app.state.client)
-    if not app.state.prices:
+    # One catalog snapshot per boot feeds both pricing and the model
+    # picker. Failure is tolerated: the bench must work offline, cost
+    # renders as unavailable and the picker falls back to exact ids.
+    app.state.catalog = await fetch_catalog(app.state.client)
+    app.state.prices = app.state.catalog["prices"]
+    if not app.state.catalog["fetched"]:
         logger.warning(
-            "OpenRouter pricing fetch failed or returned nothing; "
-            "cost display is unavailable this session"
+            "OpenRouter catalog fetch failed; cost display and model "
+            "search are unavailable this session"
         )
     yield
     await app.state.client.aclose()
@@ -291,6 +308,14 @@ async def group_detail(group_id: int) -> dict:
     if group is None:
         raise HTTPException(404, "no such group")
     return group
+
+
+@app.get("/models", response_model=CatalogResponse)
+async def get_models() -> dict:
+    return {
+        "models": app.state.catalog["models"],
+        "fetched": app.state.catalog["fetched"],
+    }
 
 
 @app.get("/prompts", response_model=PromptList)

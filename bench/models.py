@@ -17,33 +17,67 @@ REQUEST_TIMEOUT_S = 30.0
 PRICES_TIMEOUT_S = 10.0
 
 
-async def fetch_prices(client: httpx.AsyncClient) -> dict:
-    """Fetch per-token USD prices for all OpenRouter models.
+async def fetch_catalog(client: httpx.AsyncClient) -> dict:
+    """One boot-time snapshot of OpenRouter's model catalog.
 
-    Returns {model_id: {"prompt": float, "completion": float}}, or an
-    empty dict on any failure. Never raises: the caller runs this at
-    startup and a pricing outage must not stop the bench from booting.
+    Returns {"fetched": bool, "models": [...], "prices": {...}} where
+    models entries carry id, name, context_length, prompt_price and
+    completion_price (missing fields degrade to None, never breaking
+    the whole catalog) and prices is the {model_id: {prompt,
+    completion}} map cost_usd consumes. One upstream call feeds both.
+    Never raises: this runs at startup and a catalog outage must not
+    stop the bench from booting; fetched=false is how the frontend
+    tells an offline boot from an empty catalog.
     """
+    offline = {"fetched": False, "models": [], "prices": {}}
     try:
         response = await client.get(MODELS_URL, timeout=PRICES_TIMEOUT_S)
         if response.status_code != 200:
-            return {}
+            return offline
         entries = response.json()["data"]
+        if not isinstance(entries, list):
+            return offline
     except (httpx.HTTPError, ValueError, LookupError, TypeError):
-        return {}
+        return offline
 
+    models = []
     prices = {}
     for entry in entries:
-        # Prices arrive as strings in USD per token. Skip entries with
-        # missing or malformed pricing rather than losing the whole map.
+        if not isinstance(entry, dict) or not isinstance(entry.get("id"), str):
+            continue
+        model = {
+            "id": entry["id"],
+            "name": entry.get("name") if isinstance(entry.get("name"), str) else None,
+            "context_length": (
+                entry.get("context_length")
+                if isinstance(entry.get("context_length"), int)
+                else None
+            ),
+            "prompt_price": None,
+            "completion_price": None,
+        }
+        # Prices arrive as strings in USD per token. Malformed pricing
+        # degrades this entry's price fields rather than dropping the
+        # entry or the whole map.
         try:
+            model["prompt_price"] = float(entry["pricing"]["prompt"])
+            model["completion_price"] = float(entry["pricing"]["completion"])
             prices[entry["id"]] = {
-                "prompt": float(entry["pricing"]["prompt"]),
-                "completion": float(entry["pricing"]["completion"]),
+                "prompt": model["prompt_price"],
+                "completion": model["completion_price"],
             }
         except (KeyError, TypeError, ValueError):
-            continue
-    return prices
+            model["prompt_price"] = None
+            model["completion_price"] = None
+        models.append(model)
+    return {"fetched": True, "models": models, "prices": prices}
+
+
+async def fetch_prices(client: httpx.AsyncClient) -> dict:
+    """Price map only. Kept for its established contract; the lifespan
+    uses fetch_catalog so pricing and the picker share one upstream
+    call per boot."""
+    return (await fetch_catalog(client))["prices"]
 
 
 def _flatten_content(content) -> str | None:

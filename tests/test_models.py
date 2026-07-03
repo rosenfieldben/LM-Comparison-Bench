@@ -333,3 +333,47 @@ async def test_stream_error_frame_with_code_only(client):
     assert result["error"] == "upstream error: 429"
     assert result["response_text"] is None
     assert result["ttft_ms"] is None
+
+
+from bench.models import fetch_catalog
+
+
+@respx.mock
+async def test_fetch_catalog_degrades_missing_fields_to_none(client):
+    respx.get(MODELS_URL).respond(
+        json={
+            "data": [
+                {
+                    "id": "a/full",
+                    "name": "Full Model",
+                    "context_length": 32000,
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                },
+                {"id": "b/bare"},
+                {"id": "c/badprice", "name": "Bad Price", "pricing": {"prompt": "free"}},
+                {"no_id": True},
+            ]
+        }
+    )
+
+    catalog = await fetch_catalog(client)
+
+    assert catalog["fetched"] is True
+    assert [m["id"] for m in catalog["models"]] == ["a/full", "b/bare", "c/badprice"]
+    full, bare, badprice = catalog["models"]
+    assert full["context_length"] == 32000
+    assert full["prompt_price"] == 1e-06
+    assert bare["name"] is None
+    assert bare["context_length"] is None
+    assert bare["prompt_price"] is None
+    assert badprice["name"] == "Bad Price"
+    assert badprice["prompt_price"] is None
+    # The price map only carries fully priced entries.
+    assert set(catalog["prices"]) == {"a/full"}
+
+
+@respx.mock
+async def test_fetch_catalog_failure_reports_not_fetched(client):
+    respx.get(MODELS_URL).mock(side_effect=httpx.ConnectError("offline"))
+    catalog = await fetch_catalog(client)
+    assert catalog == {"fetched": False, "models": [], "prices": {}}

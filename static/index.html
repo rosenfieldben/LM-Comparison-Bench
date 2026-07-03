@@ -130,6 +130,53 @@
   .body.loading { color: #999; font-style: italic; }
   .body .error-msg { color: #a33; }
   .body .error-msg.after-text { margin-top: 0.5rem; padding-top: 0.4rem; border-top: 1px dashed #d9a09a; }
+  .rm-model {
+    font: inherit;
+    font-size: 0.8rem;
+    line-height: 1;
+    padding: 0 0.3rem;
+    border: none;
+    background: none;
+    color: #999;
+    cursor: pointer;
+  }
+  .rm-model:hover { color: #a33; }
+  #lineup-bar { display: flex; gap: 0.8rem; align-items: center; margin: 0.4rem 0 0.8rem; }
+  #lineup-bar button {
+    font: inherit;
+    font-size: 0.85rem;
+    padding: 0.2rem 0.7rem;
+    border: 1px solid #aaa;
+    border-radius: 6px;
+    background: #fff;
+    cursor: pointer;
+  }
+  #lineup-msg { font-size: 0.85rem; color: #886a00; }
+  #model-search { margin: 0 0 0.8rem; max-width: 720px; }
+  #model-search input {
+    width: 100%;
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.35rem 0.6rem;
+    border: 1px solid #aaa;
+    border-radius: 6px;
+  }
+  #search-msg { font-size: 0.85rem; color: #886a00; margin-top: 0.3rem; }
+  .match {
+    display: flex;
+    gap: 0.8rem;
+    align-items: baseline;
+    padding: 0.35rem 0.4rem;
+    border-bottom: 1px solid #eee;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+  .match:hover { background: #f0efec; }
+  .match.dimmed { opacity: 0.45; cursor: default; }
+  .match.dimmed:hover { background: none; }
+  .match-name { font-weight: 600; white-space: nowrap; }
+  .match-id { color: #777; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .match-meta { color: #555; margin-left: auto; white-space: nowrap; }
   #prompt-bar {
     display: flex;
     gap: 0.5rem;
@@ -182,6 +229,15 @@
 </div>
 <textarea id="prompt" rows="4" placeholder="Prompt to send to every checked model"></textarea>
 <div id="models"></div>
+<div id="lineup-bar">
+  <button id="add-model" type="button">Add model</button>
+  <span id="lineup-msg"></span>
+</div>
+<div id="model-search" hidden>
+  <input id="model-query" type="text" placeholder="Search models by name or id">
+  <div id="search-msg"></div>
+  <div id="model-matches"></div>
+</div>
 <button id="run" disabled>Run</button>
 <div id="run-label"></div>
 <div id="results"></div>
@@ -198,14 +254,35 @@
 </details>
 
 <script>
-// Hand-edited for now. A /models endpoint is a later phase; churn on this
-// list is rare enough that editing a const beats an extra network call.
-const MODELS = [
+// Seed for a fresh browser only. The live lineup is a localStorage
+// preference of THIS browser, not bench data: keeping it out of sqlite
+// means bench.db stays purely runs and prompts, and losing it costs
+// four clicks.
+const DEFAULT_LINEUP = [
   "deepseek/deepseek-chat",
   "z-ai/glm-4.6",
   "mistralai/mistral-small",
   "anthropic/claude-sonnet-4.6",
 ];
+const LINEUP_KEY = "bench-lineup";
+
+function loadLineup() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem(LINEUP_KEY));
+    if (Array.isArray(parsed) && parsed.every(x => typeof x === "string")) {
+      return parsed;
+    }
+  } catch (err) {
+    // Unparseable storage falls through to the defaults.
+  }
+  return [...DEFAULT_LINEUP];
+}
+
+let lineup = loadLineup();
+
+function saveLineup() {
+  localStorage.setItem(LINEUP_KEY, JSON.stringify(lineup));
+}
 
 const promptEl = document.getElementById("prompt");
 const modelsEl = document.getElementById("models");
@@ -224,14 +301,43 @@ let running = false;
 // library entry, so the link would lie.
 let selectedPromptId = null;
 
-for (const model of MODELS) {
-  const label = document.createElement("label");
-  const box = document.createElement("input");
-  box.type = "checkbox";
-  box.value = model;
-  box.addEventListener("change", updateRunState);
-  label.append(box, " " + model);
-  modelsEl.append(label);
+const lineupMsg = document.getElementById("lineup-msg");
+const addModelBtn = document.getElementById("add-model");
+const searchRow = document.getElementById("model-search");
+const queryInput = document.getElementById("model-query");
+const searchMsg = document.getElementById("search-msg");
+const matchesEl = document.getElementById("model-matches");
+// Snapshot of GET /models; fetched=false switches the picker to the
+// exact-id fallback so the bench stays usable on an offline boot.
+let catalog = { fetched: false, models: [] };
+
+function renderLineup() {
+  // Checked state is per-session; carry it across rebuilds so removing
+  // one model does not uncheck the others.
+  const checked = new Set(checkedModels());
+  modelsEl.replaceChildren();
+  for (const model of lineup) {
+    const label = document.createElement("label");
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.value = model;
+    box.checked = checked.has(model);
+    box.addEventListener("change", updateRunState);
+    const rm = document.createElement("button");
+    rm.type = "button";
+    rm.className = "rm-model";
+    rm.textContent = "×";
+    rm.title = "Remove from lineup";
+    rm.addEventListener("click", (e) => {
+      e.preventDefault();
+      lineup = lineup.filter(m => m !== model);
+      saveLineup();
+      renderLineup();
+    });
+    label.append(box, " " + model + " ", rm);
+    modelsEl.append(label);
+  }
+  updateRunState();
 }
 
 function checkedModels() {
@@ -239,15 +345,131 @@ function checkedModels() {
 }
 
 function updateRunState() {
+  const checked = checkedModels().length;
   runBtn.disabled =
-    running || promptEl.value.trim() === "" || checkedModels().length === 0;
+    running || promptEl.value.trim() === "" || checked === 0;
   deleteBtn.disabled = savedSelect.value === "";
+  // Courtesy note only, never a block: each model runs as its own
+  // request, so no request ever exceeds the /compare batch cap.
+  lineupMsg.textContent =
+    checked > 5
+      ? checked + " models checked; they will run as " + checked + " separate requests"
+      : "";
 }
 promptEl.addEventListener("input", () => {
   selectedPromptId = null;
   savedSelect.value = "";
   updateRunState();
 });
+
+async function loadCatalog() {
+  try {
+    const resp = await fetch("/models");
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    catalog = await resp.json();
+  } catch (err) {
+    catalog = { fetched: false, models: [] };
+  }
+}
+
+function clearSearch() {
+  queryInput.value = "";
+  matchesEl.replaceChildren();
+}
+
+function addToLineup(id) {
+  if (lineup.includes(id)) return;
+  lineup.push(id);
+  saveLineup();
+  renderLineup();
+  clearSearch();
+}
+
+function fmtPricing(m) {
+  if (m.prompt_price == null || m.completion_price == null) {
+    return "pricing unavailable";
+  }
+  // Per-million dollars: per-token floats are unreadable, and
+  // per-million is how every provider quotes.
+  return (
+    "$" + (m.prompt_price * 1e6).toFixed(2) +
+    " / $" + (m.completion_price * 1e6).toFixed(2) +
+    " per 1M in/out"
+  );
+}
+
+addModelBtn.addEventListener("click", () => {
+  searchRow.hidden = !searchRow.hidden;
+  if (searchRow.hidden) {
+    clearSearch();
+    return;
+  }
+  if (!catalog.fetched) {
+    searchMsg.textContent =
+      "model catalog unavailable (offline boot); add by exact id";
+    queryInput.placeholder = "exact model id, Enter to add";
+  } else {
+    searchMsg.textContent = "";
+    queryInput.placeholder = "Search models by name or id";
+  }
+  queryInput.focus();
+});
+
+function renderMatches() {
+  matchesEl.replaceChildren();
+  if (!catalog.fetched) return;
+  const q = queryInput.value.trim().toLowerCase();
+  if (q === "") return;
+  const hits = catalog.models
+    .filter(m =>
+      m.id.toLowerCase().includes(q) ||
+      (m.name || "").toLowerCase().includes(q)
+    )
+    .slice(0, 15);
+  for (const m of hits) {
+    const row = document.createElement("div");
+    row.className = "match";
+    // textContent throughout: catalog names arrive from an external
+    // API and are as untrusted as model output.
+    const name = document.createElement("span");
+    name.className = "match-name";
+    name.textContent = m.name != null ? m.name : m.id;
+    const id = document.createElement("span");
+    id.className = "match-id";
+    id.textContent = m.id;
+    const meta = document.createElement("span");
+    meta.className = "match-meta";
+    meta.textContent =
+      fmtPricing(m) +
+      (m.context_length != null
+        ? ", " + m.context_length.toLocaleString() + " ctx"
+        : "");
+    row.append(name, id, meta);
+    if (lineup.includes(m.id)) {
+      row.classList.add("dimmed");
+      row.title = "already in lineup";
+    } else {
+      row.addEventListener("click", () => addToLineup(m.id));
+    }
+    matchesEl.append(row);
+  }
+}
+
+queryInput.addEventListener("input", renderMatches);
+queryInput.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") {
+    searchRow.hidden = true;
+    clearSearch();
+  } else if (e.key === "Enter" && !catalog.fetched) {
+    // Offline fallback: nothing to search, Enter adds the exact id.
+    e.preventDefault();
+    const id = queryInput.value.trim();
+    if (id) addToLineup(id);
+  }
+});
+
+renderLineup();
+loadCatalog();
 
 async function loadPrompts(selectId) {
   let data;
@@ -760,14 +982,14 @@ async function showGroup(groupId) {
   runLabelEl.textContent =
     "Historical comparison #" + group.id + " from " +
     group.created_at.slice(0, 19).replace("T", " ") + " UTC";
-  // Columns in checkbox (MODELS) order, matching the live layout. Runs
+  // Columns in checkbox (lineup) order, matching the live layout. Runs
   // persist in completion order, so run order alone would shuffle
-  // columns between replays; models gone from the const keep run order
-  // at the end.
+  // columns between replays; models no longer in the lineup keep run
+  // order at the end.
   const results = group.runs.flatMap(r => r.results);
   const rank = m => {
-    const i = MODELS.indexOf(m);
-    return i === -1 ? MODELS.length : i;
+    const i = lineup.indexOf(m);
+    return i === -1 ? lineup.length : i;
   };
   results.sort((a, b) => rank(a.model) - rank(b.model));
   for (const result of results) {
