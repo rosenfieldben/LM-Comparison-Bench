@@ -53,6 +53,19 @@ async def test_http_429_mentions_status(client):
 
 
 @respx.mock
+async def test_null_content_becomes_error_with_finish_reason(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["choices"][0]["message"]["content"] = None
+    body["choices"][0]["finish_reason"] = "content_filter"
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == "empty response (finish_reason: content_filter)"
+
+
+@respx.mock
 async def test_missing_usage_block_yields_none_tokens(client):
     body = {k: v for k, v in FIXTURE.items() if k != "usage"}
     respx.post(OPENROUTER_URL).respond(json=body)
