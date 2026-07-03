@@ -220,6 +220,17 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
                     result["prompt_tokens"] = usage.get("prompt_tokens")
                     result["completion_tokens"] = usage.get("completion_tokens")
 
+                # OpenRouter reports mid-stream failures as an in-band
+                # error object on the 200 stream. Without this check the
+                # frame has no choices, falls into the guard below, and
+                # the real upstream reason is silently lost while the
+                # stream ends looking like a clean success.
+                err = chunk.get("error")
+                if isinstance(err, dict):
+                    detail = err.get("message") or err.get("code") or "unknown"
+                    yield done(f"upstream error: {detail}")
+                    return
+
                 try:
                     choice = chunk["choices"][0]
                     if choice.get("finish_reason"):

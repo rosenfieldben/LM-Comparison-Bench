@@ -73,7 +73,11 @@ text chunks, then one `done` event carries the full result and its
 which is the metric streaming exists to reveal; `latency_ms` alone
 hides it. One deliberate contract amendment: a result can carry BOTH
 partial `response_text` AND an `error` when a stream dies partway.
-The partial text renders above the error, live and on replay.
+The partial text renders above the error, live and on replay. If the
+browser disconnects mid-stream (tab closed, network drop), the server
+still persists the partial run with a "stream aborted before
+completion" error, so nothing the model already produced is lost from
+history.
 
 Other endpoints:
 
