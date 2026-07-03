@@ -178,3 +178,68 @@ def test_get_group_returns_runs_with_results_in_id_order(db):
     assert store.get_group(db, 999) is None
     assert store.group_exists(db, group_id) is True
     assert store.group_exists(db, 999) is False
+
+
+SCHEMA_4A = """
+CREATE TABLE prompts (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
+    group_id INTEGER NULL REFERENCES groups(id),
+    prompt_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE results (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model TEXT NOT NULL,
+    response_text TEXT,
+    latency_ms REAL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    error TEXT,
+    cost_usd REAL
+);
+"""
+
+
+def test_connect_upgrades_4a_schema_with_ttft():
+    uri = "file:pre_streaming_upgrade?mode=memory&cache=shared"
+    keeper = sqlite3.connect(uri, uri=True)
+    keeper.executescript(SCHEMA_4A)
+    keeper.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES (?, ?)",
+        ("4a-era prompt", "2026-07-01T00:00:00+00:00"),
+    )
+    keeper.execute(
+        "INSERT INTO results (run_id, model, response_text, cost_usd)"
+        " VALUES (1, 'a/model', 'hi', 2.9e-05)"
+    )
+    keeper.commit()
+
+    conn = store.connect(uri)
+    try:
+        result_cols = {row[1] for row in conn.execute("PRAGMA table_info(results)")}
+        assert "ttft_ms" in result_cols
+
+        # 4a rows survive: cost intact, ttft simply unknown.
+        run = store.get_run(conn, 1)
+        assert run["results"][0]["cost_usd"] == 2.9e-05
+        assert run["results"][0]["ttft_ms"] is None
+
+        # Streamed-shaped results persist on the upgraded database.
+        run_id = store.save_run(conn, "streamed", [make_result(ttft_ms=312.5)])
+        saved = store.get_run(conn, run_id)
+        assert saved["results"][0]["ttft_ms"] == 312.5
+    finally:
+        conn.close()
+        keeper.close()

@@ -150,3 +150,114 @@ async def test_fetch_prices_failure_returns_empty_dict(client):
 async def test_fetch_prices_http_error_returns_empty_dict(client):
     respx.get(MODELS_URL).respond(status_code=500)
     assert await fetch_prices(client) == {}
+
+
+from stream_helpers import DONE_MARKER, ChunkStream, sse
+
+from bench.models import stream_model
+
+
+def delta_chunk(content):
+    return sse({"choices": [{"delta": {"content": content}}]})
+
+
+async def collect(prompt, model, client):
+    return [e async for e in stream_model(prompt, model, client)]
+
+
+@respx.mock
+async def test_stream_accumulates_deltas_and_parses_usage(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                sse({"choices": [{"delta": {"role": "assistant"}}]}),
+                delta_chunk("Hel"),
+                delta_chunk("lo"),
+                # Content-parts delta: must flatten via the shared rule.
+                delta_chunk([{"type": "text", "text": " world"}]),
+                sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert [e["text"] for e in events[:-1]] == ["Hel", "lo", " world"]
+    result = events[-1]["result"]
+    assert events[-1]["type"] == "done"
+    assert result["response_text"] == "Hello world"
+    assert result["prompt_tokens"] == 13
+    assert result["completion_tokens"] == 8
+    assert result["error"] is None
+    assert result["ttft_ms"] is not None
+    assert result["latency_ms"] is not None
+    assert result["ttft_ms"] <= result["latency_ms"]
+
+
+@respx.mock
+async def test_stream_mid_disconnect_yields_error_with_partial_text(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([delta_chunk("Hel")], exc=httpx.ReadError("net down")),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert [e["type"] for e in events] == ["delta", "done"]
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hel"
+    assert result["error"] == "request failed: ReadError"
+    assert result["ttft_ms"] is not None
+
+
+@respx.mock
+async def test_stream_stall_yields_timeout_error(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([delta_chunk("Hel")], exc=httpx.ReadTimeout("silent")),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hel"
+    assert result["error"] == "stream stalled for 30s"
+
+
+@respx.mock
+async def test_stream_instant_http_error_has_no_ttft(client):
+    respx.post(OPENROUTER_URL).respond(status_code=429, json={"error": "rate limited"})
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert len(events) == 1
+    result = events[0]["result"]
+    assert result["error"] == "HTTP 429 from OpenRouter"
+    assert result["response_text"] is None
+    assert result["ttft_ms"] is None
+
+
+@respx.mock
+async def test_stream_malformed_chunk_yields_error_with_partial_text(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                delta_chunk("Hel"),
+                b"data: {not json\n\n",
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hel"
+    assert result["error"] == "malformed stream from OpenRouter"

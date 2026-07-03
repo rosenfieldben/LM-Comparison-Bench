@@ -77,6 +77,8 @@
     word-break: break-word;
   }
   .body.loading { color: #999; font-style: italic; }
+  .body .error-msg { color: #a33; }
+  .body .error-msg.after-text { margin-top: 0.5rem; padding-top: 0.4rem; border-top: 1px dashed #d9a09a; }
   #prompt-bar {
     display: flex;
     gap: 0.5rem;
@@ -331,10 +333,12 @@ function makeColumn(model) {
   return { col, meta, body };
 }
 
-function fillColumn(ui, result) {
-  ui.body.classList.remove("loading");
+function addBadges(ui, result) {
   if (result.latency_ms != null) {
     ui.meta.append(badge(Math.round(result.latency_ms) + " ms"));
+  }
+  if (result.ttft_ms != null) {
+    ui.meta.append(badge("ttft " + Math.round(result.ttft_ms) + " ms"));
   }
   if (result.prompt_tokens != null && result.completion_tokens != null) {
     ui.meta.append(badge(result.prompt_tokens + " in / " + result.completion_tokens + " out"));
@@ -342,33 +346,95 @@ function fillColumn(ui, result) {
   if (result.cost_usd != null) {
     ui.meta.append(badge("$" + result.cost_usd.toFixed(6)));
   }
-  if (result.error != null) {
-    ui.col.classList.add("error");
-    ui.body.textContent = result.error;
-  } else {
-    // textContent on purpose: model output is untrusted and must never be
-    // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
-    ui.body.textContent = result.response_text;
-  }
+}
+
+// A result may carry BOTH partial text and an error (stream died
+// partway); the error message renders below whatever text arrived,
+// via a text-only node like everything else.
+function applyError(ui, error) {
+  if (error == null) return;
+  ui.col.classList.add("error");
+  const msg = document.createElement("div");
+  msg.className = "error-msg";
+  // Visually separate the error from partial text when there is some.
+  if (ui.body.textContent !== "") msg.classList.add("after-text");
+  msg.textContent = error;
+  ui.body.append(msg);
+}
+
+function fillColumn(ui, result) {
+  ui.body.classList.remove("loading");
+  addBadges(ui, result);
+  // textContent on purpose: model output is untrusted and must never be
+  // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
+  ui.body.textContent = result.response_text != null ? result.response_text : "";
+  applyError(ui, result.error);
 }
 
 async function runOne(prompt, model, promptId, groupId, ui) {
+  // Deltas append to a dedicated text node: appendData is a pure text
+  // API, so the no-HTML injection rule holds for every chunk, and the
+  // node survives into the error state if the stream dies partway.
+  let textNode = null;
+  let finished = false;
+  function appendDelta(text) {
+    if (textNode === null) {
+      ui.body.classList.remove("loading");
+      ui.body.textContent = "";
+      textNode = document.createTextNode("");
+      ui.body.append(textNode);
+    }
+    textNode.appendData(text);
+  }
+  function finish(result) {
+    // Idempotence guard: a connection that dies after the done event
+    // was rendered must not stack a second set of badges or errors.
+    if (finished) return;
+    finished = true;
+    ui.body.classList.remove("loading");
+    if (textNode === null) ui.body.textContent = "";
+    addBadges(ui, result);
+    applyError(ui, result.error);
+  }
+
   try {
-    const resp = await fetch("/compare", {
+    const resp = await fetch("/compare/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         prompt: prompt,
-        models: [model],
+        model: model,
         prompt_id: promptId,
         group_id: groupId,
       }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
-    const data = await resp.json();
-    fillColumn(ui, data.results[0]);
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let sep;
+      while ((sep = buf.indexOf("\n\n")) !== -1) {
+        const frame = buf.slice(0, sep);
+        buf = buf.slice(sep + 2);
+        const line = frame.split("\n").find(l => l.startsWith("data:"));
+        if (!line) continue;
+        const event = JSON.parse(line.slice(5));
+        if (event.type === "delta") {
+          appendDelta(event.text);
+        } else if (event.type === "done") {
+          finish(event.result);
+        }
+      }
+    }
+    if (!finished) throw new Error("stream ended unexpectedly");
   } catch (err) {
-    fillColumn(ui, { error: "request failed: " + err.message });
+    // Network death mid-stream lands here; partial text stays visible
+    // through the same error rendering as a server-reported failure.
+    finish({ error: "request failed: " + err.message });
   }
 }
 

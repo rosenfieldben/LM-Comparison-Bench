@@ -258,3 +258,105 @@ def test_delete_prompt_preserves_history(client):
     detail = client.get(f"/runs/{run_id}").json()
     assert detail["prompt_id"] is None
     assert detail["prompt_text"] == "Say hello."
+
+
+from stream_helpers import DONE_MARKER, ChunkStream, sse
+
+
+def stream_events(client, body):
+    events = []
+    with client.stream("POST", "/compare/stream", json=body) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                events.append(json.loads(line[5:]))
+    return events
+
+
+def alpha_stream():
+    return ChunkStream([
+        sse({"choices": [{"delta": {"content": "Hel"}}]}),
+        sse({"choices": [{"delta": {"content": "lo"}}]}),
+        sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
+        DONE_MARKER,
+    ])
+
+
+@respx.mock
+def test_stream_endpoint_frames_sse_and_persists_ttft_and_cost(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    assert [e["type"] for e in events] == ["delta", "delta", "done"]
+    done = events[-1]
+    assert "".join(e["text"] for e in events[:-1]) == "Hello"
+    assert done["result"]["response_text"] == "Hello"
+    assert done["result"]["ttft_ms"] is not None
+    assert done["result"]["cost_usd"] == pytest.approx(2.9e-05)
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["response_text"] == "Hello"
+    assert persisted["ttft_ms"] == done["result"]["ttft_ms"]
+    assert persisted["cost_usd"] == pytest.approx(2.9e-05)
+
+
+@respx.mock
+def test_stream_endpoint_stale_group_id_degrades(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    events = stream_events(
+        client, {"prompt": "hi", "model": "model/alpha", "group_id": 777}
+    )
+
+    assert events[-1]["type"] == "done"
+    entries = client.get("/runs").json()["runs"]
+    assert len(entries) == 1
+    assert entries[0]["type"] == "run"
+
+
+@respx.mock
+def test_stream_endpoint_grouped_run_lands_in_group(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    group_id = client.post("/groups").json()["id"]
+    events = stream_events(
+        client, {"prompt": "hi", "model": "model/alpha", "group_id": group_id}
+    )
+
+    entries = client.get("/runs").json()["runs"]
+    assert entries[0]["type"] == "group"
+    assert entries[0]["run_ids"] == [events[-1]["run_id"]]
+
+
+@respx.mock
+def test_stream_endpoint_errored_stream_still_persists(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [sse({"choices": [{"delta": {"content": "par"}}]})],
+                exc=httpx.ReadError("dropped"),
+            ),
+        )
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["result"]["error"] == "request failed: ReadError"
+    assert done["result"]["response_text"] == "par"
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["error"] == "request failed: ReadError"
+    assert persisted["response_text"] == "par"
