@@ -39,7 +39,7 @@ async def test_timeout_returns_error_dict(client):
     result = await run_model("hi", "deepseek/deepseek-chat", client)
 
     assert result["response_text"] is None
-    assert "timed out" in result["error"]
+    assert result["error"] == "no response within 180s"
 
 
 @respx.mock
@@ -228,7 +228,7 @@ async def test_stream_stall_yields_timeout_error(client):
 
     result = events[-1]["result"]
     assert result["response_text"] == "Hel"
-    assert result["error"] == "stream stalled for 30s"
+    assert result["error"] == "stream stalled: no data for 120s"
 
 
 @respx.mock
@@ -412,3 +412,40 @@ async def test_stream_model_sends_explicit_max_tokens(client):
     await collect("hi", "deepseek/deepseek-chat", client)
 
     assert seen["max_tokens"] == MAX_TOKENS
+
+
+from bench.models import COMPLETION_READ_TIMEOUT_S, STREAM_READ_TIMEOUT_S
+
+
+@respx.mock
+async def test_run_model_uses_completion_read_timeout(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(request.extensions["timeout"])
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["read"] == COMPLETION_READ_TIMEOUT_S
+    assert seen["connect"] == 10.0
+
+
+@respx.mock
+async def test_stream_model_uses_stream_read_timeout(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(request.extensions["timeout"])
+        return httpx.Response(
+            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["read"] == STREAM_READ_TIMEOUT_S
+    assert seen["connect"] == 10.0
