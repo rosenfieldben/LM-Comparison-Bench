@@ -8,9 +8,29 @@ import httpx
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODELS_URL = "https://openrouter.ai/api/v1/models"
 
-# Per-request cap. Slow models are a data point in a comparison bench,
-# but past 30s the run is more useful failed than pending.
-REQUEST_TIMEOUT_S = 30.0
+# Reaching OpenRouter should be fast; a slow connect is a real failure.
+CONNECT_TIMEOUT_S = 10.0
+
+# Max silent gap between chunks on the streaming path. Reasoning models
+# think silently well past 30s before the first visible delta, so the
+# gap must accommodate hidden reasoning; a silence longer than two
+# minutes still means something is wrong.
+STREAM_READ_TIMEOUT_S = 120.0
+
+# Non-streaming path, where the single read covers the entire
+# completion including all reasoning time, so it gets more headroom
+# than the between-chunk gap.
+COMPLETION_READ_TIMEOUT_S = 180.0
+
+# Streaming: connect fast, tolerate long silent gaps between chunks.
+STREAM_TIMEOUT = httpx.Timeout(
+    connect=CONNECT_TIMEOUT_S, read=STREAM_READ_TIMEOUT_S, write=30.0, pool=10.0
+)
+
+# Non-streaming: connect fast, one long read for the whole completion.
+COMPLETION_TIMEOUT = httpx.Timeout(
+    connect=CONNECT_TIMEOUT_S, read=COMPLETION_READ_TIMEOUT_S, write=30.0, pool=10.0
+)
 
 # Reasoning models spend thousands of hidden tokens before visible
 # output and max_tokens covers both, so the budget must dwarf a
@@ -134,11 +154,11 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
     start = time.perf_counter()
     try:
         response = await client.post(
-            OPENROUTER_URL, json=payload, timeout=REQUEST_TIMEOUT_S
+            OPENROUTER_URL, json=payload, timeout=COMPLETION_TIMEOUT
         )
     except httpx.TimeoutException:
         result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
-        result["error"] = f"timed out after {REQUEST_TIMEOUT_S:.0f}s"
+        result["error"] = f"no response within {COMPLETION_READ_TIMEOUT_S:.0f}s"
         return result
     except httpx.HTTPError as exc:
         result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
@@ -193,9 +213,11 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
     is accumulated here so the done event is always self-sufficient for
     persistence, even when the consumer dropped deltas.
 
-    The 30s timeout is a read timeout between chunks, not total stream
-    duration: a slow model legitimately streams for minutes, but a
-    silent 30s gap means something is wrong.
+    The read timeout is a gap between chunks, not total stream
+    duration: a slow model legitimately streams for minutes, and a
+    reasoning model can think silently for over a minute before its
+    first visible delta, but a silence past STREAM_READ_TIMEOUT_S
+    still means something is wrong.
     """
     result = {
         "model": model,
@@ -237,7 +259,7 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
 
     try:
         async with client.stream(
-            "POST", OPENROUTER_URL, json=payload, timeout=REQUEST_TIMEOUT_S
+            "POST", OPENROUTER_URL, json=payload, timeout=STREAM_TIMEOUT
         ) as response:
             if response.status_code != 200:
                 yield done(f"HTTP {response.status_code} from OpenRouter")
@@ -291,7 +313,7 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
                     text_parts.append(text)
                     yield {"type": "delta", "text": text}
     except httpx.TimeoutException:
-        yield done(f"stream stalled for {REQUEST_TIMEOUT_S:.0f}s")
+        yield done(f"stream stalled: no data for {STREAM_READ_TIMEOUT_S:.0f}s")
         return
     except httpx.HTTPError as exc:
         yield done(f"request failed: {type(exc).__name__}")
