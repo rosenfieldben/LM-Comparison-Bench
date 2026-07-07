@@ -66,6 +66,13 @@ and reruns reuse the budget of the run they retry. The API accepts
 `"budget": "standard" | "extended"` on `/compare` and
 `/compare/stream`; anything else is a 422.
 
+## Reliability
+
+The shared HTTP client enables TCP keepalive probes (SO_KEEPALIVE,
+30s idle, 30s interval) so the minutes-long silent stretches of
+extended-budget reasoning are not culled by NAT idle timers, which
+had been surfacing as mixed ReadError and stall failures mid-lineup.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
