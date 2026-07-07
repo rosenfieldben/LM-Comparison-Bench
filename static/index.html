@@ -77,6 +77,19 @@
     flex-shrink: 0;
   }
   .diff-toggle.armed { background: #35507a; border-color: #35507a; color: #fff; }
+  .rerun-btn {
+    font: inherit;
+    font-size: 0.7rem;
+    font-weight: 400;
+    padding: 0.05rem 0.45rem;
+    border: 1px solid #b06860;
+    border-radius: 4px;
+    background: #fff;
+    color: #a33;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .rerun-btn:disabled { opacity: 0.45; cursor: default; }
   #diff-panel {
     margin-top: 1.2rem;
     border: 1px solid #b8c4d8;
@@ -612,7 +625,42 @@ function makeColumn(model) {
   body.textContent = "running...";
   col.append(header, meta, body);
   resultsEl.append(col);
-  return { col, header, meta, body };
+  return { col, header, name, meta, body };
+}
+
+// Restores a column to its initial loading state so a rerun flows
+// through the exact same streaming path as a first attempt. Rebuilding
+// the header from the name alone also drops the failed attempt's diff
+// toggle and rerun control.
+function resetColumn(ui) {
+  ui.col.classList.remove("error");
+  ui.header.replaceChildren(ui.name);
+  ui.meta.replaceChildren();
+  ui.body.className = "body loading";
+  ui.body.textContent = "running...";
+}
+
+// Rerun is a human clicking, never automatic: that click is the
+// honesty boundary between recovering from a transient failure and
+// hiding one. The failed run is already persisted by the time this
+// button exists; the rerun lands as a second run in the same group,
+// so History keeps both the failure and the retry. Only live runs
+// get the control, since rerunning history would be a new experiment
+// wearing an old label.
+function addRerun(ui, prompt, model, promptId, groupId) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "rerun-btn";
+  btn.textContent = "rerun";
+  btn.title = "Retry this model in place; the failed run stays in history";
+  btn.addEventListener("click", () => {
+    // The reset below removes the button, but disable first so a
+    // double click cannot start two reruns of the same column.
+    btn.disabled = true;
+    resetColumn(ui);
+    runOne(prompt, model, promptId, groupId, ui);
+  });
+  ui.header.append(btn);
 }
 
 function addBadges(ui, result) {
@@ -840,6 +888,11 @@ async function runOne(prompt, model, promptId, groupId, ui) {
     addBadges(ui, result);
     applyError(ui, result.error);
     registerDiffable(ui, result, model + " (live)");
+    // Only this streaming path offers a rerun; historical replays go
+    // through fillColumn and never get one.
+    if (result.error != null) {
+      addRerun(ui, prompt, model, promptId, groupId);
+    }
   }
 
   try {

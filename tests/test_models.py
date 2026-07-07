@@ -414,6 +414,41 @@ async def test_stream_model_sends_explicit_max_tokens(client):
     assert seen["max_tokens"] == MAX_TOKENS
 
 
+from bench.models import PROVIDER_PREFS
+
+
+@respx.mock
+async def test_run_model_sends_provider_prefs(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["provider"] == PROVIDER_PREFS
+
+
+@respx.mock
+async def test_stream_model_sends_provider_prefs(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert seen["provider"] == PROVIDER_PREFS
+
+
 from bench.models import COMPLETION_READ_TIMEOUT_S, STREAM_READ_TIMEOUT_S
 
 

@@ -46,6 +46,19 @@ once at startup. If that fetch fails (offline, outage), the bench
 still boots and runs; cost just shows as unavailable for the
 session.
 
+## Provider routing
+
+Every request asks OpenRouter to sort providers by throughput
+instead of its default price-weighted routing. Open-weight models
+are served by many hosts, and the default routes them to the
+cheapest, which in practice are the flakiest and often serve
+quantized weights. Sorting by throughput biases each run to the
+serious hosts at somewhat higher cost per run. The tradeoff is
+deliberate: it changes who serves the model, never what the model
+does, and because quantization varies by host it also stabilizes
+what is actually being measured. The preference lives in
+`PROVIDER_PREFS` in `bench/models.py`.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
@@ -82,6 +95,18 @@ browser disconnects mid-stream (tab closed, network drop), the server
 still persists the partial run with a "stream aborted before
 completion" error, so nothing the model already produced is lost from
 history.
+
+When a live column errors (timeout, provider failure, bad model id),
+its header gains a rerun control. Clicking it reruns that one model
+with the same prompt and the same group, streaming into the same
+column through the normal path; other columns are untouched, and the
+control is disabled while its rerun is in flight. The failed run
+stays in history exactly as it happened: failures are data, and the
+rerun persists as a second run in the same comparison group, so
+History shows both. There are no automatic retries anywhere; a human
+clicking is the boundary between recovering from a transient failure
+and hiding one. Historical replays never show the control, since
+rerunning history would be a new experiment wearing an old label.
 
 Other endpoints:
 
@@ -158,3 +183,9 @@ changes:
   remove it, then reload the page and confirm the lineup survived.
 - Boot with wifi off: the search row says the catalog is unavailable
   and the exact-id input still adds a model to the lineup.
+- Rerun: force an error (bad model id via the exact-id path) and
+  confirm only that column grows a rerun control, then rerun a real
+  errored column: it resets to loading and streams the retry while
+  the other columns sit untouched, and History shows both the
+  failure and the successful rerun in one group. Columns replayed
+  from History must never show the control.
