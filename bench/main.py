@@ -20,6 +20,7 @@ from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
     fetch_catalog,
+    keepalive_socket_options,
     run_model,
     stream_model,
 )
@@ -159,9 +160,17 @@ async def lifespan(app: FastAPI):
             "OPENROUTER_API_KEY is not set. Export it before starting the app."
         )
     # One shared client: connection pooling across the fan-out, and the
-    # auth header lives in exactly one place.
+    # auth header lives in exactly one place. The explicit transport
+    # exists to carry TCP keepalive options: extended-budget streams go
+    # silent for minutes during hidden reasoning, NAT idle timers cull
+    # flows that move no bytes, and the resulting deaths wore mixed
+    # ReadError and stall signatures. OS-level probes keep those quiet
+    # flows alive; see keepalive_socket_options in models.py.
     app.state.client = httpx.AsyncClient(
-        headers={"Authorization": f"Bearer {api_key}"}
+        headers={"Authorization": f"Bearer {api_key}"},
+        transport=httpx.AsyncHTTPTransport(
+            socket_options=keepalive_socket_options()
+        ),
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
     # One catalog snapshot per boot feeds both pricing and the model

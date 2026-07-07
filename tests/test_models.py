@@ -444,6 +444,42 @@ async def test_run_model_sends_and_echoes_explicit_max_tokens(client):
     assert result["max_tokens"] == 32000
 
 
+import socket
+
+from bench.models import (
+    KEEPALIVE_IDLE_S,
+    KEEPALIVE_INTERVAL_S,
+    keepalive_socket_options,
+)
+
+
+def test_keepalive_options_enable_probes_for_this_platform():
+    opts = keepalive_socket_options()
+
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in opts
+
+    # Exactly one idle-time option, using whichever constant this
+    # platform names it by (TCP_KEEPIDLE on Linux, TCP_KEEPALIVE on
+    # macOS). Both major platforms name one, so zero would mean the
+    # probes silently never start.
+    idle_consts = {
+        getattr(socket, name)
+        for name in ("TCP_KEEPIDLE", "TCP_KEEPALIVE")
+        if hasattr(socket, name)
+    }
+    idle_opts = [
+        o for o in opts if o[0] == socket.IPPROTO_TCP and o[1] in idle_consts
+    ]
+    assert len(idle_opts) == 1
+    assert idle_opts[0][2] == KEEPALIVE_IDLE_S
+
+    assert (
+        socket.IPPROTO_TCP,
+        socket.TCP_KEEPINTVL,
+        KEEPALIVE_INTERVAL_S,
+    ) in opts
+
+
 from bench.models import PROVIDER_PREFS
 
 

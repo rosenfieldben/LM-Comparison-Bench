@@ -1,6 +1,7 @@
 """Core model-calling logic. Pure functions over an injected httpx client."""
 
 import json
+import socket
 import time
 
 import httpx
@@ -56,6 +57,38 @@ PRICES_TIMEOUT_S = 10.0
 # and since quantization varies by host, it also stabilizes WHAT is
 # being measured, not just how reliably it answers.
 PROVIDER_PREFS = {"sort": "throughput"}
+
+# Extended-budget runs go silent for minutes while providers reason,
+# and NAT/middlebox idle timers cull flows that move no bytes. That
+# culling surfaced as sequential failures with mixed ReadError and
+# stall signatures partway through a lineup. OpenRouter's SSE comment
+# keepalives evidently do not flow reliably during deep provider-side
+# reasoning, so the fix sits below the application layer: OS-level TCP
+# probes keep the flow visibly alive when no application bytes move.
+# 30s stays comfortably under every common NAT idle window while
+# adding negligible traffic.
+KEEPALIVE_IDLE_S = 30
+KEEPALIVE_INTERVAL_S = 30
+
+
+def keepalive_socket_options() -> list[tuple[int, int, int]]:
+    """Socket options enabling TCP keepalive on the current platform.
+
+    The idle-before-first-probe constant is platform-named: TCP_KEEPIDLE
+    on Linux, TCP_KEEPALIVE on macOS. This repo runs on both a Mac and
+    Linux sandboxes, so hasattr picks whichever exists rather than
+    hardcoding one and silently doing nothing on the other.
+    """
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_IDLE_S))
+    elif hasattr(socket, "TCP_KEEPALIVE"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, KEEPALIVE_IDLE_S))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        options.append(
+            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_S)
+        )
+    return options
 
 
 async def fetch_catalog(client: httpx.AsyncClient) -> dict:

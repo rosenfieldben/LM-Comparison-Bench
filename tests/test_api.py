@@ -590,6 +590,35 @@ def test_models_endpoint_returns_catalog_with_pricing(client):
     assert bare["prompt_price"] is None
 
 
+def test_lifespan_client_transport_carries_keepalive_options(monkeypatch, tmp_path):
+    from bench.models import keepalive_socket_options
+
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+
+    # Spy on the transport constructor rather than digging through
+    # private pool attributes: the contract is what the lifespan asked
+    # for, not where httpcore happens to store it this release.
+    captured = {}
+    real_transport = httpx.AsyncHTTPTransport
+
+    def spying_transport(*args, **kwargs):
+        captured.update(kwargs)
+        return real_transport(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncHTTPTransport", spying_transport)
+
+    with TestClient(app):
+        pass
+
+    assert captured["socket_options"] == keepalive_socket_options()
+
+
 def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
