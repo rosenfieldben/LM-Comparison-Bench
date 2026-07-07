@@ -12,11 +12,8 @@ MODELS_URL = "https://openrouter.ai/api/v1/models"
 # Reaching OpenRouter should be fast; a slow connect is a real failure.
 CONNECT_TIMEOUT_S = 10.0
 
-# Max silent gap between chunks on the streaming path. Reasoning models
-# think silently well past 30s before the first visible delta, so the
-# gap must accommodate hidden reasoning; a silence longer than two
-# minutes still means something is wrong.
-STREAM_READ_TIMEOUT_S = 120.0
+# Extended-budget reasoning can legitimately sit silent for minutes between visible bytes; five # minutes of true wire silence is failure by any standard.
+STREAM_READ_TIMEOUT_S = 300.0
 
 # Non-streaming path, where the single read covers the entire
 # completion including all reasoning time, so it gets more headroom
