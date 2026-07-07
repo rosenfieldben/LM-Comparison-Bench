@@ -39,6 +39,15 @@
     cursor: pointer;
   }
   #run:disabled { opacity: 0.45; cursor: default; }
+  #run-bar { display: flex; gap: 0.6rem; align-items: center; }
+  #budget {
+    font: inherit;
+    font-size: 0.9rem;
+    padding: 0.3rem 0.6rem;
+    border: 1px solid #aaa;
+    border-radius: 6px;
+    background: #fff;
+  }
   #results {
     display: flex;
     gap: 0.8rem;
@@ -251,7 +260,13 @@
   <div id="search-msg"></div>
   <div id="model-matches"></div>
 </div>
-<button id="run" disabled>Run</button>
+<div id="run-bar">
+  <button id="run" disabled>Run</button>
+  <select id="budget" title="Completion token budget for every model in the run">
+    <option value="standard">standard</option>
+    <option value="extended">extended budget</option>
+  </select>
+</div>
 <div id="run-label"></div>
 <div id="results"></div>
 <div id="diff-panel" hidden>
@@ -300,6 +315,9 @@ function saveLineup() {
 const promptEl = document.getElementById("prompt");
 const modelsEl = document.getElementById("models");
 const runBtn = document.getElementById("run");
+// Deliberately per-session, never persisted: extended costs real
+// money, so the safe default must reassert itself on the next visit.
+const budgetSel = document.getElementById("budget");
 const resultsEl = document.getElementById("results");
 const runLabelEl = document.getElementById("run-label");
 const savedSelect = document.getElementById("saved-prompts");
@@ -647,7 +665,7 @@ function resetColumn(ui) {
 // so History keeps both the failure and the retry. Only live runs
 // get the control, since rerunning history would be a new experiment
 // wearing an old label.
-function addRerun(ui, prompt, model, promptId, groupId) {
+function addRerun(ui, prompt, model, promptId, groupId, budget) {
   const btn = document.createElement("button");
   btn.type = "button";
   btn.className = "rerun-btn";
@@ -658,7 +676,9 @@ function addRerun(ui, prompt, model, promptId, groupId) {
     // double click cannot start two reruns of the same column.
     btn.disabled = true;
     resetColumn(ui);
-    runOne(prompt, model, promptId, groupId, ui);
+    // Same budget as the run being retried, not the current control
+    // value: a rerun is a second sample of the same experiment.
+    runOne(prompt, model, promptId, groupId, budget, ui);
   });
   ui.header.append(btn);
 }
@@ -695,6 +715,12 @@ function applyError(ui, error) {
 function fillColumn(ui, result, sourceLabel) {
   ui.body.classList.remove("loading");
   addBadges(ui, result);
+  // History replay only, never live columns: two attempts at
+  // different budgets are different experiments, and the replay must
+  // say which is which. Pre-budget rows carry null and show nothing.
+  if (result.max_tokens != null) {
+    ui.meta.append(badge("budget " + result.max_tokens));
+  }
   // textContent on purpose: model output is untrusted and must never be
   // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
   ui.body.textContent = result.response_text != null ? result.response_text : "";
@@ -863,7 +889,7 @@ function registerDiffable(ui, result, sourceLabel) {
 
 document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
 
-async function runOne(prompt, model, promptId, groupId, ui) {
+async function runOne(prompt, model, promptId, groupId, budget, ui) {
   // Deltas append to a dedicated text node: appendData is a pure text
   // API, so the no-HTML injection rule holds for every chunk, and the
   // node survives into the error state if the stream dies partway.
@@ -886,12 +912,24 @@ async function runOne(prompt, model, promptId, groupId, ui) {
     ui.body.classList.remove("loading");
     if (textNode === null) ui.body.textContent = "";
     addBadges(ui, result);
-    applyError(ui, result.error);
+    // Presentation only, never persisted: the stored error stays the
+    // server's exact words. The extended budget is the one knob the
+    // user can turn when reasoning burned the whole standard budget,
+    // so say so right where the failure is reported.
+    let shownError = result.error;
+    if (
+      shownError != null &&
+      budget === "standard" &&
+      shownError.includes("finish_reason: length")
+    ) {
+      shownError += "; try extended budget";
+    }
+    applyError(ui, shownError);
     registerDiffable(ui, result, model + " (live)");
     // Only this streaming path offers a rerun; historical replays go
     // through fillColumn and never get one.
     if (result.error != null) {
-      addRerun(ui, prompt, model, promptId, groupId);
+      addRerun(ui, prompt, model, promptId, groupId, budget);
     }
   }
 
@@ -904,6 +942,7 @@ async function runOne(prompt, model, promptId, groupId, ui) {
         model: model,
         prompt_id: promptId,
         group_id: groupId,
+        budget: budget,
       }),
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
@@ -944,6 +983,7 @@ async function runOne(prompt, model, promptId, groupId, ui) {
 runBtn.addEventListener("click", async () => {
   const prompt = promptEl.value;
   const promptId = selectedPromptId;
+  const budget = budgetSel.value;
   const models = checkedModels();
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
@@ -969,7 +1009,9 @@ runBtn.addEventListener("click", async () => {
     // Deliberately swallowed; see above.
   }
   await Promise.allSettled(
-    models.map((model, i) => runOne(prompt, model, promptId, groupId, columns[i]))
+    models.map((model, i) =>
+      runOne(prompt, model, promptId, groupId, budget, columns[i])
+    )
   );
   running = false;
   updateRunState();

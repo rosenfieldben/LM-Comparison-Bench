@@ -46,6 +46,26 @@ once at startup. If that fetch fails (offline, outage), the bench
 still boots and runs; cost just shows as unavailable for the
 session.
 
+## Token budgets
+
+Every run carries one of two completion budgets, picked next to the
+Run button: standard (16384 tokens) or extended (65536). Reasoning
+models spend the budget on hidden thinking before any visible
+answer, so a hard problem can empty the standard budget and come
+back as "finish_reason: length"; extended exists for exactly that
+case, and the error message says so when it applies. The choice is
+per session and resets to standard on the next visit. The requested
+budget is clamped per model to the completion cap OpenRouter
+publishes, so asking for extended from a model capped at 32k sends
+32000 instead of drawing a hard 400. An extended run can cost up to
+four times as much as a standard one, because the budget is the
+ceiling on billable completion tokens. History records the effective
+post-clamp budget each run was sent with (shown as a "budget" badge
+on replayed columns; older runs predate the field and show none),
+and reruns reuse the budget of the run they retry. The API accepts
+`"budget": "standard" | "extended"` on `/compare` and
+`/compare/stream`; anything else is a 422.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
@@ -83,7 +103,8 @@ returns a `run_id`.
 
 The browser UI streams responses token by token via
 `POST /compare/stream` with `{"prompt": ..., "model": ...}` (one
-model per request) plus optional `prompt_id` and `group_id`. The
+model per request) plus optional `prompt_id`, `group_id` and
+`budget`. The
 response is SSE-formatted (`data: {...}` lines): `delta` events carry
 text chunks, then one `done` event carries the full result and its
 `run_id`. Streamed results include `ttft_ms` (time to first token),
@@ -189,3 +210,9 @@ changes:
   the other columns sit untouched, and History shows both the
   failure and the successful rerun in one group. Columns replayed
   from History must never show the control.
+- Budget: run a hard puzzle that empties the standard budget; the
+  errored column's message ends with "try extended budget". Switch
+  the control to extended and run again: the models now answer or
+  prove they need even more, and each attempt's History replay shows
+  the budget badge it actually ran with. Reload the page and confirm
+  the control is back on standard.

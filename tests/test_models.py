@@ -348,9 +348,11 @@ async def test_fetch_catalog_degrades_missing_fields_to_none(client):
                     "name": "Full Model",
                     "context_length": 32000,
                     "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                    "top_provider": {"max_completion_tokens": 32000},
                 },
                 {"id": "b/bare"},
                 {"id": "c/badprice", "name": "Bad Price", "pricing": {"prompt": "free"}},
+                {"id": "d/badcap", "top_provider": {"max_completion_tokens": "lots"}},
                 {"no_id": True},
             ]
         }
@@ -359,15 +361,25 @@ async def test_fetch_catalog_degrades_missing_fields_to_none(client):
     catalog = await fetch_catalog(client)
 
     assert catalog["fetched"] is True
-    assert [m["id"] for m in catalog["models"]] == ["a/full", "b/bare", "c/badprice"]
-    full, bare, badprice = catalog["models"]
+    assert [m["id"] for m in catalog["models"]] == [
+        "a/full",
+        "b/bare",
+        "c/badprice",
+        "d/badcap",
+    ]
+    full, bare, badprice, badcap = catalog["models"]
     assert full["context_length"] == 32000
     assert full["prompt_price"] == 1e-06
+    assert full["max_completion_tokens"] == 32000
     assert bare["name"] is None
     assert bare["context_length"] is None
     assert bare["prompt_price"] is None
+    assert bare["max_completion_tokens"] is None
     assert badprice["name"] == "Bad Price"
     assert badprice["prompt_price"] is None
+    # A non-integer published cap degrades to None instead of poisoning
+    # the clamp with a string.
+    assert badcap["max_completion_tokens"] is None
     # The price map only carries fully priced entries.
     assert set(catalog["prices"]) == {"a/full"}
 
@@ -379,11 +391,11 @@ async def test_fetch_catalog_failure_reports_not_fetched(client):
     assert catalog == {"fetched": False, "models": [], "prices": {}}
 
 
-from bench.models import MAX_TOKENS
+from bench.models import BUDGET_STANDARD
 
 
 @respx.mock
-async def test_run_model_sends_explicit_max_tokens(client):
+async def test_run_model_defaults_to_standard_budget(client):
     seen = {}
 
     def route(request: httpx.Request) -> httpx.Response:
@@ -392,13 +404,14 @@ async def test_run_model_sends_explicit_max_tokens(client):
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
-    await run_model("hi", "deepseek/deepseek-chat", client)
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
 
-    assert seen["max_tokens"] == MAX_TOKENS
+    assert seen["max_tokens"] == BUDGET_STANDARD
+    assert result["max_tokens"] == BUDGET_STANDARD
 
 
 @respx.mock
-async def test_stream_model_sends_explicit_max_tokens(client):
+async def test_stream_model_defaults_to_standard_budget(client):
     seen = {}
 
     def route(request: httpx.Request) -> httpx.Response:
@@ -409,9 +422,26 @@ async def test_stream_model_sends_explicit_max_tokens(client):
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
-    await collect("hi", "deepseek/deepseek-chat", client)
+    events = await collect("hi", "deepseek/deepseek-chat", client)
 
-    assert seen["max_tokens"] == MAX_TOKENS
+    assert seen["max_tokens"] == BUDGET_STANDARD
+    assert events[-1]["result"]["max_tokens"] == BUDGET_STANDARD
+
+
+@respx.mock
+async def test_run_model_sends_and_echoes_explicit_max_tokens(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client, max_tokens=32000)
+
+    assert seen["max_tokens"] == 32000
+    assert result["max_tokens"] == 32000
 
 
 from bench.models import PROVIDER_PREFS

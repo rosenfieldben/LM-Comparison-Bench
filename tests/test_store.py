@@ -212,6 +212,73 @@ CREATE TABLE results (
 """
 
 
+SCHEMA_53 = """
+CREATE TABLE prompts (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
+    group_id INTEGER NULL REFERENCES groups(id),
+    prompt_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE results (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model TEXT NOT NULL,
+    response_text TEXT,
+    latency_ms REAL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    error TEXT,
+    cost_usd REAL,
+    ttft_ms REAL
+);
+"""
+
+
+def test_connect_upgrades_53_schema_with_max_tokens():
+    uri = "file:pre_budget_upgrade?mode=memory&cache=shared"
+    keeper = sqlite3.connect(uri, uri=True)
+    keeper.executescript(SCHEMA_53)
+    keeper.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES (?, ?)",
+        ("5.3-era prompt", "2026-07-07T00:00:00+00:00"),
+    )
+    keeper.execute(
+        "INSERT INTO results (run_id, model, response_text, ttft_ms)"
+        " VALUES (1, 'a/model', 'hi', 312.5)"
+    )
+    keeper.commit()
+
+    conn = store.connect(uri)
+    try:
+        result_cols = {row[1] for row in conn.execute("PRAGMA table_info(results)")}
+        assert "max_tokens" in result_cols
+
+        # Pre-budget rows survive with an honestly unknown budget, not
+        # a backfilled guess.
+        run = store.get_run(conn, 1)
+        assert run["results"][0]["ttft_ms"] == 312.5
+        assert run["results"][0]["max_tokens"] is None
+
+        # Budget-carrying results persist on the upgraded database.
+        run_id = store.save_run(conn, "budgeted", [make_result(max_tokens=16384)])
+        saved = store.get_run(conn, run_id)
+        assert saved["results"][0]["max_tokens"] == 16384
+    finally:
+        conn.close()
+        keeper.close()
+
+
 def test_connect_upgrades_4a_schema_with_ttft():
     uri = "file:pre_streaming_upgrade?mode=memory&cache=shared"
     keeper = sqlite3.connect(uri, uri=True)
