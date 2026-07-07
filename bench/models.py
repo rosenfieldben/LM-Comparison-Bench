@@ -43,6 +43,15 @@ MAX_TOKENS = 16384
 # is the only thing a failed fetch costs.
 PRICES_TIMEOUT_S = 10.0
 
+# OpenRouter's default routing is price-weighted, which sends
+# open-weight models to their cheapest hosts, and the cheapest hosts
+# are the flakiest. Sorting by throughput biases routing to the
+# serious hosts at somewhat higher cost. Unlike a reasoning parameter
+# this does not alter what the model itself does, only who serves it;
+# and since quantization varies by host, it also stabilizes WHAT is
+# being measured, not just how reliably it answers.
+PROVIDER_PREFS = {"sort": "throughput"}
+
 
 async def fetch_catalog(client: httpx.AsyncClient) -> dict:
     """One boot-time snapshot of OpenRouter's model catalog.
@@ -149,6 +158,7 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
+        "provider": PROVIDER_PREFS,
     }
 
     start = time.perf_counter()
@@ -232,6 +242,7 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": MAX_TOKENS,
+        "provider": PROVIDER_PREFS,
         "stream": True,
         # Without this the final chunk carries no usage block and token
         # counts (and therefore cost) would be lost on streamed runs.
