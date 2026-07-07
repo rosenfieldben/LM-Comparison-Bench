@@ -228,7 +228,7 @@ async def test_stream_stall_yields_timeout_error(client):
 
     result = events[-1]["result"]
     assert result["response_text"] == "Hel"
-    assert result["error"] == "stream stalled: no data for 120s"
+    assert result["error"] == "stream stalled: no data for 300s"
 
 
 @respx.mock
