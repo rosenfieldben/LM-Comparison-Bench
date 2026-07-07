@@ -16,9 +16,20 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 from bench import store
-from bench.models import fetch_catalog, run_model, stream_model
+from bench.models import (
+    BUDGET_EXTENDED,
+    BUDGET_STANDARD,
+    fetch_catalog,
+    run_model,
+    stream_model,
+)
 
 logger = logging.getLogger(__name__)
+
+# Budget names resolve to numbers here at the boundary; internals pass
+# plain integers. Pydantic's Literal on the request models is what
+# rejects unknown names, so this map never sees one.
+BUDGET_TOKENS = {"standard": BUDGET_STANDARD, "extended": BUDGET_EXTENDED}
 
 
 class CompareRequest(BaseModel):
@@ -32,6 +43,9 @@ class CompareRequest(BaseModel):
     # Optional grouping id so the N per-model requests of one comparison
     # land as one history entry.
     group_id: int | None = None
+    # Named tiers, not a free integer: two regimes of use exist and a
+    # free field invites typos with dollar consequences.
+    budget: Literal["standard", "extended"] = "standard"
 
 
 class ModelResult(BaseModel):
@@ -45,6 +59,9 @@ class ModelResult(BaseModel):
     # Time to first content delta. Only the streaming path measures it;
     # the default keeps /compare results (which never carry the key) valid.
     ttft_ms: float | None = None
+    # The effective (post-clamp) completion budget the request was sent
+    # with. Defaults None so pre-budget history rows stay valid.
+    max_tokens: int | None = None
 
 
 class StreamCompareRequest(BaseModel):
@@ -54,6 +71,7 @@ class StreamCompareRequest(BaseModel):
     model: str = Field(min_length=1)
     prompt_id: int | None = None
     group_id: int | None = None
+    budget: Literal["standard", "extended"] = "standard"
 
 
 class CompareResponse(BaseModel):
@@ -151,6 +169,14 @@ async def lifespan(app: FastAPI):
     # renders as unavailable and the picker falls back to exact ids.
     app.state.catalog = await fetch_catalog(app.state.client)
     app.state.prices = app.state.catalog["prices"]
+    # Per-model completion caps, derived once per boot so the budget
+    # clamp is a dict lookup per request. Only published integer caps
+    # participate; an unknown cap means no clamp, same as offline.
+    app.state.completion_limits = {
+        m["id"]: m["max_completion_tokens"]
+        for m in app.state.catalog["models"]
+        if isinstance(m.get("max_completion_tokens"), int)
+    }
     if not app.state.catalog["fetched"]:
         logger.warning(
             "OpenRouter catalog fetch failed; cost display and model "
@@ -191,6 +217,18 @@ def cost_usd(result: dict, prices: dict) -> float | None:
     )
 
 
+def effective_budget(budget: str, model: str) -> int:
+    """The requested budget clamped to the model's published completion
+    cap. Sending a budget above a model's cap is a hard 400 from some
+    providers; clamping turns that failure into the best the model can
+    do. Lives here rather than in models.py because the boot catalog is
+    app state.
+    """
+    requested = BUDGET_TOKENS[budget]
+    limit = app.state.completion_limits.get(model)
+    return min(requested, limit) if limit is not None else requested
+
+
 def resolve_links(db, prompt_id: int | None, group_id: int | None):
     """Degrade stale prompt or group links to None instead of erroring.
 
@@ -211,7 +249,15 @@ async def compare(request: CompareRequest) -> dict:
     # result columns by position. run_model never raises, so no
     # return_exceptions handling is needed here.
     results = await asyncio.gather(
-        *(run_model(request.prompt, m, app.state.client) for m in request.models)
+        *(
+            run_model(
+                request.prompt,
+                m,
+                app.state.client,
+                max_tokens=effective_budget(request.budget, m),
+            )
+            for m in request.models
+        )
     )
     # Cost is a boundary concern: run_model stays a pure OpenRouter call
     # and the price snapshot lives on app.state. Computed before save_run
@@ -229,6 +275,8 @@ async def compare(request: CompareRequest) -> dict:
 
 @app.post("/compare/stream")
 async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
+    max_tokens = effective_budget(request.budget, request.model)
+
     async def events():
         # Server-side observation of the stream, enough to reconstruct
         # a result if the client disconnects before the done event: a
@@ -239,7 +287,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         handled = False
         try:
             async for event in stream_model(
-                request.prompt, request.model, app.state.client
+                request.prompt, request.model, app.state.client, max_tokens=max_tokens
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -283,6 +331,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     "error": "stream aborted before completion",
                     "cost_usd": None,
                     "ttft_ms": first_delta_ms,
+                    "max_tokens": max_tokens,
                 }
                 try:
                     prompt_id, group_id = resolve_links(

@@ -36,6 +36,16 @@ TEST_CATALOG = {
             "prompt_price": None,
             "completion_price": None,
         },
+        # Publishes a completion cap below the extended budget, so the
+        # per-model clamp has something to bite on.
+        {
+            "id": "model/capped",
+            "name": "Capped",
+            "context_length": 64000,
+            "prompt_price": None,
+            "completion_price": None,
+            "max_completion_tokens": 32000,
+        },
     ],
     "prices": TEST_PRICES,
 }
@@ -366,6 +376,27 @@ def test_stream_endpoint_grouped_run_lands_in_group(client):
 
 
 @respx.mock
+def test_stream_endpoint_extended_budget_clamps_and_persists(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    events = stream_events(
+        client, {"prompt": "hi", "model": "model/capped", "budget": "extended"}
+    )
+
+    assert seen["max_tokens"] == 32000
+    done = events[-1]
+    assert done["result"]["max_tokens"] == 32000
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    assert detail["results"][0]["max_tokens"] == 32000
+
+
+@respx.mock
 def test_stream_endpoint_errored_stream_still_persists(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
@@ -453,6 +484,92 @@ def test_stream_persistence_failure_degrades_to_null_run_id(client, monkeypatch)
     assert done["type"] == "done"
     assert done["run_id"] is None
     assert done["result"]["response_text"] == "Hello"
+
+
+from bench.models import BUDGET_EXTENDED, BUDGET_STANDARD
+
+
+@respx.mock
+def test_compare_default_budget_sends_standard(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    assert seen["max_tokens"] == BUDGET_STANDARD
+    assert resp.json()["results"][0]["max_tokens"] == BUDGET_STANDARD
+
+
+@respx.mock
+def test_compare_extended_budget_sends_extended(client):
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(200, json=FIXTURE)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    resp = client.post(
+        "/compare",
+        json={"prompt": "hi", "models": ["model/alpha"], "budget": "extended"},
+    )
+
+    assert seen["max_tokens"] == BUDGET_EXTENDED
+    assert resp.json()["results"][0]["max_tokens"] == BUDGET_EXTENDED
+
+
+@respx.mock
+def test_extended_budget_clamps_to_model_cap_and_persists_effective(client):
+    seen_by_model = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen_by_model[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/capped", "model/alpha"],
+            "budget": "extended",
+        },
+    )
+
+    # The clamp is per model within one request: capped gets its
+    # published limit, uncapped gets the full extended budget.
+    assert seen_by_model == {
+        "model/capped": 32000,
+        "model/alpha": BUDGET_EXTENDED,
+    }
+    capped, alpha = resp.json()["results"]
+    assert capped["max_tokens"] == 32000
+    assert alpha["max_tokens"] == BUDGET_EXTENDED
+
+    # History stores the effective value actually sent, not the name.
+    detail = client.get(f"/runs/{resp.json()['run_id']}").json()
+    assert [r["max_tokens"] for r in detail["results"]] == [32000, BUDGET_EXTENDED]
+
+
+def test_unknown_budget_string_is_422(client):
+    resp = client.post(
+        "/compare",
+        json={"prompt": "hi", "models": ["model/alpha"], "budget": "unlimited"},
+    )
+    assert resp.status_code == 422
+    resp = client.post(
+        "/compare/stream",
+        json={"prompt": "hi", "model": "model/alpha", "budget": "1000000"},
+    )
+    assert resp.status_code == 422
 
 
 def test_models_endpoint_returns_catalog_with_pricing(client):

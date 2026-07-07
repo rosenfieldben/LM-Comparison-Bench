@@ -34,10 +34,15 @@ COMPLETION_TIMEOUT = httpx.Timeout(
 
 # Reasoning models spend thousands of hidden tokens before visible
 # output and max_tokens covers both, so the budget must dwarf a
-# plausible reasoning burn. 16384 keeps worst-case cost per call
-# around a dollar on the priciest models while ending the
-# empty-response truncations that 4096 caused.
-MAX_TOKENS = 16384
+# plausible reasoning burn. Two named tiers instead of a free integer:
+# everyday prompts and hard problems are the two real regimes of use,
+# a free field invites typos with dollar consequences, and history
+# stays legible when every run carries one of two labels. Standard
+# keeps worst-case cost per call around a dollar on the priciest
+# models; extended exists for hard problems where reasoning empties
+# the standard budget before any visible answer appears.
+BUDGET_STANDARD = 16384
+BUDGET_EXTENDED = 65536
 
 # Boot must not hang on pricing; the bench works offline, cost display
 # is the only thing a failed fetch costs.
@@ -57,10 +62,11 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict:
     """One boot-time snapshot of OpenRouter's model catalog.
 
     Returns {"fetched": bool, "models": [...], "prices": {...}} where
-    models entries carry id, name, context_length, prompt_price and
-    completion_price (missing fields degrade to None, never breaking
-    the whole catalog) and prices is the {model_id: {prompt,
-    completion}} map cost_usd consumes. One upstream call feeds both.
+    models entries carry id, name, context_length, prompt_price,
+    completion_price and max_completion_tokens (missing fields degrade
+    to None, never breaking the whole catalog) and prices is the
+    {model_id: {prompt, completion}} map cost_usd consumes. One
+    upstream call feeds both.
     Never raises: this runs at startup and a catalog outage must not
     stop the bench from booting; fetched=false is how the frontend
     tells an offline boot from an empty catalog.
@@ -91,7 +97,16 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict:
             ),
             "prompt_price": None,
             "completion_price": None,
+            "max_completion_tokens": None,
         }
+        # OpenRouter publishes a per-model completion cap under
+        # top_provider where known. The budget clamp needs it: sending
+        # a budget above the cap is a hard 400 from some providers.
+        top = entry.get("top_provider")
+        if isinstance(top, dict) and isinstance(
+            top.get("max_completion_tokens"), int
+        ):
+            model["max_completion_tokens"] = top["max_completion_tokens"]
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
         # entry or the whole map.
@@ -139,12 +154,21 @@ def _flatten_content(content) -> str | None:
     return None
 
 
-async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
+async def run_model(
+    prompt: str,
+    model: str,
+    client: httpx.AsyncClient,
+    max_tokens: int = BUDGET_STANDARD,
+) -> dict:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
     Never raises. A comparison run fans out to several models and one
     failure must not sink the others, so every error path collapses into
     the error field of an otherwise well-formed result.
+
+    The result echoes max_tokens because a truncated answer at 16k and
+    one at 65k are different experiments; persistence must record which
+    budget was actually sent, clamping included.
     """
     result = {
         "model": model,
@@ -153,11 +177,12 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
         "prompt_tokens": None,
         "completion_tokens": None,
         "error": None,
+        "max_tokens": max_tokens,
     }
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "provider": PROVIDER_PREFS,
     }
 
@@ -213,7 +238,12 @@ async def run_model(prompt: str, model: str, client: httpx.AsyncClient) -> dict:
     return result
 
 
-async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
+async def stream_model(
+    prompt: str,
+    model: str,
+    client: httpx.AsyncClient,
+    max_tokens: int = BUDGET_STANDARD,
+):
     """Stream one chat completion, yielding delta and done event dicts.
 
     Yields {"type": "delta", "text": chunk} per content delta, then
@@ -237,11 +267,12 @@ async def stream_model(prompt: str, model: str, client: httpx.AsyncClient):
         "completion_tokens": None,
         "error": None,
         "ttft_ms": None,
+        "max_tokens": max_tokens,
     }
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens,
         "provider": PROVIDER_PREFS,
         "stream": True,
         # Without this the final chunk carries no usage block and token

@@ -40,7 +40,8 @@ CREATE TABLE IF NOT EXISTS results (
     completion_tokens INTEGER,
     error TEXT,
     cost_usd REAL,
-    ttft_ms REAL
+    ttft_ms REAL,
+    max_tokens INTEGER
 );
 """
 
@@ -51,6 +52,7 @@ MIGRATIONS = [
     ("runs", "group_id", "INTEGER NULL REFERENCES groups(id)"),
     ("results", "cost_usd", "REAL"),
     ("results", "ttft_ms", "REAL"),
+    ("results", "max_tokens", "INTEGER"),
 ]
 
 
@@ -148,8 +150,8 @@ def save_run(
         conn.executemany(
             """INSERT INTO results
                (run_id, model, response_text, latency_ms, prompt_tokens,
-                completion_tokens, error, cost_usd, ttft_ms)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                completion_tokens, error, cost_usd, ttft_ms, max_tokens)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -164,6 +166,7 @@ def save_run(
                     # carry no cost_usd) persist as NULL.
                     r.get("cost_usd"),
                     r.get("ttft_ms"),
+                    r.get("max_tokens"),
                 )
                 for r in results
             ],
@@ -243,7 +246,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
         return None
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
-                  completion_tokens, error, cost_usd, ttft_ms
+                  completion_tokens, error, cost_usd, ttft_ms, max_tokens
            FROM results WHERE run_id = ? ORDER BY id""",
         (run_id,),
     ).fetchall()
