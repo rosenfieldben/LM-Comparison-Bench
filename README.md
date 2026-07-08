@@ -1,9 +1,10 @@
 # LM Comparison Bench
 
 Send one prompt to multiple models via OpenRouter and compare the
-results side by side in the browser. Prompts can be saved as a
-reusable library and every run lands in SQLite history for later
-replay. No streaming, no cost display yet.
+results side by side in the browser. Responses stream in token by
+token, and every result card carries latency, time to first token,
+token counts and cost. Prompts can be saved as a reusable library
+and every run lands in SQLite history for later replay.
 
 ## Daily use
 
@@ -46,6 +47,39 @@ once at startup. If that fetch fails (offline, outage), the bench
 still boots and runs; cost just shows as unavailable for the
 session.
 
+## Interface
+
+The page is styled as a measurement instrument: dark, dense, calm,
+with monospace for everything measured (responses, model ids,
+badges, costs). The OS color scheme picks between the dark and
+light themes; there is no toggle. All colors, spacing steps, radii
+and type sizes live as CSS custom properties in one `:root` block
+at the top of `static/index.html`, so the next visual change is a
+token edit, not a hunt through rules.
+
+Controls sit in one deck above the results, three rows: the prompt
+row (auto-growing monospace textarea plus the saved-prompt
+library), the lineup row (model chips with per-chip remove, All and
+None selection, and the Add model search), and the run row (the Run
+button, the budget select, and a column density toggle). Density
+has two steps, comfortable and compact; compact tightens card
+padding and drops the response font a step for racing many models
+side by side. Like the budget, density is per session and resets on
+the next visit.
+
+Each result card shows its state twice, as a colored left edge and
+a text label: working, done, or error. A running card counts
+seconds ("thinking, 47s", one shared timer for all cards) so the
+long silences of extended-budget reasoning read as alive rather
+than hung; the counter disappears at the first token. Finished
+cards with text gain per-card controls: copy (raw response text to
+the clipboard, with a brief "copied" confirmation), fold (collapse
+to a six line preview, "show all" to reverse), and diff; errored
+live cards add rerun. History renders as a table of rows
+(timestamp, prompt, model chips) with a client-side filter that
+matches prompt substrings and model ids, and loads only when
+expanded.
+
 ## Token budgets
 
 Every run carries one of two completion budgets, picked next to the
@@ -84,7 +118,7 @@ never answers, so a malicious page cannot fire "simple" text/plain
 POSTs at /compare and spend money. Bodyless POSTs (like /groups) and
 everything curl or the bundled frontend sends pass unchanged. To
 serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
-in `bench/main.py` — and put real authentication in front of it
+in `bench/main.py`, and put real authentication in front of it
 first.
 
 ## Provider routing
@@ -206,11 +240,12 @@ verification, run `uvicorn bench.main:app --reload` so index.html
 edits are picked up without restarts. Verify by eyeball after UI
 changes:
 
-- Run with 2 models checked: both columns show a loading state, then
-  fill in independently, fastest first.
+- Run with 2 models checked: both cards show the working state with
+  a counting "thinking, Ns" indicator, then fill in independently,
+  fastest first, flipping to the done label.
 - Add an intentionally bad model id via the picker's exact-id path
-  and run it: that column shows the error state (red tint), others
-  unaffected.
+  and run it: that card shows the error state (red left edge plus
+  the error label), others unaffected.
 - Run with a prompt that produces multi-line output (e.g. "write a
   haiku"): line breaks survive in the response column.
 - Save a prompt, reload the page, pick it from the dropdown, replay
@@ -247,3 +282,24 @@ changes:
   prove they need even more, and each attempt's History replay shows
   the budget badge it actually ran with. Reload the page and confirm
   the control is back on standard.
+- Density: switch to compact mid-run set; cards tighten and the
+  response font drops a step; comfortable restores both. Reload and
+  confirm the control is back on comfortable.
+- Fold: fold a long answer to its six line preview, confirm the
+  control now reads "show all" and clicking it restores the full
+  text. Fold a partial-error card: the preview still holds.
+- Copy: copy a column and paste elsewhere; the paste matches the raw
+  response exactly, HTML tags included, and the button briefly reads
+  "copied" before returning to "copy".
+- Thinking counter: run a slow reasoning model next to a fast one;
+  the slow card counts up in seconds until its first token, then the
+  counter vanishes and never reappears.
+- All / None: the two lineup buttons check and uncheck every chip,
+  and Run enables or disables accordingly.
+- History filter: type a model id fragment; rows without it in their
+  prompt or models disappear; clearing the input restores them.
+- Keyboard: Tab from the top of the page; every control (deck,
+  chips, chip removes, card tools, history rows) is reachable and
+  shows a visible focus ring.
+- Theme: flip the OS color scheme; the page follows without a
+  reload, and both themes keep the state labels readable.
