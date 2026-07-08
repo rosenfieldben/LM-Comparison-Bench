@@ -5,7 +5,7 @@ import httpx
 import pytest
 import respx
 
-from bench.models import MODELS_URL, OPENROUTER_URL, fetch_prices, run_model
+from bench.models import MODELS_URL, OPENROUTER_URL, fetch_catalog, run_model
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -136,7 +136,7 @@ async def test_non_dict_usage_does_not_raise(client):
 
 
 @respx.mock
-async def test_fetch_prices_parses_and_skips_malformed_entries(client):
+async def test_catalog_price_map_skips_malformed_entries(client):
     respx.get(MODELS_URL).respond(
         json={
             "data": [
@@ -147,21 +147,16 @@ async def test_fetch_prices_parses_and_skips_malformed_entries(client):
         }
     )
 
-    prices = await fetch_prices(client)
+    catalog = await fetch_catalog(client)
 
-    assert prices == {"a/one": {"prompt": 1e-06, "completion": 2e-06}}
-
-
-@respx.mock
-async def test_fetch_prices_failure_returns_empty_dict(client):
-    respx.get(MODELS_URL).mock(side_effect=httpx.ConnectError("offline"))
-    assert await fetch_prices(client) == {}
+    assert catalog["prices"] == {"a/one": {"prompt": 1e-06, "completion": 2e-06}}
 
 
 @respx.mock
-async def test_fetch_prices_http_error_returns_empty_dict(client):
+async def test_fetch_catalog_http_error_reports_not_fetched(client):
     respx.get(MODELS_URL).respond(status_code=500)
-    assert await fetch_prices(client) == {}
+    catalog = await fetch_catalog(client)
+    assert catalog == {"fetched": False, "models": [], "prices": {}}
 
 
 from stream_helpers import DONE_MARKER, ChunkStream, sse

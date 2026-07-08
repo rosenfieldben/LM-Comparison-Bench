@@ -174,40 +174,92 @@ def save_run(
     return run_id
 
 
-def list_runs(conn: sqlite3.Connection) -> list[dict]:
-    """History entries, newest first.
+def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+    """The newest `limit` history entries.
 
     Runs sharing a group collapse into one group entry, emitted at the
     position of the group's newest run so ordering stays newest-first
     across both kinds. Ungrouped rows (all pre-grouping history) stay
     as individual run entries.
+
+    The id scan below stops as soon as `limit` entries are identified,
+    and every later query is bounded to the ids it selected, so the
+    cost of a page tracks the page size rather than total history. A
+    selected group entry still carries ALL of its member runs, even
+    members older than where the scan stopped.
     """
-    runs = [
+    # Pass 1: which entries make the page. Ids only, lazily iterated;
+    # sqlite walks the rowid index newest-first and we stop early.
+    entry_order: list[tuple[str, int]] = []
+    lone_ids: list[int] = []
+    group_ids: list[int] = []
+    seen_groups: set[int] = set()
+    for row in conn.execute("SELECT id, group_id FROM runs ORDER BY id DESC"):
+        gid = row["group_id"]
+        if gid is None:
+            entry_order.append(("run", row["id"]))
+            lone_ids.append(row["id"])
+        elif gid not in seen_groups:
+            seen_groups.add(gid)
+            entry_order.append(("group", gid))
+            group_ids.append(gid)
+        if len(entry_order) == limit:
+            break
+    if not entry_order:
+        return []
+
+    def marks(ids: list[int]) -> str:
+        return ",".join("?" * len(ids))
+
+    # Pass 2: the runs backing those entries — the lone runs plus every
+    # member of each selected group. Built conditionally because
+    # "IN ()" with zero placeholders is a syntax error.
+    conditions = []
+    params: list[int] = []
+    if lone_ids:
+        conditions.append(f"id IN ({marks(lone_ids)})")
+        params += lone_ids
+    if group_ids:
+        conditions.append(f"group_id IN ({marks(group_ids)})")
+        params += group_ids
+    run_rows = [
         dict(r)
         for r in conn.execute(
-            "SELECT id, group_id, prompt_text, created_at FROM runs ORDER BY id DESC"
+            "SELECT id, group_id, prompt_text, created_at FROM runs"
+            f" WHERE {' OR '.join(conditions)} ORDER BY id",
+            params,
         ).fetchall()
     ]
+    run_ids = [r["id"] for r in run_rows]
     # Second query instead of GROUP_CONCAT: keeps model order tied to
     # insert order, which mirrors the original request order.
     models_by_run: dict[int, list[str]] = {}
-    for row in conn.execute("SELECT run_id, model FROM results ORDER BY id"):
+    for row in conn.execute(
+        f"SELECT run_id, model FROM results WHERE run_id IN ({marks(run_ids)})"
+        " ORDER BY id",
+        run_ids,
+    ):
         models_by_run.setdefault(row["run_id"], []).append(row["model"])
-    group_created = {
-        row["id"]: row["created_at"]
-        for row in conn.execute("SELECT id, created_at FROM groups")
-    }
+    group_created = {}
+    if group_ids:
+        group_created = {
+            row["id"]: row["created_at"]
+            for row in conn.execute(
+                f"SELECT id, created_at FROM groups WHERE id IN ({marks(group_ids)})",
+                group_ids,
+            )
+        }
 
+    runs_by_id = {r["id"]: r for r in run_rows}
     members: dict[int, list[dict]] = {}
-    for run in reversed(runs):
-        if run["group_id"] is not None:
-            members.setdefault(run["group_id"], []).append(run)
+    for r in run_rows:
+        if r["group_id"] is not None:
+            members.setdefault(r["group_id"], []).append(r)
 
     entries = []
-    emitted: set[int] = set()
-    for run in runs:
-        gid = run["group_id"]
-        if gid is None:
+    for kind, key in entry_order:
+        if kind == "run":
+            run = runs_by_id[key]
             entries.append(
                 {
                     "type": "run",
@@ -217,14 +269,13 @@ def list_runs(conn: sqlite3.Connection) -> list[dict]:
                     "models": models_by_run.get(run["id"], []),
                 }
             )
-        elif gid not in emitted:
-            emitted.add(gid)
-            runs_asc = members[gid]
+        else:
+            runs_asc = members[key]
             entries.append(
                 {
                     "type": "group",
-                    "id": gid,
-                    "created_at": group_created.get(gid, runs_asc[0]["created_at"]),
+                    "id": key,
+                    "created_at": group_created.get(key, runs_asc[0]["created_at"]),
                     "prompt_text": runs_asc[0]["prompt_text"],
                     "models": [
                         m

@@ -165,6 +165,35 @@ def test_list_runs_groups_collapse_and_order_newest_first(db):
     assert entries[2]["id"] == lone_before
 
 
+def test_list_runs_limit_returns_newest_entries(db):
+    ids = [store.save_run(db, f"p{i}", [make_result()]) for i in range(3)]
+
+    entries = store.list_runs(db, limit=2)
+
+    assert [e["id"] for e in entries] == [ids[2], ids[1]]
+
+
+def test_list_runs_limit_keeps_whole_groups(db):
+    group_id = store.create_group(db)
+    r1 = store.save_run(db, "grouped", [make_result(model="a/one")], group_id=group_id)
+    lone = store.save_run(db, "lone", [make_result(model="b/two")])
+    r2 = store.save_run(db, "grouped", [make_result(model="c/three")], group_id=group_id)
+
+    entries = store.list_runs(db, limit=2)
+
+    # The id scan stops at the lone run, but the group entry (emitted
+    # at its newest member r2) must still carry the older member r1: a
+    # page boundary must never split a comparison.
+    assert [e["type"] for e in entries] == ["group", "run"]
+    assert entries[0]["run_ids"] == [r1, r2]
+    assert entries[0]["models"] == ["a/one", "c/three"]
+    assert entries[1]["id"] == lone
+
+
+def test_list_runs_empty_history_is_empty_list(db):
+    assert store.list_runs(db) == []
+
+
 def test_get_group_returns_runs_with_results_in_id_order(db):
     group_id = store.create_group(db)
     r1 = store.save_run(db, "p", [make_result(model="b/two")], group_id=group_id)
