@@ -73,6 +73,20 @@ The shared HTTP client enables TCP keepalive probes (SO_KEEPALIVE,
 extended-budget reasoning are not culled by NAT idle timers, which
 had been surfacing as mixed ReadError and stall failures mid-lineup.
 
+## Local-only guard
+
+The bench holds a paid API key, so it refuses requests that could
+only come from a hostile browser page. Requests whose Host header is
+not localhost, 127.0.0.1 or ::1 get a 403, which defeats DNS
+rebinding; POST bodies must be `application/json` (415 otherwise),
+which forces cross-origin senders into a CORS preflight the bench
+never answers, so a malicious page cannot fire "simple" text/plain
+POSTs at /compare and spend money. Bodyless POSTs (like /groups) and
+everything curl or the bundled frontend sends pass unchanged. To
+serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
+in `bench/main.py` — and put real authentication in front of it
+first.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
