@@ -3,273 +3,485 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
 <title>LM Comparison Bench</title>
 <style>
+  /* ==== Design tokens ====================================================
+     Every rule below reads from these custom properties, so the next
+     visual change is a token edit, not a hunt through selectors. Dark is
+     the default; the light block swaps token values only, and the OS
+     color scheme decides which applies. There is no toggle on purpose. */
+  :root {
+    color-scheme: dark;
+
+    /* surfaces */
+    --bg: #101418;
+    --surface: #171c22;
+    --surface-raised: #1e242b;
+    --line: #2a323b;
+    --line-strong: #3e4954;
+
+    /* text ramp */
+    --text: #d8dee4;
+    --text-dim: #9aa4ae;
+    --text-faint: #6e7883;
+
+    /* the single accent, interactive elements only */
+    --accent: #57a9ff;
+    --accent-hover: #7cbcff;
+    --accent-contrast: #0b1016;
+    --accent-soft: rgba(87, 169, 255, 0.13);
+
+    /* semantic status; always paired with a text label, never alone */
+    --ok: #4ec36f;
+    --err: #f2736c;
+    --err-surface: #241b1d;
+    --warn: #d9a63f;
+
+    /* diff */
+    --ins-bg: #17301f;
+    --ins-text: #8ce3ac;
+    --del-bg: #38201f;
+    --del-text: #ffa8a1;
+
+    /* spacing steps */
+    --s1: 2px;
+    --s2: 4px;
+    --s3: 8px;
+    --s4: 12px;
+    --s5: 16px;
+    --s6: 24px;
+
+    /* radii */
+    --r-s: 3px;
+    --r-m: 6px;
+
+    /* type scale; monospace carries everything measured */
+    --fs-xs: 0.72rem;
+    --fs-s: 0.8rem;
+    --fs-m: 0.875rem;
+    --fs-l: 1rem;
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+    /* density knobs; body.compact retunes these three and nothing else */
+    --card-pad: var(--s5);
+    --body-fs: var(--fs-m);
+    --card-min: 260px;
+
+    /* accessibility floor for interactive targets */
+    --hit: 32px;
+
+    /* hover and focus transitions only; data arrival never animates */
+    --speed: 150ms;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg: #f2f2ef;
+      --surface: #ffffff;
+      --surface-raised: #f5f6f7;
+      --line: #d8dce1;
+      --line-strong: #b7bfc7;
+      --text: #22272c;
+      --text-dim: #59626b;
+      --text-faint: #89929b;
+      --accent: #1a6fd4;
+      --accent-hover: #135caf;
+      --accent-contrast: #ffffff;
+      --accent-soft: rgba(26, 111, 212, 0.10);
+      --ok: #1a7f37;
+      --err: #c0392f;
+      --err-surface: #fdf3f2;
+      --warn: #8a6a00;
+      --ins-bg: #d9f0d9;
+      --ins-text: #1c5c1c;
+      --del-bg: #fbdcd9;
+      --del-text: #7a1f18;
+    }
+  }
+  body.compact {
+    --card-pad: var(--s3);
+    --body-fs: var(--fs-s);
+    --card-min: 220px;
+  }
+
+  /* ==== Base ==== */
   * { box-sizing: border-box; }
   body {
-    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-    background: #fafaf8;
-    color: #222;
-    max-width: 1400px;
+    font: var(--fs-m)/1.5 var(--sans);
+    /* Tabular figures everywhere so columns of costs and times align. */
+    font-variant-numeric: tabular-nums;
+    background: var(--bg);
+    color: var(--text);
+    max-width: 1500px;
     margin: 0 auto;
-    padding: 1.5rem;
+    padding: var(--s5) var(--s6) var(--s6);
   }
-  h1 { font-size: 1.3rem; margin: 0 0 1rem; }
-  #prompt {
-    width: 100%;
+
+  /* ==== Shared controls ==== */
+  button, select, input[type="text"], textarea {
     font: inherit;
-    padding: 0.6rem;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    resize: vertical;
+    color: var(--text);
+    background: var(--surface-raised);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-s);
+    min-height: var(--hit);
+    padding: var(--s2) var(--s4);
+    transition: border-color var(--speed), background-color var(--speed),
+                color var(--speed);
   }
-  #models {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.4rem 1.2rem;
-    margin: 0.8rem 0;
-  }
-  #models label { cursor: pointer; font-size: 0.95rem; }
-  #run {
-    font: inherit;
-    padding: 0.5rem 1.6rem;
-    border: 1px solid #888;
-    border-radius: 6px;
-    background: #fff;
-    cursor: pointer;
-  }
-  #run:disabled { opacity: 0.45; cursor: default; }
-  #run-bar { display: flex; gap: 0.6rem; align-items: center; }
-  #budget {
-    font: inherit;
-    font-size: 0.9rem;
-    padding: 0.3rem 0.6rem;
-    border: 1px solid #aaa;
-    border-radius: 6px;
-    background: #fff;
-  }
-  #results {
-    display: flex;
-    gap: 0.8rem;
-    margin-top: 1.2rem;
-    align-items: stretch;
-  }
-  .col {
-    /* Equal-width columns regardless of content, so 2 to 5 all line up. */
-    flex: 1 1 0;
-    min-width: 0;
-    border: 1px solid #ddd;
-    border-radius: 6px;
-    background: #fff;
-    padding: 0.7rem;
-  }
-  .col.error { background: #fdf3f2; border-color: #d9a09a; }
-  .col-header {
+  button { cursor: pointer; }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* ==== Header bar ==== */
+  #topbar {
     display: flex;
     justify-content: space-between;
     align-items: baseline;
-    gap: 0.4rem;
+    padding-bottom: var(--s3);
+    margin-bottom: var(--s5);
+    border-bottom: 1px solid var(--line);
+  }
+  #topbar h1 {
+    margin: 0;
+    font: 600 var(--fs-m) var(--mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  #session-runs { font: var(--fs-xs) var(--mono); color: var(--text-faint); }
+
+  /* ==== Control deck: prompt row, lineup row, run row ==== */
+  #deck {
+    border: 1px solid var(--line);
+    border-radius: var(--r-m);
+    background: var(--surface);
+  }
+  .deck-row { padding: var(--s4) var(--s5); }
+  .deck-row + .deck-row { border-top: 1px solid var(--line); }
+
+  #prompt-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s3);
+    align-items: center;
+    margin-bottom: var(--s3);
+  }
+  #prompt-bar button, #prompt-bar select, #prompt-bar input { font-size: var(--fs-s); }
+  #name-row { display: inline-flex; gap: var(--s2); }
+  #name-row[hidden] { display: none; }
+  #prompt-msg { font-size: var(--fs-s); color: var(--err); }
+  #prompt {
+    display: block;
+    width: 100%;
+    font-family: var(--mono);
+    font-size: var(--fs-m);
+    line-height: 1.5;
+    padding: var(--s3) var(--s4);
+    background: var(--bg);
+    /* Auto-grown from JS; the cap keeps a pasted novel from eating the
+       page, with a scrollbar past it. */
+    max-height: 40vh;
+    overflow-y: auto;
+    resize: none;
+  }
+
+  /* lineup chips */
+  #models { display: flex; flex-wrap: wrap; gap: var(--s3); margin-bottom: var(--s3); }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: var(--s3);
+    min-height: var(--hit);
+    padding-left: var(--s4);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-m);
+    background: var(--surface-raised);
+    font: var(--fs-s) var(--mono);
+    cursor: pointer;
+    transition: border-color var(--speed), background-color var(--speed);
+  }
+  .chip.on { border-color: var(--accent); background: var(--accent-soft); }
+  .chip input { accent-color: var(--accent); margin: 0; }
+  .rm-model {
+    min-width: var(--hit);
+    padding: 0;
+    border: none;
+    background: none;
+    border-radius: var(--r-m);
+    color: var(--text-faint);
+    font-size: var(--fs-m);
+  }
+  .rm-model:hover { color: var(--err); }
+  #lineup-bar { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; }
+  #lineup-bar button { font-size: var(--fs-s); }
+
+  /* model picker */
+  #model-search { margin-top: var(--s3); max-width: 760px; }
+  #model-search input {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: var(--fs-s);
+    background: var(--bg);
+  }
+  #search-msg { font-size: var(--fs-s); color: var(--warn); margin-top: var(--s2); }
+  .match {
+    display: flex;
+    gap: var(--s4);
+    align-items: baseline;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    padding: var(--s2) var(--s3);
+    font-size: var(--fs-s);
+  }
+  .match:hover:not(:disabled) { background: var(--surface-raised); }
+  .match-name { font-weight: 600; white-space: nowrap; }
+  .match-id {
+    font-family: var(--mono);
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .match-meta {
+    font: var(--fs-xs) var(--mono);
+    color: var(--text-dim);
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  /* run row; the Run button is the one primary element on the page */
+  #run-row { display: flex; flex-wrap: wrap; gap: var(--s3); align-items: center; }
+  #run {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-contrast);
     font-weight: 600;
-    font-size: 0.9rem;
-    margin-bottom: 0.4rem;
+    padding: var(--s2) var(--s6);
+  }
+  #run:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+  #run-row select { font-size: var(--fs-s); }
+  #lineup-msg { font-size: var(--fs-s); color: var(--warn); }
+
+  /* ==== Result cards ==== */
+  #run-label { margin-top: var(--s4); font-size: var(--fs-s); color: var(--text-dim); }
+  #results {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(var(--card-min), 1fr));
+    gap: var(--s4);
+    margin-top: var(--s4);
+    align-items: start;
+  }
+  .card {
+    border: 1px solid var(--line);
+    /* State rides the left edge AND the header label; see setState. */
+    border-left: 3px solid var(--line-strong);
+    border-radius: var(--r-m);
+    background: var(--surface);
+    padding: var(--card-pad);
+  }
+  .card[data-state="working"] { border-left-color: var(--accent); }
+  .card[data-state="done"] { border-left-color: var(--ok); }
+  .card[data-state="error"] { border-left-color: var(--err); background: var(--err-surface); }
+  .card-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: var(--s2) var(--s3);
+    margin-bottom: var(--s3);
+  }
+  .model-id {
+    font: 600 var(--fs-s) var(--mono);
     word-break: break-all;
+    margin-right: auto;
   }
-  .diff-toggle {
-    font: inherit;
-    font-size: 0.7rem;
-    font-weight: 400;
-    padding: 0.05rem 0.45rem;
-    border: 1px solid #aaa;
-    border-radius: 4px;
-    background: #fff;
-    cursor: pointer;
+  .status {
+    font: var(--fs-xs) var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
     flex-shrink: 0;
   }
-  .diff-toggle.armed { background: #35507a; border-color: #35507a; color: #fff; }
-  .rerun-btn {
-    font: inherit;
-    font-size: 0.7rem;
-    font-weight: 400;
-    padding: 0.05rem 0.45rem;
-    border: 1px solid #b06860;
-    border-radius: 4px;
-    background: #fff;
-    color: #a33;
-    cursor: pointer;
-    flex-shrink: 0;
+  .card[data-state="working"] .status { color: var(--accent); }
+  .card[data-state="done"] .status { color: var(--ok); }
+  .card[data-state="error"] .status { color: var(--err); }
+  .card-tools { display: flex; gap: var(--s2); flex-shrink: 0; }
+  .tool {
+    font: var(--fs-xs) var(--mono);
+    padding: 0 var(--s3);
   }
-  .rerun-btn:disabled { opacity: 0.45; cursor: default; }
+  .tool.armed {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: var(--accent-contrast);
+  }
+  .rerun-btn { color: var(--err); border-color: var(--err); }
+  .meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--s2);
+    margin-bottom: var(--s3);
+    min-height: 1.4em;
+  }
+  .badge {
+    font: var(--fs-xs) var(--mono);
+    background: var(--surface-raised);
+    border: 1px solid var(--line);
+    border-radius: var(--r-s);
+    padding: var(--s1) var(--s3);
+  }
+  .body {
+    font: var(--body-fs)/1.55 var(--mono);
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .body.loading { color: var(--text-faint); font-style: italic; }
+  /* Six line preview; the fold control in the header is the way back. */
+  .body.folded { max-height: calc(1.55em * 6); overflow: hidden; }
+  .error-msg { color: var(--err); }
+  .error-msg.after-text {
+    margin-top: var(--s3);
+    padding-top: var(--s3);
+    border-top: 1px dashed var(--err);
+  }
+
+  /* ==== Diff panel ==== */
   #diff-panel {
-    margin-top: 1.2rem;
-    border: 1px solid #b8c4d8;
-    border-radius: 6px;
-    background: #fff;
+    margin-top: var(--s4);
+    border: 1px solid var(--line-strong);
+    border-radius: var(--r-m);
+    background: var(--surface);
   }
   #diff-header {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    gap: 0.6rem;
-    padding: 0.5rem 0.7rem;
-    border-bottom: 1px solid #e2e7ef;
-    font-size: 0.9rem;
-    font-weight: 600;
+    gap: var(--s3);
+    padding: var(--s3) var(--s4);
+    border-bottom: 1px solid var(--line);
+    font: 600 var(--fs-s) var(--mono);
   }
-  #diff-close {
-    font: inherit;
-    font-size: 0.8rem;
-    font-weight: 400;
-    padding: 0.15rem 0.6rem;
-    border: 1px solid #aaa;
-    border-radius: 4px;
-    background: #fff;
-    cursor: pointer;
-  }
+  #diff-close { font: var(--fs-xs) var(--mono); }
   #diff-body {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.85rem;
+    font: var(--body-fs)/1.55 var(--mono);
     white-space: pre-wrap;
     word-break: break-word;
-    padding: 0.7rem;
+    padding: var(--s4);
   }
-  #diff-body del { background: #fbdcd9; color: #7a1f18; text-decoration: line-through; }
-  #diff-body ins { background: #d9f0d9; color: #1c5c1c; text-decoration: none; }
-  .meta { margin-bottom: 0.5rem; min-height: 1.3em; }
-  .badge {
-    display: inline-block;
-    font-size: 0.75rem;
-    background: #eee;
-    border-radius: 4px;
-    padding: 0.1rem 0.4rem;
-    margin-right: 0.4rem;
-  }
-  .body {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    font-size: 0.85rem;
-    white-space: pre-wrap;
-    word-break: break-word;
-  }
-  .body.loading { color: #999; font-style: italic; }
-  .body .error-msg { color: #a33; }
-  .body .error-msg.after-text { margin-top: 0.5rem; padding-top: 0.4rem; border-top: 1px dashed #d9a09a; }
-  .rm-model {
-    font: inherit;
-    font-size: 0.8rem;
-    line-height: 1;
-    padding: 0 0.3rem;
-    border: none;
-    background: none;
-    color: #999;
+  #diff-body del { background: var(--del-bg); color: var(--del-text); text-decoration: line-through; }
+  #diff-body ins { background: var(--ins-bg); color: var(--ins-text); text-decoration: none; }
+
+  /* ==== History ==== */
+  #history { margin-top: var(--s6); }
+  #history summary {
     cursor: pointer;
-  }
-  .rm-model:hover { color: #a33; }
-  #lineup-bar { display: flex; gap: 0.8rem; align-items: center; margin: 0.4rem 0 0.8rem; }
-  #lineup-bar button {
-    font: inherit;
-    font-size: 0.85rem;
-    padding: 0.2rem 0.7rem;
-    border: 1px solid #aaa;
-    border-radius: 6px;
-    background: #fff;
-    cursor: pointer;
-  }
-  #lineup-msg { font-size: 0.85rem; color: #886a00; }
-  #model-search { margin: 0 0 0.8rem; max-width: 720px; }
-  #model-search input {
-    width: 100%;
-    font: inherit;
-    font-size: 0.9rem;
-    padding: 0.35rem 0.6rem;
-    border: 1px solid #aaa;
-    border-radius: 6px;
-  }
-  #search-msg { font-size: 0.85rem; color: #886a00; margin-top: 0.3rem; }
-  .match {
+    color: var(--text-dim);
+    font: var(--fs-s) var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    min-height: var(--hit);
     display: flex;
-    gap: 0.8rem;
-    align-items: baseline;
-    padding: 0.35rem 0.4rem;
-    border-bottom: 1px solid #eee;
-    font-size: 0.85rem;
-    cursor: pointer;
-  }
-  .match:hover { background: #f0efec; }
-  .match.dimmed { opacity: 0.45; cursor: default; }
-  .match.dimmed:hover { background: none; }
-  .match-name { font-weight: 600; white-space: nowrap; }
-  .match-id { color: #777; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .match-meta { color: #555; margin-left: auto; white-space: nowrap; }
-  #prompt-bar {
-    display: flex;
-    gap: 0.5rem;
     align-items: center;
-    margin-bottom: 0.6rem;
   }
-  #prompt-bar select, #prompt-bar button, #prompt-bar input {
-    font: inherit;
-    font-size: 0.9rem;
-    padding: 0.3rem 0.6rem;
-    border: 1px solid #aaa;
-    border-radius: 6px;
-    background: #fff;
+  #history-tools { margin: var(--s3) 0; }
+  #history-filter {
+    width: 100%;
+    max-width: 420px;
+    font-family: var(--mono);
+    font-size: var(--fs-s);
+    background: var(--bg);
   }
-  #name-row { display: inline-flex; gap: 0.4rem; }
-  #name-row[hidden] { display: none; }
-  #prompt-bar button:disabled { opacity: 0.45; }
-  #prompt-msg { font-size: 0.85rem; color: #a33; }
-  #run-label { margin-top: 1rem; font-size: 0.85rem; color: #888; }
-  #history { margin-top: 1.5rem; }
-  #history summary { cursor: pointer; color: #555; }
   .hrow {
-    display: flex;
-    gap: 1rem;
-    padding: 0.45rem 0.3rem;
-    border-bottom: 1px solid #eee;
-    font-size: 0.85rem;
-    cursor: pointer;
+    display: grid;
+    grid-template-columns: max-content 1fr max-content;
+    gap: var(--s5);
+    align-items: center;
+    width: 100%;
+    text-align: left;
+    background: none;
+    border: none;
+    border-bottom: 1px solid var(--line);
+    border-radius: 0;
+    padding: var(--s2) var(--s3);
+    font-size: var(--fs-s);
   }
-  .hrow:hover { background: #f0efec; }
-  .hrow .htime { color: #888; white-space: nowrap; }
-  .hnote { padding: 0.45rem 0.3rem; font-size: 0.8rem; color: #888; font-style: italic; }
-  .hrow .hprompt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .hrow .hmodels { color: #777; white-space: nowrap; }
+  .hrow:hover { background: var(--surface-raised); }
+  .htime { font: var(--fs-xs) var(--mono); color: var(--text-dim); white-space: nowrap; }
+  .hprompt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hmodels { display: flex; gap: var(--s2); flex-wrap: wrap; justify-content: flex-end; }
+  .hchip {
+    font: var(--fs-xs) var(--mono);
+    border: 1px solid var(--line);
+    border-radius: var(--r-s);
+    padding: 0 var(--s2);
+    color: var(--text-dim);
+    white-space: nowrap;
+  }
+  .hnote { padding: var(--s3); font-size: var(--fs-xs); color: var(--text-faint); font-style: italic; }
 </style>
 </head>
 <body>
-<h1>LM Comparison Bench</h1>
-<div id="prompt-bar">
-  <select id="saved-prompts">
-    <option value="">Saved prompts...</option>
-  </select>
-  <button id="save-prompt" type="button">Save prompt</button>
-  <span id="name-row" hidden>
-    <input id="prompt-name" type="text" placeholder="Name for this prompt">
-    <button id="confirm-save" type="button">OK</button>
-    <button id="cancel-save" type="button">Cancel</button>
-  </span>
-  <button id="delete-prompt" type="button" disabled>Delete</button>
-  <span id="prompt-msg"></span>
-</div>
-<textarea id="prompt" rows="4" placeholder="Prompt to send to every checked model"></textarea>
-<div id="models"></div>
-<div id="lineup-bar">
-  <button id="add-model" type="button">Add model</button>
-  <span id="lineup-msg"></span>
-</div>
-<div id="model-search" hidden>
-  <input id="model-query" type="text" placeholder="Search models by name or id">
-  <div id="search-msg"></div>
-  <div id="model-matches"></div>
-</div>
-<div id="run-bar">
-  <button id="run" disabled>Run</button>
-  <select id="budget" title="Completion token budget for every model in the run">
-    <option value="standard">standard</option>
-    <option value="extended">extended budget</option>
-  </select>
-</div>
-<div id="run-label"></div>
+<header id="topbar">
+  <h1>LM Comparison Bench</h1>
+  <span id="session-runs"></span>
+</header>
+
+<section id="deck" aria-label="Run controls">
+  <div class="deck-row">
+    <div id="prompt-bar">
+      <select id="saved-prompts" aria-label="Saved prompts">
+        <option value="">Saved prompts...</option>
+      </select>
+      <button id="save-prompt" type="button">Save prompt</button>
+      <span id="name-row" hidden>
+        <input id="prompt-name" type="text" placeholder="Name for this prompt">
+        <button id="confirm-save" type="button">OK</button>
+        <button id="cancel-save" type="button">Cancel</button>
+      </span>
+      <button id="delete-prompt" type="button" disabled>Delete</button>
+      <span id="prompt-msg" role="status"></span>
+    </div>
+    <textarea id="prompt" rows="3" placeholder="Prompt to send to every checked model"></textarea>
+  </div>
+
+  <div class="deck-row">
+    <div id="models"></div>
+    <div id="lineup-bar">
+      <button id="select-all" type="button">All</button>
+      <button id="select-none" type="button">None</button>
+      <button id="add-model" type="button" aria-expanded="false">Add model</button>
+    </div>
+    <div id="model-search" hidden>
+      <input id="model-query" type="text" placeholder="Search models by name or id">
+      <div id="search-msg" role="status"></div>
+      <div id="model-matches"></div>
+    </div>
+  </div>
+
+  <div class="deck-row" id="run-row">
+    <button id="run" disabled>Run</button>
+    <select id="budget" aria-label="Completion token budget"
+            title="Completion token budget for every model in the run">
+      <option value="standard">standard</option>
+      <option value="extended">extended budget</option>
+    </select>
+    <select id="density" aria-label="Column density"
+            title="Result card density; compact fits more models side by side">
+      <option value="comfortable">comfortable</option>
+      <option value="compact">compact</option>
+    </select>
+    <span id="lineup-msg" role="status"></span>
+  </div>
+</section>
+
+<div id="run-label" role="status"></div>
 <div id="results"></div>
+
 <div id="diff-panel" hidden>
   <div id="diff-header">
     <span id="diff-title"></span>
@@ -277,8 +489,13 @@
   </div>
   <div id="diff-body"></div>
 </div>
+
 <details id="history">
   <summary>History</summary>
+  <div id="history-tools">
+    <input id="history-filter" type="text" aria-label="Filter history"
+           placeholder="Filter by prompt or model id">
+  </div>
   <div id="history-list"></div>
 </details>
 
@@ -286,7 +503,8 @@
 // Seed for a fresh browser only. The live lineup is a localStorage
 // preference of THIS browser, not bench data: keeping it out of sqlite
 // means bench.db stays purely runs and prompts, and losing it costs
-// four clicks.
+// four clicks. The key predates the interface overhaul and must never
+// change: users have lineups stored under it.
 const DEFAULT_LINEUP = [
   "deepseek/deepseek-chat",
   "z-ai/glm-4.6",
@@ -319,6 +537,7 @@ const runBtn = document.getElementById("run");
 // Deliberately per-session, never persisted: extended costs real
 // money, so the safe default must reassert itself on the next visit.
 const budgetSel = document.getElementById("budget");
+const densitySel = document.getElementById("density");
 const resultsEl = document.getElementById("results");
 const runLabelEl = document.getElementById("run-label");
 const savedSelect = document.getElementById("saved-prompts");
@@ -327,8 +546,11 @@ const deleteBtn = document.getElementById("delete-prompt");
 const promptMsg = document.getElementById("prompt-msg");
 const historyEl = document.getElementById("history");
 const historyList = document.getElementById("history-list");
+const historyFilter = document.getElementById("history-filter");
+const sessionRunsEl = document.getElementById("session-runs");
 let running = false;
-// Sent with /compare so a run links back to its saved prompt. Cleared
+let sessionRuns = 0;
+// Sent with the run so it links back to its saved prompt. Cleared
 // the moment the textarea is edited: the text no longer matches the
 // library entry, so the link would lie.
 let selectedPromptId = null;
@@ -343,31 +565,53 @@ const matchesEl = document.getElementById("model-matches");
 // exact-id fallback so the bench stays usable on an offline boot.
 let catalog = { fetched: false, models: [] };
 
+// Like the budget control, density is per session on purpose: layout
+// preferences reassert their defaults on the next visit.
+densitySel.addEventListener("change", () => {
+  document.body.classList.toggle("compact", densitySel.value === "compact");
+});
+
+function autosizePrompt() {
+  // Height tracks content; the CSS max-height caps runaway growth.
+  promptEl.style.height = "auto";
+  promptEl.style.height = promptEl.scrollHeight + "px";
+}
+
 function renderLineup() {
   // Checked state is per-session; carry it across rebuilds so removing
   // one model does not uncheck the others.
   const checked = new Set(checkedModels());
   modelsEl.replaceChildren();
   for (const model of lineup) {
-    const label = document.createElement("label");
+    const chip = document.createElement("label");
+    chip.className = "chip";
     const box = document.createElement("input");
     box.type = "checkbox";
     box.value = model;
     box.checked = checked.has(model);
-    box.addEventListener("change", updateRunState);
+    if (box.checked) chip.classList.add("on");
+    box.addEventListener("change", () => {
+      chip.classList.toggle("on", box.checked);
+      updateRunState();
+    });
+    const id = document.createElement("span");
+    id.textContent = model;
     const rm = document.createElement("button");
     rm.type = "button";
     rm.className = "rm-model";
     rm.textContent = "×";
     rm.title = "Remove from lineup";
+    rm.setAttribute("aria-label", "Remove " + model + " from lineup");
     rm.addEventListener("click", (e) => {
+      // preventDefault stops the click from also toggling the checkbox
+      // through the wrapping label.
       e.preventDefault();
       lineup = lineup.filter(m => m !== model);
       saveLineup();
       renderLineup();
     });
-    label.append(box, " " + model + " ", rm);
-    modelsEl.append(label);
+    chip.append(box, id, rm);
+    modelsEl.append(chip);
   }
   updateRunState();
 }
@@ -375,6 +619,16 @@ function renderLineup() {
 function checkedModels() {
   return [...modelsEl.querySelectorAll("input:checked")].map(b => b.value);
 }
+
+function setAllChecked(on) {
+  for (const box of modelsEl.querySelectorAll("input[type=checkbox]")) {
+    box.checked = on;
+    box.closest(".chip").classList.toggle("on", on);
+  }
+  updateRunState();
+}
+document.getElementById("select-all").addEventListener("click", () => setAllChecked(true));
+document.getElementById("select-none").addEventListener("click", () => setAllChecked(false));
 
 function updateRunState() {
   const checked = checkedModels().length;
@@ -391,6 +645,7 @@ function updateRunState() {
 promptEl.addEventListener("input", () => {
   selectedPromptId = null;
   savedSelect.value = "";
+  autosizePrompt();
   updateRunState();
 });
 
@@ -432,6 +687,7 @@ function fmtPricing(m) {
 
 addModelBtn.addEventListener("click", () => {
   searchRow.hidden = !searchRow.hidden;
+  addModelBtn.setAttribute("aria-expanded", String(!searchRow.hidden));
   if (searchRow.hidden) {
     clearSearch();
     return;
@@ -459,7 +715,9 @@ function renderMatches() {
     )
     .slice(0, 15);
   for (const m of hits) {
-    const row = document.createElement("div");
+    // Buttons, not divs: rows must be reachable by keyboard.
+    const row = document.createElement("button");
+    row.type = "button";
     row.className = "match";
     // textContent throughout: catalog names arrive from an external
     // API and are as untrusted as model output.
@@ -483,7 +741,7 @@ function renderMatches() {
         : "");
     row.append(name, id, meta);
     if (lineup.includes(m.id)) {
-      row.classList.add("dimmed");
+      row.disabled = true;
       row.title = "already in lineup";
     } else {
       row.addEventListener("click", () => addToLineup(m.id));
@@ -496,6 +754,7 @@ queryInput.addEventListener("input", renderMatches);
 queryInput.addEventListener("keydown", (e) => {
   if (e.key === "Escape") {
     searchRow.hidden = true;
+    addModelBtn.setAttribute("aria-expanded", "false");
     clearSearch();
   } else if (e.key === "Enter" && !catalog.fetched) {
     // Offline fallback: nothing to search, Enter adds the exact id.
@@ -507,6 +766,7 @@ queryInput.addEventListener("keydown", (e) => {
 
 renderLineup();
 loadCatalog();
+autosizePrompt();
 
 async function loadPrompts(selectId) {
   let data;
@@ -536,6 +796,7 @@ savedSelect.addEventListener("change", () => {
   } else {
     selectedPromptId = Number(savedSelect.value);
     promptEl.value = opt.dataset.text;
+    autosizePrompt();
   }
   updateRunState();
 });
@@ -627,6 +888,10 @@ deleteBtn.addEventListener("click", async () => {
 
 loadPrompts(null);
 
+// ---- Result cards. One skeleton builder, one completion renderer;
+// ---- live streams and history replay both end in completeColumn so
+// ---- the textContent-only rule and the error contract hold once.
+
 function badge(text) {
   const span = document.createElement("span");
   span.className = "badge";
@@ -634,34 +899,87 @@ function badge(text) {
   return span;
 }
 
+// State is conveyed twice on purpose, a colored left edge plus a text
+// label, so status never rides on color alone. The label is a polite
+// live region: screen readers hear working flip to done or error.
+function setState(ui, state) {
+  ui.card.dataset.state = state;
+  ui.status.textContent = state;
+}
+
 function makeColumn(model) {
-  const col = document.createElement("div");
-  col.className = "col";
+  const card = document.createElement("div");
+  card.className = "card";
   const header = document.createElement("div");
-  header.className = "col-header";
+  header.className = "card-header";
   const name = document.createElement("span");
+  name.className = "model-id";
   name.textContent = model;
-  header.append(name);
+  const status = document.createElement("span");
+  status.className = "status";
+  status.setAttribute("aria-live", "polite");
+  const tools = document.createElement("span");
+  tools.className = "card-tools";
+  header.append(name, status, tools);
   const meta = document.createElement("div");
   meta.className = "meta";
   const body = document.createElement("div");
-  body.className = "body loading";
-  body.textContent = "running...";
-  col.append(header, meta, body);
-  resultsEl.append(col);
-  return { col, header, name, meta, body };
+  body.className = "body";
+  card.append(header, meta, body);
+  resultsEl.append(card);
+  const ui = { card, name, status, tools, meta, body };
+  setState(ui, "working");
+  return ui;
 }
 
-// Restores a column to its initial loading state so a rerun flows
-// through the exact same streaming path as a first attempt. Rebuilding
-// the header from the name alone also drops the failed attempt's diff
-// toggle and rerun control.
+// Restores a card to its initial working state so a rerun flows
+// through the exact same streaming path as a first attempt. Clearing
+// the tools also drops the failed attempt's diff, copy, fold and
+// rerun controls.
 function resetColumn(ui) {
-  ui.col.classList.remove("error");
-  ui.header.replaceChildren(ui.name);
+  setState(ui, "working");
+  ui.tools.replaceChildren();
   ui.meta.replaceChildren();
-  ui.body.className = "body loading";
-  ui.body.textContent = "running...";
+  ui.body.className = "body";
+  ui.body.replaceChildren();
+}
+
+function toolButton(label) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = "tool";
+  btn.textContent = label;
+  return btn;
+}
+
+// ---- Elapsed indicator. One shared interval serves every running
+// ---- card, so five racing models cost one timer, not five. The
+// ---- counter exists because extended-budget reasoning sits silent
+// ---- for minutes and a frozen "running" reads as hung.
+const tickers = new Map();
+let tickerTimer = null;
+
+function renderTick(ui, startMs) {
+  const secs = Math.floor((performance.now() - startMs) / 1000);
+  ui.body.textContent = "thinking, " + secs + "s";
+}
+
+function startTicker(ui) {
+  tickers.set(ui, performance.now());
+  renderTick(ui, tickers.get(ui));
+  if (tickerTimer === null) {
+    tickerTimer = setInterval(() => {
+      for (const [u, s] of tickers) renderTick(u, s);
+    }, 1000);
+  }
+}
+
+function stopTicker(ui) {
+  if (!tickers.delete(ui)) return;
+  if (tickers.size === 0 && tickerTimer !== null) {
+    clearInterval(tickerTimer);
+    tickerTimer = null;
+  }
 }
 
 // Rerun is a human clicking, never automatic: that click is the
@@ -671,11 +989,9 @@ function resetColumn(ui) {
 // so History keeps both the failure and the retry. Only live runs
 // get the control, since rerunning history would be a new experiment
 // wearing an old label.
-function addRerun(ui, prompt, model, promptId, groupId, budget) {
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "rerun-btn";
-  btn.textContent = "rerun";
+function addRerun(ui, retry) {
+  const btn = toolButton("rerun");
+  btn.classList.add("rerun-btn");
   btn.title = "Retry this model in place; the failed run stays in history";
   btn.addEventListener("click", () => {
     // The reset below removes the button, but disable first so a
@@ -684,9 +1000,9 @@ function addRerun(ui, prompt, model, promptId, groupId, budget) {
     resetColumn(ui);
     // Same budget as the run being retried, not the current control
     // value: a rerun is a second sample of the same experiment.
-    runOne(prompt, model, promptId, groupId, budget, ui);
+    runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui);
   });
-  ui.header.append(btn);
+  ui.tools.append(btn);
 }
 
 function addBadges(ui, result) {
@@ -709,7 +1025,6 @@ function addBadges(ui, result) {
 // via a text-only node like everything else.
 function applyError(ui, error) {
   if (error == null) return;
-  ui.col.classList.add("error");
   const msg = document.createElement("div");
   msg.className = "error-msg";
   // Visually separate the error from partial text when there is some.
@@ -718,20 +1033,77 @@ function applyError(ui, error) {
   ui.body.append(msg);
 }
 
-function fillColumn(ui, result, sourceLabel) {
+function addCopy(ui, text) {
+  const btn = toolButton("copy");
+  let timer = null;
+  btn.addEventListener("click", async () => {
+    // The confirmation is a fixed literal set via textContent; the
+    // copied payload itself never touches the DOM here.
+    let label = "copied";
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (err) {
+      label = "copy failed";
+    }
+    btn.textContent = label;
+    if (timer !== null) clearTimeout(timer);
+    timer = setTimeout(() => {
+      btn.textContent = "copy";
+      timer = null;
+    }, 1200);
+  });
+  ui.tools.append(btn);
+}
+
+function addFold(ui) {
+  const btn = toolButton("fold");
+  btn.setAttribute("aria-expanded", "true");
+  btn.addEventListener("click", () => {
+    const folded = ui.body.classList.toggle("folded");
+    // The unfold affordance lives in the same control: "show all"
+    // where the fold used to be.
+    btn.textContent = folded ? "show all" : "fold";
+    btn.setAttribute("aria-expanded", String(!folded));
+  });
+  ui.tools.append(btn);
+}
+
+// The one completion renderer. Live streams and history replay both
+// land here, so the safety rules (textContent only) and the contract
+// (text or error, possibly both) are enforced in a single place.
+function completeColumn(ui, result, sourceLabel, opts) {
+  stopTicker(ui);
   ui.body.classList.remove("loading");
+  if (!opts.streamed) {
+    // textContent on purpose: model output is untrusted and must never
+    // be parsed as HTML. pre-wrap in CSS keeps line breaks readable.
+    ui.body.textContent = result.response_text != null ? result.response_text : "";
+  }
   addBadges(ui, result);
-  // History replay only, never live columns: two attempts at
-  // different budgets are different experiments, and the replay must
-  // say which is which. Pre-budget rows carry null and show nothing.
-  if (result.max_tokens != null) {
+  // Budget badge on history replay only, never live columns: two
+  // attempts at different budgets are different experiments, and the
+  // replay must say which is which. Pre-budget rows carry null and
+  // show nothing.
+  if (opts.budgetBadge && result.max_tokens != null) {
     ui.meta.append(badge("budget " + result.max_tokens));
   }
-  // textContent on purpose: model output is untrusted and must never be
-  // parsed as HTML. pre-wrap in CSS keeps its line breaks readable.
-  ui.body.textContent = result.response_text != null ? result.response_text : "";
-  applyError(ui, result.error);
+  const error = "shownError" in opts ? opts.shownError : result.error;
+  applyError(ui, error);
+  setState(ui, error != null ? "error" : "done");
+  if (result.response_text != null) {
+    addCopy(ui, result.response_text);
+    addFold(ui);
+  }
   registerDiffable(ui, result, sourceLabel);
+  if (opts.retry) addRerun(ui, opts.retry);
+}
+
+function fillColumn(ui, result, sourceLabel) {
+  completeColumn(ui, result, sourceLabel, {
+    streamed: false,
+    budgetBadge: true,
+    retry: null,
+  });
 }
 
 // ---- Diff view. Pure functions first (tokenize, lcs, render) so a JS
@@ -809,7 +1181,7 @@ function renderDiff(ops, container) {
       container.append(document.createTextNode(run.text));
     } else {
       // createElement plus textContent only: model output stays
-      // untrusted in diff form, exactly as in the columns.
+      // untrusted in diff form, exactly as in the cards.
       const el = document.createElement(run.op === "del" ? "del" : "ins");
       el.textContent = run.text;
       container.append(el);
@@ -831,7 +1203,7 @@ const diffPanel = document.getElementById("diff-panel");
 const diffTitle = document.getElementById("diff-title");
 const diffBody = document.getElementById("diff-body");
 // Armed side of a pending diff. Holds the result data, not just the
-// element: history replay replaces the columns, and surviving that is
+// element: history replay replaces the cards, and surviving that is
 // what makes live-vs-historical diffs possible.
 let armedDiff = null;
 
@@ -841,13 +1213,20 @@ function closeDiffPanel() {
   diffBody.replaceChildren();
 }
 
+function setArmed(btn, on) {
+  btn.classList.toggle("armed", on);
+  btn.setAttribute("aria-pressed", String(on));
+}
+
 // Arming deliberately survives history replay (that is what makes
-// live-vs-historical diffs possible), but not a new Run: its columns
+// live-vs-historical diffs possible), but not a new Run: its cards
 // supersede the comparison the armed result came from, and a later
-// toggle would silently diff against a vanished column.
+// toggle would silently diff against a vanished card.
 function disarmDiff() {
   if (armedDiff !== null) {
-    armedDiff.btn.classList.remove("armed");
+    // The armed button may already be detached (replaced results);
+    // clearing the state is harmless either way.
+    setArmed(armedDiff.btn, false);
     armedDiff = null;
   }
 }
@@ -865,37 +1244,35 @@ function openDiff(a, b) {
 }
 
 function registerDiffable(ui, result, sourceLabel) {
-  // Error-only columns have nothing to diff; partial text (the 4b
+  // Error-only cards have nothing to diff; partial text (the
   // both-text-and-error contract) is diffable and labeled as such.
   if (result.response_text == null || sourceLabel == null) return;
   const label = sourceLabel + (result.error != null ? " (partial)" : "");
-  const btn = document.createElement("button");
-  btn.className = "diff-toggle";
-  btn.type = "button";
-  btn.textContent = "diff";
+  const btn = toolButton("diff");
+  btn.setAttribute("aria-pressed", "false");
   btn.addEventListener("click", () => {
     if (armedDiff !== null && armedDiff.btn === btn) {
-      btn.classList.remove("armed");
+      setArmed(btn, false);
       armedDiff = null;
       return;
     }
     if (armedDiff === null) {
       armedDiff = { btn: btn, result: result, label: label };
-      btn.classList.add("armed");
+      setArmed(btn, true);
       return;
     }
     openDiff(armedDiff, { btn: btn, result: result, label: label });
-    // The armed button may already be detached (replaced results);
-    // removing the class is harmless either way.
-    armedDiff.btn.classList.remove("armed");
+    setArmed(armedDiff.btn, false);
     armedDiff = null;
   });
-  ui.header.append(btn);
+  ui.tools.append(btn);
 }
 
 document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
 
 async function runOne(prompt, model, promptId, groupId, budget, ui) {
+  ui.body.classList.add("loading");
+  startTicker(ui);
   // Deltas append to a dedicated text node: appendData is a pure text
   // API, so the no-HTML injection rule holds for every chunk, and the
   // node survives into the error state if the stream dies partway.
@@ -903,6 +1280,8 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
   let finished = false;
   function appendDelta(text) {
     if (textNode === null) {
+      // First token: the thinking counter has done its job.
+      stopTicker(ui);
       ui.body.classList.remove("loading");
       ui.body.textContent = "";
       textNode = document.createTextNode("");
@@ -915,9 +1294,6 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
     // was rendered must not stack a second set of badges or errors.
     if (finished) return;
     finished = true;
-    ui.body.classList.remove("loading");
-    if (textNode === null) ui.body.textContent = "";
-    addBadges(ui, result);
     // Presentation only, never persisted: the stored error stays the
     // server's exact words. The extended budget is the one knob the
     // user can turn when reasoning burned the whole standard budget,
@@ -930,13 +1306,16 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
     ) {
       shownError += "; try extended budget";
     }
-    applyError(ui, shownError);
-    registerDiffable(ui, result, model + " (live)");
-    // Only this streaming path offers a rerun; historical replays go
-    // through fillColumn and never get one.
-    if (result.error != null) {
-      addRerun(ui, prompt, model, promptId, groupId, budget);
-    }
+    completeColumn(ui, result, model + " (live)", {
+      streamed: textNode !== null,
+      shownError: shownError,
+      budgetBadge: false,
+      // Only this streaming path offers a rerun; historical replays go
+      // through fillColumn and never get one.
+      retry: result.error != null
+        ? { prompt, model, promptId, groupId, budget }
+        : null,
+    });
   }
 
   try {
@@ -978,7 +1357,7 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
     // Network death mid-stream lands here; partial text stays visible
     // through the same error rendering as a server-reported failure.
     // The streamed text is folded into the synthetic result so the
-    // column stays diffable on its partial text.
+    // card stays diffable on its partial text.
     finish({
       error: "request failed: " + err.message,
       response_text: textNode !== null ? textNode.data : null,
@@ -993,14 +1372,17 @@ runBtn.addEventListener("click", async () => {
   const models = checkedModels();
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
-  // A new comparison replaces the columns a shown diff came from.
+  // A new comparison replaces the cards a shown diff came from.
   closeDiffPanel();
   disarmDiff();
   running = true;
   updateRunState();
+  sessionRuns += 1;
+  sessionRunsEl.textContent =
+    sessionRuns + (sessionRuns === 1 ? " run" : " runs") + " this session";
   // One request per model instead of one batch: /compare returns only when
   // its slowest model finishes, and the bench exists to watch fast models
-  // land first. Columns are created up front so order tracks the checkbox
+  // land first. Cards are created up front so order tracks the chip
   // list, not response arrival.
   const columns = models.map(makeColumn);
   // One group per Run click so the N per-model requests land as one
@@ -1023,11 +1405,22 @@ runBtn.addEventListener("click", async () => {
   updateRunState();
 });
 
-// History loads on expand rather than page load: it is the rarely used
-// half of the page and a stale list is worse than a slightly later one.
+// ---- History. Loads on expand rather than page load: it is the
+// ---- rarely used half of the page and a stale list is worse than a
+// ---- slightly later one.
 historyEl.addEventListener("toggle", () => {
   if (historyEl.open) loadHistory();
 });
+
+// Client-side only: the filter narrows what is already on screen, it
+// never refetches. Matches the visible prompt text and model ids.
+historyFilter.addEventListener("input", applyHistoryFilter);
+function applyHistoryFilter() {
+  const q = historyFilter.value.trim().toLowerCase();
+  for (const row of historyList.querySelectorAll(".hrow")) {
+    row.hidden = q !== "" && !row.dataset.hay.includes(q);
+  }
+}
 
 // Explicit rather than relying on the server default, so the "showing
 // newest N" note below cannot drift out of sync with what was asked.
@@ -1049,8 +1442,11 @@ async function loadHistory() {
     return;
   }
   for (const run of data.runs) {
-    const row = document.createElement("div");
+    // Buttons, not divs: rows must be reachable by keyboard.
+    const row = document.createElement("button");
+    row.type = "button";
     row.className = "hrow";
+    row.dataset.hay = (run.prompt_text + " " + run.models.join(" ")).toLowerCase();
     const time = document.createElement("span");
     time.className = "htime";
     // Labeled like the replay banner: an unlabeled timestamp reads as
@@ -1061,7 +1457,12 @@ async function loadHistory() {
     text.textContent = run.prompt_text;
     const models = document.createElement("span");
     models.className = "hmodels";
-    models.textContent = run.models.join(", ");
+    for (const m of run.models) {
+      const chip = document.createElement("span");
+      chip.className = "hchip";
+      chip.textContent = m;
+      models.append(chip);
+    }
     row.append(time, text, models);
     row.addEventListener("click", () =>
       run.type === "group" ? showGroup(run.id) : showRun(run.id)
@@ -1077,6 +1478,8 @@ async function loadHistory() {
       "showing the newest " + HISTORY_LIMIT + " entries; older ones are still in bench.db";
     historyList.append(note);
   }
+  // A filter typed before this refresh still applies to the new rows.
+  applyHistoryFilter();
 }
 
 async function showGroup(groupId) {
@@ -1091,16 +1494,16 @@ async function showGroup(groupId) {
     return;
   }
   resultsEl.replaceChildren();
-  // The panel would otherwise keep showing a diff of columns that no
+  // The panel would otherwise keep showing a diff of cards that no
   // longer exist; the ARMED side stays, by design, for cross-replay
   // diffing.
   closeDiffPanel();
   runLabelEl.textContent =
     "Historical comparison #" + group.id + " from " +
     group.created_at.slice(0, 19).replace("T", " ") + " UTC";
-  // Columns in checkbox (lineup) order, matching the live layout. Runs
+  // Cards in chip (lineup) order, matching the live layout. Runs
   // persist in completion order, so run order alone would shuffle
-  // columns between replays; models no longer in the lineup keep run
+  // cards between replays; models no longer in the lineup keep run
   // order at the end.
   const results = group.runs.flatMap(r => r.results);
   const rank = m => {
@@ -1127,7 +1530,7 @@ async function showRun(runId) {
     runLabelEl.textContent = "failed to load run #" + runId + ": " + err.message;
     return;
   }
-  // Same column renderer as a live run so the textContent and
+  // Same completion renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too.
   resultsEl.replaceChildren();
   closeDiffPanel();
