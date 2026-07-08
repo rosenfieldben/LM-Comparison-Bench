@@ -43,6 +43,18 @@ async def test_timeout_returns_error_dict(client):
 
 
 @respx.mock
+async def test_connect_timeout_names_the_connect_ceiling(client):
+    # A connect timeout fires after CONNECT_TIMEOUT_S; the generic read
+    # timeout message would overstate the wait eighteenfold.
+    respx.post(OPENROUTER_URL).mock(side_effect=httpx.ConnectTimeout("handshake"))
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == "could not connect within 10s"
+
+
+@respx.mock
 async def test_http_429_mentions_status(client):
     respx.post(OPENROUTER_URL).respond(status_code=429, json={"error": "rate limited"})
 
@@ -229,6 +241,19 @@ async def test_stream_stall_yields_timeout_error(client):
     result = events[-1]["result"]
     assert result["response_text"] == "Hel"
     assert result["error"] == "stream stalled: no data for 300s"
+
+
+@respx.mock
+async def test_stream_connect_timeout_is_not_reported_as_a_stall(client):
+    respx.post(OPENROUTER_URL).mock(side_effect=httpx.ConnectTimeout("handshake"))
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert len(events) == 1
+    result = events[0]["result"]
+    assert result["error"] == "could not connect within 10s"
+    assert result["response_text"] is None
+    assert result["ttft_ms"] is None
 
 
 @respx.mock

@@ -66,7 +66,9 @@ def client(monkeypatch, tmp_path):
         return json.loads(json.dumps(TEST_CATALOG))
 
     monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
-    with TestClient(app) as c:
+    # base_url picks the Host header; the default "testserver" would be
+    # rejected by the localhost guard like any other non-local name.
+    with TestClient(app, base_url="http://localhost") as c:
         yield c
 
 
@@ -572,6 +574,46 @@ def test_unknown_budget_string_is_422(client):
     assert resp.status_code == 422
 
 
+def test_non_local_host_header_is_403(client):
+    # DNS rebinding: the attacker's page becomes same-origin with the
+    # bench, but its requests still carry the attacker's hostname.
+    for host in ("attacker.example", "attacker.example:8000", "testserver"):
+        resp = client.get("/models", headers={"host": host})
+        assert resp.status_code == 403, host
+
+
+def test_local_host_header_variants_are_accepted(client):
+    # Every spelling a local browser or curl actually sends, ports and
+    # bracketed IPv6 included.
+    for host in ("localhost", "localhost:8000", "127.0.0.1:8000", "[::1]:8000"):
+        resp = client.get("/models", headers={"host": host})
+        assert resp.status_code == 200, host
+
+
+@respx.mock
+def test_cross_site_textplain_post_is_415_and_never_reaches_upstream(client):
+    # A "simple" cross-site request: fetch() with a text/plain body
+    # needs no CORS preflight, so the guard is the only thing standing
+    # between a malicious page and the API key's wallet.
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    resp = client.post(
+        "/compare",
+        content=json.dumps({"prompt": "hi", "models": ["model/alpha"]}),
+        headers={"content-type": "text/plain"},
+    )
+
+    assert resp.status_code == 415
+    assert not route.called
+
+
+def test_bodyless_post_needs_no_content_type(client):
+    # The frontend creates groups via fetch(..., {method: "POST"}) with
+    # no body and no content-type; the guard must not break that.
+    resp = client.post("/groups")
+    assert resp.status_code == 201
+
+
 def test_models_endpoint_returns_catalog_with_pricing(client):
     body = client.get("/models").json()
 
@@ -627,7 +669,7 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
         return {"fetched": False, "models": [], "prices": {}}
 
     monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
-    with TestClient(app) as c:
+    with TestClient(app, base_url="http://localhost") as c:
         body = c.get("/models").json()
         assert body == {"models": [], "fetched": False}
 

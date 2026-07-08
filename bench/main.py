@@ -12,8 +12,9 @@ from typing import Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Response
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.datastructures import Headers
 
 from bench import store
 from bench.models import (
@@ -197,6 +198,83 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
+
+# The bench is a localhost tool holding a paid API key, which makes it a
+# target for the two ways a browser gets turned against local servers.
+# First, cross-site "simple" POSTs: a malicious page can fire fetch() at
+# http://localhost:8000 with a text/plain body and no CORS preflight,
+# and although it cannot read the response, each /compare call it lands
+# spends real money upstream. Second, DNS rebinding: an attacker's
+# hostname re-resolving to 127.0.0.1 makes the page same-origin with
+# the bench, granting full read access. Requiring JSON bodies on POST
+# forces cross-origin senders into a preflight nothing here answers,
+# and rejecting non-local Host headers kills rebinding (the rebound
+# page's requests carry the attacker's hostname in Host).
+TRUSTED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def host_header_name(host: str) -> str:
+    """The hostname part of a Host header value, port stripped.
+
+    Handles bracketed IPv6 ([::1]:8000) explicitly: a naive rsplit on
+    ":" would chop the address itself. A bare IPv6 with no brackets has
+    multiple colons and falls through unchanged.
+    """
+    host = host.strip().lower()
+    if host.startswith("[") and "]" in host:
+        return host[1 : host.index("]")]
+    if host.count(":") == 1:
+        return host.rsplit(":", 1)[0]
+    return host
+
+
+class LocalOnlyGuard:
+    """Reject requests that could only come from a hostile browser page.
+
+    Pure ASGI rather than BaseHTTPMiddleware: the streaming endpoint
+    relies on generator cancellation to persist aborted runs, and a
+    wrapping middleware layer is one more thing that could interfere
+    with disconnect propagation.
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        # A missing Host header (raw HTTP/1.0 clients) fails closed.
+        host = host_header_name(headers.get("host", ""))
+        if host not in TRUSTED_HOSTS:
+            response = JSONResponse(
+                {"detail": "the bench only answers to localhost"},
+                status_code=403,
+            )
+            await response(scope, receive, send)
+            return
+        # Only POSTs carrying a body need the content-type gate: DELETE
+        # is never a "simple" cross-site method, and the frontend's
+        # bodyless POST /groups sends no content-type at all.
+        has_body = "transfer-encoding" in headers or headers.get(
+            "content-length", "0"
+        ) not in ("", "0")
+        if (
+            scope["method"] == "POST"
+            and has_body
+            and not headers.get("content-type", "").startswith("application/json")
+        ):
+            response = JSONResponse(
+                {"detail": "POST bodies must be application/json"},
+                status_code=415,
+            )
+            await response(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(LocalOnlyGuard)
 
 INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
