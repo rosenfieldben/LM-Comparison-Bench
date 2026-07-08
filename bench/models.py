@@ -221,6 +221,13 @@ async def run_model(
         response = await client.post(
             OPENROUTER_URL, json=payload, timeout=COMPLETION_TIMEOUT
         )
+    # ConnectTimeout before the generic catch: it fires after
+    # CONNECT_TIMEOUT_S, and the generic message would claim a wait
+    # eighteen times longer than what actually happened.
+    except httpx.ConnectTimeout:
+        result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
+        result["error"] = f"could not connect within {CONNECT_TIMEOUT_S:.0f}s"
+        return result
     except httpx.TimeoutException:
         result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
         result["error"] = f"no response within {COMPLETION_READ_TIMEOUT_S:.0f}s"
@@ -384,6 +391,11 @@ async def stream_model(
                         result["ttft_ms"] = elapsed_ms()
                     text_parts.append(text)
                     yield {"type": "delta", "text": text}
+    # Same split as run_model: a connect timeout is not a stall, and
+    # "no data for 300s" would misreport a 10s handshake failure.
+    except httpx.ConnectTimeout:
+        yield done(f"could not connect within {CONNECT_TIMEOUT_S:.0f}s")
+        return
     except httpx.TimeoutException:
         yield done(f"stream stalled: no data for {STREAM_READ_TIMEOUT_S:.0f}s")
         return
