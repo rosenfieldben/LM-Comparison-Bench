@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
@@ -128,6 +128,10 @@ class CatalogModel(BaseModel):
     context_length: int | None
     prompt_price: float | None
     completion_price: float | None
+    # The published completion cap the budget clamp works from. Exposed
+    # so the picker can show why "extended" quietly becomes less on
+    # capped models; None when the catalog does not publish one.
+    max_completion_tokens: int | None
 
 
 class CatalogResponse(BaseModel):
@@ -475,8 +479,11 @@ async def remove_prompt(prompt_id: int) -> Response:
 
 
 @app.get("/runs", response_model=RunList)
-async def get_runs() -> dict:
-    runs = store.list_runs(app.state.db)
+async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
+    # Bounded so history stays cheap as bench.db grows. The 500 ceiling
+    # keeps the id lists list_runs binds comfortably under sqlite's
+    # variable limit.
+    runs = store.list_runs(app.state.db, limit)
     # Append a marker only when a cut happened, so API consumers can tell
     # a short prompt from a truncated one.
     for run in runs:

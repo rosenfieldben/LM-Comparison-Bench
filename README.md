@@ -24,10 +24,10 @@ the picker falls back to adding models by exact id.
 
 ## Setup
 
-Requires Python 3.12.
+Requires Python 3.11 or newer; CI runs the suite on 3.11 and 3.12.
 
 ```sh
-python3.12 -m venv .venv
+python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 export OPENROUTER_API_KEY=sk-or-...
 .venv/bin/uvicorn bench.main:app
@@ -104,8 +104,9 @@ what is actually being measured. The preference lives in
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
 models to compare, hit Run. Each column fills in as its model
-responds. The model list is a hand-edited const at the top of the
-script block in `static/index.html`.
+responds. The lineup is managed with the picker (see Daily use); the
+four-model default seed for a fresh browser is `DEFAULT_LINEUP` at
+the top of the script block in `static/index.html`.
 
 Or hit the API directly:
 
@@ -166,7 +167,12 @@ Other endpoints:
 - `GET /groups/{id}` returns a group's runs with full results
 - `GET /runs` lists history, most recent first, prompt text truncated
   to 80 chars; entries are either `{type: "group", ...}` for grouped
-  comparisons or `{type: "run", ...}` for legacy ungrouped rows
+  comparisons or `{type: "run", ...}` for legacy ungrouped rows.
+  Returns the newest 100 entries by default; `?limit=` (1 to 500)
+  adjusts the page size, and a group entry always carries all of its
+  runs even when the page boundary falls inside it. The browser
+  history panel notes when a full page was returned, since older
+  entries then exist beyond it
 - `GET /runs/{id}` returns a full run with results
 
 ## Diff view
@@ -185,7 +191,11 @@ instead of freezing the tab.
 
 ## Tests
 
+Test-only dependencies live in `requirements-dev.txt`, which pulls in
+the runtime pins too:
+
 ```sh
+.venv/bin/pip install -r requirements-dev.txt
 .venv/bin/pytest
 ```
 

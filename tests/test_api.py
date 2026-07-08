@@ -28,6 +28,7 @@ TEST_CATALOG = {
             "context_length": 128000,
             "prompt_price": 1e-06,
             "completion_price": 2e-06,
+            "max_completion_tokens": None,
         },
         {
             "id": "model/bare",
@@ -35,6 +36,7 @@ TEST_CATALOG = {
             "context_length": None,
             "prompt_price": None,
             "completion_price": None,
+            "max_completion_tokens": None,
         },
         # Publishes a completion cap below the extended budget, so the
         # per-model clamp has something to bite on.
@@ -258,6 +260,21 @@ def test_runs_short_prompt_is_not_marked_truncated(client):
 
     runs = client.get("/runs").json()["runs"]
     assert runs[0]["prompt_text"] == "short prompt"
+
+
+@respx.mock
+def test_runs_limit_param_bounds_history(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    client.post("/compare", json={"prompt": "one", "models": ["model/a"]})
+    client.post("/compare", json={"prompt": "two", "models": ["model/a"]})
+
+    runs = client.get("/runs?limit=1").json()["runs"]
+    assert len(runs) == 1
+    assert runs[0]["prompt_text"] == "two"
+
+    # Bounds are enforced, not silently clamped.
+    assert client.get("/runs?limit=0").status_code == 422
+    assert client.get("/runs?limit=501").status_code == 422
 
 
 def test_create_duplicate_prompt_yields_409(client):
@@ -624,12 +641,16 @@ def test_models_endpoint_returns_catalog_with_pricing(client):
     assert alpha["context_length"] == 128000
     assert alpha["prompt_price"] == 1e-06
     assert alpha["completion_price"] == 2e-06
+    assert alpha["max_completion_tokens"] is None
     # Entries with missing metadata survive as None rather than vanish.
     bare = body["models"][1]
     assert bare["id"] == "model/bare"
     assert bare["name"] is None
     assert bare["context_length"] is None
     assert bare["prompt_price"] is None
+    # The published completion cap survives into the API instead of
+    # being silently filtered by the response model.
+    assert body["models"][2]["max_completion_tokens"] == 32000
 
 
 def test_lifespan_client_transport_carries_keepalive_options(monkeypatch, tmp_path):

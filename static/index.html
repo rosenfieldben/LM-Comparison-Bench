@@ -230,6 +230,7 @@
   }
   .hrow:hover { background: #f0efec; }
   .hrow .htime { color: #888; white-space: nowrap; }
+  .hnote { padding: 0.45rem 0.3rem; font-size: 0.8rem; color: #888; font-style: italic; }
   .hrow .hprompt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hrow .hmodels { color: #777; white-space: nowrap; }
 </style>
@@ -474,6 +475,11 @@ function renderMatches() {
       fmtPricing(m) +
       (m.context_length != null
         ? ", " + m.context_length.toLocaleString() + " ctx"
+        : "") +
+      // The published completion cap, when there is one: it is why an
+      // extended-budget run on this model may be clamped below 65536.
+      (m.max_completion_tokens != null
+        ? ", " + m.max_completion_tokens.toLocaleString() + " max out"
         : "");
     row.append(name, id, meta);
     if (lineup.includes(m.id)) {
@@ -1023,11 +1029,15 @@ historyEl.addEventListener("toggle", () => {
   if (historyEl.open) loadHistory();
 });
 
+// Explicit rather than relying on the server default, so the "showing
+// newest N" note below cannot drift out of sync with what was asked.
+const HISTORY_LIMIT = 100;
+
 async function loadHistory() {
   historyList.replaceChildren();
   let data;
   try {
-    const resp = await fetch("/runs");
+    const resp = await fetch("/runs?limit=" + HISTORY_LIMIT);
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     data = await resp.json();
   } catch (err) {
@@ -1043,7 +1053,9 @@ async function loadHistory() {
     row.className = "hrow";
     const time = document.createElement("span");
     time.className = "htime";
-    time.textContent = run.created_at.slice(0, 19).replace("T", " ");
+    // Labeled like the replay banner: an unlabeled timestamp reads as
+    // local time, and these are UTC.
+    time.textContent = run.created_at.slice(0, 19).replace("T", " ") + " UTC";
     const text = document.createElement("span");
     text.className = "hprompt";
     text.textContent = run.prompt_text;
@@ -1055,6 +1067,15 @@ async function loadHistory() {
       run.type === "group" ? showGroup(run.id) : showRun(run.id)
     );
     historyList.append(row);
+  }
+  // A full page means there may be older entries beyond it; say so
+  // rather than letting truncation read as "this is everything".
+  if (data.runs.length === HISTORY_LIMIT) {
+    const note = document.createElement("div");
+    note.className = "hnote";
+    note.textContent =
+      "showing the newest " + HISTORY_LIMIT + " entries; older ones are still in bench.db";
+    historyList.append(note);
   }
 }
 

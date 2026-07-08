@@ -12,7 +12,9 @@ MODELS_URL = "https://openrouter.ai/api/v1/models"
 # Reaching OpenRouter should be fast; a slow connect is a real failure.
 CONNECT_TIMEOUT_S = 10.0
 
-# Extended-budget reasoning can legitimately sit silent for minutes between visible bytes; five # minutes of true wire silence is failure by any standard.
+# Extended-budget reasoning can legitimately sit silent for minutes
+# between visible bytes; five minutes of true wire silence is failure
+# by any standard.
 STREAM_READ_TIMEOUT_S = 300.0
 
 # Non-streaming path, where the single read covers the entire
@@ -152,13 +154,6 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict:
             model["completion_price"] = None
         models.append(model)
     return {"fetched": True, "models": models, "prices": prices}
-
-
-async def fetch_prices(client: httpx.AsyncClient) -> dict:
-    """Price map only. Kept for its established contract; the lifespan
-    uses fetch_catalog so pricing and the picker share one upstream
-    call per boot."""
-    return (await fetch_catalog(client))["prices"]
 
 
 def _flatten_content(content) -> str | None:
