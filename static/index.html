@@ -721,18 +721,18 @@
 <section id="deck" class="panel" aria-label="Run controls">
   <div id="prompt-row">
     <span class="panel-label">Prompt</span>
-    <span id="linked-name"></span>
-    <span id="prompt-msg" role="status"></span>
+    <span id="linked-name" data-testid="linked-name"></span>
+    <span id="prompt-msg" data-testid="prompt-msg" role="status"></span>
     <div id="prompt-actions">
       <span class="sel-wrap">
-        <select id="saved-prompts" aria-label="Saved prompts">
+        <select id="saved-prompts" data-testid="saved-prompts" aria-label="Saved prompts">
           <option value="">Saved</option>
         </select>
       </span>
-      <button id="save-prompt" type="button">Save</button>
+      <button id="save-prompt" data-testid="save-prompt" type="button">Save</button>
       <span id="name-row" hidden>
-        <input id="prompt-name" type="text" placeholder="Name for this prompt">
-        <button id="confirm-save" type="button">OK</button>
+        <input id="prompt-name" data-testid="prompt-name" type="text" placeholder="Name for this prompt">
+        <button id="confirm-save" data-testid="confirm-save" type="button">OK</button>
         <button id="cancel-save" type="button" class="ghost">Cancel</button>
       </span>
       <button id="delete-prompt" type="button" disabled>Delete</button>
@@ -740,12 +740,12 @@
   </div>
   <div id="prompt-box">
     <span class="caret-glyph" aria-hidden="true">❯</span>
-    <textarea id="prompt" rows="1" placeholder="Prompt to send to every checked model"></textarea>
+    <textarea id="prompt" data-testid="prompt-input" rows="1" placeholder="Prompt to send to every checked model"></textarea>
   </div>
 
   <div id="lineup-row">
     <span class="panel-label" id="lineup-label">Lineup 0/0</span>
-    <div id="models"></div>
+    <div id="models" data-testid="lineup"></div>
     <div id="lineup-actions">
       <button id="select-all" type="button" class="ghost">All</button>
       <button id="select-none" type="button" class="ghost">None</button>
@@ -759,11 +759,11 @@
   </div>
 
   <div id="run-row">
-    <button id="run" disabled>Run</button>
+    <button id="run" data-testid="run-button" disabled>Run</button>
     <div class="seg" id="budget-seg" role="group" aria-label="Completion token budget"
          title="Completion token budget for every model in the run">
-      <button type="button" data-value="standard" aria-pressed="true">standard 16k</button>
-      <button type="button" data-value="extended" aria-pressed="false">extended 64k</button>
+      <button type="button" data-value="standard" data-testid="budget-standard" aria-pressed="true">standard 16k</button>
+      <button type="button" data-value="extended" data-testid="budget-extended" aria-pressed="false">extended 64k</button>
     </div>
     <div class="seg" id="density-seg" role="group" aria-label="Column density"
          title="Result card density; compact fits more models side by side">
@@ -783,27 +783,27 @@
   <div id="race-grid"></div>
 </section>
 
-<div id="run-label" role="status"></div>
+<div id="run-label" data-testid="run-label" role="status"></div>
 <div id="results"></div>
 
-<div id="diff-panel" class="panel" hidden>
+<div id="diff-panel" data-testid="diff-panel" class="panel" hidden>
   <div id="diff-header">
     <span id="diff-dot"></span>
     <span id="diff-label">Diff</span>
     <span id="diff-title"></span>
-    <button id="diff-close" type="button" class="tool diff-btn">close</button>
+    <button id="diff-close" data-testid="diff-close" type="button" class="tool diff-btn">close</button>
   </div>
-  <div id="diff-body"></div>
+  <div id="diff-body" data-testid="diff-body"></div>
 </div>
 
 <details id="history">
-  <summary>History</summary>
+  <summary data-testid="history-toggle">History</summary>
   <div id="history-tools">
     <input id="history-filter" type="text" aria-label="Filter history"
            placeholder="filter: prompt or model id">
     <span id="history-note"></span>
   </div>
-  <div id="history-list"></div>
+  <div id="history-list" data-testid="history-list"></div>
 </details>
 </div>
 
@@ -1005,6 +1005,7 @@ function renderLineup() {
   for (const model of lineup) {
     const chip = document.createElement("label");
     chip.className = "chip";
+    chip.dataset.testid = "lineup-chip";
     chip.title = model;
     const box = document.createElement("input");
     box.type = "checkbox";
@@ -1500,6 +1501,7 @@ function metricCell(key, label) {
   k.textContent = label;
   const v = document.createElement("div");
   v.className = "mv empty";
+  v.dataset.testid = "metric-" + key;
   v.textContent = "—";
   cell.append(k, v);
   return { cell, v };
@@ -1524,15 +1526,18 @@ function setMetric(el, text, unit) {
 function makeColumn(model) {
   const card = document.createElement("div");
   card.className = "card";
+  card.dataset.testid = "result-card";
   const header = document.createElement("div");
   header.className = "card-header";
   const name = document.createElement("span");
   name.className = "model-id";
+  name.dataset.testid = "card-model";
   name.textContent = model;
   const dot = document.createElement("span");
   dot.className = "state-dot";
   const status = document.createElement("span");
   status.className = "status";
+  status.dataset.testid = "card-status";
   const statusWord = document.createElement("span");
   statusWord.setAttribute("aria-live", "polite");
   const statusTime = document.createElement("span");
@@ -1550,6 +1555,7 @@ function makeColumn(model) {
   metrics.append(ttft.cell, total.cell, tok.cell, cost.cell);
   const body = document.createElement("div");
   body.className = "body";
+  body.dataset.testid = "card-body";
   const tools = document.createElement("div");
   tools.className = "card-tools";
   card.append(header, shimmer, metrics, body, tools);
@@ -1627,6 +1633,7 @@ function stopTicker(ui) {
 // wearing an old label.
 function addRerun(ui, retry) {
   const btn = toolButton("rerun");
+  btn.dataset.testid = "tool-rerun";
   btn.classList.add("rerun-btn");
   btn.title = "Retry this model in place; the failed run stays in history";
   btn.addEventListener("click", () => {
@@ -1673,6 +1680,7 @@ function applyError(ui, error) {
   if (error == null) return;
   const msg = document.createElement("div");
   msg.className = "error-msg";
+  msg.dataset.testid = "card-error";
   // Visually separate the error from partial text when there is some.
   if (ui.body.textContent !== "") msg.classList.add("after-text");
   msg.textContent = error;
@@ -1681,6 +1689,7 @@ function applyError(ui, error) {
 
 function addCopy(ui, text) {
   const btn = toolButton("copy");
+  btn.dataset.testid = "tool-copy";
   let timer = null;
   btn.addEventListener("click", async () => {
     // The confirmation is a fixed literal set via textContent; the
@@ -1703,6 +1712,7 @@ function addCopy(ui, text) {
 
 function addFold(ui) {
   const btn = toolButton("fold");
+  btn.dataset.testid = "tool-fold";
   btn.setAttribute("aria-expanded", "true");
   btn.addEventListener("click", () => {
     const folded = ui.body.classList.toggle("folded");
@@ -1902,6 +1912,7 @@ function registerDiffable(ui, result, sourceLabel) {
   if (result.response_text == null || sourceLabel == null) return;
   const label = sourceLabel + (result.error != null ? " (partial)" : "");
   const btn = toolButton(result.error != null ? "diff (partial)" : "diff");
+  btn.dataset.testid = "tool-diff";
   btn.classList.add("diff-btn");
   btn.dataset.base = btn.textContent;
   btn.setAttribute("aria-pressed", "false");
@@ -2126,6 +2137,7 @@ async function loadHistory() {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "hrow";
+    row.dataset.testid = "history-row";
     // The filter matches model ids even though rows only show a count.
     row.dataset.hay = (run.prompt_text + " " + run.models.join(" ")).toLowerCase();
     const time = document.createElement("span");
@@ -2138,6 +2150,7 @@ async function loadHistory() {
     text.textContent = run.prompt_text;
     const count = document.createElement("span");
     count.className = "hcount";
+    count.dataset.testid = "history-count";
     count.textContent =
       run.models.length + (run.models.length === 1 ? " model" : " models");
     row.append(time, text, count);

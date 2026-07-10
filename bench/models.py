@@ -1,13 +1,18 @@
 """Core model-calling logic. Pure functions over an injected httpx client."""
 
 import json
+import os
 import socket
 import time
 
 import httpx
 
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-MODELS_URL = "https://openrouter.ai/api/v1/models"
+# Env-overridable as a test seam so the browser harness can point the
+# real app at a stub upstream; not a configuration feature.
+OPENROUTER_URL = os.environ.get(
+    "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
+)
+MODELS_URL = os.environ.get("MODELS_URL", "https://openrouter.ai/api/v1/models")
 
 # Reaching OpenRouter should be fast; a slow connect is a real failure.
 CONNECT_TIMEOUT_S = 10.0
