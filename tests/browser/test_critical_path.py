@@ -278,3 +278,17 @@ def test_10_seven_model_fanout_loses_and_reorders_nothing(bench):
         expect(card.get_by_test_id("card-model")).to_have_text(model)
         expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
         expect(card.get_by_test_id("card-body")).to_have_text(f"reply from {model}")
+
+
+def test_11_chip_controls_carry_their_own_accessible_names(bench):
+    page = bench(["stub/fast", "stub/slow"])
+
+    # The label owns only the checkbox, so the checkbox is named by the
+    # model id alone; the remove button names its action and target
+    # itself. Before the chip restructure the wrapping label absorbed
+    # the remove button's text into the checkbox's name.
+    chip = page.get_by_test_id("lineup-chip").first
+    expect(chip.get_by_role("checkbox")).to_have_accessible_name("stub/fast")
+    expect(chip.get_by_role("button")).to_have_accessible_name(
+        "Remove stub/fast from lineup"
+    )
