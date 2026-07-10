@@ -307,10 +307,29 @@ app.add_middleware(LocalOnlyGuard)
 
 INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
 
+# Hand-written bolt in the VOLT accent, sized to stay legible at 16px.
+# Served inline because browsers request /favicon.ico unprompted and
+# every miss was a 404 line of noise in the run logs.
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16">'
+    '<path d="M9.5 1 3 9.5h4L5.5 15 13 6.5H9L9.5 1z" fill="#38bdd8"/>'
+    "</svg>"
+)
+
 
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(INDEX_HTML)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    # Immutable is honest: the icon only changes when the app does.
+    return Response(
+        FAVICON_SVG,
+        media_type="image/svg+xml",
+        headers={"Cache-Control": "public, max-age=31536000, immutable"},
+    )
 
 
 def cost_usd(result: dict, prices: dict) -> float | None:

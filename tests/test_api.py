@@ -1008,3 +1008,13 @@ async def test_stream_queue_wait_is_not_reported_as_latency_or_ttft(
     # nor time to first token may include the queue wait.
     assert fast_done["latency_ms"] < 300
     assert fast_done["ttft_ms"] < 300
+
+
+def test_favicon_served_inline_with_cache_headers(client):
+    resp = client.get("/favicon.ico")
+
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("image/svg+xml")
+    # Long-lived caching is the point: one request per browser, ever.
+    assert "max-age" in resp.headers.get("cache-control", "")
+    assert b"<svg" in resp.content

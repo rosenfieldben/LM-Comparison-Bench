@@ -355,3 +355,7 @@ picked up without restarts, and verify by eyeball after UI changes:
   shows a visible focus ring.
 - Theme: flip the OS color scheme; the page follows without a
   reload, and both themes keep the state labels readable.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
