@@ -127,6 +127,18 @@ The shared HTTP client enables TCP keepalive probes (SO_KEEPALIVE,
 extended-budget reasoning are not culled by NAT idle timers, which
 had been surfacing as mixed ReadError and stall failures mid-lineup.
 
+At most five paid upstream calls run at once across everything in
+flight (`MAX_CONCURRENT_UPSTREAM` in `bench/main.py`); extra models
+queue quietly for a slot, and the wait never counts toward a model's
+measured latency or ttft. Every result also records OpenRouter's
+generation id and the provider's finish_reason, which make historical
+runs auditable against OpenRouter's generation API (actual provider,
+quantization, authoritative cost) and let budget analysis see
+truncation on runs that produced no error. If persisting a finished
+run fails, both /compare and the streaming path log the failure and
+return the results with run_id null, because the money is already
+spent and losing history must not lose the response.
+
 ## Local-only guard
 
 The bench holds a paid API key, so it refuses requests that could

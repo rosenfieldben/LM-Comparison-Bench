@@ -33,6 +33,16 @@ logger = logging.getLogger(__name__)
 # rejects unknown names, so this map never sees one.
 BUDGET_TOKENS = {"standard": BUDGET_STANDARD, "extended": BUDGET_EXTENDED}
 
+# Ceiling on simultaneous paid upstream calls across everything in
+# flight. The batch endpoint's five-model cap always implied this
+# policy, but the UI's real path is one /compare/stream per model with
+# no batch to cap, so overlapping runs and reruns could put unbounded
+# paid calls in flight. The semaphore enforces the cap where the money
+# actually moves: around the upstream HTTP exchange, in both endpoints.
+# Saturation queues quietly; a sixth model simply starts when a slot
+# frees, with no error and no acquisition timeout.
+MAX_CONCURRENT_UPSTREAM = 5
+
 
 class CompareRequest(BaseModel):
     prompt: str = Field(min_length=1)
@@ -64,6 +74,16 @@ class ModelResult(BaseModel):
     # The effective (post-clamp) completion budget the request was sent
     # with. Defaults None so pre-budget history rows stay valid.
     max_tokens: int | None = None
+    # OpenRouter's response id (gen-...). It keys OpenRouter's
+    # generation API, which records the actual provider, quantization
+    # and authoritative cost, so a persisted id makes any historical
+    # run auditable. Defaults None so pre-provenance rows stay valid.
+    generation_id: str | None = None
+    # The provider's finish_reason verbatim (stop, length,
+    # content_filter, ...). Until now it survived only inside
+    # synthesized error strings; budget analysis needs it on
+    # truncated-but-successful runs too.
+    finish_reason: str | None = None
 
 
 class StreamCompareRequest(BaseModel):
@@ -78,7 +98,9 @@ class StreamCompareRequest(BaseModel):
 
 class CompareResponse(BaseModel):
     results: list[ModelResult]
-    run_id: int
+    # None when persisting the run failed: the upstream spend already
+    # happened, so the results are returned even when history is lost.
+    run_id: int | None
 
 
 class PromptCreate(BaseModel):
@@ -178,6 +200,9 @@ async def lifespan(app: FastAPI):
         ),
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    # One shared gate for every paid upstream call this process makes;
+    # see MAX_CONCURRENT_UPSTREAM for why it exists.
+    app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -336,20 +361,26 @@ def resolve_links(db, prompt_id: int | None, group_id: int | None):
 
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict:
+    async def limited(model: str) -> dict:
+        # One slot per model inside the fan-out, not one around the
+        # batch: the cap is on simultaneous paid calls wherever they
+        # come from, and concurrent /compare and stream requests share
+        # the same gate. Acquiring before run_model keeps the clocks
+        # honest for free: its latency clock starts internally, after
+        # the slot is already held, so a queued model never reports
+        # queue wait as model latency.
+        async with app.state.upstream_semaphore:
+            return await run_model(
+                request.prompt,
+                model,
+                app.state.client,
+                max_tokens=effective_budget(request.budget, model),
+            )
+
     # gather preserves input order, which the frontend relies on to map
     # result columns by position. run_model never raises, so no
     # return_exceptions handling is needed here.
-    results = await asyncio.gather(
-        *(
-            run_model(
-                request.prompt,
-                m,
-                app.state.client,
-                max_tokens=effective_budget(request.budget, m),
-            )
-            for m in request.models
-        )
-    )
+    results = await asyncio.gather(*(limited(m) for m in request.models))
     # Cost is a boundary concern: run_model stays a pure OpenRouter call
     # and the price snapshot lives on app.state. Computed before save_run
     # so history carries the cost as priced at run time.
@@ -358,9 +389,16 @@ async def compare(request: CompareRequest) -> dict:
     prompt_id, group_id = resolve_links(
         app.state.db, request.prompt_id, request.group_id
     )
-    run_id = store.save_run(
-        app.state.db, request.prompt, list(results), prompt_id, group_id
-    )
+    # Same degradation the streaming path already has: by now the money
+    # is spent and the results exist, so a persistence failure must cost
+    # the history entry, never the response.
+    try:
+        run_id = store.save_run(
+            app.state.db, request.prompt, list(results), prompt_id, group_id
+        )
+    except Exception:
+        logger.exception("failed to persist compare run")
+        run_id = None
     return {"results": list(results), "run_id": run_id}
 
 
@@ -373,10 +411,32 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         # a result if the client disconnects before the done event: a
         # stream the user watched happen is still history.
         parts: list[str] = []
-        start = time.perf_counter()
         first_delta_ms: float | None = None
         handled = False
+        started = False
+        acquired = False
+        start = 0.0
+
+        def release_slot():
+            # Idempotent so the done branch and the finally below can
+            # both call it: the slot must never be returned twice, and
+            # a cancellation while still queued has nothing to return.
+            nonlocal acquired
+            if acquired:
+                acquired = False
+                app.state.upstream_semaphore.release()
+
         try:
+            # The slot covers the upstream exchange only, and it is
+            # acquired before any clock starts: both this generator's
+            # clock and stream_model's internal latency and ttft clocks
+            # begin after the slot is held, so a queued run never
+            # reports its queue wait as model time. Saturation queues
+            # quietly, with no acquisition timeout.
+            await app.state.upstream_semaphore.acquire()
+            acquired = True
+            started = True
+            start = time.perf_counter()
             async for event in stream_model(
                 request.prompt, request.model, app.state.client, max_tokens=max_tokens
             ):
@@ -387,6 +447,9 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     yield "data: " + json.dumps(event) + "\n\n"
                     continue
                 handled = True
+                # The done event means the upstream exchange is over;
+                # persistence must not sit on a paid-call slot.
+                release_slot()
                 result = event["result"]
                 result["cost_usd"] = cost_usd(result, app.state.prices)
                 prompt_id, group_id = resolve_links(
@@ -407,12 +470,15 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     {"type": "done", "result": result, "run_id": run_id}
                 ) + "\n\n"
         finally:
+            release_slot()
             # A client disconnect cancels this generator at a yield
             # before the done branch ever runs. Persist what the server
             # saw (no awaits or yields are legal here, sqlite is sync,
             # so this is safe during unwinding) rather than silently
             # dropping a run whose deltas already reached the browser.
-            if not handled:
+            # A run cancelled while still queued never reached upstream
+            # and spent nothing, so there is nothing truthful to record.
+            if started and not handled:
                 aborted = {
                     "model": request.model,
                     "response_text": "".join(parts) or None,

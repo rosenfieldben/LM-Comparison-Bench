@@ -339,3 +339,105 @@ def test_connect_upgrades_4a_schema_with_ttft():
     finally:
         conn.close()
         keeper.close()
+
+
+SCHEMA_PRE_PROVENANCE = """
+CREATE TABLE prompts (
+    id INTEGER PRIMARY KEY,
+    name TEXT UNIQUE NOT NULL,
+    text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE groups (
+    id INTEGER PRIMARY KEY,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE runs (
+    id INTEGER PRIMARY KEY,
+    prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
+    group_id INTEGER NULL REFERENCES groups(id),
+    prompt_text TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE results (
+    id INTEGER PRIMARY KEY,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    model TEXT NOT NULL,
+    response_text TEXT,
+    latency_ms REAL,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    error TEXT,
+    cost_usd REAL,
+    ttft_ms REAL,
+    max_tokens INTEGER
+);
+"""
+
+
+def test_connect_upgrades_pre_provenance_schema():
+    uri = "file:pre_provenance_upgrade?mode=memory&cache=shared"
+    keeper = sqlite3.connect(uri, uri=True)
+    keeper.executescript(SCHEMA_PRE_PROVENANCE)
+    keeper.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES (?, ?)",
+        ("pre-provenance prompt", "2026-07-09T00:00:00+00:00"),
+    )
+    keeper.execute(
+        "INSERT INTO results (run_id, model, response_text, max_tokens)"
+        " VALUES (1, 'a/model', 'hi', 16384)"
+    )
+    keeper.commit()
+
+    conn = store.connect(uri)
+    try:
+        result_cols = {row[1] for row in conn.execute("PRAGMA table_info(results)")}
+        assert "generation_id" in result_cols
+        assert "finish_reason" in result_cols
+
+        # Old rows survive with honestly unknown provenance, everything
+        # else intact.
+        run = store.get_run(conn, 1)
+        assert run["results"][0]["max_tokens"] == 16384
+        assert run["results"][0]["generation_id"] is None
+        assert run["results"][0]["finish_reason"] is None
+
+        # Provenance-carrying results persist on the upgraded database.
+        run_id = store.save_run(
+            conn,
+            "provenanced",
+            [make_result(generation_id="gen-x1", finish_reason="stop")],
+        )
+        saved = store.get_run(conn, run_id)
+        assert saved["results"][0]["generation_id"] == "gen-x1"
+        assert saved["results"][0]["finish_reason"] == "stop"
+    finally:
+        conn.close()
+        keeper.close()
+
+
+def index_names(conn, table):
+    return {row[1] for row in conn.execute(f"PRAGMA index_list({table})")}
+
+
+def test_connect_creates_history_indexes_on_fresh_database(db):
+    assert "idx_results_run_id" in index_names(db, "results")
+    assert "idx_runs_group_id" in index_names(db, "runs")
+
+
+def test_connect_creates_history_indexes_on_upgraded_database():
+    # The pre-grouping schema is the oldest shape connect() supports;
+    # runs.group_id only exists after the migration, so its index is
+    # proof the index pass runs after the ALTERs.
+    uri = "file:pre_grouping_index_upgrade?mode=memory&cache=shared"
+    keeper = sqlite3.connect(uri, uri=True)
+    keeper.executescript(OLD_SCHEMA)
+    keeper.commit()
+
+    conn = store.connect(uri)
+    try:
+        assert "idx_results_run_id" in index_names(conn, "results")
+        assert "idx_runs_group_id" in index_names(conn, "runs")
+    finally:
+        conn.close()
+        keeper.close()

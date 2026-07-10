@@ -570,3 +570,86 @@ async def test_stream_model_uses_stream_read_timeout(client):
 
     assert seen["read"] == STREAM_READ_TIMEOUT_S
     assert seen["connect"] == 10.0
+
+
+@respx.mock
+async def test_run_model_captures_generation_id_and_finish_reason(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["generation_id"] == "gen-1751500123-Xk3mQpR7vNwB2aZd"
+    assert result["finish_reason"] == "stop"
+
+
+@respx.mock
+async def test_run_model_missing_provenance_degrades_to_none(client):
+    # A response with no top-level id and a null finish_reason must not
+    # invent provenance; both fields stay honestly unknown.
+    body = json.loads(json.dumps(FIXTURE))
+    del body["id"]
+    body["choices"][0]["finish_reason"] = None
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["response_text"] is not None
+    assert result["generation_id"] is None
+    assert result["finish_reason"] is None
+
+
+@respx.mock
+async def test_run_model_non_string_provenance_degrades_to_none(client):
+    body = json.loads(json.dumps(FIXTURE))
+    body["id"] = 12345
+    body["choices"][0]["finish_reason"] = 3
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["generation_id"] is None
+    assert result["finish_reason"] is None
+
+
+@respx.mock
+async def test_stream_takes_first_generation_id_and_final_finish_reason(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                # First chunk carries no id: the field must wait for one
+                # rather than lock in None.
+                sse({"choices": [{"delta": {"role": "assistant"}}]}),
+                sse({"id": "gen-first", "choices": [{"delta": {"content": "Hel"}}]}),
+                sse({"id": "gen-later", "choices": [{"delta": {"content": "lo"}}]}),
+                sse({"id": "gen-later", "choices": [{"delta": {}, "finish_reason": "length"}]}),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hello"
+    assert result["generation_id"] == "gen-first"
+    assert result["finish_reason"] == "length"
+
+
+@respx.mock
+async def test_stream_missing_provenance_degrades_to_none(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "hi"
+    assert result["generation_id"] is None
+    assert result["finish_reason"] is None

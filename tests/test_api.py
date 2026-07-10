@@ -702,3 +702,309 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
         assert result["response_text"] is not None
         # No price cache on an offline boot: cost is unavailable, not wrong.
         assert result["cost_usd"] is None
+
+
+@respx.mock
+def test_compare_persists_generation_id_and_finish_reason(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    result = resp.json()["results"][0]
+    assert result["generation_id"] == "gen-1751500123-Xk3mQpR7vNwB2aZd"
+    assert result["finish_reason"] == "stop"
+
+    detail = client.get(f"/runs/{resp.json()['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["generation_id"] == "gen-1751500123-Xk3mQpR7vNwB2aZd"
+    assert persisted["finish_reason"] == "stop"
+
+
+def provenance_stream():
+    return ChunkStream([
+        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "Hel"}}]}),
+        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "lo"}}]}),
+        sse({"id": "gen-stream-1", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
+        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
+        DONE_MARKER,
+    ])
+
+
+@respx.mock
+def test_stream_persists_generation_id_and_finish_reason(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=provenance_stream())
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["result"]["generation_id"] == "gen-stream-1"
+    assert done["result"]["finish_reason"] == "stop"
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["generation_id"] == "gen-stream-1"
+    assert persisted["finish_reason"] == "stop"
+
+
+@respx.mock
+def test_stream_missing_provenance_persists_as_null(client):
+    # A stream whose chunks carry no id and no finish_reason must land
+    # in history with both fields honestly NULL, not invented.
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                sse({"choices": [{"delta": {"content": "hi"}}]}),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["result"]["generation_id"] is None
+    assert done["result"]["finish_reason"] is None
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    assert detail["results"][0]["generation_id"] is None
+    assert detail["results"][0]["finish_reason"] is None
+
+
+import logging
+
+
+@respx.mock
+def test_compare_persistence_failure_degrades_to_null_run_id(
+    client, monkeypatch, caplog
+):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("disk exploded")
+
+    monkeypatch.setattr("bench.store.save_run", boom)
+
+    with caplog.at_level(logging.ERROR, logger="bench.main"):
+        resp = client.post(
+            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
+        )
+
+    # The money is spent and the results exist: losing history must not
+    # lose the response, exactly as on the streaming path.
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_id"] is None
+    assert body["results"][0]["response_text"] is not None
+    assert "failed to persist compare run" in caplog.text
+
+
+# ---- Upstream concurrency cap. These tests drive the endpoint
+# ---- functions directly (the established pattern for stream control)
+# ---- because TestClient serializes requests, and the whole point is
+# ---- overlap. The client context stays open so app.state exists.
+
+import asyncio
+
+from bench.main import CompareRequest, StreamCompareRequest, compare, compare_stream
+
+
+def make_client(monkeypatch, tmp_path, max_upstream):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    monkeypatch.setattr("bench.main.MAX_CONCURRENT_UPSTREAM", max_upstream)
+    return TestClient(app, base_url="http://localhost")
+
+
+async def consume_stream(model, prompt="hi"):
+    resp = await compare_stream(StreamCompareRequest(prompt=prompt, model=model))
+    return [
+        json.loads(chunk.removeprefix("data: "))
+        async for chunk in resp.body_iterator
+    ]
+
+
+async def settle(condition, rounds=400):
+    # Poll a condition with real scheduling gaps; parked coroutines need
+    # loop turns to reach their park point.
+    for _ in range(rounds):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition never became true")
+
+
+@respx.mock
+async def test_stream_upstream_concurrency_never_exceeds_cap(monkeypatch, tmp_path):
+    gate = asyncio.Event()
+    tracker = {"in_flight": 0, "max": 0, "started": 0}
+
+    class ParkedStream(httpx.AsyncByteStream):
+        # In-flight is counted across the body's consumption: the slot
+        # must be held for the exchange, not just the request. The
+        # decrement sits before the final chunk rather than in a
+        # finally, because async generator finalization is deferred to
+        # GC and would keep finished exchanges counted while their
+        # successors start.
+        async def __aiter__(self):
+            tracker["in_flight"] += 1
+            tracker["started"] += 1
+            tracker["max"] = max(tracker["max"], tracker["in_flight"])
+            yield sse({"choices": [{"delta": {"content": "ok"}}]})
+            await gate.wait()
+            tracker["in_flight"] -= 1
+            yield DONE_MARKER
+
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=ParkedStream())
+    )
+
+    with make_client(monkeypatch, tmp_path, 2):
+        tasks = [
+            asyncio.create_task(consume_stream(f"model/m{i}")) for i in range(4)
+        ]
+        await settle(lambda: tracker["started"] == 2)
+        # Extra loop turns: the two queued streams must stay queued
+        # while both slots are occupied.
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert tracker["started"] == 2
+        assert tracker["max"] == 2
+
+        gate.set()
+        all_events = await asyncio.gather(*tasks)
+
+    assert tracker["started"] == 4
+    assert tracker["max"] == 2
+    # Queueing must not corrupt any stream's own result.
+    for i, events in enumerate(all_events):
+        done = events[-1]
+        assert done["type"] == "done"
+        assert done["result"]["model"] == f"model/m{i}"
+        assert done["result"]["response_text"] == "ok"
+
+
+@respx.mock
+async def test_compare_fanout_respects_upstream_cap(monkeypatch, tmp_path):
+    gate = asyncio.Event()
+    tracker = {"in_flight": 0, "max": 0, "started": 0}
+
+    async def route(request):
+        model = json.loads(request.content)["model"]
+        tracker["in_flight"] += 1
+        tracker["started"] += 1
+        tracker["max"] = max(tracker["max"], tracker["in_flight"])
+        try:
+            await gate.wait()
+        finally:
+            tracker["in_flight"] -= 1
+        return httpx.Response(200, json=response_for(model, f"reply from {model}"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    models = [f"model/m{i}" for i in range(4)]
+    with make_client(monkeypatch, tmp_path, 2):
+        task = asyncio.create_task(compare(CompareRequest(prompt="hi", models=models)))
+        await settle(lambda: tracker["started"] == 2)
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+        assert tracker["started"] == 2
+        assert tracker["max"] == 2
+
+        gate.set()
+        body = await task
+
+    assert tracker["started"] == 4
+    assert tracker["max"] == 2
+    # gather order and content survive the queueing.
+    assert [r["model"] for r in body["results"]] == models
+    assert [r["response_text"] for r in body["results"]] == [
+        f"reply from {m}" for m in models
+    ]
+
+
+@respx.mock
+async def test_compare_queue_wait_is_not_reported_as_latency(monkeypatch, tmp_path):
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    async def route(request):
+        model = json.loads(request.content)["model"]
+        if model == "model/slow":
+            entered.set()
+            await gate.wait()
+        return httpx.Response(200, json=response_for(model, "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    with make_client(monkeypatch, tmp_path, 1):
+        task = asyncio.create_task(
+            compare(CompareRequest(prompt="hi", models=["model/slow", "model/fast"]))
+        )
+        await asyncio.wait_for(entered.wait(), 5)
+        # model/fast sits queued behind the only slot this whole time.
+        await asyncio.sleep(0.6)
+        gate.set()
+        body = await task
+
+    slow, fast = body["results"]
+    assert slow["latency_ms"] >= 500
+    # The queued model waited over half a second for its slot; its own
+    # mocked exchange is near-instant, and that is what latency must
+    # report.
+    assert fast["latency_ms"] < 300
+
+
+@respx.mock
+async def test_stream_queue_wait_is_not_reported_as_latency_or_ttft(
+    monkeypatch, tmp_path
+):
+    gate = asyncio.Event()
+    entered = asyncio.Event()
+
+    class SlowStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            entered.set()
+            yield sse({"choices": [{"delta": {"content": "wait"}}]})
+            await gate.wait()
+            yield DONE_MARKER
+
+    def route(request):
+        model = json.loads(request.content)["model"]
+        if model == "model/slow":
+            return httpx.Response(200, stream=SlowStream())
+        return httpx.Response(
+            200,
+            stream=ChunkStream([
+                sse({"choices": [{"delta": {"content": "quick"}}]}),
+                DONE_MARKER,
+            ]),
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    with make_client(monkeypatch, tmp_path, 1):
+        slow_task = asyncio.create_task(consume_stream("model/slow"))
+        await asyncio.wait_for(entered.wait(), 5)
+        fast_task = asyncio.create_task(consume_stream("model/fast"))
+        # model/fast sits queued behind the only slot this whole time.
+        await asyncio.sleep(0.6)
+        gate.set()
+        slow_events = await slow_task
+        fast_events = await fast_task
+
+    slow_done = slow_events[-1]["result"]
+    fast_done = fast_events[-1]["result"]
+    assert slow_done["latency_ms"] >= 500
+    assert fast_done["response_text"] == "quick"
+    # Both clocks start after the slot is held: neither total latency
+    # nor time to first token may include the queue wait.
+    assert fast_done["latency_ms"] < 300
+    assert fast_done["ttft_ms"] < 300

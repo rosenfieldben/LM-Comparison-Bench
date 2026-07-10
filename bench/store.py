@@ -41,8 +41,18 @@ CREATE TABLE IF NOT EXISTS results (
     error TEXT,
     cost_usd REAL,
     ttft_ms REAL,
-    max_tokens INTEGER
+    max_tokens INTEGER,
+    generation_id TEXT,
+    finish_reason TEXT
 );
+"""
+
+# History reads join results by run and replay groups by scanning runs
+# by group; both tables grow monotonically, so without these indexes
+# every replay degrades into a full-table scan as bench.db accumulates.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
 """
 
 # Columns added after a table first shipped. CREATE IF NOT EXISTS skips
@@ -53,6 +63,8 @@ MIGRATIONS = [
     ("results", "cost_usd", "REAL"),
     ("results", "ttft_ms", "REAL"),
     ("results", "max_tokens", "INTEGER"),
+    ("results", "generation_id", "TEXT"),
+    ("results", "finish_reason", "TEXT"),
 ]
 
 
@@ -76,6 +88,9 @@ def connect(path: str) -> sqlite3.Connection:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
         if column not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+    # After the migrations, not before: runs.group_id may only exist
+    # once the ALTERs above have run on an old database.
+    conn.executescript(INDEXES)
     conn.commit()
     return conn
 
@@ -150,8 +165,9 @@ def save_run(
         conn.executemany(
             """INSERT INTO results
                (run_id, model, response_text, latency_ms, prompt_tokens,
-                completion_tokens, error, cost_usd, ttft_ms, max_tokens)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                completion_tokens, error, cost_usd, ttft_ms, max_tokens,
+                generation_id, finish_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -167,6 +183,8 @@ def save_run(
                     r.get("cost_usd"),
                     r.get("ttft_ms"),
                     r.get("max_tokens"),
+                    r.get("generation_id"),
+                    r.get("finish_reason"),
                 )
                 for r in results
             ],
@@ -211,7 +229,7 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     def marks(ids: list[int]) -> str:
         return ",".join("?" * len(ids))
 
-    # Pass 2: the runs backing those entries — the lone runs plus every
+    # Pass 2: the runs backing those entries, the lone runs plus every
     # member of each selected group. Built conditionally because
     # "IN ()" with zero placeholders is a syntax error.
     conditions = []
@@ -297,7 +315,8 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
         return None
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
-                  completion_tokens, error, cost_usd, ttft_ms, max_tokens
+                  completion_tokens, error, cost_usd, ttft_ms, max_tokens,
+                  generation_id, finish_reason
            FROM results WHERE run_id = ? ORDER BY id""",
         (run_id,),
     ).fetchall()
