@@ -20,3 +20,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -r requirements-dev.txt
       - run: pytest
+
+  # The every-merge gate for the frontend: the critical-path suite in
+  # tests/browser drives the real app in headless Chromium against a
+  # stub upstream, so a frontend change must prove the critical path
+  # still works. One Python version is enough; the browser, not the
+  # interpreter, is what this job exercises.
+  browser:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - name: Cache Playwright browser binaries
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-1.61.0
+      - run: playwright install --with-deps chromium
+      - run: pytest -m browser -q

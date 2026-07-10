@@ -258,19 +258,38 @@ instead of freezing the tab.
 ## Tests
 
 Test-only dependencies live in `requirements-dev.txt`, which pulls in
-the runtime pins too:
+the runtime pins too. There are two suites:
 
 ```sh
 .venv/bin/pip install -r requirements-dev.txt
+
+# unit suite: the every-edit loop, fast and browser-free
 .venv/bin/pytest
+
+# browser suite: one-time setup, then the every-merge gate
+.venv/bin/playwright install chromium
+.venv/bin/pytest -m browser
 ```
 
-No network access needed; all OpenRouter calls are mocked.
+No network access needed for either; unit tests mock OpenRouter with
+respx, and the browser suite boots the real app under uvicorn in
+headless Chromium against a stub OpenRouter it starts itself
+(`tests/browser/`). Browser tests are deselected from a plain
+`pytest` run on purpose. CI enforces both: the unit job runs on
+Python 3.11 and 3.12, and a separate browser job runs the
+critical-path suite, so a frontend change cannot merge without
+proving the critical path still works.
 
-The page has no JS test harness. During frontend eyeball
-verification, run `uvicorn bench.main:app --reload` so index.html
-edits are picked up without restarts. Verify by eyeball after UI
-changes:
+The stability contract for future frontend work: the harness selects
+elements by `data-testid` attributes (and user-visible text), never
+by styling classes or DOM structure. Keep the existing data-testid
+attributes attached to the elements that play those roles and a
+redesign can change anything visual without touching a test; remove
+or rename one and the suite will tell you what behavior it guarded.
+
+The browser suite covers the critical path only. During frontend
+work, run `uvicorn bench.main:app --reload` so index.html edits are
+picked up without restarts, and verify by eyeball after UI changes:
 
 - Run with 2 models checked: both cards show the working state with
   a counting "thinking, Ns" indicator, then fill in independently,
