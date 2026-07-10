@@ -203,6 +203,8 @@ async def run_model(
         "completion_tokens": None,
         "error": None,
         "max_tokens": max_tokens,
+        "generation_id": None,
+        "finish_reason": None,
     }
     payload = {
         "model": model,
@@ -247,6 +249,20 @@ async def run_model(
         result["error"] = "malformed response from OpenRouter"
         return result
 
+    # Provenance, both best-effort. The generation id keys OpenRouter's
+    # generation API, which records the actual provider, quantization
+    # and authoritative cost, so persisting it makes this run auditable
+    # after the fact. The finish_reason is the provider's own verdict
+    # on why output ended; until now it survived only inside
+    # synthesized error strings, and budget analysis needs it on
+    # successful runs too.
+    gen_id = data.get("id")
+    if isinstance(gen_id, str) and gen_id:
+        result["generation_id"] = gen_id
+    reason = choice.get("finish_reason")
+    if isinstance(reason, str) and reason:
+        result["finish_reason"] = reason
+
     text = _flatten_content(content)
     if text:
         result["response_text"] = text
@@ -255,8 +271,9 @@ async def run_model(
         # that as an error so every result carries either text or an error,
         # a contract the frontend relies on to pick a render state. Non-str
         # oddities land here too rather than leaking into response_text.
-        finish_reason = choice.get("finish_reason") or "unknown"
-        result["error"] = f"empty response (finish_reason: {finish_reason})"
+        result["error"] = (
+            f"empty response (finish_reason: {result['finish_reason'] or 'unknown'})"
+        )
 
     # Some providers omit usage. Report None rather than guessing counts.
     # isinstance instead of `or {}`: a truthy non-dict like "n/a" would
@@ -300,6 +317,8 @@ async def stream_model(
         "error": None,
         "ttft_ms": None,
         "max_tokens": max_tokens,
+        "generation_id": None,
+        "finish_reason": None,
     }
     payload = {
         "model": model,
@@ -312,7 +331,6 @@ async def stream_model(
         "stream_options": {"include_usage": True},
     }
     text_parts: list[str] = []
-    finish_reason = None
     start = time.perf_counter()
 
     def elapsed_ms() -> float:
@@ -327,7 +345,8 @@ async def stream_model(
         # must still carry an error so the frontend has a render state.
         if result["response_text"] is None and error is None:
             result["error"] = (
-                f"empty response (finish_reason: {finish_reason or 'unknown'})"
+                "empty response (finish_reason: "
+                f"{result['finish_reason'] or 'unknown'})"
             )
         return {"type": "done", "result": result}
 
@@ -354,6 +373,15 @@ async def stream_model(
                     yield done("malformed stream from OpenRouter")
                     return
 
+                # The generation id keys OpenRouter's generation API for
+                # a post-hoc audit of provider, quantization and cost;
+                # every chunk repeats the same id, so the first one that
+                # carries it settles the field.
+                if result["generation_id"] is None:
+                    gen_id = chunk.get("id")
+                    if isinstance(gen_id, str) and gen_id:
+                        result["generation_id"] = gen_id
+
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
                     result["prompt_tokens"] = usage.get("prompt_tokens")
@@ -372,8 +400,11 @@ async def stream_model(
 
                 try:
                     choice = chunk["choices"][0]
-                    if choice.get("finish_reason"):
-                        finish_reason = choice["finish_reason"]
+                    reason = choice.get("finish_reason")
+                    if isinstance(reason, str) and reason:
+                        # The provider sends its verdict on the closing
+                        # chunk; the final one seen is the one recorded.
+                        result["finish_reason"] = reason
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                 except (LookupError, TypeError, AttributeError):
