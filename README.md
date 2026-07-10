@@ -49,35 +49,55 @@ session.
 
 ## Interface
 
-The page is styled as a measurement instrument: dark, dense, calm,
-with monospace for everything measured (responses, model ids,
-badges, costs). The OS color scheme picks between the dark and
-light themes; there is no toggle. All colors, spacing steps, radii
-and type sizes live as CSS custom properties in one `:root` block
-at the top of `static/index.html`, so the next visual change is a
-token edit, not a hunt through rules.
+The page is styled as a race-telemetry instrument (the "VOLT"
+design): mono-heavy type, one cyan accent, state-coded color for
+working/done/error, subtle live motion (pulse, shimmer, a blinking
+placeholder cursor). The OS color scheme picks the dark or light
+theme by default; a command-bar toggle cycles auto → dark → light,
+and a motion toggle kills the animation (elapsed counters keep
+updating as text). Both persist in this browser's localStorage, as
+does `prefers-reduced-motion`, which disables animation regardless
+of the toggle. All colors, spacing steps, radii and type sizes live
+as CSS custom properties in one `:root` block at the top of
+`static/index.html`, so the next visual change is a token edit, not
+a hunt through rules.
 
-Controls sit in one deck above the results, three rows: the prompt
-row (auto-growing monospace textarea plus the saved-prompt
-library), the lineup row (model chips with per-chip remove, All and
-None selection, and the Add model search), and the run row (the Run
-button, the budget select, and a column density toggle). Density
-has two steps, comfortable and compact; compact tightens card
-padding and drops the response font a step for racing many models
-side by side. Like the budget, density is per session and resets on
-the next visit.
+A full-width command bar carries the brand plus live session stats:
+run count, cumulative spend, mean TTFT of completed requests, and
+lineup size. They are this browser session's totals and reset on
+reload.
 
-Each result card shows its state twice, as a colored left edge and
-a text label: working, done, or error. A running card counts
-seconds ("thinking, 47s", one shared timer for all cards) so the
-long silences of extended-budget reasoning read as alive rather
-than hung; the counter disappears at the first token. Finished
-cards with text gain per-card controls: copy (raw response text to
-the clipboard, with a brief "copied" confirmation), fold (collapse
-to a six line preview, "show all" to reverse), and diff; errored
-live cards add rerun. History renders as a table of rows
-(timestamp, prompt, model chips) with a client-side filter that
-matches prompt substrings and model ids, and loads only when
+Controls sit in one console deck above the results, three rows: the
+prompt row (auto-growing monospace textarea in an inset field, plus
+the saved-prompt library), the lineup row (model chips with per-chip
+remove, All and None selection, and the Add model search), and the
+run row (the Run button, a segmented token-budget control, and a
+segmented column-density control, plus a request count and worst-case
+cost estimate when pricing is available). Density has two steps,
+comfortable and compact; compact tightens card padding and drops the
+response font a step for racing many models side by side. Unlike the
+budget (per session on purpose, it costs money), density persists.
+
+During a live run a TTFT race strip sits between the deck and the
+cards: one row per model, a shimmering meter until the first token,
+then a bar sized by time-to-first-token on a shared round-number
+scale, ranked by finishing order; errored rows show stripes and
+"failed". The strip belongs to the live run only, so history replays
+hide it.
+
+Each result card shows its state twice, as a colored top edge and
+a text label: thinking, done, or error. A running card counts
+seconds in its header ("thinking · 47s", one shared timer for all
+cards) so the long silences of extended-budget reasoning read as
+alive rather than hung; the counter disappears at the first token.
+A four-cell metrics strip (ttft, total, tok i/o, cost) fills in as
+values resolve, with em dashes for unknowns. Finished cards with
+text gain per-card controls in a bottom action row: copy (raw
+response text to the clipboard, with a brief "copied" confirmation),
+fold (collapse to a six line preview, "show all" to reverse), and
+diff; errored live cards add rerun. History renders as a flat strip
+of rows (timestamp, prompt, model count) with a client-side filter
+that matches prompt substrings and model ids, and loads only when
 expanded.
 
 ## Token budgets
@@ -244,7 +264,7 @@ changes:
   a counting "thinking, Ns" indicator, then fill in independently,
   fastest first, flipping to the done label.
 - Add an intentionally bad model id via the picker's exact-id path
-  and run it: that card shows the error state (red left edge plus
+  and run it: that card shows the error state (red top edge plus
   the error label), others unaffected.
 - Run with a prompt that produces multi-line output (e.g. "write a
   haiku"): line breaks survive in the response column.
@@ -252,8 +272,9 @@ changes:
   it against one model. Open History, click the old run, and confirm
   it renders identically to a live run (plus the historical banner).
 - Watch a slow model paint token by token next to an already
-  finished fast one; the ttft badge should be visibly smaller than
-  the latency badge on streamed columns.
+  finished fast one; the ttft metric should be visibly smaller than
+  the total metric on streamed columns, and the race strip row
+  should flip from shimmer to a ranked bar at the first token.
 - Kill wifi (or the server) mid-stream: the streaming column must
   enter the error state with its partial text retained above the
   error message, not hang or go blank.
