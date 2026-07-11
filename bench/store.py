@@ -5,8 +5,18 @@ owns the connection's lifecycle, tests hand in :memory:, and swapping
 sqlite for something else later touches only this module.
 """
 
+import logging
+import os
 import sqlite3
+import stat
 from datetime import datetime, timezone
+
+# Shared with ingestion on purpose: what run_model refuses to emit,
+# get_run refuses to serve, so both ends of the pipeline enforce the
+# same field-type contract.
+from bench.models import as_metric, as_text, as_token_count
+
+logger = logging.getLogger(__name__)
 
 # runs.prompt_text is denormalized on purpose: a run must stay readable
 # after its saved prompt is edited or deleted. prompt_id is a courtesy
@@ -68,6 +78,39 @@ MIGRATIONS = [
 ]
 
 
+def _keep_private(path: str) -> None:
+    """Owner-only permissions for the database and its sqlite siblings.
+
+    Full prompts and model outputs live in this file, and umask is not
+    a policy: under the common 022 the file was born world-readable on
+    shared machines. A parent directory the bench creates is 0700, the
+    file is created 0600 with no loose window, and a pre-existing
+    readable file (or leftover journal sibling from that era) is
+    tightened on every startup. SQLite mirrors the database file's
+    permissions onto -journal and -wal files it creates later, so
+    tightening the database now also covers future siblings.
+    """
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o700)
+    existed = os.path.exists(path)
+    if not existed:
+        os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+    for sibling in (path, path + "-journal", path + "-wal", path + "-shm"):
+        if not os.path.exists(sibling):
+            continue
+        mode = stat.S_IMODE(os.stat(sibling).st_mode)
+        if mode & 0o077:
+            os.chmod(sibling, 0o600)
+            if sibling == path and existed:
+                logger.warning(
+                    "tightened %s from %04o to 0600: prompts and outputs "
+                    "must not be world-readable",
+                    path,
+                    mode,
+                )
+
+
 def connect(path: str) -> sqlite3.Connection:
     """Open a connection with the schema applied and foreign keys on.
 
@@ -76,6 +119,10 @@ def connect(path: str) -> sqlite3.Connection:
     event loop thread today, but the flag keeps a future sync endpoint
     or executor hop from crashing on an sqlite thread check.
     """
+    # In-memory and file: URI databases (the test seam) have no
+    # filesystem mode to manage.
+    if path != ":memory:" and not path.startswith("file:"):
+        _keep_private(path)
     # uri=True lets tests hand in shared in-memory databases via
     # file: URIs; sqlite treats anything not starting with "file:" as a
     # plain filename, so normal paths and ":memory:" are unaffected.
@@ -306,6 +353,24 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     return entries
 
 
+def _repaired(row: dict) -> dict:
+    """Normalize a result row's scalar fields on the way out.
+
+    Rows written before ingestion normalization can carry provider
+    junk: one string token count persisted raw turned GET /runs/{id}
+    into a permanent 500. Repair on read retires that poisoning
+    without a destructive migration, and the raw row stays in the file
+    as evidence.
+    """
+    for field in ("prompt_tokens", "completion_tokens", "max_tokens"):
+        row[field] = as_token_count(row[field])
+    for field in ("latency_ms", "ttft_ms", "cost_usd"):
+        row[field] = as_metric(row[field])
+    for field in ("response_text", "error", "generation_id", "finish_reason"):
+        row[field] = as_text(row[field])
+    return row
+
+
 def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
     run = conn.execute(
         "SELECT id, prompt_id, prompt_text, created_at FROM runs WHERE id = ?",
@@ -321,7 +386,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
         (run_id,),
     ).fetchall()
     out = dict(run)
-    out["results"] = [dict(r) for r in results]
+    out["results"] = [_repaired(dict(r)) for r in results]
     return out
 
 

@@ -137,21 +137,42 @@ quantization, authoritative cost) and let budget analysis see
 truncation on runs that produced no error. If persisting a finished
 run fails, both /compare and the streaming path log the failure and
 return the results with run_id null, because the money is already
-spent and losing history must not lose the response.
+spent and losing history must not lose the response. That is one
+instance of a broader invariant both endpoints enforce with a single
+fault boundary: after money is spent, no code path between the
+upstream results existing and the response leaving (link resolution,
+cost computation, persistence) may convert those results into an
+error response.
 
 ## Local-only guard
 
 The bench holds a paid API key, so it refuses requests that could
 only come from a hostile browser page. Requests whose Host header is
 not localhost, 127.0.0.1 or ::1 get a 403, which defeats DNS
-rebinding; POST bodies must be `application/json` (415 otherwise),
-which forces cross-origin senders into a CORS preflight the bench
-never answers, so a malicious page cannot fire "simple" text/plain
-POSTs at /compare and spend money. Bodyless POSTs (like /groups) and
-everything curl or the bundled frontend sends pass unchanged. To
+rebinding; every POST must be `application/json` (415 otherwise),
+bodyless ones included, which forces cross-origin senders into a
+CORS preflight the bench never answers, so a malicious page cannot
+fire "simple" text/plain or bodyless POSTs and spend money or create
+state. GET and HEAD stay exempt as reads, and DELETE needs no gate
+because a browser never sends it cross-site without a preflight.
+Everything curl sends with a JSON content type and everything the
+bundled frontend sends (it posts an empty JSON object to /groups)
+passes unchanged. To
 serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.
+
+## Local data
+
+Everything the bench stores lives in one SQLite file: every prompt
+you have run, every model response in full, and the timing, token,
+cost and provenance numbers around them. The file is `bench.db` in
+the working directory unless `BENCH_DB` says otherwise. It is
+created private to your user (0600, in a 0700 directory if the bench
+creates one), and a pre-existing file that is group or world readable
+is tightened to 0600 at startup with a log line, because umask is
+not a policy. Deleting the file deletes all history; there is no
+other copy.
 
 ## Provider routing
 

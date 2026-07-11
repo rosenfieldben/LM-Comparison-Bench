@@ -441,3 +441,83 @@ def test_connect_creates_history_indexes_on_upgraded_database():
     finally:
         conn.close()
         keeper.close()
+
+
+import logging
+import os
+import stat as stat_mod
+
+
+def file_mode(path) -> int:
+    return stat_mod.S_IMODE(os.stat(path).st_mode)
+
+
+def test_review_repro_fresh_database_is_private(tmp_path):
+    # Reproduction 4: bench.db was created 0644 under umask 022, so
+    # every prompt and output was world-readable on shared machines.
+    old_umask = os.umask(0o022)
+    try:
+        db_path = tmp_path / "data" / "bench.db"
+        conn = store.connect(str(db_path))
+        conn.execute("SELECT 1")
+        conn.close()
+    finally:
+        os.umask(old_umask)
+
+    assert file_mode(db_path) == 0o600
+    # The parent the bench created is private too.
+    assert file_mode(db_path.parent) == 0o700
+
+
+def test_existing_loose_database_and_siblings_tightened(tmp_path, caplog):
+    db_path = tmp_path / "bench.db"
+    seed = sqlite3.connect(str(db_path))
+    seed.execute("CREATE TABLE junk (x)")
+    seed.commit()
+    seed.close()
+    os.chmod(db_path, 0o644)
+    # A leftover sibling from the loose era; sqlite ignores a stray
+    # -wal on a rollback-journal database, so it is safe to plant.
+    wal = tmp_path / "bench.db-wal"
+    wal.write_bytes(b"")
+    os.chmod(wal, 0o644)
+
+    with caplog.at_level(logging.WARNING, logger="bench.store"):
+        conn = store.connect(str(db_path))
+        conn.close()
+
+    assert file_mode(db_path) == 0o600
+    assert file_mode(wal) == 0o600
+    assert "tightened" in caplog.text
+
+
+def test_get_run_repairs_poisoned_legacy_row(db):
+    # Written around save_run, exactly as the pre-normalization code
+    # effectively did: raw provider junk straight into the row.
+    with db:
+        cur = db.execute(
+            "INSERT INTO runs (prompt_text, created_at)"
+            " VALUES ('poisoned', '2026-01-01T00:00:00+00:00')"
+        )
+        run_id = cur.lastrowid
+        db.execute(
+            "INSERT INTO results (run_id, model, response_text, prompt_tokens,"
+            " completion_tokens, latency_ms, ttft_ms, cost_usd, max_tokens,"
+            " generation_id, finish_reason)"
+            " VALUES (?, 'old/model', 'hi', 'n/a', '12', 'slow', 'fast',"
+            " 'cheap', 'lots', 42, 7)",
+            (run_id,),
+        )
+
+    run = store.get_run(db, run_id)
+
+    row = run["results"][0]
+    assert row["response_text"] == "hi"
+    # Junk sqlite could not coerce reads back as None.
+    for field in ("prompt_tokens", "latency_ms", "ttft_ms", "cost_usd", "max_tokens"):
+        assert row[field] is None, field
+    # Values sqlite's column affinity already coerced at insert time
+    # (numeric string on INTEGER, number on TEXT) read back type-clean.
+    assert row["completion_tokens"] == 12
+    assert row["generation_id"] == "42"
+    assert row["finish_reason"] == "7"

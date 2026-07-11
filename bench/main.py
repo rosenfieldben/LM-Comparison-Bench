@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
@@ -43,6 +43,13 @@ BUDGET_TOKENS = {"standard": BUDGET_STANDARD, "extended": BUDGET_EXTENDED}
 # frees, with no error and no acquisition timeout.
 MAX_CONCURRENT_UPSTREAM = 5
 
+# SQLite stores rowids in a signed 64-bit integer. Pydantic accepted
+# any Python int, SQLite did not, and the gap surfaced as an
+# OverflowError 500 after the paid upstream call had already
+# completed. Bounding at the boundary makes the mismatch a 422 before
+# any money moves.
+MAX_SQLITE_ROWID = 2**63 - 1
+
 
 class CompareRequest(BaseModel):
     prompt: str = Field(min_length=1)
@@ -51,10 +58,11 @@ class CompareRequest(BaseModel):
     models: list[str] = Field(min_length=1, max_length=5)
     # Optional link back to a saved prompt so history can show where a
     # run came from. The run stores its own prompt_text either way.
-    prompt_id: int | None = None
+    # Bounded to the rowid range; see MAX_SQLITE_ROWID.
+    prompt_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     # Optional grouping id so the N per-model requests of one comparison
     # land as one history entry.
-    group_id: int | None = None
+    group_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     # Named tiers, not a free integer: two regimes of use exist and a
     # free field invites typos with dollar consequences.
     budget: Literal["standard", "extended"] = "standard"
@@ -91,8 +99,9 @@ class StreamCompareRequest(BaseModel):
     # One model per streaming request, mirroring the frontend's
     # per-model fetch pattern: independent columns are the product.
     model: str = Field(min_length=1)
-    prompt_id: int | None = None
-    group_id: int | None = None
+    # Bounded like CompareRequest's; see MAX_SQLITE_ROWID.
+    prompt_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
+    group_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     budget: Literal["standard", "extended"] = "standard"
 
 
@@ -283,15 +292,16 @@ class LocalOnlyGuard:
             )
             await response(scope, receive, send)
             return
-        # Only POSTs carrying a body need the content-type gate: DELETE
-        # is never a "simple" cross-site method, and the frontend's
-        # bodyless POST /groups sends no content-type at all.
-        has_body = "transfer-encoding" in headers or headers.get(
-            "content-length", "0"
-        ) not in ("", "0")
+        # Every POST must be application/json, bodyless included: POST
+        # is the one method a browser fires cross-site without a CORS
+        # preflight, and the old bodyless exemption was a reproduced
+        # hole (a no-body cross-site POST /groups returned 201).
+        # Requiring the JSON content type forces the preflight nothing
+        # here answers. GET and HEAD stay exempt as reads; DELETE needs
+        # no gate because it is never a "simple" cross-site method, so
+        # the preflight already guards it.
         if (
             scope["method"] == "POST"
-            and has_body
             and not headers.get("content-type", "").startswith("application/json")
         ):
             response = JSONResponse(
@@ -400,23 +410,31 @@ async def compare(request: CompareRequest) -> dict:
     # result columns by position. run_model never raises, so no
     # return_exceptions handling is needed here.
     results = await asyncio.gather(*(limited(m) for m in request.models))
-    # Cost is a boundary concern: run_model stays a pure OpenRouter call
-    # and the price snapshot lives on app.state. Computed before save_run
-    # so history carries the cost as priced at run time.
+    # Seeded before the fault boundary so a failure inside it can never
+    # leave a result missing the key the response model requires.
     for result in results:
-        result["cost_usd"] = cost_usd(result, app.state.prices)
-    prompt_id, group_id = resolve_links(
-        app.state.db, request.prompt_id, request.group_id
-    )
-    # Same degradation the streaming path already has: by now the money
-    # is spent and the results exist, so a persistence failure must cost
-    # the history entry, never the response.
+        result["cost_usd"] = None
+    run_id = None
+    # The invariant: after money is spent, no code path may convert
+    # results into an error response. Everything between "upstream
+    # results exist" and "response returned" (cost, link resolution,
+    # persistence) sits inside this one boundary; on any failure the
+    # results go back intact with run_id null and the links dropped.
     try:
+        # Cost is a boundary concern: run_model stays a pure OpenRouter
+        # call and the price snapshot lives on app.state. Computed
+        # before save_run so history carries the cost as priced at run
+        # time.
+        for result in results:
+            result["cost_usd"] = cost_usd(result, app.state.prices)
+        prompt_id, group_id = resolve_links(
+            app.state.db, request.prompt_id, request.group_id
+        )
         run_id = store.save_run(
             app.state.db, request.prompt, list(results), prompt_id, group_id
         )
     except Exception:
-        logger.exception("failed to persist compare run")
+        logger.exception("post-upstream processing failed for /compare")
         run_id = None
     return {"results": list(results), "run_id": run_id}
 
@@ -470,20 +488,26 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # persistence must not sit on a paid-call slot.
                 release_slot()
                 result = event["result"]
-                result["cost_usd"] = cost_usd(result, app.state.prices)
-                prompt_id, group_id = resolve_links(
-                    app.state.db, request.prompt_id, request.group_id
-                )
-                # The response is already on the wire by now, so a
-                # persistence failure has no clean HTTP error to use:
-                # degrade to run_id null in the done event and log,
-                # instead of corrupting the stream tail.
+                result["cost_usd"] = None
+                run_id = None
+                # Same invariant as /compare, and stricter here: the
+                # deltas are already on the wire, so after money is
+                # spent no code path may convert the result into a
+                # broken stream tail. Cost, link resolution and
+                # persistence all sit inside this one boundary; any
+                # failure degrades to run_id null with links dropped.
                 try:
+                    result["cost_usd"] = cost_usd(result, app.state.prices)
+                    prompt_id, group_id = resolve_links(
+                        app.state.db, request.prompt_id, request.group_id
+                    )
                     run_id = store.save_run(
                         app.state.db, request.prompt, [result], prompt_id, group_id
                     )
                 except Exception:
-                    logger.exception("failed to persist streamed run")
+                    logger.exception(
+                        "post-stream processing failed for /compare/stream"
+                    )
                     run_id = None
                 yield "data: " + json.dumps(
                     {"type": "done", "result": result, "run_id": run_id}
@@ -522,13 +546,28 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     return StreamingResponse(events(), media_type="text/event-stream")
 
 
+def ensure_rowid(value: int) -> None:
+    """404 for ids outside SQLite's rowid range.
+
+    Nothing outside the range can exist, so it reads as absence, the
+    same answer an in-range miss gets; before this check the overflow
+    surfaced from the sqlite bind as a 500.
+    """
+    if not 1 <= value <= MAX_SQLITE_ROWID:
+        raise HTTPException(404, "no such id")
+
+
+# The empty JSON object is load-bearing: a bodyless POST needs no
+# content type, and the guard middleware keys on application/json to
+# force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
-async def create_group() -> dict:
+async def create_group(body: dict = Body()) -> dict:
     return {"id": store.create_group(app.state.db)}
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)
 async def group_detail(group_id: int) -> dict:
+    ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
     if group is None:
         raise HTTPException(404, "no such group")
@@ -558,6 +597,7 @@ async def create_prompt(body: PromptCreate) -> dict:
 
 @app.delete("/prompts/{prompt_id}", status_code=204)
 async def remove_prompt(prompt_id: int) -> Response:
+    ensure_rowid(prompt_id)
     if not store.delete_prompt(app.state.db, prompt_id):
         raise HTTPException(404, "no such prompt")
     return Response(status_code=204)
@@ -579,6 +619,7 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
 
 @app.get("/runs/{run_id}", response_model=RunDetail)
 async def get_run(run_id: int) -> dict:
+    ensure_rowid(run_id)
     run = store.get_run(app.state.db, run_id)
     if run is None:
         raise HTTPException(404, "no such run")
