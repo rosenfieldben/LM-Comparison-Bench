@@ -51,6 +51,7 @@
     --diff-add-bg: rgba(63,185,112,0.13); --diff-add-text: #8ed7ab;
     --shimmer: rgba(56,189,216,0.35); --shimmer-strong: rgba(56,189,216,0.55);
     --hist-count: #5a8797;
+    --warn: #d9a63f;
 
     /* density knobs; data-density="compact" on <html> retunes these
        five and nothing else */
@@ -84,6 +85,7 @@
       --diff-add-bg: rgba(47,158,95,0.12); --diff-add-text: #237347;
       --shimmer: rgba(14,148,176,0.25); --shimmer-strong: rgba(14,148,176,0.45);
       --hist-count: #0b7990;
+      --warn: #8a6a00;
     }
   }
   :root[data-theme="light"] {
@@ -105,6 +107,7 @@
     --diff-add-bg: rgba(47,158,95,0.12); --diff-add-text: #237347;
     --shimmer: rgba(14,148,176,0.25); --shimmer-strong: rgba(14,148,176,0.45);
     --hist-count: #0b7990;
+    --warn: #8a6a00;
   }
 
   /* Live motion: pulse for anything waiting, shimmer for anything
@@ -613,6 +616,11 @@
     color: var(--err-btn-fg);
   }
   .budget-note { font-size: 10.5px; color: var(--text-faint); margin-left: auto; }
+  .save-warn {
+    padding: 8px var(--pad-card) 0;
+    font-size: 10.5px;
+    color: var(--warn);
+  }
 
   /* ==== Diff panel ==== */
   #diff-header {
@@ -716,7 +724,7 @@
   </div>
   <div id="stats">
     <div class="stat" id="stat-runs"><span class="k">runs</span><span class="v">00</span></div>
-    <div class="stat" id="stat-spend"><span class="k">session spend</span><span class="v">$0.0000</span></div>
+    <div class="stat" id="stat-spend"><span class="k">session spend</span><span class="v" data-testid="stat-spend">~$0.0000</span></div>
     <div class="stat" id="stat-ttft"><span class="k">avg ttft</span><span class="v">—</span></div>
     <div class="stat" id="stat-lineup"><span class="k">lineup</span><span class="v">—</span></div>
   </div>
@@ -892,7 +900,33 @@ const statRuns = document.querySelector("#stat-runs .v");
 const statSpend = document.querySelector("#stat-spend .v");
 const statTtft = document.querySelector("#stat-ttft .v");
 const statLineup = document.querySelector("#stat-lineup .v");
-let running = false;
+// ---- View epoch. The results area is owned by exactly one operation
+// ---- at a time. The reproduced races this exists to prevent: a rerun
+// ---- still streaming while a new Run reused its model name repainted
+// ---- the new run's race row; a history replay opened mid-run was
+// ---- repainted by the superseded run's late events; two rapid
+// ---- history selections rendered in arrival order, letting the
+// ---- first overwrite the second. Async work stamps the epoch it
+// ---- started under and touches shared view state only while that
+// ---- epoch is current; superseded work is aborted client-side and
+// ---- dropped silently. Its server-side persistence already happened
+// ---- through the disconnect path, so this is purely view integrity.
+let viewEpoch = 0;
+// In-flight fetches owned by the current epoch. Aborting them on
+// supersession frees the server's semaphore slot immediately and the
+// partial persists server-side.
+let epochControllers = [];
+// Runs and reruns in flight for the current epoch; the Run button
+// stays disabled while any of them is live.
+let inflightRuns = 0;
+
+function newViewEpoch() {
+  viewEpoch += 1;
+  for (const c of epochControllers) c.abort();
+  epochControllers = [];
+  inflightRuns = 0;
+  return viewEpoch;
+}
 // Sent with the run so it links back to its saved prompt. Cleared
 // the moment the textarea is edited: the text no longer matches the
 // library entry, so the link would lie.
@@ -912,11 +946,18 @@ document.getElementById("bar-host").textContent = location.host || "localhost:80
 // ---- Command-bar session stats. Runs, spend and mean TTFT are this
 // ---- browser session's live totals, reset by a reload on purpose:
 // ---- the bar answers "what has this sitting cost me", not history.
-const sessionStats = { runs: 0, spend: 0, ttftSum: 0, ttftN: 0 };
+const sessionStats = { runs: 0, spend: 0, unpriced: 0, ttftSum: 0, ttftN: 0 };
 
 function renderStats() {
   statRuns.textContent = String(sessionStats.runs).padStart(2, "0");
-  statSpend.textContent = "$" + sessionStats.spend.toFixed(4);
+  // Every figure here is an estimate from catalog prices, and results
+  // the session could not price are counted rather than silently
+  // dropped: a total that quietly understates spend is worse than none.
+  statSpend.textContent =
+    "~$" + sessionStats.spend.toFixed(4) +
+    (sessionStats.unpriced > 0
+      ? " + " + sessionStats.unpriced + " unpriced"
+      : "");
   statTtft.textContent = sessionStats.ttftN > 0
     ? Math.round(sessionStats.ttftSum / sessionStats.ttftN) + " ms"
     : "—";
@@ -1084,10 +1125,13 @@ function fmtEstimate(v) {
   return Number(v.toPrecision(2)).toString();
 }
 
-// "n requests · est. max $x/run". The estimate is checked models ×
-// completion price × budget (per-model capped), the worst billable
-// case; it is omitted when pricing is unavailable. The request count
-// doubles as the note that each model runs as its own request.
+// "n requests · max output cost $x/run (input not included)". The
+// estimate is checked models × completion price × budget (per-model
+// capped), the worst billable OUTPUT case; the input side depends on
+// prompt tokenization the client does not attempt, so the label says
+// so instead of pretending. Omitted when pricing is unavailable. The
+// request count doubles as the note that each model runs as its own
+// request.
 function updateEstimate() {
   const models = checkedModels();
   if (models.length === 0) {
@@ -1109,7 +1153,11 @@ function updateEstimate() {
         : BUDGET_TOKENS[budgetValue];
       est += m.completion_price * cap;
     }
-    if (computable) text += " · est. max $" + fmtEstimate(est) + "/run";
+    if (computable) {
+      text +=
+        " · max output cost $" + fmtEstimate(est) +
+        "/run (input not included)";
+    }
   }
   runNote.textContent = text;
 }
@@ -1124,7 +1172,7 @@ function renderLinked() {
 function updateRunState() {
   const checked = checkedModels().length;
   runBtn.disabled =
-    running || promptEl.value.trim() === "" || checked === 0;
+    inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
   deleteBtn.disabled = savedSelect.value === "";
   lineupLabel.textContent = "Lineup " + checked + "/" + lineup.length;
   renderLinked();
@@ -1570,6 +1618,8 @@ function makeColumn(model) {
   const total = metricCell("total", "total");
   const tok = metricCell("tok", "tok i/o");
   const cost = metricCell("cost", "cost");
+  cost.v.title =
+    "estimated from catalog prices and reported tokens; not billed cost";
   metrics.append(ttft.cell, total.cell, tok.cell, cost.cell);
   const body = document.createElement("div");
   body.className = "body";
@@ -1617,14 +1667,16 @@ let tickerTimer = null;
 function renderTick(ui, entry) {
   const secs = Math.floor((performance.now() - entry.start) / 1000);
   ui.statusTime.textContent = " · " + secs + "s";
-  if (race !== null && entry.model != null) {
+  // Race rows key by model name and a superseded run may share a name
+  // with the current run, so only current-epoch ticks may touch them.
+  if (race !== null && entry.model != null && entry.epoch === viewEpoch) {
     const row = race.rows.get(entry.model);
     if (row && row.status === "working") row.val.textContent = secs + " s";
   }
 }
 
-function startTicker(ui, model) {
-  const entry = { start: performance.now(), model: model };
+function startTicker(ui, model, epoch) {
+  const entry = { start: performance.now(), model: model, epoch: epoch };
   tickers.set(ui, entry);
   renderTick(ui, entry);
   if (tickerTimer === null) {
@@ -1661,15 +1713,16 @@ function addRerun(ui, retry) {
     resetColumn(ui);
     // Same budget as the run being retried, not the current control
     // value: a rerun is a second sample of the same experiment.
-    runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui);
+    runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, viewEpoch);
   });
   ui.tools.append(btn);
 }
 
 function fmtCost(c) {
-  // Exponential for the typical sub-cent run ($3.1e-5); plain decimals
-  // once a run costs enough for them to be readable.
-  return "$" + (c < 0.01 ? c.toExponential(1) : c.toFixed(3));
+  // Exponential for the typical sub-cent run (~$3.1e-5); plain decimals
+  // once a run costs enough for them to be readable. The tilde is the
+  // honesty marker: catalog prices times reported tokens, not a bill.
+  return "~$" + (c < 0.01 ? c.toExponential(1) : c.toFixed(3));
 }
 
 function fillMetrics(ui, result) {
@@ -1754,6 +1807,19 @@ function completeColumn(ui, result, sourceLabel, opts) {
     ui.body.textContent = result.response_text != null ? result.response_text : "";
   }
   fillMetrics(ui, result);
+  if (opts.unsaved) {
+    // run_id came back null: the server spent the money and streamed
+    // the response but could not persist it. Saying nothing would let
+    // History silently lie by omission.
+    const warn = document.createElement("div");
+    warn.className = "save-warn";
+    warn.dataset.testid = "save-warning";
+    warn.textContent = "not saved to history";
+    warn.title =
+      "persisting this run failed; the response is intact but it " +
+      "will not appear in History";
+    ui.body.before(warn);
+  }
   const error = "shownError" in opts ? opts.shownError : result.error;
   applyError(ui, error);
   setState(ui, error != null ? "error" : "done");
@@ -1954,10 +2020,17 @@ function registerDiffable(ui, result, sourceLabel) {
 
 document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
 
-async function runOne(prompt, model, promptId, groupId, budget, ui) {
+async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
+  // Superseded before it started: spend no money for a dead view.
+  if (epoch !== viewEpoch) return;
+  const current = () => epoch === viewEpoch;
+  const controller = new AbortController();
+  epochControllers.push(controller);
+  inflightRuns += 1;
+  updateRunState();
   ui.body.classList.add("loading");
   ui.body.textContent = "awaiting first token";
-  startTicker(ui, model);
+  startTicker(ui, model, epoch);
   raceRestart(model);
   // Deltas append to a dedicated text node: appendData is a pure text
   // API, so the no-HTML injection rule holds for every chunk, and the
@@ -1970,7 +2043,9 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
       // client-side TTFT drives the card metric and race bar until the
       // server's authoritative number arrives with the done event.
       const entry = tickers.get(ui);
-      if (entry) {
+      // The race strip belongs to the current view; a superseded run
+      // sharing a model name with the new one must not repaint it.
+      if (entry && current()) {
         const ttftMs = performance.now() - entry.start;
         setMetric(ui.metrics.ttft, String(Math.round(ttftMs)), "ms");
         raceTtft(model, ttftMs);
@@ -1984,24 +2059,43 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
     }
     textNode.appendData(text);
   }
-  function finish(result) {
+  function finish(result, runId) {
     // Idempotence guard: a connection that dies after the done event
     // was rendered must not stack a second set of metrics or errors.
     if (finished) return;
     finished = true;
-    if (result.error != null) {
-      raceError(model);
-    } else {
-      raceDone(model, result.ttft_ms);
+    stopTicker(ui);
+    if (current()) {
+      if (result.error != null) {
+        raceError(model);
+      } else {
+        raceDone(model, result.ttft_ms);
+      }
+      inflightRuns -= 1;
+      updateRunState();
     }
-    // Session stats: spend counts whatever was billed, failures
-    // included; mean TTFT counts completed requests only.
-    if (result.cost_usd != null) sessionStats.spend += result.cost_usd;
+    // Session accounting is view-independent: money spent by a
+    // superseded run is still money spent this session.
+    if (result.cost_usd != null) {
+      sessionStats.spend += result.cost_usd;
+    } else if (
+      result.response_text != null ||
+      result.prompt_tokens != null ||
+      result.completion_tokens != null
+    ) {
+      // Evidence of consumption with no price: offline catalog,
+      // missing usage, or an error after tokens flowed. Counted so
+      // the session total cannot quietly understate real spend.
+      sessionStats.unpriced += 1;
+    }
     if (result.error == null && result.ttft_ms != null) {
       sessionStats.ttftSum += result.ttft_ms;
       sessionStats.ttftN += 1;
     }
     renderStats();
+    // A superseded run's view work ends here: dropped silently, its
+    // persistence already handled server-side.
+    if (!current()) return;
     // Presentation only, never persisted: the stored error stays the
     // server's exact words. The extended budget is the one knob the
     // user can turn when reasoning burned the whole standard budget,
@@ -2018,6 +2112,9 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
       streamed: textNode !== null,
       shownError: shownError,
       budgetBadge: false,
+      // run_id null on the done event means the server spent the money
+      // and streamed the response but could not persist it.
+      unsaved: runId === null,
       // Only this streaming path offers a rerun; historical replays go
       // through fillColumn and never get one.
       retry: result.error != null
@@ -2037,6 +2134,7 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
         group_id: groupId,
         budget: budget,
       }),
+      signal: controller.signal,
     });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     const reader = resp.body.getReader();
@@ -2056,7 +2154,7 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
         if (event.type === "delta") {
           appendDelta(event.text);
         } else if (event.type === "done") {
-          finish(event.result);
+          finish(event.result, event.run_id);
         }
       }
     }
@@ -2066,24 +2164,31 @@ async function runOne(prompt, model, promptId, groupId, budget, ui) {
     // through the same error rendering as a server-reported failure.
     // The streamed text is folded into the synthetic result so the
     // card stays diffable on its partial text.
+    // run_id undefined, not null: whether the server persisted this
+    // run is unknown from here (its disconnect path usually does), so
+    // no not-saved warning is claimed.
     finish({
       error: "request failed: " + err.message,
       response_text: textNode !== null ? textNode.data : null,
-    });
+    }, undefined);
   }
 }
 
-runBtn.addEventListener("click", async () => {
+// Named rather than inline in the click handler so the browser suite
+// can start a superseding run directly: the disabled Run button is the
+// UX affordance, the view epoch is the integrity mechanism, and the
+// tests exercise the mechanism.
+async function startRun() {
   const prompt = promptEl.value;
   const promptId = selectedPromptId;
   const budget = budgetValue;
   const models = checkedModels();
+  const epoch = newViewEpoch();
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
   // A new comparison replaces the cards a shown diff came from.
   closeDiffPanel();
   disarmDiff();
-  running = true;
   updateRunState();
   sessionStats.runs += 1;
   renderStats();
@@ -2113,12 +2218,12 @@ runBtn.addEventListener("click", async () => {
   }
   await Promise.allSettled(
     models.map((model, i) =>
-      runOne(prompt, model, promptId, groupId, budget, columns[i])
+      runOne(prompt, model, promptId, groupId, budget, columns[i], epoch)
     )
   );
-  running = false;
   updateRunState();
-});
+}
+runBtn.addEventListener("click", startRun);
 
 // ---- History. Loads on expand rather than page load: it is the
 // ---- rarely used half of the page and a stale list is worse than a
@@ -2141,18 +2246,29 @@ function applyHistoryFilter() {
 // N" note in the header cannot drift out of sync with what was asked.
 const HISTORY_LIMIT = 100;
 
+// The newest list load owns the panel; an older one still in flight
+// is aborted rather than left to race the render.
+let historyListController = null;
+
 async function loadHistory() {
+  if (historyListController !== null) historyListController.abort();
+  const controller = new AbortController();
+  historyListController = controller;
   historyList.replaceChildren();
   historyNote.textContent = "";
   let data;
   try {
-    const resp = await fetch("/runs?limit=" + HISTORY_LIMIT);
+    const resp = await fetch("/runs?limit=" + HISTORY_LIMIT, {
+      signal: controller.signal,
+    });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     data = await resp.json();
   } catch (err) {
+    if (controller.signal.aborted) return;
     historyList.textContent = "failed to load history: " + err.message;
     return;
   }
+  if (controller !== historyListController) return;
   if (data.runs.length === 0) {
     historyList.textContent = "no runs yet";
     return;
@@ -2196,16 +2312,27 @@ async function loadHistory() {
 }
 
 async function showGroup(groupId) {
+  // Owns the view from the click: in-flight runs for the old view are
+  // aborted now, and this fetch is itself abortable by whatever
+  // supersedes it.
+  const epoch = newViewEpoch();
+  updateRunState();
+  const controller = new AbortController();
+  epochControllers.push(controller);
   let group;
   try {
-    const resp = await fetch("/groups/" + groupId);
+    const resp = await fetch("/groups/" + groupId, {
+      signal: controller.signal,
+    });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     group = await resp.json();
   } catch (err) {
+    if (epoch !== viewEpoch) return;
     runLabelEl.textContent =
       "failed to load comparison #" + groupId + ": " + err.message;
     return;
   }
+  if (epoch !== viewEpoch) return;
   resultsEl.replaceChildren();
   // The race strip visualizes the live run only; a replay has no race.
   hideRace();
@@ -2236,15 +2363,22 @@ async function showGroup(groupId) {
 }
 
 async function showRun(runId) {
+  // Same ownership rule as showGroup.
+  const epoch = newViewEpoch();
+  updateRunState();
+  const controller = new AbortController();
+  epochControllers.push(controller);
   let run;
   try {
-    const resp = await fetch("/runs/" + runId);
+    const resp = await fetch("/runs/" + runId, { signal: controller.signal });
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     run = await resp.json();
   } catch (err) {
+    if (epoch !== viewEpoch) return;
     runLabelEl.textContent = "failed to load run #" + runId + ": " + err.message;
     return;
   }
+  if (epoch !== viewEpoch) return;
   // Same completion renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too.
   resultsEl.replaceChildren();

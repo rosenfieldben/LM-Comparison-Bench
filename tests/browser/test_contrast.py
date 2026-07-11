@@ -29,6 +29,7 @@ PAIRINGS = [
     ("--accent-val",   ["--bg-panel"]),
     ("--done-label",   ["--bg-panel"]),
     ("--err",          ["--bg-panel"]),
+    ("--warn",         ["--bg-panel"]),
     ("--hist-count",   ["--bg-page", "--bg-panel"]),
     ("--seg-fg",       ["--bg-seg-on"]),
     ("--run-fg",       ["--accent"]),

@@ -62,7 +62,7 @@ def build_app() -> Starlette:
     # Closure state instead of module globals: each harness session
     # builds its own app, so flaky's fail-once behavior and the request
     # log reset with the stub process.
-    state = {"requests": [], "flaky_failed": False}
+    state = {"requests": [], "flaky_failed": False, "flaky_slow_failed": False}
 
     async def models(request):
         return JSONResponse(CATALOG)
@@ -102,6 +102,19 @@ def build_app() -> Starlette:
                 yield b"data: [DONE]\n\n"
 
             return gen()
+        if model == "stub/flaky-slow":
+            # Fails once like stub/flaky, but the successful retry is
+            # slow: the window the view-integrity tests need to start a
+            # superseding run while a rerun is still in flight.
+            if not state["flaky_slow_failed"]:
+                state["flaky_slow_failed"] = True
+
+                async def gen():
+                    yield sse({"error": {"code": 502, "message": "stub flaky failure"}})
+                    yield b"data: [DONE]\n\n"
+
+                return gen()
+            return text_stream(model, reply_text(model), "flaky-slow", delay=2.0)
         if model == "stub/null":
 
             async def gen():
