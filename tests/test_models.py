@@ -653,3 +653,57 @@ async def test_stream_missing_provenance_degrades_to_none(client):
     assert result["response_text"] == "hi"
     assert result["generation_id"] is None
     assert result["finish_reason"] is None
+
+
+from bench.models import as_token_count
+
+# The junk menu from the review: numeric strings, floats, negatives,
+# bools (an int subclass), containers. Only genuine non-negative ints
+# survive.
+JUNK_TOKEN_VALUES = ["n/a", "12", 3.7, -5, True, {}, []]
+
+
+@pytest.mark.parametrize("junk", JUNK_TOKEN_VALUES)
+def test_as_token_count_rejects_junk(junk):
+    assert as_token_count(junk) is None
+
+
+@pytest.mark.parametrize("valid", [0, 8, 16384])
+def test_as_token_count_accepts_real_counts(valid):
+    assert as_token_count(valid) == valid
+
+
+@pytest.mark.parametrize("junk", JUNK_TOKEN_VALUES)
+@respx.mock
+async def test_run_model_normalizes_junk_token_counts(client, junk):
+    body = json.loads(json.dumps(FIXTURE))
+    body["usage"] = {"prompt_tokens": junk, "completion_tokens": junk}
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["prompt_tokens"] is None
+    assert result["completion_tokens"] is None
+
+
+@pytest.mark.parametrize("junk", JUNK_TOKEN_VALUES)
+@respx.mock
+async def test_stream_model_normalizes_junk_token_counts(client, junk):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([
+                delta_chunk("hi"),
+                sse({"choices": [], "usage": {"prompt_tokens": junk, "completion_tokens": junk}}),
+                DONE_MARKER,
+            ]),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "hi"
+    assert result["prompt_tokens"] is None
+    assert result["completion_tokens"] is None

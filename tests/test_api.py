@@ -132,7 +132,7 @@ def test_group_flow_collapses_comparison_into_one_history_entry(client):
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
-    group_id = client.post("/groups").json()["id"]
+    group_id = client.post("/groups", json={}).json()["id"]
     first = client.post(
         "/compare",
         json={"prompt": "hi", "models": ["model/alpha"], "group_id": group_id},
@@ -384,7 +384,7 @@ def test_stream_endpoint_grouped_run_lands_in_group(client):
         return_value=httpx.Response(200, stream=alpha_stream())
     )
 
-    group_id = client.post("/groups").json()["id"]
+    group_id = client.post("/groups", json={}).json()["id"]
     events = stream_events(
         client, {"prompt": "hi", "model": "model/alpha", "group_id": group_id}
     )
@@ -624,11 +624,12 @@ def test_cross_site_textplain_post_is_415_and_never_reaches_upstream(client):
     assert not route.called
 
 
-def test_bodyless_post_needs_no_content_type(client):
-    # The frontend creates groups via fetch(..., {method: "POST"}) with
-    # no body and no content-type; the guard must not break that.
-    resp = client.post("/groups")
-    assert resp.status_code == 201
+def test_group_create_requires_json_body(client):
+    # The old bodyless exemption was the reproduced cross-site hole:
+    # every POST now needs the JSON content type, and the frontend
+    # sends an empty JSON object on /groups.
+    assert client.post("/groups").status_code == 415
+    assert client.post("/groups", json={}).status_code == 201
 
 
 def test_models_endpoint_returns_catalog_with_pricing(client):
@@ -798,7 +799,7 @@ def test_compare_persistence_failure_degrades_to_null_run_id(
     body = resp.json()
     assert body["run_id"] is None
     assert body["results"][0]["response_text"] is not None
-    assert "failed to persist compare run" in caplog.text
+    assert "post-upstream processing failed" in caplog.text
 
 
 # ---- Upstream concurrency cap. These tests drive the endpoint
@@ -1018,3 +1019,152 @@ def test_favicon_served_inline_with_cache_headers(client):
     # Long-lived caching is the point: one request per browser, ever.
     assert "max-age" in resp.headers.get("cache-control", "")
     assert b"<svg" in resp.content
+
+
+# ---- Review reproductions. These four requests reproduced real
+# ---- defects in an adversarial external review; they stay in the
+# ---- suite verbatim so the incidents stay in its memory.
+
+
+@respx.mock
+def test_review_repro_huge_group_id_is_422_before_any_spend(client):
+    # Reproduction 1: group_id=10**100 passed Pydantic, the paid call
+    # completed, then resolve_links raised OverflowError at the sqlite
+    # bind and the response was a 500 with nothing stored. Now the
+    # boundary rejects it before any upstream request exists.
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    resp = client.post(
+        "/compare",
+        json={"prompt": "hi", "models": ["model/alpha"], "group_id": 10**100},
+    )
+    assert resp.status_code == 422
+    assert not route.called
+
+    resp = client.post(
+        "/compare/stream",
+        json={"prompt": "hi", "model": "model/alpha", "prompt_id": 10**100},
+    )
+    assert resp.status_code == 422
+    assert not route.called
+
+
+@respx.mock
+def test_review_repro_string_token_counts_do_not_poison_history(client):
+    # Reproduction 2: a provider answered "prompt_tokens": "n/a"; the
+    # raw value was persisted, /compare 500ed at its response boundary
+    # and the stored row made GET /runs/{id} 500 forever.
+    body = json.loads(json.dumps(FIXTURE))
+    body["usage"] = {"prompt_tokens": "n/a", "completion_tokens": "n/a"}
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    assert resp.status_code == 200
+    result = resp.json()["results"][0]
+    assert result["response_text"] is not None
+    assert result["prompt_tokens"] is None
+    assert result["completion_tokens"] is None
+
+    detail = client.get(f"/runs/{resp.json()['run_id']}")
+    assert detail.status_code == 200
+    assert detail.json()["results"][0]["prompt_tokens"] is None
+
+    # A legacy row poisoned by the pre-normalization code (written
+    # around save_run, exactly as the old ingestion effectively did)
+    # must also read back, repaired, instead of 500ing forever.
+    db = client.app.state.db
+    with db:
+        cur = db.execute(
+            "INSERT INTO runs (prompt_text, created_at) VALUES ('legacy', '2026-01-01T00:00:00+00:00')"
+        )
+        legacy_id = cur.lastrowid
+        db.execute(
+            "INSERT INTO results (run_id, model, response_text, prompt_tokens,"
+            " completion_tokens, latency_ms) VALUES (?, 'old/model', 'hi',"
+            " 'n/a', '12', 'slow')",
+            (legacy_id,),
+        )
+    legacy = client.get(f"/runs/{legacy_id}")
+    assert legacy.status_code == 200
+    row = legacy.json()["results"][0]
+    assert row["response_text"] == "hi"
+    assert row["prompt_tokens"] is None
+    # SQLite's INTEGER affinity already coerced the losslessly numeric
+    # string at insert time; repair-on-read serves what survived.
+    assert row["completion_tokens"] == 12
+    assert row["latency_ms"] is None
+
+
+def test_review_repro_bodyless_cross_site_group_create_rejected(client):
+    # Reproduction 3: a bodyless cross-site POST /groups returned 201
+    # because the JSON guard exempted bodyless posts. The verbatim
+    # attack request now dies at the middleware.
+    resp = client.post(
+        "/groups",
+        headers={
+            "Origin": "https://attacker.example",
+            "Sec-Fetch-Site": "cross-site",
+        },
+    )
+    assert 400 <= resp.status_code < 500
+
+    # The frontend path, a same-origin JSON POST with an empty object,
+    # still works.
+    assert client.post("/groups", json={}).status_code == 201
+
+
+# Reproduction 4 (world-readable bench.db) lives in test_store.py as
+# test_review_repro_fresh_database_is_private, next to connect().
+
+
+@respx.mock
+def test_compare_survives_resolve_links_failure(client, monkeypatch, caplog):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    def boom(*args, **kwargs):
+        raise OverflowError("simulated post-upstream failure")
+
+    monkeypatch.setattr("bench.main.resolve_links", boom)
+
+    with caplog.at_level(logging.ERROR, logger="bench.main"):
+        resp = client.post(
+            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
+        )
+
+    # The invariant: after money is spent, no code path may convert
+    # results into an error response.
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["run_id"] is None
+    assert body["results"][0]["response_text"] is not None
+    assert "post-upstream processing failed" in caplog.text
+
+
+@respx.mock
+def test_stream_survives_resolve_links_failure(client, monkeypatch):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    def boom(*args, **kwargs):
+        raise OverflowError("simulated post-stream failure")
+
+    monkeypatch.setattr("bench.main.resolve_links", boom)
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["run_id"] is None
+    assert done["result"]["response_text"] == "Hello"
+
+
+def test_out_of_range_path_ids_read_as_absent(client):
+    # Out of sqlite's rowid range nothing can exist, so the answer is
+    # the same 404 an in-range miss gets, not a bind-overflow 500.
+    huge = str(10**100)
+    assert client.get(f"/runs/{huge}").status_code == 404
+    assert client.get(f"/groups/{huge}").status_code == 404
+    assert client.delete(f"/prompts/{huge}").status_code == 404
+    assert client.get("/runs/0").status_code == 404

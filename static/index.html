@@ -2099,7 +2099,14 @@ runBtn.addEventListener("click", async () => {
   // product.
   let groupId = null;
   try {
-    const resp = await fetch("/groups", { method: "POST" });
+    // The empty JSON body is load-bearing: the server requires
+    // application/json on every POST so hostile cross-site senders
+    // are forced into a CORS preflight it never answers.
+    const resp = await fetch("/groups", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
     if (resp.ok) groupId = (await resp.json()).id;
   } catch (err) {
     // Deliberately swallowed; see above.

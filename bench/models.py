@@ -1,11 +1,47 @@
 """Core model-calling logic. Pure functions over an injected httpx client."""
 
 import json
+import math
 import os
 import socket
 import time
 
 import httpx
+
+
+def as_token_count(value):
+    """A token count usable downstream: a non-negative int, else None.
+
+    The never-raises contract extends to field types. A provider once
+    returned "prompt_tokens": "n/a"; persisted raw, that one row made
+    /compare 500 at its own response boundary and poisoned
+    GET /runs/{id} into a permanent 500. bool is excluded explicitly
+    because isinstance(True, int) passes. Junk is rejected rather than
+    coerced: a guessed count would price a cost from fiction.
+    """
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def as_text(value):
+    """str or None; any other type becomes None, same contract as counts."""
+    return value if isinstance(value, str) else None
+
+
+def as_metric(value):
+    """A finite float measurement or None; bools and junk become None.
+
+    Used by the store's repair-on-read: measurement columns written
+    before ingestion normalization may carry non-numeric junk.
+    """
+    if (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    ):
+        return float(value)
+    return None
 
 # Env-overridable as a test seam so the browser harness can point the
 # real app at a stub upstream; not a configuration feature.
@@ -287,8 +323,8 @@ async def run_model(
     usage = data.get("usage")
     if not isinstance(usage, dict):
         usage = {}
-    result["prompt_tokens"] = usage.get("prompt_tokens")
-    result["completion_tokens"] = usage.get("completion_tokens")
+    result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
+    result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
     return result
 
 
@@ -389,8 +425,12 @@ async def stream_model(
 
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
-                    result["prompt_tokens"] = usage.get("prompt_tokens")
-                    result["completion_tokens"] = usage.get("completion_tokens")
+                    result["prompt_tokens"] = as_token_count(
+                        usage.get("prompt_tokens")
+                    )
+                    result["completion_tokens"] = as_token_count(
+                        usage.get("completion_tokens")
+                    )
 
                 # OpenRouter reports mid-stream failures as an in-band
                 # error object on the 200 stream. Without this check the
