@@ -43,9 +43,13 @@ def start_run_via_ui(page, prompt):
 def start_superseding_run(page, prompt):
     # The Run button is rightly disabled while the first run is in
     # flight; the epoch machinery must hold no matter how a second run
-    # starts, so drive the named starter directly.
+    # starts, so drive the named starter directly. The arrow wrapper
+    # returns undefined rather than startRun's promise, so evaluate does
+    # not block until the run finishes: a real button click does not
+    # block either, and tests that inspect the run mid-flight need it
+    # actually in flight.
     page.get_by_test_id("prompt-input").fill(prompt)
-    page.evaluate("startRun()")
+    page.evaluate("() => { startRun(); }")
 
 
 def collect_page_errors(page):
@@ -249,3 +253,101 @@ def test_cost_language_is_honest(bench):
     expect(cost).to_contain_text("~$")
     expect(cost).to_have_attribute("title", re.compile("not billed"))
     expect(page.get_by_test_id("stat-spend")).to_contain_text("~$")
+
+
+# ---- Regression guards for the adversarial-review findings on Phase E
+# ---- itself. These target the exact defects the review's verifier
+# ---- panel confirmed, so each fails if its fix is reverted.
+
+ERR_NULL_RUNID_FRAME = (
+    'data: {"type": "delta", "text": "partial"}\n\n'
+    'data: {"type": "done", "result": {"model": "stub/fast",'
+    ' "response_text": "partial", "latency_ms": 12.0, "prompt_tokens": 1,'
+    ' "completion_tokens": 1, "error": "upstream error: boom",'
+    ' "cost_usd": null, "ttft_ms": 5.0, "max_tokens": 16384},'
+    ' "run_id": null}\n\n'
+)
+OK_SAVED_FRAME = (
+    'data: {"type": "delta", "text": "recovered"}\n\n'
+    'data: {"type": "done", "result": {"model": "stub/fast",'
+    ' "response_text": "recovered", "latency_ms": 12.0, "prompt_tokens": 1,'
+    ' "completion_tokens": 1, "error": null, "cost_usd": 0.00001,'
+    ' "ttft_ms": 5.0, "max_tokens": 16384}, "run_id": 4242}\n\n'
+)
+
+
+def test_rerun_clears_stale_not_saved_warning(bench):
+    # An errored result whose server-side persistence also failed shows
+    # both a rerun control and the not-saved warning. The warning is a
+    # card-level sibling of the body, so the rerun's resetColumn must
+    # explicitly drop it; otherwise a cleanly-persisted rerun keeps
+    # claiming "not saved to history", the exact lie Phase E forbids.
+    page = bench(["stub/fast"])
+    calls = {"n": 0}
+
+    def handler(route):
+        body = ERR_NULL_RUNID_FRAME if calls["n"] == 0 else OK_SAVED_FRAME
+        calls["n"] += 1
+        route.fulfill(status=200, content_type="text/event-stream", body=body)
+
+    page.route("**/compare/stream", handler)
+
+    check_chip(page, 0)
+    start_run_via_ui(page, "fail then recover")
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("save-warning")).to_have_count(1)
+
+    card.get_by_test_id("tool-rerun").click()
+    expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
+    # The persisted rerun must not carry the stale warning.
+    expect(card.get_by_test_id("save-warning")).to_have_count(0)
+
+
+def test_run_button_reserved_synchronously_before_group_fetch(bench):
+    # startRun runs synchronously up to its first await (the /groups
+    # POST). The batch reservation must disable the button in that
+    # synchronous stretch, or a second click during the /groups latency
+    # starts a duplicate run. Calling startRun() and reading
+    # runBtn.disabled in the same evaluate observes exactly that window.
+    page = bench(["stub/fast"])
+    check_chip(page, 0)
+    page.get_by_test_id("prompt-input").fill("reservation")
+    disabled_in_window = page.evaluate(
+        "() => { startRun(); return document.getElementById('run').disabled; }"
+    )
+    assert disabled_in_window is True
+    # The run still completes and re-enables the button afterward.
+    expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+
+
+def test_superseded_same_model_does_not_repaint_new_race_row(bench):
+    # The epoch guard is load-bearing only when a superseded run shares a
+    # model NAME with the new run: the race strip keys rows by model id,
+    # so a stale completion would hit the new run's row. This is the case
+    # DOM replacement alone does not cover, so reverting the epoch guard
+    # fails here where the other race tests stay green.
+    page = bench(["stub/slow"])
+    errors = collect_page_errors(page)
+
+    check_chip(page, 0)
+    start_run_via_ui(page, "first slow same")
+    expect(status_of(cards(page).first)).to_contain_text("thinking")
+
+    # Supersede late in the first run's 2s silence, so its completion
+    # lands while the second run's identically-named row is still
+    # working. The slow chip stays checked from the first run, so the
+    # second run reuses the same model id on purpose (do not re-toggle).
+    page.wait_for_timeout(1600)
+    start_superseding_run(page, "second slow same")
+
+    # The first run completes ~0.4s from now; the second not for ~2s.
+    # Through that window the new run's row must stay in the working
+    # state, never flipped to a done ms value by the stale completion.
+    page.wait_for_timeout(800)
+    row = page.locator(".race-row")
+    expect(row).to_have_count(1)
+    expect(row).to_have_class(re.compile(r"\bworking\b"))
+    expect(page.locator(".race-val").first).not_to_contain_text("ms")
+    assert errors == []

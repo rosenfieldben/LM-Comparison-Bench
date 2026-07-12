@@ -724,7 +724,7 @@
   </div>
   <div id="stats">
     <div class="stat" id="stat-runs"><span class="k">runs</span><span class="v">00</span></div>
-    <div class="stat" id="stat-spend"><span class="k">session spend</span><span class="v" data-testid="stat-spend">~$0.0000</span></div>
+    <div class="stat" id="stat-spend"><span class="k">session spend</span><span class="v" data-testid="stat-spend" title="estimated from catalog prices and reported tokens; not billed cost">~$0.0000</span></div>
     <div class="stat" id="stat-ttft"><span class="k">avg ttft</span><span class="v">—</span></div>
     <div class="stat" id="stat-lineup"><span class="k">lineup</span><span class="v">—</span></div>
   </div>
@@ -1646,6 +1646,13 @@ function resetColumn(ui) {
   for (const v of Object.values(ui.metrics)) clearMetric(v);
   ui.body.className = "body";
   ui.body.replaceChildren();
+  // The not-saved warning is a card-level sibling of the body, not a
+  // child of it, so clearing the body above leaves it behind. Drop it
+  // here or a rerun that persists cleanly would keep claiming "not
+  // saved to history", and a rerun that fails again would stack a
+  // second copy.
+  const staleWarn = ui.card.querySelector(".save-warn");
+  if (staleWarn) staleWarn.remove();
 }
 
 function toolButton(label) {
@@ -2184,6 +2191,13 @@ async function startRun() {
   const budget = budgetValue;
   const models = checkedModels();
   const epoch = newViewEpoch();
+  // Reserve the in-flight registry synchronously, before the /groups
+  // await below, so the Run button is disabled for the whole batch
+  // startup. Without this a second click during the sub-second /groups
+  // latency would start a duplicate run (double-counted runs stat,
+  // orphan group row), since per-model runOne calls do not increment
+  // the registry until after that await resolves.
+  inflightRuns += 1;
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
   // A new comparison replaces the cards a shown diff came from.
@@ -2216,12 +2230,21 @@ async function startRun() {
   } catch (err) {
     // Deliberately swallowed; see above.
   }
-  await Promise.allSettled(
-    models.map((model, i) =>
-      runOne(prompt, model, promptId, groupId, budget, columns[i], epoch)
-    )
-  );
-  updateRunState();
+  try {
+    await Promise.allSettled(
+      models.map((model, i) =>
+        runOne(prompt, model, promptId, groupId, budget, columns[i], epoch)
+      )
+    );
+  } finally {
+    // Release the batch reservation, but only if this batch still owns
+    // the view: a superseding run already reset the registry to zero,
+    // so decrementing here would corrupt its count.
+    if (epoch === viewEpoch) {
+      inflightRuns -= 1;
+      updateRunState();
+    }
+  }
 }
 runBtn.addEventListener("click", startRun);
 
