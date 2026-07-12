@@ -45,7 +45,15 @@ ungrouped runs keep rendering as before).
 Cost per result is computed from OpenRouter's price list, fetched
 once at startup. If that fetch fails (offline, outage), the bench
 still boots and runs; cost just shows as unavailable for the
-session.
+session. Every cost figure the bench displays is an estimate and is
+marked with a tilde: catalog prices times the token counts providers
+report, not billed cost, and the pre-run figure covers the worst-case
+output side only (input is not estimated). The persisted generation
+id is the hook for reconciling against OpenRouter's authoritative
+per-generation numbers as future work. Results the session cannot
+price (offline catalog, missing usage, errors after tokens flowed)
+are counted next to the session total as "unpriced" rather than
+silently dropped.
 
 ## Interface
 
@@ -63,7 +71,8 @@ as CSS custom properties in one `:root` block at the top of
 a hunt through rules.
 
 A full-width command bar carries the brand plus live session stats:
-run count, cumulative spend, mean TTFT of completed requests, and
+run count, estimated spend (with a count of unpriced results when any
+run could not be priced), mean TTFT of completed requests, and
 lineup size. They are this browser session's totals and reset on
 reload.
 
@@ -137,7 +146,9 @@ quantization, authoritative cost) and let budget analysis see
 truncation on runs that produced no error. If persisting a finished
 run fails, both /compare and the streaming path log the failure and
 return the results with run_id null, because the money is already
-spent and losing history must not lose the response. That is one
+spent and losing history must not lose the response. The UI surfaces
+that null as a small "not saved to history" warning on the affected
+column, so silent history loss is visible where it happened. That is one
 instance of a broader invariant both endpoints enforce with a single
 fault boundary: after money is spent, no code path between the
 upstream results existing and the response leaving (link resolution,
@@ -357,7 +368,8 @@ picked up without restarts, and verify by eyeball after UI changes:
   the control is back on standard.
 - Density: switch to compact mid-run set; cards tighten and the
   response font drops a step; comfortable restores both. Reload and
-  confirm the control is back on comfortable.
+  confirm compact is still selected: density persists, unlike the
+  budget.
 - Fold: fold a long answer to its six line preview, confirm the
   control now reads "show all" and clicking it restores the full
   text. Fold a partial-error card: the preview still holds.
