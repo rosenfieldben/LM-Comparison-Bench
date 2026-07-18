@@ -25,7 +25,7 @@ the picker falls back to adding models by exact id.
 
 ## Setup
 
-Requires Python 3.11 or newer; CI runs the suite on 3.11 and 3.12.
+Requires Python 3.11 or newer; CI runs the suite on 3.11 through 3.14.
 
 ```sh
 python3 -m venv .venv

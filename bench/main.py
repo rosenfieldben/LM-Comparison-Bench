@@ -379,6 +379,20 @@ def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     return float(total)
 
 
+def format_usd(value: float) -> str:
+    """A dollar figure that stays truthful at the ceiling's native scale.
+
+    Priced runs here cost fractions of a cent, so the cards' four decimals
+    collapse a real sub-cent limit to $0.0000 and the 402 would misreport
+    the operator's own ceiling as zero. Six decimals cover that domain;
+    trailing zeros past the cents place are trimmed so dollar-scale limits
+    still read as $1.50, not $1.500000.
+    """
+    whole, frac = f"{value:.6f}".split(".")
+    frac = frac[:2] + frac[2:].rstrip("0")
+    return f"${whole}.{frac}"
+
+
 def enforce_spend_limit() -> None:
     """Refuse a run at the boundary once estimated spend hits the ceiling.
 
@@ -392,7 +406,8 @@ def enforce_spend_limit() -> None:
         raise HTTPException(
             402,
             "spend ceiling reached: estimated "
-            f"${app.state.accumulated_spend_usd:.4f} of ${limit:.4f} limit "
+            f"{format_usd(app.state.accumulated_spend_usd)} of "
+            f"{format_usd(limit)} limit "
             "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
         )
 
@@ -533,11 +548,15 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             await app.state.upstream_semaphore.acquire()
             acquired = True
             started = True
-            # The slot is held and the wait is over. Emitted before the
-            # clock starts, so the client can reset its own clock to this
-            # point and its TTFT estimate matches the server's.
-            yield "data: " + json.dumps({"type": "started"}) + "\n\n"
+            # Start the clock before emitting started, not after. The
+            # frame and the clock mark the same instant (the sub-ms cost
+            # of yielding one small frame on localhost is noise against a
+            # network TTFT), and starting first keeps start valid for the
+            # finally: a disconnect suspended at this yield would otherwise
+            # run the abort path with start still 0.0 and persist a garbage
+            # latency. The client still resets its own clock on the frame.
             start = time.perf_counter()
+            yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             async for event in stream_model(
                 request.prompt, request.model, app.state.client, max_tokens=max_tokens
             ):

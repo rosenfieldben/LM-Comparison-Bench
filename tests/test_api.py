@@ -1218,7 +1218,7 @@ def test_spend_ceiling_refuses_at_boundary_without_upstream_call(monkeypatch, tm
             assert resp.status_code == 402, path
             detail = resp.json()["detail"]
             assert "spend ceiling" in detail
-            assert "$1.5000" in detail and "$1.0000" in detail
+            assert "$1.50" in detail and "$1.00" in detail
         # The refusal never reached upstream: no money moved.
         assert route.call_count == 0
 
@@ -1263,6 +1263,20 @@ def test_unset_spend_limit_never_blocks(monkeypatch, tmp_path):
         assert resp.status_code == 200
 
 
+@respx.mock
+def test_spend_ceiling_message_keeps_sub_cent_figures_truthful(monkeypatch, tmp_path):
+    # A priced run costs 2.9e-5 here, so a ceiling set at the bench's
+    # native scale must not collapse to $0.0000 in the refusal: four
+    # decimals would misreport a real $0.00004 limit as zero.
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=0.00004) as c:
+        c.app.state.accumulated_spend_usd = 5.8e-5
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 402
+        detail = resp.json()["detail"]
+        assert "$0.000058 of $0.00004 limit" in detail
+
+
 # ---- F4: queued state frames.
 
 
@@ -1303,3 +1317,35 @@ async def test_stream_emits_queued_before_started_when_saturated(monkeypatch, tm
 
         rest = [json.loads(f.removeprefix("data: ")) async for f in gen]
         assert rest[-1]["type"] == "done"
+
+
+@respx.mock
+async def test_disconnect_at_started_frame_persists_sane_latency(monkeypatch, tmp_path):
+    # A client drop during the flush of the started frame finalizes the
+    # generator while it is suspended at that yield, before the async for
+    # over stream_model runs. The persisted abort must carry a real
+    # elapsed latency, not the raw perf_counter reference (host uptime in
+    # ms): the clock starts before the frame, so it is always valid when
+    # the finally runs. Regression for the window where start was set
+    # after the started yield.
+    from bench import store
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 5) as c:
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "started"
+        # Close at the started-yield suspension, before any delta arrives.
+        await gen.aclose()
+
+        run = store.get_run(c.app.state.db, 1)
+
+    assert run is not None
+    latency = run["results"][0]["latency_ms"]
+    assert latency is not None
+    assert 0.0 <= latency < 60_000.0
