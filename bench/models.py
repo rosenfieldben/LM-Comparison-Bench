@@ -5,11 +5,13 @@ import math
 import os
 import socket
 import time
+from collections.abc import AsyncIterator
+from typing import Any
 
 import httpx
 
 
-def as_token_count(value):
+def as_token_count(value: object) -> int | None:
     """A token count usable downstream: a non-negative int, else None.
 
     The never-raises contract extends to field types. A provider once
@@ -24,12 +26,12 @@ def as_token_count(value):
     return None
 
 
-def as_text(value):
+def as_text(value: object) -> str | None:
     """str or None; any other type becomes None, same contract as counts."""
     return value if isinstance(value, str) else None
 
 
-def as_metric(value):
+def as_metric(value: object) -> float | None:
     """A finite float measurement or None; bools and junk become None.
 
     Used by the store's repair-on-read: measurement columns written
@@ -130,7 +132,7 @@ def keepalive_socket_options() -> list[tuple[int, int, int]]:
     return options
 
 
-async def fetch_catalog(client: httpx.AsyncClient) -> dict:
+async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
     """One boot-time snapshot of OpenRouter's model catalog.
 
     Returns {"fetched": bool, "models": [...], "prices": {...}} where
@@ -194,7 +196,7 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict:
     return {"fetched": True, "models": models, "prices": prices}
 
 
-def _flatten_content(content) -> str | None:
+def _flatten_content(content: object) -> str | None:
     """Collapse a message content value to plain text or None.
 
     Content-parts lists (multimodal providers) flatten to their text
@@ -222,7 +224,7 @@ async def run_model(
     model: str,
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
-) -> dict:
+) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
     Never raises. A comparison run fans out to several models and one
@@ -233,7 +235,7 @@ async def run_model(
     one at 65k are different experiments; persistence must record which
     budget was actually sent, clamping included.
     """
-    result = {
+    result: dict[str, Any] = {
         "model": model,
         "response_text": None,
         "latency_ms": None,
@@ -330,7 +332,7 @@ async def stream_model(
     model: str,
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
-):
+) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
     Yields {"type": "delta", "text": chunk} per content delta, then
@@ -346,7 +348,7 @@ async def stream_model(
     first visible delta, but a silence past STREAM_READ_TIMEOUT_S
     still means something is wrong.
     """
-    result = {
+    result: dict[str, Any] = {
         "model": model,
         "response_text": None,
         "latency_ms": None,
@@ -374,7 +376,7 @@ async def stream_model(
     def elapsed_ms() -> float:
         return round((time.perf_counter() - start) * 1000, 1)
 
-    def done(error: str | None) -> dict:
+    def done(error: str | None) -> dict[str, Any]:
         result["latency_ms"] = elapsed_ms()
         if text_parts:
             result["response_text"] = "".join(text_parts)

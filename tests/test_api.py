@@ -324,7 +324,7 @@ def stream_events(client, body):
     assert frames[-1] == "", "every SSE event must end with a blank-line separator"
     events = []
     for frame in frames[:-1]:
-        data_lines = [l for l in frame.split("\n") if l.startswith("data:")]
+        data_lines = [line for line in frame.split("\n") if line.startswith("data:")]
         assert len(data_lines) == 1, (
             f"expected exactly one data line per frame: {frame!r}"
         )

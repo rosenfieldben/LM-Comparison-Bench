@@ -18,7 +18,6 @@ from pathlib import Path
 import httpx
 import pytest
 import uvicorn
-
 from stub_openrouter import build_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -116,7 +115,7 @@ def bench(page, bench_url):
         # Seeded exactly as the app stores it, a raw JSON array of ids;
         # this is also the pre-VOLT format, which must keep loading.
         page.add_init_script(
-            "localStorage.setItem('bench-lineup', %s)" % json.dumps(json.dumps(lineup))
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
         )
         page.goto(bench_url)
         return page

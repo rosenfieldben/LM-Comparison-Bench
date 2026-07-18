@@ -376,9 +376,6 @@ async def test_stream_error_frame_with_code_only(client):
     assert result["ttft_ms"] is None
 
 
-from bench.models import fetch_catalog
-
-
 @respx.mock
 async def test_fetch_catalog_degrades_missing_fields_to_none(client):
     respx.get(MODELS_URL).respond(

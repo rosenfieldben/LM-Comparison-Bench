@@ -6,15 +6,17 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bench import store
 from bench.models import (
@@ -187,7 +189,7 @@ class GroupDetail(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
     # would otherwise report every model as errored and look like an outage.
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -273,10 +275,10 @@ class LocalOnlyGuard:
     with disconnect propagation.
     """
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -339,7 +341,7 @@ async def favicon() -> Response:
     )
 
 
-def cost_usd(result: dict, prices: dict) -> float | None:
+def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     """Cost of one result, or None when tokens or pricing are unknown.
 
     isinstance rather than a None check: a provider reporting token
@@ -353,10 +355,11 @@ def cost_usd(result: dict, prices: dict) -> float | None:
         or not isinstance(result["completion_tokens"], (int, float))
     ):
         return None
-    return (
+    total = (
         result["prompt_tokens"] * price["prompt"]
         + result["completion_tokens"] * price["completion"]
     )
+    return float(total)
 
 
 def effective_budget(budget: str, model: str) -> int:
@@ -371,7 +374,9 @@ def effective_budget(budget: str, model: str) -> int:
     return min(requested, limit) if limit is not None else requested
 
 
-def resolve_links(db, prompt_id: int | None, group_id: int | None):
+def resolve_links(
+    db: sqlite3.Connection, prompt_id: int | None, group_id: int | None
+) -> tuple[int | None, int | None]:
     """Degrade stale prompt or group links to None instead of erroring.
 
     By the time links are checked the upstream calls already happened
@@ -386,8 +391,8 @@ def resolve_links(db, prompt_id: int | None, group_id: int | None):
 
 
 @app.post("/compare", response_model=CompareResponse)
-async def compare(request: CompareRequest) -> dict:
-    async def limited(model: str) -> dict:
+async def compare(request: CompareRequest) -> dict[str, Any]:
+    async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
         # batch: the cap is on simultaneous paid calls wherever they
         # come from, and concurrent /compare and stream requests share
@@ -440,7 +445,7 @@ async def compare(request: CompareRequest) -> dict:
 async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     max_tokens = effective_budget(request.budget, request.model)
 
-    async def events():
+    async def events() -> AsyncIterator[str]:
         # Server-side observation of the stream, enough to reconstruct
         # a result if the client disconnects before the done event: a
         # stream the user watched happen is still history.
@@ -451,7 +456,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         acquired = False
         start = 0.0
 
-        def release_slot():
+        def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
             # both call it: the slot must never be returned twice, and
             # a cancellation while still queued has nothing to return.
@@ -560,12 +565,12 @@ def ensure_rowid(value: int) -> None:
 # content type, and the guard middleware keys on application/json to
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
-async def create_group(body: dict = Body()) -> dict:
+async def create_group(body: dict[str, Any] = Body()) -> dict[str, Any]:
     return {"id": store.create_group(app.state.db)}
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)
-async def group_detail(group_id: int) -> dict:
+async def group_detail(group_id: int) -> dict[str, Any]:
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
     if group is None:
@@ -574,7 +579,7 @@ async def group_detail(group_id: int) -> dict:
 
 
 @app.get("/models", response_model=CatalogResponse)
-async def get_models() -> dict:
+async def get_models() -> dict[str, Any]:
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
@@ -582,16 +587,20 @@ async def get_models() -> dict:
 
 
 @app.get("/prompts", response_model=PromptList)
-async def get_prompts() -> dict:
+async def get_prompts() -> dict[str, Any]:
     return {"prompts": store.list_prompts(app.state.db)}
 
 
 @app.post("/prompts", response_model=Prompt, status_code=201)
-async def create_prompt(body: PromptCreate) -> dict:
+async def create_prompt(body: PromptCreate) -> dict[str, Any]:
     try:
         return store.save_prompt(app.state.db, body.name, body.text)
     except sqlite3.IntegrityError:
-        raise HTTPException(409, f"a prompt named {body.name!r} already exists")
+        # from None: the duplicate name is an expected outcome being
+        # translated to a 409, not an error in handling the error.
+        raise HTTPException(
+            409, f"a prompt named {body.name!r} already exists"
+        ) from None
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)
@@ -603,7 +612,7 @@ async def remove_prompt(prompt_id: int) -> Response:
 
 
 @app.get("/runs", response_model=RunList)
-async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
+async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # Bounded so history stays cheap as bench.db grows. The 500 ceiling
     # keeps the id lists list_runs binds comfortably under sqlite's
     # variable limit.
@@ -617,7 +626,7 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
 
 
 @app.get("/runs/{run_id}", response_model=RunDetail)
-async def get_run(run_id: int) -> dict:
+async def get_run(run_id: int) -> dict[str, Any]:
     ensure_rowid(run_id)
     run = store.get_run(app.state.db, run_id)
     if run is None:
