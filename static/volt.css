@@ -481,6 +481,16 @@
     align-items: start;
   }
   #results:empty { display: none; }
+  /* A history load owns the results grid the moment it is requested; its
+     loading and failure states stand alone, spanning the grid so no card
+     from another run can sit beside them. */
+  .history-status {
+    grid-column: 1 / -1;
+    padding: var(--pad-card);
+    font: 500 12px var(--mono);
+    color: var(--text-dim);
+  }
+  .history-status.failure { color: var(--err-text); }
   .card {
     background: var(--bg-panel);
     border: 1px solid var(--border);

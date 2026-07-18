@@ -1453,6 +1453,24 @@ async function loadHistory() {
   applyHistoryFilter();
 }
 
+// A history load owns the results area from the click, not from the
+// moment its fetch succeeds. Clearing the cards, race and diff and
+// showing a state up front is what keeps a failed or slow load from
+// leaving its banner over another run's cards: the grid and the banner
+// always agree. The armed diff side survives (closeDiffPanel does not
+// disarm), so cross-replay diffing still works.
+function renderHistoryState(label, testid, cls, boxText) {
+  resultsEl.replaceChildren();
+  hideRace();
+  closeDiffPanel();
+  runLabelEl.textContent = label;
+  const box = document.createElement("div");
+  box.className = "history-status " + cls;
+  box.dataset.testid = testid;
+  box.textContent = boxText;
+  resultsEl.append(box);
+}
+
 async function showGroup(groupId) {
   // Owns the view from the click: in-flight runs for the old view are
   // aborted now, and this fetch is itself abortable by whatever
@@ -1461,6 +1479,12 @@ async function showGroup(groupId) {
   updateRunState();
   const controller = new AbortController();
   epochControllers.push(controller);
+  // Clear the old view and show a loading state before any network
+  // activity begins; the old cards must be gone before the fetch.
+  renderHistoryState(
+    "Loading comparison #" + groupId,
+    "history-loading", "loading", "loading comparison"
+  );
   let group;
   try {
     const resp = await fetch("/groups/" + groupId, {
@@ -1469,19 +1493,21 @@ async function showGroup(groupId) {
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     group = await resp.json();
   } catch (err) {
+    // A superseded load stays silent; its replacement already owns the
+    // view. Otherwise the loading state becomes a failure that stands
+    // alone: banner and grid agree and no other run's cards are visible.
     if (epoch !== viewEpoch) return;
-    runLabelEl.textContent =
-      "failed to load comparison #" + groupId + ": " + err.message;
+    renderHistoryState(
+      "failed to load comparison #" + groupId + ": " + err.message,
+      "history-failure", "failure",
+      "could not load this comparison; nothing from another run is shown"
+    );
     return;
   }
   if (epoch !== viewEpoch) return;
+  // Replace the loading state with the comparison. Race and diff were
+  // already cleared when the loading state was rendered.
   resultsEl.replaceChildren();
-  // The race strip visualizes the live run only; a replay has no race.
-  hideRace();
-  // The panel would otherwise keep showing a diff of cards that no
-  // longer exist; the ARMED side stays, by design, for cross-replay
-  // diffing.
-  closeDiffPanel();
   runLabelEl.textContent =
     "Historical comparison #" + group.id + " from " +
     group.created_at.slice(0, 19).replace("T", " ") + " UTC";
@@ -1510,6 +1536,10 @@ async function showRun(runId) {
   updateRunState();
   const controller = new AbortController();
   epochControllers.push(controller);
+  renderHistoryState(
+    "Loading run #" + runId,
+    "history-loading", "loading", "loading run"
+  );
   let run;
   try {
     const resp = await fetch("/runs/" + runId, { signal: controller.signal });
@@ -1517,15 +1547,18 @@ async function showRun(runId) {
     run = await resp.json();
   } catch (err) {
     if (epoch !== viewEpoch) return;
-    runLabelEl.textContent = "failed to load run #" + runId + ": " + err.message;
+    renderHistoryState(
+      "failed to load run #" + runId + ": " + err.message,
+      "history-failure", "failure",
+      "could not load this run; nothing from another run is shown"
+    );
     return;
   }
   if (epoch !== viewEpoch) return;
   // Same completion renderer as a live run so the textContent and
-  // null-content guarantees hold for stored data too.
+  // null-content guarantees hold for stored data too. Race and diff were
+  // cleared with the loading state.
   resultsEl.replaceChildren();
-  hideRace();
-  closeDiffPanel();
   runLabelEl.textContent =
     "Historical run #" + run.id + " from " +
     run.created_at.slice(0, 19).replace("T", " ") + " UTC";

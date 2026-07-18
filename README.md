@@ -144,7 +144,10 @@ fold (collapse to a six line preview, "show all" to reverse), and
 diff; errored live cards add rerun. History renders as a flat strip
 of rows (timestamp, prompt, model count) with a client-side filter
 that matches prompt substrings and model ids, and loads only when
-expanded.
+expanded. Opening an entry clears the current cards, race and diff and
+shows a loading state before fetching; a load that fails becomes a
+standalone failure state, so a stale comparison is never left sitting
+under the banner.
 
 ## Token budgets
 
@@ -381,6 +384,10 @@ picked up without restarts, and verify by eyeball after UI changes:
 - Save a prompt, reload the page, pick it from the dropdown, replay
   it against one model. Open History, click the old run, and confirm
   it renders identically to a live run (plus the historical banner).
+- Failed history load: run a comparison, then with devtools throttled
+  to offline (or the server stopped) open History and click the entry.
+  The cards clear to a loading then a failure state that stands alone;
+  no card from the earlier run stays visible under the failure banner.
 - Watch a slow model paint token by token next to an already
   finished fast one; the ttft metric should be visibly smaller than
   the total metric on streamed columns, and the race strip row
