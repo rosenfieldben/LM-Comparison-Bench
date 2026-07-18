@@ -123,7 +123,9 @@ def test_04_extended_budget_sends_65536_and_clamps_capped(bench, stub_url):
 
     # The budget assertion belongs at the stub: what was actually sent,
     # not what the UI believes it selected.
-    recorded = httpx.get(stub_url + "/_test/requests").json()["requests"]
+    recorded = httpx.get(stub_url + "/_test/requests", trust_env=False).json()[
+        "requests"
+    ]
     sent = {
         r["model"]: r["max_tokens"]
         for r in recorded

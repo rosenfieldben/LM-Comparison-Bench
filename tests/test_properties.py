@@ -102,7 +102,9 @@ sse_line = st.one_of(
 def test_stream_model_closes_with_one_done_and_honest_ttft(lines):
     async def drive():
         blob = ("\n".join(lines) + "\n").encode("utf-8")
-        async with httpx.AsyncClient() as client:
+        # trust_env off for hermeticity under a poisoned proxy; respx
+        # intercepts regardless.
+        async with httpx.AsyncClient(trust_env=False) as client:
             with respx.mock:
                 respx.post(OPENROUTER_URL).mock(
                     return_value=httpx.Response(200, stream=ChunkStream([blob]))
@@ -159,7 +161,9 @@ def test_stream_model_error_iff_stream_had_no_terminator(content, terminal):
 
     async def drive():
         blob = ("\n".join(lines) + "\n").encode("utf-8")
-        async with httpx.AsyncClient() as client:
+        # trust_env off for hermeticity under a poisoned proxy; respx
+        # intercepts regardless.
+        async with httpx.AsyncClient(trust_env=False) as client:
             with respx.mock:
                 respx.post(OPENROUTER_URL).mock(
                     return_value=httpx.Response(200, stream=ChunkStream([blob]))

@@ -14,7 +14,10 @@ FIXTURE = json.loads(
 
 @pytest.fixture
 async def client():
-    async with httpx.AsyncClient() as c:
+    # trust_env off so an ambient developer proxy cannot route test
+    # traffic; respx intercepts regardless, and the poisoned-proxy
+    # acceptance run (HTTPS_PROXY set) depends on this.
+    async with httpx.AsyncClient(trust_env=False) as c:
         yield c
 
 

@@ -33,7 +33,9 @@ def wait_for(url: str, timeout_s: float = 30.0) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         try:
-            if httpx.get(url, timeout=2.0).status_code == 200:
+            # trust_env off: poll loopback directly, never via an ambient
+            # developer proxy that would fail the localhost connection.
+            if httpx.get(url, timeout=2.0, trust_env=False).status_code == 200:
                 return
         except httpx.HTTPError:
             pass
@@ -68,6 +70,20 @@ def bench_url(stub_url, tmp_path_factory):
             "MODELS_URL": stub_url + "/api/v1/models",
         }
     )
+    # The app subprocess keeps trust_env on (real operators may reach
+    # OpenRouter through a proxy), so a developer proxy in the environment
+    # would route its real localhost call to the stub OpenRouter through
+    # that proxy and hang the harness. Scrub the proxy vars from this
+    # subprocess rather than making the app degrade its own behavior.
+    for proxy_var in (
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ):
+        env.pop(proxy_var, None)
     log_path = tmp_path_factory.mktemp("browser-logs") / "uvicorn.log"
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(

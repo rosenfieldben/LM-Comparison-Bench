@@ -246,6 +246,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # flows that move no bytes, and the resulting deaths wore mixed
     # ReadError and stall signatures. OS-level probes keep those quiet
     # flows alive; see keepalive_socket_options in models.py.
+    # trust_env stays at its default (on): an operator may legitimately
+    # reach OpenRouter through a corporate proxy, and honoring HTTP(S)_PROXY
+    # is the right behavior for the real app. The test harness is the one
+    # place that must not inherit a developer proxy, and it opts out itself
+    # (trust_env=False on its own clients, proxy vars scrubbed from the
+    # browser subprocess) rather than the app degrading its own behavior.
     app.state.client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
