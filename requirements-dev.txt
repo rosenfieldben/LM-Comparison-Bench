@@ -7,6 +7,6 @@ pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-playwright==0.8.0
 playwright==1.61.0
-ruff==0.14.4
+ruff==0.15.22
 mypy==1.18.2
 hypothesis==6.140.3
