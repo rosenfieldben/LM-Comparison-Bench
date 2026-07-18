@@ -61,10 +61,15 @@ CONNECT_TIMEOUT_S = 10.0
 # by any standard.
 STREAM_READ_TIMEOUT_S = 300.0
 
-# Non-streaming path, where the single read covers the entire
-# completion including all reasoning time, so it gets more headroom
-# than the between-chunk gap.
-COMPLETION_READ_TIMEOUT_S = 180.0
+# Non-streaming path. The single read covers the whole completion,
+# including all reasoning time, so it deserves at least the stream's
+# per-gap tolerance. At 180 it was lower than the stream's 300, so an
+# extended non-streaming run could fail at 181s where the streamed route
+# survived; raised to match. Extended non-streaming runs stay more
+# timeout-prone by nature: the stream resets its clock on every chunk and
+# can run far longer overall, while this is one uninterrupted read. The
+# browser always streams; /compare is the scripting path.
+COMPLETION_READ_TIMEOUT_S = 300.0
 
 # Streaming: connect fast, tolerate long silent gaps between chunks.
 STREAM_TIMEOUT = httpx.Timeout(
@@ -177,17 +182,33 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
         top = entry.get("top_provider")
-        if isinstance(top, dict) and isinstance(top.get("max_completion_tokens"), int):
-            model["max_completion_tokens"] = top["max_completion_tokens"]
+        if isinstance(top, dict):
+            cap = top.get("max_completion_tokens")
+            # A non-bool int strictly above zero only. isinstance(True, int)
+            # is true in Python, so a provider sending true would otherwise
+            # become a cap of 1 that clamps every budget to a single token;
+            # zero and negatives are not real caps either.
+            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+                model["max_completion_tokens"] = cap
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
-        # entry or the whole map.
+        # entry or the whole map. Non-finite and negative prices are
+        # malformed too: a NaN price yields a NaN cost, and a NaN summed
+        # into accumulated spend makes the ceiling comparison permanently
+        # false, silently disabling it. Raising inside the try reuses the
+        # single degrade path, matching as_metric's finiteness contract.
         try:
-            model["prompt_price"] = float(entry["pricing"]["prompt"])
-            model["completion_price"] = float(entry["pricing"]["completion"])
+            prompt_price = float(entry["pricing"]["prompt"])
+            completion_price = float(entry["pricing"]["completion"])
+            if not (math.isfinite(prompt_price) and math.isfinite(completion_price)):
+                raise ValueError("non-finite price")
+            if prompt_price < 0 or completion_price < 0:
+                raise ValueError("negative price")
+            model["prompt_price"] = prompt_price
+            model["completion_price"] = completion_price
             prices[entry["id"]] = {
-                "prompt": model["prompt_price"],
-                "completion": model["completion_price"],
+                "prompt": prompt_price,
+                "completion": completion_price,
             }
         except (KeyError, TypeError, ValueError):
             model["prompt_price"] = None
@@ -371,6 +392,7 @@ async def stream_model(
         "stream_options": {"include_usage": True},
     }
     text_parts: list[str] = []
+    saw_done = False
     start = time.perf_counter()
 
     def elapsed_ms() -> float:
@@ -404,6 +426,7 @@ async def stream_model(
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -471,4 +494,15 @@ async def stream_model(
         yield done(f"request failed: {type(exc).__name__}")
         return
 
+    # A clean iterator exhaustion without the [DONE] marker is not a
+    # success: a load balancer idle-closing the connection or a provider
+    # crashing with a clean close both land here, and done(None) would show
+    # and persist a truncated answer as complete, corrupting the
+    # comparison. But a stream that delivered a finish_reason and then
+    # closed without [DONE] is semantically complete (the provider stated
+    # why it stopped), so flagging that would be a false alarm. done()
+    # already carries the partial text accumulated so far.
+    if not saw_done and result["finish_reason"] is None:
+        yield done("stream ended before completion: no [DONE] and no finish reason")
+        return
     yield done(None)

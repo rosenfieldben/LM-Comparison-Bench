@@ -14,7 +14,10 @@ FIXTURE = json.loads(
 
 @pytest.fixture
 async def client():
-    async with httpx.AsyncClient() as c:
+    # trust_env off so an ambient developer proxy cannot route test
+    # traffic; respx intercepts regardless, and the poisoned-proxy
+    # acceptance run (HTTPS_PROXY set) depends on this.
+    async with httpx.AsyncClient(trust_env=False) as c:
         yield c
 
 
@@ -41,7 +44,7 @@ async def test_timeout_returns_error_dict(client):
     result = await run_model("hi", "deepseek/deepseek-chat", client)
 
     assert result["response_text"] is None
-    assert result["error"] == "no response within 180s"
+    assert result["error"] == "no response within 300s"
 
 
 @respx.mock
@@ -737,3 +740,118 @@ async def test_stream_model_normalizes_junk_token_counts(client, junk):
     assert result["response_text"] == "hi"
     assert result["prompt_tokens"] is None
     assert result["completion_tokens"] is None
+
+
+@respx.mock
+async def test_review_repro_nonfinite_and_negative_prices_degrade(client):
+    """External review finding 3: catalog pricing predated as_metric's
+    finiteness check, so a NaN or inf price string passed the bare
+    float()/try-except, produced a NaN cost, and a NaN summed into
+    accumulated spend made the ceiling comparison permanently false,
+    silently disabling it. Non-finite and negative prices must degrade the
+    entry to unpriced while the entry itself stays in the catalog."""
+    respx.get(MODELS_URL).respond(
+        json={
+            "data": [
+                {"id": "a/nan", "pricing": {"prompt": "NaN", "completion": "0.000002"}},
+                {"id": "b/inf", "pricing": {"prompt": "0.000001", "completion": "inf"}},
+                {
+                    "id": "c/neg",
+                    "pricing": {"prompt": "-0.000001", "completion": "0.000002"},
+                },
+                {
+                    "id": "d/ok",
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                },
+            ]
+        }
+    )
+
+    catalog = await fetch_catalog(client)
+
+    # All four entries survive (degrade philosophy); only the finite,
+    # non-negative one is priced.
+    assert [m["id"] for m in catalog["models"]] == ["a/nan", "b/inf", "c/neg", "d/ok"]
+    assert set(catalog["prices"]) == {"d/ok"}
+    nan_m, inf_m, neg_m, ok_m = catalog["models"]
+    assert nan_m["prompt_price"] is None and nan_m["completion_price"] is None
+    assert inf_m["prompt_price"] is None and inf_m["completion_price"] is None
+    assert neg_m["prompt_price"] is None and neg_m["completion_price"] is None
+    assert ok_m["prompt_price"] == 1e-06
+
+
+@respx.mock
+async def test_review_repro_boolean_and_nonpositive_completion_cap_ignored(client):
+    """External review finding 3: max_completion_tokens accepted any int,
+    and isinstance(True, int) is true, so a provider sending true became a
+    cap of 1 that clamped every budget to a single token. Only a non-bool
+    integer strictly above zero is a real cap."""
+    respx.get(MODELS_URL).respond(
+        json={
+            "data": [
+                {"id": "a/booltrue", "top_provider": {"max_completion_tokens": True}},
+                {"id": "b/zero", "top_provider": {"max_completion_tokens": 0}},
+                {"id": "c/neg", "top_provider": {"max_completion_tokens": -5}},
+                {"id": "d/real", "top_provider": {"max_completion_tokens": 32000}},
+            ]
+        }
+    )
+
+    catalog = await fetch_catalog(client)
+
+    booltrue, zero, neg, real = catalog["models"]
+    assert booltrue["max_completion_tokens"] is None
+    assert zero["max_completion_tokens"] is None
+    assert neg["max_completion_tokens"] is None
+    assert real["max_completion_tokens"] == 32000
+
+
+@respx.mock
+async def test_review_repro_clean_eof_without_done_is_error(client):
+    """External review finding 2: stream_model broke on [DONE] without
+    recording that it saw the marker, so any ordinary iterator exhaustion
+    (a load balancer idle-closing the connection, a provider crashing with
+    a clean close) fell through to done(None) and a truncated answer was
+    shown and persisted as complete. A clean EOF with no [DONE] and no
+    finish_reason must be an error, with the partial text preserved."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=ChunkStream([delta_chunk("Hel")]))
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hel"
+    assert (
+        result["error"]
+        == "stream ended before completion: no [DONE] and no finish reason"
+    )
+
+
+@respx.mock
+async def test_review_repro_finish_reason_without_done_not_flagged(client):
+    """External review finding 2 refinement (inverse lock): a stream that
+    delivered a finish_reason and then closed without [DONE] is
+    semantically complete (the provider stated why it stopped), so flagging
+    it aborted would be a false alarm. Guards against over-correcting the
+    fix above into treating every missing [DONE] as an error."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hello"),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    # No [DONE]: the connection simply closes after the
+                    # provider stated why it stopped.
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hello"
+    assert result["error"] is None
+    assert result["finish_reason"] == "stop"

@@ -371,6 +371,59 @@ def test_stream_endpoint_frames_sse_and_persists_ttft_and_cost(client):
 
 
 @respx.mock
+def test_review_repro_clean_eof_persists_as_error(client):
+    """External review finding 2: a clean EOF without [DONE] must persist
+    through the streaming API as an error with the partial text kept, not
+    as a complete run that silently corrupts the comparison."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([sse({"choices": [{"delta": {"content": "Hel"}}]})]),
+        )
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["result"]["response_text"] == "Hel"
+    assert done["result"]["error"] is not None
+    assert "no [DONE]" in done["result"]["error"]
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["response_text"] == "Hel"
+    assert "no [DONE]" in persisted["error"]
+
+
+def test_review_repro_index_denies_framing(client):
+    """External review finding 4: nothing stopped a hostile page from
+    framing the localhost UI and redressing a Run click into paid work.
+    Every response must carry anti-framing headers."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert resp.headers["x-frame-options"] == "DENY"
+    assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+
+@respx.mock
+def test_review_repro_stream_response_denies_framing(client):
+    """External review finding 4: the streaming response carries the
+    anti-framing headers too, injected on response start without buffering
+    the SSE body (the streaming and disconnect suites prove no buffering)."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with client.stream(
+        "POST", "/compare/stream", json={"prompt": "hi", "model": "model/alpha"}
+    ) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+        resp.read()
+
+
+@respx.mock
 def test_stream_endpoint_stale_group_id_degrades(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())
@@ -1275,6 +1328,156 @@ def test_spend_ceiling_message_keeps_sub_cent_figures_truthful(monkeypatch, tmp_
         assert resp.status_code == 402
         detail = resp.json()["detail"]
         assert "$0.000058 of $0.00004 limit" in detail
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1", "0", "abc"])
+def test_review_repro_invalid_spend_limit_fails_boot(monkeypatch, tmp_path, bad):
+    """External review finding 3: BENCH_SPEND_LIMIT_USD was parsed with a
+    bare float() and never validated, so nan and inf produced a ceiling
+    never crossed (silently disabling the limit), and negative or zero
+    produced a nonsensical or ambiguous one. Each must fail boot with the
+    variable named."""
+    with (
+        pytest.raises(RuntimeError, match="BENCH_SPEND_LIMIT_USD"),
+        spend_client(monkeypatch, tmp_path, limit=bad),
+    ):
+        pass
+
+
+@respx.mock
+def test_review_repro_nan_price_counts_as_unpriced_not_poison(monkeypatch, tmp_path):
+    """External review finding 3: a NaN price produced a NaN cost, and a
+    NaN summed into accumulated spend made accumulated >= limit permanently
+    false, silently disabling the ceiling. A NaN-priced run must count as
+    unpriced (cost None), leaving the counter finite and unmoved, not
+    poison it."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # A NaN price injected past the catalog guard, standing in for a
+        # rogue price that reached app.state before fetch_catalog learned
+        # to reject non-finite values.
+        c.app.state.prices["model/alpha"] = {"prompt": float("nan"), "completion": 0.0}
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["cost_usd"] is None
+        assert c.app.state.accumulated_spend_usd == 0.0
+
+
+def test_review_repro_record_spend_ignores_non_finite(monkeypatch, tmp_path):
+    """Closing review: the accumulator is the spend invariant's last line.
+    cost_usd already screens non-finite totals, but record_spend must also
+    refuse them so a caller that bypassed that screen cannot poison the
+    counter; one NaN would make the ceiling comparison permanently false."""
+    from bench import main as bench_main
+
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        c.app.state.accumulated_spend_usd = 0.5
+        bench_main.record_spend(float("nan"))
+        bench_main.record_spend(float("inf"))
+        bench_main.record_spend(None)
+        assert c.app.state.accumulated_spend_usd == 0.5
+        # A finite cost still accumulates.
+        bench_main.record_spend(0.25)
+        assert c.app.state.accumulated_spend_usd == 0.75
+
+
+# ---- F1.2: post-admission spend recheck.
+
+
+@respx.mock
+async def test_review_repro_stream_rechecks_ceiling_after_admission(
+    monkeypatch, tmp_path
+):
+    """External review finding 1 (High): admission was checked only at
+    entry, so N stream requests admitted below the limit all executed even
+    after an earlier one's recorded spend crossed it, bounding overshoot by
+    lineup size rather than the semaphore. A run admitted below the ceiling
+    must be refused, before spending, if the ceiling is crossed before it
+    acquires its slot."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Admitted at entry below the limit.
+        assert c.app.state.accumulated_spend_usd == 0.0
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        # A concurrent run's spend crosses the ceiling before this one
+        # reaches its slot.
+        c.app.state.accumulated_spend_usd = 1.5
+        sem_before = c.app.state.upstream_semaphore._value
+        frames = [json.loads(f.removeprefix("data: ")) async for f in gen]
+
+        # One done frame, refusal error, run_id null, no started or delta.
+        assert [f["type"] for f in frames] == ["done"]
+        assert frames[0]["run_id"] is None
+        result = frames[0]["result"]
+        assert "refused before reaching upstream" in result["error"]
+        # Shaped like a done result: model and effective budget set, every
+        # metric and text field None.
+        assert result["model"] == "model/alpha"
+        assert result["max_tokens"] == 16384
+        for key in (
+            "response_text",
+            "latency_ms",
+            "prompt_tokens",
+            "completion_tokens",
+            "ttft_ms",
+            "cost_usd",
+            "generation_id",
+            "finish_reason",
+        ):
+            assert result[key] is None
+        # Slot returned (net zero), no upstream call, nothing persisted.
+        assert c.app.state.upstream_semaphore._value == sem_before
+        assert route.call_count == 0
+        assert c.get("/runs").json()["runs"] == []
+
+
+@respx.mock
+def test_review_repro_compare_rechecks_ceiling_mid_batch(monkeypatch, tmp_path):
+    """External review finding 1 (High): the batch endpoint checked
+    admission once at entry, so once spend crossed the ceiling mid-batch
+    every already-admitted model still called upstream. The recheck under
+    the held slot must refuse the not-yet-started models before they
+    spend, while the batch still persists with the refusal row."""
+    calls = {"n": 0}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        model = json.loads(request.content)["model"]
+        # The first call directly crosses the ceiling, standing in for a
+        # concurrent request's recorded spend (this batch's own spend is
+        # recorded only after the gather); the next model must then be
+        # refused before it reaches upstream.
+        if calls["n"] == 1:
+            app.state.accumulated_spend_usd = 5.0
+        return httpx.Response(200, json=response_for(model, "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    monkeypatch.setenv("BENCH_SPEND_LIMIT_USD", "1.0")
+    # A semaphore of one forces the two models to run one after the other,
+    # so the first's spend is visible when the second rechecks.
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        resp = c.post(
+            "/compare",
+            json={"prompt": "hi", "models": ["model/alpha", "model/alpha"]},
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        # First ran; second refused before any upstream call.
+        assert calls["n"] == 1
+        assert results[0]["error"] is None
+        assert "refused before reaching upstream" in results[1]["error"]
+        # The batch persisted, refusal row and all.
+        run_id = resp.json()["run_id"]
+        assert run_id is not None
+        detail = c.get(f"/runs/{run_id}").json()
+        assert len(detail["results"]) == 2
+        assert detail["results"][1]["error"] is not None
 
 
 # ---- F4: queued state frames.

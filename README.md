@@ -55,15 +55,26 @@ price (offline catalog, missing usage, errors after tokens flowed)
 are counted next to the session total as "unpriced" rather than
 silently dropped.
 
-Set `BENCH_SPEND_LIMIT_USD` (a float, unset means no limit) to cap
-estimated spend for the life of the process. Once accumulated
+Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
+cap estimated spend for the life of the process. An invalid value
+(unparseable, non-finite, negative, or zero) fails boot with a message
+naming the variable, rather than silently producing a ceiling that never
+trips. Once accumulated
 estimated spend reaches the ceiling, `/compare` and `/compare/stream`
 refuse new runs with HTTP 402 and a message naming both figures,
 checked at entry before any upstream call so a refusal costs nothing;
-runs already in flight are never interrupted. The ceiling tracks
-estimates, the same catalog-price times reported-token figures the
-cards show, so unpriced results (offline catalog, missing usage) do
-not count against it. It resets when the process restarts.
+runs already in flight are never interrupted. Admission is rechecked
+once more the instant a run acquires its upstream slot, so a run admitted
+below the ceiling is still refused (before it spends) if a concurrent run
+crossed the ceiling in the meantime; that refusal costs nothing and lands
+in history as an honest cut-short row. Worst-case overshoot is therefore
+bounded by the runs already executing when the ceiling trips, at most
+`MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
+cost, not by the size of the lineup. A full reservation ledger (atomic
+admission) is deliberately deferred. The ceiling tracks estimates, the
+same catalog-price times reported-token figures the cards show, so
+unpriced results (offline catalog, missing usage) do not count against
+it. It resets when the process restarts.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
@@ -194,7 +205,12 @@ state. GET and HEAD stay exempt as reads, and DELETE needs no gate
 because a browser never sends it cross-site without a preflight.
 Everything curl sends with a JSON content type and everything the
 bundled frontend sends (it posts an empty JSON object to /groups)
-passes unchanged. To
+passes unchanged. Every response also carries `X-Frame-Options: DENY`
+and `Content-Security-Policy: frame-ancestors 'none'`, so the UI cannot
+be embedded in a hostile frame and a Run click cannot be redressed into
+paid work; the headers are added on response start with no body
+buffering, so streaming is untouched. A fuller CSP is deferred: the
+pre-paint inline theme script would need a hash or externalization. To
 serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.

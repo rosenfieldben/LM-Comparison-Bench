@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -16,8 +17,8 @@ from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.datastructures import Headers
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import store
 from bench.models import (
@@ -189,6 +190,34 @@ class GroupDetail(BaseModel):
     runs: list[RunDetail]
 
 
+def _parse_spend_limit(raw: str | None) -> float | None:
+    """The validated per-boot spend ceiling, or None for no limit.
+
+    Unset or empty means no limit. Anything present must parse to a
+    strictly positive finite float. A non-finite or negative value is
+    nonsense, and zero is ambiguous between a deliberate lockout and a
+    misconfiguration; the two are indistinguishable, so both are refused
+    loudly at boot rather than silently producing a broken or surprising
+    ceiling. A bare float() would have accepted nan and inf (a nan ceiling
+    is never crossed, silently disabling the limit) and negatives.
+    """
+    if not raw:
+        return None
+    try:
+        limit = float(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"BENCH_SPEND_LIMIT_USD must be a number, got {raw!r}. "
+            "Unset it for no limit."
+        ) from None
+    if not math.isfinite(limit) or limit <= 0:
+        raise RuntimeError(
+            f"BENCH_SPEND_LIMIT_USD must be a positive number, got {raw!r}. "
+            "Unset it for no limit."
+        )
+    return limit
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
@@ -198,6 +227,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise RuntimeError(
             "OPENROUTER_API_KEY is not set. Export it before starting the app."
         )
+    # Per-boot spend ceiling, validated here next to the key check and
+    # before any resource is allocated so a misconfigured limit fails fast
+    # and loud like a missing key. Unset means no limit. The figure tracked
+    # is estimated spend (catalog prices times reported tokens), the same
+    # numbers the cards show, accumulated as a plain float: one event loop
+    # makes that safe without a lock. Results the session cannot price
+    # (offline catalog, missing usage) never move the counter, so the
+    # ceiling bounds known estimated spend, not a billed total.
+    app.state.spend_limit_usd = _parse_spend_limit(
+        os.environ.get("BENCH_SPEND_LIMIT_USD")
+    )
+    app.state.accumulated_spend_usd = 0.0
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -205,6 +246,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # flows that move no bytes, and the resulting deaths wore mixed
     # ReadError and stall signatures. OS-level probes keep those quiet
     # flows alive; see keepalive_socket_options in models.py.
+    # trust_env stays at its default (on): an operator may legitimately
+    # reach OpenRouter through a corporate proxy, and honoring HTTP(S)_PROXY
+    # is the right behavior for the real app. The test harness is the one
+    # place that must not inherit a developer proxy, and it opts out itself
+    # (trust_env=False on its own clients, proxy vars scrubbed from the
+    # browser subprocess) rather than the app degrading its own behavior.
     app.state.client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
@@ -213,15 +260,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
-    # Per-boot spend ceiling. Unset means no limit. The figure tracked is
-    # estimated spend (catalog prices times reported tokens), the same
-    # numbers the cards show, accumulated as a plain float: one event
-    # loop makes that safe without a lock. Results the session cannot
-    # price (offline catalog, missing usage) never move the counter, so
-    # the ceiling bounds known estimated spend, not a billed total.
-    raw_limit = os.environ.get("BENCH_SPEND_LIMIT_USD")
-    app.state.spend_limit_usd = float(raw_limit) if raw_limit else None
-    app.state.accumulated_spend_usd = 0.0
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -292,6 +330,26 @@ class LocalOnlyGuard:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        # Deny framing on every HTTP response. A hostile page cannot read a
+        # cross-origin response, but it can frame the real localhost UI and
+        # redress a Run click into paid work; these headers refuse the
+        # frame. Modern Chrome's private-network rules blunt this, other
+        # browsers differ, and the headers cost nothing. Blanket
+        # application is deliberate: no response here is meant to be
+        # embedded. The headers are added on http.response.start only, with
+        # no buffering of the body, so SSE streaming and the generator
+        # cancellation the streaming endpoint depends on stay untouched,
+        # which is the reason this guard is pure ASGI. A fuller CSP is out
+        # of scope: the pre-paint inline theme script in index.html would
+        # need a hash or externalization, so this stops at frame-ancestors.
+        async def framed_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["x-frame-options"] = "DENY"
+                headers["content-security-policy"] = "frame-ancestors 'none'"
+            await send(message)
+
         headers = Headers(scope=scope)
         # A missing Host header (raw HTTP/1.0 clients) fails closed.
         host = host_header_name(headers.get("host", ""))
@@ -300,7 +358,7 @@ class LocalOnlyGuard:
                 {"detail": "the bench only answers to localhost"},
                 status_code=403,
             )
-            await response(scope, receive, send)
+            await response(scope, receive, framed_send)
             return
         # Every POST must be application/json, bodyless included: POST
         # is the one method a browser fires cross-site without a CORS
@@ -317,9 +375,9 @@ class LocalOnlyGuard:
                 {"detail": "POST bodies must be application/json"},
                 status_code=415,
             )
-            await response(scope, receive, send)
+            await response(scope, receive, framed_send)
             return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, framed_send)
 
 
 app.add_middleware(LocalOnlyGuard)
@@ -376,6 +434,13 @@ def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
         result["prompt_tokens"] * price["prompt"]
         + result["completion_tokens"] * price["completion"]
     )
+    # The catalog is the primary guard: fetch_catalog rejects non-finite
+    # prices at ingestion, so a NaN can only reach here if a price was set
+    # past that path. This is the belt: an unpriceable total degrades to
+    # None, never a NaN that would poison accumulated spend and silently
+    # disable the ceiling.
+    if not math.isfinite(total):
+        return None
     return float(total)
 
 
@@ -393,21 +458,35 @@ def format_usd(value: float) -> str:
     return f"${whole}.{frac}"
 
 
+def spend_ceiling_reached() -> bool:
+    """True when an active ceiling has been reached by accumulated spend.
+
+    The shared predicate behind the entry check and the post-admission
+    recheck. Unpriced results never moved the counter, so this bounds
+    known estimated spend, not billed cost.
+    """
+    limit = app.state.spend_limit_usd
+    if limit is None:
+        return False
+    return bool(app.state.accumulated_spend_usd >= limit)
+
+
 def enforce_spend_limit() -> None:
     """Refuse a run at the boundary once estimated spend hits the ceiling.
 
     Checked at endpoint entry, before the semaphore and before any
     upstream call, so a refusal costs nothing. Money already in flight
     is never interrupted. The 402 names both figures so the operator
-    knows how far over the intent they are.
+    knows how far over the intent they are. A second recheck runs after
+    admission (spend_refusal_result) to close the gap where runs admitted
+    below the limit would all execute once an earlier one crossed it.
     """
-    limit = app.state.spend_limit_usd
-    if limit is not None and app.state.accumulated_spend_usd >= limit:
+    if spend_ceiling_reached():
         raise HTTPException(
             402,
             "spend ceiling reached: estimated "
             f"{format_usd(app.state.accumulated_spend_usd)} of "
-            f"{format_usd(limit)} limit "
+            f"{format_usd(app.state.spend_limit_usd)} limit "
             "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
         )
 
@@ -416,10 +495,43 @@ def record_spend(cost: float | None) -> None:
     """Add a priced result's estimate to the accumulated spend.
 
     None means the result could not be priced (offline catalog, missing
-    usage), and those never count against the ceiling by design.
+    usage), and those never count against the ceiling by design. A
+    non-finite cost is refused here too: cost_usd already screens it out,
+    but the accumulator is the invariant's last line, and a single NaN
+    summed in would make the ceiling comparison permanently false.
     """
-    if cost is not None:
+    if cost is not None and math.isfinite(cost):
         app.state.accumulated_spend_usd += cost
+
+
+def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
+    """A synthetic result for a run refused at the post-admission recheck.
+
+    Shaped like stream_model's done() result, which is a superset of
+    run_model's and which both endpoints' response models accept. Every
+    metric and text field is None because no upstream call happened. The
+    error reuses format_usd and states plainly that the run was refused
+    before reaching upstream, so the persisted row is unambiguous that no
+    money moved.
+    """
+    return {
+        "model": model,
+        "response_text": None,
+        "latency_ms": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "error": (
+            "run refused before reaching upstream: estimated spend "
+            f"{format_usd(app.state.accumulated_spend_usd)} reached the "
+            f"{format_usd(app.state.spend_limit_usd)} ceiling "
+            "(BENCH_SPEND_LIMIT_USD); no upstream call was made"
+        ),
+        "cost_usd": None,
+        "ttft_ms": None,
+        "max_tokens": max_tokens,
+        "generation_id": None,
+        "finish_reason": None,
+    }
 
 
 def effective_budget(budget: str, model: str) -> int:
@@ -462,12 +574,28 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # honest for free: its latency clock starts internally, after
         # the slot is already held, so a queued model never reports
         # queue wait as model latency.
+        budget = effective_budget(request.budget, model)
         async with app.state.upstream_semaphore:
+            # Recheck under the held slot, before run_model spends. This
+            # batch records its own spend only after the gather completes,
+            # so the recheck cannot observe an earlier model in this same
+            # batch; what it catches is spend a concurrent request (another
+            # /compare or a stream) recorded while this model waited for a
+            # slot. One batch is capped at five models, equal to
+            # MAX_CONCURRENT_UPSTREAM, so a batch's own overshoot already
+            # sits within the documented bound; the recheck stops a queued
+            # batch from spending once a concurrent run crossed the ceiling.
+            # On refusal return a synthetic result shaped like run_model's,
+            # error set, with no upstream call. The batch persists as usual
+            # with the refusal row included: honest history for a cut-short
+            # run.
+            if spend_ceiling_reached():
+                return spend_refusal_result(model, budget)
             return await run_model(
                 request.prompt,
                 model,
                 app.state.client,
-                max_tokens=effective_budget(request.budget, model),
+                max_tokens=budget,
             )
 
     # gather preserves input order, which the frontend relies on to map
@@ -547,6 +675,31 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             # quietly, with no acquisition timeout.
             await app.state.upstream_semaphore.acquire()
             acquired = True
+            # Recheck the ceiling now that a slot is held, before started is
+            # set, before the clock, and before the started frame. The entry
+            # check admits every queued run below the limit; without this
+            # recheck an earlier run crossing the ceiling would not stop the
+            # ones already admitted, so overshoot would be bounded by lineup
+            # size, not by the semaphore. On refusal return the slot, emit
+            # one done frame carrying the synthetic refusal result with
+            # run_id null, and persist nothing: the refusal happened before
+            # any upstream call, exactly like a queued cancel, so there is
+            # nothing truthful to record. started stays false so the
+            # finally's abort-persist path never fires.
+            if spend_ceiling_reached():
+                release_slot()
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "done",
+                            "result": spend_refusal_result(request.model, max_tokens),
+                            "run_id": None,
+                        }
+                    )
+                    + "\n\n"
+                )
+                return
             started = True
             # Start the clock before emitting started, not after. The
             # frame and the clock mark the same instant (the sub-ms cost
