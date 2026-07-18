@@ -1222,9 +1222,12 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
   const current = () => epoch === viewEpoch;
   const controller = new AbortController();
   epochControllers.push(controller);
-  // A Stop that landed during startup (before this controller existed)
-  // marked the epoch: begin already aborted so the run halts as stopped
-  // rather than streaming to completion once its slot opens.
+  // A Stop that landed during this batch's startup (before this
+  // controller existed) marked the epoch: begin already aborted so the
+  // run halts as stopped rather than streaming to completion once its
+  // slot opens. The mark is cleared when the batch settles, so a rerun
+  // issued later in the same view reaches this line with it already
+  // reset and runs normally.
   if (epoch === stoppedEpoch) controller.abort();
   inflightRuns += 1;
   updateRunState();
@@ -1477,6 +1480,15 @@ async function startRun() {
       )
     );
   } finally {
+    // The stop mark exists only to catch this batch's own models when a
+    // Stop lands during the group-POST await, before their controllers
+    // exist. Once the batch has settled, every such run has passed its
+    // startup check, so clear the mark: a later rerun reuses this epoch
+    // (it stays in the same view) and must not be aborted as if it were
+    // part of the stopped batch. Cleared regardless of supersession; if
+    // it belonged to a superseded epoch no future epoch would match it
+    // anyway, but leaving it set would strand a rerun in this view.
+    if (stoppedEpoch === epoch) stoppedEpoch = -1;
     // Release the batch reservation, but only if this batch still owns
     // the view: a superseding run already reset the registry to zero,
     // so decrementing here would corrupt its count.
@@ -1496,7 +1508,9 @@ runBtn.addEventListener("click", startRun);
 // a later Run or rerun works through the untouched epoch machinery. The
 // abort disconnects each stream, so the server persists a started run
 // through its existing disconnect path and a queued run not at all,
-// exactly as the cards show.
+// exactly as the cards show. The stop mark set here lives only until the
+// stopped batch settles (startRun clears it in its finally), so a rerun
+// issued afterward in this same view is unaffected.
 function stopRuns() {
   // Mark the epoch stopped before aborting, so a per-model run still
   // starting up (its controller not yet in the list because startRun is

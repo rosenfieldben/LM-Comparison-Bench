@@ -458,3 +458,82 @@ def test_review_repro_stop_during_group_creation_halts_run(bench):
     expect(card.get_by_test_id("card-body")).to_have_text("")
     expect(page.get_by_test_id("run-button")).to_be_enabled()
     expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+
+def test_review_repro_rerun_after_stop_runs_not_stopped(bench):
+    """Adversarial review of F2.4: the stop mark (stoppedEpoch) is set on
+    Stop and, pre-fix, lived for the whole view because Stop does not
+    advance the epoch. A rerun reuses that same epoch (it stays in the
+    view), so runOne's startup check aborted it on sight, rendering a
+    second 'stopped' card and dropping the retry. The mark must be scoped
+    to the stopped batch: once it settles, a rerun in the same view runs.
+
+    Mixed batch: stub/fast is forced to error (earning a Rerun) via a
+    per-model done frame fulfilled at the app boundary, so the error is
+    deterministic and independent of the session-shared flaky one-shot;
+    stub/stall0 hits the real backend and stalls. Stop halts the stall,
+    then Rerun on the errored card must actually reach the network again
+    (it errors once more, since the route always errors that model), not
+    abort straight to 'stopped'. The error->error transition on rerun is
+    the tombstone: pre-fix the rerun never fetched and read 'stopped'.
+    """
+    page = bench(["stub/fast", "stub/stall0"])
+
+    # Force stub/fast to error at the app boundary on every attempt; leave
+    # every other /compare/stream (the stall) to the real backend. The
+    # done frame carries an error result, the exact shape the client turns
+    # into an error card with a Rerun.
+    err_frame = (
+        'data: {"type":"done","result":'
+        '{"error":"forced review error","response_text":null},"run_id":1}\n\n'
+    )
+
+    def force_fast_error(route):
+        data = route.request.post_data or ""
+        if '"model":"stub/fast"' in data.replace(" ", ""):
+            route.fulfill(
+                status=200,
+                content_type="text/event-stream",
+                body=err_frame,
+            )
+        else:
+            route.continue_()
+
+    page.route("**/compare/stream", force_fast_error)
+
+    check_all_chips(page)
+    start_run(page, "f2 rerun after stop")
+
+    fast = (
+        cards(page)
+        .filter(has=page.get_by_test_id("card-model").filter(has_text="stub/fast"))
+        .first
+    )
+    stall = (
+        cards(page)
+        .filter(has=page.get_by_test_id("card-model").filter(has_text="stub/stall0"))
+        .first
+    )
+
+    # The forced model errors and earns a Rerun; the stall streams then hangs.
+    expect(status_of(fast)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(fast.get_by_test_id("card-error")).to_contain_text("forced review error")
+    expect(fast.get_by_test_id("tool-rerun")).to_be_visible()
+    expect(stall.get_by_test_id("card-body")).to_contain_text(
+        "partial text", timeout=DONE_TIMEOUT
+    )
+
+    # Stop halts the stall; the batch settles and Run re-enables.
+    page.get_by_test_id("stop-button").click()
+    expect(status_of(stall)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+    # Rerun the errored card. Pre-fix this aborted on the lingering stop
+    # mark and rendered 'stopped'; post-fix it reaches the network again
+    # and errors, proving the rerun actually ran rather than self-aborting.
+    fast.get_by_test_id("tool-rerun").click()
+    expect(status_of(fast)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(fast.get_by_test_id("card-error")).to_contain_text("forced review error")
+    # The stall's stopped card is untouched by the rerun.
+    expect(status_of(stall)).to_have_text("stopped")
