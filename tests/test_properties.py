@@ -123,6 +123,63 @@ def test_stream_model_closes_with_one_done_and_honest_ttft(lines):
     assert (events[-1]["result"]["ttft_ms"] is not None) == saw_text
 
 
+# Content lines that never trigger an error path (no malformed json, no
+# in-band error frame): text deltas and usage-only frames. The terminal
+# marker is chosen separately so the terminal contract stays unambiguous.
+safe_content_line = st.one_of(
+    st.builds(_delta_line, st.text(max_size=8)),
+    st.just(
+        "data: "
+        + json.dumps(
+            {"choices": [], "usage": {"prompt_tokens": 1, "completion_tokens": 1}}
+        )
+    ),
+)
+
+
+@settings(deadline=None, max_examples=60, print_blob=True)
+@given(
+    content=st.lists(safe_content_line, max_size=8),
+    terminal=st.sampled_from(["done", "finish", "none"]),
+)
+def test_stream_model_error_iff_stream_had_no_terminator(content, terminal):
+    # The refined terminal contract from the external review (finding 2):
+    # the done error is set exactly when the stream ended with neither a
+    # [DONE] marker nor a finish_reason. A clean iterator exhaustion is not
+    # a success, but a finish_reason without [DONE] is still complete.
+    lines = list(content)
+    if terminal == "done":
+        lines.append("data: [DONE]")
+    elif terminal == "finish":
+        lines.append(
+            "data: " + json.dumps({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+        )
+    # terminal == "none": nothing appended; a clean EOF with neither
+    # terminator, standing in for an idle-closed or crashed connection.
+
+    async def drive():
+        blob = ("\n".join(lines) + "\n").encode("utf-8")
+        async with httpx.AsyncClient() as client:
+            with respx.mock:
+                respx.post(OPENROUTER_URL).mock(
+                    return_value=httpx.Response(200, stream=ChunkStream([blob]))
+                )
+                return [event async for event in stream_model("p", "model/x", client)]
+
+    events = asyncio.run(drive())
+    error = events[-1]["result"]["error"]
+    had_text = any(e["type"] == "delta" for e in events[:-1])
+
+    if terminal == "none":
+        assert error == "stream ended before completion: no [DONE] and no finish reason"
+    elif had_text:
+        # A terminator plus visible text is a clean, complete success.
+        assert error is None
+    else:
+        # A terminator but no text is the pre-existing empty-response case.
+        assert error is not None and error.startswith("empty response")
+
+
 def _make_result():
     # The minimal shape save_run reads; the rest defaults via .get.
     return {

@@ -387,6 +387,7 @@ async def stream_model(
         "stream_options": {"include_usage": True},
     }
     text_parts: list[str] = []
+    saw_done = False
     start = time.perf_counter()
 
     def elapsed_ms() -> float:
@@ -420,6 +421,7 @@ async def stream_model(
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    saw_done = True
                     break
                 try:
                     chunk = json.loads(data)
@@ -487,4 +489,15 @@ async def stream_model(
         yield done(f"request failed: {type(exc).__name__}")
         return
 
+    # A clean iterator exhaustion without the [DONE] marker is not a
+    # success: a load balancer idle-closing the connection or a provider
+    # crashing with a clean close both land here, and done(None) would show
+    # and persist a truncated answer as complete, corrupting the
+    # comparison. But a stream that delivered a finish_reason and then
+    # closed without [DONE] is semantically complete (the provider stated
+    # why it stopped), so flagging that would be a false alarm. done()
+    # already carries the partial text accumulated so far.
+    if not saw_done and result["finish_reason"] is None:
+        yield done("stream ended before completion: no [DONE] and no finish reason")
+        return
     yield done(None)

@@ -371,6 +371,32 @@ def test_stream_endpoint_frames_sse_and_persists_ttft_and_cost(client):
 
 
 @respx.mock
+def test_review_repro_clean_eof_persists_as_error(client):
+    """External review finding 2: a clean EOF without [DONE] must persist
+    through the streaming API as an error with the partial text kept, not
+    as a complete run that silently corrupts the comparison."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream([sse({"choices": [{"delta": {"content": "Hel"}}]})]),
+        )
+    )
+
+    events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["result"]["response_text"] == "Hel"
+    assert done["result"]["error"] is not None
+    assert "no [DONE]" in done["result"]["error"]
+
+    detail = client.get(f"/runs/{done['run_id']}").json()
+    persisted = detail["results"][0]
+    assert persisted["response_text"] == "Hel"
+    assert "no [DONE]" in persisted["error"]
+
+
+@respx.mock
 def test_stream_endpoint_stale_group_id_degrades(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())

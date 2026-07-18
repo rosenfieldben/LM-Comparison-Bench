@@ -801,3 +801,54 @@ async def test_review_repro_boolean_and_nonpositive_completion_cap_ignored(clien
     assert zero["max_completion_tokens"] is None
     assert neg["max_completion_tokens"] is None
     assert real["max_completion_tokens"] == 32000
+
+
+@respx.mock
+async def test_review_repro_clean_eof_without_done_is_error(client):
+    """External review finding 2: stream_model broke on [DONE] without
+    recording that it saw the marker, so any ordinary iterator exhaustion
+    (a load balancer idle-closing the connection, a provider crashing with
+    a clean close) fell through to done(None) and a truncated answer was
+    shown and persisted as complete. A clean EOF with no [DONE] and no
+    finish_reason must be an error, with the partial text preserved."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=ChunkStream([delta_chunk("Hel")]))
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hel"
+    assert (
+        result["error"]
+        == "stream ended before completion: no [DONE] and no finish reason"
+    )
+
+
+@respx.mock
+async def test_review_repro_finish_reason_without_done_not_flagged(client):
+    """External review finding 2 refinement (inverse lock): a stream that
+    delivered a finish_reason and then closed without [DONE] is
+    semantically complete (the provider stated why it stopped), so flagging
+    it aborted would be a false alarm. Guards against over-correcting the
+    fix above into treating every missing [DONE] as an error."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hello"),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    # No [DONE]: the connection simply closes after the
+                    # provider stated why it stopped.
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["response_text"] == "Hello"
+    assert result["error"] is None
+    assert result["finish_reason"] == "stop"
