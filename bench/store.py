@@ -202,6 +202,21 @@ def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
     return row is not None
 
 
+def group_prompt(conn: sqlite3.Connection, group_id: int) -> str | None:
+    """The prompt a group is established with: its first member's prompt
+    text, or None if the group has no runs yet (or does not exist).
+
+    One prompt per group is a semantic the frontend already keeps; this
+    lets the API enforce it too, derived from members so no schema column
+    is needed. The first run to persist under a group fixes its prompt.
+    """
+    row = conn.execute(
+        "SELECT prompt_text FROM runs WHERE group_id = ? ORDER BY id LIMIT 1",
+        (group_id,),
+    ).fetchone()
+    return row["prompt_text"] if row else None
+
+
 def save_run(
     conn: sqlite3.Connection,
     prompt_text: str,

@@ -534,6 +534,43 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     }
 
 
+def _excerpt(text: str, limit: int = 60) -> str:
+    """A bounded, single-line excerpt of a prompt for an error detail:
+    enough to name a conflict without dumping a full prompt into a 409.
+    """
+    one_line = " ".join(text.split())
+    return one_line if len(one_line) <= limit else one_line[:limit] + "..."
+
+
+def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
+    """Reject a run whose group already holds a different prompt.
+
+    Checked at endpoint entry, before the semaphore and any upstream call,
+    so a mismatch is a 409 that spends nothing and never reaches the
+    post-spend degrade path (link resolution stays degrade-only). An empty
+    or unknown group accepts any prompt; the first member establishes the
+    group's prompt.
+
+    Residual: two concurrent first members with different prompts can both
+    pass the empty-group check here, because group_prompt returns None for
+    both before either persists. Single-user localhost makes that a
+    non-path, the frontend cannot produce it (one Run creates one group
+    with one prompt), and rejecting after spend is forbidden by the
+    fault-boundary invariant, so the residual is accepted rather than
+    closed with a lock.
+    """
+    if group_id is None:
+        return
+    established = store.group_prompt(app.state.db, group_id)
+    if established is not None and established != prompt:
+        raise HTTPException(
+            409,
+            "prompt does not match this group's established prompt "
+            f"({_excerpt(established)!r}); a group holds one prompt across "
+            "its runs",
+        )
+
+
 def effective_budget(budget: str, model: str) -> int:
     """The requested budget clamped to the model's published completion
     cap. Sending a budget above a model's cap is a hard 400 from some
@@ -565,6 +602,7 @@ def resolve_links(
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict[str, Any]:
     enforce_spend_limit()
+    enforce_group_prompt(request.prompt, request.group_id)
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -637,6 +675,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # At entry, before the generator runs and so before the semaphore or
     # any upstream call: a refusal must spend nothing.
     enforce_spend_limit()
+    enforce_group_prompt(request.prompt, request.group_id)
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:

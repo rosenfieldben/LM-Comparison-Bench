@@ -573,3 +573,16 @@ def test_wal_siblings_are_kept_owner_only(tmp_path):
             conn2.close()
     finally:
         conn.close()
+
+
+def test_group_prompt_is_first_member_or_none(db):
+    # Review finding 8 helper: a group's established prompt is its first
+    # member's, derived from members with no schema column.
+    gid = store.create_group(db)
+    # Empty group and unknown group both have no established prompt.
+    assert store.group_prompt(db, gid) is None
+    assert store.group_prompt(db, 999999) is None
+    store.save_run(db, "the first prompt", [make_result()], group_id=gid)
+    store.save_run(db, "a later, different prompt", [make_result()], group_id=gid)
+    # The first member fixes it, regardless of later members' text.
+    assert store.group_prompt(db, gid) == "the first prompt"

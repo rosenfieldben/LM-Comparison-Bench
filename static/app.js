@@ -1503,8 +1503,17 @@ async function loadHistory() {
     const count = document.createElement("span");
     count.className = "hcount";
     count.dataset.testid = "history-count";
-    count.textContent =
-      run.models.length + (run.models.length === 1 ? " model" : " models");
+    // run.models carries one entry per result, so a model rerun twice
+    // appears twice. Label by distinct models, and add the attempt count
+    // separately only when reruns pushed it above the model count, so a
+    // rerun group reads "1 model · 2 attempts" not "2 models".
+    const uniqueModels = new Set(run.models).size;
+    const attempts = run.models.length;
+    let countText = uniqueModels + (uniqueModels === 1 ? " model" : " models");
+    if (attempts > uniqueModels) {
+      countText += " · " + attempts + " attempts";
+    }
+    count.textContent = countText;
     row.append(time, text, count);
     row.title = run.models.join(", ");
     row.addEventListener("click", () =>

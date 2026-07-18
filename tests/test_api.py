@@ -172,6 +172,68 @@ def test_stale_group_id_degrades_to_ungrouped(client):
     assert entries[0]["type"] == "run"
 
 
+# ---- F2.3: one prompt per group.
+
+
+@respx.mock
+def test_review_repro_group_rejects_second_prompt(client):
+    """Review finding 8: group membership only checked that the id
+    existed, so the API could attach different prompts to one group and
+    history then summarized the whole group under the oldest member's
+    prompt. Entry now enforces one prompt per group with a 409 before any
+    upstream call; same-prompt additions and empty/unknown groups pass."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post("/groups", json={}).json()["id"]
+
+    r1 = client.post(
+        "/compare",
+        json={"prompt": "established", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert r1.status_code == 200
+    calls = route.call_count
+
+    # A different prompt in the same group is refused before spending.
+    r2 = client.post(
+        "/compare",
+        json={"prompt": "a different one", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert r2.status_code == 409
+    assert "one prompt" in r2.json()["detail"]
+    assert route.call_count == calls
+
+    # The same prompt still passes (a rerun or a second model).
+    r3 = client.post(
+        "/compare",
+        json={"prompt": "established", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert r3.status_code == 200
+
+
+@respx.mock
+def test_review_repro_stream_group_rejects_second_prompt(client):
+    """Review finding 8, streaming path: the same one-prompt-per-group
+    check fires at entry, a 409 before any upstream call rather than an
+    SSE frame."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    gid = client.post("/groups", json={}).json()["id"]
+
+    events = stream_events(
+        client, {"prompt": "stream one", "model": "model/alpha", "group_id": gid}
+    )
+    assert events[-1]["type"] == "done"
+    calls = route.call_count
+
+    resp = client.post(
+        "/compare/stream",
+        json={"prompt": "stream two", "model": "model/alpha", "group_id": gid},
+    )
+    assert resp.status_code == 409
+    assert "one prompt" in resp.json()["detail"]
+    assert route.call_count == calls
+
+
 @respx.mock
 def test_cost_computed_from_price_cache(client):
     def route(request: httpx.Request) -> httpx.Response:

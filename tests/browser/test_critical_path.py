@@ -107,10 +107,13 @@ def test_03_flaky_errors_then_rerun_recovers_in_same_group(bench):
     expect(card.get_by_test_id("card-body")).to_have_text("reply from stub/flaky")
 
     # Both attempts persist as one comparison group: failures are data.
+    # The group holds one distinct model run twice, so the count reads by
+    # unique model with the attempts noted separately (Phase F.2 changed
+    # this from the old "2 models" wording, which mislabeled a rerun).
     page.get_by_test_id("history-toggle").click()
     row = page.get_by_test_id("history-row").filter(has_text="flaky prompt")
     expect(row).to_have_count(1)
-    expect(row.get_by_test_id("history-count")).to_have_text("2 models")
+    expect(row.get_by_test_id("history-count")).to_have_text("1 model · 2 attempts")
 
 
 def test_04_extended_budget_sends_65536_and_clamps_capped(bench, stub_url):

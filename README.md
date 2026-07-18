@@ -142,9 +142,10 @@ text gain per-card controls in a bottom action row: copy (raw
 response text to the clipboard, with a brief "copied" confirmation),
 fold (collapse to a six line preview, "show all" to reverse), and
 diff; errored live cards add rerun. History renders as a flat strip
-of rows (timestamp, prompt, model count) with a client-side filter
-that matches prompt substrings and model ids, and loads only when
-expanded. Opening an entry clears the current cards, race and diff and
+of rows (timestamp, prompt, and a model count that counts distinct
+models, noting attempts separately when a rerun pushed the total above
+them, as in "1 model · 2 attempts") with a client-side filter that
+matches prompt substrings and model ids, and loads only when expanded. Opening an entry clears the current cards, race and diff and
 shows a loading state before fetching; a load that fails becomes a
 standalone failure state, so a stale comparison is never left sitting
 under the banner.
@@ -306,7 +307,11 @@ Other endpoints:
 - `DELETE /prompts/{id}` removes a prompt; runs that used it keep
   their text, only the link is cleared
 - `POST /groups` creates a grouping id so one comparison's per-model
-  requests land as a single history entry
+  requests land as a single history entry. A group holds one prompt
+  across its runs (the first member's), enforced at run entry: a
+  `/compare` or `/compare/stream` whose `group_id` names a group already
+  holding a different prompt is a 409 before any upstream call, never a
+  post-spend rejection
 - `GET /groups/{id}` returns a group's runs with full results
 - `GET /runs` lists history, most recent first, prompt text truncated
   to 80 chars; entries are either `{type: "group", ...}` for grouped
