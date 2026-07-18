@@ -120,9 +120,11 @@ def connect(path: str) -> sqlite3.Connection:
     event loop thread today, but the flag keeps a future sync endpoint
     or executor hop from crashing on an sqlite thread check.
     """
-    # In-memory and file: URI databases (the test seam) have no
-    # filesystem mode to manage.
-    if path != ":memory:" and not path.startswith("file:"):
+    # A real file on disk, as opposed to the in-memory and file: URI
+    # databases the test seam hands in, which have no filesystem mode to
+    # manage and no meaningful WAL.
+    file_backed = path != ":memory:" and not path.startswith("file:")
+    if file_backed:
         _keep_private(path)
     # uri=True lets tests hand in shared in-memory databases via
     # file: URIs; sqlite treats anything not starting with "file:" as a
@@ -131,6 +133,16 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # Off by default in sqlite; without it ON DELETE SET NULL is inert.
     conn.execute("PRAGMA foreign_keys = ON")
+    if file_backed:
+        # A second process opening bench.db (an analysis script run while
+        # the bench is live) risks "database is locked" under the default
+        # rollback journal, which takes an exclusive lock for every
+        # write. WAL lets that reader coexist with the bench's writer,
+        # and busy_timeout waits out a transient lock instead of failing
+        # the query instantly. WAL is meaningless for memory databases,
+        # which is why this is gated on a real file.
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}

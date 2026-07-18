@@ -480,19 +480,23 @@ def test_existing_loose_database_and_siblings_tightened(tmp_path, caplog):
     seed.commit()
     seed.close()
     os.chmod(db_path, 0o644)
-    # A leftover sibling from the loose era; sqlite ignores a stray
-    # -wal on a rollback-journal database, so it is safe to plant.
+    # A leftover sibling as a crash would leave one; _keep_private runs
+    # before sqlite opens the WAL database and tightens it.
     wal = tmp_path / "bench.db-wal"
     wal.write_bytes(b"")
     os.chmod(wal, 0o644)
 
     with caplog.at_level(logging.WARNING, logger="bench.store"):
         conn = store.connect(str(db_path))
+    try:
+        # The database file mode survives close, but the -wal is checked
+        # while the connection is open: closing a WAL database
+        # checkpoints and removes the sibling.
+        assert file_mode(db_path) == 0o600
+        assert file_mode(wal) == 0o600
+        assert "tightened" in caplog.text
+    finally:
         conn.close()
-
-    assert file_mode(db_path) == 0o600
-    assert file_mode(wal) == 0o600
-    assert "tightened" in caplog.text
 
 
 def test_get_run_repairs_poisoned_legacy_row(db):
@@ -525,3 +529,47 @@ def test_get_run_repairs_poisoned_legacy_row(db):
     assert row["completion_tokens"] == 12
     assert row["generation_id"] == "42"
     assert row["finish_reason"] == "7"
+
+
+def test_file_backed_connection_enables_wal_and_busy_timeout(tmp_path):
+    # WAL and a busy timeout let an analysis script read bench.db while
+    # the bench writes, instead of colliding on "database is locked".
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        conn.close()
+
+
+def test_memory_database_ignores_wal(db):
+    # The :memory: fixture must keep working: sqlite reports "memory"
+    # rather than "wal" for it, and connect must not have errored.
+    assert db.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
+
+
+def test_wal_siblings_are_kept_owner_only(tmp_path):
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    try:
+        # A write while the connection is open materializes the -wal
+        # sibling and keeps it alive (closing WAL checkpoints it away).
+        store.save_run(conn, "prompt", [make_result()])
+        wal = tmp_path / "bench.db-wal"
+        assert wal.exists()
+        # SQLite mirrors the 0600 database file onto siblings it creates.
+        assert file_mode(wal) == 0o600
+        shm = tmp_path / "bench.db-shm"
+        if shm.exists():
+            assert file_mode(shm) == 0o600
+
+        # And a later startup re-tightens a sibling that somehow went
+        # loose, via _keep_private: the permissions compose.
+        os.chmod(wal, 0o644)
+        conn2 = store.connect(str(db_path))
+        try:
+            assert file_mode(wal) == 0o600
+        finally:
+            conn2.close()
+    finally:
+        conn.close()
