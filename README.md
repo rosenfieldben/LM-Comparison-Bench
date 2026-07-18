@@ -55,8 +55,11 @@ price (offline catalog, missing usage, errors after tokens flowed)
 are counted next to the session total as "unpriced" rather than
 silently dropped.
 
-Set `BENCH_SPEND_LIMIT_USD` (a float, unset means no limit) to cap
-estimated spend for the life of the process. Once accumulated
+Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
+cap estimated spend for the life of the process. An invalid value
+(unparseable, non-finite, negative, or zero) fails boot with a message
+naming the variable, rather than silently producing a ceiling that never
+trips. Once accumulated
 estimated spend reaches the ceiling, `/compare` and `/compare/stream`
 refuse new runs with HTTP 402 and a message naming both figures,
 checked at entry before any upstream call so a refusal costs nothing;

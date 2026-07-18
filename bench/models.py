@@ -177,17 +177,33 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
         top = entry.get("top_provider")
-        if isinstance(top, dict) and isinstance(top.get("max_completion_tokens"), int):
-            model["max_completion_tokens"] = top["max_completion_tokens"]
+        if isinstance(top, dict):
+            cap = top.get("max_completion_tokens")
+            # A non-bool int strictly above zero only. isinstance(True, int)
+            # is true in Python, so a provider sending true would otherwise
+            # become a cap of 1 that clamps every budget to a single token;
+            # zero and negatives are not real caps either.
+            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+                model["max_completion_tokens"] = cap
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
-        # entry or the whole map.
+        # entry or the whole map. Non-finite and negative prices are
+        # malformed too: a NaN price yields a NaN cost, and a NaN summed
+        # into accumulated spend makes the ceiling comparison permanently
+        # false, silently disabling it. Raising inside the try reuses the
+        # single degrade path, matching as_metric's finiteness contract.
         try:
-            model["prompt_price"] = float(entry["pricing"]["prompt"])
-            model["completion_price"] = float(entry["pricing"]["completion"])
+            prompt_price = float(entry["pricing"]["prompt"])
+            completion_price = float(entry["pricing"]["completion"])
+            if not (math.isfinite(prompt_price) and math.isfinite(completion_price)):
+                raise ValueError("non-finite price")
+            if prompt_price < 0 or completion_price < 0:
+                raise ValueError("negative price")
+            model["prompt_price"] = prompt_price
+            model["completion_price"] = completion_price
             prices[entry["id"]] = {
-                "prompt": model["prompt_price"],
-                "completion": model["completion_price"],
+                "prompt": prompt_price,
+                "completion": completion_price,
             }
         except (KeyError, TypeError, ValueError):
             model["prompt_price"] = None

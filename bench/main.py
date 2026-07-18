@@ -3,6 +3,7 @@
 import asyncio
 import json
 import logging
+import math
 import os
 import sqlite3
 import time
@@ -189,6 +190,34 @@ class GroupDetail(BaseModel):
     runs: list[RunDetail]
 
 
+def _parse_spend_limit(raw: str | None) -> float | None:
+    """The validated per-boot spend ceiling, or None for no limit.
+
+    Unset or empty means no limit. Anything present must parse to a
+    strictly positive finite float. A non-finite or negative value is
+    nonsense, and zero is ambiguous between a deliberate lockout and a
+    misconfiguration; the two are indistinguishable, so both are refused
+    loudly at boot rather than silently producing a broken or surprising
+    ceiling. A bare float() would have accepted nan and inf (a nan ceiling
+    is never crossed, silently disabling the limit) and negatives.
+    """
+    if not raw:
+        return None
+    try:
+        limit = float(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"BENCH_SPEND_LIMIT_USD must be a number, got {raw!r}. "
+            "Unset it for no limit."
+        ) from None
+    if not math.isfinite(limit) or limit <= 0:
+        raise RuntimeError(
+            f"BENCH_SPEND_LIMIT_USD must be a positive number, got {raw!r}. "
+            "Unset it for no limit."
+        )
+    return limit
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
@@ -198,6 +227,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         raise RuntimeError(
             "OPENROUTER_API_KEY is not set. Export it before starting the app."
         )
+    # Per-boot spend ceiling, validated here next to the key check and
+    # before any resource is allocated so a misconfigured limit fails fast
+    # and loud like a missing key. Unset means no limit. The figure tracked
+    # is estimated spend (catalog prices times reported tokens), the same
+    # numbers the cards show, accumulated as a plain float: one event loop
+    # makes that safe without a lock. Results the session cannot price
+    # (offline catalog, missing usage) never move the counter, so the
+    # ceiling bounds known estimated spend, not a billed total.
+    app.state.spend_limit_usd = _parse_spend_limit(
+        os.environ.get("BENCH_SPEND_LIMIT_USD")
+    )
+    app.state.accumulated_spend_usd = 0.0
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -213,15 +254,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
-    # Per-boot spend ceiling. Unset means no limit. The figure tracked is
-    # estimated spend (catalog prices times reported tokens), the same
-    # numbers the cards show, accumulated as a plain float: one event
-    # loop makes that safe without a lock. Results the session cannot
-    # price (offline catalog, missing usage) never move the counter, so
-    # the ceiling bounds known estimated spend, not a billed total.
-    raw_limit = os.environ.get("BENCH_SPEND_LIMIT_USD")
-    app.state.spend_limit_usd = float(raw_limit) if raw_limit else None
-    app.state.accumulated_spend_usd = 0.0
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -376,6 +408,13 @@ def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
         result["prompt_tokens"] * price["prompt"]
         + result["completion_tokens"] * price["completion"]
     )
+    # The catalog is the primary guard: fetch_catalog rejects non-finite
+    # prices at ingestion, so a NaN can only reach here if a price was set
+    # past that path. This is the belt: an unpriceable total degrades to
+    # None, never a NaN that would poison accumulated spend and silently
+    # disable the ceiling.
+    if not math.isfinite(total):
+        return None
     return float(total)
 
 

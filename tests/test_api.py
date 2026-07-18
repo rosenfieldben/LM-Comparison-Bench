@@ -1277,6 +1277,40 @@ def test_spend_ceiling_message_keeps_sub_cent_figures_truthful(monkeypatch, tmp_
         assert "$0.000058 of $0.00004 limit" in detail
 
 
+@pytest.mark.parametrize("bad", ["nan", "inf", "-1", "0", "abc"])
+def test_review_repro_invalid_spend_limit_fails_boot(monkeypatch, tmp_path, bad):
+    """External review finding 3: BENCH_SPEND_LIMIT_USD was parsed with a
+    bare float() and never validated, so nan and inf produced a ceiling
+    never crossed (silently disabling the limit), and negative or zero
+    produced a nonsensical or ambiguous one. Each must fail boot with the
+    variable named."""
+    with (
+        pytest.raises(RuntimeError, match="BENCH_SPEND_LIMIT_USD"),
+        spend_client(monkeypatch, tmp_path, limit=bad),
+    ):
+        pass
+
+
+@respx.mock
+def test_review_repro_nan_price_counts_as_unpriced_not_poison(monkeypatch, tmp_path):
+    """External review finding 3: a NaN price produced a NaN cost, and a
+    NaN summed into accumulated spend made accumulated >= limit permanently
+    false, silently disabling the ceiling. A NaN-priced run must count as
+    unpriced (cost None), leaving the counter finite and unmoved, not
+    poison it."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # A NaN price injected past the catalog guard, standing in for a
+        # rogue price that reached app.state before fetch_catalog learned
+        # to reject non-finite values.
+        c.app.state.prices["model/alpha"] = {"prompt": float("nan"), "completion": 0.0}
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["cost_usd"] is None
+        assert c.app.state.accumulated_spend_usd == 0.0
+
+
 # ---- F4: queued state frames.
 
 
