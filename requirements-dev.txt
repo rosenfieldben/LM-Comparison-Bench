@@ -9,4 +9,4 @@ pytest-playwright==0.8.0
 playwright==1.61.0
 ruff==0.15.22
 mypy==1.18.2
-hypothesis==6.140.3
+hypothesis==6.156.6
