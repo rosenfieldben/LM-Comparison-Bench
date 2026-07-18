@@ -32,8 +32,10 @@ from bench.models import (
 # nested arbitrarily. floats include nan and inf on purpose.
 json_ish = st.recursive(
     st.none() | st.booleans() | st.integers() | st.floats() | st.text() | st.binary(),
-    lambda children: st.lists(children, max_size=4)
-    | st.dictionaries(st.text(max_size=5), children, max_size=4),
+    lambda children: (
+        st.lists(children, max_size=4)
+        | st.dictionaries(st.text(max_size=5), children, max_size=4)
+    ),
     max_leaves=20,
 )
 
