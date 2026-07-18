@@ -9,13 +9,28 @@ on:
   pull_request:
 
 jobs:
+  # Static gate: format, lint, and strict types on the backend. One
+  # interpreter is enough; these tools are version-agnostic here.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements-dev.txt
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy bench
+
   tests:
     runs-on: ubuntu-latest
     strategy:
-      # Both ends of the supported range, so the README's version floor
-      # is a tested claim rather than an aspiration.
+      # The supported floor plus the newer interpreters. 3.13 and 3.14
+      # ship cp3xx wheels for the one compiled pin (pydantic-core), and
+      # everything else is pure Python.
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
