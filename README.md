@@ -388,6 +388,12 @@ picked up without restarts, and verify by eyeball after UI changes:
   to offline (or the server stopped) open History and click the entry.
   The cards clear to a loading then a failure state that stands alone;
   no card from the earlier run stays visible under the failure banner.
+- Double Enter on save: open the save name row, type a name, and press
+  Enter (or click OK) twice fast. Exactly one prompt is created with no
+  lingering "already exists" error; saving under a duplicate name shows
+  the conflict, and renaming and saving again clears it. Editing the
+  prompt text while a save is in flight leaves the saved-prompt link
+  cleared rather than claiming a match that is no longer on screen.
 - Watch a slow model paint token by token next to an already
   finished fast one; the ttft metric should be visibly smaller than
   the total metric on streamed columns, and the race strip row

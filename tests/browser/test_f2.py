@@ -47,6 +47,16 @@ def open_history(page):
     page.get_by_test_id("history-toggle").click()
 
 
+def save_prompt(page, text, name):
+    page.get_by_test_id("prompt-input").fill(text)
+    page.get_by_test_id("save-prompt").click()
+    page.get_by_test_id("prompt-name").fill(name)
+    page.get_by_test_id("confirm-save").click()
+    expect(page.get_by_test_id("linked-name")).to_have_text(
+        "linked: " + name, timeout=DONE_TIMEOUT
+    )
+
+
 def collect_page_errors(page):
     errors = []
     page.on("pageerror", lambda e: errors.append(str(e)))
@@ -184,3 +194,102 @@ def test_review_repro_superseded_load_stays_silent(bench):
     expect(page.get_by_test_id("history-failure")).to_have_count(0)
     expect(cards(page)).to_have_count(1)
     assert errors == []
+
+
+# ---- F2.2: prompt-library ownership.
+
+
+def test_review_repro_double_save_posts_once(bench):
+    """Review finding 6: submitSave had no in-flight guard, so a double OK
+    or double Enter issued two POSTs; the second 409'd and left a false
+    'already exists' error after a successful save. The guard must issue
+    exactly one POST and no false error."""
+    page = bench(["stub/fast"])
+    posts = {"n": 0}
+
+    def count(route):
+        if route.request.method == "POST":
+            posts["n"] += 1
+        route.continue_()
+
+    page.route("**/prompts", count)
+    page.get_by_test_id("prompt-input").fill("f2 double text")
+    page.get_by_test_id("save-prompt").click()
+    page.get_by_test_id("prompt-name").fill("f2 double name")
+    # Two submitSave calls in one tick: the guard must collapse them to one
+    # POST. Driving submitSave directly proves the flag, not just the
+    # button's disabled state.
+    page.evaluate("() => { submitSave(); submitSave(); }")
+
+    expect(page.get_by_test_id("linked-name")).to_have_text(
+        "linked: f2 double name", timeout=DONE_TIMEOUT
+    )
+    expect(page.get_by_test_id("prompt-msg")).to_have_text("")
+    assert posts["n"] == 1
+
+
+def test_review_repro_stale_409_clears_after_successful_save(bench):
+    """Review finding 6: a duplicate-name 409 survived a later successful
+    save. Clearing the library error at the start of each attempt means a
+    rename-and-retry cannot inherit the old conflict message."""
+    page = bench(["stub/fast"])
+    save_prompt(page, "keeper text", "f2 keeper")
+
+    # A same-name save collides.
+    page.get_by_test_id("prompt-input").fill("different text")
+    page.get_by_test_id("save-prompt").click()
+    page.get_by_test_id("prompt-name").fill("f2 keeper")
+    page.get_by_test_id("confirm-save").click()
+    expect(page.get_by_test_id("prompt-msg")).to_have_text(
+        "a prompt with that name already exists"
+    )
+
+    # Rename and save: the stale 409 must clear.
+    page.get_by_test_id("prompt-name").fill("f2 keeper renamed")
+    page.get_by_test_id("confirm-save").click()
+    expect(page.get_by_test_id("linked-name")).to_have_text(
+        "linked: f2 keeper renamed", timeout=DONE_TIMEOUT
+    )
+    expect(page.get_by_test_id("prompt-msg")).to_have_text("")
+
+
+def test_review_repro_reload_preserves_live_selection(bench):
+    """Review finding 6: loadPrompts wrote the selection from a parameter
+    and had no version, so a stale reload resolving after a newer choice
+    reset the dropdown. The reconciling setter keeps the live selection
+    through a reload (awaited here, so the assertion runs after it
+    resolves, exactly the window a stale GET would land in)."""
+    page = bench(["stub/fast"])
+    save_prompt(page, "alpha text", "f2 sel alpha")
+    save_prompt(page, "beta text", "f2 sel beta")
+
+    page.get_by_test_id("saved-prompts").select_option(label="f2 sel alpha")
+    expect(page.get_by_test_id("linked-name")).to_have_text("linked: f2 sel alpha")
+
+    page.evaluate("async () => { await loadPrompts(); }")
+    expect(page.get_by_test_id("linked-name")).to_have_text("linked: f2 sel alpha")
+
+
+def test_review_repro_edit_during_save_leaves_no_false_link(bench):
+    """Review finding 6: a save that landed after the textarea changed
+    re-linked a prompt whose text no longer matched the screen. The link
+    is re-established only if the textarea still shows the saved text."""
+    page = bench(["stub/fast"])
+    page.get_by_test_id("prompt-input").fill("original text")
+    page.get_by_test_id("save-prompt").click()
+    page.get_by_test_id("prompt-name").fill("f2 edit race")
+    # Start the save (it captures the current text), change the textarea
+    # before the POST returns, then let it resolve. The captured text no
+    # longer matches, so no link is claimed.
+    page.evaluate(
+        """async () => {
+          const p = submitSave();
+          document.getElementById('prompt').value = 'changed mid-save';
+          await p;
+        }"""
+    )
+
+    expect(page.get_by_test_id("linked-name")).to_have_text("")
+    # The prompt was still saved, just not linked.
+    options = page.get_by_test_id("saved-prompts").locator("option")
+    expect(options.filter(has_text="f2 edit race")).to_have_count(1)

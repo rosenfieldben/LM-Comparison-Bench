@@ -39,7 +39,14 @@ function loadLineup() {
 let lineup = loadLineup();
 
 function saveLineup() {
-  localStorage.setItem(LINEUP_KEY, JSON.stringify(lineup));
+  // Guarded like the pref helpers below: a quota or SecurityError must
+  // not abort an add or remove. The in-memory lineup stays authoritative;
+  // persistence just lapses for the session.
+  try {
+    localStorage.setItem(LINEUP_KEY, JSON.stringify(lineup));
+  } catch (err) {
+    // Blocked or full storage: the lineup lives in memory this session.
+  }
 }
 
 // UI prefs (theme, motion, density) persist per browser; a bootstrap
@@ -477,24 +484,60 @@ renderLineup();
 loadCatalog();
 autosizePrompt();
 
-async function loadPrompts(selectId) {
-  let data;
-  try {
-    const resp = await fetch("/prompts");
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
-    data = await resp.json();
-  } catch (err) {
-    promptMsg.textContent = "failed to load prompts: " + err.message;
-    return;
-  }
+// ---- Prompt library ownership. Like the run and history paths, the
+// ---- library owns its requests: one controller aborts an in-flight
+// ---- load when a newer one starts, and a monotonic version means only
+// ---- the latest response may write library state, so a stale reload
+// ---- that resolves late cannot clobber a newer one. libraryBusy gates
+// ---- the mutations so a double OK or double Enter cannot POST twice.
+let promptsController = null;
+let promptsVersion = 0;
+let libraryBusy = false;
+
+// The one place a fetched list writes the dropdown, and the only place
+// the selection is reconciled against the server's truth: a prompt
+// deleted in another tab degrades to no selection instead of a dangling
+// id the next run would send. selectedPromptId is the live selection
+// (set by the dropdown, cleared on textarea edit, set by a save), so
+// reconciling against it keeps a late reload from resetting a newer
+// choice. Programmatic value assignment fires no change event, so this
+// does not loop through the change handler.
+function setPromptLibrary(prompts) {
   savedSelect.replaceChildren(new Option("Saved", ""));
-  for (const p of data.prompts) {
+  const ids = new Set();
+  for (const p of prompts) {
     const opt = new Option(p.name, String(p.id));
     opt.dataset.text = p.text;
     savedSelect.append(opt);
+    ids.add(String(p.id));
   }
-  savedSelect.value = selectId != null ? String(selectId) : "";
+  const wanted = selectedPromptId != null ? String(selectedPromptId) : "";
+  const resolved = ids.has(wanted) ? wanted : "";
+  savedSelect.value = resolved;
+  selectedPromptId = resolved === "" ? null : Number(resolved);
   updateRunState();
+}
+
+async function loadPrompts() {
+  if (promptsController !== null) promptsController.abort();
+  const controller = new AbortController();
+  promptsController = controller;
+  const version = ++promptsVersion;
+  let data;
+  try {
+    const resp = await fetch("/prompts", { signal: controller.signal });
+    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    data = await resp.json();
+  } catch (err) {
+    // A superseded or aborted load stays silent; only a current failure
+    // reports itself.
+    if (controller.signal.aborted || version !== promptsVersion) return;
+    promptMsg.textContent = "failed to load prompts: " + err.message;
+    return;
+  }
+  // Only the latest load writes library state.
+  if (version !== promptsVersion) return;
+  setPromptLibrary(data.prompts);
 }
 
 savedSelect.addEventListener("change", () => {
@@ -533,15 +576,28 @@ saveBtn.addEventListener("click", () => {
 });
 
 async function submitSave() {
+  // One save at a time: a double OK or a second Enter while the POST is
+  // in flight must not issue a second request. libraryBusy is the
+  // authoritative guard (Enter reaches here even with the button
+  // disabled); disabling the button is the visible affordance.
+  if (libraryBusy) return;
   const name = nameInput.value.trim();
   // Empty name is a no-op, mirroring the old cancelled-dialog behavior:
   // the row stays open so the user can type or explicitly cancel.
   if (!name) return;
+  // The exact text sent, captured now so the link is re-established only
+  // if the textarea still shows it when the save returns.
+  const sentText = promptEl.value;
+  // Clear any stale library error at the start of the attempt, so a 409
+  // from a previous attempt cannot outlive its cause.
+  promptMsg.textContent = "";
+  libraryBusy = true;
+  confirmSave.disabled = true;
   try {
     const resp = await fetch("/prompts", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name, text: promptEl.value }),
+      body: JSON.stringify({ name: name, text: sentText }),
     });
     if (resp.status === 409) {
       // Row stays open on conflict so the name can be edited and retried.
@@ -554,10 +610,16 @@ async function submitSave() {
     }
     const saved = await resp.json();
     closeNameRow();
-    selectedPromptId = saved.id;
-    await loadPrompts(saved.id);
+    // Re-establish the saved-prompt link only if the textarea still
+    // matches the saved text; if it changed while the save was in
+    // flight, leave the link cleared rather than claim a false match.
+    selectedPromptId = promptEl.value === sentText ? saved.id : null;
+    await loadPrompts();
   } catch (err) {
     promptMsg.textContent = "save failed: " + err.message;
+  } finally {
+    libraryBusy = false;
+    confirmSave.disabled = false;
   }
 }
 
@@ -577,25 +639,32 @@ nameInput.addEventListener("keydown", (e) => {
 });
 
 deleteBtn.addEventListener("click", async () => {
+  // Same one-mutation-at-a-time guard as save.
+  if (libraryBusy) return;
   const opt = savedSelect.selectedOptions[0];
   if (savedSelect.value === "") return;
   if (!window.confirm(`Delete saved prompt "${opt.textContent}"? Run history is kept.`)) return;
-  let resp;
+  promptMsg.textContent = "";
+  libraryBusy = true;
+  deleteBtn.disabled = true;
   try {
-    resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+    const resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+    if (!resp.ok && resp.status !== 404) {
+      promptMsg.textContent = "delete failed: HTTP " + resp.status;
+      return;
+    }
+    selectedPromptId = null;
+    await loadPrompts();
   } catch (err) {
     promptMsg.textContent = "delete failed: " + err.message;
-    return;
+  } finally {
+    libraryBusy = false;
+    // Re-sync the delete button to the resolved selection.
+    updateRunState();
   }
-  if (!resp.ok && resp.status !== 404) {
-    promptMsg.textContent = "delete failed: HTTP " + resp.status;
-    return;
-  }
-  selectedPromptId = null;
-  await loadPrompts(null);
 });
 
-loadPrompts(null);
+loadPrompts();
 
 // ---- TTFT race strip. One row per model in the live run; the meter
 // ---- shimmers until the first token, then locks to a bar sized by
