@@ -509,6 +509,13 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 app.state.upstream_semaphore.release()
 
         try:
+            # A saturated semaphore means this run waits for a slot.
+            # Tell the client so its column reads "queued" instead of
+            # pretending the model is already thinking; locked() is true
+            # exactly when no slot is free. Emitted before any clock so
+            # the wait pollutes no metric.
+            if app.state.upstream_semaphore.locked():
+                yield "data: " + json.dumps({"type": "queued"}) + "\n\n"
             # The slot covers the upstream exchange only, and it is
             # acquired before any clock starts: both this generator's
             # clock and stream_model's internal latency and ttft clocks
@@ -518,6 +525,10 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             await app.state.upstream_semaphore.acquire()
             acquired = True
             started = True
+            # The slot is held and the wait is over. Emitted before the
+            # clock starts, so the client can reset its own clock to this
+            # point and its TTFT estimate matches the server's.
+            yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             start = time.perf_counter()
             async for event in stream_model(
                 request.prompt, request.model, app.state.client, max_tokens=max_tokens

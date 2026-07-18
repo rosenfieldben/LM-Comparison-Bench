@@ -109,6 +109,10 @@ a text label: thinking, done, or error. A running card counts
 seconds in its header ("thinking · 47s", one shared timer for all
 cards) so the long silences of extended-budget reasoning read as
 alive rather than hung; the counter disappears at the first token.
+At most five models call upstream at once (see Reliability); a model
+still waiting for a slot reads "queued" rather than "thinking", and
+flips to "thinking" with its timer reset the instant a slot frees, so
+the queue wait never inflates its time to first token.
 A four-cell metrics strip (ttft, total, tok i/o, cost) fills in as
 values resolve, with em dashes for unknowns. Finished cards with
 text gain per-card controls in a bottom action row: copy (raw
@@ -402,6 +406,9 @@ picked up without restarts, and verify by eyeball after UI changes:
   tiny value, run until the session estimate crosses it, then run
   again: the columns error with the ceiling message spelled out in
   words, and no new upstream call is made.
+- Queued state: run six or more models at once; the sixth card reads
+  "queued" while five are in flight, then flips to "thinking" when a
+  slot frees, and its counter restarts so its ttft excludes the wait.
 
 ## License
 

@@ -2174,7 +2174,19 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
           appendDelta(event.text);
         } else if (event.type === "done") {
           finish(event.result, event.run_id);
+        } else if (event.type === "queued") {
+          // Waiting on a server slot, not reasoning yet: say so instead
+          // of counting up as "thinking".
+          ui.statusWord.textContent = "queued";
+        } else if (event.type === "started") {
+          // The slot was just acquired. Restart the client clock here so
+          // the TTFT estimate excludes queue wait, matching the server's
+          // post-acquire clock, and restore the thinking label.
+          const entry = tickers.get(ui);
+          if (entry) entry.start = performance.now();
+          ui.statusWord.textContent = "thinking";
         }
+        // Unknown frame types are ignored, as before.
       }
     }
     if (!finished) throw new Error("stream ended unexpectedly");

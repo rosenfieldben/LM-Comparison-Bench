@@ -354,9 +354,11 @@ def test_stream_endpoint_frames_sse_and_persists_ttft_and_cost(client):
 
     events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
 
-    assert [e["type"] for e in events] == ["delta", "delta", "done"]
+    # A free slot: a started frame leads, no queued before it.
+    assert [e["type"] for e in events] == ["started", "delta", "delta", "done"]
     done = events[-1]
-    assert "".join(e["text"] for e in events[:-1]) == "Hello"
+    deltas = [e for e in events if e["type"] == "delta"]
+    assert "".join(e["text"] for e in deltas) == "Hello"
     assert done["result"]["response_text"] == "Hello"
     assert done["result"]["ttft_ms"] is not None
     assert done["result"]["cost_usd"] == pytest.approx(2.9e-05)
@@ -474,6 +476,10 @@ async def test_client_disconnect_persists_partial_run(client):
 
     resp = await compare_stream(StreamCompareRequest(prompt="hi", model="model/alpha"))
     gen = resp.body_iterator
+    # The started frame leads with a free slot; consume it, then the
+    # first delta, then disconnect with only "Hel" seen.
+    started = await gen.__anext__()
+    assert json.loads(started.removeprefix("data: "))["type"] == "started"
     first = await gen.__anext__()
     assert json.loads(first.removeprefix("data: "))["type"] == "delta"
     await gen.aclose()
@@ -1255,3 +1261,45 @@ def test_unset_spend_limit_never_blocks(monkeypatch, tmp_path):
         c.app.state.accumulated_spend_usd = 1000.0
         resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
         assert resp.status_code == 200
+
+
+# ---- F4: queued state frames.
+
+
+@respx.mock
+async def test_stream_emits_started_and_no_queued_when_slot_free(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 5):
+        events = await consume_stream("model/alpha")
+
+    types = [e["type"] for e in events]
+    assert "queued" not in types
+    assert types[0] == "started"
+    assert types[-1] == "done"
+
+
+@respx.mock
+async def test_stream_emits_queued_before_started_when_saturated(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        # Hold the only slot by hand so the run must queue for it.
+        await c.app.state.upstream_semaphore.acquire()
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "queued"
+
+        # Free the slot; the run acquires it and announces started.
+        c.app.state.upstream_semaphore.release()
+        second = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert second["type"] == "started"
+
+        rest = [json.loads(f.removeprefix("data: ")) async for f in gen]
+        assert rest[-1]["type"] == "done"
