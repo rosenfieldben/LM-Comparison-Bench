@@ -61,10 +61,15 @@ CONNECT_TIMEOUT_S = 10.0
 # by any standard.
 STREAM_READ_TIMEOUT_S = 300.0
 
-# Non-streaming path, where the single read covers the entire
-# completion including all reasoning time, so it gets more headroom
-# than the between-chunk gap.
-COMPLETION_READ_TIMEOUT_S = 180.0
+# Non-streaming path. The single read covers the whole completion,
+# including all reasoning time, so it deserves at least the stream's
+# per-gap tolerance. At 180 it was lower than the stream's 300, so an
+# extended non-streaming run could fail at 181s where the streamed route
+# survived; raised to match. Extended non-streaming runs stay more
+# timeout-prone by nature: the stream resets its clock on every chunk and
+# can run far longer overall, while this is one uninterrupted read. The
+# browser always streams; /compare is the scripting path.
+COMPLETION_READ_TIMEOUT_S = 300.0
 
 # Streaming: connect fast, tolerate long silent gaps between chunks.
 STREAM_TIMEOUT = httpx.Timeout(

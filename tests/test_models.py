@@ -41,7 +41,7 @@ async def test_timeout_returns_error_dict(client):
     result = await run_model("hi", "deepseek/deepseek-chat", client)
 
     assert result["response_text"] is None
-    assert result["error"] == "no response within 180s"
+    assert result["error"] == "no response within 300s"
 
 
 @respx.mock
