@@ -152,7 +152,9 @@ def test_list_runs_groups_collapse_and_order_newest_first(db):
     lone_before = store.save_run(db, "ungrouped early", [make_result(model="a/one")])
     group_id = store.create_group(db)
     r1 = store.save_run(db, "grouped", [make_result(model="b/two")], group_id=group_id)
-    r2 = store.save_run(db, "grouped", [make_result(model="c/three")], group_id=group_id)
+    r2 = store.save_run(
+        db, "grouped", [make_result(model="c/three")], group_id=group_id
+    )
     lone_after = store.save_run(db, "ungrouped late", [make_result(model="d/four")])
 
     entries = store.list_runs(db)
@@ -177,7 +179,9 @@ def test_list_runs_limit_keeps_whole_groups(db):
     group_id = store.create_group(db)
     r1 = store.save_run(db, "grouped", [make_result(model="a/one")], group_id=group_id)
     lone = store.save_run(db, "lone", [make_result(model="b/two")])
-    r2 = store.save_run(db, "grouped", [make_result(model="c/three")], group_id=group_id)
+    r2 = store.save_run(
+        db, "grouped", [make_result(model="c/three")], group_id=group_id
+    )
 
     entries = store.list_runs(db, limit=2)
 

@@ -325,19 +325,25 @@ def stream_events(client, body):
     events = []
     for frame in frames[:-1]:
         data_lines = [l for l in frame.split("\n") if l.startswith("data:")]
-        assert len(data_lines) == 1, f"expected exactly one data line per frame: {frame!r}"
+        assert len(data_lines) == 1, (
+            f"expected exactly one data line per frame: {frame!r}"
+        )
         events.append(json.loads(data_lines[0][5:]))
     return events
 
 
 def alpha_stream():
-    return ChunkStream([
-        sse({"choices": [{"delta": {"content": "Hel"}}]}),
-        sse({"choices": [{"delta": {"content": "lo"}}]}),
-        sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
-        DONE_MARKER,
-    ])
+    return ChunkStream(
+        [
+            sse({"choices": [{"delta": {"content": "Hel"}}]}),
+            sse({"choices": [{"delta": {"content": "lo"}}]}),
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            ),
+            DONE_MARKER,
+        ]
+    )
 
 
 @respx.mock
@@ -466,9 +472,7 @@ async def test_client_disconnect_persists_partial_run(client):
         return_value=httpx.Response(200, stream=alpha_stream())
     )
 
-    resp = await compare_stream(
-        StreamCompareRequest(prompt="hi", model="model/alpha")
-    )
+    resp = await compare_stream(StreamCompareRequest(prompt="hi", model="model/alpha"))
     gen = resp.body_iterator
     first = await gen.__anext__()
     assert json.loads(first.removeprefix("data: "))["type"] == "delta"
@@ -722,13 +726,22 @@ def test_compare_persists_generation_id_and_finish_reason(client):
 
 
 def provenance_stream():
-    return ChunkStream([
-        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "Hel"}}]}),
-        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "lo"}}]}),
-        sse({"id": "gen-stream-1", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
-        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
-        DONE_MARKER,
-    ])
+    return ChunkStream(
+        [
+            sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "Hel"}}]}),
+            sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "lo"}}]}),
+            sse(
+                {
+                    "id": "gen-stream-1",
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                }
+            ),
+            sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            ),
+            DONE_MARKER,
+        ]
+    )
 
 
 @respx.mock
@@ -756,10 +769,12 @@ def test_stream_missing_provenance_persists_as_null(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                sse({"choices": [{"delta": {"content": "hi"}}]}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -789,9 +804,7 @@ def test_compare_persistence_failure_degrades_to_null_run_id(
     monkeypatch.setattr("bench.store.save_run", boom)
 
     with caplog.at_level(logging.ERROR, logger="bench.main"):
-        resp = client.post(
-            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
-        )
+        resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
 
     # The money is spent and the results exist: losing history must not
     # lose the response, exactly as on the streaming path.
@@ -827,8 +840,7 @@ def make_client(monkeypatch, tmp_path, max_upstream):
 async def consume_stream(model, prompt="hi"):
     resp = await compare_stream(StreamCompareRequest(prompt=prompt, model=model))
     return [
-        json.loads(chunk.removeprefix("data: "))
-        async for chunk in resp.body_iterator
+        json.loads(chunk.removeprefix("data: ")) async for chunk in resp.body_iterator
     ]
 
 
@@ -868,9 +880,7 @@ async def test_stream_upstream_concurrency_never_exceeds_cap(monkeypatch, tmp_pa
     )
 
     with make_client(monkeypatch, tmp_path, 2):
-        tasks = [
-            asyncio.create_task(consume_stream(f"model/m{i}")) for i in range(4)
-        ]
+        tasks = [asyncio.create_task(consume_stream(f"model/m{i}")) for i in range(4)]
         await settle(lambda: tracker["started"] == 2)
         # Extra loop turns: the two queued streams must stay queued
         # while both slots are occupied.
@@ -983,10 +993,12 @@ async def test_stream_queue_wait_is_not_reported_as_latency_or_ttft(
             return httpx.Response(200, stream=SlowStream())
         return httpx.Response(
             200,
-            stream=ChunkStream([
-                sse({"choices": [{"delta": {"content": "quick"}}]}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "quick"}}]}),
+                    DONE_MARKER,
+                ]
+            ),
         )
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
@@ -1128,9 +1140,7 @@ def test_compare_survives_resolve_links_failure(client, monkeypatch, caplog):
     monkeypatch.setattr("bench.main.resolve_links", boom)
 
     with caplog.at_level(logging.ERROR, logger="bench.main"):
-        resp = client.post(
-            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
-        )
+        resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
 
     # The invariant: after money is spent, no code path may convert
     # results into an error response.

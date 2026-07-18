@@ -171,9 +171,7 @@ def test_rapid_history_selections_last_click_wins(bench):
     start_run_via_ui(page, "beta entry")
     expect(cards(page)).to_have_count(2)
     for i in range(2):
-        expect(status_of(cards(page).nth(i))).to_have_text(
-            "done", timeout=DONE_TIMEOUT
-        )
+        expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
 
     page.get_by_test_id("history-toggle").click()
     page.get_by_test_id("history-row").filter(has_text="alpha entry").click()
@@ -196,9 +194,7 @@ def test_unpriced_results_count_in_session_spend(bench):
         check_chip(page, i)
     start_run_via_ui(page, "unpriced run")
     for i in range(2):
-        expect(status_of(cards(page).nth(i))).to_have_text(
-            "done", timeout=DONE_TIMEOUT
-        )
+        expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
 
     spend = page.get_by_test_id("stat-spend")
     expect(spend).to_contain_text("+ 1 unpriced")

@@ -204,9 +204,7 @@ async def lifespan(app: FastAPI):
     # flows alive; see keepalive_socket_options in models.py.
     app.state.client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {api_key}"},
-        transport=httpx.AsyncHTTPTransport(
-            socket_options=keepalive_socket_options()
-        ),
+        transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
     # One shared gate for every paid upstream call this process makes;
@@ -300,9 +298,8 @@ class LocalOnlyGuard:
         # here answers. GET and HEAD stay exempt as reads; DELETE needs
         # no gate because it is never a "simple" cross-site method, so
         # the preflight already guards it.
-        if (
-            scope["method"] == "POST"
-            and not headers.get("content-type", "").startswith("application/json")
+        if scope["method"] == "POST" and not headers.get("content-type", "").startswith(
+            "application/json"
         ):
             response = JSONResponse(
                 {"detail": "POST bodies must be application/json"},
@@ -509,9 +506,11 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                         "post-stream processing failed for /compare/stream"
                     )
                     run_id = None
-                yield "data: " + json.dumps(
-                    {"type": "done", "result": result, "run_id": run_id}
-                ) + "\n\n"
+                yield (
+                    "data: "
+                    + json.dumps({"type": "done", "result": result, "run_id": run_id})
+                    + "\n\n"
+                )
         finally:
             release_slot()
             # A client disconnect cancels this generator at a yield

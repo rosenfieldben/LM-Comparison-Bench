@@ -160,9 +160,7 @@ def save_prompt(conn: sqlite3.Connection, name: str, text: str) -> dict:
 
 
 def get_prompt(conn: sqlite3.Connection, prompt_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM prompts WHERE id = ?", (prompt_id,)
-    ).fetchone()
+    row = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
     return dict(row) if row else None
 
 
@@ -184,9 +182,7 @@ def create_group(conn: sqlite3.Connection) -> int:
 
 
 def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM groups WHERE id = ?", (group_id,)
-    ).fetchone()
+    row = conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone()
     return row is not None
 
 
@@ -343,9 +339,7 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
                     "created_at": group_created.get(key, runs_asc[0]["created_at"]),
                     "prompt_text": runs_asc[0]["prompt_text"],
                     "models": [
-                        m
-                        for r in runs_asc
-                        for m in models_by_run.get(r["id"], [])
+                        m for r in runs_asc for m in models_by_run.get(r["id"], [])
                     ],
                     "run_ids": [r["id"] for r in runs_asc],
                 }

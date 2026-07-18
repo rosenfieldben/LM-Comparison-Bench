@@ -19,20 +19,20 @@ AA_NORMAL = 4.5
 # buttons on bg-btn, chips on bg-chip, the active segment on bg-seg-on
 # and the Run button's text on the accent itself.
 PAIRINGS = [
-    ("--text",         ["--bg-page", "--bg-bar", "--bg-panel", "--bg-inset"]),
-    ("--text-strong",  ["--bg-bar", "--bg-panel", "--bg-btn"]),
-    ("--text-body",    ["--bg-page", "--bg-panel", "--bg-chip"]),
-    ("--text-sec",     ["--bg-page", "--bg-panel", "--bg-btn"]),
-    ("--text-dim",     ["--bg-page", "--bg-bar", "--bg-panel", "--bg-chip"]),
-    ("--text-faint",   ["--bg-page", "--bg-bar", "--bg-panel"]),
+    ("--text", ["--bg-page", "--bg-bar", "--bg-panel", "--bg-inset"]),
+    ("--text-strong", ["--bg-bar", "--bg-panel", "--bg-btn"]),
+    ("--text-body", ["--bg-page", "--bg-panel", "--bg-chip"]),
+    ("--text-sec", ["--bg-page", "--bg-panel", "--bg-btn"]),
+    ("--text-dim", ["--bg-page", "--bg-bar", "--bg-panel", "--bg-chip"]),
+    ("--text-faint", ["--bg-page", "--bg-bar", "--bg-panel"]),
     ("--accent-label", ["--bg-panel"]),
-    ("--accent-val",   ["--bg-panel"]),
-    ("--done-label",   ["--bg-panel"]),
-    ("--err",          ["--bg-panel"]),
-    ("--warn",         ["--bg-panel"]),
-    ("--hist-count",   ["--bg-page", "--bg-panel"]),
-    ("--seg-fg",       ["--bg-seg-on"]),
-    ("--run-fg",       ["--accent"]),
+    ("--accent-val", ["--bg-panel"]),
+    ("--done-label", ["--bg-panel"]),
+    ("--err", ["--bg-panel"]),
+    ("--warn", ["--bg-panel"]),
+    ("--hist-count", ["--bg-page", "--bg-panel"]),
+    ("--seg-fg", ["--bg-seg-on"]),
+    ("--run-fg", ["--accent"]),
 ]
 
 # Text sitting on a translucent tint: the effective background is the
@@ -79,9 +79,7 @@ def relative_luminance(rgb):
         return ((channel + 0.055) / 1.055) ** 2.4
 
     r, g, b = rgb[:3]
-    return (
-        0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
-    )
+    return 0.2126 * linearize(r) + 0.7152 * linearize(g) + 0.0722 * linearize(b)
 
 
 def contrast(fg, bg):

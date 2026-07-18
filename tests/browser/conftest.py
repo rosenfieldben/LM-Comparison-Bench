@@ -61,12 +61,14 @@ def stub_url():
 def bench_url(stub_url, tmp_path_factory):
     port = free_port()
     env = os.environ.copy()
-    env.update({
-        "OPENROUTER_API_KEY": "test-key",
-        "BENCH_DB": str(tmp_path_factory.mktemp("browser-db") / "bench.db"),
-        "OPENROUTER_URL": stub_url + "/api/v1/chat/completions",
-        "MODELS_URL": stub_url + "/api/v1/models",
-    })
+    env.update(
+        {
+            "OPENROUTER_API_KEY": "test-key",
+            "BENCH_DB": str(tmp_path_factory.mktemp("browser-db") / "bench.db"),
+            "OPENROUTER_URL": stub_url + "/api/v1/chat/completions",
+            "MODELS_URL": stub_url + "/api/v1/models",
+        }
+    )
     log_path = tmp_path_factory.mktemp("browser-logs") / "uvicorn.log"
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(
@@ -114,8 +116,7 @@ def bench(page, bench_url):
         # Seeded exactly as the app stores it, a raw JSON array of ids;
         # this is also the pre-VOLT format, which must keep loading.
         page.add_init_script(
-            "localStorage.setItem('bench-lineup', %s)"
-            % json.dumps(json.dumps(lineup))
+            "localStorage.setItem('bench-lineup', %s)" % json.dumps(json.dumps(lineup))
         )
         page.goto(bench_url)
         return page

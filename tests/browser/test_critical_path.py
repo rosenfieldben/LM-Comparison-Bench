@@ -119,9 +119,7 @@ def test_04_extended_budget_sends_65536_and_clamps_capped(bench, stub_url):
     page.get_by_test_id("budget-extended").click()
     start_run(page, "budget probe")
     for i in range(2):
-        expect(status_of(cards(page).nth(i))).to_have_text(
-            "done", timeout=DONE_TIMEOUT
-        )
+        expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
 
     # The budget assertion belongs at the stub: what was actually sent,
     # not what the UI believes it selected.
@@ -198,9 +196,7 @@ def test_07_html_output_renders_inert_everywhere(bench):
     check_all_chips(page)
     start_run(page, "injection probe")
     for i in range(2):
-        expect(status_of(cards(page).nth(i))).to_have_text(
-            "done", timeout=DONE_TIMEOUT
-        )
+        expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
 
     html_card = cards(page).nth(0)
     body = html_card.get_by_test_id("card-body")

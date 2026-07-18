@@ -43,6 +43,7 @@ def as_metric(value):
         return float(value)
     return None
 
+
 # Env-overridable as a test seam so the browser harness can point the
 # real app at a stub upstream; not a configuration feature.
 OPENROUTER_URL = os.environ.get(
@@ -125,9 +126,7 @@ def keepalive_socket_options() -> list[tuple[int, int, int]]:
     elif hasattr(socket, "TCP_KEEPALIVE"):
         options.append((socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, KEEPALIVE_IDLE_S))
     if hasattr(socket, "TCP_KEEPINTVL"):
-        options.append(
-            (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_S)
-        )
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, KEEPALIVE_INTERVAL_S))
     return options
 
 
@@ -176,9 +175,7 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict:
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
         top = entry.get("top_provider")
-        if isinstance(top, dict) and isinstance(
-            top.get("max_completion_tokens"), int
-        ):
+        if isinstance(top, dict) and isinstance(top.get("max_completion_tokens"), int):
             model["max_completion_tokens"] = top["max_completion_tokens"]
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
@@ -425,9 +422,7 @@ async def stream_model(
 
                 usage = chunk.get("usage")
                 if isinstance(usage, dict):
-                    result["prompt_tokens"] = as_token_count(
-                        usage.get("prompt_tokens")
-                    )
+                    result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
                     result["completion_tokens"] = as_token_count(
                         usage.get("completion_tokens")
                     )
@@ -475,4 +470,3 @@ async def stream_model(
         return
 
     yield done(None)
-
