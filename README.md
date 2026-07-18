@@ -65,6 +65,13 @@ estimates, the same catalog-price times reported-token figures the
 cards show, so unpriced results (offline catalog, missing usage) do
 not count against it. It resets when the process restarts.
 
+The interface serves entirely from the bench: the fonts are vendored
+under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
+SIL Open Font License in `static/fonts/OFL.txt`) rather than fetched
+from a CDN, so the page makes no external request. The offline story
+is complete: only the model calls reach the network, through
+OpenRouter.
+
 ## Interface
 
 The page is styled as a race-telemetry instrument (the "VOLT"

@@ -21,10 +21,26 @@
     } catch (err) { /* storage blocked: defaults apply */ }
   })();
 </script>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
+  /* Self-hosted so the bench needs no network at all: these are the
+     latin-subset variable fonts Google Fonts served, vendored under
+     static/fonts with their OFL license. swap keeps text visible on the
+     fallback stack while the woff2 loads. */
+  @font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 400 700;
+    font-display: swap;
+    src: url("/static/fonts/jetbrains-mono-latin.woff2") format("woff2");
+  }
+  @font-face {
+    font-family: "Space Grotesk";
+    font-style: normal;
+    font-weight: 600 700;
+    font-display: swap;
+    src: url("/static/fonts/space-grotesk-latin.woff2") format("woff2");
+  }
+
   /* ==== VOLT design tokens ===============================================
      Every rule below reads from these custom properties, so the next
      visual change is a token edit, not a hunt through selectors. Dark is

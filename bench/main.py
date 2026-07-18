@@ -14,6 +14,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -323,7 +324,14 @@ class LocalOnlyGuard:
 
 app.add_middleware(LocalOnlyGuard)
 
-INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+INDEX_HTML = STATIC_DIR / "index.html"
+
+# Serve the static assets (vendored fonts now; the split-out stylesheet
+# and scripts later) from one mount. LocalOnlyGuard wraps the whole app
+# and GET is exempt from the JSON-POST rule, so the security posture is
+# unchanged: these are read-only assets on a localhost-only server.
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Hand-written bolt in the VOLT accent, sized to stay legible at 16px.
 # Served inline because browsers request /favicon.ico unprompted and

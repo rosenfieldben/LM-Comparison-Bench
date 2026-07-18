@@ -104,14 +104,13 @@ def browser_type_launch_args(browser_type_launch_args):
 
 @pytest.fixture
 def bench(page, bench_url):
-    """A page factory bound to the bench: seeds a lineup, blocks the
-    external font fetch (hermetic and faster), and navigates."""
+    """A page factory bound to the bench: seeds a lineup and navigates.
+
+    The fonts are self-hosted now, so nothing external is fetched and no
+    blocking route is needed to keep the harness hermetic.
+    """
 
     def open_bench(lineup):
-        page.route(
-            lambda url: "fonts.googleapis.com" in url or "fonts.gstatic.com" in url,
-            lambda route: route.abort(),
-        )
         # Seeded exactly as the app stores it, a raw JSON array of ids;
         # this is also the pre-VOLT format, which must keep loading.
         page.add_init_script(
