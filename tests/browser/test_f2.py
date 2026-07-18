@@ -414,3 +414,47 @@ def test_review_repro_stopped_run_persists_as_aborted_in_history(bench):
         "partial text", timeout=DONE_TIMEOUT
     )
     expect(replayed.get_by_test_id("card-error")).to_contain_text("aborted")
+
+
+def test_review_repro_stop_during_group_creation_halts_run(bench):
+    """Closing review (finding 1): Stop is enabled the instant Run is
+    clicked (the batch reservation), but during the /groups POST no
+    per-model controller exists yet. A Stop in that window must still halt
+    the run, not let it stream to completion once /groups resolves."""
+    page = bench(["stub/stall0"])
+    held = []
+
+    def hold_groups(route):
+        if route.request.method == "POST":
+            held.append(route)
+        else:
+            route.continue_()
+
+    page.route("**/groups", hold_groups)
+    check_chip(page, 0)
+    # Fill the prompt so Run re-enables on a clean drain (not the
+    # empty-prompt guard) once the batch settles.
+    page.get_by_test_id("prompt-input").fill("f2 stop during groups")
+    # startRun creates the cards, then awaits the held /groups POST.
+    page.evaluate("() => { startRun(); }")
+    expect(page.get_by_test_id("stop-button")).to_be_enabled()
+    page.get_by_test_id("stop-button").click()
+
+    # Release the held /groups so startRun leaves the await (pre-fix, the
+    # run would then stream; post-fix it is already aborted).
+    for _ in range(100):
+        if held:
+            break
+        page.wait_for_timeout(20)
+    assert held, "/groups POST was not intercepted"
+    try:
+        held[0].continue_()
+    except Exception:
+        pass  # the Stop aborted this request; fine
+
+    card = cards(page).first
+    # Halted: stopped state, and it never reached the stub, so no text.
+    expect(status_of(card)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("card-body")).to_have_text("")
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()

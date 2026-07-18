@@ -110,6 +110,11 @@ let epochControllers = [];
 // Runs and reruns in flight for the current epoch; the Run button
 // stays disabled while any of them is live.
 let inflightRuns = 0;
+// The epoch a Stop targeted. Stop can land while startRun is still
+// awaiting the group POST, before any per-model controller exists; a run
+// that starts up afterward sees this mark and begins already aborted, so
+// a Stop in that window halts the batch instead of being silently lost.
+let stoppedEpoch = -1;
 
 function newViewEpoch() {
   viewEpoch += 1;
@@ -1217,6 +1222,10 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
   const current = () => epoch === viewEpoch;
   const controller = new AbortController();
   epochControllers.push(controller);
+  // A Stop that landed during startup (before this controller existed)
+  // marked the epoch: begin already aborted so the run halts as stopped
+  // rather than streaming to completion once its slot opens.
+  if (epoch === stoppedEpoch) controller.abort();
   inflightRuns += 1;
   updateRunState();
   ui.body.classList.add("loading");
@@ -1442,6 +1451,11 @@ async function startRun() {
   // than blocking: grouping is bookkeeping, the comparison is the
   // product.
   let groupId = null;
+  // The group POST joins the epoch's controllers so Stop can abort it
+  // too: a Stop during this await then leaves the batch ungrouped and,
+  // via stoppedEpoch, halts every model that was about to start.
+  const groupController = new AbortController();
+  epochControllers.push(groupController);
   try {
     // The empty JSON body is load-bearing: the server requires
     // application/json on every POST so hostile cross-site senders
@@ -1450,10 +1464,11 @@ async function startRun() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}",
+      signal: groupController.signal,
     });
     if (resp.ok) groupId = (await resp.json()).id;
   } catch (err) {
-    // Deliberately swallowed; see above.
+    // Deliberately swallowed, a Stop abort included; see above.
   }
   try {
     await Promise.allSettled(
@@ -1483,6 +1498,10 @@ runBtn.addEventListener("click", startRun);
 // through its existing disconnect path and a queued run not at all,
 // exactly as the cards show.
 function stopRuns() {
+  // Mark the epoch stopped before aborting, so a per-model run still
+  // starting up (its controller not yet in the list because startRun is
+  // mid group-POST) begins already aborted rather than streaming on.
+  stoppedEpoch = viewEpoch;
   for (const c of epochControllers) c.abort();
 }
 stopBtn.addEventListener("click", stopRuns);
