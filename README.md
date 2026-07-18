@@ -84,8 +84,13 @@ updating as text). Both persist in this browser's localStorage, as
 does `prefers-reduced-motion`, which disables animation regardless
 of the toggle. All colors, spacing steps, radii and type sizes live
 as CSS custom properties in one `:root` block at the top of
-`static/index.html`, so the next visual change is a token edit, not
-a hunt through rules.
+`static/volt.css`, so the next visual change is a token edit, not
+a hunt through rules. The front end is three static files with no
+build step: `static/index.html` (markup plus a pre-paint theme
+script, the stylesheet link, and two script tags), `static/lib.js`
+(the pure, DOM-free helpers, including the diff engine), and
+`static/app.js` (everything that touches the document). All three are
+served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
 run count, estimated spend (with a count of unpriced results when any
@@ -225,7 +230,7 @@ Open http://localhost:8000 in a browser. Type a prompt, check the
 models to compare, hit Run. Each column fills in as its model
 responds. The lineup is managed with the picker (see Daily use); the
 four-model default seed for a fresh browser is `DEFAULT_LINEUP` at
-the top of the script block in `static/index.html`.
+the top of `static/app.js`.
 
 Or hit the API directly:
 
@@ -322,16 +327,21 @@ the runtime pins too. There are two suites:
 # browser suite: one-time setup, then the every-merge gate
 .venv/bin/playwright install chromium
 .venv/bin/pytest -m browser
+
+# pure frontend helpers: no build step, no npm install
+node --test "tests/js/**/*.test.js"
 ```
 
-No network access needed for either; unit tests mock OpenRouter with
-respx, and the browser suite boots the real app under uvicorn in
+No network access needed for any of them; unit tests mock OpenRouter
+with respx, the browser suite boots the real app under uvicorn in
 headless Chromium against a stub OpenRouter it starts itself
-(`tests/browser/`). Browser tests are deselected from a plain
-`pytest` run on purpose. CI enforces both: the unit job runs on
-Python 3.11 and 3.12, and a separate browser job runs the
-critical-path suite, so a frontend change cannot merge without
-proving the critical path still works.
+(`tests/browser/`), and the node suite requires `static/lib.js`
+directly through its CommonJS guard to check the diff engine and the
+formatting helpers. Browser tests are deselected from a plain
+`pytest` run on purpose. CI enforces all of it: a lint job (ruff and
+mypy), the unit matrix across Python 3.11 through 3.14, the node
+job, and the browser job, so neither a backend nor a frontend change
+can merge without proving the critical path still works.
 
 The stability contract for future frontend work: the harness selects
 elements by `data-testid` attributes (and user-visible text), never

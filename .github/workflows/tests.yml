@@ -39,6 +39,18 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: pytest
 
+  # Pure-function frontend tests. static/lib.js is DOM-free and has a
+  # CommonJS guard, so node requires it directly: no build step, no npm
+  # install, no dependencies.
+  js:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22"
+      - run: node --test "tests/js/**/*.test.js"
+
   # The every-merge gate for the frontend: the critical-path suite in
   # tests/browser drives the real app in headless Chromium against a
   # stub upstream, so a frontend change must prove the critical path
