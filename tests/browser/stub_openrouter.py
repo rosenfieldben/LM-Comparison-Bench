@@ -77,10 +77,12 @@ def build_app() -> Starlette:
             if delay:
                 await asyncio.sleep(delay)
             for i, chunk in enumerate(deltas):
-                yield sse({
-                    "id": f"gen-stub-{gen_suffix}",
-                    "choices": [{"delta": {"content": chunk}}],
-                })
+                yield sse(
+                    {
+                        "id": f"gen-stub-{gen_suffix}",
+                        "choices": [{"delta": {"content": chunk}}],
+                    }
+                )
                 await asyncio.sleep(0.02)
             yield sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
             yield sse({"choices": [], "usage": USAGE})
@@ -119,7 +121,9 @@ def build_app() -> Starlette:
 
             async def gen():
                 await asyncio.sleep(0.05)
-                yield sse({"choices": [{"delta": {}, "finish_reason": "content_filter"}]})
+                yield sse(
+                    {"choices": [{"delta": {}, "finish_reason": "content_filter"}]}
+                )
                 yield sse({"choices": [], "usage": USAGE})
                 yield b"data: [DONE]\n\n"
 
@@ -128,10 +132,12 @@ def build_app() -> Starlette:
 
             async def gen():
                 for chunk in HTML_DELTAS:
-                    yield sse({
-                        "id": "gen-stub-html",
-                        "choices": [{"delta": {"content": chunk}}],
-                    })
+                    yield sse(
+                        {
+                            "id": "gen-stub-html",
+                            "choices": [{"delta": {"content": chunk}}],
+                        }
+                    )
                     await asyncio.sleep(0.02)
                 yield sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
                 yield sse({"choices": [], "usage": USAGE})
@@ -146,23 +152,31 @@ def build_app() -> Starlette:
             state["flaky_failed"] = True
             return JSONResponse({"error": "stub flaky failure"}, status_code=502)
         if model == "stub/null":
-            return JSONResponse({
-                "id": "gen-stub-null",
-                "choices": [{
-                    "message": {"role": "assistant", "content": None},
-                    "finish_reason": "content_filter",
-                }],
-                "usage": USAGE,
-            })
+            return JSONResponse(
+                {
+                    "id": "gen-stub-null",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": None},
+                            "finish_reason": "content_filter",
+                        }
+                    ],
+                    "usage": USAGE,
+                }
+            )
         text = "".join(HTML_DELTAS) if model == "stub/html" else reply_text(model)
-        return JSONResponse({
-            "id": f"gen-stub-{model.split('/')[-1]}",
-            "choices": [{
-                "message": {"role": "assistant", "content": text},
-                "finish_reason": "stop",
-            }],
-            "usage": USAGE,
-        })
+        return JSONResponse(
+            {
+                "id": f"gen-stub-{model.split('/')[-1]}",
+                "choices": [
+                    {
+                        "message": {"role": "assistant", "content": text},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": USAGE,
+            }
+        )
 
     async def completions(request):
         payload = await request.json()
@@ -177,8 +191,10 @@ def build_app() -> Starlette:
     async def recorded_requests(request):
         return JSONResponse({"requests": state["requests"]})
 
-    return Starlette(routes=[
-        Route("/api/v1/models", models),
-        Route("/api/v1/chat/completions", completions, methods=["POST"]),
-        Route("/_test/requests", recorded_requests),
-    ])
+    return Starlette(
+        routes=[
+            Route("/api/v1/models", models),
+            Route("/api/v1/chat/completions", completions, methods=["POST"]),
+            Route("/_test/requests", recorded_requests),
+        ]
+    )

@@ -22,7 +22,9 @@ async def client():
 async def test_happy_path_parses_text_and_tokens(client):
     respx.post(OPENROUTER_URL).respond(json=FIXTURE)
 
-    result = await run_model("Say hello in five words.", "deepseek/deepseek-chat", client)
+    result = await run_model(
+        "Say hello in five words.", "deepseek/deepseek-chat", client
+    )
 
     assert result["error"] is None
     assert result["model"] == "deepseek/deepseek-chat"
@@ -140,9 +142,15 @@ async def test_catalog_price_map_skips_malformed_entries(client):
     respx.get(MODELS_URL).respond(
         json={
             "data": [
-                {"id": "a/one", "pricing": {"prompt": "0.000001", "completion": "0.000002"}},
+                {
+                    "id": "a/one",
+                    "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                },
                 {"id": "b/broken", "pricing": {}},
-                {"id": "c/nonnumeric", "pricing": {"prompt": "free", "completion": "0"}},
+                {
+                    "id": "c/nonnumeric",
+                    "pricing": {"prompt": "free", "completion": "0"},
+                },
             ]
         }
     )
@@ -177,16 +185,23 @@ async def test_stream_accumulates_deltas_and_parses_usage(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                sse({"choices": [{"delta": {"role": "assistant"}}]}),
-                delta_chunk("Hel"),
-                delta_chunk("lo"),
-                # Content-parts delta: must flatten via the shared rule.
-                delta_chunk([{"type": "text", "text": " world"}]),
-                sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-                sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"role": "assistant"}}]}),
+                    delta_chunk("Hel"),
+                    delta_chunk("lo"),
+                    # Content-parts delta: must flatten via the shared rule.
+                    delta_chunk([{"type": "text", "text": " world"}]),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 13, "completion_tokens": 8},
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -269,10 +284,12 @@ async def test_stream_malformed_chunk_yields_error_with_partial_text(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                delta_chunk("Hel"),
-                b"data: {not json\n\n",
-            ]),
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hel"),
+                    b"data: {not json\n\n",
+                ]
+            ),
         )
     )
 
@@ -301,12 +318,14 @@ async def test_stream_null_text_content_part_does_not_raise(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                delta_chunk("Hi "),
-                delta_chunk([{"type": "text", "text": None}]),
-                delta_chunk([{"type": "text", "text": "there"}]),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hi "),
+                    delta_chunk([{"type": "text", "text": None}]),
+                    delta_chunk([{"type": "text", "text": "there"}]),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -323,11 +342,13 @@ async def test_stream_error_frame_surfaces_upstream_message(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                delta_chunk("Hel"),
-                sse({"error": {"code": 502, "message": "upstream model crashed"}}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hel"),
+                    sse({"error": {"code": 502, "message": "upstream model crashed"}}),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -355,9 +376,6 @@ async def test_stream_error_frame_with_code_only(client):
     assert result["ttft_ms"] is None
 
 
-from bench.models import fetch_catalog
-
-
 @respx.mock
 async def test_fetch_catalog_degrades_missing_fields_to_none(client):
     respx.get(MODELS_URL).respond(
@@ -371,7 +389,11 @@ async def test_fetch_catalog_degrades_missing_fields_to_none(client):
                     "top_provider": {"max_completion_tokens": 32000},
                 },
                 {"id": "b/bare"},
-                {"id": "c/badprice", "name": "Bad Price", "pricing": {"prompt": "free"}},
+                {
+                    "id": "c/badprice",
+                    "name": "Bad Price",
+                    "pricing": {"prompt": "free"},
+                },
                 {"id": "d/badcap", "top_provider": {"max_completion_tokens": "lots"}},
                 {"no_id": True},
             ]
@@ -436,9 +458,7 @@ async def test_stream_model_defaults_to_standard_budget(client):
 
     def route(request: httpx.Request) -> httpx.Response:
         seen.update(json.loads(request.content))
-        return httpx.Response(
-            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
-        )
+        return httpx.Response(200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER]))
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
@@ -487,9 +507,7 @@ def test_keepalive_options_enable_probes_for_this_platform():
         for name in ("TCP_KEEPIDLE", "TCP_KEEPALIVE")
         if hasattr(socket, name)
     }
-    idle_opts = [
-        o for o in opts if o[0] == socket.IPPROTO_TCP and o[1] in idle_consts
-    ]
+    idle_opts = [o for o in opts if o[0] == socket.IPPROTO_TCP and o[1] in idle_consts]
     assert len(idle_opts) == 1
     assert idle_opts[0][2] == KEEPALIVE_IDLE_S
 
@@ -524,9 +542,7 @@ async def test_stream_model_sends_provider_prefs(client):
 
     def route(request: httpx.Request) -> httpx.Response:
         seen.update(json.loads(request.content))
-        return httpx.Response(
-            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
-        )
+        return httpx.Response(200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER]))
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
@@ -560,9 +576,7 @@ async def test_stream_model_uses_stream_read_timeout(client):
 
     def route(request: httpx.Request) -> httpx.Response:
         seen.update(request.extensions["timeout"])
-        return httpx.Response(
-            200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
-        )
+        return httpx.Response(200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER]))
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
@@ -619,15 +633,24 @@ async def test_stream_takes_first_generation_id_and_final_finish_reason(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                # First chunk carries no id: the field must wait for one
-                # rather than lock in None.
-                sse({"choices": [{"delta": {"role": "assistant"}}]}),
-                sse({"id": "gen-first", "choices": [{"delta": {"content": "Hel"}}]}),
-                sse({"id": "gen-later", "choices": [{"delta": {"content": "lo"}}]}),
-                sse({"id": "gen-later", "choices": [{"delta": {}, "finish_reason": "length"}]}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    # First chunk carries no id: the field must wait for one
+                    # rather than lock in None.
+                    sse({"choices": [{"delta": {"role": "assistant"}}]}),
+                    sse(
+                        {"id": "gen-first", "choices": [{"delta": {"content": "Hel"}}]}
+                    ),
+                    sse({"id": "gen-later", "choices": [{"delta": {"content": "lo"}}]}),
+                    sse(
+                        {
+                            "id": "gen-later",
+                            "choices": [{"delta": {}, "finish_reason": "length"}],
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -693,11 +716,18 @@ async def test_stream_model_normalizes_junk_token_counts(client, junk):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                delta_chunk("hi"),
-                sse({"choices": [], "usage": {"prompt_tokens": junk, "completion_tokens": junk}}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    delta_chunk("hi"),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": junk, "completion_tokens": junk},
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 

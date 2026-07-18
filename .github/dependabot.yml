@@ -1,0 +1,13 @@
+# Weekly dependency PRs. Dependabot understands the SHA-pinned actions
+# in tests.yml and keeps the pin-plus-version-comment format, so the CI
+# hardening survives its updates.
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

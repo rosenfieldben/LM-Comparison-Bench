@@ -25,7 +25,7 @@ the picker falls back to adding models by exact id.
 
 ## Setup
 
-Requires Python 3.11 or newer; CI runs the suite on 3.11 and 3.12.
+Requires Python 3.11 or newer; CI runs the suite on 3.11 through 3.14.
 
 ```sh
 python3 -m venv .venv
@@ -55,6 +55,23 @@ price (offline catalog, missing usage, errors after tokens flowed)
 are counted next to the session total as "unpriced" rather than
 silently dropped.
 
+Set `BENCH_SPEND_LIMIT_USD` (a float, unset means no limit) to cap
+estimated spend for the life of the process. Once accumulated
+estimated spend reaches the ceiling, `/compare` and `/compare/stream`
+refuse new runs with HTTP 402 and a message naming both figures,
+checked at entry before any upstream call so a refusal costs nothing;
+runs already in flight are never interrupted. The ceiling tracks
+estimates, the same catalog-price times reported-token figures the
+cards show, so unpriced results (offline catalog, missing usage) do
+not count against it. It resets when the process restarts.
+
+The interface serves entirely from the bench: the fonts are vendored
+under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
+SIL Open Font License in `static/fonts/OFL.txt`) rather than fetched
+from a CDN, so the page makes no external request. The offline story
+is complete: only the model calls reach the network, through
+OpenRouter.
+
 ## Interface
 
 The page is styled as a race-telemetry instrument (the "VOLT"
@@ -67,8 +84,13 @@ updating as text). Both persist in this browser's localStorage, as
 does `prefers-reduced-motion`, which disables animation regardless
 of the toggle. All colors, spacing steps, radii and type sizes live
 as CSS custom properties in one `:root` block at the top of
-`static/index.html`, so the next visual change is a token edit, not
-a hunt through rules.
+`static/volt.css`, so the next visual change is a token edit, not
+a hunt through rules. The front end is three static files with no
+build step: `static/index.html` (markup plus a pre-paint theme
+script, the stylesheet link, and two script tags), `static/lib.js`
+(the pure, DOM-free helpers, including the diff engine), and
+`static/app.js` (everything that touches the document). All three are
+served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
 run count, estimated spend (with a count of unpriced results when any
@@ -99,6 +121,10 @@ a text label: thinking, done, or error. A running card counts
 seconds in its header ("thinking · 47s", one shared timer for all
 cards) so the long silences of extended-budget reasoning read as
 alive rather than hung; the counter disappears at the first token.
+At most five models call upstream at once (see Reliability); a model
+still waiting for a slot reads "queued" rather than "thinking", and
+flips to "thinking" with its timer reset the instant a slot frees, so
+the queue wait never inflates its time to first token.
 A four-cell metrics strip (ttft, total, tok i/o, cost) fills in as
 values resolve, with em dashes for unknowns. Finished cards with
 text gain per-card controls in a bottom action row: copy (raw
@@ -204,7 +230,7 @@ Open http://localhost:8000 in a browser. Type a prompt, check the
 models to compare, hit Run. Each column fills in as its model
 responds. The lineup is managed with the picker (see Daily use); the
 four-model default seed for a fresh browser is `DEFAULT_LINEUP` at
-the top of the script block in `static/index.html`.
+the top of `static/app.js`.
 
 Or hit the API directly:
 
@@ -301,16 +327,21 @@ the runtime pins too. There are two suites:
 # browser suite: one-time setup, then the every-merge gate
 .venv/bin/playwright install chromium
 .venv/bin/pytest -m browser
+
+# pure frontend helpers: no build step, no npm install
+node --test "tests/js/**/*.test.js"
 ```
 
-No network access needed for either; unit tests mock OpenRouter with
-respx, and the browser suite boots the real app under uvicorn in
+No network access needed for any of them; unit tests mock OpenRouter
+with respx, the browser suite boots the real app under uvicorn in
 headless Chromium against a stub OpenRouter it starts itself
-(`tests/browser/`). Browser tests are deselected from a plain
-`pytest` run on purpose. CI enforces both: the unit job runs on
-Python 3.11 and 3.12, and a separate browser job runs the
-critical-path suite, so a frontend change cannot merge without
-proving the critical path still works.
+(`tests/browser/`), and the node suite requires `static/lib.js`
+directly through its CommonJS guard to check the diff engine and the
+formatting helpers. Browser tests are deselected from a plain
+`pytest` run on purpose. CI enforces all of it: a lint job (ruff and
+mypy), the unit matrix across Python 3.11 through 3.14, the node
+job, and the browser job, so neither a backend nor a frontend change
+can merge without proving the critical path still works.
 
 The stability contract for future frontend work: the harness selects
 elements by `data-testid` attributes (and user-visible text), never
@@ -388,6 +419,13 @@ picked up without restarts, and verify by eyeball after UI changes:
   shows a visible focus ring.
 - Theme: flip the OS color scheme; the page follows without a
   reload, and both themes keep the state labels readable.
+- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set to a
+  tiny value, run until the session estimate crosses it, then run
+  again: the columns error with the ceiling message spelled out in
+  words, and no new upstream call is made.
+- Queued state: run six or more models at once; the sixth card reads
+  "queued" while five are in flight, then flips to "thinking" when a
+  slot frees, and its counter restarts so its ttft excludes the wait.
 
 ## License
 

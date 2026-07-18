@@ -6,15 +6,18 @@ import logging
 import os
 import sqlite3
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import httpx
 from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from bench import store
 from bench.models import (
@@ -187,7 +190,7 @@ class GroupDetail(BaseModel):
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
     # would otherwise report every model as errored and look like an outage.
     api_key = os.environ.get("OPENROUTER_API_KEY")
@@ -204,14 +207,21 @@ async def lifespan(app: FastAPI):
     # flows alive; see keepalive_socket_options in models.py.
     app.state.client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {api_key}"},
-        transport=httpx.AsyncHTTPTransport(
-            socket_options=keepalive_socket_options()
-        ),
+        transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
     )
     app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+    # Per-boot spend ceiling. Unset means no limit. The figure tracked is
+    # estimated spend (catalog prices times reported tokens), the same
+    # numbers the cards show, accumulated as a plain float: one event
+    # loop makes that safe without a lock. Results the session cannot
+    # price (offline catalog, missing usage) never move the counter, so
+    # the ceiling bounds known estimated spend, not a billed total.
+    raw_limit = os.environ.get("BENCH_SPEND_LIMIT_USD")
+    app.state.spend_limit_usd = float(raw_limit) if raw_limit else None
+    app.state.accumulated_spend_usd = 0.0
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -275,10 +285,10 @@ class LocalOnlyGuard:
     with disconnect propagation.
     """
 
-    def __init__(self, app):
+    def __init__(self, app: ASGIApp) -> None:
         self.app = app
 
-    async def __call__(self, scope, receive, send):
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
@@ -300,9 +310,8 @@ class LocalOnlyGuard:
         # here answers. GET and HEAD stay exempt as reads; DELETE needs
         # no gate because it is never a "simple" cross-site method, so
         # the preflight already guards it.
-        if (
-            scope["method"] == "POST"
-            and not headers.get("content-type", "").startswith("application/json")
+        if scope["method"] == "POST" and not headers.get("content-type", "").startswith(
+            "application/json"
         ):
             response = JSONResponse(
                 {"detail": "POST bodies must be application/json"},
@@ -315,7 +324,14 @@ class LocalOnlyGuard:
 
 app.add_middleware(LocalOnlyGuard)
 
-INDEX_HTML = Path(__file__).resolve().parent.parent / "static" / "index.html"
+STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
+INDEX_HTML = STATIC_DIR / "index.html"
+
+# Serve the static assets (vendored fonts now; the split-out stylesheet
+# and scripts later) from one mount. LocalOnlyGuard wraps the whole app
+# and GET is exempt from the JSON-POST rule, so the security posture is
+# unchanged: these are read-only assets on a localhost-only server.
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 # Hand-written bolt in the VOLT accent, sized to stay legible at 16px.
 # Served inline because browsers request /favicon.ico unprompted and
@@ -342,7 +358,7 @@ async def favicon() -> Response:
     )
 
 
-def cost_usd(result: dict, prices: dict) -> float | None:
+def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     """Cost of one result, or None when tokens or pricing are unknown.
 
     isinstance rather than a None check: a provider reporting token
@@ -356,10 +372,54 @@ def cost_usd(result: dict, prices: dict) -> float | None:
         or not isinstance(result["completion_tokens"], (int, float))
     ):
         return None
-    return (
+    total = (
         result["prompt_tokens"] * price["prompt"]
         + result["completion_tokens"] * price["completion"]
     )
+    return float(total)
+
+
+def format_usd(value: float) -> str:
+    """A dollar figure that stays truthful at the ceiling's native scale.
+
+    Priced runs here cost fractions of a cent, so the cards' four decimals
+    collapse a real sub-cent limit to $0.0000 and the 402 would misreport
+    the operator's own ceiling as zero. Six decimals cover that domain;
+    trailing zeros past the cents place are trimmed so dollar-scale limits
+    still read as $1.50, not $1.500000.
+    """
+    whole, frac = f"{value:.6f}".split(".")
+    frac = frac[:2] + frac[2:].rstrip("0")
+    return f"${whole}.{frac}"
+
+
+def enforce_spend_limit() -> None:
+    """Refuse a run at the boundary once estimated spend hits the ceiling.
+
+    Checked at endpoint entry, before the semaphore and before any
+    upstream call, so a refusal costs nothing. Money already in flight
+    is never interrupted. The 402 names both figures so the operator
+    knows how far over the intent they are.
+    """
+    limit = app.state.spend_limit_usd
+    if limit is not None and app.state.accumulated_spend_usd >= limit:
+        raise HTTPException(
+            402,
+            "spend ceiling reached: estimated "
+            f"{format_usd(app.state.accumulated_spend_usd)} of "
+            f"{format_usd(limit)} limit "
+            "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
+        )
+
+
+def record_spend(cost: float | None) -> None:
+    """Add a priced result's estimate to the accumulated spend.
+
+    None means the result could not be priced (offline catalog, missing
+    usage), and those never count against the ceiling by design.
+    """
+    if cost is not None:
+        app.state.accumulated_spend_usd += cost
 
 
 def effective_budget(budget: str, model: str) -> int:
@@ -374,7 +434,9 @@ def effective_budget(budget: str, model: str) -> int:
     return min(requested, limit) if limit is not None else requested
 
 
-def resolve_links(db, prompt_id: int | None, group_id: int | None):
+def resolve_links(
+    db: sqlite3.Connection, prompt_id: int | None, group_id: int | None
+) -> tuple[int | None, int | None]:
     """Degrade stale prompt or group links to None instead of erroring.
 
     By the time links are checked the upstream calls already happened
@@ -389,8 +451,10 @@ def resolve_links(db, prompt_id: int | None, group_id: int | None):
 
 
 @app.post("/compare", response_model=CompareResponse)
-async def compare(request: CompareRequest) -> dict:
-    async def limited(model: str) -> dict:
+async def compare(request: CompareRequest) -> dict[str, Any]:
+    enforce_spend_limit()
+
+    async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
         # batch: the cap is on simultaneous paid calls wherever they
         # come from, and concurrent /compare and stream requests share
@@ -427,6 +491,7 @@ async def compare(request: CompareRequest) -> dict:
         # time.
         for result in results:
             result["cost_usd"] = cost_usd(result, app.state.prices)
+            record_spend(result["cost_usd"])
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )
@@ -441,9 +506,12 @@ async def compare(request: CompareRequest) -> dict:
 
 @app.post("/compare/stream")
 async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
+    # At entry, before the generator runs and so before the semaphore or
+    # any upstream call: a refusal must spend nothing.
+    enforce_spend_limit()
     max_tokens = effective_budget(request.budget, request.model)
 
-    async def events():
+    async def events() -> AsyncIterator[str]:
         # Server-side observation of the stream, enough to reconstruct
         # a result if the client disconnects before the done event: a
         # stream the user watched happen is still history.
@@ -454,7 +522,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         acquired = False
         start = 0.0
 
-        def release_slot():
+        def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
             # both call it: the slot must never be returned twice, and
             # a cancellation while still queued has nothing to return.
@@ -464,6 +532,13 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 app.state.upstream_semaphore.release()
 
         try:
+            # A saturated semaphore means this run waits for a slot.
+            # Tell the client so its column reads "queued" instead of
+            # pretending the model is already thinking; locked() is true
+            # exactly when no slot is free. Emitted before any clock so
+            # the wait pollutes no metric.
+            if app.state.upstream_semaphore.locked():
+                yield "data: " + json.dumps({"type": "queued"}) + "\n\n"
             # The slot covers the upstream exchange only, and it is
             # acquired before any clock starts: both this generator's
             # clock and stream_model's internal latency and ttft clocks
@@ -473,7 +548,15 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             await app.state.upstream_semaphore.acquire()
             acquired = True
             started = True
+            # Start the clock before emitting started, not after. The
+            # frame and the clock mark the same instant (the sub-ms cost
+            # of yielding one small frame on localhost is noise against a
+            # network TTFT), and starting first keeps start valid for the
+            # finally: a disconnect suspended at this yield would otherwise
+            # run the abort path with start still 0.0 and persist a garbage
+            # latency. The client still resets its own clock on the frame.
             start = time.perf_counter()
+            yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             async for event in stream_model(
                 request.prompt, request.model, app.state.client, max_tokens=max_tokens
             ):
@@ -498,6 +581,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # failure degrades to run_id null with links dropped.
                 try:
                     result["cost_usd"] = cost_usd(result, app.state.prices)
+                    record_spend(result["cost_usd"])
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
@@ -509,9 +593,11 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                         "post-stream processing failed for /compare/stream"
                     )
                     run_id = None
-                yield "data: " + json.dumps(
-                    {"type": "done", "result": result, "run_id": run_id}
-                ) + "\n\n"
+                yield (
+                    "data: "
+                    + json.dumps({"type": "done", "result": result, "run_id": run_id})
+                    + "\n\n"
+                )
         finally:
             release_slot()
             # A client disconnect cancels this generator at a yield
@@ -561,12 +647,12 @@ def ensure_rowid(value: int) -> None:
 # content type, and the guard middleware keys on application/json to
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
-async def create_group(body: dict = Body()) -> dict:
+async def create_group(body: dict[str, Any] = Body()) -> dict[str, Any]:
     return {"id": store.create_group(app.state.db)}
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)
-async def group_detail(group_id: int) -> dict:
+async def group_detail(group_id: int) -> dict[str, Any]:
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
     if group is None:
@@ -575,7 +661,7 @@ async def group_detail(group_id: int) -> dict:
 
 
 @app.get("/models", response_model=CatalogResponse)
-async def get_models() -> dict:
+async def get_models() -> dict[str, Any]:
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
@@ -583,16 +669,20 @@ async def get_models() -> dict:
 
 
 @app.get("/prompts", response_model=PromptList)
-async def get_prompts() -> dict:
+async def get_prompts() -> dict[str, Any]:
     return {"prompts": store.list_prompts(app.state.db)}
 
 
 @app.post("/prompts", response_model=Prompt, status_code=201)
-async def create_prompt(body: PromptCreate) -> dict:
+async def create_prompt(body: PromptCreate) -> dict[str, Any]:
     try:
         return store.save_prompt(app.state.db, body.name, body.text)
     except sqlite3.IntegrityError:
-        raise HTTPException(409, f"a prompt named {body.name!r} already exists")
+        # from None: the duplicate name is an expected outcome being
+        # translated to a 409, not an error in handling the error.
+        raise HTTPException(
+            409, f"a prompt named {body.name!r} already exists"
+        ) from None
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)
@@ -604,7 +694,7 @@ async def remove_prompt(prompt_id: int) -> Response:
 
 
 @app.get("/runs", response_model=RunList)
-async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
+async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # Bounded so history stays cheap as bench.db grows. The 500 ceiling
     # keeps the id lists list_runs binds comfortably under sqlite's
     # variable limit.
@@ -618,7 +708,7 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict:
 
 
 @app.get("/runs/{run_id}", response_model=RunDetail)
-async def get_run(run_id: int) -> dict:
+async def get_run(run_id: int) -> dict[str, Any]:
     ensure_rowid(run_id)
     run = store.get_run(app.state.db, run_id)
     if run is None:

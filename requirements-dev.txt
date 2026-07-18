@@ -1,6 +1,12 @@
 -r requirements.txt
+# Starlette's TestClient warns that using httpx rather than httpx2 is
+# deprecated (the unit suite prints it once). Migrating to httpx2 is
+# deferred; tracked here where the pins live.
 respx==0.23.1
 pytest==9.1.1
 pytest-asyncio==1.4.0
 pytest-playwright==0.8.0
 playwright==1.61.0
+ruff==0.14.4
+mypy==1.18.2
+hypothesis==6.140.3

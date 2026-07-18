@@ -324,20 +324,26 @@ def stream_events(client, body):
     assert frames[-1] == "", "every SSE event must end with a blank-line separator"
     events = []
     for frame in frames[:-1]:
-        data_lines = [l for l in frame.split("\n") if l.startswith("data:")]
-        assert len(data_lines) == 1, f"expected exactly one data line per frame: {frame!r}"
+        data_lines = [line for line in frame.split("\n") if line.startswith("data:")]
+        assert len(data_lines) == 1, (
+            f"expected exactly one data line per frame: {frame!r}"
+        )
         events.append(json.loads(data_lines[0][5:]))
     return events
 
 
 def alpha_stream():
-    return ChunkStream([
-        sse({"choices": [{"delta": {"content": "Hel"}}]}),
-        sse({"choices": [{"delta": {"content": "lo"}}]}),
-        sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
-        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
-        DONE_MARKER,
-    ])
+    return ChunkStream(
+        [
+            sse({"choices": [{"delta": {"content": "Hel"}}]}),
+            sse({"choices": [{"delta": {"content": "lo"}}]}),
+            sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+            sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            ),
+            DONE_MARKER,
+        ]
+    )
 
 
 @respx.mock
@@ -348,9 +354,11 @@ def test_stream_endpoint_frames_sse_and_persists_ttft_and_cost(client):
 
     events = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
 
-    assert [e["type"] for e in events] == ["delta", "delta", "done"]
+    # A free slot: a started frame leads, no queued before it.
+    assert [e["type"] for e in events] == ["started", "delta", "delta", "done"]
     done = events[-1]
-    assert "".join(e["text"] for e in events[:-1]) == "Hello"
+    deltas = [e for e in events if e["type"] == "delta"]
+    assert "".join(e["text"] for e in deltas) == "Hello"
     assert done["result"]["response_text"] == "Hello"
     assert done["result"]["ttft_ms"] is not None
     assert done["result"]["cost_usd"] == pytest.approx(2.9e-05)
@@ -466,10 +474,12 @@ async def test_client_disconnect_persists_partial_run(client):
         return_value=httpx.Response(200, stream=alpha_stream())
     )
 
-    resp = await compare_stream(
-        StreamCompareRequest(prompt="hi", model="model/alpha")
-    )
+    resp = await compare_stream(StreamCompareRequest(prompt="hi", model="model/alpha"))
     gen = resp.body_iterator
+    # The started frame leads with a free slot; consume it, then the
+    # first delta, then disconnect with only "Hel" seen.
+    started = await gen.__anext__()
+    assert json.loads(started.removeprefix("data: "))["type"] == "started"
     first = await gen.__anext__()
     assert json.loads(first.removeprefix("data: "))["type"] == "delta"
     await gen.aclose()
@@ -722,13 +732,22 @@ def test_compare_persists_generation_id_and_finish_reason(client):
 
 
 def provenance_stream():
-    return ChunkStream([
-        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "Hel"}}]}),
-        sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "lo"}}]}),
-        sse({"id": "gen-stream-1", "choices": [{"delta": {}, "finish_reason": "stop"}]}),
-        sse({"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}),
-        DONE_MARKER,
-    ])
+    return ChunkStream(
+        [
+            sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "Hel"}}]}),
+            sse({"id": "gen-stream-1", "choices": [{"delta": {"content": "lo"}}]}),
+            sse(
+                {
+                    "id": "gen-stream-1",
+                    "choices": [{"delta": {}, "finish_reason": "stop"}],
+                }
+            ),
+            sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            ),
+            DONE_MARKER,
+        ]
+    )
 
 
 @respx.mock
@@ -756,10 +775,12 @@ def test_stream_missing_provenance_persists_as_null(client):
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
-            stream=ChunkStream([
-                sse({"choices": [{"delta": {"content": "hi"}}]}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    DONE_MARKER,
+                ]
+            ),
         )
     )
 
@@ -789,9 +810,7 @@ def test_compare_persistence_failure_degrades_to_null_run_id(
     monkeypatch.setattr("bench.store.save_run", boom)
 
     with caplog.at_level(logging.ERROR, logger="bench.main"):
-        resp = client.post(
-            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
-        )
+        resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
 
     # The money is spent and the results exist: losing history must not
     # lose the response, exactly as on the streaming path.
@@ -827,8 +846,7 @@ def make_client(monkeypatch, tmp_path, max_upstream):
 async def consume_stream(model, prompt="hi"):
     resp = await compare_stream(StreamCompareRequest(prompt=prompt, model=model))
     return [
-        json.loads(chunk.removeprefix("data: "))
-        async for chunk in resp.body_iterator
+        json.loads(chunk.removeprefix("data: ")) async for chunk in resp.body_iterator
     ]
 
 
@@ -868,9 +886,7 @@ async def test_stream_upstream_concurrency_never_exceeds_cap(monkeypatch, tmp_pa
     )
 
     with make_client(monkeypatch, tmp_path, 2):
-        tasks = [
-            asyncio.create_task(consume_stream(f"model/m{i}")) for i in range(4)
-        ]
+        tasks = [asyncio.create_task(consume_stream(f"model/m{i}")) for i in range(4)]
         await settle(lambda: tracker["started"] == 2)
         # Extra loop turns: the two queued streams must stay queued
         # while both slots are occupied.
@@ -983,10 +999,12 @@ async def test_stream_queue_wait_is_not_reported_as_latency_or_ttft(
             return httpx.Response(200, stream=SlowStream())
         return httpx.Response(
             200,
-            stream=ChunkStream([
-                sse({"choices": [{"delta": {"content": "quick"}}]}),
-                DONE_MARKER,
-            ]),
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "quick"}}]}),
+                    DONE_MARKER,
+                ]
+            ),
         )
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
@@ -1128,9 +1146,7 @@ def test_compare_survives_resolve_links_failure(client, monkeypatch, caplog):
     monkeypatch.setattr("bench.main.resolve_links", boom)
 
     with caplog.at_level(logging.ERROR, logger="bench.main"):
-        resp = client.post(
-            "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
-        )
+        resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
 
     # The invariant: after money is spent, no code path may convert
     # results into an error response.
@@ -1168,3 +1184,168 @@ def test_out_of_range_path_ids_read_as_absent(client):
     assert client.get(f"/groups/{huge}").status_code == 404
     assert client.delete(f"/prompts/{huge}").status_code == 404
     assert client.get("/runs/0").status_code == 404
+
+
+# ---- F3: per-boot spend ceiling.
+
+
+def spend_client(monkeypatch, tmp_path, limit=None):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    if limit is not None:
+        monkeypatch.setenv("BENCH_SPEND_LIMIT_USD", str(limit))
+    else:
+        monkeypatch.delenv("BENCH_SPEND_LIMIT_USD", raising=False)
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+@respx.mock
+def test_spend_ceiling_refuses_at_boundary_without_upstream_call(monkeypatch, tmp_path):
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Already over the ceiling from prior runs this boot.
+        c.app.state.accumulated_spend_usd = 1.5
+        for path, body in (
+            ("/compare", {"prompt": "hi", "models": ["model/alpha"]}),
+            ("/compare/stream", {"prompt": "hi", "model": "model/alpha"}),
+        ):
+            resp = c.post(path, json=body)
+            assert resp.status_code == 402, path
+            detail = resp.json()["detail"]
+            assert "spend ceiling" in detail
+            assert "$1.50" in detail and "$1.00" in detail
+        # The refusal never reached upstream: no money moved.
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_spend_accumulates_across_runs_and_ignores_unpriced(monkeypatch, tmp_path):
+    def route(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(200, json=response_for(model, "hi"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        assert c.app.state.accumulated_spend_usd == 0.0
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        # Two priced alpha runs at 2.9e-5 each.
+        assert c.app.state.accumulated_spend_usd == pytest.approx(5.8e-5)
+        # An unpriced model (no entry in the price cache) does not move
+        # the counter, matching the documented semantics.
+        c.post("/compare", json={"prompt": "hi", "models": ["model/bare"]})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(5.8e-5)
+
+
+@respx.mock
+def test_stream_run_accumulates_spend(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_unset_spend_limit_never_blocks(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=None) as c:
+        assert c.app.state.spend_limit_usd is None
+        # Even a large accumulated figure cannot block without a limit.
+        c.app.state.accumulated_spend_usd = 1000.0
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200
+
+
+@respx.mock
+def test_spend_ceiling_message_keeps_sub_cent_figures_truthful(monkeypatch, tmp_path):
+    # A priced run costs 2.9e-5 here, so a ceiling set at the bench's
+    # native scale must not collapse to $0.0000 in the refusal: four
+    # decimals would misreport a real $0.00004 limit as zero.
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=0.00004) as c:
+        c.app.state.accumulated_spend_usd = 5.8e-5
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 402
+        detail = resp.json()["detail"]
+        assert "$0.000058 of $0.00004 limit" in detail
+
+
+# ---- F4: queued state frames.
+
+
+@respx.mock
+async def test_stream_emits_started_and_no_queued_when_slot_free(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 5):
+        events = await consume_stream("model/alpha")
+
+    types = [e["type"] for e in events]
+    assert "queued" not in types
+    assert types[0] == "started"
+    assert types[-1] == "done"
+
+
+@respx.mock
+async def test_stream_emits_queued_before_started_when_saturated(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        # Hold the only slot by hand so the run must queue for it.
+        await c.app.state.upstream_semaphore.acquire()
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "queued"
+
+        # Free the slot; the run acquires it and announces started.
+        c.app.state.upstream_semaphore.release()
+        second = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert second["type"] == "started"
+
+        rest = [json.loads(f.removeprefix("data: ")) async for f in gen]
+        assert rest[-1]["type"] == "done"
+
+
+@respx.mock
+async def test_disconnect_at_started_frame_persists_sane_latency(monkeypatch, tmp_path):
+    # A client drop during the flush of the started frame finalizes the
+    # generator while it is suspended at that yield, before the async for
+    # over stream_model runs. The persisted abort must carry a real
+    # elapsed latency, not the raw perf_counter reference (host uptime in
+    # ms): the clock starts before the frame, so it is always valid when
+    # the finally runs. Regression for the window where start was set
+    # after the started yield.
+    from bench import store
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 5) as c:
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "started"
+        # Close at the started-yield suspension, before any delta arrives.
+        await gen.aclose()
+
+        run = store.get_run(c.app.state.db, 1)
+
+    assert run is not None
+    latency = run["results"][0]["latency_ms"]
+    assert latency is not None
+    assert 0.0 <= latency < 60_000.0

@@ -18,7 +18,6 @@ from pathlib import Path
 import httpx
 import pytest
 import uvicorn
-
 from stub_openrouter import build_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -61,12 +60,14 @@ def stub_url():
 def bench_url(stub_url, tmp_path_factory):
     port = free_port()
     env = os.environ.copy()
-    env.update({
-        "OPENROUTER_API_KEY": "test-key",
-        "BENCH_DB": str(tmp_path_factory.mktemp("browser-db") / "bench.db"),
-        "OPENROUTER_URL": stub_url + "/api/v1/chat/completions",
-        "MODELS_URL": stub_url + "/api/v1/models",
-    })
+    env.update(
+        {
+            "OPENROUTER_API_KEY": "test-key",
+            "BENCH_DB": str(tmp_path_factory.mktemp("browser-db") / "bench.db"),
+            "OPENROUTER_URL": stub_url + "/api/v1/chat/completions",
+            "MODELS_URL": stub_url + "/api/v1/models",
+        }
+    )
     log_path = tmp_path_factory.mktemp("browser-logs") / "uvicorn.log"
     with open(log_path, "wb") as log:
         proc = subprocess.Popen(
@@ -103,19 +104,17 @@ def browser_type_launch_args(browser_type_launch_args):
 
 @pytest.fixture
 def bench(page, bench_url):
-    """A page factory bound to the bench: seeds a lineup, blocks the
-    external font fetch (hermetic and faster), and navigates."""
+    """A page factory bound to the bench: seeds a lineup and navigates.
+
+    The fonts are self-hosted now, so nothing external is fetched and no
+    blocking route is needed to keep the harness hermetic.
+    """
 
     def open_bench(lineup):
-        page.route(
-            lambda url: "fonts.googleapis.com" in url or "fonts.gstatic.com" in url,
-            lambda route: route.abort(),
-        )
         # Seeded exactly as the app stores it, a raw JSON array of ids;
         # this is also the pre-VOLT format, which must keep loading.
         page.add_init_script(
-            "localStorage.setItem('bench-lineup', %s)"
-            % json.dumps(json.dumps(lineup))
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
         )
         page.goto(bench_url)
         return page

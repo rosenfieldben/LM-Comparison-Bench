@@ -9,7 +9,8 @@ import logging
 import os
 import sqlite3
 import stat
-from datetime import datetime, timezone
+from datetime import UTC, datetime
+from typing import Any
 
 # Shared with ingestion on purpose: what run_model refuses to emit,
 # get_run refuses to serve, so both ends of the pipeline enforce the
@@ -119,9 +120,11 @@ def connect(path: str) -> sqlite3.Connection:
     event loop thread today, but the flag keeps a future sync endpoint
     or executor hop from crashing on an sqlite thread check.
     """
-    # In-memory and file: URI databases (the test seam) have no
-    # filesystem mode to manage.
-    if path != ":memory:" and not path.startswith("file:"):
+    # A real file on disk, as opposed to the in-memory and file: URI
+    # databases the test seam hands in, which have no filesystem mode to
+    # manage and no meaningful WAL.
+    file_backed = path != ":memory:" and not path.startswith("file:")
+    if file_backed:
         _keep_private(path)
     # uri=True lets tests hand in shared in-memory databases via
     # file: URIs; sqlite treats anything not starting with "file:" as a
@@ -130,6 +133,16 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # Off by default in sqlite; without it ON DELETE SET NULL is inert.
     conn.execute("PRAGMA foreign_keys = ON")
+    if file_backed:
+        # A second process opening bench.db (an analysis script run while
+        # the bench is live) risks "database is locked" under the default
+        # rollback journal, which takes an exclusive lock for every
+        # write. WAL lets that reader coexist with the bench's writer,
+        # and busy_timeout waits out a transient lock instead of failing
+        # the query instantly. WAL is meaningless for memory databases,
+        # which is why this is gated on a real file.
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 5000")
     conn.executescript(SCHEMA)
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -143,10 +156,10 @@ def connect(path: str) -> sqlite3.Connection:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
-def save_prompt(conn: sqlite3.Connection, name: str, text: str) -> dict:
+def save_prompt(conn: sqlite3.Connection, name: str, text: str) -> dict[str, Any]:
     """Insert a prompt. Raises sqlite3.IntegrityError on duplicate name."""
     with conn:
         cur = conn.execute(
@@ -159,14 +172,12 @@ def save_prompt(conn: sqlite3.Connection, name: str, text: str) -> dict:
     return dict(row)
 
 
-def get_prompt(conn: sqlite3.Connection, prompt_id: int) -> dict | None:
-    row = conn.execute(
-        "SELECT * FROM prompts WHERE id = ?", (prompt_id,)
-    ).fetchone()
+def get_prompt(conn: sqlite3.Connection, prompt_id: int) -> dict[str, Any] | None:
+    row = conn.execute("SELECT * FROM prompts WHERE id = ?", (prompt_id,)).fetchone()
     return dict(row) if row else None
 
 
-def list_prompts(conn: sqlite3.Connection) -> list[dict]:
+def list_prompts(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     rows = conn.execute("SELECT * FROM prompts ORDER BY name").fetchall()
     return [dict(r) for r in rows]
 
@@ -180,20 +191,21 @@ def delete_prompt(conn: sqlite3.Connection, prompt_id: int) -> bool:
 def create_group(conn: sqlite3.Connection) -> int:
     with conn:
         cur = conn.execute("INSERT INTO groups (created_at) VALUES (?)", (_now(),))
+    # lastrowid is Optional in the DBAPI types but always set after a
+    # single-row INSERT; assert so the int return stays honest.
+    assert cur.lastrowid is not None
     return cur.lastrowid
 
 
 def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
-    row = conn.execute(
-        "SELECT 1 FROM groups WHERE id = ?", (group_id,)
-    ).fetchone()
+    row = conn.execute("SELECT 1 FROM groups WHERE id = ?", (group_id,)).fetchone()
     return row is not None
 
 
 def save_run(
     conn: sqlite3.Connection,
     prompt_text: str,
-    results: list[dict],
+    results: list[dict[str, Any]],
     prompt_id: int | None = None,
     group_id: int | None = None,
 ) -> int:
@@ -208,6 +220,9 @@ def save_run(
             " VALUES (?, ?, ?, ?)",
             (prompt_id, group_id, prompt_text, _now()),
         )
+        # lastrowid is always set after this single-row INSERT; assert
+        # so the int return type is not a lie.
+        assert cur.lastrowid is not None
         run_id = cur.lastrowid
         conn.executemany(
             """INSERT INTO results
@@ -239,7 +254,7 @@ def save_run(
     return run_id
 
 
-def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
+def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]]:
     """The newest `limit` history entries.
 
     Runs sharing a group collapse into one group entry, emitted at the
@@ -316,7 +331,7 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
         }
 
     runs_by_id = {r["id"]: r for r in run_rows}
-    members: dict[int, list[dict]] = {}
+    members: dict[int, list[dict[str, Any]]] = {}
     for r in run_rows:
         if r["group_id"] is not None:
             members.setdefault(r["group_id"], []).append(r)
@@ -343,9 +358,7 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
                     "created_at": group_created.get(key, runs_asc[0]["created_at"]),
                     "prompt_text": runs_asc[0]["prompt_text"],
                     "models": [
-                        m
-                        for r in runs_asc
-                        for m in models_by_run.get(r["id"], [])
+                        m for r in runs_asc for m in models_by_run.get(r["id"], [])
                     ],
                     "run_ids": [r["id"] for r in runs_asc],
                 }
@@ -353,7 +366,7 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict]:
     return entries
 
 
-def _repaired(row: dict) -> dict:
+def _repaired(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize a result row's scalar fields on the way out.
 
     Rows written before ingestion normalization can carry provider
@@ -371,7 +384,7 @@ def _repaired(row: dict) -> dict:
     return row
 
 
-def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
+def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     run = conn.execute(
         "SELECT id, prompt_id, prompt_text, created_at FROM runs WHERE id = ?",
         (run_id,),
@@ -390,7 +403,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict | None:
     return out
 
 
-def get_group(conn: sqlite3.Connection, group_id: int) -> dict | None:
+def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     """The group's runs with full results, run order by id."""
     row = conn.execute(
         "SELECT id, created_at FROM groups WHERE id = ?", (group_id,)

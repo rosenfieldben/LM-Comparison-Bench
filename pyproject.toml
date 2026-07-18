@@ -1,0 +1,46 @@
+# Tool configuration only. The install story stays requirements.txt and
+# requirements-dev.txt; this file carries no packaging metadata on
+# purpose, so nothing here turns the bench into a distributable package.
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/F: pyflakes and pycodestyle correctness. I: import sorting. B:
+# bugbear (mutable defaults, misused builtins). UP: pyupgrade, so the
+# codebase tracks the language floor it already targets.
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's parameter markers are calls in argument defaults by design
+# (Body/Query/Path/Depends drive dependency injection), so they are not
+# the mutable-default footgun B008 targets.
+extend-immutable-calls = [
+    "fastapi.Body",
+    "fastapi.Query",
+    "fastapi.Path",
+    "fastapi.Depends",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests build request payloads and fixtures inline and lean on pytest's
+# assert rewriting; the bugbear and line rules there fight readability
+# more than they help. E402 is allowed because several suites import a
+# helper right where the section that needs it begins, keeping the
+# import next to its use.
+"tests/**" = ["B", "E501", "E402"]
+
+[tool.mypy]
+python_version = "3.11"
+# Strict everywhere, then narrowed to bench below: the CI gate is
+# `mypy bench`, and the internals pass plain dicts on purpose, so tests
+# stay out of the type surface.
+strict = true
+
+[[tool.mypy.overrides]]
+# Tests are excluded from strict typing: respx, the Playwright fixtures,
+# and inline dict payloads would demand annotations that document
+# nothing.
+module = "tests.*"
+ignore_errors = true
