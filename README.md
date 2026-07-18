@@ -205,7 +205,12 @@ state. GET and HEAD stay exempt as reads, and DELETE needs no gate
 because a browser never sends it cross-site without a preflight.
 Everything curl sends with a JSON content type and everything the
 bundled frontend sends (it posts an empty JSON object to /groups)
-passes unchanged. To
+passes unchanged. Every response also carries `X-Frame-Options: DENY`
+and `Content-Security-Policy: frame-ancestors 'none'`, so the UI cannot
+be embedded in a hostile frame and a Run click cannot be redressed into
+paid work; the headers are added on response start with no body
+buffering, so streaming is untouched. A fuller CSP is deferred: the
+pre-paint inline theme script would need a hash or externalization. To
 serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.

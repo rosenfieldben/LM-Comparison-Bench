@@ -396,6 +396,33 @@ def test_review_repro_clean_eof_persists_as_error(client):
     assert "no [DONE]" in persisted["error"]
 
 
+def test_review_repro_index_denies_framing(client):
+    """External review finding 4: nothing stopped a hostile page from
+    framing the localhost UI and redressing a Run click into paid work.
+    Every response must carry anti-framing headers."""
+    resp = client.get("/")
+    assert resp.status_code == 200
+    assert resp.headers["x-frame-options"] == "DENY"
+    assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+
+
+@respx.mock
+def test_review_repro_stream_response_denies_framing(client):
+    """External review finding 4: the streaming response carries the
+    anti-framing headers too, injected on response start without buffering
+    the SSE body (the streaming and disconnect suites prove no buffering)."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with client.stream(
+        "POST", "/compare/stream", json={"prompt": "hi", "model": "model/alpha"}
+    ) as resp:
+        assert resp.status_code == 200
+        assert resp.headers["x-frame-options"] == "DENY"
+        assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+        resp.read()
+
+
 @respx.mock
 def test_stream_endpoint_stale_group_id_degrades(client):
     respx.post(OPENROUTER_URL).mock(

@@ -17,8 +17,8 @@ from fastapi import Body, FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.datastructures import Headers
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.datastructures import Headers, MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import store
 from bench.models import (
@@ -324,6 +324,26 @@ class LocalOnlyGuard:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
+
+        # Deny framing on every HTTP response. A hostile page cannot read a
+        # cross-origin response, but it can frame the real localhost UI and
+        # redress a Run click into paid work; these headers refuse the
+        # frame. Modern Chrome's private-network rules blunt this, other
+        # browsers differ, and the headers cost nothing. Blanket
+        # application is deliberate: no response here is meant to be
+        # embedded. The headers are added on http.response.start only, with
+        # no buffering of the body, so SSE streaming and the generator
+        # cancellation the streaming endpoint depends on stay untouched,
+        # which is the reason this guard is pure ASGI. A fuller CSP is out
+        # of scope: the pre-paint inline theme script in index.html would
+        # need a hash or externalization, so this stops at frame-ancestors.
+        async def framed_send(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["x-frame-options"] = "DENY"
+                headers["content-security-policy"] = "frame-ancestors 'none'"
+            await send(message)
+
         headers = Headers(scope=scope)
         # A missing Host header (raw HTTP/1.0 clients) fails closed.
         host = host_header_name(headers.get("host", ""))
@@ -332,7 +352,7 @@ class LocalOnlyGuard:
                 {"detail": "the bench only answers to localhost"},
                 status_code=403,
             )
-            await response(scope, receive, send)
+            await response(scope, receive, framed_send)
             return
         # Every POST must be application/json, bodyless included: POST
         # is the one method a browser fires cross-site without a CORS
@@ -349,9 +369,9 @@ class LocalOnlyGuard:
                 {"detail": "POST bodies must be application/json"},
                 status_code=415,
             )
-            await response(scope, receive, send)
+            await response(scope, receive, framed_send)
             return
-        await self.app(scope, receive, send)
+        await self.app(scope, receive, framed_send)
 
 
 app.add_middleware(LocalOnlyGuard)
