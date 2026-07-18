@@ -9,6 +9,8 @@ synchronous tick, or a stalling stub personality, never with sleeps or
 timing luck.
 """
 
+import re
+
 import pytest
 from playwright.sync_api import expect
 
@@ -27,6 +29,12 @@ def status_of(card):
 
 def check_chip(page, index):
     page.get_by_test_id("lineup-chip").nth(index).click()
+
+
+def check_all_chips(page):
+    chips = page.get_by_test_id("lineup-chip")
+    for i in range(chips.count()):
+        chips.nth(i).click()
 
 
 def start_run(page, prompt):
@@ -293,3 +301,116 @@ def test_review_repro_edit_during_save_leaves_no_false_link(bench):
     # The prompt was still saved, just not linked.
     options = page.get_by_test_id("saved-prompts").locator("option")
     expect(options.filter(has_text="f2 edit race")).to_have_count(1)
+
+
+# ---- F2.4: Stop.
+
+
+def test_review_repro_stop_mid_stream_keeps_partial_shows_stopped(bench):
+    """F2.4: Stop mid stream keeps the partial text under a stopped status
+    (no error styling, no fabricated metrics) and the race entry stops
+    working and reads stopped. Server-side persistence of the disconnected
+    run is covered by test_client_disconnect_persists_partial_run."""
+    page = bench(["stub/stall0"])
+    check_chip(page, 0)
+    start_run(page, "f2 stop mid")
+    card = cards(page).first
+    expect(card.get_by_test_id("card-body")).to_contain_text(
+        "partial text", timeout=DONE_TIMEOUT
+    )
+    expect(page.get_by_test_id("stop-button")).to_be_enabled()
+
+    page.get_by_test_id("stop-button").click()
+
+    expect(status_of(card)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("card-body")).to_contain_text("partial text")
+    expect(card.get_by_test_id("card-error")).to_have_count(0)
+    row = page.locator(".race-row")
+    expect(row).to_have_class(re.compile(r"\bstopped\b"))
+    expect(row).not_to_have_class(re.compile(r"\bworking\b"))
+    expect(page.locator(".race-val")).to_have_text("stopped")
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+
+def test_review_repro_stop_queued_run_shows_stopped_no_text(bench):
+    """F2.4: a run still queued for an upstream slot when Stop is pressed
+    shows the stopped state with no text (it never streamed). Five stall
+    ids fill the five slots so a sixth queues."""
+    models = [f"stub/stall{i}" for i in range(6)]
+    page = bench(models)
+    check_all_chips(page)
+    start_run(page, "f2 stop queued")
+
+    # Exactly one of the six queues behind the five upstream slots.
+    expect(page.get_by_test_id("card-status").filter(has_text="queued")).to_have_count(
+        1, timeout=DONE_TIMEOUT
+    )
+
+    page.get_by_test_id("stop-button").click()
+
+    for i in range(6):
+        expect(status_of(cards(page).nth(i))).to_have_text(
+            "stopped", timeout=DONE_TIMEOUT
+        )
+    # The five that started kept partial text; the queued one shows none.
+    expect(
+        page.get_by_test_id("card-body").filter(has_text="partial text")
+    ).to_have_count(5)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+
+def test_review_repro_run_after_stop_streams_normally(bench):
+    """F2.4: after Stop the epoch machinery is intact, so a fresh Run
+    streams normally."""
+    page = bench(["stub/stall0", "stub/fast"])
+    check_chip(page, 0)
+    start_run(page, "f2 stop then run")
+    card = cards(page).first
+    expect(card.get_by_test_id("card-body")).to_contain_text(
+        "partial text", timeout=DONE_TIMEOUT
+    )
+    page.get_by_test_id("stop-button").click()
+    expect(status_of(card)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+
+    # A fresh run of the fast model works end to end.
+    check_chip(page, 0)
+    check_chip(page, 1)
+    start_run(page, "after stop run")
+    fresh = cards(page).first
+    expect(fresh.get_by_test_id("card-model")).to_have_text("stub/fast")
+    expect(status_of(fresh)).to_have_text("done", timeout=DONE_TIMEOUT)
+    expect(fresh.get_by_test_id("card-body")).to_have_text("reply from stub/fast")
+
+
+def test_review_repro_stopped_run_persists_as_aborted_in_history(bench):
+    """F2.4: stopping a started run preserves what streamed, in history as
+    an aborted record on the next load (the client never gets a run id).
+    The server disconnect persistence is unit-tested
+    (test_client_disconnect_persists_partial_run); this drives it end to
+    end through Stop."""
+    page = bench(["stub/stall0"])
+    check_chip(page, 0)
+    start_run(page, "f2 stop persists")
+    card = cards(page).first
+    expect(card.get_by_test_id("card-body")).to_contain_text(
+        "partial text", timeout=DONE_TIMEOUT
+    )
+    page.get_by_test_id("stop-button").click()
+    expect(status_of(card)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+
+    # Wait for the server to persist the disconnected run, then load it.
+    page.wait_for_function(
+        """(t) => fetch('/runs?limit=100').then(r => r.json())
+              .then(d => d.runs.some(x => x.prompt_text.includes(t)))""",
+        arg="f2 stop persists",
+    )
+    open_history(page)
+    page.get_by_test_id("history-row").filter(has_text="f2 stop persists").click()
+    replayed = cards(page).first
+    expect(replayed.get_by_test_id("card-body")).to_contain_text(
+        "partial text", timeout=DONE_TIMEOUT
+    )
+    expect(replayed.get_by_test_id("card-error")).to_contain_text("aborted")

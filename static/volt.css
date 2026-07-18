@@ -408,6 +408,20 @@
   }
   #run:hover:not(:disabled) { background: var(--run-hover); border-color: var(--run-hover); color: var(--run-fg); }
   #run:disabled { opacity: 0.45; color: var(--run-fg); border-color: var(--accent); }
+  /* Stop is a secondary, outline action next to Run, enabled only while
+     runs are in flight. It reads as a halt, not a failure. */
+  #stop {
+    font: 600 13px var(--display);
+    letter-spacing: 0.06em;
+    color: var(--text-sec);
+    background: none;
+    border: 1px solid var(--border-2);
+    border-radius: 5px;
+    min-height: 36px;
+    padding: 0 24px;
+  }
+  #stop:hover:not(:disabled) { color: var(--err-text); border-color: var(--err); }
+  #stop:disabled { opacity: 0.4; }
   .seg {
     display: flex;
     border: 1px solid var(--border-2);
@@ -445,6 +459,7 @@
   .race-rank { font: 600 12px var(--mono); color: var(--text-dim); }
   .race-row.working .race-rank { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-rank { color: var(--err); }
+  .race-row.stopped .race-rank { color: var(--text-dim); }
   .race-name {
     font-size: 12px;
     color: var(--text);
@@ -470,6 +485,7 @@
   .race-val { font: 600 12px var(--mono); color: var(--text); text-align: right; white-space: nowrap; }
   .race-row.working .race-val { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-val { color: var(--err); }
+  .race-row.stopped .race-val { color: var(--text-dim); }
 
   /* ==== Result cards ==== */
   #run-label { font-size: 10.5px; color: var(--text-faint); }
@@ -501,6 +517,9 @@
   .card[data-state="working"] { border-top-color: var(--accent); }
   .card[data-state="done"] { border-top-color: var(--done); }
   .card[data-state="error"] { border-color: var(--err-card-border); border-top-color: var(--err); }
+  /* Stopped is a user halt, not a provider failure: a muted edge, no
+     error tint. */
+  .card[data-state="stopped"] { border-top-color: var(--text-dim); }
   .card-header {
     display: flex;
     align-items: center;
@@ -517,6 +536,7 @@
   .card[data-state="working"] .state-dot { background: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .card[data-state="done"] .state-dot { background: var(--done); }
   .card[data-state="error"] .state-dot { background: var(--err); }
+  .card[data-state="stopped"] .state-dot { background: var(--text-dim); }
   .status {
     font-size: 10px;
     letter-spacing: 0.08em;
@@ -527,6 +547,7 @@
   .card[data-state="working"] .status { color: var(--accent-label); }
   .card[data-state="done"] .status { color: var(--done-label); }
   .card[data-state="error"] .status { color: var(--err); }
+  .card[data-state="stopped"] .status { color: var(--text-dim); }
   .card-shimmer { display: none; height: 2px; margin-top: 10px; }
   .card[data-state="working"] .card-shimmer {
     display: block;

@@ -113,12 +113,25 @@ Controls sit in one console deck above the results, three rows: the
 prompt row (auto-growing monospace textarea in an inset field, plus
 the saved-prompt library), the lineup row (model chips with per-chip
 remove, All and None selection, and the Add model search), and the
-run row (the Run button, a segmented token-budget control, and a
-segmented column-density control, plus a request count and worst-case
-cost estimate when pricing is available). Density has two steps,
-comfortable and compact; compact tightens card padding and drops the
-response font a step for racing many models side by side. Unlike the
-budget (per session on purpose, it costs money), density persists.
+run row (the Run button, a Stop button, a segmented token-budget
+control, and a segmented column-density control, plus a request count
+and worst-case cost estimate when pricing is available). Density has
+two steps, comfortable and compact; compact tightens card padding and
+drops the response font a step for racing many models side by side.
+Unlike the budget (per session on purpose, it costs money), density
+persists.
+
+Stop is live only while runs are in flight. It aborts every request in
+the current comparison without clearing it: each card keeps whatever
+already streamed and switches to a muted "stopped" state (no error
+styling, no invented metrics), a card still waiting for a slot shows
+stopped with no text, and its race row stops ticking. Stopping does not
+refund anything: spend already incurred stands, and each aborted request
+disconnects its stream, so the server persists a started run as an
+aborted record (visible on the next history load, since the client never
+receives a run id) and a still-queued run not at all. After a Stop the
+in-flight count reaches zero, Run re-enables, and a fresh Run or a rerun
+works as usual.
 
 During a live run a TTFT race strip sits between the deck and the
 cards: one row per model, a shimmering meter until the first token,
@@ -406,6 +419,12 @@ picked up without restarts, and verify by eyeball after UI changes:
 - Kill wifi (or the server) mid-stream: the streaming column must
   enter the error state with its partial text retained above the
   error message, not hang or go blank.
+- Stop mid-stream: run an extended prompt on a slow model and hit Stop
+  while it is thinking. The card keeps its partial text and flips to the
+  muted stopped state (not error), the race row stops ticking, Run
+  re-enables, and a fresh Run works. Open History: the stopped run is
+  there as an aborted record. Run six or more models and hit Stop while
+  one is still queued: that card reads stopped with no text.
 - Diff two live columns from similar prompts ("write a haiku about
   rain" on two models): common words flow plain, unique words tinted.
 - Diff a live column against the same model's historical run of the

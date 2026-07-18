@@ -70,6 +70,7 @@ function prefSet(key, value) {
 const promptEl = document.getElementById("prompt");
 const modelsEl = document.getElementById("models");
 const runBtn = document.getElementById("run");
+const stopBtn = document.getElementById("stop");
 const resultsEl = document.getElementById("results");
 const runLabelEl = document.getElementById("run-label");
 const savedSelect = document.getElementById("saved-prompts");
@@ -351,6 +352,9 @@ function updateRunState() {
   const checked = checkedModels().length;
   runBtn.disabled =
     inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
+  // Stop is live exactly while runs are: it acts on the in-flight
+  // controllers and has nothing to do when the count is zero.
+  stopBtn.disabled = inflightRuns === 0;
   deleteBtn.disabled = savedSelect.value === "";
   lineupLabel.textContent = "Lineup " + checked + "/" + lineup.length;
   renderLinked();
@@ -725,6 +729,15 @@ function raceError(model) {
   raceRender();
 }
 
+// A user Stop: the row must not keep shimmering as if still working. It
+// leaves the working state and reads "stopped", ranked among nothing.
+function raceStopped(model) {
+  const row = race !== null ? race.rows.get(model) : undefined;
+  if (!row) return;
+  row.status = "stopped";
+  raceRender();
+}
+
 // The server's TTFT replaces the client-side first-token measurement
 // when the run completes; they differ by network jitter only.
 function raceDone(model, serverTtft) {
@@ -759,6 +772,11 @@ function raceRender() {
       r.rank.textContent = "—";
       r.fill.style.width = "";
       r.val.textContent = "failed";
+    } else if (r.status === "stopped") {
+      // No rank, no bar: the run was halted, not finished or failed.
+      r.rank.textContent = "·";
+      r.fill.style.width = "";
+      r.val.textContent = "stopped";
     } else if (r.ttft != null) {
       r.rank.textContent = String(r.rankN);
       r.fill.style.width = Math.min(100, (r.ttft / scale) * 100) + "%";
@@ -1054,7 +1072,9 @@ function completeColumn(ui, result, sourceLabel, opts) {
   }
   const error = "shownError" in opts ? opts.shownError : result.error;
   applyError(ui, error);
-  setState(ui, error != null ? "error" : "done");
+  // A user Stop is neither done nor a provider failure; it gets its own
+  // muted state so the card never implies the model finished or errored.
+  setState(ui, opts.stopped ? "stopped" : error != null ? "error" : "done");
   // Rerun leads the action row so the recovery control is where the
   // eye lands first on a failed card.
   if (opts.retry) addRerun(ui, opts.retry);
@@ -1237,7 +1257,9 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
     finished = true;
     stopTicker(ui);
     if (current()) {
-      if (result.error != null) {
+      if (result.stopped) {
+        raceStopped(model);
+      } else if (result.error != null) {
         raceError(model);
       } else {
         raceDone(model, result.ttft_ms);
@@ -1246,22 +1268,29 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
       updateRunState();
     }
     // Session accounting is view-independent: money spent by a
-    // superseded run is still money spent this session.
-    if (result.cost_usd != null) {
-      sessionStats.spend += result.cost_usd;
-    } else if (
-      result.response_text != null ||
-      result.prompt_tokens != null ||
-      result.completion_tokens != null
-    ) {
-      // Evidence of consumption with no price: offline catalog,
-      // missing usage, or an error after tokens flowed. Counted so
-      // the session total cannot quietly understate real spend.
-      sessionStats.unpriced += 1;
-    }
-    if (result.error == null && result.ttft_ms != null) {
-      sessionStats.ttftSum += result.ttft_ms;
-      sessionStats.ttftN += 1;
+    // superseded run is still money spent this session. A user-stopped
+    // run adds nothing: no cost frame ever arrived, which matches the
+    // server, where the disconnect path persists a started run as aborted
+    // with null cost and a queued run not at all. Stopping does not refund
+    // spend already incurred; it just is not counted here because the
+    // client never received it.
+    if (!result.stopped) {
+      if (result.cost_usd != null) {
+        sessionStats.spend += result.cost_usd;
+      } else if (
+        result.response_text != null ||
+        result.prompt_tokens != null ||
+        result.completion_tokens != null
+      ) {
+        // Evidence of consumption with no price: offline catalog,
+        // missing usage, or an error after tokens flowed. Counted so
+        // the session total cannot quietly understate real spend.
+        sessionStats.unpriced += 1;
+      }
+      if (result.error == null && result.ttft_ms != null) {
+        sessionStats.ttftSum += result.ttft_ms;
+        sessionStats.ttftN += 1;
+      }
     }
     renderStats();
     // A superseded run's view work ends here: dropped silently, its
@@ -1287,10 +1316,13 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
       // and streamed the response but could not persist it.
       unsaved: runId === null,
       // Only this streaming path offers a rerun; historical replays go
-      // through fillColumn and never get one.
+      // through fillColumn and never get one. A stopped run has no error,
+      // so it gets no rerun control.
       retry: result.error != null
         ? { prompt, model, promptId, groupId, budget }
         : null,
+      // A user Stop renders as an honest stopped state, not done or error.
+      stopped: result.stopped === true,
     });
   }
 
@@ -1355,16 +1387,21 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
     }
     if (!finished) throw new Error("stream ended unexpectedly");
   } catch (err) {
-    // Network death mid-stream lands here; partial text stays visible
-    // through the same error rendering as a server-reported failure.
-    // The streamed text is folded into the synthetic result so the
-    // card stays diffable on its partial text.
+    // An abort while this run's epoch is still current is a user Stop.
+    // Supersession aborts too, but it also moves the epoch, so current()
+    // is false there and the run drops silently in finish(). A stopped
+    // run keeps whatever text streamed in and renders an honest stopped
+    // status with no error and no fabricated metrics; a network death
+    // shows the error as before, its partial text still folded in so the
+    // card stays diffable.
     // run_id undefined, not null: whether the server persisted this
     // run is unknown from here (its disconnect path usually does), so
     // no not-saved warning is claimed.
+    const stopped = err.name === "AbortError" && current();
     finish({
-      error: "request failed: " + err.message,
+      error: stopped ? null : "request failed: " + err.message,
       response_text: textNode !== null ? textNode.data : null,
+      stopped: stopped,
     }, undefined);
   }
 }
@@ -1435,6 +1472,20 @@ async function startRun() {
   }
 }
 runBtn.addEventListener("click", startRun);
+
+// Stop aborts every in-flight controller in the current epoch WITHOUT
+// taking a new view epoch: the comparison stays the view, its cards stay,
+// nothing is cleared. Each aborted runOne lands in its catch with the
+// epoch still current and renders a stopped card; as they settle the
+// in-flight count drains to zero, re-enabling Run and disabling Stop, so
+// a later Run or rerun works through the untouched epoch machinery. The
+// abort disconnects each stream, so the server persists a started run
+// through its existing disconnect path and a queued run not at all,
+// exactly as the cards show.
+function stopRuns() {
+  for (const c of epochControllers) c.abort();
+}
+stopBtn.addEventListener("click", stopRuns);
 
 // ---- History. Loads on expand rather than page load: it is the
 // ---- rarely used half of the page and a stale list is worse than a
