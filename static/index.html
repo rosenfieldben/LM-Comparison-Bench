@@ -2143,7 +2143,19 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
       }),
       signal: controller.signal,
     });
-    if (!resp.ok) throw new Error("HTTP " + resp.status);
+    if (!resp.ok) {
+      // A refusal like the spend ceiling (402) carries a JSON detail
+      // explaining itself in words; surface that instead of a bare
+      // status so the error card reads as a sentence, not a code.
+      let detail = "HTTP " + resp.status;
+      try {
+        const body = await resp.json();
+        if (body && typeof body.detail === "string") detail = body.detail;
+      } catch (err) {
+        // Non-JSON error body: the status line is the best we have.
+      }
+      throw new Error(detail);
+    }
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
     let buf = "";

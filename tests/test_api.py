@@ -1178,3 +1178,80 @@ def test_out_of_range_path_ids_read_as_absent(client):
     assert client.get(f"/groups/{huge}").status_code == 404
     assert client.delete(f"/prompts/{huge}").status_code == 404
     assert client.get("/runs/0").status_code == 404
+
+
+# ---- F3: per-boot spend ceiling.
+
+
+def spend_client(monkeypatch, tmp_path, limit=None):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    if limit is not None:
+        monkeypatch.setenv("BENCH_SPEND_LIMIT_USD", str(limit))
+    else:
+        monkeypatch.delenv("BENCH_SPEND_LIMIT_USD", raising=False)
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+@respx.mock
+def test_spend_ceiling_refuses_at_boundary_without_upstream_call(monkeypatch, tmp_path):
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Already over the ceiling from prior runs this boot.
+        c.app.state.accumulated_spend_usd = 1.5
+        for path, body in (
+            ("/compare", {"prompt": "hi", "models": ["model/alpha"]}),
+            ("/compare/stream", {"prompt": "hi", "model": "model/alpha"}),
+        ):
+            resp = c.post(path, json=body)
+            assert resp.status_code == 402, path
+            detail = resp.json()["detail"]
+            assert "spend ceiling" in detail
+            assert "$1.5000" in detail and "$1.0000" in detail
+        # The refusal never reached upstream: no money moved.
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_spend_accumulates_across_runs_and_ignores_unpriced(monkeypatch, tmp_path):
+    def route(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(200, json=response_for(model, "hi"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        assert c.app.state.accumulated_spend_usd == 0.0
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        # Two priced alpha runs at 2.9e-5 each.
+        assert c.app.state.accumulated_spend_usd == pytest.approx(5.8e-5)
+        # An unpriced model (no entry in the price cache) does not move
+        # the counter, matching the documented semantics.
+        c.post("/compare", json={"prompt": "hi", "models": ["model/bare"]})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(5.8e-5)
+
+
+@respx.mock
+def test_stream_run_accumulates_spend(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_unset_spend_limit_never_blocks(monkeypatch, tmp_path):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with spend_client(monkeypatch, tmp_path, limit=None) as c:
+        assert c.app.state.spend_limit_usd is None
+        # Even a large accumulated figure cannot block without a limit.
+        c.app.state.accumulated_spend_usd = 1000.0
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200

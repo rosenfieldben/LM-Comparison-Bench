@@ -55,6 +55,16 @@ price (offline catalog, missing usage, errors after tokens flowed)
 are counted next to the session total as "unpriced" rather than
 silently dropped.
 
+Set `BENCH_SPEND_LIMIT_USD` (a float, unset means no limit) to cap
+estimated spend for the life of the process. Once accumulated
+estimated spend reaches the ceiling, `/compare` and `/compare/stream`
+refuse new runs with HTTP 402 and a message naming both figures,
+checked at entry before any upstream call so a refusal costs nothing;
+runs already in flight are never interrupted. The ceiling tracks
+estimates, the same catalog-price times reported-token figures the
+cards show, so unpriced results (offline catalog, missing usage) do
+not count against it. It resets when the process restarts.
+
 ## Interface
 
 The page is styled as a race-telemetry instrument (the "VOLT"
@@ -388,6 +398,10 @@ picked up without restarts, and verify by eyeball after UI changes:
   shows a visible focus ring.
 - Theme: flip the OS color scheme; the page follows without a
   reload, and both themes keep the state labels readable.
+- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set to a
+  tiny value, run until the session estimate crosses it, then run
+  again: the columns error with the ceiling message spelled out in
+  words, and no new upstream call is made.
 
 ## License
 

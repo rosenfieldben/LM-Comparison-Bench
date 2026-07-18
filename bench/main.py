@@ -212,6 +212,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+    # Per-boot spend ceiling. Unset means no limit. The figure tracked is
+    # estimated spend (catalog prices times reported tokens), the same
+    # numbers the cards show, accumulated as a plain float: one event
+    # loop makes that safe without a lock. Results the session cannot
+    # price (offline catalog, missing usage) never move the counter, so
+    # the ceiling bounds known estimated spend, not a billed total.
+    raw_limit = os.environ.get("BENCH_SPEND_LIMIT_USD")
+    app.state.spend_limit_usd = float(raw_limit) if raw_limit else None
+    app.state.accumulated_spend_usd = 0.0
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -362,6 +371,34 @@ def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     return float(total)
 
 
+def enforce_spend_limit() -> None:
+    """Refuse a run at the boundary once estimated spend hits the ceiling.
+
+    Checked at endpoint entry, before the semaphore and before any
+    upstream call, so a refusal costs nothing. Money already in flight
+    is never interrupted. The 402 names both figures so the operator
+    knows how far over the intent they are.
+    """
+    limit = app.state.spend_limit_usd
+    if limit is not None and app.state.accumulated_spend_usd >= limit:
+        raise HTTPException(
+            402,
+            "spend ceiling reached: estimated "
+            f"${app.state.accumulated_spend_usd:.4f} of ${limit:.4f} limit "
+            "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
+        )
+
+
+def record_spend(cost: float | None) -> None:
+    """Add a priced result's estimate to the accumulated spend.
+
+    None means the result could not be priced (offline catalog, missing
+    usage), and those never count against the ceiling by design.
+    """
+    if cost is not None:
+        app.state.accumulated_spend_usd += cost
+
+
 def effective_budget(budget: str, model: str) -> int:
     """The requested budget clamped to the model's published completion
     cap. Sending a budget above a model's cap is a hard 400 from some
@@ -392,6 +429,8 @@ def resolve_links(
 
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict[str, Any]:
+    enforce_spend_limit()
+
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
         # batch: the cap is on simultaneous paid calls wherever they
@@ -429,6 +468,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # time.
         for result in results:
             result["cost_usd"] = cost_usd(result, app.state.prices)
+            record_spend(result["cost_usd"])
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )
@@ -443,6 +483,9 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
 
 @app.post("/compare/stream")
 async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
+    # At entry, before the generator runs and so before the semaphore or
+    # any upstream call: a refusal must spend nothing.
+    enforce_spend_limit()
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -500,6 +543,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # failure degrades to run_id null with links dropped.
                 try:
                     result["cost_usd"] = cost_usd(result, app.state.prices)
+                    record_spend(result["cost_usd"])
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
