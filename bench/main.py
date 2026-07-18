@@ -495,9 +495,12 @@ def record_spend(cost: float | None) -> None:
     """Add a priced result's estimate to the accumulated spend.
 
     None means the result could not be priced (offline catalog, missing
-    usage), and those never count against the ceiling by design.
+    usage), and those never count against the ceiling by design. A
+    non-finite cost is refused here too: cost_usd already screens it out,
+    but the accumulator is the invariant's last line, and a single NaN
+    summed in would make the ceiling comparison permanently false.
     """
-    if cost is not None:
+    if cost is not None and math.isfinite(cost):
         app.state.accumulated_spend_usd += cost
 
 
@@ -573,14 +576,19 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # queue wait as model latency.
         budget = effective_budget(request.budget, model)
         async with app.state.upstream_semaphore:
-            # Recheck under the held slot, before run_model spends. The
-            # entry check admitted this whole batch below the limit, but a
-            # concurrent run (or an earlier model here) may since have
-            # recorded spend that crossed the ceiling; without this, every
-            # admitted model would still call upstream. On refusal return a
-            # synthetic result shaped like run_model's, error set, and make
-            # no upstream call. The batch persists as usual with the
-            # refusal row included: honest history for a run cut short.
+            # Recheck under the held slot, before run_model spends. This
+            # batch records its own spend only after the gather completes,
+            # so the recheck cannot observe an earlier model in this same
+            # batch; what it catches is spend a concurrent request (another
+            # /compare or a stream) recorded while this model waited for a
+            # slot. One batch is capped at five models, equal to
+            # MAX_CONCURRENT_UPSTREAM, so a batch's own overshoot already
+            # sits within the documented bound; the recheck stops a queued
+            # batch from spending once a concurrent run crossed the ceiling.
+            # On refusal return a synthetic result shaped like run_model's,
+            # error set, with no upstream call. The batch persists as usual
+            # with the refusal row included: honest history for a cut-short
+            # run.
             if spend_ceiling_reached():
                 return spend_refusal_result(model, budget)
             return await run_model(

@@ -1364,6 +1364,24 @@ def test_review_repro_nan_price_counts_as_unpriced_not_poison(monkeypatch, tmp_p
         assert c.app.state.accumulated_spend_usd == 0.0
 
 
+def test_review_repro_record_spend_ignores_non_finite(monkeypatch, tmp_path):
+    """Closing review: the accumulator is the spend invariant's last line.
+    cost_usd already screens non-finite totals, but record_spend must also
+    refuse them so a caller that bypassed that screen cannot poison the
+    counter; one NaN would make the ceiling comparison permanently false."""
+    from bench import main as bench_main
+
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        c.app.state.accumulated_spend_usd = 0.5
+        bench_main.record_spend(float("nan"))
+        bench_main.record_spend(float("inf"))
+        bench_main.record_spend(None)
+        assert c.app.state.accumulated_spend_usd == 0.5
+        # A finite cost still accumulates.
+        bench_main.record_spend(0.25)
+        assert c.app.state.accumulated_spend_usd == 0.75
+
+
 # ---- F1.2: post-admission spend recheck.
 
 
@@ -1431,8 +1449,9 @@ def test_review_repro_compare_rechecks_ceiling_mid_batch(monkeypatch, tmp_path):
     def route(request: httpx.Request) -> httpx.Response:
         calls["n"] += 1
         model = json.loads(request.content)["model"]
-        # The first model's run stands in for spend (from this batch or a
-        # concurrent request) crossing the ceiling; the next must then be
+        # The first call directly crosses the ceiling, standing in for a
+        # concurrent request's recorded spend (this batch's own spend is
+        # recorded only after the gather); the next model must then be
         # refused before it reaches upstream.
         if calls["n"] == 1:
             app.state.accumulated_spend_usd = 5.0
