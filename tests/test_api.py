@@ -1311,6 +1311,103 @@ def test_review_repro_nan_price_counts_as_unpriced_not_poison(monkeypatch, tmp_p
         assert c.app.state.accumulated_spend_usd == 0.0
 
 
+# ---- F1.2: post-admission spend recheck.
+
+
+@respx.mock
+async def test_review_repro_stream_rechecks_ceiling_after_admission(
+    monkeypatch, tmp_path
+):
+    """External review finding 1 (High): admission was checked only at
+    entry, so N stream requests admitted below the limit all executed even
+    after an earlier one's recorded spend crossed it, bounding overshoot by
+    lineup size rather than the semaphore. A run admitted below the ceiling
+    must be refused, before spending, if the ceiling is crossed before it
+    acquires its slot."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Admitted at entry below the limit.
+        assert c.app.state.accumulated_spend_usd == 0.0
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        # A concurrent run's spend crosses the ceiling before this one
+        # reaches its slot.
+        c.app.state.accumulated_spend_usd = 1.5
+        sem_before = c.app.state.upstream_semaphore._value
+        frames = [json.loads(f.removeprefix("data: ")) async for f in gen]
+
+        # One done frame, refusal error, run_id null, no started or delta.
+        assert [f["type"] for f in frames] == ["done"]
+        assert frames[0]["run_id"] is None
+        result = frames[0]["result"]
+        assert "refused before reaching upstream" in result["error"]
+        # Shaped like a done result: model and effective budget set, every
+        # metric and text field None.
+        assert result["model"] == "model/alpha"
+        assert result["max_tokens"] == 16384
+        for key in (
+            "response_text",
+            "latency_ms",
+            "prompt_tokens",
+            "completion_tokens",
+            "ttft_ms",
+            "cost_usd",
+            "generation_id",
+            "finish_reason",
+        ):
+            assert result[key] is None
+        # Slot returned (net zero), no upstream call, nothing persisted.
+        assert c.app.state.upstream_semaphore._value == sem_before
+        assert route.call_count == 0
+        assert c.get("/runs").json()["runs"] == []
+
+
+@respx.mock
+def test_review_repro_compare_rechecks_ceiling_mid_batch(monkeypatch, tmp_path):
+    """External review finding 1 (High): the batch endpoint checked
+    admission once at entry, so once spend crossed the ceiling mid-batch
+    every already-admitted model still called upstream. The recheck under
+    the held slot must refuse the not-yet-started models before they
+    spend, while the batch still persists with the refusal row."""
+    calls = {"n": 0}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        model = json.loads(request.content)["model"]
+        # The first model's run stands in for spend (from this batch or a
+        # concurrent request) crossing the ceiling; the next must then be
+        # refused before it reaches upstream.
+        if calls["n"] == 1:
+            app.state.accumulated_spend_usd = 5.0
+        return httpx.Response(200, json=response_for(model, "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    monkeypatch.setenv("BENCH_SPEND_LIMIT_USD", "1.0")
+    # A semaphore of one forces the two models to run one after the other,
+    # so the first's spend is visible when the second rechecks.
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        resp = c.post(
+            "/compare",
+            json={"prompt": "hi", "models": ["model/alpha", "model/alpha"]},
+        )
+        assert resp.status_code == 200
+        results = resp.json()["results"]
+        # First ran; second refused before any upstream call.
+        assert calls["n"] == 1
+        assert results[0]["error"] is None
+        assert "refused before reaching upstream" in results[1]["error"]
+        # The batch persisted, refusal row and all.
+        run_id = resp.json()["run_id"]
+        assert run_id is not None
+        detail = c.get(f"/runs/{run_id}").json()
+        assert len(detail["results"]) == 2
+        assert detail["results"][1]["error"] is not None
+
+
 # ---- F4: queued state frames.
 
 

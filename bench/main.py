@@ -432,21 +432,35 @@ def format_usd(value: float) -> str:
     return f"${whole}.{frac}"
 
 
+def spend_ceiling_reached() -> bool:
+    """True when an active ceiling has been reached by accumulated spend.
+
+    The shared predicate behind the entry check and the post-admission
+    recheck. Unpriced results never moved the counter, so this bounds
+    known estimated spend, not billed cost.
+    """
+    limit = app.state.spend_limit_usd
+    if limit is None:
+        return False
+    return bool(app.state.accumulated_spend_usd >= limit)
+
+
 def enforce_spend_limit() -> None:
     """Refuse a run at the boundary once estimated spend hits the ceiling.
 
     Checked at endpoint entry, before the semaphore and before any
     upstream call, so a refusal costs nothing. Money already in flight
     is never interrupted. The 402 names both figures so the operator
-    knows how far over the intent they are.
+    knows how far over the intent they are. A second recheck runs after
+    admission (spend_refusal_result) to close the gap where runs admitted
+    below the limit would all execute once an earlier one crossed it.
     """
-    limit = app.state.spend_limit_usd
-    if limit is not None and app.state.accumulated_spend_usd >= limit:
+    if spend_ceiling_reached():
         raise HTTPException(
             402,
             "spend ceiling reached: estimated "
             f"{format_usd(app.state.accumulated_spend_usd)} of "
-            f"{format_usd(limit)} limit "
+            f"{format_usd(app.state.spend_limit_usd)} limit "
             "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
         )
 
@@ -459,6 +473,36 @@ def record_spend(cost: float | None) -> None:
     """
     if cost is not None:
         app.state.accumulated_spend_usd += cost
+
+
+def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
+    """A synthetic result for a run refused at the post-admission recheck.
+
+    Shaped like stream_model's done() result, which is a superset of
+    run_model's and which both endpoints' response models accept. Every
+    metric and text field is None because no upstream call happened. The
+    error reuses format_usd and states plainly that the run was refused
+    before reaching upstream, so the persisted row is unambiguous that no
+    money moved.
+    """
+    return {
+        "model": model,
+        "response_text": None,
+        "latency_ms": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "error": (
+            "run refused before reaching upstream: estimated spend "
+            f"{format_usd(app.state.accumulated_spend_usd)} reached the "
+            f"{format_usd(app.state.spend_limit_usd)} ceiling "
+            "(BENCH_SPEND_LIMIT_USD); no upstream call was made"
+        ),
+        "cost_usd": None,
+        "ttft_ms": None,
+        "max_tokens": max_tokens,
+        "generation_id": None,
+        "finish_reason": None,
+    }
 
 
 def effective_budget(budget: str, model: str) -> int:
@@ -501,12 +545,23 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # honest for free: its latency clock starts internally, after
         # the slot is already held, so a queued model never reports
         # queue wait as model latency.
+        budget = effective_budget(request.budget, model)
         async with app.state.upstream_semaphore:
+            # Recheck under the held slot, before run_model spends. The
+            # entry check admitted this whole batch below the limit, but a
+            # concurrent run (or an earlier model here) may since have
+            # recorded spend that crossed the ceiling; without this, every
+            # admitted model would still call upstream. On refusal return a
+            # synthetic result shaped like run_model's, error set, and make
+            # no upstream call. The batch persists as usual with the
+            # refusal row included: honest history for a run cut short.
+            if spend_ceiling_reached():
+                return spend_refusal_result(model, budget)
             return await run_model(
                 request.prompt,
                 model,
                 app.state.client,
-                max_tokens=effective_budget(request.budget, model),
+                max_tokens=budget,
             )
 
     # gather preserves input order, which the frontend relies on to map
@@ -586,6 +641,31 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             # quietly, with no acquisition timeout.
             await app.state.upstream_semaphore.acquire()
             acquired = True
+            # Recheck the ceiling now that a slot is held, before started is
+            # set, before the clock, and before the started frame. The entry
+            # check admits every queued run below the limit; without this
+            # recheck an earlier run crossing the ceiling would not stop the
+            # ones already admitted, so overshoot would be bounded by lineup
+            # size, not by the semaphore. On refusal return the slot, emit
+            # one done frame carrying the synthetic refusal result with
+            # run_id null, and persist nothing: the refusal happened before
+            # any upstream call, exactly like a queued cancel, so there is
+            # nothing truthful to record. started stays false so the
+            # finally's abort-persist path never fires.
+            if spend_ceiling_reached():
+                release_slot()
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "done",
+                            "result": spend_refusal_result(request.model, max_tokens),
+                            "run_id": None,
+                        }
+                    )
+                    + "\n\n"
+                )
+                return
             started = True
             # Start the clock before emitting started, not after. The
             # frame and the clock mark the same instant (the sub-ms cost

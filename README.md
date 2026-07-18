@@ -63,10 +63,18 @@ trips. Once accumulated
 estimated spend reaches the ceiling, `/compare` and `/compare/stream`
 refuse new runs with HTTP 402 and a message naming both figures,
 checked at entry before any upstream call so a refusal costs nothing;
-runs already in flight are never interrupted. The ceiling tracks
-estimates, the same catalog-price times reported-token figures the
-cards show, so unpriced results (offline catalog, missing usage) do
-not count against it. It resets when the process restarts.
+runs already in flight are never interrupted. Admission is rechecked
+once more the instant a run acquires its upstream slot, so a run admitted
+below the ceiling is still refused (before it spends) if a concurrent run
+crossed the ceiling in the meantime; that refusal costs nothing and lands
+in history as an honest cut-short row. Worst-case overshoot is therefore
+bounded by the runs already executing when the ceiling trips, at most
+`MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
+cost, not by the size of the lineup. A full reservation ledger (atomic
+admission) is deliberately deferred. The ceiling tracks estimates, the
+same catalog-price times reported-token figures the cards show, so
+unpriced results (offline catalog, missing usage) do not count against
+it. It resets when the process restarts.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
