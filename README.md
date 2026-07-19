@@ -113,12 +113,25 @@ Controls sit in one console deck above the results, three rows: the
 prompt row (auto-growing monospace textarea in an inset field, plus
 the saved-prompt library), the lineup row (model chips with per-chip
 remove, All and None selection, and the Add model search), and the
-run row (the Run button, a segmented token-budget control, and a
-segmented column-density control, plus a request count and worst-case
-cost estimate when pricing is available). Density has two steps,
-comfortable and compact; compact tightens card padding and drops the
-response font a step for racing many models side by side. Unlike the
-budget (per session on purpose, it costs money), density persists.
+run row (the Run button, a Stop button, a segmented token-budget
+control, and a segmented column-density control, plus a request count
+and worst-case cost estimate when pricing is available). Density has
+two steps, comfortable and compact; compact tightens card padding and
+drops the response font a step for racing many models side by side.
+Unlike the budget (per session on purpose, it costs money), density
+persists.
+
+Stop is live only while runs are in flight. It aborts every request in
+the current comparison without clearing it: each card keeps whatever
+already streamed and switches to a muted "stopped" state (no error
+styling, no invented metrics), a card still waiting for a slot shows
+stopped with no text, and its race row stops ticking. Stopping does not
+refund anything: spend already incurred stands, and each aborted request
+disconnects its stream, so the server persists a started run as an
+aborted record (visible on the next history load, since the client never
+receives a run id) and a still-queued run not at all. After a Stop the
+in-flight count reaches zero, Run re-enables, and a fresh Run or a rerun
+works as usual.
 
 During a live run a TTFT race strip sits between the deck and the
 cards: one row per model, a shimmering meter until the first token,
@@ -142,9 +155,13 @@ text gain per-card controls in a bottom action row: copy (raw
 response text to the clipboard, with a brief "copied" confirmation),
 fold (collapse to a six line preview, "show all" to reverse), and
 diff; errored live cards add rerun. History renders as a flat strip
-of rows (timestamp, prompt, model count) with a client-side filter
-that matches prompt substrings and model ids, and loads only when
-expanded.
+of rows (timestamp, prompt, and a model count that counts distinct
+models, noting attempts separately when a rerun pushed the total above
+them, as in "1 model · 2 attempts") with a client-side filter that
+matches prompt substrings and model ids, and loads only when expanded. Opening an entry clears the current cards, race and diff and
+shows a loading state before fetching; a load that fails becomes a
+standalone failure state, so a stale comparison is never left sitting
+under the banner.
 
 ## Token budgets
 
@@ -303,7 +320,11 @@ Other endpoints:
 - `DELETE /prompts/{id}` removes a prompt; runs that used it keep
   their text, only the link is cleared
 - `POST /groups` creates a grouping id so one comparison's per-model
-  requests land as a single history entry
+  requests land as a single history entry. A group holds one prompt
+  across its runs (the first member's), enforced at run entry: a
+  `/compare` or `/compare/stream` whose `group_id` names a group already
+  holding a different prompt is a 409 before any upstream call, never a
+  post-spend rejection
 - `GET /groups/{id}` returns a group's runs with full results
 - `GET /runs` lists history, most recent first, prompt text truncated
   to 80 chars; entries are either `{type: "group", ...}` for grouped
@@ -381,6 +402,16 @@ picked up without restarts, and verify by eyeball after UI changes:
 - Save a prompt, reload the page, pick it from the dropdown, replay
   it against one model. Open History, click the old run, and confirm
   it renders identically to a live run (plus the historical banner).
+- Failed history load: run a comparison, then with devtools throttled
+  to offline (or the server stopped) open History and click the entry.
+  The cards clear to a loading then a failure state that stands alone;
+  no card from the earlier run stays visible under the failure banner.
+- Double Enter on save: open the save name row, type a name, and press
+  Enter (or click OK) twice fast. Exactly one prompt is created with no
+  lingering "already exists" error; saving under a duplicate name shows
+  the conflict, and renaming and saving again clears it. Editing the
+  prompt text while a save is in flight leaves the saved-prompt link
+  cleared rather than claiming a match that is no longer on screen.
 - Watch a slow model paint token by token next to an already
   finished fast one; the ttft metric should be visibly smaller than
   the total metric on streamed columns, and the race strip row
@@ -388,6 +419,12 @@ picked up without restarts, and verify by eyeball after UI changes:
 - Kill wifi (or the server) mid-stream: the streaming column must
   enter the error state with its partial text retained above the
   error message, not hang or go blank.
+- Stop mid-stream: run an extended prompt on a slow model and hit Stop
+  while it is thinking. The card keeps its partial text and flips to the
+  muted stopped state (not error), the race row stops ticking, Run
+  re-enables, and a fresh Run works. Open History: the stopped run is
+  there as an aborted record. Run six or more models and hit Stop while
+  one is still queued: that card reads stopped with no text.
 - Diff two live columns from similar prompts ("write a haiku about
   rain" on two models): common words flow plain, unique words tinted.
 - Diff a live column against the same model's historical run of the

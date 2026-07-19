@@ -144,6 +144,25 @@ def build_app() -> Starlette:
                 yield b"data: [DONE]\n\n"
 
             return gen()
+        if model.startswith("stub/stall"):
+            # Streams a little text, then stalls indefinitely with no
+            # [DONE] and no finish reason: the window a user Stop must be
+            # able to interrupt. The prefix lets several distinct stall
+            # ids fill the upstream slots so a further one queues. The
+            # sleeping generator is cancelled cleanly when the client
+            # disconnects.
+            async def gen():
+                for chunk in ("partial ", "text"):
+                    yield sse(
+                        {
+                            "id": "gen-stub-stall",
+                            "choices": [{"delta": {"content": chunk}}],
+                        }
+                    )
+                    await asyncio.sleep(0.02)
+                await asyncio.sleep(3600)
+
+            return gen()
         # stub/fast and anything unrecognized: quick and correct.
         return text_stream(model, reply_text(model), model.split("/")[-1])
 
