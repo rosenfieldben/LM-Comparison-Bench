@@ -102,7 +102,7 @@ def test_review_repro_group_load_clears_view_synchronously_then_fails(bench):
     # fetch. Read the DOM in the same evaluate tick to observe that window.
     sync_state = page.evaluate(
         """() => {
-          showGroup(999999);
+          BenchHistory.showGroup(999999);
           return {
             cards: document.querySelectorAll('[data-testid=result-card]').length,
             loading: document.querySelectorAll('[data-testid=history-loading]').length,
@@ -158,7 +158,7 @@ def test_review_repro_group_load_shows_loading_then_group(bench):
     # real fetch resolves.
     loading_first = page.evaluate(
         f"""() => {{
-          showGroup({gid});
+          BenchHistory.showGroup({gid});
           return document.querySelectorAll('[data-testid=history-loading]').length === 1
               && document.querySelectorAll('[data-testid=result-card]').length === 0;
         }}"""
@@ -188,7 +188,7 @@ def test_review_repro_superseded_load_stays_silent(bench):
     # tick, so the load's 404 arrives after the epoch has moved on.
     page.evaluate(
         """() => {
-          showGroup(999999);
+          BenchHistory.showGroup(999999);
           BenchStream.startRun();
         }"""
     )
