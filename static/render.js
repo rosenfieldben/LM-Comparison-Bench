@@ -424,7 +424,7 @@
       addCopy(ui, result.response_text);
       addFold(ui);
     }
-    registerDiffable(ui, result, sourceLabel);
+    BenchDiff.registerDiffable(ui, result, sourceLabel);
     // Budget note on history replay only, never live columns: two
     // attempts at different budgets are different experiments, and the
     // replay must say which is which. Pre-budget rows carry null and
