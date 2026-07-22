@@ -227,12 +227,17 @@ because a browser never sends it cross-site without a preflight.
 Everything curl sends with a JSON content type and everything the
 bundled frontend sends (it posts an empty JSON object to /groups)
 passes unchanged. Every response also carries `X-Frame-Options: DENY`
-and `Content-Security-Policy: frame-ancestors 'none'`, so the UI cannot
-be embedded in a hostile frame and a Run click cannot be redressed into
-paid work; the headers are added on response start with no body
-buffering, so streaming is untouched. A fuller CSP is deferred: the
-pre-paint inline theme script would need a hash or externalization. To
-serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
+and a full `Content-Security-Policy`: `default-src 'none'` with each
+source opened only to `'self'` (`script-src`, `style-src`, `img-src`,
+`font-src`, `connect-src`), plus `base-uri 'none'`, `form-action 'none'`,
+and `frame-ancestors 'none'`. The policy needs no `'unsafe-inline'`
+because the markup has no inline styles, the scripts create no style or
+script elements, and the fonts, favicon, and every fetch and SSE endpoint
+are same-origin; the pre-paint theme script is a same-origin file
+(`static/theme-boot.js`) rather than an inline block, which is what lets
+`script-src` stay `'self'`. The headers are added on response start with
+no body buffering, so streaming is untouched. To serve the bench beyond
+localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.
 
@@ -446,6 +451,10 @@ picked up without restarts, and verify by eyeball after UI changes:
   confirm the tags render as literal text inside the tinted spans.
 - Picker: search for a model by a name fragment, add it, run it,
   remove it, then reload the page and confirm the lineup survived.
+- CSP: with the devtools Console open, walk the whole path once (load,
+  run, stop, save, replay from History). The console stays clean; no
+  Content-Security-Policy violation is reported and nothing renders
+  unstyled or fails to fetch.
 - Boot with wifi off: the search row says the catalog is unavailable
   and the exact-id input still adds a model to the lineup.
 - Rerun: force an error (bad model id via the exact-id path) and

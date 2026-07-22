@@ -314,6 +314,29 @@ def host_header_name(host: str) -> str:
     return host
 
 
+# A strict content security policy, enforced on every response. The audit
+# behind it: index.html has no inline style attributes and no inline
+# scripts (the pre-paint theme script is a same-origin file now), the
+# scripts create no style or script elements, and the fonts, the favicon,
+# and every fetch and SSE endpoint are same-origin. So nothing needs
+# 'unsafe-inline' or a remote origin. default-src 'none' denies by default;
+# each source is opened only to 'self'. base-uri and form-action are locked
+# down so an injected <base> or form cannot exfiltrate. frame-ancestors
+# 'none' carries the old anti-framing guarantee, with X-Frame-Options: DENY
+# as the belt for browsers that predate frame-ancestors.
+CONTENT_SECURITY_POLICY = (
+    "default-src 'none'; "
+    "script-src 'self'; "
+    "style-src 'self'; "
+    "img-src 'self'; "
+    "font-src 'self'; "
+    "connect-src 'self'; "
+    "base-uri 'none'; "
+    "form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
 class LocalOnlyGuard:
     """Reject requests that could only come from a hostile browser page.
 
@@ -331,23 +354,22 @@ class LocalOnlyGuard:
             await self.app(scope, receive, send)
             return
 
-        # Deny framing on every HTTP response. A hostile page cannot read a
-        # cross-origin response, but it can frame the real localhost UI and
-        # redress a Run click into paid work; these headers refuse the
-        # frame. Modern Chrome's private-network rules blunt this, other
-        # browsers differ, and the headers cost nothing. Blanket
-        # application is deliberate: no response here is meant to be
-        # embedded. The headers are added on http.response.start only, with
-        # no buffering of the body, so SSE streaming and the generator
-        # cancellation the streaming endpoint depends on stay untouched,
-        # which is the reason this guard is pure ASGI. A fuller CSP is out
-        # of scope: the pre-paint inline theme script in index.html would
-        # need a hash or externalization, so this stops at frame-ancestors.
+        # Security headers on every HTTP response. A hostile page cannot read
+        # a cross-origin response, but it can frame the real localhost UI and
+        # redress a Run click into paid work; frame-ancestors and
+        # X-Frame-Options refuse the frame, and the full CSP denies any
+        # inline or cross-origin script, style, or connection the page was
+        # never meant to make. Blanket application is deliberate: no response
+        # here is meant to be embedded or to load foreign resources. The
+        # headers are added on http.response.start only, with no buffering of
+        # the body, so SSE streaming and the generator cancellation the
+        # streaming endpoint depends on stay untouched, which is the reason
+        # this guard is pure ASGI.
         async def framed_send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 headers = MutableHeaders(scope=message)
                 headers["x-frame-options"] = "DENY"
-                headers["content-security-policy"] = "frame-ancestors 'none'"
+                headers["content-security-policy"] = CONTENT_SECURITY_POLICY
             await send(message)
 
         headers = Headers(scope=scope)
