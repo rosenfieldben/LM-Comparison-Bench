@@ -227,7 +227,7 @@ def test_review_repro_double_save_posts_once(bench):
     # Two submitSave calls in one tick: the guard must collapse them to one
     # POST. Driving submitSave directly proves the flag, not just the
     # button's disabled state.
-    page.evaluate("() => { submitSave(); submitSave(); }")
+    page.evaluate("() => { BenchLibrary.submitSave(); BenchLibrary.submitSave(); }")
 
     expect(page.get_by_test_id("linked-name")).to_have_text(
         "linked: f2 double name", timeout=DONE_TIMEOUT
@@ -274,7 +274,7 @@ def test_review_repro_reload_preserves_live_selection(bench):
     page.get_by_test_id("saved-prompts").select_option(label="f2 sel alpha")
     expect(page.get_by_test_id("linked-name")).to_have_text("linked: f2 sel alpha")
 
-    page.evaluate("async () => { await loadPrompts(); }")
+    page.evaluate("async () => { await BenchLibrary.loadPrompts(); }")
     expect(page.get_by_test_id("linked-name")).to_have_text("linked: f2 sel alpha")
 
 
@@ -291,7 +291,7 @@ def test_review_repro_edit_during_save_leaves_no_false_link(bench):
     # longer matches, so no link is claimed.
     page.evaluate(
         """async () => {
-          const p = submitSave();
+          const p = BenchLibrary.submitSave();
           document.getElementById('prompt').value = 'changed mid-save';
           await p;
         }"""
