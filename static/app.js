@@ -87,46 +87,6 @@ const historyNote = document.getElementById("history-note");
 const raceEl = document.getElementById("race");
 const raceGrid = document.getElementById("race-grid");
 const raceScale = document.getElementById("race-scale");
-const statRuns = document.querySelector("#stat-runs .v");
-const statSpend = document.querySelector("#stat-spend .v");
-const statTtft = document.querySelector("#stat-ttft .v");
-const statLineup = document.querySelector("#stat-lineup .v");
-// ---- View epoch. The results area is owned by exactly one operation
-// ---- at a time. The reproduced races this exists to prevent: a rerun
-// ---- still streaming while a new Run reused its model name repainted
-// ---- the new run's race row; a history replay opened mid-run was
-// ---- repainted by the superseded run's late events; two rapid
-// ---- history selections rendered in arrival order, letting the
-// ---- first overwrite the second. Async work stamps the epoch it
-// ---- started under and touches shared view state only while that
-// ---- epoch is current; superseded work is aborted client-side and
-// ---- dropped silently. Its server-side persistence already happened
-// ---- through the disconnect path, so this is purely view integrity.
-let viewEpoch = 0;
-// In-flight fetches owned by the current epoch. Aborting them on
-// supersession frees the server's semaphore slot immediately and the
-// partial persists server-side.
-let epochControllers = [];
-// Runs and reruns in flight for the current epoch; the Run button
-// stays disabled while any of them is live.
-let inflightRuns = 0;
-// The epoch a Stop targeted. Stop can land while startRun is still
-// awaiting the group POST, before any per-model controller exists; a run
-// that starts up afterward sees this mark and begins already aborted, so
-// a Stop in that window halts the batch instead of being silently lost.
-let stoppedEpoch = -1;
-
-function newViewEpoch() {
-  viewEpoch += 1;
-  for (const c of epochControllers) c.abort();
-  epochControllers = [];
-  inflightRuns = 0;
-  return viewEpoch;
-}
-// Sent with the run so it links back to its saved prompt. Cleared
-// the moment the textarea is edited: the text no longer matches the
-// library entry, so the link would lie.
-let selectedPromptId = null;
 
 const addModelBtn = document.getElementById("add-model");
 const searchRow = document.getElementById("model-search");
@@ -138,27 +98,6 @@ const matchesEl = document.getElementById("model-matches");
 let catalog = { fetched: false, models: [] };
 
 document.getElementById("bar-host").textContent = location.host || "localhost:8000";
-
-// ---- Command-bar session stats. Runs, spend and mean TTFT are this
-// ---- browser session's live totals, reset by a reload on purpose:
-// ---- the bar answers "what has this sitting cost me", not history.
-const sessionStats = { runs: 0, spend: 0, unpriced: 0, ttftSum: 0, ttftN: 0 };
-
-function renderStats() {
-  statRuns.textContent = String(sessionStats.runs).padStart(2, "0");
-  // Every figure here is an estimate from catalog prices, and results
-  // the session could not price are counted rather than silently
-  // dropped: a total that quietly understates spend is worse than none.
-  statSpend.textContent =
-    "~$" + sessionStats.spend.toFixed(4) +
-    (sessionStats.unpriced > 0
-      ? " + " + sessionStats.unpriced + " unpriced"
-      : "");
-  statTtft.textContent = sessionStats.ttftN > 0
-    ? Math.round(sessionStats.ttftSum / sessionStats.ttftN) + " ms"
-    : "—";
-  statLineup.textContent = lineup.length + (lineup.length === 1 ? " model" : " models");
-}
 
 // ---- UI prefs: theme override (auto follows the OS), motion, density.
 const themeBtn = document.getElementById("theme-btn");
@@ -282,13 +221,13 @@ function renderLineup() {
       lineup = lineup.filter(m => m !== model);
       saveLineup();
       renderLineup();
-      renderStats();
+      BenchState.renderStats();
     });
     chip.append(label, rm);
     modelsEl.append(chip);
   }
   updateRunState();
-  renderStats();
+  BenchState.renderStats();
 }
 
 function checkedModels() {
@@ -356,17 +295,17 @@ function renderLinked() {
 function updateRunState() {
   const checked = checkedModels().length;
   runBtn.disabled =
-    inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
+    BenchState.inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
   // Stop is live exactly while runs are: it acts on the in-flight
   // controllers and has nothing to do when the count is zero.
-  stopBtn.disabled = inflightRuns === 0;
+  stopBtn.disabled = BenchState.inflightRuns === 0;
   deleteBtn.disabled = savedSelect.value === "";
   lineupLabel.textContent = "Lineup " + checked + "/" + lineup.length;
   renderLinked();
   updateEstimate();
 }
 promptEl.addEventListener("input", () => {
-  selectedPromptId = null;
+  BenchState.selectedPromptId = null;
   savedSelect.value = "";
   autosizePrompt();
   updateRunState();
@@ -520,10 +459,10 @@ function setPromptLibrary(prompts) {
     savedSelect.append(opt);
     ids.add(String(p.id));
   }
-  const wanted = selectedPromptId != null ? String(selectedPromptId) : "";
+  const wanted = BenchState.selectedPromptId != null ? String(BenchState.selectedPromptId) : "";
   const resolved = ids.has(wanted) ? wanted : "";
   savedSelect.value = resolved;
-  selectedPromptId = resolved === "" ? null : Number(resolved);
+  BenchState.selectedPromptId = resolved === "" ? null : Number(resolved);
   updateRunState();
 }
 
@@ -553,9 +492,9 @@ savedSelect.addEventListener("change", () => {
   promptMsg.textContent = "";
   const opt = savedSelect.selectedOptions[0];
   if (savedSelect.value === "") {
-    selectedPromptId = null;
+    BenchState.selectedPromptId = null;
   } else {
-    selectedPromptId = Number(savedSelect.value);
+    BenchState.selectedPromptId = Number(savedSelect.value);
     promptEl.value = opt.dataset.text;
     autosizePrompt();
   }
@@ -622,7 +561,7 @@ async function submitSave() {
     // Re-establish the saved-prompt link only if the textarea still
     // matches the saved text; if it changed while the save was in
     // flight, leave the link cleared rather than claim a false match.
-    selectedPromptId = promptEl.value === sentText ? saved.id : null;
+    BenchState.selectedPromptId = promptEl.value === sentText ? saved.id : null;
     await loadPrompts();
   } catch (err) {
     promptMsg.textContent = "save failed: " + err.message;
@@ -662,7 +601,7 @@ deleteBtn.addEventListener("click", async () => {
       promptMsg.textContent = "delete failed: HTTP " + resp.status;
       return;
     }
-    selectedPromptId = null;
+    BenchState.selectedPromptId = null;
     await loadPrompts();
   } catch (err) {
     promptMsg.textContent = "delete failed: " + err.message;
@@ -931,7 +870,7 @@ function renderTick(ui, entry) {
   ui.statusTime.textContent = " · " + secs + "s";
   // Race rows key by model name and a superseded run may share a name
   // with the current run, so only current-epoch ticks may touch them.
-  if (race !== null && entry.model != null && entry.epoch === viewEpoch) {
+  if (race !== null && entry.model != null && entry.epoch === BenchState.viewEpoch) {
     const row = race.rows.get(entry.model);
     if (row && row.status === "working") row.val.textContent = secs + " s";
   }
@@ -975,7 +914,7 @@ function addRerun(ui, retry) {
     resetColumn(ui);
     // Same budget as the run being retried, not the current control
     // value: a rerun is a second sample of the same experiment.
-    runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, viewEpoch);
+    runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, BenchState.viewEpoch);
   });
   ui.tools.append(btn);
 }
@@ -1218,18 +1157,18 @@ document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
 
 async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
   // Superseded before it started: spend no money for a dead view.
-  if (epoch !== viewEpoch) return;
-  const current = () => epoch === viewEpoch;
+  if (epoch !== BenchState.viewEpoch) return;
+  const current = () => epoch === BenchState.viewEpoch;
   const controller = new AbortController();
-  epochControllers.push(controller);
+  BenchState.epochControllers.push(controller);
   // A Stop that landed during this batch's startup (before this
   // controller existed) marked the epoch: begin already aborted so the
   // run halts as stopped rather than streaming to completion once its
   // slot opens. The mark is cleared when the batch settles, so a rerun
   // issued later in the same view reaches this line with it already
   // reset and runs normally.
-  if (epoch === stoppedEpoch) controller.abort();
-  inflightRuns += 1;
+  if (epoch === BenchState.stoppedEpoch) controller.abort();
+  BenchState.inflightRuns += 1;
   updateRunState();
   ui.body.classList.add("loading");
   ui.body.textContent = "awaiting first token";
@@ -1276,7 +1215,7 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
       } else {
         raceDone(model, result.ttft_ms);
       }
-      inflightRuns -= 1;
+      BenchState.inflightRuns -= 1;
       updateRunState();
     }
     // Session accounting is view-independent: money spent by a
@@ -1288,7 +1227,7 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
     // client never received it.
     if (!result.stopped) {
       if (result.cost_usd != null) {
-        sessionStats.spend += result.cost_usd;
+        BenchState.sessionStats.spend += result.cost_usd;
       } else if (
         result.response_text != null ||
         result.prompt_tokens != null ||
@@ -1297,14 +1236,14 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
         // Evidence of consumption with no price: offline catalog,
         // missing usage, or an error after tokens flowed. Counted so
         // the session total cannot quietly understate real spend.
-        sessionStats.unpriced += 1;
+        BenchState.sessionStats.unpriced += 1;
       }
       if (result.error == null && result.ttft_ms != null) {
-        sessionStats.ttftSum += result.ttft_ms;
-        sessionStats.ttftN += 1;
+        BenchState.sessionStats.ttftSum += result.ttft_ms;
+        BenchState.sessionStats.ttftN += 1;
       }
     }
-    renderStats();
+    BenchState.renderStats();
     // A superseded run's view work ends here: dropped silently, its
     // persistence already handled server-side.
     if (!current()) return;
@@ -1424,25 +1363,25 @@ async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
 // tests exercise the mechanism.
 async function startRun() {
   const prompt = promptEl.value;
-  const promptId = selectedPromptId;
+  const promptId = BenchState.selectedPromptId;
   const budget = budgetValue;
   const models = checkedModels();
-  const epoch = newViewEpoch();
+  const epoch = BenchState.newViewEpoch();
   // Reserve the in-flight registry synchronously, before the /groups
   // await below, so the Run button is disabled for the whole batch
   // startup. Without this a second click during the sub-second /groups
   // latency would start a duplicate run (double-counted runs stat,
   // orphan group row), since per-model runOne calls do not increment
   // the registry until after that await resolves.
-  inflightRuns += 1;
+  BenchState.inflightRuns += 1;
   resultsEl.replaceChildren();
   runLabelEl.textContent = "";
   // A new comparison replaces the cards a shown diff came from.
   closeDiffPanel();
   disarmDiff();
   updateRunState();
-  sessionStats.runs += 1;
-  renderStats();
+  BenchState.sessionStats.runs += 1;
+  BenchState.renderStats();
   // One request per model instead of one batch: /compare returns only when
   // its slowest model finishes, and the bench exists to watch fast models
   // land first. Cards are created up front so order tracks the chip
@@ -1458,7 +1397,7 @@ async function startRun() {
   // too: a Stop during this await then leaves the batch ungrouped and,
   // via stoppedEpoch, halts every model that was about to start.
   const groupController = new AbortController();
-  epochControllers.push(groupController);
+  BenchState.epochControllers.push(groupController);
   try {
     // The empty JSON body is load-bearing: the server requires
     // application/json on every POST so hostile cross-site senders
@@ -1488,12 +1427,12 @@ async function startRun() {
     // part of the stopped batch. Cleared regardless of supersession; if
     // it belonged to a superseded epoch no future epoch would match it
     // anyway, but leaving it set would strand a rerun in this view.
-    if (stoppedEpoch === epoch) stoppedEpoch = -1;
+    if (BenchState.stoppedEpoch === epoch) BenchState.stoppedEpoch = -1;
     // Release the batch reservation, but only if this batch still owns
     // the view: a superseding run already reset the registry to zero,
     // so decrementing here would corrupt its count.
-    if (epoch === viewEpoch) {
-      inflightRuns -= 1;
+    if (epoch === BenchState.viewEpoch) {
+      BenchState.inflightRuns -= 1;
       updateRunState();
     }
   }
@@ -1515,8 +1454,8 @@ function stopRuns() {
   // Mark the epoch stopped before aborting, so a per-model run still
   // starting up (its controller not yet in the list because startRun is
   // mid group-POST) begins already aborted rather than streaming on.
-  stoppedEpoch = viewEpoch;
-  for (const c of epochControllers) c.abort();
+  BenchState.stoppedEpoch = BenchState.viewEpoch;
+  for (const c of BenchState.epochControllers) c.abort();
 }
 stopBtn.addEventListener("click", stopRuns);
 
@@ -1637,10 +1576,10 @@ async function showGroup(groupId) {
   // Owns the view from the click: in-flight runs for the old view are
   // aborted now, and this fetch is itself abortable by whatever
   // supersedes it.
-  const epoch = newViewEpoch();
+  const epoch = BenchState.newViewEpoch();
   updateRunState();
   const controller = new AbortController();
-  epochControllers.push(controller);
+  BenchState.epochControllers.push(controller);
   // Clear the old view and show a loading state before any network
   // activity begins; the old cards must be gone before the fetch.
   renderHistoryState(
@@ -1658,7 +1597,7 @@ async function showGroup(groupId) {
     // A superseded load stays silent; its replacement already owns the
     // view. Otherwise the loading state becomes a failure that stands
     // alone: banner and grid agree and no other run's cards are visible.
-    if (epoch !== viewEpoch) return;
+    if (epoch !== BenchState.viewEpoch) return;
     renderHistoryState(
       "failed to load comparison #" + groupId + ": " + err.message,
       "history-failure", "failure",
@@ -1666,7 +1605,7 @@ async function showGroup(groupId) {
     );
     return;
   }
-  if (epoch !== viewEpoch) return;
+  if (epoch !== BenchState.viewEpoch) return;
   // Replace the loading state with the comparison. Race and diff were
   // already cleared when the loading state was rendered.
   resultsEl.replaceChildren();
@@ -1694,10 +1633,10 @@ async function showGroup(groupId) {
 
 async function showRun(runId) {
   // Same ownership rule as showGroup.
-  const epoch = newViewEpoch();
+  const epoch = BenchState.newViewEpoch();
   updateRunState();
   const controller = new AbortController();
-  epochControllers.push(controller);
+  BenchState.epochControllers.push(controller);
   renderHistoryState(
     "Loading run #" + runId,
     "history-loading", "loading", "loading run"
@@ -1708,7 +1647,7 @@ async function showRun(runId) {
     if (!resp.ok) throw new Error("HTTP " + resp.status);
     run = await resp.json();
   } catch (err) {
-    if (epoch !== viewEpoch) return;
+    if (epoch !== BenchState.viewEpoch) return;
     renderHistoryState(
       "failed to load run #" + runId + ": " + err.message,
       "history-failure", "failure",
@@ -1716,7 +1655,7 @@ async function showRun(runId) {
     );
     return;
   }
-  if (epoch !== viewEpoch) return;
+  if (epoch !== BenchState.viewEpoch) return;
   // Same completion renderer as a live run so the textContent and
   // null-content guarantees hold for stored data too. Race and diff were
   // cleared with the loading state.

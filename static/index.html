@@ -135,7 +135,11 @@
 </details>
 </div>
 
+<!-- Classic scripts in dependency order: the order is load-bearing.
+     Each module assigns its window.Bench* namespace, and later modules
+     read earlier ones, so a reorder breaks the page at load. -->
 <script src="/static/lib.js"></script>
+<script src="/static/state.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
