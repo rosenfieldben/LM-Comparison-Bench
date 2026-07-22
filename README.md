@@ -371,18 +371,24 @@ the runtime pins too. There are two suites:
 
 # pure frontend helpers: no build step, no npm install
 node --test "tests/js/**/*.test.js"
+
+# front-end format and lint (pinned Biome; a local npx fallback)
+npx --yes @biomejs/biome@1.9.4 check static/ tests/js/
 ```
 
-No network access needed for any of them; unit tests mock OpenRouter
+No network access needed for the suites; unit tests mock OpenRouter
 with respx, the browser suite boots the real app under uvicorn in
 headless Chromium against a stub OpenRouter it starts itself
 (`tests/browser/`), and the node suite requires `static/lib.js`
 directly through its CommonJS guard to check the diff engine and the
 formatting helpers. Browser tests are deselected from a plain
-`pytest` run on purpose. CI enforces all of it: a lint job (ruff and
-mypy), the unit matrix across Python 3.11 through 3.14, the node
-job, and the browser job, so neither a backend nor a frontend change
-can merge without proving the critical path still works.
+`pytest` run on purpose. Biome formats and lints the front-end module
+scripts against the committed `biome.jsonc`; the pinned `npx` above is
+the local fallback, and CI runs the same version from a checksum-verified
+binary (no package.json, no npm install). CI enforces all of it: a lint
+job (ruff and mypy), the unit matrix across Python 3.11 through 3.14, the
+node job, the Biome job, and the browser job, so neither a backend nor a
+frontend change can merge without proving the critical path still works.
 
 The stability contract for future frontend work: the harness selects
 elements by `data-testid` attributes (and user-visible text), never

@@ -51,6 +51,27 @@ jobs:
           node-version: "22"
       - run: node --test "tests/js/**/*.test.js"
 
+  # Front-end static gate: Biome formats and lints the module scripts and
+  # the js test. The binary is fetched at a pinned version from the npm
+  # registry and checksum-verified before it runs, matching the SHA-pin
+  # ethos of the actions above, with no package.json and no npm install.
+  biome:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Fetch the pinned Biome binary, checksum-verified
+        run: |
+          set -euo pipefail
+          curl -sSL -o biome.tgz \
+            https://registry.npmjs.org/@biomejs/cli-linux-x64/-/cli-linux-x64-1.9.4.tgz
+          echo "3e38f0368640ac9d25cca30199a4070ee6179f330d9f0f432aac6e21020269d7  biome.tgz" \
+            | sha256sum -c -
+          tar xzf biome.tgz
+          echo "ce247fb644999ef52e5111dd6fd6e471019669fc9c4a44b5699721e39b7032c3  package/biome" \
+            | sha256sum -c -
+          chmod +x package/biome
+      - run: ./package/biome ci static/ tests/js/
+
   # The every-merge gate for the frontend: the critical-path suite in
   # tests/browser drives the real app in headless Chromium against a
   # stub upstream, so a frontend change must prove the critical path
