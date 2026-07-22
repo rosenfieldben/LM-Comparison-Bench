@@ -70,7 +70,7 @@
       ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) + " ms"
       : "—";
     statLineup.textContent =
-      lineup.length + (lineup.length === 1 ? " model" : " models");
+      window.BenchControls.lineup.length + (window.BenchControls.lineup.length === 1 ? " model" : " models");
   }
 
   window.BenchState = state;
