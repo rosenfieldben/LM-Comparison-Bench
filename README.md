@@ -96,12 +96,16 @@ does `prefers-reduced-motion`, which disables animation regardless
 of the toggle. All colors, spacing steps, radii and type sizes live
 as CSS custom properties in one `:root` block at the top of
 `static/volt.css`, so the next visual change is a token edit, not
-a hunt through rules. The front end is three static files with no
-build step: `static/index.html` (markup plus a pre-paint theme
-script, the stylesheet link, and two script tags), `static/lib.js`
-(the pure, DOM-free helpers, including the diff engine), and
-`static/app.js` (everything that touches the document). All three are
-served from the `/static` mount.
+a hunt through rules. The front end has no build step. `static/index.html`
+holds the markup, a pre-paint theme script, the stylesheet link, and the
+module script tags in dependency order. `static/lib.js` holds the pure,
+DOM-free helpers, including the diff engine. The DOM logic is split by
+concern into small classic scripts, each assigning one `window.Bench*`
+namespace: `state`, `controls`, `render`, `diff`, `library`, `stream`,
+and `history`, with `boot.js` wiring them last. Cross-file access goes
+through the namespaces, so a load-order mistake fails loudly rather than
+silently at click time; the script order in index.html is load-bearing.
+All are served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
 run count, estimated spend (with a count of unpriced results when any
