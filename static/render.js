@@ -312,7 +312,7 @@
       resetColumn(ui);
       // Same budget as the run being retried, not the current control
       // value: a rerun is a second sample of the same experiment.
-      runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, BenchState.viewEpoch);
+      BenchStream.runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, BenchState.viewEpoch);
     });
     ui.tools.append(btn);
   }

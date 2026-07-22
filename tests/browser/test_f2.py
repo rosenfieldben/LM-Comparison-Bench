@@ -48,7 +48,7 @@ def start_superseding_run(page, prompt):
     # the named starter directly (it returns undefined, so evaluate does
     # not block until the run finishes).
     page.get_by_test_id("prompt-input").fill(prompt)
-    page.evaluate("() => { startRun(); }")
+    page.evaluate("() => { BenchStream.startRun(); }")
 
 
 def open_history(page):
@@ -189,7 +189,7 @@ def test_review_repro_superseded_load_stays_silent(bench):
     page.evaluate(
         """() => {
           showGroup(999999);
-          startRun();
+          BenchStream.startRun();
         }"""
     )
     expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
@@ -436,7 +436,7 @@ def test_review_repro_stop_during_group_creation_halts_run(bench):
     # empty-prompt guard) once the batch settles.
     page.get_by_test_id("prompt-input").fill("f2 stop during groups")
     # startRun creates the cards, then awaits the held /groups POST.
-    page.evaluate("() => { startRun(); }")
+    page.evaluate("() => { BenchStream.startRun(); }")
     expect(page.get_by_test_id("stop-button")).to_be_enabled()
     page.get_by_test_id("stop-button").click()
 
