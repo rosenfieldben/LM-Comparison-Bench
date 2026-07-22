@@ -8,11 +8,24 @@ on:
     branches: [main]
   pull_request:
 
+# CI only reads the repo; nothing here writes to it. The default token is
+# narrowed to read so a compromised step cannot push, comment, or release.
+permissions:
+  contents: read
+
+# One in-flight run per ref. A superseding push to a pull request cancels
+# the previous run so it stops burning minutes; runs on main are left to
+# finish so every commit keeps a complete run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Static gate: format, lint, and strict types on the backend. One
   # interpreter is enough; these tools are version-agnostic here.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -25,6 +38,7 @@ jobs:
 
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       # The supported floor plus the newer interpreters. 3.13 and 3.14
       # ship cp3xx wheels for the one compiled pin (pydantic-core), and
@@ -44,6 +58,7 @@ jobs:
   # install, no dependencies.
   js:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -57,6 +72,7 @@ jobs:
   # ethos of the actions above, with no package.json and no npm install.
   biome:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - name: Fetch the pinned Biome binary, checksum-verified
@@ -79,6 +95,7 @@ jobs:
   # interpreter, is what this job exercises.
   browser:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -100,6 +117,7 @@ jobs:
   # the compile floor (3.11), the version the closure was pinned under.
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
