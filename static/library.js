@@ -37,7 +37,9 @@
       ids.add(String(p.id));
     }
     const wanted =
-      BenchState.selectedPromptId != null ? String(BenchState.selectedPromptId) : "";
+      BenchState.selectedPromptId != null
+        ? String(BenchState.selectedPromptId)
+        : "";
     const resolved = ids.has(wanted) ? wanted : "";
     savedSelect.value = resolved;
     BenchState.selectedPromptId = resolved === "" ? null : Number(resolved);
@@ -110,7 +112,8 @@
       // Re-establish the saved-prompt link only if the textarea still
       // matches the saved text; if it changed while the save was in
       // flight, leave the link cleared rather than claim a false match.
-      BenchState.selectedPromptId = promptEl.value === sentText ? saved.id : null;
+      BenchState.selectedPromptId =
+        promptEl.value === sentText ? saved.id : null;
       await loadPrompts();
     } catch (err) {
       promptMsg.textContent = "save failed: " + err.message;
@@ -165,12 +168,19 @@
       if (libraryBusy) return;
       const opt = savedSelect.selectedOptions[0];
       if (savedSelect.value === "") return;
-      if (!window.confirm(`Delete saved prompt "${opt.textContent}"? Run history is kept.`)) return;
+      if (
+        !window.confirm(
+          `Delete saved prompt "${opt.textContent}"? Run history is kept.`,
+        )
+      )
+        return;
       promptMsg.textContent = "";
       libraryBusy = true;
       deleteBtn.disabled = true;
       try {
-        const resp = await fetch("/prompts/" + savedSelect.value, { method: "DELETE" });
+        const resp = await fetch("/prompts/" + savedSelect.value, {
+          method: "DELETE",
+        });
         if (!resp.ok && resp.status !== 404) {
           promptMsg.textContent = "delete failed: HTTP " + resp.status;
           return;

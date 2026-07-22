@@ -62,15 +62,19 @@
     // the session could not price are counted rather than silently
     // dropped: a total that quietly understates spend is worse than none.
     statSpend.textContent =
-      "~$" + state.sessionStats.spend.toFixed(4) +
+      "~$" +
+      state.sessionStats.spend.toFixed(4) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");
-    statTtft.textContent = state.sessionStats.ttftN > 0
-      ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) + " ms"
-      : "—";
+    statTtft.textContent =
+      state.sessionStats.ttftN > 0
+        ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) +
+          " ms"
+        : "—";
     statLineup.textContent =
-      window.BenchControls.lineup.length + (window.BenchControls.lineup.length === 1 ? " model" : " models");
+      window.BenchControls.lineup.length +
+      (window.BenchControls.lineup.length === 1 ? " model" : " models");
   }
 
   window.BenchState = state;

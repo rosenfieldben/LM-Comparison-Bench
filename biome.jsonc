@@ -1,0 +1,39 @@
+{
+  "$schema": "https://biomejs.dev/schemas/1.9.4/schema.json",
+  "files": {
+    "include": ["static/*.js", "tests/js/**/*.js"]
+  },
+  "vcs": {
+    "enabled": false
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 80
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "style": {
+        // The front end builds strings by concatenation throughout, on
+        // purpose and consistently; converting a scattered handful to
+        // template literals would fragment the style, not improve it.
+        "useTemplate": "off"
+      },
+      "complexity": {
+        // Every module is an immediately-invoked function expression, the
+        // pattern lib.js established for a self-contained namespace with no
+        // global leakage. Arrow IIFEs would deviate from it for no gain.
+        "useArrowFunction": "off"
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "trailingCommas": "all"
+    }
+  }
+}

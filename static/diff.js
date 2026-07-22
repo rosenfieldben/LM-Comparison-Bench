@@ -88,7 +88,9 @@
     // both-text-and-error contract) is diffable and labeled as such.
     if (result.response_text == null || sourceLabel == null) return;
     const label = sourceLabel + (result.error != null ? " (partial)" : "");
-    const btn = BenchRender.toolButton(result.error != null ? "diff (partial)" : "diff");
+    const btn = BenchRender.toolButton(
+      result.error != null ? "diff (partial)" : "diff",
+    );
     btn.dataset.testid = "tool-diff";
     btn.classList.add("diff-btn");
     btn.dataset.base = btn.textContent;
@@ -112,7 +114,9 @@
   }
 
   function init() {
-    document.getElementById("diff-close").addEventListener("click", closeDiffPanel);
+    document
+      .getElementById("diff-close")
+      .addEventListener("click", closeDiffPanel);
   }
 
   window.BenchDiff = { closeDiffPanel, disarmDiff, registerDiffable, init };

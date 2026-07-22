@@ -59,7 +59,11 @@
       row.className = "hrow";
       row.dataset.testid = "history-row";
       // The filter matches model ids even though rows only show a count.
-      row.dataset.hay = (run.prompt_text + " " + run.models.join(" ")).toLowerCase();
+      row.dataset.hay = (
+        run.prompt_text +
+        " " +
+        run.models.join(" ")
+      ).toLowerCase();
       const time = document.createElement("span");
       time.className = "htime";
       // Labeled like the replay banner: an unlabeled timestamp reads as
@@ -77,7 +81,8 @@
       // rerun group reads "1 model · 2 attempts" not "2 models".
       const uniqueModels = new Set(run.models).size;
       const attempts = run.models.length;
-      let countText = uniqueModels + (uniqueModels === 1 ? " model" : " models");
+      let countText =
+        uniqueModels + (uniqueModels === 1 ? " model" : " models");
       if (attempts > uniqueModels) {
         countText += " · " + attempts + " attempts";
       }
@@ -85,7 +90,7 @@
       row.append(time, text, count);
       row.title = run.models.join(", ");
       row.addEventListener("click", () =>
-        run.type === "group" ? showGroup(run.id) : showRun(run.id)
+        run.type === "group" ? showGroup(run.id) : showRun(run.id),
       );
       historyList.append(row);
     }
@@ -129,7 +134,9 @@
     // activity begins; the old cards must be gone before the fetch.
     renderHistoryState(
       "Loading comparison #" + groupId,
-      "history-loading", "loading", "loading comparison"
+      "history-loading",
+      "loading",
+      "loading comparison",
     );
     let group;
     try {
@@ -145,8 +152,9 @@
       if (epoch !== BenchState.viewEpoch) return;
       renderHistoryState(
         "failed to load comparison #" + groupId + ": " + err.message,
-        "history-failure", "failure",
-        "could not load this comparison; nothing from another run is shown"
+        "history-failure",
+        "failure",
+        "could not load this comparison; nothing from another run is shown",
       );
       return;
     }
@@ -155,22 +163,26 @@
     // already cleared when the loading state was rendered.
     resultsEl.replaceChildren();
     runLabelEl.textContent =
-      "Historical comparison #" + group.id + " from " +
-      group.created_at.slice(0, 19).replace("T", " ") + " UTC";
+      "Historical comparison #" +
+      group.id +
+      " from " +
+      group.created_at.slice(0, 19).replace("T", " ") +
+      " UTC";
     // Cards in chip (lineup) order, matching the live layout. Runs
     // persist in completion order, so run order alone would shuffle
     // cards between replays; models no longer in the lineup keep run
     // order at the end.
-    const results = group.runs.flatMap(r => r.results);
-    const rank = m => {
+    const results = group.runs.flatMap((r) => r.results);
+    const rank = (m) => {
       const i = BenchControls.lineup.indexOf(m);
       return i === -1 ? BenchControls.lineup.length : i;
     };
     results.sort((a, b) => rank(a.model) - rank(b.model));
     for (const result of results) {
       BenchRender.fillColumn(
-        BenchRender.makeColumn(result.model), result,
-        result.model + ", comparison #" + group.id
+        BenchRender.makeColumn(result.model),
+        result,
+        result.model + ", comparison #" + group.id,
       );
     }
     window.scrollTo({ top: 0 });
@@ -184,7 +196,9 @@
     BenchState.epochControllers.push(controller);
     renderHistoryState(
       "Loading run #" + runId,
-      "history-loading", "loading", "loading run"
+      "history-loading",
+      "loading",
+      "loading run",
     );
     let run;
     try {
@@ -195,8 +209,9 @@
       if (epoch !== BenchState.viewEpoch) return;
       renderHistoryState(
         "failed to load run #" + runId + ": " + err.message,
-        "history-failure", "failure",
-        "could not load this run; nothing from another run is shown"
+        "history-failure",
+        "failure",
+        "could not load this run; nothing from another run is shown",
       );
       return;
     }
@@ -206,10 +221,17 @@
     // cleared with the loading state.
     resultsEl.replaceChildren();
     runLabelEl.textContent =
-      "Historical run #" + run.id + " from " +
-      run.created_at.slice(0, 19).replace("T", " ") + " UTC";
+      "Historical run #" +
+      run.id +
+      " from " +
+      run.created_at.slice(0, 19).replace("T", " ") +
+      " UTC";
     for (const result of run.results) {
-      BenchRender.fillColumn(BenchRender.makeColumn(result.model), result, result.model + ", run #" + run.id);
+      BenchRender.fillColumn(
+        BenchRender.makeColumn(result.model),
+        result,
+        result.model + ", run #" + run.id,
+      );
     }
     window.scrollTo({ top: 0 });
   }

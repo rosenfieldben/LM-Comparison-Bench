@@ -40,7 +40,14 @@
       val.className = "race-val";
       wrap.append(rank, name, meter, val);
       raceGrid.append(wrap);
-      race.rows.set(model, { wrap, rank, fill, val, ttft: null, status: "working" });
+      race.rows.set(model, {
+        wrap,
+        rank,
+        fill,
+        val,
+        ttft: null,
+        status: "working",
+      });
     }
     raceEl.hidden = false;
     raceRender();
@@ -94,13 +101,20 @@
     if (race === null) return;
     const rows = [...race.rows.values()];
     const ranked = rows
-      .filter(r => r.status === "ttft" && r.ttft != null)
+      .filter((r) => r.status === "ttft" && r.ttft != null)
       .sort((a, b) => a.ttft - b.ttft);
-    const scale = niceScale(ranked.length > 0 ? ranked[ranked.length - 1].ttft : 0);
+    const scale = niceScale(
+      ranked.length > 0 ? ranked[ranked.length - 1].ttft : 0,
+    );
     raceScale.textContent = "scale 0–" + scale + " ms";
-    raceEl.classList.toggle("live", rows.some(r => r.status === "working"));
+    raceEl.classList.toggle(
+      "live",
+      rows.some((r) => r.status === "working"),
+    );
     for (const r of rows) r.rankN = null;
-    ranked.forEach((r, i) => { r.rankN = i + 1; });
+    ranked.forEach((r, i) => {
+      r.rankN = i + 1;
+    });
     for (const r of rows) {
       r.wrap.className =
         "race-row " + r.status + (r.rankN === 1 ? " fastest" : "");
@@ -221,7 +235,12 @@
     card.append(header, shimmer, metrics, body, tools);
     resultsEl.append(card);
     const ui = {
-      card, name, statusWord, statusTime, tools, body,
+      card,
+      name,
+      statusWord,
+      statusTime,
+      tools,
+      body,
       metrics: { ttft: ttft.v, total: total.v, tok: tok.v, cost: cost.v },
     };
     setState(ui, "working");
@@ -268,7 +287,11 @@
     ui.statusTime.textContent = " · " + secs + "s";
     // Race rows key by model name and a superseded run may share a name
     // with the current run, so only current-epoch ticks may touch them.
-    if (race !== null && entry.model != null && entry.epoch === BenchState.viewEpoch) {
+    if (
+      race !== null &&
+      entry.model != null &&
+      entry.epoch === BenchState.viewEpoch
+    ) {
       const row = race.rows.get(entry.model);
       if (row && row.status === "working") row.val.textContent = secs + " s";
     }
@@ -312,7 +335,15 @@
       resetColumn(ui);
       // Same budget as the run being retried, not the current control
       // value: a rerun is a second sample of the same experiment.
-      BenchStream.runOne(retry.prompt, retry.model, retry.promptId, retry.groupId, retry.budget, ui, BenchState.viewEpoch);
+      BenchStream.runOne(
+        retry.prompt,
+        retry.model,
+        retry.promptId,
+        retry.groupId,
+        retry.budget,
+        ui,
+        BenchState.viewEpoch,
+      );
     });
     ui.tools.append(btn);
   }
@@ -323,13 +354,21 @@
     }
     if (result.latency_ms != null) {
       if (result.latency_ms < 1000) {
-        setMetric(ui.metrics.total, String(Math.round(result.latency_ms)), "ms");
+        setMetric(
+          ui.metrics.total,
+          String(Math.round(result.latency_ms)),
+          "ms",
+        );
       } else {
         setMetric(ui.metrics.total, (result.latency_ms / 1000).toFixed(2), "s");
       }
     }
     if (result.prompt_tokens != null && result.completion_tokens != null) {
-      setMetric(ui.metrics.tok, result.prompt_tokens + "/" + result.completion_tokens, null);
+      setMetric(
+        ui.metrics.tok,
+        result.prompt_tokens + "/" + result.completion_tokens,
+        null,
+      );
     }
     if (result.cost_usd != null) {
       setMetric(ui.metrics.cost, fmtCost(result.cost_usd), null);
@@ -396,7 +435,8 @@
     if (!opts.streamed) {
       // textContent on purpose: model output is untrusted and must never
       // be parsed as HTML. pre-wrap in CSS keeps line breaks readable.
-      ui.body.textContent = result.response_text != null ? result.response_text : "";
+      ui.body.textContent =
+        result.response_text != null ? result.response_text : "";
     }
     fillMetrics(ui, result);
     if (opts.unsaved) {
@@ -446,8 +486,20 @@
   }
 
   window.BenchRender = {
-    raceInit, raceRestart, raceTtft, raceError, raceStopped, raceDone,
-    hideRace, makeColumn, completeColumn, fillColumn, setMetric,
-    startTicker, stopTicker, toolButton, tickers,
+    raceInit,
+    raceRestart,
+    raceTtft,
+    raceError,
+    raceStopped,
+    raceDone,
+    hideRace,
+    makeColumn,
+    completeColumn,
+    fillColumn,
+    setMetric,
+    startTicker,
+    stopTicker,
+    toolButton,
+    tickers,
   };
 })();

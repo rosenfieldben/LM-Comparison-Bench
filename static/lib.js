@@ -63,9 +63,10 @@
     const dp = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
     for (let i = 1; i <= n; i += 1) {
       for (let j = 1; j <= m; j += 1) {
-        dp[i][j] = a[i - 1].key === b[j - 1].key
-          ? dp[i - 1][j - 1] + 1
-          : Math.max(dp[i - 1][j], dp[i][j - 1]);
+        dp[i][j] =
+          a[i - 1].key === b[j - 1].key
+            ? dp[i - 1][j - 1] + 1
+            : Math.max(dp[i - 1][j], dp[i][j - 1]);
       }
     }
     const ops = [];
@@ -86,8 +87,14 @@
         j -= 1;
       }
     }
-    while (i > 0) { ops.push({ op: "del", raw: a[i - 1].raw }); i -= 1; }
-    while (j > 0) { ops.push({ op: "ins", raw: b[j - 1].raw }); j -= 1; }
+    while (i > 0) {
+      ops.push({ op: "del", raw: a[i - 1].raw });
+      i -= 1;
+    }
+    while (j > 0) {
+      ops.push({ op: "ins", raw: b[j - 1].raw });
+      j -= 1;
+    }
     return ops.reverse();
   }
 

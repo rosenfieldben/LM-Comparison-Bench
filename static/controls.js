@@ -24,7 +24,7 @@
   function loadLineup() {
     try {
       const parsed = JSON.parse(localStorage.getItem(LINEUP_KEY));
-      if (Array.isArray(parsed) && parsed.every(x => typeof x === "string")) {
+      if (Array.isArray(parsed) && parsed.every((x) => typeof x === "string")) {
         return parsed;
       }
     } catch (err) {
@@ -188,7 +188,7 @@
       rm.title = "Remove from lineup";
       rm.setAttribute("aria-label", "Remove " + model + " from lineup");
       rm.addEventListener("click", () => {
-        C.lineup = C.lineup.filter(m => m !== model);
+        C.lineup = C.lineup.filter((m) => m !== model);
         saveLineup();
         renderLineup();
         BS.renderStats();
@@ -201,7 +201,7 @@
   }
 
   function checkedModels() {
-    return [...modelsEl.querySelectorAll("input:checked")].map(b => b.value);
+    return [...modelsEl.querySelectorAll("input:checked")].map((b) => b.value);
   }
 
   function setAllChecked(on) {
@@ -234,19 +234,21 @@
       let est = 0;
       let computable = true;
       for (const id of models) {
-        const m = catalog.models.find(x => x.id === id);
+        const m = catalog.models.find((x) => x.id === id);
         if (!m || m.completion_price == null) {
           computable = false;
           break;
         }
-        const cap = m.max_completion_tokens != null
-          ? Math.min(m.max_completion_tokens, BUDGET_TOKENS[C.budgetValue])
-          : BUDGET_TOKENS[C.budgetValue];
+        const cap =
+          m.max_completion_tokens != null
+            ? Math.min(m.max_completion_tokens, BUDGET_TOKENS[C.budgetValue])
+            : BUDGET_TOKENS[C.budgetValue];
         est += m.completion_price * cap;
       }
       if (computable) {
         text +=
-          " · max output cost $" + fmtEstimate(est) +
+          " · max output cost $" +
+          fmtEstimate(est) +
           "/run (input not included)";
       }
     }
@@ -255,9 +257,8 @@
 
   function renderLinked() {
     const opt = savedSelect.selectedOptions[0];
-    linkedEl.textContent = savedSelect.value !== "" && opt
-      ? "linked: " + opt.textContent
-      : "";
+    linkedEl.textContent =
+      savedSelect.value !== "" && opt ? "linked: " + opt.textContent : "";
   }
 
   function updateRunState() {
@@ -305,8 +306,10 @@
     // Per-million dollars: per-token floats are unreadable, and
     // per-million is how every provider quotes.
     return (
-      "$" + (m.prompt_price * 1e6).toFixed(2) +
-      " / $" + (m.completion_price * 1e6).toFixed(2) +
+      "$" +
+      (m.prompt_price * 1e6).toFixed(2) +
+      " / $" +
+      (m.completion_price * 1e6).toFixed(2) +
       " per 1M in/out"
     );
   }
@@ -317,9 +320,10 @@
     const q = queryInput.value.trim().toLowerCase();
     if (q === "") return;
     const hits = catalog.models
-      .filter(m =>
-        m.id.toLowerCase().includes(q) ||
-        (m.name || "").toLowerCase().includes(q)
+      .filter(
+        (m) =>
+          m.id.toLowerCase().includes(q) ||
+          (m.name || "").toLowerCase().includes(q),
       )
       .slice(0, 15);
     for (const m of hits) {
@@ -388,9 +392,11 @@
       prefSet("bench-density", v);
     });
 
-    document.getElementById("select-all")
+    document
+      .getElementById("select-all")
       .addEventListener("click", () => setAllChecked(true));
-    document.getElementById("select-none")
+    document
+      .getElementById("select-none")
       .addEventListener("click", () => setAllChecked(false));
 
     promptEl.addEventListener("input", () => {

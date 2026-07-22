@@ -43,7 +43,11 @@
         // sharing a model name with the new one must not repaint it.
         if (entry && current()) {
           const ttftMs = performance.now() - entry.start;
-          BenchRender.setMetric(ui.metrics.ttft, String(Math.round(ttftMs)), "ms");
+          BenchRender.setMetric(
+            ui.metrics.ttft,
+            String(Math.round(ttftMs)),
+            "ms",
+          );
           BenchRender.raceTtft(model, ttftMs);
         }
         BenchRender.stopTicker(ui);
@@ -123,9 +127,10 @@
         // Only this streaming path offers a rerun; historical replays go
         // through fillColumn and never get one. A stopped run has no error,
         // so it gets no rerun control.
-        retry: result.error != null
-          ? { prompt, model, promptId, groupId, budget }
-          : null,
+        retry:
+          result.error != null
+            ? { prompt, model, promptId, groupId, budget }
+            : null,
         // A user Stop renders as an honest stopped state, not done or error.
         stopped: result.stopped === true,
       });
@@ -168,7 +173,7 @@
         while ((sep = buf.indexOf("\n\n")) !== -1) {
           const frame = buf.slice(0, sep);
           buf = buf.slice(sep + 2);
-          const line = frame.split("\n").find(l => l.startsWith("data:"));
+          const line = frame.split("\n").find((l) => l.startsWith("data:"));
           if (!line) continue;
           const event = JSON.parse(line.slice(5));
           if (event.type === "delta") {
@@ -203,11 +208,14 @@
       // run is unknown from here (its disconnect path usually does), so
       // no not-saved warning is claimed.
       const stopped = err.name === "AbortError" && current();
-      finish({
-        error: stopped ? null : "request failed: " + err.message,
-        response_text: textNode !== null ? textNode.data : null,
-        stopped: stopped,
-      }, undefined);
+      finish(
+        {
+          error: stopped ? null : "request failed: " + err.message,
+          response_text: textNode !== null ? textNode.data : null,
+          stopped: stopped,
+        },
+        undefined,
+      );
     }
   }
 
@@ -269,8 +277,8 @@
     try {
       await Promise.allSettled(
         models.map((model, i) =>
-          runOne(prompt, model, promptId, groupId, budget, columns[i], epoch)
-        )
+          runOne(prompt, model, promptId, groupId, budget, columns[i], epoch),
+        ),
       );
     } finally {
       // The stop mark exists only to catch this batch's own models when a
