@@ -170,6 +170,7 @@
         if (done) break;
         buf += decoder.decode(value, { stream: true });
         let sep;
+        // biome-ignore lint/suspicious/noAssignInExpressions: the SSE frame split reads and advances the buffer in one loop condition
         while ((sep = buf.indexOf("\n\n")) !== -1) {
           const frame = buf.slice(0, sep);
           buf = buf.slice(sep + 2);
