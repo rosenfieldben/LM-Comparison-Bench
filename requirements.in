@@ -1,0 +1,15 @@
+# Direct runtime dependencies, the human edit surface. requirements.txt is
+# the compiled, hashed, fully-pinned closure: edit here, then recompile
+# (see the README test section). Pins are exact so a recompile reproduces
+# the same closure rather than drifting to a newer minor.
+#
+# The closure is compiled under the Python floor (3.11). Cross-version
+# environment markers are the known risk: a newer interpreter in the CI
+# matrix could need a dependency the 3.11 compile did not pin. The matrix
+# (3.11 through 3.14, installing with --require-hashes) is the standing
+# proof; if a leg fails resolution, constrain the offender here and
+# recompile rather than dropping the hashes.
+fastapi==0.139.2
+uvicorn==0.51.0
+httpx==0.28.1
+pydantic==2.13.4

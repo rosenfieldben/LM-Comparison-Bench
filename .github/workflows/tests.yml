@@ -18,7 +18,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy bench
@@ -36,7 +36,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - run: pytest
 
   # Pure-function frontend tests. static/lib.js is DOM-free and has a
@@ -84,7 +84,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - name: Cache Playwright browser binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -92,3 +92,18 @@ jobs:
           key: playwright-${{ runner.os }}-1.61.0
       - run: playwright install --with-deps chromium
       - run: pytest -m browser -q
+
+  # Dependency audit: pip-audit checks the pinned closure against known
+  # advisories and fails on any of them. An advisory that must be waived
+  # goes in --ignore-vuln with an adjacent comment carrying the advisory
+  # id, the reason, and the revisit condition; no silent ignores. Runs on
+  # the compile floor (3.11), the version the closure was pinned under.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - run: pip install --require-hashes -r requirements-dev.txt
+      - run: pip-audit -r requirements-dev.txt

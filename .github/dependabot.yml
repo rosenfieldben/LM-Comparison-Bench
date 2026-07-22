@@ -3,6 +3,10 @@
 # hardening survives its updates.
 version: 2
 updates:
+  # The pip ecosystem understands the pip-compile layout: it bumps the
+  # direct pins in the .in files and regenerates the hashed .txt outputs,
+  # so no config change is needed for the hashed-constraints move. The
+  # ruff-bump-plus-reformat-commit convention still stands.
   - package-ecosystem: "pip"
     directory: "/"
     schedule:

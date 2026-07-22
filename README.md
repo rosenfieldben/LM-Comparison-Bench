@@ -362,7 +362,23 @@ instead of freezing the tab.
 ## Tests
 
 Test-only dependencies live in `requirements-dev.txt`, which pulls in
-the runtime pins too. There are two suites:
+the runtime pins too. That file and `requirements.txt` are compiled,
+hashed outputs, not the edit surface: the direct dependencies live in
+`requirements.in` and `requirements-dev.in`, and after editing one of
+those, recompile with pip-tools (from the repo root, under the 3.11
+floor):
+
+```sh
+.venv/bin/pip-compile --allow-unsafe --generate-hashes \
+  --output-file=requirements.txt requirements.in
+.venv/bin/pip-compile --allow-unsafe --generate-hashes \
+  --output-file=requirements-dev.txt requirements-dev.in
+```
+
+The install command is unchanged (the compiled files keep their names);
+CI installs with `--require-hashes`, which is what turns the hashes into
+enforcement, and a dedicated `audit` job runs `pip-audit` over the pinned
+closure. There are two test suites:
 
 ```sh
 .venv/bin/pip install -r requirements-dev.txt
