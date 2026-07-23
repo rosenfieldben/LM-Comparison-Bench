@@ -1,0 +1,17 @@
+# Direct dev/test dependencies, the human edit surface. Pulls in the
+# runtime pins, then adds the test and tooling deps. requirements-dev.txt
+# is the compiled, hashed closure.
+#
+# Starlette's TestClient warns that using httpx rather than httpx2 is
+# deprecated (the unit suite prints it once). Migrating to httpx2 is
+# deferred; tracked here where the pins live.
+-r requirements.in
+respx==0.23.1
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-playwright==0.8.0
+playwright==1.61.0
+ruff==0.15.22
+mypy==2.3.0
+hypothesis==6.156.6
+pip-audit==2.10.1

@@ -2,7 +2,7 @@
 
 The view-epoch tests reproduce the review's races and assert they are
 gone: a superseded run's late events must never repaint the view that
-replaced it. Superseding runs are started via the named startRun()
+replaced it. Superseding runs are started via the named BenchStream.startRun()
 where the Run button's disabled state would block the UI path; the
 button is the affordance, the epoch is the mechanism under test.
 
@@ -49,7 +49,7 @@ def start_superseding_run(page, prompt):
     # block either, and tests that inspect the run mid-flight need it
     # actually in flight.
     page.get_by_test_id("prompt-input").fill(prompt)
-    page.evaluate("() => { startRun(); }")
+    page.evaluate("() => { BenchStream.startRun(); }")
 
 
 def collect_page_errors(page):
@@ -304,13 +304,13 @@ def test_run_button_reserved_synchronously_before_group_fetch(bench):
     # startRun runs synchronously up to its first await (the /groups
     # POST). The batch reservation must disable the button in that
     # synchronous stretch, or a second click during the /groups latency
-    # starts a duplicate run. Calling startRun() and reading
+    # starts a duplicate run. Calling BenchStream.startRun() and reading
     # runBtn.disabled in the same evaluate observes exactly that window.
     page = bench(["stub/fast"])
     check_chip(page, 0)
     page.get_by_test_id("prompt-input").fill("reservation")
     disabled_in_window = page.evaluate(
-        "() => { startRun(); return document.getElementById('run').disabled; }"
+        "() => { BenchStream.startRun(); return document.getElementById('run').disabled; }"
     )
     assert disabled_in_window is True
     # The run still completes and re-enables the button afterward.

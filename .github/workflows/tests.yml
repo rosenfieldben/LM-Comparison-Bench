@@ -8,23 +8,37 @@ on:
     branches: [main]
   pull_request:
 
+# CI only reads the repo; nothing here writes to it. The default token is
+# narrowed to read so a compromised step cannot push, comment, or release.
+permissions:
+  contents: read
+
+# One in-flight run per ref. A superseding push to a pull request cancels
+# the previous run so it stops burning minutes; runs on main are left to
+# finish so every commit keeps a complete run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Static gate: format, lint, and strict types on the backend. One
   # interpreter is enough; these tools are version-agnostic here.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy bench
 
   tests:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     strategy:
       # The supported floor plus the newer interpreters. 3.13 and 3.14
       # ship cp3xx wheels for the one compiled pin (pydantic-core), and
@@ -36,7 +50,7 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - run: pytest
 
   # Pure-function frontend tests. static/lib.js is DOM-free and has a
@@ -44,12 +58,35 @@ jobs:
   # install, no dependencies.
   js:
     runs-on: ubuntu-latest
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "22"
       - run: node --test "tests/js/**/*.test.js"
+
+  # Front-end static gate: Biome formats and lints the module scripts and
+  # the js test. The binary is fetched at a pinned version from the npm
+  # registry and checksum-verified before it runs, matching the SHA-pin
+  # ethos of the actions above, with no package.json and no npm install.
+  biome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Fetch the pinned Biome binary, checksum-verified
+        run: |
+          set -euo pipefail
+          curl -sSL -o biome.tgz \
+            https://registry.npmjs.org/@biomejs/cli-linux-x64/-/cli-linux-x64-1.9.4.tgz
+          echo "3e38f0368640ac9d25cca30199a4070ee6179f330d9f0f432aac6e21020269d7  biome.tgz" \
+            | sha256sum -c -
+          tar xzf biome.tgz
+          echo "ce247fb644999ef52e5111dd6fd6e471019669fc9c4a44b5699721e39b7032c3  package/biome" \
+            | sha256sum -c -
+          chmod +x package/biome
+      - run: ./package/biome ci static/ tests/js/
 
   # The every-merge gate for the frontend: the critical-path suite in
   # tests/browser drives the real app in headless Chromium against a
@@ -58,12 +95,13 @@ jobs:
   # interpreter, is what this job exercises.
   browser:
     runs-on: ubuntu-latest
+    timeout-minutes: 8
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
-      - run: pip install -r requirements-dev.txt
+      - run: pip install --require-hashes -r requirements-dev.txt
       - name: Cache Playwright browser binaries
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -71,3 +109,19 @@ jobs:
           key: playwright-${{ runner.os }}-1.61.0
       - run: playwright install --with-deps chromium
       - run: pytest -m browser -q
+
+  # Dependency audit: pip-audit checks the pinned closure against known
+  # advisories and fails on any of them. An advisory that must be waived
+  # goes in --ignore-vuln with an adjacent comment carrying the advisory
+  # id, the reason, and the revisit condition; no silent ignores. Runs on
+  # the compile floor (3.11), the version the closure was pinned under.
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - run: pip install --require-hashes -r requirements-dev.txt
+      - run: pip-audit -r requirements-dev.txt

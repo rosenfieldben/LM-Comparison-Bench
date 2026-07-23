@@ -5,22 +5,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="dark light">
 <title>LM Comparison Bench</title>
-<script>
-  // UI prefs must be on <html> before first paint or the page flashes
-  // the defaults. The main script re-reads these and wires the toggles.
-  (function () {
-    try {
-      var t = localStorage.getItem("bench-theme");
-      if (t === "dark" || t === "light") document.documentElement.dataset.theme = t;
-      if (localStorage.getItem("bench-motion") === "off") {
-        document.documentElement.dataset.motion = "off";
-      }
-      if (localStorage.getItem("bench-density") === "compact") {
-        document.documentElement.dataset.density = "compact";
-      }
-    } catch (err) { /* storage blocked: defaults apply */ }
-  })();
-</script>
+<!-- Blocking, in <head> on purpose: the pre-paint prefs must be on <html>
+     before first paint or the page flashes the defaults. Externalized from
+     an inline block so the CSP needs no script-src 'unsafe-inline'. -->
+<script src="/static/theme-boot.js"></script>
 <link rel="stylesheet" href="/static/volt.css">
 </head>
 <body>
@@ -135,7 +123,17 @@
 </details>
 </div>
 
+<!-- Classic scripts in dependency order: the order is load-bearing.
+     Each module assigns its window.Bench* namespace, and later modules
+     read earlier ones, so a reorder breaks the page at load. -->
 <script src="/static/lib.js"></script>
-<script src="/static/app.js"></script>
+<script src="/static/state.js"></script>
+<script src="/static/controls.js"></script>
+<script src="/static/render.js"></script>
+<script src="/static/diff.js"></script>
+<script src="/static/library.js"></script>
+<script src="/static/stream.js"></script>
+<script src="/static/history.js"></script>
+<script src="/static/boot.js"></script>
 </body>
 </html>

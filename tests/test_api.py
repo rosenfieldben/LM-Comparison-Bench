@@ -458,14 +458,33 @@ def test_review_repro_clean_eof_persists_as_error(client):
     assert "no [DONE]" in persisted["error"]
 
 
+def _assert_full_csp(csp: str) -> None:
+    # The full policy (F3.3): default-deny with every source at 'self', the
+    # inline and remote origins closed, and frame-ancestors carried over.
+    for directive in (
+        "default-src 'none'",
+        "script-src 'self'",
+        "style-src 'self'",
+        "img-src 'self'",
+        "font-src 'self'",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'none'",
+        "frame-ancestors 'none'",
+    ):
+        assert directive in csp, f"missing CSP directive: {directive}"
+    assert "unsafe-inline" not in csp
+
+
 def test_review_repro_index_denies_framing(client):
     """External review finding 4: nothing stopped a hostile page from
     framing the localhost UI and redressing a Run click into paid work.
-    Every response must carry anti-framing headers."""
+    Every response must carry the anti-framing headers, now inside the
+    full content security policy (F3.3)."""
     resp = client.get("/")
     assert resp.status_code == 200
     assert resp.headers["x-frame-options"] == "DENY"
-    assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+    _assert_full_csp(resp.headers["content-security-policy"])
 
 
 @respx.mock
@@ -481,7 +500,7 @@ def test_review_repro_stream_response_denies_framing(client):
     ) as resp:
         assert resp.status_code == 200
         assert resp.headers["x-frame-options"] == "DENY"
-        assert resp.headers["content-security-policy"] == "frame-ancestors 'none'"
+        _assert_full_csp(resp.headers["content-security-policy"])
         resp.read()
 
 

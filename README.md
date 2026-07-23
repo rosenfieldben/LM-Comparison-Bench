@@ -96,12 +96,16 @@ does `prefers-reduced-motion`, which disables animation regardless
 of the toggle. All colors, spacing steps, radii and type sizes live
 as CSS custom properties in one `:root` block at the top of
 `static/volt.css`, so the next visual change is a token edit, not
-a hunt through rules. The front end is three static files with no
-build step: `static/index.html` (markup plus a pre-paint theme
-script, the stylesheet link, and two script tags), `static/lib.js`
-(the pure, DOM-free helpers, including the diff engine), and
-`static/app.js` (everything that touches the document). All three are
-served from the `/static` mount.
+a hunt through rules. The front end has no build step. `static/index.html`
+holds the markup, a pre-paint theme script, the stylesheet link, and the
+module script tags in dependency order. `static/lib.js` holds the pure,
+DOM-free helpers, including the diff engine. The DOM logic is split by
+concern into small classic scripts, each assigning one `window.Bench*`
+namespace: `state`, `controls`, `render`, `diff`, `library`, `stream`,
+and `history`, with `boot.js` wiring them last. Cross-file access goes
+through the namespaces, so a load-order mistake fails loudly rather than
+silently at click time; the script order in index.html is load-bearing.
+All are served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
 run count, estimated spend (with a count of unpriced results when any
@@ -223,12 +227,17 @@ because a browser never sends it cross-site without a preflight.
 Everything curl sends with a JSON content type and everything the
 bundled frontend sends (it posts an empty JSON object to /groups)
 passes unchanged. Every response also carries `X-Frame-Options: DENY`
-and `Content-Security-Policy: frame-ancestors 'none'`, so the UI cannot
-be embedded in a hostile frame and a Run click cannot be redressed into
-paid work; the headers are added on response start with no body
-buffering, so streaming is untouched. A fuller CSP is deferred: the
-pre-paint inline theme script would need a hash or externalization. To
-serve the bench beyond localhost deliberately, edit `TRUSTED_HOSTS`
+and a full `Content-Security-Policy`: `default-src 'none'` with each
+source opened only to `'self'` (`script-src`, `style-src`, `img-src`,
+`font-src`, `connect-src`), plus `base-uri 'none'`, `form-action 'none'`,
+and `frame-ancestors 'none'`. The policy needs no `'unsafe-inline'`
+because the markup has no inline styles, the scripts create no style or
+script elements, and the fonts, favicon, and every fetch and SSE endpoint
+are same-origin; the pre-paint theme script is a same-origin file
+(`static/theme-boot.js`) rather than an inline block, which is what lets
+`script-src` stay `'self'`. The headers are added on response start with
+no body buffering, so streaming is untouched. To serve the bench beyond
+localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.
 
@@ -353,7 +362,23 @@ instead of freezing the tab.
 ## Tests
 
 Test-only dependencies live in `requirements-dev.txt`, which pulls in
-the runtime pins too. There are two suites:
+the runtime pins too. That file and `requirements.txt` are compiled,
+hashed outputs, not the edit surface: the direct dependencies live in
+`requirements.in` and `requirements-dev.in`, and after editing one of
+those, recompile with pip-tools (from the repo root, under the 3.11
+floor):
+
+```sh
+.venv/bin/pip-compile --allow-unsafe --generate-hashes \
+  --output-file=requirements.txt requirements.in
+.venv/bin/pip-compile --allow-unsafe --generate-hashes \
+  --output-file=requirements-dev.txt requirements-dev.in
+```
+
+The install command is unchanged (the compiled files keep their names);
+CI installs with `--require-hashes`, which is what turns the hashes into
+enforcement, and a dedicated `audit` job runs `pip-audit` over the pinned
+closure. There are two test suites:
 
 ```sh
 .venv/bin/pip install -r requirements-dev.txt
@@ -367,18 +392,24 @@ the runtime pins too. There are two suites:
 
 # pure frontend helpers: no build step, no npm install
 node --test "tests/js/**/*.test.js"
+
+# front-end format and lint (pinned Biome; a local npx fallback)
+npx --yes @biomejs/biome@1.9.4 check static/ tests/js/
 ```
 
-No network access needed for any of them; unit tests mock OpenRouter
+No network access needed for the suites; unit tests mock OpenRouter
 with respx, the browser suite boots the real app under uvicorn in
 headless Chromium against a stub OpenRouter it starts itself
 (`tests/browser/`), and the node suite requires `static/lib.js`
 directly through its CommonJS guard to check the diff engine and the
 formatting helpers. Browser tests are deselected from a plain
-`pytest` run on purpose. CI enforces all of it: a lint job (ruff and
-mypy), the unit matrix across Python 3.11 through 3.14, the node
-job, and the browser job, so neither a backend nor a frontend change
-can merge without proving the critical path still works.
+`pytest` run on purpose. Biome formats and lints the front-end module
+scripts against the committed `biome.jsonc`; the pinned `npx` above is
+the local fallback, and CI runs the same version from a checksum-verified
+binary (no package.json, no npm install). CI enforces all of it: a lint
+job (ruff and mypy), the unit matrix across Python 3.11 through 3.14, the
+node job, the Biome job, and the browser job, so neither a backend nor a
+frontend change can merge without proving the critical path still works.
 
 The stability contract for future frontend work: the harness selects
 elements by `data-testid` attributes (and user-visible text), never
@@ -436,6 +467,10 @@ picked up without restarts, and verify by eyeball after UI changes:
   confirm the tags render as literal text inside the tinted spans.
 - Picker: search for a model by a name fragment, add it, run it,
   remove it, then reload the page and confirm the lineup survived.
+- CSP: with the devtools Console open, walk the whole path once (load,
+  run, stop, save, replay from History). The console stays clean; no
+  Content-Security-Policy violation is reported and nothing renders
+  unstyled or fails to fetch.
 - Boot with wifi off: the search row says the catalog is unavailable
   and the exact-id input still adds a model to the lineup.
 - Rerun: force an error (bad model id via the exact-id path) and

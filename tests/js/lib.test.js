@@ -52,7 +52,10 @@ test("tokenizeDiff keeps spacing in raw and keys on the bare word", () => {
 });
 
 test("diffTokens marks deletions, insertions, and shared text", () => {
-  const ops = diffTokens(tokenizeDiff("the quick fox"), tokenizeDiff("the slow fox"));
+  const ops = diffTokens(
+    tokenizeDiff("the quick fox"),
+    tokenizeDiff("the slow fox"),
+  );
   const sames = ops.filter((o) => o.op === "same").map((o) => o.raw.trim());
   assert.ok(sames.includes("the"));
   assert.ok(sames.includes("fox"));
@@ -61,7 +64,10 @@ test("diffTokens marks deletions, insertions, and shared text", () => {
 });
 
 test("diffTokens on identical input is all 'same'", () => {
-  const ops = diffTokens(tokenizeDiff("same text here"), tokenizeDiff("same text here"));
+  const ops = diffTokens(
+    tokenizeDiff("same text here"),
+    tokenizeDiff("same text here"),
+  );
   assert.ok(ops.every((o) => o.op === "same"));
 });
 
