@@ -18,9 +18,10 @@
     // A Stop that landed during this batch's startup (before this
     // controller existed) marked the epoch: begin already aborted so the
     // run halts as stopped rather than streaming to completion once its
-    // slot opens. The mark is cleared when the batch settles, so a rerun
-    // issued later in the same view reaches this line with it already
-    // reset and runs normally.
+    // slot opens. The mark exists only while startRun's group-POST window
+    // is open, and startRun's finally clears it when the batch settles, so
+    // a standalone rerun issued later in this same view reaches this line
+    // with no mark set and runs normally.
     if (epoch === BenchState.stoppedEpoch) controller.abort();
     BenchState.inflightRuns += 1;
     BenchControls.updateRunState();
@@ -261,6 +262,11 @@
     // via stoppedEpoch, halts every model that was about to start.
     const groupController = new AbortController();
     BenchState.epochControllers.push(groupController);
+    // Open the batch-startup window. Until the finally below closes it,
+    // this epoch has runs that do not exist yet and so cannot be aborted
+    // directly; that is the only situation the stop mark is for, and
+    // stopRuns consults this to decide whether to set one.
+    BenchState.pendingBatchEpoch = epoch;
     try {
       // The empty JSON body is load-bearing: the server requires
       // application/json on every POST so hostile cross-site senders
@@ -282,14 +288,16 @@
         ),
       );
     } finally {
-      // The stop mark exists only to catch this batch's own models when a
-      // Stop lands during the group-POST await, before their controllers
-      // exist. Once the batch has settled, every such run has passed its
-      // startup check, so clear the mark: a later rerun reuses this epoch
-      // (it stays in the same view) and must not be aborted as if it were
-      // part of the stopped batch. Cleared regardless of supersession; if
-      // it belonged to a superseded epoch no future epoch would match it
-      // anyway, but leaving it set would strand a rerun in this view.
+      // Close the batch-startup window and drop any mark it produced. Every
+      // run this batch will ever launch has now passed its startup check, so
+      // the mark has done its job; leaving it set was the defect, because a
+      // later standalone rerun reuses this epoch (Stop does not advance the
+      // view) and would begin already aborted. Cleared regardless of
+      // supersession: a superseded epoch matches no future run anyway, but a
+      // stale mark would strand a rerun in this view.
+      if (BenchState.pendingBatchEpoch === epoch) {
+        BenchState.pendingBatchEpoch = -1;
+      }
       if (BenchState.stoppedEpoch === epoch) BenchState.stoppedEpoch = -1;
       // Release the batch reservation, but only if this batch still owns
       // the view: a superseding run already reset the registry to zero,
@@ -309,14 +317,19 @@
   // a later Run or rerun works through the untouched epoch machinery. The
   // abort disconnects each stream, so the server persists a started run
   // through its existing disconnect path and a queued run not at all,
-  // exactly as the cards show. The stop mark set here lives only until the
-  // stopped batch settles (startRun clears it in its finally), so a rerun
-  // issued afterward in this same view is unaffected.
+  // exactly as the cards show.
   function stopRuns() {
-    // Mark the epoch stopped before aborting, so a per-model run still
-    // starting up (its controller not yet in the list because startRun is
-    // mid group-POST) begins already aborted rather than streaming on.
-    BenchState.stoppedEpoch = BenchState.viewEpoch;
+    // The mark is only for runs that have no controller yet because
+    // startRun is still awaiting the group POST. Setting it unconditionally
+    // was the defect: with no batch pending (a Stop of a standalone rerun),
+    // nothing clears it, so it outlived its stop and every later rerun in
+    // the view began already aborted and rendered stopped. Aborting the
+    // registered controllers is what stops everything that has started, and
+    // runOne registers synchronously, so a Stop with no pending batch needs
+    // no mark at all.
+    if (BenchState.pendingBatchEpoch === BenchState.viewEpoch) {
+      BenchState.stoppedEpoch = BenchState.viewEpoch;
+    }
     for (const c of BenchState.epochControllers) c.abort();
   }
 

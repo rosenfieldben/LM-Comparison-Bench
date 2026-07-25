@@ -30,12 +30,17 @@
     // Runs and reruns in flight for the current epoch; the Run button
     // stays disabled while any of them is live.
     inflightRuns: 0,
-    // The epoch a Stop targeted. Stop can land while startRun is still
-    // awaiting the group POST, before any per-model controller exists; a
-    // run that starts up afterward sees this mark and begins already
-    // aborted, so a Stop in that window halts the batch instead of being
-    // silently lost.
+    // The epoch a Stop targeted, and the epoch whose batch startup is
+    // still pending. These exist only for the group-POST window: runOne
+    // registers its controller synchronously, so any run that has started
+    // is stoppable by direct abort, and the ONLY runs a Stop cannot reach
+    // are the ones startRun has not launched yet because it is awaiting
+    // the group POST. pendingBatchEpoch marks that window open (set by
+    // startRun before the POST, cleared in its finally), and stopRuns sets
+    // stoppedEpoch only while it is open, so the mark cannot outlive the
+    // window it belongs to. Both -1 means no window and no mark.
     stoppedEpoch: -1,
+    pendingBatchEpoch: -1,
     // Sent with the run so it links back to its saved prompt. Cleared
     // the moment the textarea is edited: the text no longer matches the
     // library entry, so the link would lie.
