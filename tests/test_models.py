@@ -855,3 +855,251 @@ async def test_review_repro_finish_reason_without_done_not_flagged(client):
     assert result["response_text"] == "Hello"
     assert result["error"] is None
     assert result["finish_reason"] == "stop"
+
+
+# ---- G2: billed truth, read in-band.
+
+# The full usage object as OpenRouter sends it: cost is the charge,
+# cost_details is the BYOK-only upstream figure, and the two details
+# objects carry the token breakdowns that never appear in the answer.
+FULL_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8,
+    "cost": 0.000031,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 512},
+    "prompt_tokens_details": {"cached_tokens": 9},
+}
+
+
+@respx.mock
+async def test_billed_cost_and_token_breakdown_are_ingested(client):
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            **FIXTURE,
+            "provider": "Fireworks",
+            "usage": FULL_USAGE,
+            "choices": [
+                {**FIXTURE["choices"][0], "native_finish_reason": "STOP_SEQUENCE"}
+            ],
+        }
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["billed_cost_usd"] == 0.000031
+    assert result["reasoning_tokens"] == 512
+    assert result["cached_tokens"] == 9
+    assert result["provider"] == "Fireworks"
+    assert result["native_finish_reason"] == "STOP_SEQUENCE"
+    # The normalized value is untouched by the native one arriving.
+    assert result["finish_reason"] == "stop"
+
+
+@respx.mock
+async def test_stream_ingests_billed_cost_and_provider(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse(
+                        {
+                            "id": "gen-1",
+                            "provider": "Together",
+                            "choices": [{"delta": {"content": "Hi"}}],
+                        }
+                    ),
+                    sse(
+                        {
+                            "choices": [
+                                {
+                                    "delta": {},
+                                    "finish_reason": "stop",
+                                    "native_finish_reason": "eos",
+                                }
+                            ]
+                        }
+                    ),
+                    sse({"choices": [], "usage": FULL_USAGE}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["error"] is None
+    assert result["billed_cost_usd"] == 0.000031
+    assert result["reasoning_tokens"] == 512
+    assert result["cached_tokens"] == 9
+    assert result["provider"] == "Together"
+    assert result["native_finish_reason"] == "eos"
+
+
+@respx.mock
+async def test_absent_usage_details_leave_the_new_fields_none(client):
+    """Most providers send a bare usage object. Its absence of detail is
+    not a failure and must not be guessed at."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["prompt_tokens"] == 13
+    for field in ("billed_cost_usd", "reasoning_tokens", "cached_tokens"):
+        assert result[field] is None, field
+    # The captured fixture is a real DeepSeek response, so it does carry
+    # the two provenance strings; only the usage detail is missing.
+    assert result["provider"] == "DeepSeek"
+    assert result["native_finish_reason"] == "stop"
+
+
+@pytest.mark.parametrize("poison", [float("nan"), float("-inf"), -0.5, "1e-5", True])
+@respx.mock
+async def test_review_repro_poisoned_billed_cost_degrades_to_none(client, poison):
+    """The F.1 money rule on the new field. A NaN makes every ceiling
+    comparison false, silently disabling the ceiling; a negative charge
+    walks the accumulated total backward and buys headroom that was never
+    earned; a string raises on the first arithmetic. All of them must
+    degrade to None, and none of them may error a result the money was
+    already spent on."""
+    # Encoded by hand rather than through respx's json= helper: httpx
+    # refuses to serialize NaN and infinity, and a bare NaN token is
+    # exactly what a misbehaving provider puts on the wire and what the
+    # client's own json parsing accepts on the way back in.
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps({**FIXTURE, "usage": {"cost": poison}}),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["billed_cost_usd"] is None
+    assert result["error"] is None
+    assert result["response_text"] is not None
+
+
+@respx.mock
+async def test_review_repro_stream_poisoned_billed_cost_degrades_to_none(client):
+    """Same rule on the streaming path, where the usage object rides the
+    final chunk and the deltas are already on the wire when it lands."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hi"),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {**FULL_USAGE, "cost": float("nan")},
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["billed_cost_usd"] is None
+    assert result["error"] is None
+    assert result["response_text"] == "Hi"
+    # The rest of the usage object survives its poisoned neighbour.
+    assert result["reasoning_tokens"] == 512
+
+
+@respx.mock
+async def test_non_dict_usage_details_do_not_raise(client):
+    """The never-raises contract one level down: a provider sending a
+    string where a details object belongs must degrade, not crash."""
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            **FIXTURE,
+            "usage": {
+                "prompt_tokens": 13,
+                "completion_tokens": 8,
+                "completion_tokens_details": "n/a",
+                "prompt_tokens_details": None,
+            },
+        }
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["reasoning_tokens"] is None
+    assert result["cached_tokens"] is None
+
+
+@respx.mock
+async def test_non_string_provider_degrades_to_none(client):
+    """Junk in a provenance field never reaches persistence: a dict bound
+    into a sqlite text column would roll back the whole run."""
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            **FIXTURE,
+            "provider": {"name": "Fireworks"},
+            "choices": [{**FIXTURE["choices"][0], "native_finish_reason": 7}],
+        }
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["error"] is None
+    assert result["provider"] is None
+    assert result["native_finish_reason"] is None
+
+
+@respx.mock
+async def test_empty_provider_string_is_absent_not_blank(client):
+    """An empty caption reads as a layout fault, so "" is absence."""
+    respx.post(OPENROUTER_URL).respond(json={**FIXTURE, "provider": ""})
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["provider"] is None
+
+
+@respx.mock
+async def test_a_later_usage_object_without_cost_does_not_leave_a_stale_charge(client):
+    """Last usage object wins, entirely. A stream that reports usage twice
+    must not leave the first object's cost standing beside the second
+    object's token counts: that row would claim a charge the platform did
+    not reconfirm."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hi"),
+                    sse({"choices": [], "usage": FULL_USAGE}),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {"prompt_tokens": 13, "completion_tokens": 8},
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    result = events[-1]["result"]
+    assert result["billed_cost_usd"] is None
+    assert result["reasoning_tokens"] is None
+    assert result["cached_tokens"] is None
+    assert result["completion_tokens"] == 8

@@ -49,25 +49,40 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
-Cost per result is computed from OpenRouter's price list, fetched
-once at startup. If that fetch fails (offline, outage), the bench
-still boots and runs; cost just shows as unavailable for the
-session. Every cost figure the bench displays is an estimate and is
-marked with a tilde: catalog prices times the token counts providers
-report, not billed cost, and the pre-run figure covers the worst-case
-output side only (input is not estimated). The persisted generation
-id is the hook for reconciling against OpenRouter's authoritative
-per-generation numbers as future work. Results the session cannot
-price (offline catalog, missing usage, errors after tokens flowed)
-are counted next to the session total as "unpriced" rather than
-silently dropped.
+Every response carries a `usage` object reporting what OpenRouter
+actually charged, and that billed figure is the number a card and the
+session total show, without a tilde. Beside it the bench keeps its own
+estimate, computed from OpenRouter's price list fetched once at startup:
+catalog prices times the token counts providers report. The estimate is
+always marked with a tilde and stays reachable in the cost cell's
+tooltip, because a gap between the two says something about the provider
+that served the run. When no billed figure arrives, the estimate is the
+whole display, exactly as before. If the price fetch fails (offline,
+outage) the bench still boots and runs; only the estimate is
+unavailable for the session, and the pre-run figure (which is an
+estimate by nature, since nothing has been charged yet) covers the
+worst-case output side only, input not included.
+
+Results the session can price by neither route (no usage object, an
+offline catalog, errors after tokens flowed) are counted next to the
+session total as "unpriced" rather than silently dropped. A poisoned
+money value is treated as no value: a cost that is not a finite,
+non-negative number degrades to nothing, so it cannot subtract from a
+total or turn every ceiling comparison false.
+
+Each card also reports the hidden reasoning tokens the response burned
+(billed as completion tokens, counted against the budget, invisible in
+the answer) and the provider that served it. Routing is by throughput,
+so the provider is chosen per request and can differ between two runs of
+the same model; naming it per run makes the largest confound in a
+comparison visible rather than assumed away.
 
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
-cap estimated spend for the life of the process. An invalid value
+cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message
 naming the variable, rather than silently producing a ceiling that never
 trips. Once accumulated
-estimated spend reaches the ceiling, `/compare` and `/compare/stream`
+spend reaches the ceiling, `/compare` and `/compare/stream`
 refuse new runs with HTTP 402 and a message naming both figures,
 checked at entry before any upstream call so a refusal costs nothing;
 runs already in flight are never interrupted. Admission is rechecked
@@ -78,10 +93,12 @@ in history as an honest cut-short row. Worst-case overshoot is therefore
 bounded by the runs already executing when the ceiling trips, at most
 `MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
 cost, not by the size of the lineup. A full reservation ledger (atomic
-admission) is deliberately deferred. The ceiling tracks estimates, the
-same catalog-price times reported-token figures the cards show, so
-unpriced results (offline catalog, missing usage) do not count against
-it. It resets when the process restarts.
+admission) is deliberately deferred. The ceiling counts each result
+once, using its billed cost when the platform reported one and the
+catalog estimate otherwise: it is advisory, and advising from real
+charges beats advising from catalog arithmetic. Results that are
+unpriced by both routes do not count against it. It resets when the
+process restarts.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
@@ -115,8 +132,9 @@ silently at click time; the script order in index.html is load-bearing.
 All are served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
-run count, estimated spend (with a count of unpriced results when any
-run could not be priced), mean TTFT of completed requests, and
+run count, spend (tilde-marked while any contribution to it was an
+estimate, with a count of unpriced results when any run could not be
+priced by either route), mean TTFT of completed requests, and
 lineup size. They are this browser session's totals and reset on
 reload.
 
@@ -279,7 +297,13 @@ column it occupied (`position`, so a replay rebuilds the original
 side-by-side layout from the rows instead of from a lineup that has
 since been edited) and the exact payload that was sent (`request_json`,
 authorization excluded, since auth travels in headers and never in the
-body).
+body). Each result also records what the platform reported about the
+exchange: the amount charged (`billed_cost_usd`), the hidden reasoning
+and discounted cached token counts (`reasoning_tokens`,
+`cached_tokens`), the host that served it (`provider`), and that host's
+own word for why generation ended (`native_finish_reason`, beside
+OpenRouter's normalized `finish_reason`). `quantization` is reserved for
+the reconcile path, since it is not reported in-band.
 
 Databases from before these columns existed are migrated in place on
 the next start, additively: nothing is renamed, dropped or retyped, old

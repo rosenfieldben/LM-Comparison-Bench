@@ -6,7 +6,12 @@
 // stream and diff modules, which load later; they are called only at
 // click/completion time, so the globals exist by then.
 (function () {
-  const { shortName, fmtCost, niceScale } = window.BenchLib;
+  const { shortName, fmtCost, fmtBilled, niceScale } = window.BenchLib;
+
+  // The cost cell's default explanation, restored on reset so a rerun of a
+  // billed run does not keep claiming the previous attempt's charge.
+  const COST_ESTIMATE_TITLE =
+    "estimated from catalog prices and reported tokens; not billed cost";
   const resultsEl = document.getElementById("results");
   const raceEl = document.getElementById("race");
   const raceGrid = document.getElementById("race-grid");
@@ -239,16 +244,32 @@
     const ttft = metricCell("ttft", "ttft");
     const total = metricCell("total", "total");
     const tok = metricCell("tok", "tok i/o");
+    // Reasoning tokens are billed and consume the completion budget while
+    // never appearing in the answer, which is the whole reason the two
+    // tiers exist. A cell of its own makes that burn a number on every
+    // card instead of an inference from a truncated response.
+    const reasoning = metricCell("reasoning", "reasoning");
+    reasoning.v.title =
+      "hidden reasoning tokens, billed as completion tokens and counted " +
+      "against the budget";
     const cost = metricCell("cost", "cost");
-    cost.v.title =
-      "estimated from catalog prices and reported tokens; not billed cost";
-    metrics.append(ttft.cell, total.cell, tok.cell, cost.cell);
+    cost.v.title = COST_ESTIMATE_TITLE;
+    metrics.append(ttft.cell, total.cell, tok.cell, reasoning.cell, cost.cell);
+    // Which host actually served the request. Routing is by throughput, so
+    // the provider is chosen per request and varies between two runs of the
+    // same model; naming it makes the largest confound in any comparison
+    // visible rather than assumed away. Hidden until one is known, because
+    // an empty caption reads as a layout fault.
+    const caption = document.createElement("div");
+    caption.className = "card-caption";
+    caption.dataset.testid = "card-provider";
+    caption.hidden = true;
     const body = document.createElement("div");
     body.className = "body";
     body.dataset.testid = "card-body";
     const tools = document.createElement("div");
     tools.className = "card-tools";
-    card.append(header, shimmer, metrics, body, tools);
+    card.append(header, shimmer, metrics, caption, body, tools);
     resultsEl.append(card);
     const ui = {
       card,
@@ -257,7 +278,14 @@
       statusTime,
       tools,
       body,
-      metrics: { ttft: ttft.v, total: total.v, tok: tok.v, cost: cost.v },
+      caption,
+      metrics: {
+        ttft: ttft.v,
+        total: total.v,
+        tok: tok.v,
+        reasoning: reasoning.v,
+        cost: cost.v,
+      },
     };
     setState(ui, "working");
     return ui;
@@ -271,6 +299,12 @@
     setState(ui, "working");
     ui.tools.replaceChildren();
     for (const v of Object.values(ui.metrics)) clearMetric(v);
+    // The cost cell's tooltip is rewritten when a billed figure lands, so
+    // it has to come back with the metrics: a rerun that the platform does
+    // not price would otherwise still show the previous attempt's charge.
+    ui.metrics.cost.title = COST_ESTIMATE_TITLE;
+    ui.caption.textContent = "";
+    ui.caption.hidden = true;
     ui.body.className = "body";
     ui.body.replaceChildren();
     // The not-saved warning is a card-level sibling of the body, not a
@@ -393,8 +427,29 @@
         null,
       );
     }
-    if (result.cost_usd != null) {
+    if (result.reasoning_tokens != null) {
+      setMetric(ui.metrics.reasoning, String(result.reasoning_tokens), null);
+    }
+    // Billed wins when the platform reported one: it is the charge, the
+    // estimate is arithmetic over reported tokens, and showing arithmetic
+    // beside an available fact is a choice to be less accurate. The
+    // estimate stays reachable in the tooltip rather than being dropped,
+    // because a large gap between the two is itself a signal (a provider
+    // priced differently than the catalog says).
+    if (result.billed_cost_usd != null) {
+      setMetric(ui.metrics.cost, fmtBilled(result.billed_cost_usd), null);
+      ui.metrics.cost.title =
+        result.cost_usd != null
+          ? "billed by OpenRouter for this request; the catalog estimate " +
+            "was " +
+            fmtCost(result.cost_usd)
+          : "billed by OpenRouter for this request";
+    } else if (result.cost_usd != null) {
       setMetric(ui.metrics.cost, fmtCost(result.cost_usd), null);
+    }
+    if (result.provider != null) {
+      ui.caption.textContent = "served by " + result.provider;
+      ui.caption.hidden = false;
     }
   }
 

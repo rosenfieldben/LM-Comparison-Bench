@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import httpx
@@ -2067,3 +2068,161 @@ def test_position_is_bounded_without_capping_wide_lineups(client):
             json={"prompt": "hi", "model": "model/alpha", "position": bad},
         )
         assert resp.status_code == 422, bad
+
+
+# ---- G2: billed truth, read in-band.
+
+BILLED_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8,
+    "cost": 0.5,
+    "completion_tokens_details": {"reasoning_tokens": 512},
+    "prompt_tokens_details": {"cached_tokens": 9},
+}
+
+
+def billed_response(model: str) -> dict:
+    body = json.loads(json.dumps(FIXTURE))
+    body["model"] = model
+    body["provider"] = "Fireworks"
+    body["usage"] = BILLED_USAGE
+    body["choices"][0]["native_finish_reason"] = "STOP_SEQUENCE"
+    return body
+
+
+def billed_stream():
+    return ChunkStream(
+        [
+            sse({"provider": "Together", "choices": [{"delta": {"content": "Hi"}}]}),
+            sse(
+                {
+                    "choices": [
+                        {
+                            "delta": {},
+                            "finish_reason": "stop",
+                            "native_finish_reason": "eos",
+                        }
+                    ]
+                }
+            ),
+            sse({"choices": [], "usage": BILLED_USAGE}),
+            DONE_MARKER,
+        ]
+    )
+
+
+@respx.mock
+def test_billed_truth_round_trips_into_history(client):
+    """The authoritative numbers have to survive the write and the read,
+    or the card is the only place they ever existed."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=billed_response(json.loads(request.content)["model"])
+        )
+    )
+
+    body = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+    assert body.status_code == 200
+    live = body.json()["results"][0]
+    assert live["billed_cost_usd"] == 0.5
+    assert live["provider"] == "Fireworks"
+
+    detail = client.get(f"/runs/{body.json()['run_id']}").json()
+    stored = detail["results"][0]
+    assert stored["billed_cost_usd"] == 0.5
+    assert stored["reasoning_tokens"] == 512
+    assert stored["cached_tokens"] == 9
+    assert stored["provider"] == "Fireworks"
+    assert stored["native_finish_reason"] == "STOP_SEQUENCE"
+    # The estimate keeps its own column and its own meaning: 13 prompt
+    # tokens at 1e-6 plus 8 completion tokens at 2e-6.
+    assert stored["cost_usd"] == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_billed_truth_round_trips_into_history_from_the_stream(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=billed_stream())
+    )
+
+    frames = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+    done = next(f for f in frames if f["type"] == "done")
+    assert done["result"]["billed_cost_usd"] == 0.5
+    assert done["result"]["provider"] == "Together"
+
+    stored = client.get(f"/runs/{done['run_id']}").json()["results"][0]
+    assert stored["billed_cost_usd"] == 0.5
+    assert stored["reasoning_tokens"] == 512
+    assert stored["provider"] == "Together"
+    assert stored["native_finish_reason"] == "eos"
+
+
+@respx.mock
+def test_ceiling_counts_billed_cost_and_never_the_estimate_too(monkeypatch, tmp_path):
+    """The ceiling is advisory, so it advises from the real charge when one
+    exists. The other half matters as much: a result carrying both figures
+    contributes exactly one of them, or a single run would be charged to
+    the ceiling twice."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=billed_response(json.loads(request.content)["model"])
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        assert c.app.state.accumulated_spend_usd == 0.0
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        # The billed 0.50 alone: not the 2.9e-5 estimate, and not the sum.
+        assert c.app.state.accumulated_spend_usd == 0.5
+
+
+@respx.mock
+def test_ceiling_falls_back_to_the_estimate_when_nothing_was_billed(
+    monkeypatch, tmp_path
+):
+    """Removing the estimate from the ceiling would leave every provider
+    that omits cost invisible to it."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "hello")
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_poisoned_billed_cost_never_reaches_the_accumulator(monkeypatch, tmp_path):
+    """The money rule end to end, through the real endpoint. A NaN summed
+    into accumulated spend makes every ceiling comparison false and
+    silently disables the ceiling for the life of the process; the run must
+    still succeed, and the ceiling must still work afterwards.
+
+    Not named as a tombstone, because it does not fail on naive ingestion:
+    record_spend's own finiteness guard (F.1) catches a NaN that got past
+    as_money, and Pydantic serializes a NaN float to null on the way out.
+    Those are the belts, and this locks that all of them together hold. The
+    tombstones for as_money itself are in test_models.py, where the field
+    value is observable before either belt applies."""
+    # Encoded by hand: json.dumps writes a bare NaN token by default, which
+    # httpx's json= helper refuses to produce and which is exactly what a
+    # misbehaving provider puts on the wire.
+    body = json.dumps({**FIXTURE, "usage": {**FIXTURE["usage"], "cost": float("nan")}})
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["error"] is None
+        assert result["billed_cost_usd"] is None
+        total = c.app.state.accumulated_spend_usd
+        assert math.isfinite(total)
+        # The ceiling still answers, which a NaN total would have made
+        # permanently false.
+        c.app.state.accumulated_spend_usd = 20.0
+        assert main.spend_ceiling_reached() is True
+        c.app.state.accumulated_spend_usd = total

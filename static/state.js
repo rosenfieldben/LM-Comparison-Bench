@@ -48,7 +48,18 @@
     // ---- Command-bar session stats. Runs, spend and mean TTFT are this
     // ---- browser session's live totals, reset by a reload on purpose:
     // ---- the bar answers "what has this sitting cost me", not history.
-    sessionStats: { runs: 0, spend: 0, unpriced: 0, ttftSum: 0, ttftN: 0 },
+    // estimated counts the contributions that came from catalog arithmetic
+    // rather than from a billed figure. The total is a mix whenever it is
+    // nonzero, and one estimated contribution is enough to make the whole
+    // sum an estimate, which is what the tilde has to track.
+    sessionStats: {
+      runs: 0,
+      spend: 0,
+      unpriced: 0,
+      estimated: 0,
+      ttftSum: 0,
+      ttftN: 0,
+    },
     newViewEpoch,
     renderStats,
   };
@@ -63,17 +74,23 @@
 
   function renderStats() {
     statRuns.textContent = String(state.sessionStats.runs).padStart(2, "0");
-    // Every figure here is an estimate from catalog prices, and results
-    // the session could not price are counted rather than silently
+    // Results the session could not price are counted rather than silently
     // dropped: a total that quietly understates spend is worse than none.
-    // fmtCost, the same significant-digit formatter the cards use, rather
-    // than toFixed(4): a real total below $0.00005 floored to "~$0.0000",
-    // so a session that had spent money reported zero. Only an untouched
+    // The significant-digit formatters the cards use, rather than
+    // toFixed(4): a real total below $0.00005 floored to "$0.0000", so a
+    // session that had spent money reported zero. The tilde survives only
+    // while some contribution was a catalog estimate; once every priced
+    // run in the session came back with a billed figure, the total is not
+    // an estimate and must not wear the estimate marker. Only an untouched
     // session shows the fixed zero, which keeps the idle bar readable and
     // is honest because nothing has been spent yet.
     const spend = state.sessionStats.spend;
+    const fmt =
+      state.sessionStats.estimated > 0
+        ? window.BenchLib.fmtCost
+        : window.BenchLib.fmtBilled;
     statSpend.textContent =
-      (spend === 0 ? "~$0.0000" : window.BenchLib.fmtCost(spend)) +
+      (spend === 0 ? "~$0.0000" : fmt(spend)) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");

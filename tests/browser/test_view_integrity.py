@@ -197,9 +197,11 @@ def test_rapid_history_selections_last_click_wins(bench):
 
 
 def test_unpriced_results_count_in_session_spend(bench):
-    # stub/unlisted is absent from the stub catalog, so its usage has
-    # no price and cost_usd comes back null.
-    page = bench(["stub/fast", "stub/unlisted"])
+    # stub/nousage returns no usage object at all AND is absent from the
+    # stub catalog, so it has neither a billed figure nor an estimate.
+    # Unpriced by both routes is what the counter is for; a model missing
+    # only from the catalog is now priced by the platform's own number.
+    page = bench(["stub/fast", "stub/nousage"])
 
     for i in range(2):
         check_chip(page, i)
@@ -209,7 +211,10 @@ def test_unpriced_results_count_in_session_spend(bench):
 
     spend = page.get_by_test_id("stat-spend")
     expect(spend).to_contain_text("+ 1 unpriced")
-    expect(spend).to_contain_text("~$")
+    # stub/fast came back billed, so the total is not an estimate and wears
+    # no tilde. The unpriced suffix is what keeps it from claiming to be the
+    # whole story.
+    expect(spend).to_have_text(re.compile(r"^\$3\.1e-5 \+ 1 unpriced$"))
 
 
 def test_null_run_id_shows_not_saved_warning(bench):
@@ -257,9 +262,33 @@ def test_cost_language_is_honest(bench):
     card = cards(page).first
     expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
     cost = card.get_by_test_id("metric-cost")
-    expect(cost).to_contain_text("~$")
-    expect(cost).to_have_attribute("title", re.compile("not billed"))
-    expect(page.get_by_test_id("stat-spend")).to_contain_text("~$")
+    # The stub reports a billed cost, so the card shows the charge, without
+    # the estimate marker, and the estimate moves to the tooltip where it
+    # is still legible and still labeled as an estimate.
+    expect(cost).to_have_text("$3.1e-5")
+    expect(cost).to_have_attribute("title", re.compile("billed by OpenRouter"))
+    expect(cost).to_have_attribute("title", re.compile(r"estimate was ~\$2\.9e-5"))
+    expect(page.get_by_test_id("stat-spend")).to_have_text("$3.1e-5")
+
+
+def test_estimate_language_survives_an_unbilled_result(bench):
+    """The tilde and the estimate wording are not dead code: with no billed
+    figure on the wire they are still the whole display, and the honesty
+    they carry (catalog arithmetic, not a charge) is the pre-G behavior this
+    workstream had to leave intact.
+    """
+    # In the catalog, so an estimate exists, but the response carries a
+    # poisoned billed cost that must degrade to nothing.
+    page = bench(["stub/nancost"])
+
+    check_chip(page, 0)
+    start_run_via_ui(page, "estimate language")
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
+    cost = card.get_by_test_id("metric-cost")
+    expect(cost).to_have_text("~$2.9e-5")
+    expect(cost).to_have_attribute("title", re.compile("not billed cost"))
+    expect(page.get_by_test_id("stat-spend")).to_have_text("~$2.9e-5")
 
 
 # ---- Regression guards for the adversarial-review findings on Phase E

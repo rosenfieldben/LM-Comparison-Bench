@@ -8,6 +8,7 @@ const assert = require("node:assert");
 const {
   shortName,
   fmtCost,
+  fmtBilled,
   fmtEstimate,
   niceScale,
   tokenizeDiff,
@@ -27,6 +28,27 @@ test("fmtCost is exponential below a cent and fixed decimals above", () => {
   // Exactly a cent is the boundary: no longer exponential.
   assert.equal(fmtCost(0.01), "~$0.010");
   assert.equal(fmtCost(1.5), "~$1.500");
+});
+
+test("fmtBilled carries the same digits without the estimate marker", () => {
+  // The tilde is the only difference, and it is the whole point: a billed
+  // figure that renders with one would claim to be catalog arithmetic.
+  for (const amount of [3.1e-5, 0.005, 0.01, 1.5, 4.9e-5]) {
+    assert.equal(fmtBilled(amount), fmtCost(amount).slice(1));
+    assert.ok(!fmtBilled(amount).includes("~"));
+  }
+  assert.equal(fmtBilled(3.1e-5), "$3.1e-5");
+  assert.equal(fmtBilled(1.5), "$1.500");
+});
+
+test("fmtBilled keeps a tiny nonzero charge from reading as zero", () => {
+  // Same significant-digit contract as fmtCost: real charges on this bench
+  // sit below a hundredth of a cent, where fixed decimals floor to zero.
+  for (const tiny of [4.9e-5, 1e-6, 1e-12]) {
+    const shown = fmtBilled(tiny);
+    assert.notEqual(shown, "$0.0000");
+    assert.match(shown, /[1-9]/, `${shown} must carry a nonzero digit`);
+  }
 });
 
 test("fmtEstimate rounds large values and trims small ones", () => {

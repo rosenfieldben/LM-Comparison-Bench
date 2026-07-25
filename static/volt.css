@@ -566,7 +566,7 @@
      the hairline color, the cells are panel-colored. */
   .metrics {
     display: grid;
-    grid-template-columns: repeat(4, 1fr);
+    grid-template-columns: repeat(5, 1fr);
     gap: 1px;
     background: var(--hairline);
     border-top: 1px solid var(--hairline);
@@ -582,6 +582,17 @@
   .card[data-state="error"] .mcell.ttft .mv { color: var(--text); }
   .mv.empty { color: var(--text-dash); }
   .card[data-state="error"] .mv.empty { color: var(--text-dash); }
+  /* Provider caption: routing metadata, not output, so it reads at the
+     dim weight of a label rather than competing with the response. */
+  .card-caption {
+    padding: 6px var(--pad-card) 0;
+    font: 400 9px var(--mono);
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
   .body {
     padding: 12px var(--pad-card);
     font: 400 var(--fs-out)/1.65 var(--mono);

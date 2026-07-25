@@ -98,8 +98,14 @@
       // spend already incurred; it just is not counted here because the
       // client never received it.
       if (!result.stopped) {
-        if (result.cost_usd != null) {
-          BenchState.sessionStats.spend += result.cost_usd;
+        // Billed first, estimate second, matching the card and the server's
+        // ceiling: one contribution per run, never both, so the bar cannot
+        // double-count a result that carries each.
+        const billed = result.billed_cost_usd;
+        const charge = billed != null ? billed : result.cost_usd;
+        if (charge != null) {
+          BenchState.sessionStats.spend += charge;
+          if (billed == null) BenchState.sessionStats.estimated += 1;
         } else if (
           result.response_text != null ||
           result.prompt_tokens != null ||

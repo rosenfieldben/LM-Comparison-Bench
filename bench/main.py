@@ -27,6 +27,7 @@ from bench import store
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
+    as_money,
     as_text,
     fetch_catalog,
     keepalive_socket_options,
@@ -671,8 +672,9 @@ def spend_ceiling_reached() -> bool:
     """True when an active ceiling has been reached by accumulated spend.
 
     The shared predicate behind the entry check and the post-admission
-    recheck. Unpriced results never moved the counter, so this bounds
-    known estimated spend, not billed cost.
+    recheck. Results the bench could price neither from the platform's
+    billed figure nor from the catalog never moved the counter, so this
+    bounds known spend, not all spend.
     """
     limit = app.state.spend_limit_usd
     if limit is None:
@@ -681,7 +683,7 @@ def spend_ceiling_reached() -> bool:
 
 
 def enforce_spend_limit() -> None:
-    """Refuse a run at the boundary once estimated spend hits the ceiling.
+    """Refuse a run at the boundary once recorded spend hits the ceiling.
 
     Checked at endpoint entry, before the semaphore and before any
     upstream call, so a refusal costs nothing. Money already in flight
@@ -693,7 +695,7 @@ def enforce_spend_limit() -> None:
     if spend_ceiling_reached():
         raise HTTPException(
             402,
-            "spend ceiling reached: estimated "
+            "spend ceiling reached: recorded "
             f"{format_usd(app.state.accumulated_spend_usd)} of "
             f"{format_usd(app.state.spend_limit_usd)} limit "
             "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
@@ -701,16 +703,40 @@ def enforce_spend_limit() -> None:
 
 
 def record_spend(cost: float | None) -> None:
-    """Add a priced result's estimate to the accumulated spend.
+    """Add one priced result to the accumulated spend.
 
-    None means the result could not be priced (offline catalog, missing
-    usage), and those never count against the ceiling by design. A
+    The caller chooses between billed cost and the estimate (ceiling_cost);
+    this only accumulates. None means the result could not be priced by
+    either route (offline catalog, missing usage), and those never count
+    against the ceiling by design. A
     non-finite cost is refused here too: cost_usd already screens it out,
     but the accumulator is the invariant's last line, and a single NaN
     summed in would make the ceiling comparison permanently false.
     """
     if cost is not None and math.isfinite(cost):
         app.state.accumulated_spend_usd += cost
+
+
+def ceiling_cost(result: dict[str, Any]) -> float | None:
+    """What one result contributes to the accumulated spend.
+
+    Billed cost when the platform reported one, the catalog estimate
+    otherwise. The ceiling is advisory, a guard against a runaway session
+    rather than an accounting ledger, and advising from what was actually
+    charged beats advising from catalog arithmetic over reported token
+    counts. Both figures stay on the row; only one of them counts here, so
+    a result can never be charged to the ceiling twice.
+
+    Both fields already passed the money rule at ingestion (as_money for
+    billed, the finiteness check in cost_usd for the estimate). Re-applying
+    as_money here is the accumulator's own last line rather than a
+    duplicate: this reads a plain dict that a persistence round trip or a
+    future writer could reach, and one poisoned value summed in would make
+    the ceiling comparison permanently false. None means the result is
+    unpriced by both routes, which by design never moves the counter.
+    """
+    billed = as_money(result.get("billed_cost_usd"))
+    return billed if billed is not None else as_money(result.get("cost_usd"))
 
 
 def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
@@ -747,7 +773,7 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "completion_tokens": None,
         "spend_refused": True,
         "error": (
-            "run refused before reaching upstream: estimated spend "
+            "run refused before reaching upstream: recorded spend "
             f"{format_usd(app.state.accumulated_spend_usd)} reached the "
             f"{format_usd(app.state.spend_limit_usd)} ceiling "
             "(BENCH_SPEND_LIMIT_USD); no upstream call was made"
@@ -757,6 +783,15 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "max_tokens": max_tokens,
         "generation_id": None,
         "finish_reason": None,
+        # Nothing was charged because nothing was sent. Present and None
+        # rather than absent so this stays a superset of the shape both
+        # client functions produce, which is what lets one response model
+        # and one persistence path accept either.
+        "billed_cost_usd": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "provider": None,
+        "native_finish_reason": None,
     }
 
 
@@ -905,7 +940,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # time.
         for result in results:
             result["cost_usd"] = cost_usd(result, app.state.prices)
-            record_spend(result["cost_usd"])
+            record_spend(ceiling_cost(result))
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )
@@ -1027,7 +1062,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # failure degrades to run_id null with links dropped.
                 try:
                     result["cost_usd"] = cost_usd(result, app.state.prices)
-                    record_spend(result["cost_usd"])
+                    record_spend(ceiling_cost(result))
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )

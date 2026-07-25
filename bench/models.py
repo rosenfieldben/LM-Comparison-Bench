@@ -272,6 +272,66 @@ def _flatten_content(content: object) -> str | None:
     return None
 
 
+def _ingest_usage(result: dict[str, Any], usage: object) -> None:
+    """Fold one usage object into a result, every field total.
+
+    OpenRouter attaches usage to every response (the final SSE chunk on a
+    stream), so this is the one place the authoritative numbers enter. It
+    is called with whatever the payload held: isinstance instead of a
+    truthiness guard because a non-dict like "n/a" would pass truthiness
+    and raise on .get, and neither client function may raise.
+
+    Every field is assigned unconditionally, including to None, rather
+    than only when present. A stream can carry more than one usage object,
+    and a later one that omits a field must not leave the earlier value
+    standing as if it had been reconfirmed. Last usage object wins,
+    entirely.
+
+    cost is the amount OpenRouter charged, and it goes through as_money
+    rather than as_metric: a NaN or negative charge must degrade to None
+    instead of reaching the spend accumulator, where NaN makes every
+    ceiling comparison false and a negative subtracts from the total.
+
+    cost_details.upstream_inference_cost is deliberately not persisted. It
+    is the amount the upstream provider charged under bring-your-own-key,
+    and is absent or zero for the normal credits path this bench uses, so
+    a column for it would be null on every row this bench produces.
+    """
+    if not isinstance(usage, dict):
+        return
+    result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
+    result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
+    result["billed_cost_usd"] = as_money(usage.get("cost"))
+    # Reasoning tokens are the reason the two-tier budget exists: they are
+    # billed as completion tokens and consume max_tokens, but never appear
+    # in the visible answer. Cached prompt tokens are the other direction,
+    # charged at a discount, and both live one level down in the details
+    # objects.
+    completion_details = usage.get("completion_tokens_details")
+    result["reasoning_tokens"] = (
+        as_token_count(completion_details.get("reasoning_tokens"))
+        if isinstance(completion_details, dict)
+        else None
+    )
+    prompt_details = usage.get("prompt_tokens_details")
+    result["cached_tokens"] = (
+        as_token_count(prompt_details.get("cached_tokens"))
+        if isinstance(prompt_details, dict)
+        else None
+    )
+
+
+def _as_label(value: object) -> str | None:
+    """as_text with the empty string treated as absent.
+
+    A provider name or a finish reason of "" is not a value the frontend
+    can render as a caption; it would paint an empty slot that looks like
+    a layout bug. Everything else is as_text's contract.
+    """
+    text = as_text(value)
+    return text if text else None
+
+
 async def run_model(
     prompt: str,
     model: str,
@@ -299,6 +359,11 @@ async def run_model(
         "generation_id": None,
         "finish_reason": None,
         "request_json": None,
+        "billed_cost_usd": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "provider": None,
+        "native_finish_reason": None,
     }
     payload = {
         "model": model,
@@ -366,6 +431,16 @@ async def run_model(
     reason = choice.get("finish_reason")
     if isinstance(reason, str) and reason:
         result["finish_reason"] = reason
+    # The provider that actually served this request, and its own word for
+    # why generation ended. Under throughput routing the provider is
+    # chosen per request, so it is the largest confound in any comparison
+    # this bench draws; recording it per result is what makes the confound
+    # visible instead of assumed away. Both degrade to None when the
+    # payload omits them, which is the common case for native_finish_reason
+    # (OpenRouter only sends it when the provider's value differs from its
+    # own normalized one).
+    result["provider"] = _as_label(data.get("provider"))
+    result["native_finish_reason"] = _as_label(choice.get("native_finish_reason"))
 
     text = _flatten_content(content)
     if text:
@@ -383,11 +458,9 @@ async def run_model(
     # isinstance instead of `or {}`: a truthy non-dict like "n/a" would
     # pass the truthiness guard and raise on .get, and this function must
     # never raise.
-    usage = data.get("usage")
-    if not isinstance(usage, dict):
-        usage = {}
-    result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
-    result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
+    # Some providers omit usage entirely; the counts and the billed cost
+    # then stay None rather than being guessed. See _ingest_usage.
+    _ingest_usage(result, data.get("usage"))
     return result
 
 
@@ -424,6 +497,11 @@ async def stream_model(
         "generation_id": None,
         "finish_reason": None,
         "request_json": None,
+        "billed_cost_usd": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "provider": None,
+        "native_finish_reason": None,
     }
     payload = {
         "model": model,
@@ -492,12 +570,15 @@ async def stream_model(
                     if isinstance(gen_id, str) and gen_id:
                         result["generation_id"] = gen_id
 
-                usage = chunk.get("usage")
-                if isinstance(usage, dict):
-                    result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
-                    result["completion_tokens"] = as_token_count(
-                        usage.get("completion_tokens")
-                    )
+                # The provider name rides every chunk, not just the last;
+                # the first one that carries it settles the field, like the
+                # generation id above.
+                if result["provider"] is None:
+                    result["provider"] = _as_label(chunk.get("provider"))
+
+                # Usage arrives on the final chunk (stream_options above
+                # asks for it) and carries the billed cost with it.
+                _ingest_usage(result, chunk.get("usage"))
 
                 # OpenRouter reports mid-stream failures as an in-band
                 # error object on the 200 stream. Without this check the
@@ -517,6 +598,13 @@ async def stream_model(
                         # The provider sends its verdict on the closing
                         # chunk; the final one seen is the one recorded.
                         result["finish_reason"] = reason
+                    native = _as_label(choice.get("native_finish_reason"))
+                    if native is not None:
+                        # Guarded like finish_reason above: OpenRouter sends
+                        # the provider's own word only on the chunk that ends
+                        # generation, so a later chunk carrying a choice
+                        # without it must not erase what was already seen.
+                        result["native_finish_reason"] = native
                     delta = choice.get("delta") or {}
                     content = delta.get("content")
                 except (LookupError, TypeError, AttributeError):
