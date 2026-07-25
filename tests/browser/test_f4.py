@@ -248,3 +248,43 @@ def test_genuine_persistence_failure_keeps_its_warning(bench):
     expect(warning).to_have_count(1)
     expect(warning).to_have_text("not saved to history")
     expect(warning).to_have_attribute("title", re.compile("persisting this run failed"))
+
+
+# ---- F4.6: the session bar cannot floor a nonzero total to zero.
+
+
+def test_review_repro_session_spend_never_floors_to_zero(bench):
+    """Second review: the session bar rendered spend with toFixed(4), so a
+    real total below $0.00005 displayed as "~$0.0000" and a session that had
+    spent money reported zero. The bar must use the same significant-digit
+    formatter the cards use.
+
+    Driven through the real accounting path: the state module owns the
+    total, so the test adds a sub-threshold amount and re-renders exactly as
+    a completed run does, rather than asserting on a formatter in isolation
+    (the node suite already covers that).
+    """
+    page = bench(["stub/fast"])
+    spend_stat = page.get_by_test_id("stat-spend")
+    # An untouched session reads a clean zero.
+    expect(spend_stat).to_have_text("~$0.0000")
+
+    shown = page.evaluate(
+        """() => {
+          BenchState.sessionStats.spend = 4.9e-5;
+          BenchState.renderStats();
+          return document.querySelector('[data-testid=stat-spend]').textContent;
+        }"""
+    )
+    assert shown != "~$0.0000", "a real total floored to zero"
+    assert "4.9" in shown, f"expected significant digits, got {shown!r}"
+
+    # The unpriced suffix still rides along with the new formatter.
+    with_suffix = page.evaluate(
+        """() => {
+          BenchState.sessionStats.unpriced = 2;
+          BenchState.renderStats();
+          return document.querySelector('[data-testid=stat-spend]').textContent;
+        }"""
+    )
+    assert "4.9" in with_suffix and "2 unpriced" in with_suffix, with_suffix

@@ -66,9 +66,14 @@
     // Every figure here is an estimate from catalog prices, and results
     // the session could not price are counted rather than silently
     // dropped: a total that quietly understates spend is worse than none.
+    // fmtCost, the same significant-digit formatter the cards use, rather
+    // than toFixed(4): a real total below $0.00005 floored to "~$0.0000",
+    // so a session that had spent money reported zero. Only an untouched
+    // session shows the fixed zero, which keeps the idle bar readable and
+    // is honest because nothing has been spent yet.
+    const spend = state.sessionStats.spend;
     statSpend.textContent =
-      "~$" +
-      state.sessionStats.spend.toFixed(4) +
+      (spend === 0 ? "~$0.0000" : window.BenchLib.fmtCost(spend)) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");
