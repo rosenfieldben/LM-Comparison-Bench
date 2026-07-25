@@ -53,11 +53,19 @@
     // rather than from a billed figure. The total is a mix whenever it is
     // nonzero, and one estimated contribution is enough to make the whole
     // sum an estimate, which is what the tilde has to track.
+    //
+    // priced counts contributions of either kind. It exists because the
+    // amount cannot stand in for "has anything been priced yet": free
+    // models are real, and a session of them is priced at exactly zero.
+    // Keying the idle display on spend === 0 made such a session claim
+    // "nothing priced yet" and wear the estimate tilde over a figure the
+    // platform had actually confirmed.
     sessionStats: {
       runs: 0,
       spend: 0,
       unpriced: 0,
       estimated: 0,
+      priced: 0,
       ttftSum: 0,
       ttftN: 0,
     },
@@ -125,12 +133,17 @@
     // session shows the fixed zero, which keeps the idle bar readable and
     // is honest because nothing has been spent yet.
     const spend = state.sessionStats.spend;
+    // Idle means nothing has been priced AND nothing has accumulated.
+    // Either condition alone is enough to leave it: a nonzero total is
+    // self-evidently not idle, and a zero total after a priced run is a
+    // confirmed zero rather than an absence of information.
+    const idle = state.sessionStats.priced === 0 && spend === 0;
     const fmt =
       state.sessionStats.estimated > 0
         ? window.BenchLib.fmtCost
         : window.BenchLib.fmtBilled;
     statSpend.textContent =
-      (spend === 0 ? "~$0.0000" : fmt(spend)) +
+      (idle ? "~$0.0000" : fmt(spend)) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");
@@ -139,7 +152,7 @@
     // runs: a fixed string calling it an estimate became false the moment
     // a billed figure landed in it.
     const composition =
-      spend === 0
+      idle
         ? "nothing priced yet this session"
         : state.sessionStats.estimated > 0
           ? "part billed by OpenRouter, part estimated from catalog " +

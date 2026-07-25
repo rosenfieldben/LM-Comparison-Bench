@@ -11,6 +11,11 @@
   }
 
   function usdDigits(c) {
+    // Exact zero written out rather than as an exponent. "$0.0e+0" is a
+    // needlessly cryptic way to write nothing, and a real zero is
+    // reachable: free models exist, and their billed cost is genuinely
+    // zero rather than absent.
+    if (c === 0) return "$0.0000";
     // Exponential for the typical sub-cent run ($3.1e-5); plain decimals
     // once a run costs enough for them to be readable. Shared so the
     // estimate and the billed figure sit at the same scale on the card and

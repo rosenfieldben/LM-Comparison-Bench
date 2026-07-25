@@ -2372,3 +2372,69 @@ def test_the_streaming_path_sends_the_policy_too(monkeypatch, tmp_path):
             "SELECT data_policy FROM runs WHERE id = ?", (run_id,)
         ).fetchone()
         assert row["data_policy"] == "zdr"
+
+
+# ---- Phase G closing review.
+
+
+def test_review_repro_wide_lineup_still_gets_a_group(client):
+    """Closing review: the group POST borrowed CompareRequest's five-model
+    cap, so a comparison wider than five was rejected. A failed group
+    create degrades to ungrouped runs rather than erroring, so those
+    comparisons silently lost their single history entry, which is exactly
+    what the group row exists to provide."""
+    models = [f"model/m{i}" for i in range(7)]
+
+    resp = client.post("/groups", json={"prompt": "wide", "models": models})
+
+    assert resp.status_code == 201
+    group_id = resp.json()["id"]
+    row = client.app.state.db.execute(
+        "SELECT models_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    assert json.loads(row["models_json"]) == models
+
+
+def test_the_group_body_is_still_bounded(client):
+    """Bounded, just not at five. An absurd body is still refused at the
+    boundary rather than written into the schema."""
+    huge = [f"model/m{i}" for i in range(MAX_POSITION + 2)]
+    resp = client.post("/groups", json={"prompt": "absurd", "models": huge})
+    assert resp.status_code == 422
+
+
+@respx.mock
+def test_poisoned_provenance_never_breaks_a_paid_result(client):
+    """Closing review sweep: every new capture step, poisoned in turn. The
+    money was already spent by the time any of these are read, and the
+    post-spend invariant forbids turning that into a failure, so each one
+    must degrade to None and leave the response successful."""
+    poisoned = json.loads(json.dumps(FIXTURE))
+    poisoned["provider"] = {"name": "Fireworks"}
+    poisoned["choices"][0]["native_finish_reason"] = 7
+    poisoned["usage"] = {
+        "prompt_tokens": 13,
+        "completion_tokens": 8,
+        "completion_tokens_details": "n/a",
+        "prompt_tokens_details": {"cached_tokens": "many"},
+    }
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps(poisoned),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    assert resp.status_code == 200
+    result = resp.json()["results"][0]
+    assert result["error"] is None
+    assert result["response_text"] is not None
+    for field in ("provider", "native_finish_reason", "reasoning_tokens"):
+        assert result[field] is None, field
+    # And the row that was written says the same thing on the way back.
+    stored = client.get(f"/runs/{resp.json()['run_id']}").json()["results"][0]
+    assert stored["provider"] is None
+    assert stored["native_finish_reason"] is None

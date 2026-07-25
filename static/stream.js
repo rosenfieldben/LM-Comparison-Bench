@@ -115,6 +115,7 @@
         const charge = billed != null ? billed : result.cost_usd;
         if (charge != null) {
           BenchState.sessionStats.spend += charge;
+          BenchState.sessionStats.priced += 1;
           if (billed == null) BenchState.sessionStats.estimated += 1;
         } else if (
           result.response_text != null ||

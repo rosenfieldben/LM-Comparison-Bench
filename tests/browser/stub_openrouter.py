@@ -147,15 +147,7 @@ def build_app() -> Starlette:
     # Closure state instead of module globals: each harness session
     # builds its own app, so flaky's fail-once behavior and the request
     # log reset with the stub process.
-    state = {
-        "requests": [],
-        "flaky_failed": False,
-        "flaky_slow_failed": False,
-        # Ids the generation endpoint reports as gone, the way OpenRouter
-        # expires old records. Populated by tests through the module, not
-        # by any request.
-        "expired_generations": set(),
-    }
+    state = {"requests": [], "flaky_failed": False, "flaky_slow_failed": False}
 
     async def models(request):
         return JSONResponse(CATALOG)
@@ -352,8 +344,6 @@ def build_app() -> Starlette:
         gen_id = request.query_params.get("id")
         if not gen_id:
             return JSONResponse({"error": "missing id"}, status_code=400)
-        if gen_id in state["expired_generations"]:
-            return JSONResponse({"error": "not found"}, status_code=404)
         return JSONResponse(
             {
                 "data": {

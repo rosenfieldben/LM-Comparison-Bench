@@ -270,3 +270,61 @@ def test_the_policy_reaches_the_wire_from_the_browser(zdr_bench):
         }"""
     )
     assert sent == {"sort": "throughput", "zdr": True, "data_collection": "deny"}
+
+
+# ---- Phase G closing review.
+
+
+def test_review_repro_replay_uses_the_declared_position_not_the_chip_order(bench):
+    """Closing review: the group replay sorted cards by the CURRENT chip
+    order, which is the exact drift the position column was added to
+    eliminate. Editing the lineup after a run rearranged that run's replay
+    to match a lineup it never ran under.
+    """
+    page = bench(["stub/fast", "stub/slow"])
+    check_all_chips(page)
+    start_run(page, "g-review declared order")
+    for i in range(2):
+        expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
+    # The comparison ran fast-then-slow, and stub/slow finishes second, so
+    # run order and declared order disagree in the stored rows too.
+    assert [c.inner_text() for c in cards(page).get_by_test_id("card-model").all()] == [
+        "stub/fast",
+        "stub/slow",
+    ]
+
+    # Reverse the lineup, which is what the old sort keyed on.
+    page.evaluate("() => { BenchControls.lineup.reverse(); }")
+
+    page.get_by_test_id("history-toggle").click()
+    page.get_by_test_id("history-row").filter(
+        has_text="g-review declared order"
+    ).click()
+    expect(cards(page)).to_have_count(2, timeout=DONE_TIMEOUT)
+
+    replayed = [c.inner_text() for c in cards(page).get_by_test_id("card-model").all()]
+    assert replayed == ["stub/fast", "stub/slow"], replayed
+
+
+def test_review_repro_a_zero_billed_session_is_not_reported_as_unpriced_idle(bench):
+    """Closing review: the bar keyed its idle display on the amount, so a
+    session priced at exactly zero (free models are real) claimed "nothing
+    priced yet" and wore the estimate tilde over a figure the platform had
+    confirmed. Driven through the accounting path the stream client uses.
+    """
+    page = bench(["stub/fast"])
+    spend = page.get_by_test_id("stat-spend")
+    # Untouched: the fixed zero, honestly, because nothing has run.
+    expect(spend).to_have_text("~$0.0000")
+    expect(spend).to_have_attribute("title", re.compile("nothing priced yet"))
+
+    shown = page.evaluate(
+        """() => {
+          BenchState.sessionStats.priced = 1;
+          BenchState.renderStats();
+          const el = document.querySelector('[data-testid=stat-spend]');
+          return { text: el.textContent, title: el.title };
+        }"""
+    )
+    assert shown["text"] == "$0.0000", shown
+    assert "billed by OpenRouter" in shown["title"], shown

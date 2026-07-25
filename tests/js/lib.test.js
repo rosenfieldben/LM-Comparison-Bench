@@ -116,3 +116,11 @@ test("fmtCost keeps a tiny nonzero total from reading as zero", () => {
   assert.equal((4.9e-5).toFixed(4), "0.0000");
   assert.equal(fmtCost(4.9e-5), "~$4.9e-5");
 });
+
+test("an exact zero reads as zero, not as an exponent", () => {
+  // Free models make a genuinely zero charge reachable, and the idle bar
+  // shows the same string, so the two must not disagree on how nothing
+  // is written.
+  assert.equal(fmtBilled(0), "$0.0000");
+  assert.equal(fmtCost(0), "~$0.0000");
+});

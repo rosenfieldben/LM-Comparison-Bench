@@ -229,9 +229,18 @@ class GroupCreate(BaseModel):
     model_config = FORBID_UNKNOWN
 
     prompt: str | None = Field(default=None, min_length=1)
-    # The ordered lineup as declared. Same cap as CompareRequest.models,
-    # for the same reason: this is a side-by-side bench.
-    models: list[str] | None = Field(default=None, min_length=1, max_length=5)
+    # The ordered lineup as declared. Deliberately NOT CompareRequest's
+    # five-model cap: that cap bounds concurrent paid calls inside one
+    # batch request, while this is a record of a lineup the browser fans
+    # out one request at a time and never caps. Borrowing it here rejected
+    # every comparison wider than five, and because a failed group create
+    # degrades to ungrouped runs rather than erroring, those comparisons
+    # silently lost their history entry. Bounded at MAX_POSITION's scale
+    # for the same reason that constant exists: keep an absurd body out
+    # without capping real use.
+    models: list[str] | None = Field(
+        default=None, min_length=1, max_length=MAX_POSITION + 1
+    )
 
 
 class GroupCreated(BaseModel):
