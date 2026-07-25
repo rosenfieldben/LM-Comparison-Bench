@@ -7,7 +7,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from bench import main
-from bench.main import app
+from bench.main import MAX_POSITION, app
 from bench.models import OPENROUTER_URL
 
 FIXTURE = json.loads(
@@ -1962,3 +1962,108 @@ def test_fetched_catalog_budgets_are_unchanged(client):
     )
     assert seen["model/capped"] == 32000
     assert seen["model/alpha"] == BUDGET_EXTENDED
+
+
+# ---- G1: the experiment record and provenance.
+
+
+@respx.mock
+def test_group_declares_prompt_and_lineup_before_any_member(client):
+    """The group row is created before any upstream call, so recording the
+    prompt and lineup there makes it the experiment record and fixes the
+    group's prompt ahead of its first member."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post(
+        "/groups",
+        json={"prompt": "declared", "models": ["model/alpha", "model/bare"]},
+    ).json()["id"]
+
+    # A different prompt is refused with no member present at all, which
+    # the derive-from-first-member rule could never do.
+    clash = client.post(
+        "/compare",
+        json={"prompt": "different", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert clash.status_code == 409
+    assert route.call_count == 0
+    # The declared prompt passes.
+    ok = client.post(
+        "/compare",
+        json={"prompt": "declared", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert ok.status_code == 200
+
+
+def test_empty_group_body_still_accepted(client):
+    """The empty JSON object is load-bearing for the CORS preflight
+    defense and is what every pre-G client sends; it must stay valid."""
+    assert client.post("/groups", json={}).status_code == 201
+
+
+@respx.mock
+def test_run_rows_carry_provenance_and_position(client):
+    """Every run row records which build produced it and how old its price
+    catalog was; every result records the column it occupied and the exact
+    payload that was sent."""
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    resp = client.post(
+        "/compare",
+        json={"prompt": "provenance", "models": ["model/alpha", "model/bare"]},
+    )
+    run_id = resp.json()["run_id"]
+    detail = client.get(f"/runs/{run_id}").json()
+
+    # catalog_snapshot_at is set because the test catalog reports fetched.
+    assert detail["catalog_snapshot_at"] is not None
+    # app_sha is best-effort: a string when git answers, None otherwise,
+    # and never a reason to fail a run.
+    assert detail["app_sha"] is None or isinstance(detail["app_sha"], str)
+    # Array order is the declared layout for the batch endpoint.
+    assert [r["position"] for r in detail["results"]] == [0, 1]
+    assert [r["model"] for r in detail["results"]] == ["model/alpha", "model/bare"]
+    # The reproducibility record is the payload actually sent, and it
+    # carries no authorization: auth lives in the client's headers.
+    sent = json.loads(detail["results"][0]["request_json"])
+    assert sent["model"] == "model/alpha"
+    assert sent["max_tokens"] == BUDGET_STANDARD
+    assert "authorization" not in json.dumps(sent).lower()
+
+
+@respx.mock
+def test_stream_records_declared_position(client):
+    """The frontend fans out one request per model, so only the client
+    knows the layout; the declared position is what gets persisted."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    frames = stream_events(
+        client, {"prompt": "positioned", "model": "model/alpha", "position": 3}
+    )
+    run_id = next(f for f in frames if f["type"] == "done")["run_id"]
+    detail = client.get(f"/runs/{run_id}").json()
+    assert detail["results"][0]["position"] == 3
+
+
+def test_position_is_bounded_without_capping_wide_lineups(client):
+    """position is bounded at the boundary rather than trusted into the
+    schema, but the bound is not the batch endpoint's five-model cap: the
+    streaming path is one request per model and the browser lineup has no
+    size limit, so a seven-model comparison must still declare positions
+    five and six."""
+    ok = client.post(
+        "/compare/stream",
+        json={"prompt": "hi", "model": "model/alpha", "position": 6},
+    )
+    assert ok.status_code == 200
+    ok.read()
+    for bad in (-1, MAX_POSITION + 1):
+        resp = client.post(
+            "/compare/stream",
+            json={"prompt": "hi", "model": "model/alpha", "position": bad},
+        )
+        assert resp.status_code == 422, bad

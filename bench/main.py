@@ -7,9 +7,11 @@ import logging
 import math
 import os
 import sqlite3
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,6 +27,7 @@ from bench import store
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
+    as_text,
     fetch_catalog,
     keepalive_socket_options,
     run_model,
@@ -60,6 +63,14 @@ MAX_CONCURRENT_UPSTREAM = 5
 # completed. Bounding at the boundary makes the mismatch a 422 before
 # any money moves.
 MAX_SQLITE_ROWID = 2**63 - 1
+
+# Upper bound on a declared column index. Deliberately not the batch
+# endpoint's five-model cap: that cap belongs to /compare, while the
+# streaming path is one request per model and the browser lineup has no
+# size limit, so a wide comparison legitimately declares positions past
+# five. This is only here to keep an absurd value out of the schema; a
+# side-by-side visual comparison is tens of columns at the very most.
+MAX_POSITION = 999
 
 
 # Unknown fields are refused on every request model at the boundary, not
@@ -120,6 +131,20 @@ class ModelResult(BaseModel):
     # error strings; budget analysis needs it on truncated-but-successful
     # runs too.
     finish_reason: str | None = None
+    # Phase G provenance and billed truth. All default None so pre-G rows,
+    # and the paths that do not set them, stay valid. position is the
+    # column this result occupied; request_json is the exact payload sent,
+    # auth excluded; billed_cost_usd is what the platform actually charged,
+    # kept beside cost_usd rather than replacing it, because the estimate
+    # and the charge are different facts and history needs both.
+    position: int | None = None
+    request_json: str | None = None
+    billed_cost_usd: float | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    provider: str | None = None
+    quantization: str | None = None
+    native_finish_reason: str | None = None
 
 
 class StreamCompareRequest(BaseModel):
@@ -134,6 +159,14 @@ class StreamCompareRequest(BaseModel):
     prompt_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     group_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     budget: Literal["standard", "extended"] = "standard"
+    # Which column this run occupied in the comparison. The frontend fans
+    # out one request per model, so only the client knows the layout; the
+    # batch endpoint derives the same thing from array order. Recorded so
+    # a replay can reconstruct the original side by side arrangement from
+    # the rows themselves rather than from the current chip order, which
+    # drifts as the lineup is edited. See MAX_POSITION for why the bound is
+    # not the batch endpoint's five-model cap.
+    position: int | None = Field(default=None, ge=0, le=MAX_POSITION)
 
 
 class CompareResponse(BaseModel):
@@ -184,9 +217,18 @@ class RunList(BaseModel):
 
 
 class GroupCreate(BaseModel):
-    # No fields: an empty JSON object is the whole contract, so this model
-    # exists only to refuse unknown ones. See FORBID_UNKNOWN.
+    # Both optional so an empty JSON object stays a valid body: that is
+    # what every pre-G client sends, and the empty object is load-bearing
+    # for the CORS preflight defense. When present they record what the
+    # comparison IS, before any upstream call, which is what makes the
+    # group row the experiment record and fixes the group's prompt ahead
+    # of its first member. See FORBID_UNKNOWN for the unknown-field rule.
     model_config = FORBID_UNKNOWN
+
+    prompt: str | None = Field(default=None, min_length=1)
+    # The ordered lineup as declared. Same cap as CompareRequest.models,
+    # for the same reason: this is a side-by-side bench.
+    models: list[str] | None = Field(default=None, min_length=1, max_length=5)
 
 
 class GroupCreated(BaseModel):
@@ -218,12 +260,45 @@ class RunDetail(BaseModel):
     prompt_text: str
     prompt_id: int | None
     results: list[ModelResult]
+    # What this run actually was: the build that produced it, how old the
+    # prices it was costed against were, and the data-handling policy its
+    # payloads declared. None on every pre-G row.
+    app_sha: str | None = None
+    catalog_snapshot_at: str | None = None
+    data_policy: str | None = None
 
 
 class GroupDetail(BaseModel):
     id: int
     created_at: str
     runs: list[RunDetail]
+
+
+def _app_sha() -> str | None:
+    """The current commit, or None when that cannot be determined.
+
+    Provenance for "what code produced this row". Read once at boot rather
+    than per run: it cannot change while the process lives, and a
+    subprocess per request would be absurd. Degrades to None whenever git
+    is missing, the checkout is not a repository, or git is slow enough to
+    hit the timeout, because none of those are reasons to fail a boot. The
+    timeout is short for the same reason: this is a nice-to-have label,
+    not a dependency.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=Path(__file__).resolve().parent.parent,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return as_text(proc.stdout.strip()) or None
 
 
 def _parse_spend_limit(raw: str | None) -> float | None:
@@ -299,8 +374,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
+    app.state.app_sha = _app_sha()
     app.state.catalog = await fetch_catalog(app.state.client)
     app.state.prices = app.state.catalog["prices"]
+    # When the prices a run was costed against were read. None on an
+    # offline boot, where there is no snapshot to date: that absence is
+    # itself the provenance, since those runs have no estimate either.
+    app.state.catalog_snapshot_at = (
+        datetime.now(UTC).isoformat() if app.state.catalog["fetched"] else None
+    )
     # Per-model completion caps, derived once per boot so the budget
     # clamp is a dict lookup per request. Only published integer caps
     # participate. With the catalog fetched, an unknown cap means no clamp;
@@ -528,6 +610,21 @@ async def favicon() -> Response:
     )
 
 
+def run_provenance() -> dict[str, Any]:
+    """The run-level facts of this boot, stamped onto every run row.
+
+    Read from app.state at call time rather than captured once, so a test
+    that rebuilds state between clients sees its own values. data_policy is
+    filled by the privacy workstream; it is listed here so every writer
+    already carries the key.
+    """
+    return {
+        "app_sha": getattr(app.state, "app_sha", None),
+        "catalog_snapshot_at": getattr(app.state, "catalog_snapshot_at", None),
+        "data_policy": getattr(app.state, "data_policy", None),
+    }
+
+
 def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     """Cost of one result, or None when tokens or pricing are unknown.
 
@@ -676,16 +773,20 @@ def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
 
     Checked at endpoint entry, before the semaphore and any upstream call,
     so a mismatch is a 409 that spends nothing and never reaches the
-    post-spend degrade path (link resolution stays degrade-only). An empty
-    or unknown group accepts any prompt; the first member establishes the
-    group's prompt.
+    post-spend degrade path (link resolution stays degrade-only). An
+    unknown group, and a group with neither a declared prompt nor a member,
+    accepts any prompt.
 
-    Residual: two concurrent first members with different prompts can both
-    pass the empty-group check here, because group_prompt returns None for
-    both before either persists. Single-user localhost makes that a
-    non-path, the frontend cannot produce it (one Run creates one group
-    with one prompt), and rejecting after spend is forbidden by the
-    fault-boundary invariant, so the residual is accepted rather than
+    Residual, now confined to legacy groups: a group that declared its
+    prompt at creation is checked against a value that existed before any
+    member was sent, so two concurrent first members cannot both see an
+    empty group. Every group the current frontend creates declares one. The
+    old race survives only for groups created before that column existed,
+    or by a client that omits the prompt: there group_prompt still derives
+    from the first member and returns None for both racers. Those are
+    finite and historical, single-user localhost makes the window a
+    non-path anyway, and rejecting after spend is forbidden by the
+    fault-boundary invariant, so the remainder is accepted rather than
     closed with a lock.
     """
     if group_id is None:
@@ -786,8 +887,11 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     results = await asyncio.gather(*(limited(m) for m in request.models))
     # Seeded before the fault boundary so a failure inside it can never
     # leave a result missing the key the response model requires.
-    for result in results:
+    # position comes from array order here: gather preserves it, and for
+    # the batch endpoint the caller's array IS the declared layout.
+    for index, result in enumerate(results):
         result["cost_usd"] = None
+        result["position"] = index
     run_id = None
     # The invariant: after money is spent, no code path may convert
     # results into an error response. Everything between "upstream
@@ -806,7 +910,12 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
             app.state.db, request.prompt_id, request.group_id
         )
         run_id = store.save_run(
-            app.state.db, request.prompt, list(results), prompt_id, group_id
+            app.state.db,
+            request.prompt,
+            list(results),
+            prompt_id,
+            group_id,
+            run_provenance(),
         )
     except Exception:
         logger.exception("post-upstream processing failed for /compare")
@@ -908,6 +1017,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 release_slot()
                 result = event["result"]
                 result["cost_usd"] = None
+                result["position"] = request.position
                 run_id = None
                 # Same invariant as /compare, and stricter here: the
                 # deltas are already on the wire, so after money is
@@ -922,7 +1032,12 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                         app.state.db, request.prompt_id, request.group_id
                     )
                     run_id = store.save_run(
-                        app.state.db, request.prompt, [result], prompt_id, group_id
+                        app.state.db,
+                        request.prompt,
+                        [result],
+                        prompt_id,
+                        group_id,
+                        run_provenance(),
                     )
                 except Exception:
                     logger.exception(
@@ -954,13 +1069,19 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     "cost_usd": None,
                     "ttft_ms": first_delta_ms,
                     "max_tokens": max_tokens,
+                    "position": request.position,
                 }
                 try:
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
                     store.save_run(
-                        app.state.db, request.prompt, [aborted], prompt_id, group_id
+                        app.state.db,
+                        request.prompt,
+                        [aborted],
+                        prompt_id,
+                        group_id,
+                        run_provenance(),
                     )
                 except Exception:
                     logger.exception("failed to persist aborted streamed run")
@@ -984,7 +1105,7 @@ def ensure_rowid(value: int) -> None:
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
 async def create_group(body: GroupCreate) -> dict[str, Any]:
-    return {"id": store.create_group(app.state.db)}
+    return {"id": store.create_group(app.state.db, body.prompt, body.models)}
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)

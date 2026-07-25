@@ -5,6 +5,7 @@ owns the connection's lifecycle, tests hand in :memory:, and swapping
 sqlite for something else later touches only this module.
 """
 
+import json
 import logging
 import os
 import sqlite3
@@ -16,7 +17,7 @@ from typing import Any
 # Shared with ingestion on purpose: what run_model refuses to emit,
 # get_run refuses to serve, so both ends of the pipeline enforce the
 # same field-type contract.
-from bench.models import as_metric, as_text, as_token_count
+from bench.models import as_metric, as_money, as_text, as_token_count
 
 logger = logging.getLogger(__name__)
 
@@ -33,14 +34,19 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    prompt_text TEXT,
+    models_json TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
     prompt_id INTEGER NULL REFERENCES prompts(id) ON DELETE SET NULL,
     group_id INTEGER NULL REFERENCES groups(id),
     prompt_text TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    app_sha TEXT,
+    catalog_snapshot_at TEXT,
+    data_policy TEXT
 );
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
@@ -55,7 +61,15 @@ CREATE TABLE IF NOT EXISTS results (
     ttft_ms REAL,
     max_tokens INTEGER,
     generation_id TEXT,
-    finish_reason TEXT
+    finish_reason TEXT,
+    position INTEGER,
+    request_json TEXT,
+    billed_cost_usd REAL,
+    reasoning_tokens INTEGER,
+    cached_tokens INTEGER,
+    provider TEXT,
+    quantization TEXT,
+    native_finish_reason TEXT
 );
 """
 
@@ -77,6 +91,34 @@ MIGRATIONS = [
     ("results", "max_tokens", "INTEGER"),
     ("results", "generation_id", "TEXT"),
     ("results", "finish_reason", "TEXT"),
+    # Phase G, measurement integrity. All nullable and additive, so a
+    # pre-G database keeps every existing row and reads them back with
+    # each new column None. cost_usd deliberately keeps its name and its
+    # meaning (the local catalog estimate); billed truth gets its own
+    # column beside it rather than overwriting the estimate's history.
+    # The group row is created before any upstream call, which makes it
+    # the natural experiment record: what was asked, of which models.
+    ("groups", "prompt_text", "TEXT"),
+    ("groups", "models_json", "TEXT"),
+    # Enough provenance to say what an old run actually was: which build
+    # produced it, how old its price catalog was, and what data-handling
+    # policy its payloads carried.
+    ("runs", "app_sha", "TEXT"),
+    ("runs", "catalog_snapshot_at", "TEXT"),
+    ("runs", "data_policy", "TEXT"),
+    # position reconstructs the original side-by-side layout from the row
+    # itself; request_json is the reproducibility record of what was
+    # actually sent. The rest are the authoritative numbers Phase G stops
+    # discarding, filled by later workstreams: the columns land here so
+    # the schema changes exactly once.
+    ("results", "position", "INTEGER"),
+    ("results", "request_json", "TEXT"),
+    ("results", "billed_cost_usd", "REAL"),
+    ("results", "reasoning_tokens", "INTEGER"),
+    ("results", "cached_tokens", "INTEGER"),
+    ("results", "provider", "TEXT"),
+    ("results", "quantization", "TEXT"),
+    ("results", "native_finish_reason", "TEXT"),
 ]
 
 
@@ -235,9 +277,28 @@ def delete_prompt(conn: sqlite3.Connection, prompt_id: int) -> bool:
     return cur.rowcount > 0
 
 
-def create_group(conn: sqlite3.Connection) -> int:
+def create_group(
+    conn: sqlite3.Connection,
+    prompt_text: str | None = None,
+    models: list[str] | None = None,
+) -> int:
+    """Create the group row, optionally recording what the comparison is.
+
+    The group is created before any upstream call, so the prompt and the
+    ordered lineup recorded here are the experiment as declared, not as it
+    turned out. Both stay optional: a caller that does not know them yet
+    (and every pre-G caller) still gets a plain group row.
+    """
     with conn:
-        cur = conn.execute("INSERT INTO groups (created_at) VALUES (?)", (_now(),))
+        cur = conn.execute(
+            "INSERT INTO groups (created_at, prompt_text, models_json)"
+            " VALUES (?, ?, ?)",
+            (
+                _now(),
+                prompt_text,
+                json.dumps(models) if models is not None else None,
+            ),
+        )
     # lastrowid is Optional in the DBAPI types but always set after a
     # single-row INSERT; assert so the int return stays honest.
     assert cur.lastrowid is not None
@@ -250,18 +311,30 @@ def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
 
 
 def group_prompt(conn: sqlite3.Connection, group_id: int) -> str | None:
-    """The prompt a group is established with: its first member's prompt
-    text, or None if the group has no runs yet (or does not exist).
+    """The prompt a group is established with, or None if it has none yet.
 
-    One prompt per group is a semantic the frontend already keeps; this
-    lets the API enforce it too, derived from members so no schema column
-    is needed. The first run to persist under a group fixes its prompt.
+    Prefers the group's own prompt_text, recorded at creation before any
+    run existed. That is what dissolves the concurrent-first-member race:
+    the prompt is fixed before the first member is even sent, so two
+    simultaneous first members are checked against a value that already
+    exists rather than against each other's absence.
+
+    Falls back to deriving from the first member for groups created before
+    the column existed, and for any caller that creates a group without
+    declaring a prompt. The race survives only in that fallback.
     """
     row = conn.execute(
+        "SELECT prompt_text FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    if row is not None and row["prompt_text"] is not None:
+        declared = as_text(row["prompt_text"])
+        if declared is not None:
+            return declared
+    member = conn.execute(
         "SELECT prompt_text FROM runs WHERE group_id = ? ORDER BY id LIMIT 1",
         (group_id,),
     ).fetchone()
-    return row["prompt_text"] if row else None
+    return member["prompt_text"] if member else None
 
 
 def save_run(
@@ -270,17 +343,35 @@ def save_run(
     results: list[dict[str, Any]],
     prompt_id: int | None = None,
     group_id: int | None = None,
+    provenance: dict[str, Any] | None = None,
 ) -> int:
     """Insert a run and its results atomically. Returns the run id.
 
     One transaction so a failing result insert cannot leave a run row
     with missing or partial results in the history.
+
+    provenance carries the run-level facts the caller knows and the store
+    does not: which build was running, how old the price catalog was, and
+    which data-handling policy the payloads declared. Optional, and every
+    key optional within it, so a caller that knows none of it still writes
+    a valid row with those columns None.
     """
+    prov = provenance or {}
     with conn:
         cur = conn.execute(
-            "INSERT INTO runs (prompt_id, group_id, prompt_text, created_at)"
-            " VALUES (?, ?, ?, ?)",
-            (prompt_id, group_id, prompt_text, _now()),
+            """INSERT INTO runs
+               (prompt_id, group_id, prompt_text, created_at,
+                app_sha, catalog_snapshot_at, data_policy)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                prompt_id,
+                group_id,
+                prompt_text,
+                _now(),
+                prov.get("app_sha"),
+                prov.get("catalog_snapshot_at"),
+                prov.get("data_policy"),
+            ),
         )
         # lastrowid is always set after this single-row INSERT; assert
         # so the int return type is not a lie.
@@ -290,8 +381,10 @@ def save_run(
             """INSERT INTO results
                (run_id, model, response_text, latency_ms, prompt_tokens,
                 completion_tokens, error, cost_usd, ttft_ms, max_tokens,
-                generation_id, finish_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                generation_id, finish_reason, position, request_json,
+                billed_cost_usd, reasoning_tokens, cached_tokens,
+                provider, quantization, native_finish_reason)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -309,6 +402,14 @@ def save_run(
                     r.get("max_tokens"),
                     r.get("generation_id"),
                     r.get("finish_reason"),
+                    r.get("position"),
+                    r.get("request_json"),
+                    r.get("billed_cost_usd"),
+                    r.get("reasoning_tokens"),
+                    r.get("cached_tokens"),
+                    r.get("provider"),
+                    r.get("quantization"),
+                    r.get("native_finish_reason"),
                 )
                 for r in results
             ],
@@ -437,27 +538,59 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
     without a destructive migration, and the raw row stays in the file
     as evidence.
     """
-    for field in ("prompt_tokens", "completion_tokens", "max_tokens"):
+    for field in (
+        "prompt_tokens",
+        "completion_tokens",
+        "max_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+    ):
         row[field] = as_token_count(row[field])
     for field in ("latency_ms", "ttft_ms", "cost_usd"):
         row[field] = as_metric(row[field])
-    for field in ("response_text", "error", "generation_id", "finish_reason"):
+    # Money, so the finite rule applies on the way out too: a poisoned
+    # billed cost in an old row must read as None, never as a number a
+    # reconciliation or a total would trust.
+    row["billed_cost_usd"] = as_money(row["billed_cost_usd"])
+    for field in (
+        "response_text",
+        "error",
+        "generation_id",
+        "finish_reason",
+        "request_json",
+        "provider",
+        "quantization",
+        "native_finish_reason",
+    ):
         row[field] = as_text(row[field])
+    # position orders the replay, so junk in it must not reorder history;
+    # a non-integer degrades to None and falls back to insertion order.
+    row["position"] = as_token_count(row["position"])
     return row
 
 
 def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     run = conn.execute(
-        "SELECT id, prompt_id, prompt_text, created_at FROM runs WHERE id = ?",
+        """SELECT id, prompt_id, prompt_text, created_at,
+                  app_sha, catalog_snapshot_at, data_policy
+           FROM runs WHERE id = ?""",
         (run_id,),
     ).fetchone()
     if run is None:
         return None
+    # Ordered by position when the row carries one, falling back to
+    # insertion order for legacy rows. The COALESCE keeps a mixed run
+    # (legacy rows beside new ones) deterministic instead of interleaving
+    # NULLs arbitrarily: positioned rows sort where they were placed, and
+    # unpositioned ones keep the order they were written in.
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
-                  generation_id, finish_reason
-           FROM results WHERE run_id = ? ORDER BY id""",
+                  generation_id, finish_reason, position, request_json,
+                  billed_cost_usd, reasoning_tokens, cached_tokens,
+                  provider, quantization, native_finish_reason
+           FROM results WHERE run_id = ?
+           ORDER BY COALESCE(position, id), id""",
         (run_id,),
     ).fetchall()
     out = dict(run)

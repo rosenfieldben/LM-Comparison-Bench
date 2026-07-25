@@ -6,6 +6,13 @@ token, and every result card carries latency, time to first token,
 token counts and cost. Prompts can be saved as a reusable library
 and every run lands in SQLite history for later replay.
 
+This is a comparison workbench: it puts models side by side under
+identical conditions and records what happened, with enough provenance
+to say later what an old run actually was. The evaluation layer on top
+of it, datasets, repeated trials and scoring, is in progress and not
+here yet, so treat a comparison as evidence to read rather than a
+benchmark result to cite.
+
 ## Daily use
 
 ```sh
@@ -258,6 +265,28 @@ creates one), and a pre-existing file that is group or world readable
 is tightened to 0600 at startup with a log line, because umask is
 not a policy. Deleting the file deletes all history; there is no
 other copy.
+
+Each row carries provenance, so a run stays interpretable after the
+code, the prices, or the lineup have moved on. A group records the
+prompt and the ordered lineup as declared, before any model is called,
+which makes the group row the experiment record and fixes the group's
+prompt ahead of its first member. Each run records the commit that
+produced it (`app_sha`, best effort: None when git is unavailable), the
+timestamp of the price catalog it was costed against
+(`catalog_snapshot_at`, None on an offline boot), and the data-handling
+policy its payloads declared (`data_policy`). Each result records the
+column it occupied (`position`, so a replay rebuilds the original
+side-by-side layout from the rows instead of from a lineup that has
+since been edited) and the exact payload that was sent (`request_json`,
+authorization excluded, since auth travels in headers and never in the
+body).
+
+Databases from before these columns existed are migrated in place on
+the next start, additively: nothing is renamed, dropped or retyped, old
+rows keep their values, and every new column reads back as None on
+them. `cost_usd` keeps its name and its meaning throughout, the local
+estimate from catalog prices; the billed figure lives beside it in its
+own column rather than overwriting the estimate's history.
 
 ## Provider routing
 

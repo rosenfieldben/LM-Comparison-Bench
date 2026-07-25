@@ -46,6 +46,24 @@ def as_metric(value: object) -> float | None:
     return None
 
 
+def as_money(value: object) -> float | None:
+    """A usable money amount: finite, non-negative, else None.
+
+    The F.1 money rule as a function, so every place that ingests a
+    currency figure applies it identically. Stricter than as_metric by the
+    sign: a negative charge is not a measurement that happens to be below
+    zero, it is a value no billing path should produce, and treating it as
+    real would let it subtract from an accumulated total and quietly
+    disable the spend ceiling. A NaN would do the same by making every
+    comparison false, which is why finiteness is checked here rather than
+    trusted from the payload.
+    """
+    amount = as_metric(value)
+    if amount is None or amount < 0:
+        return None
+    return amount
+
+
 # Env-overridable as a test seam so the browser harness can point the
 # real app at a stub upstream; not a configuration feature.
 OPENROUTER_URL = os.environ.get(
@@ -217,6 +235,20 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
     return {"fetched": True, "models": models, "prices": prices}
 
 
+def _request_record(payload: dict[str, Any]) -> str | None:
+    """The payload as a stable JSON string, or None if it will not serialize.
+
+    sort_keys so two identical requests produce identical records and a
+    diff of two runs shows real differences rather than key order. Returns
+    None rather than raising on an unserializable payload: this is a
+    provenance nicety, and the never-raises contract outranks it.
+    """
+    try:
+        return json.dumps(payload, sort_keys=True)
+    except (TypeError, ValueError):
+        return None
+
+
 def _flatten_content(content: object) -> str | None:
     """Collapse a message content value to plain text or None.
 
@@ -266,6 +298,7 @@ async def run_model(
         "max_tokens": max_tokens,
         "generation_id": None,
         "finish_reason": None,
+        "request_json": None,
     }
     payload = {
         "model": model,
@@ -273,6 +306,13 @@ async def run_model(
         "max_tokens": max_tokens,
         "provider": PROVIDER_PREFS,
     }
+    # The reproducibility record: what was actually sent, not what was
+    # intended. Serialized here, beside the dict that goes on the wire, so
+    # the two cannot drift. Authorization lives in the client's headers and
+    # never enters the payload, so nothing secret is recorded. Echoed even
+    # on failure paths, because knowing what a failed request asked for is
+    # exactly when this matters.
+    result["request_json"] = _request_record(payload)
 
     start = time.perf_counter()
     try:
@@ -383,6 +423,7 @@ async def stream_model(
         "max_tokens": max_tokens,
         "generation_id": None,
         "finish_reason": None,
+        "request_json": None,
     }
     payload = {
         "model": model,
@@ -394,6 +435,9 @@ async def stream_model(
         # counts (and therefore cost) would be lost on streamed runs.
         "stream_options": {"include_usage": True},
     }
+    # See run_model: the exact payload, auth excluded, recorded beside the
+    # dict that goes on the wire.
+    result["request_json"] = _request_record(payload)
     text_parts: list[str] = []
     saw_done = False
     start = time.perf_counter()

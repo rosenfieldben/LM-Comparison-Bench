@@ -363,6 +363,9 @@
         retry.budget,
         ui,
         BenchState.viewEpoch,
+        // Same column as the attempt being retried: a rerun is a second
+        // sample in the same slot, not a new column.
+        retry.position,
       );
     });
     ui.tools.append(btn);

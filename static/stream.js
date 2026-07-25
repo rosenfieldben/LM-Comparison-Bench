@@ -9,7 +9,16 @@
   const runBtn = document.getElementById("run");
   const stopBtn = document.getElementById("stop");
 
-  async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
+  async function runOne(
+    prompt,
+    model,
+    promptId,
+    groupId,
+    budget,
+    ui,
+    epoch,
+    position,
+  ) {
     // Superseded before it started: spend no money for a dead view.
     if (epoch !== BenchState.viewEpoch) return;
     const current = () => epoch === BenchState.viewEpoch;
@@ -145,7 +154,7 @@
         // refused card into a red error card on the first click.
         retry:
           result.error != null && !refused
-            ? { prompt, model, promptId, groupId, budget }
+            ? { prompt, model, promptId, groupId, budget, position }
             : null,
         // A user Stop renders as an honest stopped state, not done or error.
         stopped: result.stopped === true,
@@ -162,6 +171,12 @@
           prompt_id: promptId,
           group_id: groupId,
           budget: budget,
+          // Which column this run occupies, so a replay can rebuild the
+          // layout from the rows instead of from the current chip order,
+          // which drifts as the lineup is edited. Omitted (undefined
+          // drops out of JSON) for a rerun, which reuses the position the
+          // retried run already recorded.
+          position: position,
         }),
         signal: controller.signal,
       });
@@ -283,13 +298,16 @@
     // decide whether to set one. The group POST's own finally closes it.
     BenchState.pendingBatchEpoch = epoch;
     try {
-      // The empty JSON body is load-bearing: the server requires
+      // A JSON body is load-bearing: the server requires
       // application/json on every POST so hostile cross-site senders
-      // are forced into a CORS preflight it never answers.
+      // are forced into a CORS preflight it never answers. It now also
+      // declares the experiment, the prompt and the ordered lineup,
+      // before any model is called, which is what lets the server fix
+      // the group's prompt ahead of its first member.
       const resp = await fetch("/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ prompt: prompt, models: models }),
         signal: groupController.signal,
       });
       if (resp.ok) groupId = (await resp.json()).id;
@@ -312,7 +330,16 @@
     try {
       await Promise.allSettled(
         models.map((model, i) =>
-          runOne(prompt, model, promptId, groupId, budget, columns[i], epoch),
+          runOne(
+            prompt,
+            model,
+            promptId,
+            groupId,
+            budget,
+            columns[i],
+            epoch,
+            i,
+          ),
         ),
       );
     } finally {
