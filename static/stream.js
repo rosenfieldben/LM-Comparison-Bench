@@ -43,6 +43,10 @@
     // node survives into the error state if the stream dies partway.
     let textNode = null;
     let finished = false;
+    // Whether the server said this run acquired an upstream slot. A stop
+    // before that point verifiably spent nothing; a stop after it may or
+    // may not have, which is the distinction the unpriced count now makes.
+    let sawStarted = false;
     function appendDelta(text) {
       if (textNode === null) {
         // First token: the thinking counter has done its job, and the
@@ -92,12 +96,18 @@
       }
       // Session accounting is view-independent: money spent by a
       // superseded run is still money spent this session. A user-stopped
-      // run adds nothing: no cost frame ever arrived, which matches the
-      // server, where the disconnect path persists a started run as aborted
-      // with null cost and a queued run not at all. Stopping does not refund
-      // spend already incurred; it just is not counted here because the
-      // client never received it.
-      if (!result.stopped) {
+      // run contributes no amount, because no cost frame ever arrived, but
+      // it is not free either: stream cancellation stops the charge only on
+      // providers that support it, and throughput routing picks the
+      // provider per request, so a stopped run's billing is unknowable from
+      // here. Counting it in neither spend nor unpriced read as "cost
+      // nothing", which is a claim the bench cannot make. A run stopped
+      // while still queued is the one case that IS free: it never acquired
+      // a slot and never reached a provider, which is also why the server
+      // persists nothing for it.
+      if (result.stopped) {
+        if (sawStarted) BenchState.sessionStats.unpriced += 1;
+      } else {
         // Billed first, estimate second, matching the card and the server's
         // ceiling: one contribution per run, never both, so the bar cannot
         // double-count a result that carries each.
@@ -225,7 +235,10 @@
           } else if (event.type === "started") {
             // The slot was just acquired. Restart the client clock here so
             // the TTFT estimate excludes queue wait, matching the server's
-            // post-acquire clock, and restore the thinking label.
+            // post-acquire clock, and restore the thinking label. This is
+            // also the line past which a stop can no longer claim the run
+            // was free.
+            sawStarted = true;
             const entry = BenchRender.tickers.get(ui);
             if (entry) entry.start = performance.now();
             ui.statusWord.textContent = "thinking";

@@ -94,6 +94,25 @@
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");
+    // The tooltip is rewritten on every render rather than fixed in the
+    // markup, because what the total is made of changes as the session
+    // runs: a fixed string calling it an estimate became false the moment
+    // a billed figure landed in it.
+    const composition =
+      spend === 0
+        ? "nothing priced yet this session"
+        : state.sessionStats.estimated > 0
+          ? "part billed by OpenRouter, part estimated from catalog " +
+            "prices and reported tokens; the tilde marks that some of it " +
+            "is an estimate"
+          : "billed by OpenRouter, not estimated";
+    statSpend.title =
+      state.sessionStats.unpriced > 0
+        ? composition +
+          ". Unpriced counts runs with neither a billed nor an estimated " +
+          "cost, and runs stopped after they started, whose billing " +
+          "depends on whether the provider supports cancellation"
+        : composition;
     statTtft.textContent =
       state.sessionStats.ttftN > 0
         ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) +
