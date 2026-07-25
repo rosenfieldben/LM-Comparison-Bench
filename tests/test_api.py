@@ -1786,3 +1786,67 @@ def test_refusal_marker_absent_from_ordinary_results(monkeypatch, tmp_path):
                 "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
             ).json()
     assert "spend_refused" not in body["results"][0]
+
+
+# ---- F4.7: unknown request fields are refused, not silently ignored.
+
+
+@respx.mock
+def test_review_repro_unknown_field_rejected_on_every_mutating_endpoint(client):
+    """Second review: the API silently ignored unknown JSON fields, so a
+    typo like {"budgte": "extended"} ran a valid but unintended paid
+    request. The caller asked for one thing and the bench did another, with
+    the money moving either way. Every mutating endpoint must answer 422 and
+    name the offending field, and the compare endpoints must not have
+    reached upstream."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    cases = [
+        ("/compare", {"prompt": "hi", "models": ["model/alpha"], "budgte": "extended"}),
+        (
+            "/compare/stream",
+            {"prompt": "hi", "model": "model/alpha", "budgte": "extended"},
+        ),
+        ("/prompts", {"name": "n", "text": "t", "tags": ["oops"]}),
+        ("/groups", {"unexpected": 1}),
+    ]
+    for path, body in cases:
+        resp = client.post(path, json=body)
+        assert resp.status_code == 422, (path, resp.status_code)
+        # The offending field is named, so the mistake is obvious.
+        detail = json.dumps(resp.json()["detail"])
+        offender = next(k for k in body if k in ("budgte", "tags", "unexpected"))
+        assert offender in detail, (path, detail)
+
+    # No money moved for any of them: the refusal is at the boundary.
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_legitimate_fields_still_accepted(client):
+    """The control: every field the frontend and the suite actually send
+    stays valid, on both compare shapes and the two other bodies."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post("/groups", json={}).json()["id"]
+    pid = client.post("/prompts", json={"name": "f47", "text": "t"}).json()["id"]
+    full = client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "prompt_id": pid,
+            "group_id": gid,
+            "budget": "extended",
+        },
+    )
+    assert full.status_code == 200
+    stream = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "hi",
+            "model": "model/alpha",
+            "prompt_id": pid,
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+    assert stream.status_code == 200

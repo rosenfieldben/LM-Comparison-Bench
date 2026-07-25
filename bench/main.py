@@ -14,10 +14,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -56,7 +56,18 @@ MAX_CONCURRENT_UPSTREAM = 5
 MAX_SQLITE_ROWID = 2**63 - 1
 
 
+# Unknown fields are refused on every request model at the boundary, not
+# ignored. A typo like {"budgte": "extended"} used to run a valid but
+# unintended paid request: the caller asked for one thing, the bench did
+# another, and the money moved either way. A 422 naming the offending field
+# costs nothing and turns a silent wrong run into an obvious mistake. The
+# frontend's existing non-OK handling surfaces the detail on the card.
+FORBID_UNKNOWN = ConfigDict(extra="forbid")
+
+
 class CompareRequest(BaseModel):
+    model_config = FORBID_UNKNOWN
+
     prompt: str = Field(min_length=1)
     # Cap at 5: the bench is for side-by-side eyeballing, and each extra
     # model is a concurrent upstream request on one API key.
@@ -100,6 +111,9 @@ class ModelResult(BaseModel):
 
 
 class StreamCompareRequest(BaseModel):
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
     prompt: str = Field(min_length=1)
     # One model per streaming request, mirroring the frontend's
     # per-model fetch pattern: independent columns are the product.
@@ -118,6 +132,9 @@ class CompareResponse(BaseModel):
 
 
 class PromptCreate(BaseModel):
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
     name: str = Field(min_length=1)
     text: str = Field(min_length=1)
 
@@ -152,6 +169,12 @@ class GroupEntry(BaseModel):
 
 class RunList(BaseModel):
     runs: list[GroupEntry | RunEntry]
+
+
+class GroupCreate(BaseModel):
+    # No fields: an empty JSON object is the whole contract, so this model
+    # exists only to refuse unknown ones. See FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
 
 
 class GroupCreated(BaseModel):
@@ -916,7 +939,7 @@ def ensure_rowid(value: int) -> None:
 # content type, and the guard middleware keys on application/json to
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
-async def create_group(body: dict[str, Any] = Body()) -> dict[str, Any]:
+async def create_group(body: GroupCreate) -> dict[str, Any]:
     return {"id": store.create_group(app.state.db)}
 
 
