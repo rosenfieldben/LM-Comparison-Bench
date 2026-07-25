@@ -78,6 +78,16 @@
     raceRender();
   }
 
+  // A spend refusal never reached a provider, so the strip must not call it
+  // a failure: that is the same mis-description the card stopped making.
+  // Ranked among nothing, like a stop, because there is no time to rank.
+  function raceRefused(model) {
+    const row = race !== null ? race.rows.get(model) : undefined;
+    if (!row) return;
+    row.status = "refused";
+    raceRender();
+  }
+
   // A user Stop: the row must not keep shimmering as if still working. It
   // leaves the working state and reads "stopped", ranked among nothing.
   function raceStopped(model) {
@@ -133,6 +143,12 @@
         r.rank.textContent = "·";
         r.fill.style.width = "";
         r.val.textContent = "stopped";
+      } else if (r.status === "refused") {
+        // No rank, no bar: the ceiling refused it before any provider saw
+        // it, so there is nothing to time and nothing that failed.
+        r.rank.textContent = "·";
+        r.fill.style.width = "";
+        r.val.textContent = "refused";
       } else if (r.ttft != null) {
         r.rank.textContent = String(r.rankN);
         r.fill.style.width = Math.min(100, (r.ttft / scale) * 100) + "%";
@@ -508,6 +524,7 @@
     raceTtft,
     raceError,
     raceStopped,
+    raceRefused,
     raceDone,
     hideRace,
     makeColumn,

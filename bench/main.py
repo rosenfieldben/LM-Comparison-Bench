@@ -66,8 +66,12 @@ MAX_SQLITE_ROWID = 2**63 - 1
 # ignored. A typo like {"budgte": "extended"} used to run a valid but
 # unintended paid request: the caller asked for one thing, the bench did
 # another, and the money moved either way. A 422 naming the offending field
-# costs nothing and turns a silent wrong run into an obvious mistake. The
-# frontend's existing non-OK handling surfaces the detail on the card.
+# costs nothing and turns a silent wrong run into an obvious mistake.
+# The audience is whoever hand-writes a request (curl, a script): FastAPI's
+# 422 detail is a list of per-field errors, and the card's error path only
+# renders a string detail, so a card would read "HTTP 422" rather than the
+# field name. That is not worth widening the error renderer for, because the
+# frontend sends fixed bodies and cannot produce this 422 at all.
 FORBID_UNKNOWN = ConfigDict(extra="forbid")
 
 
@@ -299,7 +303,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.prices = app.state.catalog["prices"]
     # Per-model completion caps, derived once per boot so the budget
     # clamp is a dict lookup per request. Only published integer caps
-    # participate; an unknown cap means no clamp, same as offline.
+    # participate. With the catalog fetched, an unknown cap means no clamp;
+    # on an offline boot there are no caps at all and effective_budget
+    # falls back to the conservative tier instead. See effective_budget.
     app.state.completion_limits = {
         m["id"]: m["max_completion_tokens"]
         for m in app.state.catalog["models"]
@@ -340,6 +346,14 @@ def peer_is_local(client: Any) -> bool:
     --host 0.0.0.0 typo, a container publishing the port), that is a
     remote caller spending the key. This is the socket-level companion:
     the peer address itself must be loopback.
+
+    Not quite the raw socket: uvicorn's proxy-headers support rewrites
+    scope["client"] from X-Forwarded-For, but only for peers listed in
+    FORWARDED_ALLOW_IPS, which defaults to 127.0.0.1. So in the case this
+    guard is for, a genuinely remote peer reaching a wrongly-bound server,
+    that peer is not trusted to rewrite anything and its real address is
+    what gets checked. Widening FORWARDED_ALLOW_IPS hands the header that
+    trust deliberately, and would weaken this check along with it.
 
     In-process transports have no socket. Starlette's TestClient presents
     the synthetic peer ("testclient", 50000), and other harnesses present
@@ -620,6 +634,13 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     field is additive by the client contract (unknown fields are ignored),
     and it is a marker rather than an error-string match because the error
     text is prose that may be reworded.
+
+    The marker rides the streaming frame only. /compare serializes through
+    ModelResult, which declares no such field and therefore drops it; that
+    is deliberate. Surfacing it there would either need a schema column to
+    persist it (out of scope this phase) or would report a misleading false
+    on every historical row, and the frontend, the only consumer that acts
+    on it, uses the streaming endpoint.
     """
     return {
         "model": model,

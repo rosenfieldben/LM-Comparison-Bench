@@ -219,6 +219,17 @@ def test_review_repro_refused_card_is_not_a_save_failure(bench):
     expect(page.locator("#page")).not_to_contain_text("not saved to history")
     # A refusal is its own state, not an error and not done.
     expect(status_of(card)).to_have_text("refused")
+    # And the race strip must agree: a refusal never reached a provider, so
+    # calling it "failed" in the error color would reproduce on the strip
+    # the exact mis-description this fix removed from the card.
+    row = page.locator(".race-row")
+    expect(row).to_have_class(re.compile(r"\brefused\b"))
+    expect(row).not_to_have_class(re.compile(r"\berror\b"))
+    expect(page.locator(".race-val")).to_have_text("refused")
+    # No rerun either: the ceiling holds for the life of the process, so a
+    # rerun could only be refused again, and the first click would turn this
+    # honest card into a red error card.
+    expect(card.get_by_test_id("tool-rerun")).to_have_count(0)
 
 
 def test_genuine_persistence_failure_keeps_its_warning(bench):

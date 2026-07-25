@@ -1771,21 +1771,35 @@ async def test_review_repro_refusal_frame_carries_spend_refused_marker(
     assert "$1.50" in result["error"] and "$1.00" in result["error"]
 
 
+@respx.mock
 def test_refusal_marker_absent_from_ordinary_results(monkeypatch, tmp_path):
     """The marker must mark only refusals. A genuine post-spend persistence
     failure keeps arriving as run_id null with no marker, which is what
-    preserves its "not saved to history" warning."""
-    result = main.spend_refusal_result("model/alpha", 16384)
-    assert result["spend_refused"] is True
-    # An ordinary successful result never carries the key, so a falsy read
-    # on the client is the safe default for every other path.
-    with respx.mock:
-        respx.post(OPENROUTER_URL).respond(json=FIXTURE)
-        with spend_client(monkeypatch, tmp_path, limit=None) as c:
-            body = c.post(
-                "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
-            ).json()
-    assert "spend_refused" not in body["results"][0]
+    preserves its "not saved to history" warning.
+
+    Asserted on the streaming frame, the contract the client actually reads.
+    Asserting it on /compare would prove nothing: that endpoint serializes
+    through ModelResult, which drops every field it does not declare, so the
+    key would be absent there no matter what this function returned.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    # A ceiling is set but never approached: the run below stays far under
+    # it, so this exercises the ordinary path while still letting the
+    # refusal builder format its figures.
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Inside the client context: the refusal message reads app.state for
+        # the accumulated and limit figures, which exist only once booted.
+        refusal = main.spend_refusal_result("model/alpha", 16384)
+        assert refusal["spend_refused"] is True
+        frames = stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+    done = [f for f in frames if f["type"] == "done"]
+    assert len(done) == 1
+    # An ordinary successful run never carries the key, so a falsy read on
+    # the client is the safe default for every other path.
+    assert "spend_refused" not in done[0]["result"]
+    assert done[0]["result"]["response_text"] is not None
 
 
 # ---- F4.7: unknown request fields are refused, not silently ignored.

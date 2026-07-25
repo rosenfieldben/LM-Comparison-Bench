@@ -89,7 +89,18 @@ def test_superseded_run_never_touches_new_view(bench):
     assert errors == []
 
     # The abort disconnected the stream, so the server persisted the
-    # first run through its existing disconnect path.
+    # first run through its existing disconnect path. Wait for that write
+    # to land before opening History: the list is fetched once per open, so
+    # an assertion made against an earlier fetch can never come true no
+    # matter how long it retries. Observed failing exactly that way, since
+    # the server only notices the disconnect when the stalled upstream read
+    # unwinds. This polls the API for the persisted row instead, the same
+    # deterministic wait the Stop persistence tombstone uses.
+    page.wait_for_function(
+        """(t) => fetch('/runs?limit=100').then(r => r.json())
+              .then(d => d.runs.some(x => x.prompt_text.includes(t)))""",
+        arg="first slow",
+    )
     page.get_by_test_id("history-toggle").click()
     row = page.get_by_test_id("history-row").filter(has_text="first slow")
     expect(row).to_have_count(1)

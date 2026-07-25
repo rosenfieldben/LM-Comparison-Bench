@@ -132,13 +132,23 @@ def _disk_path(path: str) -> str | None:
     if not path.startswith("file:"):
         return path
     parsed = urllib.parse.urlparse(path)
-    if "memory" in urllib.parse.parse_qs(parsed.query).get("mode", []):
+    # Last occurrence wins, because that is what sqlite's own URI parser
+    # does: it overwrites the mode flag per occurrence. Taking any
+    # occurrence would call file:x.db?mode=memory&mode=rwc memory-backed
+    # when sqlite opens it as a real file on disk, which is precisely the
+    # hole this function exists to close.
+    modes = urllib.parse.parse_qs(parsed.query).get("mode", [])
+    if modes and modes[-1] == "memory":
+        return None
+    # sqlite accepts only an empty or "localhost" authority and rejects
+    # anything else outright ("invalid uri authority"). Returning a path
+    # for those would have _keep_private create and chmod a file for a URI
+    # that can never open, so hand back None and let sqlite raise.
+    if parsed.netloc not in ("", "localhost"):
         return None
     # urlparse puts a URI's path in .path, but only when it begins with a
     # slash; a relative URI (file:bench.db) lands in .path too, while an
     # authority-form URI (file://localhost/tmp/x.db) splits the host off.
-    # sqlite only accepts an empty or "localhost" authority, and treats
-    # both as the local filesystem, so .path alone is the filename.
     decoded = urllib.parse.unquote(parsed.path)
     # An empty path with no authority is sqlite's private temporary
     # database ("file:?cache=shared" style): no file to harden.

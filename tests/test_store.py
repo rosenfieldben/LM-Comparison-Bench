@@ -641,3 +641,44 @@ def test_disk_path_classifies_uri_shapes(tmp_path):
     assert store._disk_path("file:/tmp/a%20b.db") == "/tmp/a b.db"
     # A private temporary database has no filename to harden.
     assert store._disk_path("file:?cache=shared") is None
+
+
+def test_review_repro_repeated_mode_follows_sqlite_last_wins(tmp_path):
+    """Closing review: _disk_path treated a repeated mode parameter as
+    memory whenever ANY occurrence was memory, but sqlite overwrites the
+    flag per occurrence, so file:x.db?mode=memory&mode=rwc opens a real file
+    on disk. That file then skipped _keep_private and the WAL pragmas, which
+    is exactly the hole F4.1 exists to close, reached through the parser."""
+    db_path = tmp_path / "lastwins.db"
+    uri = f"file:{db_path}?mode=memory&mode=rwc"
+    assert store._disk_path(uri) == str(db_path)
+    old_umask = os.umask(0o022)
+    try:
+        conn = store.connect(uri)
+    finally:
+        os.umask(old_umask)
+    try:
+        # sqlite really did open it on disk, and it is hardened.
+        assert db_path.exists()
+        assert file_mode(db_path) == 0o600
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+    finally:
+        conn.close()
+    # The mirror image is memory, because there the last mode wins too.
+    assert store._disk_path("file:x.db?mode=rwc&mode=memory") is None
+
+
+def test_review_repro_foreign_authority_creates_no_file(tmp_path):
+    """Closing review: _disk_path dropped the URI authority instead of
+    checking it, so a URI sqlite rejects outright ("invalid uri authority")
+    still went through _keep_private, which created and chmod'd a file for a
+    database that could never open."""
+    target = tmp_path / "authority.db"
+    uri = f"file://remote{target}"
+    assert store._disk_path(uri) is None
+    with pytest.raises(sqlite3.OperationalError):
+        store.connect(uri)
+    # No stray file left behind by the rejected URI.
+    assert not target.exists()
+    # The authorities sqlite does accept still resolve to the file.
+    assert store._disk_path(f"file://localhost{target}") == str(target)

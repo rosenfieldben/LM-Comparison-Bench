@@ -460,6 +460,7 @@
   .race-row.working .race-rank { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-rank { color: var(--err); }
   .race-row.stopped .race-rank { color: var(--text-dim); }
+  .race-row.refused .race-rank { color: var(--text-dim); }
   .race-name {
     font-size: 12px;
     color: var(--text);
@@ -486,6 +487,7 @@
   .race-row.working .race-val { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-val { color: var(--err); }
   .race-row.stopped .race-val { color: var(--text-dim); }
+  .race-row.refused .race-val { color: var(--text-dim); }
 
   /* ==== Result cards ==== */
   #run-label { font-size: 10.5px; color: var(--text-faint); }
@@ -610,6 +612,14 @@
     color: var(--err-text);
   }
   .error-msg.after-text { margin-top: 10px; }
+  /* A refusal is the ceiling working, so its message is informational,
+     not a provider failure: the same muted treatment as the card edge
+     rather than the error tint. */
+  .card[data-state="refused"] .error-msg {
+    background: none;
+    border-left-color: var(--text-dim);
+    color: var(--text-sec);
+  }
   .card-tools {
     display: flex;
     gap: 6px;

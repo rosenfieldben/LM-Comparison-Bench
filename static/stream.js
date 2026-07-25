@@ -69,6 +69,10 @@
       if (current()) {
         if (result.stopped) {
           BenchRender.raceStopped(model);
+        } else if (result.spend_refused === true) {
+          // Refused before any provider saw it: the strip must not call
+          // that a failure, matching the card's own refused state.
+          BenchRender.raceRefused(model);
         } else if (result.error != null) {
           BenchRender.raceError(model);
         } else {
@@ -135,9 +139,12 @@
         refused: refused,
         // Only this streaming path offers a rerun; historical replays go
         // through fillColumn and never get one. A stopped run has no error,
-        // so it gets no rerun control.
+        // so it gets no rerun control, and neither does a refusal: the
+        // ceiling holds for the life of the process, so a rerun could only
+        // ever be refused again, and offering it would turn the honest
+        // refused card into a red error card on the first click.
         retry:
-          result.error != null
+          result.error != null && !refused
             ? { prompt, model, promptId, groupId, budget }
             : null,
         // A user Stop renders as an honest stopped state, not done or error.
@@ -270,10 +277,10 @@
     // via stoppedEpoch, halts every model that was about to start.
     const groupController = new AbortController();
     BenchState.epochControllers.push(groupController);
-    // Open the batch-startup window. Until the finally below closes it,
-    // this epoch has runs that do not exist yet and so cannot be aborted
-    // directly; that is the only situation the stop mark is for, and
-    // stopRuns consults this to decide whether to set one.
+    // Open the batch-startup window. While it is open this epoch has runs
+    // that do not exist yet and so cannot be aborted directly; that is the
+    // only situation the stop mark is for, and stopRuns consults this to
+    // decide whether to set one. The group POST's own finally closes it.
     BenchState.pendingBatchEpoch = epoch;
     try {
       // The empty JSON body is load-bearing: the server requires
@@ -288,6 +295,19 @@
       if (resp.ok) groupId = (await resp.json()).id;
     } catch (err) {
       // Deliberately swallowed, a Stop abort included; see above.
+    } finally {
+      // The window closes here, not when the batch settles. Past this
+      // point every run this batch launches registers its controller
+      // synchronously, so a Stop reaches all of them by direct abort and
+      // needs no mark. Leaving the window open for the whole batch would
+      // let a mid-batch Stop arm stoppedEpoch, and a rerun issued in the
+      // moments before the batch settled would then begin already aborted:
+      // the same leak F4.3 closed, just narrower. Any mark this window did
+      // produce survives until the finally below, because the runOne calls
+      // that must consume it have not started yet.
+      if (BenchState.pendingBatchEpoch === epoch) {
+        BenchState.pendingBatchEpoch = -1;
+      }
     }
     try {
       await Promise.allSettled(
@@ -296,13 +316,14 @@
         ),
       );
     } finally {
-      // Close the batch-startup window and drop any mark it produced. Every
-      // run this batch will ever launch has now passed its startup check, so
-      // the mark has done its job; leaving it set was the defect, because a
-      // later standalone rerun reuses this epoch (Stop does not advance the
-      // view) and would begin already aborted. Cleared regardless of
-      // supersession: a superseded epoch matches no future run anyway, but a
-      // stale mark would strand a rerun in this view.
+      // Drop any mark the startup window produced. Every run this batch
+      // will ever launch has now passed its startup check, so the mark has
+      // done its job; leaving it set was the defect, because a later
+      // standalone rerun reuses this epoch (Stop does not advance the view)
+      // and would begin already aborted. Cleared regardless of supersession:
+      // a superseded epoch matches no future run anyway, but a stale mark
+      // would strand a rerun in this view. The window itself closed with the
+      // group POST; this is a belt for the paths that never opened it.
       if (BenchState.pendingBatchEpoch === epoch) {
         BenchState.pendingBatchEpoch = -1;
       }
