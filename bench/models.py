@@ -313,10 +313,13 @@ async def run_model(
     # Provenance, both best-effort. The generation id keys OpenRouter's
     # generation API, which records the actual provider, quantization
     # and authoritative cost, so persisting it makes this run auditable
-    # after the fact. The finish_reason is the provider's own verdict
-    # on why output ended; until now it survived only inside
-    # synthesized error strings, and budget analysis needs it on
-    # successful runs too.
+    # after the fact. The finish_reason says why output ended; until now
+    # it survived only inside synthesized error strings, and budget
+    # analysis needs it on successful runs too. It is OpenRouter's
+    # NORMALIZED value, not the provider's own word: OpenRouter maps each
+    # provider's vocabulary onto a common set and exposes the raw one
+    # separately as native_finish_reason. Persisting that native value is
+    # Phase G provenance work, so what lands here is the normalized one.
     gen_id = data.get("id")
     if isinstance(gen_id, str) and gen_id:
         result["generation_id"] = gen_id

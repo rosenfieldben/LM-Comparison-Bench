@@ -78,6 +78,16 @@
     raceRender();
   }
 
+  // A spend refusal never reached a provider, so the strip must not call it
+  // a failure: that is the same mis-description the card stopped making.
+  // Ranked among nothing, like a stop, because there is no time to rank.
+  function raceRefused(model) {
+    const row = race !== null ? race.rows.get(model) : undefined;
+    if (!row) return;
+    row.status = "refused";
+    raceRender();
+  }
+
   // A user Stop: the row must not keep shimmering as if still working. It
   // leaves the working state and reads "stopped", ranked among nothing.
   function raceStopped(model) {
@@ -133,6 +143,12 @@
         r.rank.textContent = "·";
         r.fill.style.width = "";
         r.val.textContent = "stopped";
+      } else if (r.status === "refused") {
+        // No rank, no bar: the ceiling refused it before any provider saw
+        // it, so there is nothing to time and nothing that failed.
+        r.rank.textContent = "·";
+        r.fill.style.width = "";
+        r.val.textContent = "refused";
       } else if (r.ttft != null) {
         r.rank.textContent = String(r.rankN);
         r.fill.style.width = Math.min(100, (r.ttft / scale) * 100) + "%";
@@ -332,6 +348,10 @@
       // The reset below removes the button, but disable first so a
       // double click cannot start two reruns of the same column.
       btn.disabled = true;
+      // Before the reset, while the armed diff button is still in this
+      // card's subtree: a rerun of the armed card must not leave the armed
+      // side pointing at the attempt this is about to destroy.
+      BenchDiff.disarmIfArmedOn(ui);
       resetColumn(ui);
       // Same budget as the run being retried, not the current control
       // value: a rerun is a second sample of the same experiment.
@@ -454,9 +474,22 @@
     }
     const error = "shownError" in opts ? opts.shownError : result.error;
     applyError(ui, error);
-    // A user Stop is neither done nor a provider failure; it gets its own
-    // muted state so the card never implies the model finished or errored.
-    setState(ui, opts.stopped ? "stopped" : error != null ? "error" : "done");
+    // A user Stop is neither done nor a provider failure, and a spend
+    // refusal is neither of those nor a failure of any kind: the ceiling
+    // worked. Each gets its own state so a card never implies the model
+    // finished, errored, or lost its history. The refusal's message (which
+    // names both the accumulated spend and the ceiling) still renders
+    // through applyError above; only the framing differs.
+    setState(
+      ui,
+      opts.stopped
+        ? "stopped"
+        : opts.refused
+          ? "refused"
+          : error != null
+            ? "error"
+            : "done",
+    );
     // Rerun leads the action row so the recovery control is where the
     // eye lands first on a failed card.
     if (opts.retry) addRerun(ui, opts.retry);
@@ -491,6 +524,7 @@
     raceTtft,
     raceError,
     raceStopped,
+    raceRefused,
     raceDone,
     hideRace,
     makeColumn,

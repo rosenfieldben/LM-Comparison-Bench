@@ -1,6 +1,7 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -13,10 +14,10 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import Body, FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -37,6 +38,12 @@ logger = logging.getLogger(__name__)
 # rejects unknown names, so this map never sees one.
 BUDGET_TOKENS = {"standard": BUDGET_STANDARD, "extended": BUDGET_EXTENDED}
 
+# The budget an offline boot falls back to when no cap is published. See
+# effective_budget: offline is also unpriced, so the conservative tier is
+# what keeps an unverified extended run from being both unbounded and
+# uncounted.
+UNKNOWN_CAP_BUDGET = BUDGET_STANDARD
+
 # Ceiling on simultaneous paid upstream calls across everything in
 # flight. The batch endpoint's five-model cap always implied this
 # policy, but the UI's real path is one /compare/stream per model with
@@ -55,7 +62,22 @@ MAX_CONCURRENT_UPSTREAM = 5
 MAX_SQLITE_ROWID = 2**63 - 1
 
 
+# Unknown fields are refused on every request model at the boundary, not
+# ignored. A typo like {"budgte": "extended"} used to run a valid but
+# unintended paid request: the caller asked for one thing, the bench did
+# another, and the money moved either way. A 422 naming the offending field
+# costs nothing and turns a silent wrong run into an obvious mistake.
+# The audience is whoever hand-writes a request (curl, a script): FastAPI's
+# 422 detail is a list of per-field errors, and the card's error path only
+# renders a string detail, so a card would read "HTTP 422" rather than the
+# field name. That is not worth widening the error renderer for, because the
+# frontend sends fixed bodies and cannot produce this 422 at all.
+FORBID_UNKNOWN = ConfigDict(extra="forbid")
+
+
 class CompareRequest(BaseModel):
+    model_config = FORBID_UNKNOWN
+
     prompt: str = Field(min_length=1)
     # Cap at 5: the bench is for side-by-side eyeballing, and each extra
     # model is a concurrent upstream request on one API key.
@@ -91,14 +113,19 @@ class ModelResult(BaseModel):
     # and authoritative cost, so a persisted id makes any historical
     # run auditable. Defaults None so pre-provenance rows stay valid.
     generation_id: str | None = None
-    # The provider's finish_reason verbatim (stop, length,
-    # content_filter, ...). Until now it survived only inside
-    # synthesized error strings; budget analysis needs it on
-    # truncated-but-successful runs too.
+    # Why output ended (stop, length, content_filter, ...). This is
+    # OpenRouter's normalized value, not the provider's own word, which it
+    # exposes separately as native_finish_reason; capturing that is Phase G
+    # provenance work. Until now this survived only inside synthesized
+    # error strings; budget analysis needs it on truncated-but-successful
+    # runs too.
     finish_reason: str | None = None
 
 
 class StreamCompareRequest(BaseModel):
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
     prompt: str = Field(min_length=1)
     # One model per streaming request, mirroring the frontend's
     # per-model fetch pattern: independent columns are the product.
@@ -117,6 +144,9 @@ class CompareResponse(BaseModel):
 
 
 class PromptCreate(BaseModel):
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
     name: str = Field(min_length=1)
     text: str = Field(min_length=1)
 
@@ -151,6 +181,12 @@ class GroupEntry(BaseModel):
 
 class RunList(BaseModel):
     runs: list[GroupEntry | RunEntry]
+
+
+class GroupCreate(BaseModel):
+    # No fields: an empty JSON object is the whole contract, so this model
+    # exists only to refuse unknown ones. See FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
 
 
 class GroupCreated(BaseModel):
@@ -267,7 +303,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.prices = app.state.catalog["prices"]
     # Per-model completion caps, derived once per boot so the budget
     # clamp is a dict lookup per request. Only published integer caps
-    # participate; an unknown cap means no clamp, same as offline.
+    # participate. With the catalog fetched, an unknown cap means no clamp;
+    # on an offline boot there are no caps at all and effective_budget
+    # falls back to the conservative tier instead. See effective_budget.
     app.state.completion_limits = {
         m["id"]: m["max_completion_tokens"]
         for m in app.state.catalog["models"]
@@ -297,6 +335,46 @@ app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
 # and rejecting non-local Host headers kills rebinding (the rebound
 # page's requests carry the attacker's hostname in Host).
 TRUSTED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def peer_is_local(client: Any) -> bool:
+    """Whether an ASGI scope's client is a loopback peer or in-process.
+
+    The Host check above defends browsers, not sockets: it is a header, so
+    a non-browser client that reaches the port can simply send
+    "Host: localhost". If the server is ever bound beyond loopback (a
+    --host 0.0.0.0 typo, a container publishing the port), that is a
+    remote caller spending the key. This is the socket-level companion:
+    the peer address itself must be loopback.
+
+    Not quite the raw socket: uvicorn's proxy-headers support rewrites
+    scope["client"] from X-Forwarded-For, but only for peers listed in
+    FORWARDED_ALLOW_IPS, which defaults to 127.0.0.1. So in the case this
+    guard is for, a genuinely remote peer reaching a wrongly-bound server,
+    that peer is not trusted to rewrite anything and its real address is
+    what gets checked. Widening FORWARDED_ALLOW_IPS hands the header that
+    trust deliberately, and would weaken this check along with it.
+
+    In-process transports have no socket. Starlette's TestClient presents
+    the synthetic peer ("testclient", 50000), and other harnesses present
+    None, so a client that does not parse as an IP address is treated as
+    in-process and allowed: there is no network peer to be remote. Anything
+    that IS a real IP is held to loopback strictly, which is the case that
+    matters, since only a real socket can carry a remote attacker. The
+    browser suite runs a real uvicorn on 127.0.0.1 and so exercises the
+    strict path end to end.
+    """
+    if not client:
+        return True
+    try:
+        host = client[0]
+    except (TypeError, IndexError):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not an IP at all: an in-process transport's synthetic name.
+        return True
 
 
 def host_header_name(host: str) -> str:
@@ -371,6 +449,18 @@ class LocalOnlyGuard:
                 headers["x-frame-options"] = "DENY"
                 headers["content-security-policy"] = CONTENT_SECURITY_POLICY
             await send(message)
+
+        # The socket-level check runs first, before anything a caller
+        # controls: Host is a header a remote client can forge, the peer
+        # address is not. See peer_is_local for the in-process transport
+        # carve-out and why it is safe.
+        if not peer_is_local(scope.get("client")):
+            response = JSONResponse(
+                {"detail": "the bench only answers to loopback clients"},
+                status_code=403,
+            )
+            await response(scope, receive, framed_send)
+            return
 
         headers = Headers(scope=scope)
         # A missing Host header (raw HTTP/1.0 clients) fails closed.
@@ -535,6 +625,22 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     error reuses format_usd and states plainly that the run was refused
     before reaching upstream, so the persisted row is unambiguous that no
     money moved.
+
+    spend_refused marks the frame so the client can tell a working control
+    from a broken one. Both arrive as run_id null, but the meanings are
+    opposite: a refusal deliberately persists nothing, while a genuine
+    post-spend persistence failure means money moved and history lost it.
+    Without the marker the UI described the ceiling as a failure. An extra
+    field is additive by the client contract (unknown fields are ignored),
+    and it is a marker rather than an error-string match because the error
+    text is prose that may be reworded.
+
+    The marker rides the streaming frame only. /compare serializes through
+    ModelResult, which declares no such field and therefore drops it; that
+    is deliberate. Surfacing it there would either need a schema column to
+    persist it (out of scope this phase) or would report a misleading false
+    on every historical row, and the frontend, the only consumer that acts
+    on it, uses the streaming endpoint.
     """
     return {
         "model": model,
@@ -542,6 +648,7 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "latency_ms": None,
         "prompt_tokens": None,
         "completion_tokens": None,
+        "spend_refused": True,
         "error": (
             "run refused before reaching upstream: estimated spend "
             f"{format_usd(app.state.accumulated_spend_usd)} reached the "
@@ -595,13 +702,28 @@ def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
 
 def effective_budget(budget: str, model: str) -> int:
     """The requested budget clamped to the model's published completion
-    cap. Sending a budget above a model's cap is a hard 400 from some
-    providers; clamping turns that failure into the best the model can
-    do. Lives here rather than in models.py because the boot catalog is
-    app state.
+    cap, or to the conservative tier when no cap is known. Sending a budget
+    above a model's cap is a hard 400 from some providers; clamping turns
+    that failure into the best the model can do. Lives here rather than in
+    models.py because the boot catalog is app state.
+
+    On an offline boot there are no published caps at all, and the old code
+    sent the full requested tier, dropping both protections at the worst
+    moment: an offline catalog is also an unpriced one, so an extended run
+    there is unverified against the provider AND invisible to the spend
+    ceiling. Falling back to the standard tier bounds the blast radius to
+    the tier the bench defaults to anyway. The effective budget is recorded
+    and shown per run, so the card carries the truth about what was sent.
+
+    Deliberately scoped to the offline boot rather than to every unknown
+    cap: with the catalog fetched, most models simply do not publish one,
+    and clamping those would quietly disable the extended tier for them.
+    A fetched catalog keeps today's behavior exactly.
     """
     requested = BUDGET_TOKENS[budget]
-    limit = app.state.completion_limits.get(model)
+    limit: int | None = app.state.completion_limits.get(model)
+    if limit is None and not app.state.catalog["fetched"]:
+        return min(requested, UNKNOWN_CAP_BUDGET)
     return min(requested, limit) if limit is not None else requested
 
 
@@ -861,7 +983,7 @@ def ensure_rowid(value: int) -> None:
 # content type, and the guard middleware keys on application/json to
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
-async def create_group(body: dict[str, Any] = Body()) -> dict[str, Any]:
+async def create_group(body: GroupCreate) -> dict[str, Any]:
     return {"id": store.create_group(app.state.db)}
 
 

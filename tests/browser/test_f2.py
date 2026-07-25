@@ -346,6 +346,16 @@ def test_review_repro_stop_queued_run_shows_stopped_no_text(bench):
     expect(page.get_by_test_id("card-status").filter(has_text="queued")).to_have_count(
         1, timeout=DONE_TIMEOUT
     )
+    # Wait for the five slot-holders to finish streaming before stopping.
+    # The queued frame is emitted at admission, while the stall stub is
+    # still 20ms from its second delta, so a Stop clicked on the queued
+    # assertion alone could land between "partial " and "text" and leave a
+    # card short of the full string the count below expects. This is an
+    # auto-retrying precondition, not a sleep: it settles the state Stop
+    # acts on rather than hoping the timing lands right.
+    expect(
+        page.get_by_test_id("card-body").filter(has_text="partial text")
+    ).to_have_count(5, timeout=DONE_TIMEOUT)
 
     page.get_by_test_id("stop-button").click()
 
@@ -537,3 +547,98 @@ def test_review_repro_rerun_after_stop_runs_not_stopped(bench):
     expect(fast.get_by_test_id("card-error")).to_contain_text("forced review error")
     # The stall's stopped card is untouched by the rerun.
     expect(status_of(stall)).to_have_text("stopped")
+
+
+# ---- F4.3: the stop mark must not outlive the stop it belongs to.
+
+
+def test_review_repro_stop_of_standalone_rerun_leaves_no_mark(bench):
+    """Second review, confirmed defect: stopRuns() set stoppedEpoch
+    unconditionally, and the only clearing site was startRun's finally. Stop
+    a standalone rerun, with no batch startup pending, and nothing ever
+    cleared the mark: it lived for the life of the view, so every later
+    rerun began already aborted and rendered stopped.
+
+    The reviewer's repro verbatim: two errored cards, rerun one, Stop it,
+    then rerun the other. The second rerun must reach the network and
+    stream. Both models are forced to error on their first attempt and to
+    behave on later ones, at the app boundary, so ordering is deterministic
+    and independent of the session-shared stub state.
+    """
+    page = bench(["stub/fast", "stub/slow"])
+    attempts = {}
+
+    err_frame = (
+        'data: {"type":"done","result":'
+        '{"error":"forced first attempt","response_text":null},"run_id":1}\n\n'
+    )
+
+    def route_stream(route):
+        data = (route.request.post_data or "").replace(" ", "")
+        model = "stub/fast" if '"model":"stub/fast"' in data else "stub/slow"
+        attempts[model] = attempts.get(model, 0) + 1
+        if attempts[model] == 1:
+            # First attempt for each model errors, earning a Rerun control.
+            route.fulfill(status=200, content_type="text/event-stream", body=err_frame)
+        elif model == "stub/fast":
+            # The card that gets Stopped must stay live, so this attempt
+            # goes to the real backend rewritten onto the stalling stub
+            # model: a fulfilled body would end the response and drain the
+            # in-flight count, disabling Stop before it can be clicked.
+            route.continue_(
+                post_data=(route.request.post_data or "").replace(
+                    '"stub/fast"', '"stub/stall0"'
+                )
+            )
+        else:
+            # The card rerun after the Stop must reach the network and
+            # stream to completion. Pre-fix it never fetched at all.
+            route.fulfill(
+                status=200,
+                content_type="text/event-stream",
+                body=(
+                    'data: {"type":"delta","text":"second rerun streamed"}\n\n'
+                    'data: {"type":"done","result":'
+                    '{"response_text":"second rerun streamed","error":null},'
+                    '"run_id":2}\n\n'
+                ),
+            )
+
+    page.route("**/compare/stream", route_stream)
+    check_all_chips(page)
+    start_run(page, "f4 standalone rerun stop")
+
+    fast = (
+        cards(page)
+        .filter(has=page.get_by_test_id("card-model").filter(has_text="stub/fast"))
+        .first
+    )
+    slow = (
+        cards(page)
+        .filter(has=page.get_by_test_id("card-model").filter(has_text="stub/slow"))
+        .first
+    )
+    # Both cards error, so both carry a Rerun. The batch has settled, which
+    # is what makes the next Stop a standalone-rerun Stop.
+    expect(status_of(fast)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(status_of(slow)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+    # Rerun the first card, then Stop it. No batch startup is pending here.
+    fast.get_by_test_id("tool-rerun").click()
+    expect(fast.get_by_test_id("card-body")).to_contain_text(
+        "partial", timeout=DONE_TIMEOUT
+    )
+    expect(page.get_by_test_id("stop-button")).to_be_enabled()
+    page.get_by_test_id("stop-button").click()
+    expect(status_of(fast)).to_have_text("stopped", timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+
+    # The tombstone: rerun the OTHER card. Pre-fix the lingering mark
+    # aborted it on sight and it read "stopped" with no text.
+    slow.get_by_test_id("tool-rerun").click()
+    expect(status_of(slow)).to_have_text("done", timeout=DONE_TIMEOUT)
+    expect(slow.get_by_test_id("card-body")).to_have_text("second rerun streamed")
+    # The stopped card is untouched by the other card's rerun.
+    expect(status_of(fast)).to_have_text("stopped")

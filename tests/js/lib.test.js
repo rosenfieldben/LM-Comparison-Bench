@@ -80,3 +80,17 @@ test("the size-notice threshold is a number tokenize can exceed", () => {
   const big = tokenizeDiff("word ".repeat(DIFF_TOKEN_LIMIT + 1));
   assert.ok(big.length > DIFF_TOKEN_LIMIT);
 });
+
+test("fmtCost keeps a tiny nonzero total from reading as zero", () => {
+  // F4.6: the session bar used toFixed(4), so a real total below $0.00005
+  // floored to "~$0.0000" and a session that had spent money reported
+  // zero. fmtCost carries significant digits instead, at any magnitude.
+  for (const tiny of [4.9e-5, 1e-6, 2.9e-5, 1e-12]) {
+    const shown = fmtCost(tiny);
+    assert.notEqual(shown, "~$0.0000");
+    assert.match(shown, /[1-9]/, `${shown} must carry a nonzero digit`);
+  }
+  // The specific boundary the defect sat on: half a hundredth of a cent.
+  assert.equal((4.9e-5).toFixed(4), "0.0000");
+  assert.equal(fmtCost(4.9e-5), "~$4.9e-5");
+});

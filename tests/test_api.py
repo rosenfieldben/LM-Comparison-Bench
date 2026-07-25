@@ -6,6 +6,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from bench import main
 from bench.main import app
 from bench.models import OPENROUTER_URL
 
@@ -1633,3 +1634,331 @@ async def test_disconnect_at_started_frame_persists_sane_latency(monkeypatch, tm
     latency = run["results"][0]["latency_ms"]
     assert latency is not None
     assert 0.0 <= latency < 60_000.0
+
+
+# ---- F4.2: the peer address, not just the Host header, must be loopback.
+
+
+def _call_guard_with_peer(client_tuple):
+    """Drive the ASGI app directly so scope["client"] is exactly what a
+    real socket would present. TestClient always synthesizes its own peer,
+    so it cannot express a remote caller; this is the only seam that can.
+    Returns (status, body_bytes).
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/runs",
+        "raw_path": b"/runs",
+        "query_string": b"",
+        "root_path": "",
+        # A perfectly valid Host header: the point is that a remote client
+        # can forge this, so the header alone cannot be the whole defense.
+        "headers": [(b"host", b"localhost:8000")],
+        "client": client_tuple,
+        "server": ("127.0.0.1", 8000),
+    }
+    received = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        received.append(message)
+
+    asyncio.run(main.LocalOnlyGuard(_reject_all_app)(scope, receive, send))
+    status = next(m["status"] for m in received if m["type"] == "http.response.start")
+    body = b"".join(
+        m.get("body", b"") for m in received if m["type"] == "http.response.body"
+    )
+    return status, body
+
+
+async def _reject_all_app(scope, receive, send):
+    """Stand-in for the real app: reaching it at all means the guard let the
+    request through, which is what the pass case asserts.
+    """
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 299,
+            "headers": [(b"content-type", b"text/plain")],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"reached the app"})
+
+
+def test_review_repro_non_loopback_peer_is_rejected():
+    """Second review: the guard validated only the Host header, which
+    defends browsers, not sockets. A non-browser client reaching the port
+    (server bound beyond loopback by a --host typo or a published container
+    port) could send "Host: localhost" and spend the key. The peer address
+    must be loopback."""
+    status, body = _call_guard_with_peer(("203.0.113.7", 54321))
+    assert status == 403
+    assert b"loopback" in body
+
+    # IPv6 remote peers are refused on the same rule.
+    status6, _ = _call_guard_with_peer(("2001:db8::1", 54321))
+    assert status6 == 403
+
+
+def test_loopback_peer_with_same_request_passes():
+    """The control: identical request, loopback peer, reaches the app."""
+    for peer in (("127.0.0.1", 54321), ("::1", 54321), ("127.0.0.5", 9)):
+        status, body = _call_guard_with_peer(peer)
+        assert status == 299, f"loopback peer {peer} was rejected"
+        assert body == b"reached the app"
+
+
+def test_in_process_transports_keep_working():
+    """In-process transports have no socket to be remote. Starlette's
+    TestClient presents ("testclient", 50000) and other harnesses present
+    None or omit the key; all must pass, since only a real IP can carry a
+    remote attacker. peer_is_local documents this carve-out."""
+    for peer in (("testclient", 50000), None, (), ("", 0)):
+        status, _ = _call_guard_with_peer(peer)
+        assert status == 299, f"in-process peer {peer!r} was rejected"
+
+
+def test_peer_is_local_classifies_addresses():
+    """The predicate itself, including the loopback ranges beyond the
+    canonical two."""
+    assert main.peer_is_local(("127.0.0.1", 1)) is True
+    assert main.peer_is_local(("127.13.99.4", 1)) is True
+    assert main.peer_is_local(("::1", 1)) is True
+    assert main.peer_is_local(None) is True
+    assert main.peer_is_local(("testclient", 1)) is True
+    assert main.peer_is_local(("10.0.0.4", 1)) is False
+    assert main.peer_is_local(("203.0.113.7", 1)) is False
+    assert main.peer_is_local(("2001:db8::1", 1)) is False
+
+
+# ---- F4.5: a spend refusal is not a persistence failure.
+
+
+@respx.mock
+async def test_review_repro_refusal_frame_carries_spend_refused_marker(
+    monkeypatch, tmp_path
+):
+    """Second review: every run_id null card claimed "not saved to history"
+    with a tooltip saying persistence failed. The pre-upstream spend refusal
+    deliberately persists nothing, so the UI described a working control as
+    a failure. The frame now carries an explicit marker the client keys on,
+    so a refusal and a genuine persistence failure stop being
+    indistinguishable. Locked here because the client contract depends on
+    the field name, and on the marker rather than the error prose."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        c.app.state.accumulated_spend_usd = 1.5
+        frames = [json.loads(f.removeprefix("data: ")) async for f in gen]
+
+    assert [f["type"] for f in frames] == ["done"]
+    assert frames[0]["run_id"] is None
+    result = frames[0]["result"]
+    # The marker, and the ceiling message that must reach the card.
+    assert result["spend_refused"] is True
+    assert "refused before reaching upstream" in result["error"]
+    assert "$1.50" in result["error"] and "$1.00" in result["error"]
+
+
+@respx.mock
+def test_refusal_marker_absent_from_ordinary_results(monkeypatch, tmp_path):
+    """The marker must mark only refusals. A genuine post-spend persistence
+    failure keeps arriving as run_id null with no marker, which is what
+    preserves its "not saved to history" warning.
+
+    Asserted on the streaming frame, the contract the client actually reads.
+    Asserting it on /compare would prove nothing: that endpoint serializes
+    through ModelResult, which drops every field it does not declare, so the
+    key would be absent there no matter what this function returned.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    # A ceiling is set but never approached: the run below stays far under
+    # it, so this exercises the ordinary path while still letting the
+    # refusal builder format its figures.
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        # Inside the client context: the refusal message reads app.state for
+        # the accumulated and limit figures, which exist only once booted.
+        refusal = main.spend_refusal_result("model/alpha", 16384)
+        assert refusal["spend_refused"] is True
+        frames = stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+    done = [f for f in frames if f["type"] == "done"]
+    assert len(done) == 1
+    # An ordinary successful run never carries the key, so a falsy read on
+    # the client is the safe default for every other path.
+    assert "spend_refused" not in done[0]["result"]
+    assert done[0]["result"]["response_text"] is not None
+
+
+# ---- F4.7: unknown request fields are refused, not silently ignored.
+
+
+@respx.mock
+def test_review_repro_unknown_field_rejected_on_every_mutating_endpoint(client):
+    """Second review: the API silently ignored unknown JSON fields, so a
+    typo like {"budgte": "extended"} ran a valid but unintended paid
+    request. The caller asked for one thing and the bench did another, with
+    the money moving either way. Every mutating endpoint must answer 422 and
+    name the offending field, and the compare endpoints must not have
+    reached upstream."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    cases = [
+        ("/compare", {"prompt": "hi", "models": ["model/alpha"], "budgte": "extended"}),
+        (
+            "/compare/stream",
+            {"prompt": "hi", "model": "model/alpha", "budgte": "extended"},
+        ),
+        ("/prompts", {"name": "n", "text": "t", "tags": ["oops"]}),
+        ("/groups", {"unexpected": 1}),
+    ]
+    for path, body in cases:
+        resp = client.post(path, json=body)
+        assert resp.status_code == 422, (path, resp.status_code)
+        # The offending field is named, so the mistake is obvious.
+        detail = json.dumps(resp.json()["detail"])
+        offender = next(k for k in body if k in ("budgte", "tags", "unexpected"))
+        assert offender in detail, (path, detail)
+
+    # No money moved for any of them: the refusal is at the boundary.
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_legitimate_fields_still_accepted(client):
+    """The control: every field the frontend and the suite actually send
+    stays valid, on both compare shapes and the two other bodies."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post("/groups", json={}).json()["id"]
+    pid = client.post("/prompts", json={"name": "f47", "text": "t"}).json()["id"]
+    full = client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "prompt_id": pid,
+            "group_id": gid,
+            "budget": "extended",
+        },
+    )
+    assert full.status_code == 200
+    stream = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "hi",
+            "model": "model/alpha",
+            "prompt_id": pid,
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+    assert stream.status_code == 200
+
+
+# ---- F4.8: an offline catalog keeps a conservative completion cap.
+
+
+def test_review_repro_offline_extended_clamps_to_standard(monkeypatch, tmp_path):
+    """Second review: with the catalog offline there is no published limit,
+    so effective_budget sent the full requested tier. That dropped the
+    provider hard-400 protection and the runaway-size guard at exactly the
+    moment spend is already unpriced, since an offline catalog has no
+    prices either. An extended request on an offline boot must fall back to
+    the standard tier, and the effective budget it was sent with must be
+    what gets recorded and displayed."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    with TestClient(app, base_url="http://localhost") as c:
+        with respx.mock:
+            respx.post(OPENROUTER_URL).mock(side_effect=route)
+            resp = c.post(
+                "/compare",
+                json={
+                    "prompt": "hi",
+                    "models": ["model/unknown"],
+                    "budget": "extended",
+                },
+            )
+        assert resp.status_code == 200
+        # Sent conservatively, not at the full extended tier.
+        assert seen["model/unknown"] == BUDGET_STANDARD
+        # Recorded and returned as the effective budget, so the card is
+        # honest about what was actually asked for.
+        assert resp.json()["results"][0]["max_tokens"] == BUDGET_STANDARD
+        run_id = resp.json()["run_id"]
+        persisted = c.get(f"/runs/{run_id}").json()["results"][0]
+        assert persisted["max_tokens"] == BUDGET_STANDARD
+
+
+def test_offline_standard_request_is_unchanged(monkeypatch, tmp_path):
+    """The clamp only ever lowers: a standard request on an offline boot
+    still sends the standard tier."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    with TestClient(app, base_url="http://localhost") as c:
+        with respx.mock:
+            respx.post(OPENROUTER_URL).mock(side_effect=route)
+            c.post("/compare", json={"prompt": "hi", "models": ["model/unknown"]})
+    assert seen["model/unknown"] == BUDGET_STANDARD
+
+
+@respx.mock
+def test_fetched_catalog_budgets_are_unchanged(client):
+    """The scope control: with the catalog present, published caps behave
+    exactly as before. A capped model still clamps to its published limit,
+    and a catalogued model that publishes no cap still gets the full
+    extended tier, since clamping those would quietly disable the extended
+    tier for most of the catalog."""
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/capped", "model/alpha"],
+            "budget": "extended",
+        },
+    )
+    assert seen["model/capped"] == 32000
+    assert seen["model/alpha"] == BUDGET_EXTENDED

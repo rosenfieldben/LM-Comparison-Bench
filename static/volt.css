@@ -460,6 +460,7 @@
   .race-row.working .race-rank { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-rank { color: var(--err); }
   .race-row.stopped .race-rank { color: var(--text-dim); }
+  .race-row.refused .race-rank { color: var(--text-dim); }
   .race-name {
     font-size: 12px;
     color: var(--text);
@@ -486,6 +487,7 @@
   .race-row.working .race-val { color: var(--accent); animation: benchPulse 2s ease-in-out infinite; }
   .race-row.error .race-val { color: var(--err); }
   .race-row.stopped .race-val { color: var(--text-dim); }
+  .race-row.refused .race-val { color: var(--text-dim); }
 
   /* ==== Result cards ==== */
   #run-label { font-size: 10.5px; color: var(--text-faint); }
@@ -520,6 +522,9 @@
   /* Stopped is a user halt, not a provider failure: a muted edge, no
      error tint. */
   .card[data-state="stopped"] { border-top-color: var(--text-dim); }
+  /* A spend refusal is the ceiling working, not a provider failure: the
+     same muted edge as a Stop, never the error tint. */
+  .card[data-state="refused"] { border-top-color: var(--text-dim); }
   .card-header {
     display: flex;
     align-items: center;
@@ -537,6 +542,7 @@
   .card[data-state="done"] .state-dot { background: var(--done); }
   .card[data-state="error"] .state-dot { background: var(--err); }
   .card[data-state="stopped"] .state-dot { background: var(--text-dim); }
+  .card[data-state="refused"] .state-dot { background: var(--text-dim); }
   .status {
     font-size: 10px;
     letter-spacing: 0.08em;
@@ -548,6 +554,7 @@
   .card[data-state="done"] .status { color: var(--done-label); }
   .card[data-state="error"] .status { color: var(--err); }
   .card[data-state="stopped"] .status { color: var(--text-dim); }
+  .card[data-state="refused"] .status { color: var(--text-dim); }
   .card-shimmer { display: none; height: 2px; margin-top: 10px; }
   .card[data-state="working"] .card-shimmer {
     display: block;
@@ -605,6 +612,14 @@
     color: var(--err-text);
   }
   .error-msg.after-text { margin-top: 10px; }
+  /* A refusal is the ceiling working, so its message is informational,
+     not a provider failure: the same muted treatment as the card edge
+     rather than the error tint. */
+  .card[data-state="refused"] .error-msg {
+    background: none;
+    border-left-color: var(--text-dim);
+    color: var(--text-sec);
+  }
   .card-tools {
     display: flex;
     gap: 6px;

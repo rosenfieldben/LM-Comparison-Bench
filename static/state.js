@@ -30,12 +30,17 @@
     // Runs and reruns in flight for the current epoch; the Run button
     // stays disabled while any of them is live.
     inflightRuns: 0,
-    // The epoch a Stop targeted. Stop can land while startRun is still
-    // awaiting the group POST, before any per-model controller exists; a
-    // run that starts up afterward sees this mark and begins already
-    // aborted, so a Stop in that window halts the batch instead of being
-    // silently lost.
+    // The epoch a Stop targeted, and the epoch whose batch startup is
+    // still pending. These exist only for the group-POST window: runOne
+    // registers its controller synchronously, so any run that has started
+    // is stoppable by direct abort, and the ONLY runs a Stop cannot reach
+    // are the ones startRun has not launched yet because it is awaiting
+    // the group POST. pendingBatchEpoch marks that window open (set by
+    // startRun before the POST, cleared in its finally), and stopRuns sets
+    // stoppedEpoch only while it is open, so the mark cannot outlive the
+    // window it belongs to. Both -1 means no window and no mark.
     stoppedEpoch: -1,
+    pendingBatchEpoch: -1,
     // Sent with the run so it links back to its saved prompt. Cleared
     // the moment the textarea is edited: the text no longer matches the
     // library entry, so the link would lie.
@@ -61,9 +66,14 @@
     // Every figure here is an estimate from catalog prices, and results
     // the session could not price are counted rather than silently
     // dropped: a total that quietly understates spend is worse than none.
+    // fmtCost, the same significant-digit formatter the cards use, rather
+    // than toFixed(4): a real total below $0.00005 floored to "~$0.0000",
+    // so a session that had spent money reported zero. Only an untouched
+    // session shows the fixed zero, which keeps the idle bar readable and
+    // is honest because nothing has been spent yet.
+    const spend = state.sessionStats.spend;
     statSpend.textContent =
-      "~$" +
-      state.sessionStats.spend.toFixed(4) +
+      (spend === 0 ? "~$0.0000" : window.BenchLib.fmtCost(spend)) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");

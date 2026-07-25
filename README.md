@@ -178,7 +178,13 @@ case, and the error message says so when it applies. The choice is
 per session and resets to standard on the next visit. The requested
 budget is clamped per model to the completion cap OpenRouter
 publishes, so asking for extended from a model capped at 32k sends
-32000 instead of drawing a hard 400. An extended run can cost up to
+32000 instead of drawing a hard 400. On an offline boot there are no
+published caps to clamp against, and an offline catalog is an unpriced
+one, so an extended run there would be both unverified against the
+provider and invisible to the spend ceiling; extended therefore falls
+back to the standard tier until the catalog is available again. A
+fetched catalog is unaffected, including the many models that publish no
+cap at all. An extended run can cost up to
 four times as much as a standard one, because the budget is the
 ceiling on billable completion tokens. History records the effective
 post-clamp budget each run was sent with (shown as a "budget" badge
@@ -272,7 +278,7 @@ Open http://localhost:8000 in a browser. Type a prompt, check the
 models to compare, hit Run. Each column fills in as its model
 responds. The lineup is managed with the picker (see Daily use); the
 four-model default seed for a fresh browser is `DEFAULT_LINEUP` at
-the top of `static/app.js`.
+the top of `static/controls.js`.
 
 Or hit the API directly:
 
