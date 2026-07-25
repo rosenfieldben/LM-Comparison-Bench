@@ -71,6 +71,21 @@
     }
   }
 
+  // A rerun of the armed card destroys the attempt the armed side points
+  // at: resetColumn detaches its button and the column goes on to hold a
+  // different result. Pre-fix, disarmDiff ran only from startRun, so
+  // armedDiff survived and a later diff completed against a detached,
+  // invisible prior attempt. Scope matters here: a rerun of a DIFFERENT
+  // card must leave arming alone, because a live-vs-live diff across cards
+  // is the point, and history replay must leave it alone too (that
+  // survival is deliberate, see disarmDiff). Must be called before
+  // resetColumn, while the armed button is still in the card's subtree.
+  function disarmIfArmedOn(ui) {
+    if (armedDiff !== null && ui.card.contains(armedDiff.btn)) {
+      disarmDiff();
+    }
+  }
+
   function openDiff(a, b) {
     diffTitle.textContent = a.label + " ⇄ " + b.label;
     const ta = tokenizeDiff(a.result.response_text);
@@ -119,5 +134,11 @@
       .addEventListener("click", closeDiffPanel);
   }
 
-  window.BenchDiff = { closeDiffPanel, disarmDiff, registerDiffable, init };
+  window.BenchDiff = {
+    closeDiffPanel,
+    disarmDiff,
+    disarmIfArmedOn,
+    registerDiffable,
+    init,
+  };
 })();

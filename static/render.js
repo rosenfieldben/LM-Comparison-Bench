@@ -332,6 +332,10 @@
       // The reset below removes the button, but disable first so a
       // double click cannot start two reruns of the same column.
       btn.disabled = true;
+      // Before the reset, while the armed diff button is still in this
+      // card's subtree: a rerun of the armed card must not leave the armed
+      // side pointing at the attempt this is about to destroy.
+      BenchDiff.disarmIfArmedOn(ui);
       resetColumn(ui);
       // Same budget as the run being retried, not the current control
       // value: a rerun is a second sample of the same experiment.
