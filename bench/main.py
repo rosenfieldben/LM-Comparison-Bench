@@ -580,6 +580,15 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     error reuses format_usd and states plainly that the run was refused
     before reaching upstream, so the persisted row is unambiguous that no
     money moved.
+
+    spend_refused marks the frame so the client can tell a working control
+    from a broken one. Both arrive as run_id null, but the meanings are
+    opposite: a refusal deliberately persists nothing, while a genuine
+    post-spend persistence failure means money moved and history lost it.
+    Without the marker the UI described the ceiling as a failure. An extra
+    field is additive by the client contract (unknown fields are ignored),
+    and it is a marker rather than an error-string match because the error
+    text is prose that may be reworded.
     """
     return {
         "model": model,
@@ -587,6 +596,7 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "latency_ms": None,
         "prompt_tokens": None,
         "completion_tokens": None,
+        "spend_refused": True,
         "error": (
             "run refused before reaching upstream: estimated spend "
             f"{format_usd(app.state.accumulated_spend_usd)} reached the "

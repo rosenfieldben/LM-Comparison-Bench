@@ -118,13 +118,21 @@
       ) {
         shownError += "; try extended budget";
       }
+      // The spend ceiling refusing a run is a working control, not a
+      // failure. It arrives as run_id null like a persistence failure does,
+      // so the marker the server sets is what tells them apart; keying on
+      // the error text would break the moment that prose is reworded.
+      const refused = result.spend_refused === true;
       BenchRender.completeColumn(ui, result, model + " (live)", {
         streamed: textNode !== null,
         shownError: shownError,
         budgetBadge: false,
         // run_id null on the done event means the server spent the money
-        // and streamed the response but could not persist it.
-        unsaved: runId === null,
+        // and streamed the response but could not persist it. A refusal is
+        // run_id null too, but deliberately: it persists nothing because
+        // nothing happened, so it must not claim history was lost.
+        unsaved: runId === null && !refused,
+        refused: refused,
         // Only this streaming path offers a rerun; historical replays go
         // through fillColumn and never get one. A stopped run has no error,
         // so it gets no rerun control.

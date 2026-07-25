@@ -1735,3 +1735,54 @@ def test_peer_is_local_classifies_addresses():
     assert main.peer_is_local(("10.0.0.4", 1)) is False
     assert main.peer_is_local(("203.0.113.7", 1)) is False
     assert main.peer_is_local(("2001:db8::1", 1)) is False
+
+
+# ---- F4.5: a spend refusal is not a persistence failure.
+
+
+@respx.mock
+async def test_review_repro_refusal_frame_carries_spend_refused_marker(
+    monkeypatch, tmp_path
+):
+    """Second review: every run_id null card claimed "not saved to history"
+    with a tooltip saying persistence failed. The pre-upstream spend refusal
+    deliberately persists nothing, so the UI described a working control as
+    a failure. The frame now carries an explicit marker the client keys on,
+    so a refusal and a genuine persistence failure stop being
+    indistinguishable. Locked here because the client contract depends on
+    the field name, and on the marker rather than the error prose."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with spend_client(monkeypatch, tmp_path, limit=1.0) as c:
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="hi", model="model/alpha")
+        )
+        gen = resp.body_iterator
+        c.app.state.accumulated_spend_usd = 1.5
+        frames = [json.loads(f.removeprefix("data: ")) async for f in gen]
+
+    assert [f["type"] for f in frames] == ["done"]
+    assert frames[0]["run_id"] is None
+    result = frames[0]["result"]
+    # The marker, and the ceiling message that must reach the card.
+    assert result["spend_refused"] is True
+    assert "refused before reaching upstream" in result["error"]
+    assert "$1.50" in result["error"] and "$1.00" in result["error"]
+
+
+def test_refusal_marker_absent_from_ordinary_results(monkeypatch, tmp_path):
+    """The marker must mark only refusals. A genuine post-spend persistence
+    failure keeps arriving as run_id null with no marker, which is what
+    preserves its "not saved to history" warning."""
+    result = main.spend_refusal_result("model/alpha", 16384)
+    assert result["spend_refused"] is True
+    # An ordinary successful result never carries the key, so a falsy read
+    # on the client is the safe default for every other path.
+    with respx.mock:
+        respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+        with spend_client(monkeypatch, tmp_path, limit=None) as c:
+            body = c.post(
+                "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
+            ).json()
+    assert "spend_refused" not in body["results"][0]

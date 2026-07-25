@@ -458,9 +458,22 @@
     }
     const error = "shownError" in opts ? opts.shownError : result.error;
     applyError(ui, error);
-    // A user Stop is neither done nor a provider failure; it gets its own
-    // muted state so the card never implies the model finished or errored.
-    setState(ui, opts.stopped ? "stopped" : error != null ? "error" : "done");
+    // A user Stop is neither done nor a provider failure, and a spend
+    // refusal is neither of those nor a failure of any kind: the ceiling
+    // worked. Each gets its own state so a card never implies the model
+    // finished, errored, or lost its history. The refusal's message (which
+    // names both the accumulated spend and the ceiling) still renders
+    // through applyError above; only the framing differs.
+    setState(
+      ui,
+      opts.stopped
+        ? "stopped"
+        : opts.refused
+          ? "refused"
+          : error != null
+            ? "error"
+            : "done",
+    );
     // Rerun leads the action row so the recovery control is where the
     // eye lands first on a failed card.
     if (opts.retry) addRerun(ui, opts.retry);

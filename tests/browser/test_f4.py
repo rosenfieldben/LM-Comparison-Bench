@@ -5,6 +5,8 @@ with sleeps, and each test keys on its own prompt text so the
 session-shared bench server and database stay usable by the other files.
 """
 
+import re
+
 import pytest
 from playwright.sync_api import expect
 
@@ -164,3 +166,85 @@ def test_rerun_of_other_card_keeps_arming(bench):
     expect(body).to_contain_text("gamma stays armed")
     expect(body).to_contain_text("delta rerun")
     page.get_by_test_id("diff-close").click()
+
+
+# ---- F4.5: a spend refusal is not a persistence failure.
+
+
+CEILING_MESSAGE = (
+    "run refused before reaching upstream: estimated spend $1.50 reached "
+    "the $1.00 ceiling (BENCH_SPEND_LIMIT_USD); no upstream call was made"
+)
+
+
+def test_review_repro_refused_card_is_not_a_save_failure(bench):
+    """Second review: every run_id null card showed "not saved to history"
+    with a tooltip claiming persistence failed. The pre-upstream spend
+    refusal deliberately persists nothing, so the UI described a working
+    control as a failure. Keyed on the server's marker, a refusal card must
+    carry the ceiling message and no save warning.
+
+    The refusal frame is served by route interception rather than by
+    tripping a real ceiling: the frame shape, including the marker, is
+    locked server-side by its own unit tombstone, and what is under test
+    here is purely how the client renders it.
+    """
+    page = bench(["stub/fast"])
+    refusal = (
+        'data: {"type":"done","result":{"model":"stub/fast",'
+        '"response_text":null,"latency_ms":null,"prompt_tokens":null,'
+        '"completion_tokens":null,"spend_refused":true,'
+        f'"error":"{CEILING_MESSAGE}",'
+        '"cost_usd":null,"ttft_ms":null,"max_tokens":16384,'
+        '"generation_id":null,"finish_reason":null},"run_id":null}\n\n'
+    )
+    page.route(
+        "**/compare/stream",
+        lambda route: route.fulfill(
+            status=200, content_type="text/event-stream", body=refusal
+        ),
+    )
+    check_all_chips(page)
+    start_run(page, "f4 refusal is not a failure")
+
+    card = cards(page).first
+    # The ceiling message reaches the card, naming both figures.
+    expect(card.get_by_test_id("card-error")).to_contain_text(
+        "refused before reaching upstream", timeout=DONE_TIMEOUT
+    )
+    expect(card.get_by_test_id("card-error")).to_contain_text("$1.50")
+    expect(card.get_by_test_id("card-error")).to_contain_text("$1.00")
+    # The defect: no save warning anywhere, and no failure tooltip.
+    expect(page.get_by_test_id("save-warning")).to_have_count(0)
+    expect(page.locator("#page")).not_to_contain_text("not saved to history")
+    # A refusal is its own state, not an error and not done.
+    expect(status_of(card)).to_have_text("refused")
+
+
+def test_genuine_persistence_failure_keeps_its_warning(bench):
+    """The control: a real post-spend persistence failure still arrives as
+    run_id null with no marker, and must keep today's warning exactly. This
+    is what proves the fix keyed on the marker rather than on run_id."""
+    page = bench(["stub/fast"])
+    lost = (
+        'data: {"type":"delta","text":"spent but unsaved"}\n\n'
+        'data: {"type":"done","result":{"model":"stub/fast",'
+        '"response_text":"spent but unsaved","error":null},"run_id":null}\n\n'
+    )
+    page.route(
+        "**/compare/stream",
+        lambda route: route.fulfill(
+            status=200, content_type="text/event-stream", body=lost
+        ),
+    )
+    check_all_chips(page)
+    start_run(page, "f4 persistence failure keeps warning")
+
+    card = cards(page).first
+    expect(card.get_by_test_id("card-body")).to_contain_text(
+        "spent but unsaved", timeout=DONE_TIMEOUT
+    )
+    warning = page.get_by_test_id("save-warning")
+    expect(warning).to_have_count(1)
+    expect(warning).to_have_text("not saved to history")
+    expect(warning).to_have_attribute("title", re.compile("persisting this run failed"))
