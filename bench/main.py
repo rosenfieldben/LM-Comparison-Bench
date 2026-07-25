@@ -976,6 +976,12 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         started = False
         acquired = False
         start = 0.0
+        # Injected state, not a protocol change: stream_model writes the
+        # generation id here the moment it knows one, so the disconnect
+        # path below can persist it. A stopped run never reaches the done
+        # event, and it is the run whose billing is least knowable locally
+        # and therefore most in need of an id to reconcile against.
+        id_holder: dict[str, Any] = {}
 
         def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
@@ -1038,7 +1044,11 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             start = time.perf_counter()
             yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             async for event in stream_model(
-                request.prompt, request.model, app.state.client, max_tokens=max_tokens
+                request.prompt,
+                request.model,
+                app.state.client,
+                max_tokens=max_tokens,
+                id_holder=id_holder,
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -1105,6 +1115,14 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     "ttft_ms": first_delta_ms,
                     "max_tokens": max_tokens,
                     "position": request.position,
+                    # A plain dict lookup with a default: no await, no
+                    # attribute access on a half-torn-down object, and no
+                    # way to raise during generator unwinding. Without it
+                    # the runs with the least knowable billing (stopped
+                    # mid-stream, so cancellation may or may not have
+                    # stopped the charge) were the only ones with no id to
+                    # reconcile against.
+                    "generation_id": id_holder.get("generation_id"),
                 }
                 try:
                     prompt_id, group_id = resolve_links(

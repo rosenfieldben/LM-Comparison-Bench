@@ -1,6 +1,7 @@
 """Core model-calling logic. Pure functions over an injected httpx client."""
 
 import json
+import logging
 import math
 import os
 import socket
@@ -9,6 +10,8 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 def as_token_count(value: object) -> int | None:
@@ -321,6 +324,52 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     )
 
 
+# OpenRouter returns the generation id in this response header on every
+# endpoint, available the moment the response starts and therefore before
+# any chunk has been read. That timing is the point: a run the user stops
+# mid-stream is exactly the run whose billing is unknowable locally
+# (cancellation only stops billing on providers that support it), so it is
+# the run that most needs an id to reconcile against later, and reading the
+# id out of a chunk would lose it for precisely those runs.
+GENERATION_ID_HEADER = "X-Generation-Id"
+
+
+def _settle_generation_id(
+    result: dict[str, Any],
+    value: object,
+    holder: dict[str, Any] | None = None,
+) -> None:
+    """Record the generation id the first time one is seen.
+
+    First writer wins, so the header settles the field and a chunk id only
+    fills in when no header arrived. A later value that disagrees is logged
+    rather than raised or applied: the never-raises contract holds, and
+    overwriting would mean the persisted id depends on which source spoke
+    last. Junk and empty strings are absence, per _as_label.
+
+    holder is dependency-injected state, not a protocol change. The
+    streaming endpoint owns a plain dict and passes it in so its disconnect
+    path can read the id without waiting for a done event that a stopped
+    run never produces. Only the id goes in, and only by assignment, so
+    reading it back during generator unwinding cannot await or raise.
+    """
+    gen_id = _as_label(value)
+    if gen_id is None:
+        return
+    settled = result["generation_id"]
+    if settled is None:
+        result["generation_id"] = gen_id
+        if holder is not None:
+            holder["generation_id"] = gen_id
+    elif settled != gen_id:
+        logger.warning(
+            "generation id disagreement: header/first chunk said %s, later "
+            "source said %s; keeping the first",
+            settled,
+            gen_id,
+        )
+
+
 def _as_label(value: object) -> str | None:
     """as_text with the empty string treated as absent.
 
@@ -403,6 +452,12 @@ async def run_model(
     # outside the clock, so big responses do not inflate the measurement.
     result["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
 
+    # Before the status check and before the body is parsed: the header is
+    # available at response start, and an id captured here survives a
+    # response whose body turns out to be unparseable, which is one of the
+    # cases worth reconciling later.
+    _settle_generation_id(result, response.headers.get(GENERATION_ID_HEADER))
+
     if response.status_code != 200:
         result["error"] = f"HTTP {response.status_code} from OpenRouter"
         return result
@@ -418,16 +473,15 @@ async def run_model(
     # Provenance, both best-effort. The generation id keys OpenRouter's
     # generation API, which records the actual provider, quantization
     # and authoritative cost, so persisting it makes this run auditable
-    # after the fact. The finish_reason says why output ended; until now
+    # after the fact. The body id is the fallback here, not the primary:
+    # the header above already settled the field on any response that
+    # carried one. The finish_reason says why output ended; until now
     # it survived only inside synthesized error strings, and budget
     # analysis needs it on successful runs too. It is OpenRouter's
     # NORMALIZED value, not the provider's own word: OpenRouter maps each
     # provider's vocabulary onto a common set and exposes the raw one
-    # separately as native_finish_reason. Persisting that native value is
-    # Phase G provenance work, so what lands here is the normalized one.
-    gen_id = data.get("id")
-    if isinstance(gen_id, str) and gen_id:
-        result["generation_id"] = gen_id
+    # separately as native_finish_reason, which is captured below.
+    _settle_generation_id(result, data.get("id"))
     reason = choice.get("finish_reason")
     if isinstance(reason, str) and reason:
         result["finish_reason"] = reason
@@ -469,8 +523,15 @@ async def stream_model(
     model: str,
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
+    id_holder: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
+
+    id_holder, when given, receives the generation id under that key as
+    soon as it is known. A consumer that never reaches the done event
+    (a client disconnect cancels this generator at a yield) has no other
+    way to learn it, and a stopped run is exactly the run whose billing
+    has to be reconciled later. See _settle_generation_id.
 
     Yields {"type": "delta", "text": chunk} per content delta, then
     exactly one {"type": "done", "result": {...}}. Like run_model, this
@@ -541,6 +602,13 @@ async def stream_model(
         async with client.stream(
             "POST", OPENROUTER_URL, json=payload, timeout=STREAM_TIMEOUT
         ) as response:
+            # Before the status check and before the first chunk is read.
+            # This is the whole reason the header is preferred: a run the
+            # user stops seconds later never reaches a chunk that carries
+            # an id, and it is the run that most needs one.
+            _settle_generation_id(
+                result, response.headers.get(GENERATION_ID_HEADER), id_holder
+            )
             if response.status_code != 200:
                 yield done(f"HTTP {response.status_code} from OpenRouter")
                 return
@@ -561,14 +629,11 @@ async def stream_model(
                     yield done("malformed stream from OpenRouter")
                     return
 
-                # The generation id keys OpenRouter's generation API for
-                # a post-hoc audit of provider, quantization and cost;
-                # every chunk repeats the same id, so the first one that
-                # carries it settles the field.
-                if result["generation_id"] is None:
-                    gen_id = chunk.get("id")
-                    if isinstance(gen_id, str) and gen_id:
-                        result["generation_id"] = gen_id
+                # The chunk id is the fallback for a response that carried
+                # no header. Every chunk repeats the same id, so the first
+                # one that carries it settles the field, and a disagreement
+                # with the header is logged rather than applied.
+                _settle_generation_id(result, chunk.get("id"), id_holder)
 
                 # The provider name rides every chunk, not just the last;
                 # the first one that carries it settles the field, like the

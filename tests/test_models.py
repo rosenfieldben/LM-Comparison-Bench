@@ -1103,3 +1103,123 @@ async def test_a_later_usage_object_without_cost_does_not_leave_a_stale_charge(c
     assert result["reasoning_tokens"] is None
     assert result["cached_tokens"] is None
     assert result["completion_tokens"] == 8
+
+
+# ---- G3: the generation id survives everything, including aborts.
+
+from bench.models import GENERATION_ID_HEADER  # noqa: E402
+
+
+@respx.mock
+async def test_generation_id_comes_from_the_response_header(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200, json=FIXTURE, headers={GENERATION_ID_HEADER: "gen-from-header"}
+        )
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    # The header settles it; the body's own id is only the fallback.
+    assert result["generation_id"] == "gen-from-header"
+
+
+@respx.mock
+async def test_generation_id_falls_back_to_the_body_id(client):
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    assert result["generation_id"] == FIXTURE["id"]
+
+
+@respx.mock
+async def test_review_repro_stream_holder_carries_the_id_with_no_chunk_seen(client):
+    """The runs with the least knowable billing were the only ones with no
+    id to reconcile against: the id was read out of a chunk, so a stream
+    that died or was stopped before any chunk arrived persisted nothing to
+    audit. The header is available at response start, and the injected
+    holder is how a consumer that never reaches the done event learns it.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={GENERATION_ID_HEADER: "gen-header-only"},
+            stream=ChunkStream([], exc=httpx.ReadError("net down")),
+        )
+    )
+    holder = {}
+
+    events = [
+        e
+        async for e in stream_model(
+            "hi", "deepseek/deepseek-chat", client, id_holder=holder
+        )
+    ]
+
+    # No chunk ever arrived, so the old chunk-only capture had nothing.
+    assert events[-1]["result"]["response_text"] is None
+    assert events[-1]["result"]["error"] is not None
+    assert holder["generation_id"] == "gen-header-only"
+    assert events[-1]["result"]["generation_id"] == "gen-header-only"
+
+
+@respx.mock
+async def test_holder_is_optional_and_stream_works_without_one(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={GENERATION_ID_HEADER: "gen-1"},
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hi"),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert events[-1]["result"]["generation_id"] == "gen-1"
+
+
+@respx.mock
+async def test_a_disagreeing_chunk_id_is_logged_not_applied(client, caplog):
+    """Two sources for one fact means they can disagree. Overwriting would
+    make the persisted id depend on which source spoke last, and raising
+    would break the never-raises contract over a provenance nicety."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={GENERATION_ID_HEADER: "gen-header"},
+            stream=ChunkStream(
+                [
+                    sse({"id": "gen-chunk", "choices": [{"delta": {"content": "Hi"}}]}),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    with caplog.at_level("WARNING"):
+        events = await collect("hi", "deepseek/deepseek-chat", client)
+
+    assert events[-1]["result"]["generation_id"] == "gen-header"
+    assert events[-1]["result"]["error"] is None
+    assert "generation id disagreement" in caplog.text
+
+
+@respx.mock
+async def test_a_junk_generation_id_header_is_absence_not_a_value(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=FIXTURE, headers={})
+    )
+
+    result = await run_model("hi", "deepseek/deepseek-chat", client)
+
+    # No header at all: the body id stands, and nothing crashed reaching
+    # for a header that was not sent.
+    assert result["generation_id"] == FIXTURE["id"]

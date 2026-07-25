@@ -21,6 +21,12 @@ from starlette.applications import Starlette
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
+# Spelled out rather than imported from bench.models: this stub stands in
+# for the external contract, and importing the app's own constant would
+# make a typo in it invisible, since both sides would then agree on the
+# wrong name.
+GENERATION_ID_HEADER = "X-Generation-Id"
+
 # Priced so cost metrics fill in: usage below is 13 in / 8 out, giving
 # 13e-6 + 16e-6 = 2.9e-5 USD per completed run. stub/capped publishes a
 # completion cap far below the extended budget so the clamp has
@@ -241,7 +247,7 @@ def build_app() -> Starlette:
         # stub/fast and anything unrecognized: quick and correct.
         return text_stream(model, reply_text(model), model.split("/")[-1])
 
-    def non_stream_body(model: str) -> JSONResponse:
+    def non_stream_body(model: str, headers: dict) -> Response:
         if model == "stub/flaky" and not state["flaky_failed"]:
             state["flaky_failed"] = True
             return JSONResponse({"error": "stub flaky failure"}, status_code=502)
@@ -256,7 +262,8 @@ def build_app() -> Starlette:
                         }
                     ],
                     "usage": USAGE,
-                }
+                },
+                headers=headers,
             )
         text = "".join(HTML_DELTAS) if model == "stub/html" else reply_text(model)
         body = {
@@ -276,17 +283,29 @@ def build_app() -> Starlette:
         # allow_nan so the poisoned personalities put a bare NaN on the
         # wire, the way a misbehaving provider would; Starlette's default
         # encoder would raise on it instead.
-        return Response(json.dumps(body, allow_nan=True), media_type="application/json")
+        return Response(
+            json.dumps(body, allow_nan=True),
+            media_type="application/json",
+            headers=headers,
+        )
 
     async def completions(request):
         payload = await request.json()
         state["requests"].append(payload)
         model = payload["model"]
+        # The real API returns the generation id in a response header,
+        # available before any chunk. The stall personality streams forever
+        # and never emits a chunk id at all, so without this header a run
+        # stopped mid-stream would have nothing to persist, which is the
+        # exact case the header exists to cover.
+        headers = {GENERATION_ID_HEADER: f"gen-hdr-{model.split('/')[-1]}"}
         if payload.get("stream"):
             return StreamingResponse(
-                personality_stream(model), media_type="text/event-stream"
+                personality_stream(model),
+                media_type="text/event-stream",
+                headers=headers,
             )
-        return non_stream_body(model)
+        return non_stream_body(model, headers)
 
     async def recorded_requests(request):
         return JSONResponse({"requests": state["requests"]})

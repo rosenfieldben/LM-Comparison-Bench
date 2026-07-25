@@ -232,7 +232,12 @@ measured latency or ttft. Every result also records OpenRouter's
 generation id and the provider's finish_reason, which make historical
 runs auditable against OpenRouter's generation API (actual provider,
 quantization, authoritative cost) and let budget analysis see
-truncation on runs that produced no error. If persisting a finished
+truncation on runs that produced no error. The generation id is read
+from the response header, which arrives before any chunk, so a run
+stopped mid-stream still records one. That ordering matters: stopping a
+stream only stops the charge on providers that support cancellation, so
+a stopped run is the one whose billing is least knowable locally and the
+one that most needs an id to reconcile against later. If persisting a finished
 run fails, both /compare and the streaming path log the failure and
 return the results with run_id null, because the money is already
 spent and losing history must not lose the response. The UI surfaces

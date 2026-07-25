@@ -2226,3 +2226,65 @@ def test_poisoned_billed_cost_never_reaches_the_accumulator(monkeypatch, tmp_pat
         c.app.state.accumulated_spend_usd = 20.0
         assert main.spend_ceiling_reached() is True
         c.app.state.accumulated_spend_usd = total
+
+
+# ---- G3: the generation id survives everything, including aborts.
+
+
+@respx.mock
+async def test_review_repro_aborted_stream_persists_its_generation_id(client):
+    """A run stopped mid-stream is the run whose billing is least knowable
+    locally (stream cancellation only stops the charge on providers that
+    support it, and throughput routing picks the provider per request), so
+    it is the run that most needs an id to reconcile against later. The id
+    used to be read out of a chunk and dropped on the way to the disconnect
+    path, which left exactly those runs unauditable.
+    """
+    from bench.main import StreamCompareRequest, compare_stream
+    from bench.models import GENERATION_ID_HEADER
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={GENERATION_ID_HEADER: "gen-aborted-run"},
+            stream=alpha_stream(),
+        )
+    )
+
+    resp = await compare_stream(
+        StreamCompareRequest(prompt="abort me", model="model/alpha")
+    )
+    gen = resp.body_iterator
+    assert (
+        json.loads((await gen.__anext__()).removeprefix("data: "))["type"] == "started"
+    )
+    assert json.loads((await gen.__anext__()).removeprefix("data: "))["type"] == "delta"
+    # aclose() raises GeneratorExit at the yield, the same mechanism a
+    # Starlette client disconnect triggers.
+    await gen.aclose()
+
+    entries = client.get("/runs").json()["runs"]
+    persisted = client.get(f"/runs/{entries[0]['id']}").json()["results"][0]
+    assert persisted["error"] == "stream aborted before completion"
+    assert persisted["generation_id"] == "gen-aborted-run"
+
+
+@respx.mock
+async def test_a_run_aborted_before_any_response_persists_no_invented_id(client):
+    """The holder only ever holds what the platform said. A run cancelled
+    while still queued reaches upstream never, and persists nothing at all,
+    which the queued-cancel invariant already requires."""
+    from bench.main import StreamCompareRequest, compare_stream
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    resp = await compare_stream(
+        StreamCompareRequest(prompt="queued", model="model/alpha")
+    )
+    gen = resp.body_iterator
+    # Closed before the started frame is consumed: nothing was ever sent.
+    await gen.aclose()
+
+    assert client.get("/runs").json()["runs"] == []
