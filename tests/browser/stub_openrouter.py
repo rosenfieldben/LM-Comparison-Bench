@@ -4,8 +4,9 @@ Serves the two endpoints the bench calls, with streaming personalities
 keyed by model id so one stub exercises every frontend state the
 critical-path suite needs: fast, slow (elapsed indicator and late
 arrival), flaky (rerun), null content (empty-response path), HTML
-payloads (injection probe), and three billing shapes (no usage object at
-all, a NaN cost, a negative cost). Unknown model ids get the fast
+payloads (injection probe), three billing shapes (no usage object at
+all, a NaN cost, a negative cost), and a data-policy refusal (no endpoint
+matches the requested routing). Unknown model ids get the fast
 personality with model-specific text, so tests can fan out to any width
 without growing the catalog.
 
@@ -222,6 +223,24 @@ def build_app() -> Starlette:
                     await asyncio.sleep(0.02)
                 yield finish_chunk()
                 yield sse({"choices": [], "usage": USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model == "stub/nopolicy":
+            # No endpoint satisfies the requested data policy. OpenRouter
+            # reports this like any other routing failure, as an in-band
+            # error object on the 200 stream, so the bench needs no new
+            # code path: the card shows it the way it shows a provider
+            # outage. That inheritance is the point of the test.
+            async def gen():
+                yield sse(
+                    {
+                        "error": {
+                            "code": 404,
+                            "message": ("No endpoints found matching your data policy"),
+                        }
+                    }
+                )
                 yield b"data: [DONE]\n\n"
 
             return gen()

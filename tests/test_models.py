@@ -1223,3 +1223,111 @@ async def test_a_junk_generation_id_header_is_absence_not_a_value(client):
     # No header at all: the body id stands, and nothing crashed reaching
     # for a header that was not sent.
     assert result["generation_id"] == FIXTURE["id"]
+
+
+# ---- G5: privacy routing.
+
+from bench.models import DATA_POLICY_PREFS, provider_preferences  # noqa: E402
+
+
+def test_standard_policy_sends_todays_payload_unchanged():
+    """The default must cost nothing and claim nothing. Any extra key here
+    would be a routing constraint no operator asked for."""
+    assert provider_preferences("standard") == {"sort": "throughput"}
+
+
+def test_deny_policy_asks_for_no_training_routing():
+    # Field name pinned against OpenRouter's provider-routing docs; see
+    # DATA_POLICY_PREFS for the URL and the date it was read.
+    assert provider_preferences("deny") == {
+        "sort": "throughput",
+        "data_collection": "deny",
+    }
+
+
+def test_zdr_policy_asks_for_zero_retention_and_no_training():
+    assert provider_preferences("zdr") == {
+        "sort": "throughput",
+        "zdr": True,
+        "data_collection": "deny",
+    }
+
+
+def test_no_policy_silently_sends_the_standard_payload():
+    """The failure this guards is silence: a mode that quietly degraded to
+    standard would route confidential prompts to training-eligible
+    providers while the run row claimed otherwise."""
+    standard = provider_preferences("standard")
+    for policy in DATA_POLICY_PREFS:
+        if policy == "standard":
+            continue
+        assert provider_preferences(policy) != standard, policy
+
+
+@pytest.mark.parametrize("policy", sorted(DATA_POLICY_PREFS))
+@respx.mock
+async def test_run_model_sends_the_policys_provider_block(client, policy):
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    await run_model(
+        "hi",
+        "deepseek/deepseek-chat",
+        client,
+        provider_prefs=provider_preferences(policy),
+    )
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["provider"] == provider_preferences(policy)
+
+
+@pytest.mark.parametrize("policy", sorted(DATA_POLICY_PREFS))
+@respx.mock
+async def test_stream_model_sends_the_policys_provider_block(client, policy):
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    delta_chunk("Hi"),
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    async for _ in stream_model(
+        "hi",
+        "deepseek/deepseek-chat",
+        client,
+        provider_prefs=provider_preferences(policy),
+    ):
+        pass
+
+    sent = json.loads(route.calls[0].request.content)
+    assert sent["provider"] == provider_preferences(policy)
+    # The throughput sort is not dropped by the merge: it stabilizes WHAT
+    # is measured, and a privacy mode must not quietly cost that.
+    assert sent["provider"]["sort"] == "throughput"
+
+
+@respx.mock
+async def test_the_recorded_request_shows_the_policy_that_was_sent(client):
+    """request_json is the reproducibility record, so it has to carry the
+    routing constraints too: "which policy was this run under" must be
+    answerable from the row and not only from the process that made it."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    result = await run_model(
+        "hi",
+        "deepseek/deepseek-chat",
+        client,
+        provider_prefs=provider_preferences("zdr"),
+    )
+
+    recorded = json.loads(result["request_json"])
+    assert recorded["provider"] == {
+        "sort": "throughput",
+        "zdr": True,
+        "data_collection": "deny",
+    }

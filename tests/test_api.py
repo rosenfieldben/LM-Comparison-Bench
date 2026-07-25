@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 
 from bench import main
 from bench.main import MAX_POSITION, app
-from bench.models import OPENROUTER_URL
+from bench.models import OPENROUTER_URL, provider_preferences
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -839,7 +839,7 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
     monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
     with TestClient(app, base_url="http://localhost") as c:
         body = c.get("/models").json()
-        assert body == {"models": [], "fetched": False}
+        assert body == {"models": [], "fetched": False, "data_policy": "standard"}
 
         with respx.mock:
             respx.post(OPENROUTER_URL).respond(json=FIXTURE)
@@ -2288,3 +2288,87 @@ async def test_a_run_aborted_before_any_response_persists_no_invented_id(client)
     await gen.aclose()
 
     assert client.get("/runs").json()["runs"] == []
+
+
+# ---- G5: privacy routing.
+
+
+def policy_client(monkeypatch, tmp_path, policy=None):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    if policy is None:
+        monkeypatch.delenv("BENCH_DATA_POLICY", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_DATA_POLICY", policy)
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+@pytest.mark.parametrize("bad", ["strict", "DENY ZDR", "true", "none"])
+def test_an_unknown_data_policy_fails_boot(monkeypatch, tmp_path, bad):
+    """A typo must not fall back to standard. The fallback would send
+    prompts to training-eligible providers while the operator believed
+    otherwise, and nothing after the fact would show it."""
+    with (
+        pytest.raises(RuntimeError, match="BENCH_DATA_POLICY"),
+        policy_client(monkeypatch, tmp_path, bad),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [(None, "standard"), ("standard", "standard"), ("deny", "deny"), ("zdr", "zdr")],
+)
+def test_the_boot_policy_is_reported_to_the_page(monkeypatch, tmp_path, env, expected):
+    with policy_client(monkeypatch, tmp_path, env) as c:
+        assert c.get("/models").json()["data_policy"] == expected
+
+
+@pytest.mark.parametrize("policy", ["standard", "deny", "zdr"])
+@respx.mock
+def test_the_run_row_records_the_policy_that_was_actually_sent(
+    monkeypatch, tmp_path, policy
+):
+    """The column has to match the wire, not the intent: a row claiming a
+    policy the payload did not carry is worse than no column at all."""
+    route = respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "hi")
+        )
+    )
+    with policy_client(monkeypatch, tmp_path, policy) as c:
+        body = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        run_id = body.json()["run_id"]
+
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["provider"] == provider_preferences(policy)
+
+        row = c.app.state.db.execute(
+            "SELECT data_policy FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert row["data_policy"] == policy
+
+
+@respx.mock
+def test_the_streaming_path_sends_the_policy_too(monkeypatch, tmp_path):
+    """Two endpoints, one policy. The streaming path is the one the browser
+    uses, so a policy that only reached /compare would be inert in
+    practice."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with policy_client(monkeypatch, tmp_path, "zdr") as c:
+        frames = stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+        run_id = next(f for f in frames if f["type"] == "done")["run_id"]
+
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["provider"] == provider_preferences("zdr")
+        row = c.app.state.db.execute(
+            "SELECT data_policy FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert row["data_policy"] == "zdr"

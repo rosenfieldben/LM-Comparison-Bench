@@ -183,7 +183,22 @@
   }
   #brand h1 .sl { color: var(--accent); }
   #brand .bar-sub { font: 400 10.5px var(--mono); color: var(--text-faint); }
-  #stats { display: flex; gap: 28px; margin-left: auto; }
+  #stats { display: flex; gap: 28px; margin-left: auto; align-items: center; }
+  /* Data-policy badge. Outlined rather than filled, and in the accent
+     rather than an alarm color: a non-default routing policy is a
+     deliberate state to notice, not a fault to fix. Present only when the
+     policy is not standard, so its absence carries meaning too. */
+  #policy-badge {
+    align-self: center;
+    padding: 3px 8px;
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    font: 600 9.5px var(--mono);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent-val);
+    white-space: nowrap;
+  }
   .stat { display: flex; flex-direction: column; gap: 1px; }
   .stat .k { font-size: 9.5px; letter-spacing: 0.08em; color: var(--text-dim); }
   .stat .v { font: 600 14px var(--mono); color: var(--text); }

@@ -127,6 +127,41 @@ PRICES_TIMEOUT_S = 10.0
 # being measured, not just how reliably it answers.
 PROVIDER_PREFS = {"sort": "throughput"}
 
+# Data-handling routing, merged into the provider block above per policy.
+# Field names pinned against OpenRouter's provider-routing documentation
+# at https://openrouter.ai/docs/features/provider-routing, read 2026-07-25,
+# not from memory: data_collection takes "allow" (the documented default,
+# meaning providers that store user data non-transiently and may train on
+# it are eligible) or "deny" (route only to providers that do not collect
+# user data), and zdr is a boolean that restricts routing to zero data
+# retention endpoints. Both are keys of the same top-level provider object
+# the throughput sort already uses.
+#
+# zdr sends data_collection deny as well, which the documentation does not
+# require. The two flags govern different things (retention versus
+# collection and training eligibility), and a mode chosen for confidential
+# prompts that still permitted training-eligible routing would be a trap.
+# The stricter reading is the safe one to be wrong about.
+DATA_POLICY_PREFS: dict[str, dict[str, Any]] = {
+    # Today's payload, unchanged, so the default costs nothing and says
+    # nothing it cannot back up.
+    "standard": {},
+    "deny": {"data_collection": "deny"},
+    "zdr": {"zdr": True, "data_collection": "deny"},
+}
+
+
+def provider_preferences(data_policy: str) -> dict[str, Any]:
+    """The provider block for one data policy, throughput sort included.
+
+    Raises KeyError on an unknown policy, deliberately: the value is
+    validated once at boot (resolve_data_policy), and a typo reaching here
+    would otherwise silently send the standard payload while the run row
+    claimed something stricter.
+    """
+    return {**PROVIDER_PREFS, **DATA_POLICY_PREFS[data_policy]}
+
+
 # Extended-budget runs go silent for minutes while providers reason,
 # and NAT/middlebox idle timers cull flows that move no bytes. That
 # culling surfaced as sequential failures with mixed ReadError and
@@ -386,6 +421,7 @@ async def run_model(
     model: str,
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
+    provider_prefs: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
@@ -418,7 +454,11 @@ async def run_model(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "provider": PROVIDER_PREFS,
+        # Injected rather than read from module state, so the boot-scoped
+        # data policy reaches the wire without this function knowing where
+        # policy lives. The default keeps a direct caller on today's
+        # behavior.
+        "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
     }
     # The reproducibility record: what was actually sent, not what was
     # intended. Serialized here, beside the dict that goes on the wire, so
@@ -524,6 +564,7 @@ async def stream_model(
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
     id_holder: dict[str, Any] | None = None,
+    provider_prefs: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
@@ -568,7 +609,9 @@ async def stream_model(
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "provider": PROVIDER_PREFS,
+        # See run_model: injected so the boot-scoped data policy reaches
+        # the wire without this function knowing where policy lives.
+        "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
         "stream": True,
         # Without this the final chunk carries no usage block and token
         # counts (and therefore cost) would be lost on streamed runs.

@@ -13,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
@@ -58,8 +59,16 @@ def stub_url():
     thread.join(timeout=5)
 
 
-@pytest.fixture(scope="session")
-def bench_url(stub_url, tmp_path_factory):
+@contextmanager
+def boot_bench(stub_url, tmp_path_factory, extra_env=None):
+    """One bench subprocess against the stub, with its own database.
+
+    Factored out because the data-policy badge and payload can only be
+    exercised against a process booted with BENCH_DATA_POLICY set: the
+    policy is boot-scoped by design, so there is no way to switch it on a
+    running server, and pretending otherwise would test something the app
+    does not do.
+    """
     port = free_port()
     env = os.environ.copy()
     env.update(
@@ -70,6 +79,7 @@ def bench_url(stub_url, tmp_path_factory):
             "MODELS_URL": stub_url + "/api/v1/models",
         }
     )
+    env.update(extra_env or {})
     # The app subprocess keeps trust_env on (real operators may reach
     # OpenRouter through a proxy), so a developer proxy in the environment
     # would route its real localhost call to the stub OpenRouter through
@@ -108,6 +118,23 @@ def bench_url(stub_url, tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
+def bench_url(stub_url, tmp_path_factory):
+    with boot_bench(stub_url, tmp_path_factory) as url:
+        yield url
+
+
+@pytest.fixture(scope="session")
+def zdr_bench_url(stub_url, tmp_path_factory):
+    """A second bench booted under the strictest data policy.
+
+    Session-scoped like the default one, and started only when a test asks
+    for it, so the common suite still pays for exactly one server.
+    """
+    with boot_bench(stub_url, tmp_path_factory, {"BENCH_DATA_POLICY": "zdr"}) as url:
+        yield url
+
+
+@pytest.fixture(scope="session")
 def browser_type_launch_args(browser_type_launch_args):
     # Environments with a pre-provisioned Chromium (sandboxes, offline
     # runners) can point the harness at it instead of running
@@ -133,6 +160,20 @@ def bench(page, bench_url):
             f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
         )
         page.goto(bench_url)
+        return page
+
+    return open_bench
+
+
+@pytest.fixture
+def zdr_bench(page, zdr_bench_url):
+    """The same page factory, pointed at the zdr-policy bench."""
+
+    def open_bench(lineup):
+        page.add_init_script(
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
+        )
+        page.goto(zdr_bench_url)
         return page
 
     return open_bench

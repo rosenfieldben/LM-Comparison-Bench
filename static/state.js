@@ -9,6 +9,7 @@
   const statSpend = document.querySelector("#stat-spend .v");
   const statTtft = document.querySelector("#stat-ttft .v");
   const statLineup = document.querySelector("#stat-lineup .v");
+  const policyBadge = document.getElementById("policy-badge");
 
   // ---- View epoch. The results area is owned by exactly one operation
   // ---- at a time. The reproduced races this exists to prevent: a rerun
@@ -62,7 +63,46 @@
     },
     newViewEpoch,
     renderStats,
+    setDataPolicy,
   };
+
+  // What each mode asks OpenRouter for, in the operator's terms. The
+  // wording deliberately says "asks": the routing constraint is
+  // OpenRouter's to honor, and this application cannot verify it.
+  const POLICY_LABELS = {
+    deny: {
+      text: "no-training routing",
+      title:
+        "BENCH_DATA_POLICY=deny: every request asks OpenRouter to route " +
+        "only to providers that do not collect user data. The guarantee " +
+        "is OpenRouter's, not this application's",
+    },
+    zdr: {
+      text: "zero-retention routing",
+      title:
+        "BENCH_DATA_POLICY=zdr: every request asks OpenRouter to route " +
+        "only to zero-data-retention endpoints, and to providers that do " +
+        "not collect user data. The guarantee is OpenRouter's, not this " +
+        "application's",
+    },
+  };
+
+  function setDataPolicy(policy) {
+    // Absence of the badge means the default. Anything unrecognized is
+    // treated as standard rather than rendered raw: a badge is a claim
+    // about where prompts go, and a claim assembled from an unknown
+    // server value is one this page cannot stand behind.
+    const label = POLICY_LABELS[policy];
+    if (!label) {
+      policyBadge.hidden = true;
+      policyBadge.textContent = "";
+      policyBadge.removeAttribute("title");
+      return;
+    }
+    policyBadge.textContent = label.text;
+    policyBadge.title = label.title;
+    policyBadge.hidden = false;
+  }
 
   function newViewEpoch() {
     state.viewEpoch += 1;

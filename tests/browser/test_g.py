@@ -210,3 +210,63 @@ def test_the_unpriced_tooltip_says_what_unpriced_includes(bench):
     spend = page.get_by_test_id("stat-spend")
     expect(spend).to_have_attribute("title", re.compile("neither a billed nor an"))
     expect(spend).to_have_attribute("title", re.compile("stopped after they started"))
+
+
+# ---- G5: privacy routing.
+
+
+def test_no_badge_on_the_default_policy(bench):
+    """The badge's absence carries meaning too: standard routing is the
+    default and gets no decoration, so a badge always means a deliberate,
+    non-default posture."""
+    page = bench(["stub/fast"])
+    expect(page.get_by_test_id("policy-badge")).to_be_hidden()
+
+
+def test_a_non_standard_policy_is_visible_at_a_glance(zdr_bench):
+    """A confidential session must never be ambiguous. The wording says
+    "asks", because the routing constraint is OpenRouter's to honor and
+    this application cannot verify it."""
+    page = zdr_bench(["stub/fast"])
+    badge = page.get_by_test_id("policy-badge")
+    expect(badge).to_be_visible()
+    expect(badge).to_have_text("zero-retention routing")
+    expect(badge).to_have_attribute("title", re.compile("BENCH_DATA_POLICY=zdr"))
+    expect(badge).to_have_attribute("title", re.compile("guarantee is OpenRouter's"))
+
+
+def test_no_compliant_endpoint_surfaces_as_an_ordinary_failure(zdr_bench):
+    """Failure is loud by inheritance. When no endpoint satisfies the
+    policy, OpenRouter reports it like any other routing failure, so the
+    card shows it through the existing error path with no new code. The
+    badge stays up while it does, so the reason is legible."""
+    page = zdr_bench(["stub/nopolicy"])
+    check_chip(page, 0)
+    start_run(page, "g5 no compliant endpoint")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("card-error")).to_contain_text(
+        "No endpoints found matching your data policy"
+    )
+    expect(page.get_by_test_id("policy-badge")).to_be_visible()
+
+
+def test_the_policy_reaches_the_wire_from_the_browser(zdr_bench):
+    """End to end, through the real streaming path the browser uses: the
+    stub records every payload it received, so this asserts the provider
+    block that was actually sent rather than the one the app intended."""
+    page = zdr_bench(["stub/fast"])
+    check_chip(page, 0)
+    start_run(page, "g5 policy on the wire")
+    expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
+
+    sent = page.evaluate(
+        """async () => {
+          const r = await fetch('/runs');
+          const runs = (await r.json()).runs;
+          const detail = await (await fetch('/runs/' + runs[0].id)).json();
+          return JSON.parse(detail.results[0].request_json).provider;
+        }"""
+    )
+    assert sent == {"sort": "throughput", "zdr": True, "data_collection": "deny"}

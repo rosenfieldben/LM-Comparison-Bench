@@ -27,10 +27,12 @@ from bench import store
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
+    DATA_POLICY_PREFS,
     as_money,
     as_text,
     fetch_catalog,
     keepalive_socket_options,
+    provider_preferences,
     run_model,
     stream_model,
 )
@@ -253,6 +255,12 @@ class CatalogResponse(BaseModel):
     # Lets the frontend tell an offline boot from an empty catalog and
     # switch to the exact-id fallback instead of a dead search box.
     fetched: bool
+    # The boot-scoped data-handling policy, so the page can say plainly
+    # that this session is not on the default routing. It rides the catalog
+    # response rather than a new endpoint because the frontend already
+    # fetches this once at boot, and one more round trip to learn one word
+    # is not worth an endpoint.
+    data_policy: str = "standard"
 
 
 class RunDetail(BaseModel):
@@ -330,6 +338,28 @@ def _parse_spend_limit(raw: str | None) -> float | None:
     return limit
 
 
+def _parse_data_policy(raw: str | None) -> str:
+    """The validated per-boot data-handling policy, defaulting to standard.
+
+    Refused loudly at boot, like the spend ceiling, and for a sharper
+    reason: a typo silently falling back to standard would send prompts to
+    training-eligible providers while the operator believed otherwise, and
+    the run rows would record the fallback rather than the intent. Nothing
+    about that failure is visible after the fact, so it has to be visible
+    before the first request.
+    """
+    if not raw:
+        return "standard"
+    policy = raw.strip().lower()
+    if policy not in DATA_POLICY_PREFS:
+        allowed = ", ".join(sorted(DATA_POLICY_PREFS))
+        raise RuntimeError(
+            f"BENCH_DATA_POLICY must be one of {allowed}, got {raw!r}. "
+            "Unset it for standard."
+        )
+    return policy
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
@@ -351,6 +381,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
     app.state.accumulated_spend_usd = 0.0
+    # Data-handling routing, validated beside the ceiling and before any
+    # request can be built. The resolved provider block is computed once
+    # here rather than per request: it is boot-scoped by design, so a run
+    # can never be sent under a policy other than the one its row records.
+    app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
+    app.state.provider_prefs = provider_preferences(app.state.data_policy)
+    if app.state.data_policy != "standard":
+        logger.info(
+            "data policy %s: provider preferences %s",
+            app.state.data_policy,
+            app.state.provider_prefs,
+        )
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -914,6 +956,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 model,
                 app.state.client,
                 max_tokens=budget,
+                provider_prefs=app.state.provider_prefs,
             )
 
     # gather preserves input order, which the frontend relies on to map
@@ -1049,6 +1092,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 app.state.client,
                 max_tokens=max_tokens,
                 id_holder=id_holder,
+                provider_prefs=app.state.provider_prefs,
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -1175,6 +1219,7 @@ async def get_models() -> dict[str, Any]:
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
+        "data_policy": app.state.data_policy,
     }
 
 

@@ -339,6 +339,42 @@ does, and because quantization varies by host it also stabilizes
 what is actually being measured. The preference lives in
 `PROVIDER_PREFS` in `bench/models.py`.
 
+## Where your prompts go
+
+Every prompt you run leaves this machine. It goes to OpenRouter, and
+OpenRouter forwards it to whichever provider it routes the request to.
+Nothing about running the bench locally changes that, and this
+application cannot see what a provider does with a prompt once it
+arrives.
+
+What it can do is state a data-handling preference on every request.
+`BENCH_DATA_POLICY` picks one for the life of the process:
+
+- `standard` (the default, and what an unset variable means) sends
+  today's payload unchanged and asks for nothing about data handling.
+  Providers that store prompts and may train on them are eligible.
+- `deny` asks OpenRouter to route only to providers that do not collect
+  user data (`data_collection: "deny"` in the provider preferences).
+- `zdr` asks for zero-data-retention endpoints only (`zdr: true`), and
+  sends `data_collection: "deny"` alongside it. The two settings govern
+  different things, retention versus collection, and a mode chosen for
+  confidential prompts should not leave the other one open.
+
+An unrecognized value fails boot with a message naming the variable,
+rather than quietly falling back to `standard`: a silent fallback would
+send prompts to training-eligible providers while you believed
+otherwise. The active policy is recorded per run in the `data_policy`
+column, and when it is not `standard` a badge appears beside the session
+stats so a confidential session is never ambiguous at a glance.
+
+The important limit: this is a request, not a guarantee. The routing
+constraint is OpenRouter's to honor, and the bench only shows you what
+it asked for. When no endpoint satisfies the policy, OpenRouter refuses
+the request and the card shows that refusal like any other provider
+failure. The field names are pinned against OpenRouter's provider
+routing documentation; the URL and the date it was read are in the
+comment above `DATA_POLICY_PREFS` in `bench/models.py`.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
