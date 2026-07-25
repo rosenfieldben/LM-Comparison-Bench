@@ -38,6 +38,12 @@ logger = logging.getLogger(__name__)
 # rejects unknown names, so this map never sees one.
 BUDGET_TOKENS = {"standard": BUDGET_STANDARD, "extended": BUDGET_EXTENDED}
 
+# The budget an offline boot falls back to when no cap is published. See
+# effective_budget: offline is also unpriced, so the conservative tier is
+# what keeps an unverified extended run from being both unbounded and
+# uncounted.
+UNKNOWN_CAP_BUDGET = BUDGET_STANDARD
+
 # Ceiling on simultaneous paid upstream calls across everything in
 # flight. The batch endpoint's five-model cap always implied this
 # policy, but the UI's real path is one /compare/stream per model with
@@ -673,13 +679,28 @@ def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
 
 def effective_budget(budget: str, model: str) -> int:
     """The requested budget clamped to the model's published completion
-    cap. Sending a budget above a model's cap is a hard 400 from some
-    providers; clamping turns that failure into the best the model can
-    do. Lives here rather than in models.py because the boot catalog is
-    app state.
+    cap, or to the conservative tier when no cap is known. Sending a budget
+    above a model's cap is a hard 400 from some providers; clamping turns
+    that failure into the best the model can do. Lives here rather than in
+    models.py because the boot catalog is app state.
+
+    On an offline boot there are no published caps at all, and the old code
+    sent the full requested tier, dropping both protections at the worst
+    moment: an offline catalog is also an unpriced one, so an extended run
+    there is unverified against the provider AND invisible to the spend
+    ceiling. Falling back to the standard tier bounds the blast radius to
+    the tier the bench defaults to anyway. The effective budget is recorded
+    and shown per run, so the card carries the truth about what was sent.
+
+    Deliberately scoped to the offline boot rather than to every unknown
+    cap: with the catalog fetched, most models simply do not publish one,
+    and clamping those would quietly disable the extended tier for them.
+    A fetched catalog keeps today's behavior exactly.
     """
     requested = BUDGET_TOKENS[budget]
-    limit = app.state.completion_limits.get(model)
+    limit: int | None = app.state.completion_limits.get(model)
+    if limit is None and not app.state.catalog["fetched"]:
+        return min(requested, UNKNOWN_CAP_BUDGET)
     return min(requested, limit) if limit is not None else requested
 
 

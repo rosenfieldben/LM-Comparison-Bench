@@ -1850,3 +1850,101 @@ def test_legitimate_fields_still_accepted(client):
         },
     )
     assert stream.status_code == 200
+
+
+# ---- F4.8: an offline catalog keeps a conservative completion cap.
+
+
+def test_review_repro_offline_extended_clamps_to_standard(monkeypatch, tmp_path):
+    """Second review: with the catalog offline there is no published limit,
+    so effective_budget sent the full requested tier. That dropped the
+    provider hard-400 protection and the runaway-size guard at exactly the
+    moment spend is already unpriced, since an offline catalog has no
+    prices either. An extended request on an offline boot must fall back to
+    the standard tier, and the effective budget it was sent with must be
+    what gets recorded and displayed."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    with TestClient(app, base_url="http://localhost") as c:
+        with respx.mock:
+            respx.post(OPENROUTER_URL).mock(side_effect=route)
+            resp = c.post(
+                "/compare",
+                json={
+                    "prompt": "hi",
+                    "models": ["model/unknown"],
+                    "budget": "extended",
+                },
+            )
+        assert resp.status_code == 200
+        # Sent conservatively, not at the full extended tier.
+        assert seen["model/unknown"] == BUDGET_STANDARD
+        # Recorded and returned as the effective budget, so the card is
+        # honest about what was actually asked for.
+        assert resp.json()["results"][0]["max_tokens"] == BUDGET_STANDARD
+        run_id = resp.json()["run_id"]
+        persisted = c.get(f"/runs/{run_id}").json()["results"][0]
+        assert persisted["max_tokens"] == BUDGET_STANDARD
+
+
+def test_offline_standard_request_is_unchanged(monkeypatch, tmp_path):
+    """The clamp only ever lowers: a standard request on an offline boot
+    still sends the standard tier."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    with TestClient(app, base_url="http://localhost") as c:
+        with respx.mock:
+            respx.post(OPENROUTER_URL).mock(side_effect=route)
+            c.post("/compare", json={"prompt": "hi", "models": ["model/unknown"]})
+    assert seen["model/unknown"] == BUDGET_STANDARD
+
+
+@respx.mock
+def test_fetched_catalog_budgets_are_unchanged(client):
+    """The scope control: with the catalog present, published caps behave
+    exactly as before. A capped model still clamps to its published limit,
+    and a catalogued model that publishes no cap still gets the full
+    extended tier, since clamping those would quietly disable the extended
+    tier for most of the catalog."""
+    seen = {}
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        seen[body["model"]] = body["max_tokens"]
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/capped", "model/alpha"],
+            "budget": "extended",
+        },
+    )
+    assert seen["model/capped"] == 32000
+    assert seen["model/alpha"] == BUDGET_EXTENDED
