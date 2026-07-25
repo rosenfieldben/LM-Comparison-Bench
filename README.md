@@ -319,6 +319,32 @@ own word for why generation ended (`native_finish_reason`, beside
 OpenRouter's normalized `finish_reason`). `quantization` is reserved for
 the reconcile path, since it is not reported in-band.
 
+Some of that is only knowable after the fact. A run stopped mid-stream
+never receives a usage object, and OpenRouter's `/generation` endpoint
+holds the record it does have. `python -m bench.reconcile` walks the
+result rows that carry a generation id but no billed cost, asks about
+each one, and prints what it would write:
+
+```sh
+.venv/bin/python -m bench.reconcile          # dry run, writes nothing
+.venv/bin/python -m bench.reconcile --apply  # take the writes
+```
+
+Dry run is the default because this is the only path in the bench that
+edits history. It fetches serially with a pause between lookups, and it
+writes only `billed_cost_usd`, `provider`, `quantization` and
+`native_finish_reason`. Response text, errors, timings and the local
+estimate are never touched: this adds what the platform knows, it does
+not revise what the bench observed. A field the endpoint does not report
+leaves whatever was captured live in place, and an expired record (the
+endpoint 404s for old generations) is reported and skipped. It is safe
+to run against a live bench, since the database is in WAL mode.
+`--limit N` walks the oldest rows first, and `--delay` sets the pause.
+
+Nothing runs it for you. Reconciliation is one upstream call per row, and
+doing that at boot or inside a request would make a comparison wait on an
+audit it did not ask for.
+
 Databases from before these columns existed are migrated in place on
 the next start, additively: nothing is renamed, dropped or retyped, old
 rows keep their values, and every new column reads back as None on

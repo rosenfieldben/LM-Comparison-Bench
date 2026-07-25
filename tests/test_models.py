@@ -1331,3 +1331,130 @@ async def test_the_recorded_request_shows_the_policy_that_was_sent(client):
         "zdr": True,
         "data_collection": "deny",
     }
+
+
+# ---- G6: the reconcile path.
+
+from bench.models import GENERATION_URL, fetch_generation  # noqa: E402
+
+# The response shape OpenRouter's OpenAPI description of GET /generation
+# gives; see fetch_generation for the URL and the date it was read.
+GENERATION_BODY = {
+    "data": {
+        "id": "gen-1",
+        "total_cost": 0.0015,
+        "provider_name": "Infermatic",
+        "native_finish_reason": "stop",
+        "native_tokens_prompt": 10,
+        "native_tokens_completion": 25,
+        "native_tokens_reasoning": 5,
+        "native_tokens_cached": 3,
+    }
+}
+
+
+@respx.mock
+async def test_fetch_generation_normalizes_the_audit_record(client):
+    route = respx.get(GENERATION_URL).respond(json=GENERATION_BODY)
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert route.calls[0].request.url.params["id"] == "gen-1"
+    assert record["error"] is None
+    assert record["billed_cost_usd"] == 0.0015
+    assert record["provider"] == "Infermatic"
+    assert record["native_finish_reason"] == "stop"
+    assert record["prompt_tokens"] == 10
+    assert record["completion_tokens"] == 25
+    assert record["reasoning_tokens"] == 5
+    assert record["cached_tokens"] == 3
+    # Not in the endpoint's documented response schema today, so absent
+    # rather than wrong. A None here does not mean unquantized weights.
+    assert record["quantization"] is None
+
+
+@respx.mock
+async def test_fetch_generation_reads_quantization_when_it_is_there(client):
+    body = {"data": {**GENERATION_BODY["data"], "quantization": "fp8"}}
+    respx.get(GENERATION_URL).respond(json=body)
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert record["quantization"] == "fp8"
+
+
+@pytest.mark.parametrize("poison", [float("nan"), -0.5, "0.0015", True, None])
+@respx.mock
+async def test_review_repro_poisoned_generation_cost_degrades_to_none(client, poison):
+    """The money rule on the audit path too. A poisoned charge here would
+    be written straight into billed_cost_usd, where it would reach the
+    ceiling accumulator on the next boot's reads and the session bar's
+    arithmetic, having bypassed the streaming path's guard entirely."""
+    body = json.dumps({"data": {**GENERATION_BODY["data"], "total_cost": poison}})
+    respx.get(GENERATION_URL).mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert record["billed_cost_usd"] is None
+    # The rest of the record survives its poisoned neighbour, so one bad
+    # field does not cost the row its provider and finish reason.
+    assert record["error"] is None
+    assert record["provider"] == "Infermatic"
+
+
+@respx.mock
+async def test_fetch_generation_reports_an_expired_record_without_raising(client):
+    """404 is ordinary: OpenRouter expires generation records, and a run
+    old enough to have aged out is not a failure of the pass."""
+    respx.get(GENERATION_URL).respond(status_code=404, json={"error": "not found"})
+
+    record = await fetch_generation(client, "gen-old")
+
+    assert record["error"] == "HTTP 404 from OpenRouter"
+    assert record["billed_cost_usd"] is None
+
+
+@respx.mock
+async def test_fetch_generation_survives_a_network_failure(client):
+    respx.get(GENERATION_URL).mock(side_effect=httpx.ReadError("net down"))
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert record["error"] == "request failed: ReadError"
+
+
+@pytest.mark.parametrize("body", ["not json", '{"no_data_key": 1}', '{"data": "n/a"}'])
+@respx.mock
+async def test_fetch_generation_survives_a_malformed_body(client, body):
+    respx.get(GENERATION_URL).mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert record["error"] == "malformed response from OpenRouter"
+
+
+@respx.mock
+async def test_non_string_provenance_from_the_audit_path_degrades(client):
+    body = {
+        "data": {
+            **GENERATION_BODY["data"],
+            "provider_name": {"name": "Infermatic"},
+            "native_finish_reason": "",
+            "native_tokens_prompt": "10",
+        }
+    }
+    respx.get(GENERATION_URL).respond(json=body)
+
+    record = await fetch_generation(client, "gen-1")
+
+    assert record["provider"] is None
+    assert record["native_finish_reason"] is None
+    assert record["prompt_tokens"] is None

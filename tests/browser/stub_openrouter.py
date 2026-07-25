@@ -10,6 +10,9 @@ matches the requested routing). Unknown model ids get the fast
 personality with model-specific text, so tests can fan out to any width
 without growing the catalog.
 
+It also serves /generation, the after-the-fact audit record the reconcile
+pass reads.
+
 /_test/requests exposes every recorded /chat/completions payload; it
 exists for test assertions (budget clamping) and is not part of the
 OpenRouter surface being stubbed.
@@ -81,6 +84,13 @@ PROVIDER = "StubHost"
 # passes through beside its normalized "stop".
 NATIVE_FINISH_REASON = "STOP_SEQUENCE"
 
+# What the generation endpoint reports after the fact. The cost differs
+# from BILLED_COST on purpose: a reconcile test must be able to tell a
+# backfilled row from one that already carried a charge.
+RECONCILED_COST = 0.000037
+RECONCILED_PROVIDER = "StubAuditHost"
+RECONCILED_QUANTIZATION = "fp8"
+
 # Deltas that must render as literal text everywhere, never as markup.
 HTML_DELTAS = ["<img src=x onerror=alert(1)>", " and ", "<b>bold?</b>"]
 
@@ -137,7 +147,15 @@ def build_app() -> Starlette:
     # Closure state instead of module globals: each harness session
     # builds its own app, so flaky's fail-once behavior and the request
     # log reset with the stub process.
-    state = {"requests": [], "flaky_failed": False, "flaky_slow_failed": False}
+    state = {
+        "requests": [],
+        "flaky_failed": False,
+        "flaky_slow_failed": False,
+        # Ids the generation endpoint reports as gone, the way OpenRouter
+        # expires old records. Populated by tests through the module, not
+        # by any request.
+        "expired_generations": set(),
+    }
 
     async def models(request):
         return JSONResponse(CATALOG)
@@ -326,6 +344,32 @@ def build_app() -> Starlette:
             )
         return non_stream_body(model, headers)
 
+    async def generation(request):
+        # The after-the-fact audit record, shaped like OpenRouter's
+        # GET /generation: the charge is total_cost, the host is
+        # provider_name, and the token counts are the native ones. An
+        # unknown id 404s the way an expired record does.
+        gen_id = request.query_params.get("id")
+        if not gen_id:
+            return JSONResponse({"error": "missing id"}, status_code=400)
+        if gen_id in state["expired_generations"]:
+            return JSONResponse({"error": "not found"}, status_code=404)
+        return JSONResponse(
+            {
+                "data": {
+                    "id": gen_id,
+                    "total_cost": RECONCILED_COST,
+                    "provider_name": RECONCILED_PROVIDER,
+                    "quantization": RECONCILED_QUANTIZATION,
+                    "native_finish_reason": NATIVE_FINISH_REASON,
+                    "native_tokens_prompt": 13,
+                    "native_tokens_completion": 8,
+                    "native_tokens_reasoning": 5,
+                    "native_tokens_cached": 2,
+                }
+            }
+        )
+
     async def recorded_requests(request):
         return JSONResponse({"requests": state["requests"]})
 
@@ -333,6 +377,7 @@ def build_app() -> Starlette:
         routes=[
             Route("/api/v1/models", models),
             Route("/api/v1/chat/completions", completions, methods=["POST"]),
+            Route("/api/v1/generation", generation),
             Route("/_test/requests", recorded_requests),
         ]
     )

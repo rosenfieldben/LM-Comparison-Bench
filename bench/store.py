@@ -614,3 +614,70 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     out = dict(row)
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
+
+
+def results_awaiting_reconciliation(
+    conn: sqlite3.Connection, limit: int | None = None
+) -> list[dict[str, Any]]:
+    """Result rows that have a generation id but no billed cost yet.
+
+    The reconcile pass's work list. Aborted rows qualify by construction:
+    they carry an id (captured from the response header before any chunk)
+    and never a billed cost, since no usage object ever arrived, and they
+    are the rows whose billing is least knowable without asking.
+
+    Ordered by id so a run interrupted partway through resumes in a
+    predictable place, and so a --limit run walks the oldest rows first.
+    """
+    sql = (
+        "SELECT r.id, r.run_id, r.model, r.generation_id, r.cost_usd, r.error "
+        "FROM results r "
+        "WHERE r.generation_id IS NOT NULL AND r.billed_cost_usd IS NULL "
+        "ORDER BY r.id"
+    )
+    params: tuple[Any, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    return [dict(row) for row in conn.execute(sql, params).fetchall()]
+
+
+# The only columns the reconcile pass may write. Text, errors, timings and
+# the local estimate are excluded on purpose: this is an audit that adds
+# what the platform knows, not a rewrite of what the bench observed. A pass
+# that could edit response_text would make history unfalsifiable.
+RECONCILABLE_COLUMNS = (
+    "billed_cost_usd",
+    "provider",
+    "quantization",
+    "native_finish_reason",
+)
+
+
+def apply_reconciliation(
+    conn: sqlite3.Connection, result_id: int, record: dict[str, Any]
+) -> None:
+    """Write the audit columns for one result from a generation record.
+
+    COALESCE on the three text columns so a field the generation endpoint
+    does not return cannot erase one captured in-band: absence there means
+    "not reported", never "known to be nothing". billed_cost_usd is
+    assigned outright because the work list only contains rows where it is
+    already NULL, so there is nothing to overwrite.
+    """
+    with conn:
+        conn.execute(
+            """UPDATE results
+               SET billed_cost_usd = ?,
+                   provider = COALESCE(?, provider),
+                   quantization = COALESCE(?, quantization),
+                   native_finish_reason = COALESCE(?, native_finish_reason)
+               WHERE id = ?""",
+            (
+                record["billed_cost_usd"],
+                record["provider"],
+                record["quantization"],
+                record["native_finish_reason"],
+                result_id,
+            ),
+        )

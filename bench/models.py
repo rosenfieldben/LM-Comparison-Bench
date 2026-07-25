@@ -73,6 +73,9 @@ OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 MODELS_URL = os.environ.get("MODELS_URL", "https://openrouter.ai/api/v1/models")
+GENERATION_URL = os.environ.get(
+    "GENERATION_URL", "https://openrouter.ai/api/v1/generation"
+)
 
 # Reaching OpenRouter should be fast; a slow connect is a real failure.
 CONNECT_TIMEOUT_S = 10.0
@@ -749,3 +752,80 @@ async def stream_model(
         yield done("stream ended before completion: no [DONE] and no finish reason")
         return
     yield done(None)
+
+
+# The generation endpoint is an audit surface, not a costing path: it is
+# called after the fact by the reconcile script, never during a run.
+# Fifteen seconds is generous for one metadata lookup and short enough
+# that a hung endpoint does not stall a long backfill.
+GENERATION_TIMEOUT_S = 15.0
+
+
+async def fetch_generation(
+    client: httpx.AsyncClient, generation_id: str
+) -> dict[str, Any]:
+    """One generation's after-the-fact record, or an error field saying why.
+
+    Never raises, like the two client functions: this runs in a loop over
+    many rows, and one bad id must not end the pass. Every field goes
+    through the same total field-type functions, with the money rule on the
+    charge, so a poisoned value from the audit path cannot do what it could
+    not do from the streaming path.
+
+    Field names are the ones OpenRouter's OpenAPI description of
+    GET /generation gives (read 2026-07-25 from
+    https://openrouter.ai/docs/api/api-reference/generations/get-request-%26-usage-metadata-for-a-generation):
+    the charge is total_cost, the host is provider_name, and the token
+    counts prefixed native_ are the model's own tokenizer's, which is what
+    the in-band usage object reports too, so the two are comparable.
+
+    quantization is read but is NOT in that description's response schema
+    today. It is fetched anyway rather than omitted, because the field is
+    what the reconcile pass exists to recover and reading a key that may
+    appear costs nothing; until it does appear, this degrades to None like
+    any absent field. Do not read a None here as "the provider served
+    unquantized weights".
+    """
+    record: dict[str, Any] = {
+        "generation_id": generation_id,
+        "billed_cost_usd": None,
+        "provider": None,
+        "quantization": None,
+        "native_finish_reason": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "error": None,
+    }
+    try:
+        response = await client.get(
+            GENERATION_URL,
+            params={"id": generation_id},
+            timeout=GENERATION_TIMEOUT_S,
+        )
+    except httpx.HTTPError as exc:
+        record["error"] = f"request failed: {type(exc).__name__}"
+        return record
+    if response.status_code != 200:
+        # 404 is ordinary here: OpenRouter expires generation records, and
+        # a run old enough to have aged out is not a failure of this pass.
+        record["error"] = f"HTTP {response.status_code} from OpenRouter"
+        return record
+    try:
+        data = response.json()["data"]
+        if not isinstance(data, dict):
+            raise ValueError("data is not an object")
+    except (ValueError, LookupError, TypeError):
+        record["error"] = "malformed response from OpenRouter"
+        return record
+
+    record["billed_cost_usd"] = as_money(data.get("total_cost"))
+    record["provider"] = _as_label(data.get("provider_name"))
+    record["quantization"] = _as_label(data.get("quantization"))
+    record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))
+    record["prompt_tokens"] = as_token_count(data.get("native_tokens_prompt"))
+    record["completion_tokens"] = as_token_count(data.get("native_tokens_completion"))
+    record["reasoning_tokens"] = as_token_count(data.get("native_tokens_reasoning"))
+    record["cached_tokens"] = as_token_count(data.get("native_tokens_cached"))
+    return record
