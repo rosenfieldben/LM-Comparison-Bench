@@ -6,6 +6,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
+from bench import main
 from bench.main import app
 from bench.models import OPENROUTER_URL
 
@@ -1633,3 +1634,104 @@ async def test_disconnect_at_started_frame_persists_sane_latency(monkeypatch, tm
     latency = run["results"][0]["latency_ms"]
     assert latency is not None
     assert 0.0 <= latency < 60_000.0
+
+
+# ---- F4.2: the peer address, not just the Host header, must be loopback.
+
+
+def _call_guard_with_peer(client_tuple):
+    """Drive the ASGI app directly so scope["client"] is exactly what a
+    real socket would present. TestClient always synthesizes its own peer,
+    so it cannot express a remote caller; this is the only seam that can.
+    Returns (status, body_bytes).
+    """
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": "/runs",
+        "raw_path": b"/runs",
+        "query_string": b"",
+        "root_path": "",
+        # A perfectly valid Host header: the point is that a remote client
+        # can forge this, so the header alone cannot be the whole defense.
+        "headers": [(b"host", b"localhost:8000")],
+        "client": client_tuple,
+        "server": ("127.0.0.1", 8000),
+    }
+    received = []
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        received.append(message)
+
+    asyncio.run(main.LocalOnlyGuard(_reject_all_app)(scope, receive, send))
+    status = next(m["status"] for m in received if m["type"] == "http.response.start")
+    body = b"".join(
+        m.get("body", b"") for m in received if m["type"] == "http.response.body"
+    )
+    return status, body
+
+
+async def _reject_all_app(scope, receive, send):
+    """Stand-in for the real app: reaching it at all means the guard let the
+    request through, which is what the pass case asserts.
+    """
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 299,
+            "headers": [(b"content-type", b"text/plain")],
+        }
+    )
+    await send({"type": "http.response.body", "body": b"reached the app"})
+
+
+def test_review_repro_non_loopback_peer_is_rejected():
+    """Second review: the guard validated only the Host header, which
+    defends browsers, not sockets. A non-browser client reaching the port
+    (server bound beyond loopback by a --host typo or a published container
+    port) could send "Host: localhost" and spend the key. The peer address
+    must be loopback."""
+    status, body = _call_guard_with_peer(("203.0.113.7", 54321))
+    assert status == 403
+    assert b"loopback" in body
+
+    # IPv6 remote peers are refused on the same rule.
+    status6, _ = _call_guard_with_peer(("2001:db8::1", 54321))
+    assert status6 == 403
+
+
+def test_loopback_peer_with_same_request_passes():
+    """The control: identical request, loopback peer, reaches the app."""
+    for peer in (("127.0.0.1", 54321), ("::1", 54321), ("127.0.0.5", 9)):
+        status, body = _call_guard_with_peer(peer)
+        assert status == 299, f"loopback peer {peer} was rejected"
+        assert body == b"reached the app"
+
+
+def test_in_process_transports_keep_working():
+    """In-process transports have no socket to be remote. Starlette's
+    TestClient presents ("testclient", 50000) and other harnesses present
+    None or omit the key; all must pass, since only a real IP can carry a
+    remote attacker. peer_is_local documents this carve-out."""
+    for peer in (("testclient", 50000), None, (), ("", 0)):
+        status, _ = _call_guard_with_peer(peer)
+        assert status == 299, f"in-process peer {peer!r} was rejected"
+
+
+def test_peer_is_local_classifies_addresses():
+    """The predicate itself, including the loopback ranges beyond the
+    canonical two."""
+    assert main.peer_is_local(("127.0.0.1", 1)) is True
+    assert main.peer_is_local(("127.13.99.4", 1)) is True
+    assert main.peer_is_local(("::1", 1)) is True
+    assert main.peer_is_local(None) is True
+    assert main.peer_is_local(("testclient", 1)) is True
+    assert main.peer_is_local(("10.0.0.4", 1)) is False
+    assert main.peer_is_local(("203.0.113.7", 1)) is False
+    assert main.peer_is_local(("2001:db8::1", 1)) is False

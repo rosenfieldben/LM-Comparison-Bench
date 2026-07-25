@@ -1,6 +1,7 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import ipaddress
 import json
 import logging
 import math
@@ -299,6 +300,38 @@ app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
 TRUSTED_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 
+def peer_is_local(client: Any) -> bool:
+    """Whether an ASGI scope's client is a loopback peer or in-process.
+
+    The Host check above defends browsers, not sockets: it is a header, so
+    a non-browser client that reaches the port can simply send
+    "Host: localhost". If the server is ever bound beyond loopback (a
+    --host 0.0.0.0 typo, a container publishing the port), that is a
+    remote caller spending the key. This is the socket-level companion:
+    the peer address itself must be loopback.
+
+    In-process transports have no socket. Starlette's TestClient presents
+    the synthetic peer ("testclient", 50000), and other harnesses present
+    None, so a client that does not parse as an IP address is treated as
+    in-process and allowed: there is no network peer to be remote. Anything
+    that IS a real IP is held to loopback strictly, which is the case that
+    matters, since only a real socket can carry a remote attacker. The
+    browser suite runs a real uvicorn on 127.0.0.1 and so exercises the
+    strict path end to end.
+    """
+    if not client:
+        return True
+    try:
+        host = client[0]
+    except (TypeError, IndexError):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        # Not an IP at all: an in-process transport's synthetic name.
+        return True
+
+
 def host_header_name(host: str) -> str:
     """The hostname part of a Host header value, port stripped.
 
@@ -371,6 +404,18 @@ class LocalOnlyGuard:
                 headers["x-frame-options"] = "DENY"
                 headers["content-security-policy"] = CONTENT_SECURITY_POLICY
             await send(message)
+
+        # The socket-level check runs first, before anything a caller
+        # controls: Host is a header a remote client can forge, the peer
+        # address is not. See peer_is_local for the in-process transport
+        # carve-out and why it is safe.
+        if not peer_is_local(scope.get("client")):
+            response = JSONResponse(
+                {"detail": "the bench only answers to loopback clients"},
+                status_code=403,
+            )
+            await response(scope, receive, framed_send)
+            return
 
         headers = Headers(scope=scope)
         # A missing Host header (raw HTTP/1.0 clients) fails closed.
