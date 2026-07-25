@@ -9,6 +9,7 @@ import logging
 import os
 import sqlite3
 import stat
+import urllib.parse
 from datetime import UTC, datetime
 from typing import Any
 
@@ -112,6 +113,38 @@ def _keep_private(path: str) -> None:
                 )
 
 
+def _disk_path(path: str) -> str | None:
+    """The filesystem path this database lives at, or None if memory-backed.
+
+    sqlite accepts three shapes here: ":memory:", a plain filename, and a
+    "file:" URI. Only the URI needs parsing, and the rule is the inverse of
+    what this module assumed before: a URI is memory-backed exactly when it
+    carries mode=memory, so the test seam's shared memory databases are
+    memory and everything else, including file:/tmp/x.db?cache=private, is
+    a real file that must get the private permissions and the WAL pragmas.
+
+    The path is URL-decoded because sqlite decodes URI paths itself, so a
+    URI naming a file with a space or a percent must be chmod'd under the
+    same name sqlite will open.
+    """
+    if path == ":memory:":
+        return None
+    if not path.startswith("file:"):
+        return path
+    parsed = urllib.parse.urlparse(path)
+    if "memory" in urllib.parse.parse_qs(parsed.query).get("mode", []):
+        return None
+    # urlparse puts a URI's path in .path, but only when it begins with a
+    # slash; a relative URI (file:bench.db) lands in .path too, while an
+    # authority-form URI (file://localhost/tmp/x.db) splits the host off.
+    # sqlite only accepts an empty or "localhost" authority, and treats
+    # both as the local filesystem, so .path alone is the filename.
+    decoded = urllib.parse.unquote(parsed.path)
+    # An empty path with no authority is sqlite's private temporary
+    # database ("file:?cache=shared" style): no file to harden.
+    return decoded or None
+
+
 def connect(path: str) -> sqlite3.Connection:
     """Open a connection with the schema applied and foreign keys on.
 
@@ -120,12 +153,16 @@ def connect(path: str) -> sqlite3.Connection:
     event loop thread today, but the flag keeps a future sync endpoint
     or executor hop from crashing on an sqlite thread check.
     """
-    # A real file on disk, as opposed to the in-memory and file: URI
-    # databases the test seam hands in, which have no filesystem mode to
-    # manage and no meaningful WAL.
-    file_backed = path != ":memory:" and not path.startswith("file:")
-    if file_backed:
-        _keep_private(path)
+    # A real file on disk, as opposed to a memory database, which has no
+    # filesystem mode to manage and no meaningful WAL. A file: URI is NOT
+    # memory-backed by default: only mode=memory makes it so. Treating
+    # every URI as memory-like was a defect, since a disk-backed URI then
+    # skipped the private permissions and the WAL and busy_timeout pragmas
+    # (reproduced: file:/tmp/x.db?cache=private came out 0644 running
+    # journal_mode=delete under umask 022).
+    disk_path = _disk_path(path)
+    if disk_path is not None:
+        _keep_private(disk_path)
     # uri=True lets tests hand in shared in-memory databases via
     # file: URIs; sqlite treats anything not starting with "file:" as a
     # plain filename, so normal paths and ":memory:" are unaffected.
@@ -133,7 +170,7 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     # Off by default in sqlite; without it ON DELETE SET NULL is inert.
     conn.execute("PRAGMA foreign_keys = ON")
-    if file_backed:
+    if disk_path is not None:
         # A second process opening bench.db (an analysis script run while
         # the bench is live) risks "database is locked" under the default
         # rollback journal, which takes an exclusive lock for every

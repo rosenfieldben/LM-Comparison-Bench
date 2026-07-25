@@ -586,3 +586,58 @@ def test_group_prompt_is_first_member_or_none(db):
     store.save_run(db, "a later, different prompt", [make_result()], group_id=gid)
     # The first member fixes it, regardless of later members' text.
     assert store.group_prompt(db, gid) == "the first prompt"
+
+
+# ---- F4.1: a disk-backed file: URI is a real file, not a memory database.
+
+
+def test_review_repro_disk_uri_gets_permissions_and_pragmas(tmp_path):
+    """Second review: connect() treated every file:-prefixed path as
+    memory-like, so a disk-backed URI skipped _keep_private, WAL and
+    busy_timeout. Reproduced under umask 022: file:/tmp/x.db?cache=private
+    came out 0644 running journal_mode=delete."""
+    db_path = tmp_path / "uri.db"
+    uri = f"file:{db_path}?cache=private"
+    old_umask = os.umask(0o022)
+    try:
+        conn = store.connect(uri)
+    finally:
+        os.umask(old_umask)
+    try:
+        assert file_mode(db_path) == 0o600
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 5000
+    finally:
+        conn.close()
+
+
+def test_memory_uri_stays_memory_backed():
+    """The test seam's shared in-memory databases must keep working: a
+    mode=memory URI has no file to harden and no meaningful WAL."""
+    uri = "file:f4_memory_uri?mode=memory&cache=shared"
+    conn = store.connect(uri)
+    try:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "memory"
+    finally:
+        conn.close()
+
+
+def test_disk_path_classifies_uri_shapes(tmp_path):
+    """The classifier itself: mode=memory (in any parameter position) is
+    memory, everything else with a path is a file, and the shapes with no
+    filename to chmod degrade to None rather than guessing."""
+    assert store._disk_path(":memory:") is None
+    assert store._disk_path("bench.db") == "bench.db"
+    # mode=memory anywhere in the query, not just first.
+    assert store._disk_path("file:x?cache=shared&mode=memory") is None
+    assert store._disk_path("file:x?mode=memory") is None
+    # Disk URIs, absolute and relative, with and without an authority.
+    assert store._disk_path("file:/tmp/x.db?cache=private") == "/tmp/x.db"
+    assert store._disk_path("file:bench.db") == "bench.db"
+    assert store._disk_path("file://localhost/tmp/x.db") == "/tmp/x.db"
+    # mode=rw is explicitly not memory.
+    assert store._disk_path("file:/tmp/x.db?mode=rw") == "/tmp/x.db"
+    # Percent-encoding is decoded, since sqlite opens the decoded name.
+    assert store._disk_path("file:/tmp/a%20b.db") == "/tmp/a b.db"
+    # A private temporary database has no filename to harden.
+    assert store._disk_path("file:?cache=shared") is None
