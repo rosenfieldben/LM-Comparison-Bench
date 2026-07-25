@@ -151,14 +151,13 @@
     // markup, because what the total is made of changes as the session
     // runs: a fixed string calling it an estimate became false the moment
     // a billed figure landed in it.
-    const composition =
-      idle
-        ? "nothing priced yet this session"
-        : state.sessionStats.estimated > 0
-          ? "part billed by OpenRouter, part estimated from catalog " +
-            "prices and reported tokens; the tilde marks that some of it " +
-            "is an estimate"
-          : "billed by OpenRouter, not estimated";
+    const composition = idle
+      ? "nothing priced yet this session"
+      : state.sessionStats.estimated > 0
+        ? "part billed by OpenRouter, part estimated from catalog " +
+          "prices and reported tokens; the tilde marks that some of it " +
+          "is an estimate"
+        : "billed by OpenRouter, not estimated";
     statSpend.title =
       state.sessionStats.unpriced > 0
         ? composition +
