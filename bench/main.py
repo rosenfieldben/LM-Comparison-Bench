@@ -109,10 +109,12 @@ class ModelResult(BaseModel):
     # and authoritative cost, so a persisted id makes any historical
     # run auditable. Defaults None so pre-provenance rows stay valid.
     generation_id: str | None = None
-    # The provider's finish_reason verbatim (stop, length,
-    # content_filter, ...). Until now it survived only inside
-    # synthesized error strings; budget analysis needs it on
-    # truncated-but-successful runs too.
+    # Why output ended (stop, length, content_filter, ...). This is
+    # OpenRouter's normalized value, not the provider's own word, which it
+    # exposes separately as native_finish_reason; capturing that is Phase G
+    # provenance work. Until now this survived only inside synthesized
+    # error strings; budget analysis needs it on truncated-but-successful
+    # runs too.
     finish_reason: str | None = None
 
 

@@ -278,7 +278,7 @@ Open http://localhost:8000 in a browser. Type a prompt, check the
 models to compare, hit Run. Each column fills in as its model
 responds. The lineup is managed with the picker (see Daily use); the
 four-model default seed for a fresh browser is `DEFAULT_LINEUP` at
-the top of `static/app.js`.
+the top of `static/controls.js`.
 
 Or hit the API directly:
 
