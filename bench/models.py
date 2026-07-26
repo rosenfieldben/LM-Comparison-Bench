@@ -566,16 +566,20 @@ async def stream_model(
     model: str,
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
-    id_holder: dict[str, Any] | None = None,
+    holder: dict[str, Any] | None = None,
     provider_prefs: dict[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
-    id_holder, when given, receives the generation id under that key as
-    soon as it is known. A consumer that never reaches the done event
-    (a client disconnect cancels this generator at a yield) has no other
-    way to learn it, and a stopped run is exactly the run whose billing
-    has to be reconciled later. See _settle_generation_id.
+    holder, when given, receives facts about the exchange as soon as each
+    becomes known: the request record before the request is sent, then the
+    generation id and the serving provider. A consumer that never reaches
+    the done event (a client disconnect cancels this generator at a yield)
+    has no other way to learn any of them, and a run cut short is exactly
+    the run whose billing has to be reconciled later, on a row that should
+    still be able to say what it asked for. Writes only, by plain
+    assignment, so a reader during generator unwinding cannot await or
+    raise. See _settle_generation_id.
 
     Yields {"type": "delta", "text": chunk} per content delta, then
     exactly one {"type": "done", "result": {...}}. Like run_model, this
@@ -621,8 +625,13 @@ async def stream_model(
         "stream_options": {"include_usage": True},
     }
     # See run_model: the exact payload, auth excluded, recorded beside the
-    # dict that goes on the wire.
+    # dict that goes on the wire. Mirrored into the holder in the same
+    # breath, because this is knowable before the request is even sent and
+    # a run cut short mid-stream is exactly the row that should still be
+    # able to say what it asked for.
     result["request_json"] = _request_record(payload)
+    if holder is not None:
+        holder["request_json"] = result["request_json"]
     text_parts: list[str] = []
     saw_done = False
     start = time.perf_counter()
@@ -653,7 +662,7 @@ async def stream_model(
             # user stops seconds later never reaches a chunk that carries
             # an id, and it is the run that most needs one.
             _settle_generation_id(
-                result, response.headers.get(GENERATION_ID_HEADER), id_holder
+                result, response.headers.get(GENERATION_ID_HEADER), holder
             )
             if response.status_code != 200:
                 yield done(f"HTTP {response.status_code} from OpenRouter")
@@ -679,13 +688,17 @@ async def stream_model(
                 # no header. Every chunk repeats the same id, so the first
                 # one that carries it settles the field, and a disagreement
                 # with the header is logged rather than applied.
-                _settle_generation_id(result, chunk.get("id"), id_holder)
+                _settle_generation_id(result, chunk.get("id"), holder)
 
                 # The provider name rides every chunk, not just the last;
                 # the first one that carries it settles the field, like the
-                # generation id above.
+                # generation id above, and reaches the holder for the same
+                # reason: an aborted row that knows which host served it is
+                # a row whose routing confound is still visible.
                 if result["provider"] is None:
                     result["provider"] = _as_label(chunk.get("provider"))
+                    if holder is not None and result["provider"] is not None:
+                        holder["provider"] = result["provider"]
 
                 # Usage arrives on the final chunk (stream_options above
                 # asks for it) and carries the billed cost with it.

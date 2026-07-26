@@ -2267,6 +2267,19 @@ async def test_review_repro_aborted_stream_persists_its_generation_id(client):
     persisted = client.get(f"/runs/{entries[0]['id']}").json()["results"][0]
     assert persisted["error"] == "stream aborted before completion"
     assert persisted["generation_id"] == "gen-aborted-run"
+    # The reproducibility record too. models.py promises request_json is
+    # echoed "on failure paths, because knowing what a failed request asked
+    # for is exactly when this matters", and the disconnect path is a
+    # failure path. It used to be the one path that dropped it, on exactly
+    # the rows the reconcile pass is built to visit.
+    sent = json.loads(persisted["request_json"])
+    assert sent["model"] == "model/alpha"
+    assert sent["max_tokens"] == 16384
+    assert "authorization" not in json.dumps(sent).lower()
+    # A run that did not finish reports no finish reason: any value there
+    # would be a claim the server cannot make.
+    assert persisted["finish_reason"] is None
+    assert persisted["native_finish_reason"] is None
 
 
 @respx.mock

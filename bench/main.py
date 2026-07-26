@@ -1028,12 +1028,13 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         started = False
         acquired = False
         start = 0.0
-        # Injected state, not a protocol change: stream_model writes the
-        # generation id here the moment it knows one, so the disconnect
-        # path below can persist it. A stopped run never reaches the done
-        # event, and it is the run whose billing is least knowable locally
-        # and therefore most in need of an id to reconcile against.
-        id_holder: dict[str, Any] = {}
+        # Injected state, not a protocol change: stream_model writes each
+        # fact here the moment it knows it, so the disconnect path below can
+        # persist what the server saw. A run cut short never reaches the
+        # done event, and it is the run whose billing is least knowable
+        # locally, so it is the row most in need of an id to reconcile
+        # against and of a record of what it asked for.
+        holder: dict[str, Any] = {}
 
         def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
@@ -1100,7 +1101,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 request.model,
                 app.state.client,
                 max_tokens=max_tokens,
-                id_holder=id_holder,
+                holder=holder,
                 provider_prefs=app.state.provider_prefs,
             ):
                 if event["type"] != "done":
@@ -1168,14 +1169,21 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     "ttft_ms": first_delta_ms,
                     "max_tokens": max_tokens,
                     "position": request.position,
-                    # A plain dict lookup with a default: no await, no
+                    # Plain dict lookups with defaults: no await, no
                     # attribute access on a half-torn-down object, and no
-                    # way to raise during generator unwinding. Without it
-                    # the runs with the least knowable billing (stopped
+                    # way to raise during generator unwinding. Without them
+                    # the runs with the least knowable billing (cut short
                     # mid-stream, so cancellation may or may not have
                     # stopped the charge) were the only ones with no id to
-                    # reconcile against.
-                    "generation_id": id_holder.get("generation_id"),
+                    # reconcile against and no record of what was sent,
+                    # which made request_json absent from exactly the rows
+                    # the reconcile pass exists to visit.
+                    "generation_id": holder.get("generation_id"),
+                    "request_json": holder.get("request_json"),
+                    "provider": holder.get("provider"),
+                    # finish_reason and native_finish_reason stay absent on
+                    # purpose: this run did not finish, so any value here
+                    # would be a claim the server cannot make.
                 }
                 try:
                     prompt_id, group_id = resolve_links(

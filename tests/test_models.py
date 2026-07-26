@@ -1153,7 +1153,7 @@ async def test_review_repro_stream_holder_carries_the_id_with_no_chunk_seen(clie
     events = [
         e
         async for e in stream_model(
-            "hi", "deepseek/deepseek-chat", client, id_holder=holder
+            "hi", "deepseek/deepseek-chat", client, holder=holder
         )
     ]
 
