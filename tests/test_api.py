@@ -2270,24 +2270,48 @@ async def test_review_repro_aborted_stream_persists_its_generation_id(client):
 
 
 @respx.mock
-async def test_a_run_aborted_before_any_response_persists_no_invented_id(client):
-    """The holder only ever holds what the platform said. A run cancelled
-    while still queued reaches upstream never, and persists nothing at all,
-    which the queued-cancel invariant already requires."""
+async def test_a_run_cancelled_while_queued_persists_nothing(monkeypatch, tmp_path):
+    """A run cancelled while still waiting for a slot reaches upstream
+    never, holds no slot, and persists nothing. The holder cannot invent an
+    id for it because no response ever arrived.
+
+    This test used to call aclose() on a generator it had never advanced,
+    which runs none of the generator's body: no slot was awaited, no frame
+    was emitted, the finally never ran, and "nothing was persisted" held
+    because nothing had executed. It read as proof of the queued-cancel
+    invariant while proving only that Python does not start a generator you
+    do not iterate. Advancing to the queued frame first puts the generator
+    at a real suspension point inside events(), which is where a browser
+    Stop lands it.
+    """
     from bench.main import StreamCompareRequest, compare_stream
 
-    respx.post(OPENROUTER_URL).mock(
+    route = respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())
     )
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        # Hold the only slot by hand so the run must queue for it.
+        await c.app.state.upstream_semaphore.acquire()
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="queued cancel", model="model/alpha")
+        )
+        gen = resp.body_iterator
 
-    resp = await compare_stream(
-        StreamCompareRequest(prompt="queued", model="model/alpha")
-    )
-    gen = resp.body_iterator
-    # Closed before the started frame is consumed: nothing was ever sent.
-    await gen.aclose()
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "queued"
+        free_slots = c.app.state.upstream_semaphore._value
 
-    assert client.get("/runs").json()["runs"] == []
+        # GeneratorExit at the queued yield, the same mechanism a client
+        # disconnect triggers, with the generator suspended before it ever
+        # acquires a slot.
+        await gen.aclose()
+
+        assert route.call_count == 0, "a queued cancel must not reach upstream"
+        assert c.get("/runs").json()["runs"] == []
+        # The slot it never took is still free: an aborted queue wait must
+        # not release a slot it did not hold.
+        assert c.app.state.upstream_semaphore._value == free_slots
+        c.app.state.upstream_semaphore.release()
 
 
 # ---- G5: privacy routing.
