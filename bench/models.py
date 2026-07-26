@@ -158,7 +158,7 @@ def provider_preferences(data_policy: str) -> dict[str, Any]:
     """The provider block for one data policy, throughput sort included.
 
     Raises KeyError on an unknown policy, deliberately: the value is
-    validated once at boot (resolve_data_policy), and a typo reaching here
+    validated once at boot (bench.main._parse_data_policy), and a typo
     would otherwise silently send the standard payload while the run row
     claimed something stricter.
     """
@@ -316,9 +316,14 @@ def _flatten_content(content: object) -> str | None:
 def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     """Fold one usage object into a result, every field total.
 
-    OpenRouter attaches usage to every response (the final SSE chunk on a
-    stream), so this is the one place the authoritative numbers enter. It
-    is called with whatever the payload held: isinstance instead of a
+    OpenRouter attaches usage to every response, in the final SSE chunk on
+    a stream ("Full usage details are now always included automatically in
+    every response", openrouter.ai/docs/cookbook/administration/
+    usage-accounting, read 2026-07-25), so this is the one place the
+    authoritative numbers enter. Always is the vendor's word, not an
+    assumption this code makes: every field below still degrades when a
+    provider disagrees. It is called with whatever the payload held:
+    isinstance instead of a
     truthiness guard because a non-dict like "n/a" would pass truthiness
     and raise on .get, and neither client function may raise.
 
@@ -364,7 +369,12 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
 
 # OpenRouter returns the generation id in this response header on every
 # endpoint, available the moment the response starts and therefore before
-# any chunk has been read. That timing is the point: a run the user stops
+# any chunk has been read. Pinned against the vendor's own words rather
+# than memory, like DATA_POLICY_PREFS above: "fetch the generation record
+# via GET /api/v1/generation using the X-Generation-Id response header"
+# (openrouter.ai/docs/guides/features/router-metadata, read 2026-07-25).
+#
+# That timing is the point: a run the user stops
 # mid-stream is exactly the run whose billing is unknowable locally
 # (cancellation only stops billing on providers that support it), so it is
 # the run that most needs an id to reconcile against later, and reading the
@@ -551,12 +561,11 @@ async def run_model(
             f"empty response (finish_reason: {result['finish_reason'] or 'unknown'})"
         )
 
-    # Some providers omit usage. Report None rather than guessing counts.
-    # isinstance instead of `or {}`: a truthy non-dict like "n/a" would
-    # pass the truthiness guard and raise on .get, and this function must
-    # never raise.
-    # Some providers omit usage entirely; the counts and the billed cost
-    # then stay None rather than being guessed. See _ingest_usage.
+    # A missing or oddly shaped usage object leaves the counts and the
+    # billed cost None rather than guessed. The guard that makes that safe
+    # (isinstance, not truthiness, so a value like "n/a" cannot raise on
+    # .get) lives in _ingest_usage now, which is where its comment lives
+    # too.
     _ingest_usage(result, data.get("usage"))
     return result
 
@@ -620,8 +629,13 @@ async def stream_model(
         # the wire without this function knowing where policy lives.
         "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
         "stream": True,
-        # Without this the final chunk carries no usage block and token
-        # counts (and therefore cost) would be lost on streamed runs.
+        # A deprecated no-op, kept only because removing it would change
+        # the recorded request_json of every streamed run for no gain.
+        # OpenRouter's usage-accounting page states that this flag and
+        # usage.include "are deprecated and have no effect. Full usage
+        # details are now always included automatically in every response"
+        # (read 2026-07-25). The usage block arrives because the platform
+        # sends it, not because this asks.
         "stream_options": {"include_usage": True},
     }
     # See run_model: the exact payload, auth excluded, recorded beside the

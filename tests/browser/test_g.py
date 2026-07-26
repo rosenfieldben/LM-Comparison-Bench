@@ -310,7 +310,14 @@ def test_review_repro_a_zero_billed_session_is_not_reported_as_unpriced_idle(ben
     """Closing review: the bar keyed its idle display on the amount, so a
     session priced at exactly zero (free models are real) claimed "nothing
     priced yet" and wore the estimate tilde over a figure the platform had
-    confirmed. Driven through the accounting path the stream client uses.
+    confirmed.
+
+    This pins the render rule only. It sets the counter directly rather
+    than earning it through a run, because the stub has no free model to
+    earn it with, so the increment in stream.js that feeds this counter is
+    NOT covered here. Saying so is the point: the docstring used to claim
+    this was driven through the stream client's accounting path, which it
+    never was.
     """
     page = bench(["stub/fast"])
     spend = page.get_by_test_id("stat-spend")

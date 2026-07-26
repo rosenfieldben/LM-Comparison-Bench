@@ -1213,15 +1213,27 @@ async def test_a_disagreeing_chunk_id_is_logged_not_applied(client, caplog):
 
 
 @respx.mock
-async def test_a_junk_generation_id_header_is_absence_not_a_value(client):
+async def test_an_empty_generation_id_header_is_absence_not_a_value(client):
+    """An empty header is absence, not a value: _as_label's empty-string
+    rule is what keeps it from settling the field and locking out the body
+    id that follows. The version of this test that sent no header at all
+    could not tell the two apart, and duplicated the fallback test above
+    it.
+
+    Only the empty string, deliberately. A whitespace-only header IS
+    currently taken as a value, because _as_label tests truthiness rather
+    than stripping. That is a behaviour question rather than a coverage
+    one, so it is recorded rather than asserted here: a test claiming a
+    rule the code does not have would be the same defect this replaces.
+    """
     respx.post(OPENROUTER_URL).mock(
-        return_value=httpx.Response(200, json=FIXTURE, headers={})
+        return_value=httpx.Response(
+            200, json=FIXTURE, headers={GENERATION_ID_HEADER: ""}
+        )
     )
 
     result = await run_model("hi", "deepseek/deepseek-chat", client)
 
-    # No header at all: the body id stands, and nothing crashed reaching
-    # for a header that was not sent.
     assert result["generation_id"] == FIXTURE["id"]
 
 

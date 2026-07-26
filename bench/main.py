@@ -381,11 +381,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Per-boot spend ceiling, validated here next to the key check and
     # before any resource is allocated so a misconfigured limit fails fast
     # and loud like a missing key. Unset means no limit. The figure tracked
-    # is estimated spend (catalog prices times reported tokens), the same
-    # numbers the cards show, accumulated as a plain float: one event loop
-    # makes that safe without a lock. Results the session cannot price
-    # (offline catalog, missing usage) never move the counter, so the
-    # ceiling bounds known estimated spend, not a billed total.
+    # is what each result contributes through ceiling_cost: the platform's
+    # billed charge when it reported one, the catalog estimate otherwise,
+    # the same numbers the cards show. Accumulated as a plain float, which
+    # one event loop makes safe without a lock. Only results unpriced by
+    # BOTH routes leave the counter untouched, so an offline catalog no
+    # longer means an uncounted run: a usage object still prices it.
     app.state.spend_limit_usd = _parse_spend_limit(
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
@@ -835,9 +836,10 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "generation_id": None,
         "finish_reason": None,
         # Nothing was charged because nothing was sent. Present and None
-        # rather than absent so this stays a superset of the shape both
-        # client functions produce, which is what lets one response model
-        # and one persistence path accept either.
+        # rather than absent so a reader of this dict sees the same fields
+        # a real result carries. request_json is the deliberate exception:
+        # both client functions always set it, and here there is no payload
+        # to record because none was built.
         "billed_cost_usd": None,
         "reasoning_tokens": None,
         "cached_tokens": None,

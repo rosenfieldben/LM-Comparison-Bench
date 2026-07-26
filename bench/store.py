@@ -578,11 +578,14 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     ).fetchone()
     if run is None:
         return None
-    # Ordered by position when the row carries one, falling back to
-    # insertion order for legacy rows. The COALESCE keeps a mixed run
-    # (legacy rows beside new ones) deterministic instead of interleaving
-    # NULLs arbitrarily: positioned rows sort where they were placed, and
-    # unpositioned ones keep the order they were written in.
+    # Ordered by position when the rows carry one, falling back to
+    # insertion order when they do not. A run's results are written in a
+    # single executemany from a single code path, so in practice every row
+    # of a run is positioned or none is, and each case orders exactly as
+    # intended. The COALESCE only has to keep a hypothetical mix
+    # deterministic, which it does, though not gracefully: it compares a
+    # zero-based column index against a rowid, so positioned rows would all
+    # sort ahead of unpositioned ones rather than interleaving by place.
     results = conn.execute(
         """SELECT model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,

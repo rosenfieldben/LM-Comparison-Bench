@@ -203,9 +203,9 @@
           budget: budget,
           // Which column this run occupies, so a replay can rebuild the
           // layout from the rows instead of from the current chip order,
-          // which drifts as the lineup is edited. Omitted (undefined
-          // drops out of JSON) for a rerun, which reuses the position the
-          // retried run already recorded.
+          // which drifts as the lineup is edited. A rerun re-sends the
+          // retried attempt's position (render.js passes it back) so the
+          // second sample lands in the same column as the first.
           position: position,
         }),
         signal: controller.signal,

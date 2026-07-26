@@ -49,9 +49,11 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
-Every response carries a `usage` object reporting what OpenRouter
+OpenRouter attaches a `usage` object to every response reporting what it
 actually charged, and that billed figure is the number a card and the
-session total show, without a tilde. Beside it the bench keeps its own
+session total show, without a tilde. The bench still degrades gracefully
+if a provider disagrees, since "always" is the platform's promise rather
+than something this code can enforce. Beside it the bench keeps its own
 estimate, computed from OpenRouter's price list fetched once at startup:
 catalog prices times the token counts providers report. The estimate is
 always marked with a tilde and stays reachable in the cost cell's
