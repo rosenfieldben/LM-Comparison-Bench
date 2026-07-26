@@ -626,13 +626,26 @@ def results_awaiting_reconciliation(
     and never a billed cost, since no usage object ever arrived, and they
     are the rows whose billing is least knowable without asking.
 
+    "No billed cost yet" is the money rule, not IS NULL. The two are not
+    the same predicate, and the gap between them was a trap: a negative or
+    non-numeric charge is NOT NULL to SQL while _repaired hands every
+    reader None for it, so such a row displayed as unpriced forever AND was
+    invisible to the one pass that could have fixed it. The three clauses
+    below are as_money expressed in SQL, so a value no reader will trust is
+    a value this list still offers to replace. NaN needs no clause: SQLite
+    has no NaN and binds one as NULL, which the first clause already
+    catches.
+
     Ordered by id so a run interrupted partway through resumes in a
     predictable place, and so a --limit run walks the oldest rows first.
     """
     sql = (
         "SELECT r.id, r.run_id, r.model, r.generation_id, r.cost_usd, r.error "
         "FROM results r "
-        "WHERE r.generation_id IS NOT NULL AND r.billed_cost_usd IS NULL "
+        "WHERE r.generation_id IS NOT NULL "
+        "AND (r.billed_cost_usd IS NULL "
+        "     OR typeof(r.billed_cost_usd) NOT IN ('real', 'integer') "
+        "     OR r.billed_cost_usd < 0) "
         "ORDER BY r.id"
     )
     params: tuple[Any, ...] = ()
@@ -662,8 +675,10 @@ def apply_reconciliation(
     COALESCE on the three text columns so a field the generation endpoint
     does not return cannot erase one captured in-band: absence there means
     "not reported", never "known to be nothing". billed_cost_usd is
-    assigned outright because the work list only contains rows where it is
-    already NULL, so there is nothing to overwrite.
+    assigned outright because the work list only offers rows whose stored
+    charge no reader would trust anyway (results_awaiting_reconciliation),
+    so overwriting it with None loses nothing and replaces a poisoned value
+    with an honest absence.
     """
     with conn:
         conn.execute(

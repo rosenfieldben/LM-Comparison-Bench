@@ -319,3 +319,52 @@ def test_the_script_refuses_to_run_without_a_key(monkeypatch, capsys):
 
     assert main([]) == 2
     assert "OPENROUTER_API_KEY is not set" in capsys.readouterr().err
+
+
+# ---- Phase G.1: the work list is the money rule, not IS NULL.
+
+
+@pytest.mark.parametrize(
+    ("stored", "label"),
+    [(-1.5, "negative"), ("n/a", "non-numeric"), (None, "absent")],
+)
+@respx.mock
+async def test_review_repro_a_charge_no_reader_trusts_stays_reconcilable(
+    conn, stored, label
+):
+    """Adversarial review: the work list asked SQL `billed_cost_usd IS
+    NULL` while every reader goes through as_money. A negative or
+    non-numeric charge is NOT NULL to SQL and None to _repaired, so the row
+    displayed as unpriced forever and was invisible to the only pass that
+    could have replaced it. Two predicates for one question, disagreeing.
+    """
+    respx.get(GENERATION_URL).respond(json=audit_body("gen-a"))
+    run_id = seed(conn, [completed_result("model/a", "gen-a", billed_cost_usd=stored)])
+    # Whatever SQL holds, the reader sees nothing usable.
+    assert row_of(conn, run_id)["billed_cost_usd"] is None, label
+
+    assert [
+        p["generation_id"] for p in store.results_awaiting_reconciliation(conn)
+    ] == ["gen-a"], label
+
+    async with httpx.AsyncClient(trust_env=False) as client:
+        counts = await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
+
+    assert counts["written"] == 1, label
+    assert row_of(conn, run_id)["billed_cost_usd"] == 0.0015, label
+    # And the poisoned value is gone from the column, not merely hidden.
+    raw = conn.execute(
+        "SELECT billed_cost_usd FROM results WHERE run_id = ?", (run_id,)
+    ).fetchone()["billed_cost_usd"]
+    assert raw == 0.0015, label
+
+
+@respx.mock
+async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
+    """The guard against over-correcting: free models are real, and a
+    confirmed zero is a charge, not an absence. It must stay out of the
+    work list or the pass would re-ask about it forever."""
+    respx.get(GENERATION_URL).respond(json=audit_body("gen-free"))
+    seed(conn, [completed_result("model/free", "gen-free", billed_cost_usd=0.0)])
+
+    assert store.results_awaiting_reconciliation(conn) == []
