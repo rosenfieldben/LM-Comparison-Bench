@@ -350,21 +350,26 @@ def test_review_repro_superseded_run_after_started_joins_unpriced(bench):
     path that aborted it differs.
 
     Driven through the real epoch machinery: newViewEpoch is what a History
-    click and a second Run both call, and stub/slow holds two seconds of
-    true wire silence after admission, which is exactly the window.
+    click and a second Run both call. stub/hush opens the stream and then
+    says nothing, so the window between the started frame and the first
+    delta is held open indefinitely rather than for a couple of seconds.
+
+    The precondition is the elapsed ticker reaching one second, which is an
+    auto-retrying assertion rather than a sleep and, more to the point, is
+    a state only reachable after the run is genuinely in flight. Waiting on
+    the status word instead was a bug: makeColumn sets it to "thinking" at
+    card creation, so it matched before startRun had even finished awaiting
+    the group POST, and the run had not begun.
     """
-    page = bench(["stub/slow"])
+    page = bench(["stub/hush"])
     check_chip(page, 0)
     start_run(page, "g1 superseded after started")
 
     card = cards(page).first
-    # The started frame has been consumed (the label leaves "queued" for
-    # "thinking") and no delta has landed yet. An auto-retrying assertion,
-    # not a sleep: it settles the state supersession acts on.
-    expect(status_of(card)).to_contain_text("thinking", timeout=DONE_TIMEOUT)
+    expect(status_of(card)).to_contain_text("· 1s", timeout=DONE_TIMEOUT)
     assert (
         card.get_by_test_id("card-body").inner_text().strip() == "awaiting first token"
-    ), "precondition: no delta has arrived yet"
+    ), "precondition: the run is in flight and no delta has arrived"
 
     page.evaluate("() => { BenchState.newViewEpoch(); }")
 

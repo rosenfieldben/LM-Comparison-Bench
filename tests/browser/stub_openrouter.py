@@ -254,6 +254,18 @@ def build_app() -> Starlette:
                 yield b"data: [DONE]\n\n"
 
             return gen()
+        if model == "stub/hush":
+            # Opens the stream and then says nothing, ever. The bench emits
+            # its started frame before calling upstream, so this is the
+            # window between admission and the first delta, held open
+            # indefinitely. The stall personality cannot serve that window
+            # because it streams text first, and stub/slow only holds it for
+            # two seconds, which is a race rather than a window.
+            async def gen():
+                await asyncio.sleep(3600)
+                yield b""
+
+            return gen()
         if model.startswith("stub/stall"):
             # Streams a little text, then stalls indefinitely with no
             # [DONE] and no finish reason: the window a user Stop must be
