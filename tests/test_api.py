@@ -1,4 +1,5 @@
 import json
+import math
 from pathlib import Path
 
 import httpx
@@ -7,8 +8,8 @@ import respx
 from fastapi.testclient import TestClient
 
 from bench import main
-from bench.main import app
-from bench.models import OPENROUTER_URL
+from bench.main import MAX_POSITION, app
+from bench.models import OPENROUTER_URL, provider_preferences
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -838,7 +839,7 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
     monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
     with TestClient(app, base_url="http://localhost") as c:
         body = c.get("/models").json()
-        assert body == {"models": [], "fetched": False}
+        assert body == {"models": [], "fetched": False, "data_policy": "standard"}
 
         with respx.mock:
             respx.post(OPENROUTER_URL).respond(json=FIXTURE)
@@ -1962,3 +1963,515 @@ def test_fetched_catalog_budgets_are_unchanged(client):
     )
     assert seen["model/capped"] == 32000
     assert seen["model/alpha"] == BUDGET_EXTENDED
+
+
+# ---- G1: the experiment record and provenance.
+
+
+@respx.mock
+def test_group_declares_prompt_and_lineup_before_any_member(client):
+    """The group row is created before any upstream call, so recording the
+    prompt and lineup there makes it the experiment record and fixes the
+    group's prompt ahead of its first member."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post(
+        "/groups",
+        json={"prompt": "declared", "models": ["model/alpha", "model/bare"]},
+    ).json()["id"]
+
+    # A different prompt is refused with no member present at all, which
+    # the derive-from-first-member rule could never do.
+    clash = client.post(
+        "/compare",
+        json={"prompt": "different", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert clash.status_code == 409
+    assert route.call_count == 0
+    # The declared prompt passes.
+    ok = client.post(
+        "/compare",
+        json={"prompt": "declared", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert ok.status_code == 200
+
+
+def test_empty_group_body_still_accepted(client):
+    """The empty JSON object is load-bearing for the CORS preflight
+    defense and is what every pre-G client sends; it must stay valid."""
+    assert client.post("/groups", json={}).status_code == 201
+
+
+@respx.mock
+def test_run_rows_carry_provenance_and_position(client):
+    """Every run row records which build produced it and how old its price
+    catalog was; every result records the column it occupied and the exact
+    payload that was sent."""
+
+    def route(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        return httpx.Response(200, json=response_for(body["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    resp = client.post(
+        "/compare",
+        json={"prompt": "provenance", "models": ["model/alpha", "model/bare"]},
+    )
+    run_id = resp.json()["run_id"]
+    detail = client.get(f"/runs/{run_id}").json()
+
+    # catalog_snapshot_at is set because the test catalog reports fetched.
+    assert detail["catalog_snapshot_at"] is not None
+    # app_sha is best-effort: a string when git answers, None otherwise,
+    # and never a reason to fail a run.
+    assert detail["app_sha"] is None or isinstance(detail["app_sha"], str)
+    # Array order is the declared layout for the batch endpoint.
+    assert [r["position"] for r in detail["results"]] == [0, 1]
+    assert [r["model"] for r in detail["results"]] == ["model/alpha", "model/bare"]
+    # The reproducibility record is the payload actually sent, and it
+    # carries no authorization: auth lives in the client's headers.
+    sent = json.loads(detail["results"][0]["request_json"])
+    assert sent["model"] == "model/alpha"
+    assert sent["max_tokens"] == BUDGET_STANDARD
+    assert "authorization" not in json.dumps(sent).lower()
+
+
+@respx.mock
+def test_stream_records_declared_position(client):
+    """The frontend fans out one request per model, so only the client
+    knows the layout; the declared position is what gets persisted."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    frames = stream_events(
+        client, {"prompt": "positioned", "model": "model/alpha", "position": 3}
+    )
+    run_id = next(f for f in frames if f["type"] == "done")["run_id"]
+    detail = client.get(f"/runs/{run_id}").json()
+    assert detail["results"][0]["position"] == 3
+
+
+def test_position_is_bounded_without_capping_wide_lineups(client):
+    """position is bounded at the boundary rather than trusted into the
+    schema, but the bound is not the batch endpoint's five-model cap: the
+    streaming path is one request per model and the browser lineup has no
+    size limit, so a seven-model comparison must still declare positions
+    five and six."""
+    ok = client.post(
+        "/compare/stream",
+        json={"prompt": "hi", "model": "model/alpha", "position": 6},
+    )
+    assert ok.status_code == 200
+    ok.read()
+    for bad in (-1, MAX_POSITION + 1):
+        resp = client.post(
+            "/compare/stream",
+            json={"prompt": "hi", "model": "model/alpha", "position": bad},
+        )
+        assert resp.status_code == 422, bad
+
+
+# ---- G2: billed truth, read in-band.
+
+BILLED_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8,
+    "cost": 0.5,
+    "completion_tokens_details": {"reasoning_tokens": 512},
+    "prompt_tokens_details": {"cached_tokens": 9},
+}
+
+
+def billed_response(model: str) -> dict:
+    body = json.loads(json.dumps(FIXTURE))
+    body["model"] = model
+    body["provider"] = "Fireworks"
+    body["usage"] = BILLED_USAGE
+    body["choices"][0]["native_finish_reason"] = "STOP_SEQUENCE"
+    return body
+
+
+def billed_stream():
+    return ChunkStream(
+        [
+            sse({"provider": "Together", "choices": [{"delta": {"content": "Hi"}}]}),
+            sse(
+                {
+                    "choices": [
+                        {
+                            "delta": {},
+                            "finish_reason": "stop",
+                            "native_finish_reason": "eos",
+                        }
+                    ]
+                }
+            ),
+            sse({"choices": [], "usage": BILLED_USAGE}),
+            DONE_MARKER,
+        ]
+    )
+
+
+@respx.mock
+def test_billed_truth_round_trips_into_history(client):
+    """The authoritative numbers have to survive the write and the read,
+    or the card is the only place they ever existed."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=billed_response(json.loads(request.content)["model"])
+        )
+    )
+
+    body = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+    assert body.status_code == 200
+    live = body.json()["results"][0]
+    assert live["billed_cost_usd"] == 0.5
+    assert live["provider"] == "Fireworks"
+
+    detail = client.get(f"/runs/{body.json()['run_id']}").json()
+    stored = detail["results"][0]
+    assert stored["billed_cost_usd"] == 0.5
+    assert stored["reasoning_tokens"] == 512
+    assert stored["cached_tokens"] == 9
+    assert stored["provider"] == "Fireworks"
+    assert stored["native_finish_reason"] == "STOP_SEQUENCE"
+    # The estimate keeps its own column and its own meaning: 13 prompt
+    # tokens at 1e-6 plus 8 completion tokens at 2e-6.
+    assert stored["cost_usd"] == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_billed_truth_round_trips_into_history_from_the_stream(client):
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=billed_stream())
+    )
+
+    frames = stream_events(client, {"prompt": "hi", "model": "model/alpha"})
+    done = next(f for f in frames if f["type"] == "done")
+    assert done["result"]["billed_cost_usd"] == 0.5
+    assert done["result"]["provider"] == "Together"
+
+    stored = client.get(f"/runs/{done['run_id']}").json()["results"][0]
+    assert stored["billed_cost_usd"] == 0.5
+    assert stored["reasoning_tokens"] == 512
+    assert stored["provider"] == "Together"
+    assert stored["native_finish_reason"] == "eos"
+
+
+@respx.mock
+def test_ceiling_counts_billed_cost_and_never_the_estimate_too(monkeypatch, tmp_path):
+    """The ceiling is advisory, so it advises from the real charge when one
+    exists. The other half matters as much: a result carrying both figures
+    contributes exactly one of them, or a single run would be charged to
+    the ceiling twice."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=billed_response(json.loads(request.content)["model"])
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        assert c.app.state.accumulated_spend_usd == 0.0
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        # The billed 0.50 alone: not the 2.9e-5 estimate, and not the sum.
+        assert c.app.state.accumulated_spend_usd == 0.5
+
+
+@respx.mock
+def test_ceiling_falls_back_to_the_estimate_when_nothing_was_billed(
+    monkeypatch, tmp_path
+):
+    """Removing the estimate from the ceiling would leave every provider
+    that omits cost invisible to it."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "hello")
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2.9e-5)
+
+
+@respx.mock
+def test_poisoned_billed_cost_never_reaches_the_accumulator(monkeypatch, tmp_path):
+    """The money rule end to end, through the real endpoint. A NaN summed
+    into accumulated spend makes every ceiling comparison false and
+    silently disables the ceiling for the life of the process; the run must
+    still succeed, and the ceiling must still work afterwards.
+
+    Not named as a tombstone, because it does not fail on naive ingestion:
+    record_spend's own finiteness guard (F.1) catches a NaN that got past
+    as_money, and Pydantic serializes a NaN float to null on the way out.
+    Those are the belts, and this locks that all of them together hold. The
+    tombstones for as_money itself are in test_models.py, where the field
+    value is observable before either belt applies."""
+    # Encoded by hand: json.dumps writes a bare NaN token by default, which
+    # httpx's json= helper refuses to produce and which is exactly what a
+    # misbehaving provider puts on the wire.
+    body = json.dumps({**FIXTURE, "usage": {**FIXTURE["usage"], "cost": float("nan")}})
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200, content=body, headers={"content-type": "application/json"}
+        )
+    )
+    with spend_client(monkeypatch, tmp_path, limit=10.0) as c:
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 200
+        result = resp.json()["results"][0]
+        assert result["error"] is None
+        assert result["billed_cost_usd"] is None
+        total = c.app.state.accumulated_spend_usd
+        assert math.isfinite(total)
+        # The ceiling still answers, which a NaN total would have made
+        # permanently false.
+        c.app.state.accumulated_spend_usd = 20.0
+        assert main.spend_ceiling_reached() is True
+        c.app.state.accumulated_spend_usd = total
+
+
+# ---- G3: the generation id survives everything, including aborts.
+
+
+@respx.mock
+async def test_review_repro_aborted_stream_persists_its_generation_id(client):
+    """A run stopped mid-stream is the run whose billing is least knowable
+    locally (stream cancellation only stops the charge on providers that
+    support it, and throughput routing picks the provider per request), so
+    it is the run that most needs an id to reconcile against later. The id
+    used to be read out of a chunk and dropped on the way to the disconnect
+    path, which left exactly those runs unauditable.
+    """
+    from bench.main import StreamCompareRequest, compare_stream
+    from bench.models import GENERATION_ID_HEADER
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            headers={GENERATION_ID_HEADER: "gen-aborted-run"},
+            stream=alpha_stream(),
+        )
+    )
+
+    resp = await compare_stream(
+        StreamCompareRequest(prompt="abort me", model="model/alpha")
+    )
+    gen = resp.body_iterator
+    assert (
+        json.loads((await gen.__anext__()).removeprefix("data: "))["type"] == "started"
+    )
+    assert json.loads((await gen.__anext__()).removeprefix("data: "))["type"] == "delta"
+    # aclose() raises GeneratorExit at the yield, the same mechanism a
+    # Starlette client disconnect triggers.
+    await gen.aclose()
+
+    entries = client.get("/runs").json()["runs"]
+    persisted = client.get(f"/runs/{entries[0]['id']}").json()["results"][0]
+    assert persisted["error"] == "stream aborted before completion"
+    assert persisted["generation_id"] == "gen-aborted-run"
+    # The reproducibility record too. models.py promises request_json is
+    # echoed "on failure paths, because knowing what a failed request asked
+    # for is exactly when this matters", and the disconnect path is a
+    # failure path. It used to be the one path that dropped it, on exactly
+    # the rows the reconcile pass is built to visit.
+    sent = json.loads(persisted["request_json"])
+    assert sent["model"] == "model/alpha"
+    assert sent["max_tokens"] == 16384
+    assert "authorization" not in json.dumps(sent).lower()
+    # A run that did not finish reports no finish reason: any value there
+    # would be a claim the server cannot make.
+    assert persisted["finish_reason"] is None
+    assert persisted["native_finish_reason"] is None
+
+
+@respx.mock
+async def test_a_run_cancelled_while_queued_persists_nothing(monkeypatch, tmp_path):
+    """A run cancelled while still waiting for a slot reaches upstream
+    never, holds no slot, and persists nothing. The holder cannot invent an
+    id for it because no response ever arrived.
+
+    This test used to call aclose() on a generator it had never advanced,
+    which runs none of the generator's body: no slot was awaited, no frame
+    was emitted, the finally never ran, and "nothing was persisted" held
+    because nothing had executed. It read as proof of the queued-cancel
+    invariant while proving only that Python does not start a generator you
+    do not iterate. Advancing to the queued frame first puts the generator
+    at a real suspension point inside events(), which is where a browser
+    Stop lands it.
+    """
+    from bench.main import StreamCompareRequest, compare_stream
+
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with make_client(monkeypatch, tmp_path, 1) as c:
+        # Hold the only slot by hand so the run must queue for it.
+        await c.app.state.upstream_semaphore.acquire()
+        resp = await compare_stream(
+            StreamCompareRequest(prompt="queued cancel", model="model/alpha")
+        )
+        gen = resp.body_iterator
+
+        first = json.loads((await gen.__anext__()).removeprefix("data: "))
+        assert first["type"] == "queued"
+        free_slots = c.app.state.upstream_semaphore._value
+
+        # GeneratorExit at the queued yield, the same mechanism a client
+        # disconnect triggers, with the generator suspended before it ever
+        # acquires a slot.
+        await gen.aclose()
+
+        assert route.call_count == 0, "a queued cancel must not reach upstream"
+        assert c.get("/runs").json()["runs"] == []
+        # The slot it never took is still free: an aborted queue wait must
+        # not release a slot it did not hold.
+        assert c.app.state.upstream_semaphore._value == free_slots
+        c.app.state.upstream_semaphore.release()
+
+
+# ---- G5: privacy routing.
+
+
+def policy_client(monkeypatch, tmp_path, policy=None):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    if policy is None:
+        monkeypatch.delenv("BENCH_DATA_POLICY", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_DATA_POLICY", policy)
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+@pytest.mark.parametrize("bad", ["strict", "DENY ZDR", "true", "none"])
+def test_an_unknown_data_policy_fails_boot(monkeypatch, tmp_path, bad):
+    """A typo must not fall back to standard. The fallback would send
+    prompts to training-eligible providers while the operator believed
+    otherwise, and nothing after the fact would show it."""
+    with (
+        pytest.raises(RuntimeError, match="BENCH_DATA_POLICY"),
+        policy_client(monkeypatch, tmp_path, bad),
+    ):
+        pass
+
+
+@pytest.mark.parametrize(
+    ("env", "expected"),
+    [(None, "standard"), ("standard", "standard"), ("deny", "deny"), ("zdr", "zdr")],
+)
+def test_the_boot_policy_is_reported_to_the_page(monkeypatch, tmp_path, env, expected):
+    with policy_client(monkeypatch, tmp_path, env) as c:
+        assert c.get("/models").json()["data_policy"] == expected
+
+
+@pytest.mark.parametrize("policy", ["standard", "deny", "zdr"])
+@respx.mock
+def test_the_run_row_records_the_policy_that_was_actually_sent(
+    monkeypatch, tmp_path, policy
+):
+    """The column has to match the wire, not the intent: a row claiming a
+    policy the payload did not carry is worse than no column at all."""
+    route = respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "hi")
+        )
+    )
+    with policy_client(monkeypatch, tmp_path, policy) as c:
+        body = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        run_id = body.json()["run_id"]
+
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["provider"] == provider_preferences(policy)
+
+        row = c.app.state.db.execute(
+            "SELECT data_policy FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert row["data_policy"] == policy
+
+
+@respx.mock
+def test_the_streaming_path_sends_the_policy_too(monkeypatch, tmp_path):
+    """Two endpoints, one policy. The streaming path is the one the browser
+    uses, so a policy that only reached /compare would be inert in
+    practice."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with policy_client(monkeypatch, tmp_path, "zdr") as c:
+        frames = stream_events(c, {"prompt": "hi", "model": "model/alpha"})
+        run_id = next(f for f in frames if f["type"] == "done")["run_id"]
+
+        sent = json.loads(route.calls[0].request.content)
+        assert sent["provider"] == provider_preferences("zdr")
+        row = c.app.state.db.execute(
+            "SELECT data_policy FROM runs WHERE id = ?", (run_id,)
+        ).fetchone()
+        assert row["data_policy"] == "zdr"
+
+
+# ---- Phase G closing review.
+
+
+def test_review_repro_wide_lineup_still_gets_a_group(client):
+    """Closing review: the group POST borrowed CompareRequest's five-model
+    cap, so a comparison wider than five was rejected. A failed group
+    create degrades to ungrouped runs rather than erroring, so those
+    comparisons silently lost their single history entry, which is exactly
+    what the group row exists to provide."""
+    models = [f"model/m{i}" for i in range(7)]
+
+    resp = client.post("/groups", json={"prompt": "wide", "models": models})
+
+    assert resp.status_code == 201
+    group_id = resp.json()["id"]
+    row = client.app.state.db.execute(
+        "SELECT models_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    assert json.loads(row["models_json"]) == models
+
+
+def test_the_group_body_is_still_bounded(client):
+    """Bounded, just not at five. An absurd body is still refused at the
+    boundary rather than written into the schema."""
+    huge = [f"model/m{i}" for i in range(MAX_POSITION + 2)]
+    resp = client.post("/groups", json={"prompt": "absurd", "models": huge})
+    assert resp.status_code == 422
+
+
+@respx.mock
+def test_poisoned_provenance_never_breaks_a_paid_result(client):
+    """Closing review sweep: every new capture step, poisoned in turn. The
+    money was already spent by the time any of these are read, and the
+    post-spend invariant forbids turning that into a failure, so each one
+    must degrade to None and leave the response successful."""
+    poisoned = json.loads(json.dumps(FIXTURE))
+    poisoned["provider"] = {"name": "Fireworks"}
+    poisoned["choices"][0]["native_finish_reason"] = 7
+    poisoned["usage"] = {
+        "prompt_tokens": 13,
+        "completion_tokens": 8,
+        "completion_tokens_details": "n/a",
+        "prompt_tokens_details": {"cached_tokens": "many"},
+    }
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            content=json.dumps(poisoned),
+            headers={"content-type": "application/json"},
+        )
+    )
+
+    resp = client.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+
+    assert resp.status_code == 200
+    result = resp.json()["results"][0]
+    assert result["error"] is None
+    assert result["response_text"] is not None
+    for field in ("provider", "native_finish_reason", "reasoning_tokens"):
+        assert result[field] is None, field
+    # And the row that was written says the same thing on the way back.
+    stored = client.get(f"/runs/{resp.json()['run_id']}").json()["results"][0]
+    assert stored["provider"] is None
+    assert stored["native_finish_reason"] is None

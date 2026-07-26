@@ -282,6 +282,10 @@
     } catch (err) {
       catalog = { fetched: false, models: [] };
     }
+    // The data policy rides this response. A failed catalog load leaves it
+    // undefined, which setDataPolicy treats as standard: a badge is a claim
+    // about where prompts go, and a failed fetch is not evidence for one.
+    BS.setDataPolicy(catalog.data_policy);
     // Pricing just arrived (or didn't): refresh the run estimate.
     updateRunState();
   }

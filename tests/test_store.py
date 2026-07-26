@@ -1,4 +1,6 @@
+import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -682,3 +684,171 @@ def test_review_repro_foreign_authority_creates_no_file(tmp_path):
     assert not target.exists()
     # The authorities sqlite does accept still resolve to the file.
     assert store._disk_path(f"file://localhost{target}") == str(target)
+
+
+# ---- Phase G: the migration onto a real pre-G database.
+
+
+PRE_G_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_g_schema.sql").read_text()
+
+
+def test_migration_onto_pre_g_database_is_additive_and_idempotent(tmp_path):
+    """Phase G lifted the schema freeze, so the migration has to be proven
+    against the schema that actually shipped, not against a hand-written
+    approximation of it. The fixture is the pre-G SCHEMA string verbatim.
+
+    Three things must hold: the migration runs on a populated legacy
+    database, a second connect is a no-op rather than an error, and every
+    legacy row still reads back through the normal paths with each new
+    column None.
+    """
+    db_path = tmp_path / "pre_g.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_G_SCHEMA)
+    legacy.execute(
+        "INSERT INTO groups (id, created_at) VALUES (1, '2026-01-01T00:00:00+00:00')"
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-01-01T00:00:00+00:00')"""
+    )
+    # A completed row and an aborted one: the aborted shape is the one the
+    # disconnect path writes, and it is exactly the row a reconcile would
+    # later want to fill in, so it must survive the migration intact.
+    legacy.execute(
+        """INSERT INTO results
+           (run_id, model, response_text, latency_ms, prompt_tokens,
+            completion_tokens, error, cost_usd, ttft_ms, max_tokens,
+            generation_id, finish_reason)
+           VALUES (1, 'legacy/model', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 5.5, 16384, 'gen-legacy', 'stop')"""
+    )
+    legacy.execute(
+        """INSERT INTO results
+           (run_id, model, response_text, latency_ms, prompt_tokens,
+            completion_tokens, error, cost_usd, ttft_ms, max_tokens,
+            generation_id, finish_reason)
+           VALUES (1, 'legacy/aborted', 'partial', 30.0, NULL, NULL,
+                   'stream aborted before completion', NULL, 7.5, 16384,
+                   NULL, NULL)"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        run = store.get_run(conn, 1)
+        assert run is not None
+        # Legacy run-level provenance is absent, not invented.
+        for column in ("app_sha", "catalog_snapshot_at", "data_policy"):
+            assert run[column] is None, column
+        assert [r["model"] for r in run["results"]] == [
+            "legacy/model",
+            "legacy/aborted",
+        ]
+        for result in run["results"]:
+            for column in (
+                "position",
+                "request_json",
+                "billed_cost_usd",
+                "reasoning_tokens",
+                "cached_tokens",
+                "provider",
+                "quantization",
+                "native_finish_reason",
+            ):
+                assert result[column] is None, (result["model"], column)
+        # The pre-existing values are untouched by the migration.
+        assert run["results"][0]["cost_usd"] == pytest.approx(2.9e-05)
+        assert run["results"][0]["generation_id"] == "gen-legacy"
+        assert run["results"][1]["error"] == "stream aborted before completion"
+        # Group and history reads work too, and a legacy group has no
+        # declared prompt, so group_prompt falls back to its first member.
+        assert store.group_prompt(conn, 1) == "legacy prompt"
+        group = store.get_group(conn, 1)
+        assert group is not None and len(group["runs"]) == 1
+        assert len(store.list_runs(conn)) == 1
+    finally:
+        conn.close()
+
+    # Idempotent: connecting again must not attempt the ALTERs a second
+    # time, and must serve the same rows.
+    again = store.connect(str(db_path))
+    try:
+        run = again.execute("SELECT COUNT(*) AS n FROM results").fetchone()
+        assert run["n"] == 2
+        cols = {r[1] for r in again.execute("PRAGMA table_info(results)")}
+        assert "billed_cost_usd" in cols and "position" in cols
+    finally:
+        again.close()
+
+
+def test_new_group_declares_its_prompt_before_any_member(db):
+    """The group row is created before any upstream call, so recording the
+    prompt there fixes it ahead of the first member. That is what dissolves
+    the concurrent-first-member race for new groups: two simultaneous first
+    members are both checked against a value that already exists."""
+    gid = store.create_group(db, "declared prompt", ["a/one", "b/two"])
+    # Established with no runs at all, which the derive-from-member
+    # fallback could never do.
+    assert store.group_prompt(db, gid) == "declared prompt"
+    row = db.execute("SELECT models_json FROM groups WHERE id = ?", (gid,)).fetchone()
+    assert json.loads(row["models_json"]) == ["a/one", "b/two"]
+    # A member with a different prompt does not change what was declared.
+    store.save_run(db, "some other prompt", [make_result()], group_id=gid)
+    assert store.group_prompt(db, gid) == "declared prompt"
+
+
+def test_results_replay_in_declared_position_order(db):
+    """Replay must reconstruct the original layout from the rows. Results
+    are inserted in a deliberately different order than their positions, so
+    id order and position order disagree and only the intended one passes.
+    """
+    run_id = store.save_run(
+        db,
+        "positioned",
+        [
+            make_result("third/model", position=2),
+            make_result("first/model", position=0),
+            make_result("second/model", position=1),
+        ],
+    )
+    run = store.get_run(db, run_id)
+    assert run is not None
+    assert [r["model"] for r in run["results"]] == [
+        "first/model",
+        "second/model",
+        "third/model",
+    ]
+
+
+def test_legacy_rows_without_position_keep_insertion_order(db):
+    """Rows written before the column existed carry no position, and must
+    keep the order they were written in rather than collapsing together."""
+    run_id = store.save_run(
+        db,
+        "unpositioned",
+        [make_result("alpha/model"), make_result("beta/model")],
+    )
+    run = store.get_run(db, run_id)
+    assert run is not None
+    assert [r["model"] for r in run["results"]] == ["alpha/model", "beta/model"]
+
+
+def test_run_provenance_columns_round_trip(db):
+    """The run-level provenance the caller knows and the store does not."""
+    run_id = store.save_run(
+        db,
+        "provenanced",
+        [make_result()],
+        provenance={
+            "app_sha": "abc123",
+            "catalog_snapshot_at": "2026-07-25T00:00:00+00:00",
+            "data_policy": "deny",
+        },
+    )
+    run = store.get_run(db, run_id)
+    assert run is not None
+    assert run["app_sha"] == "abc123"
+    assert run["catalog_snapshot_at"] == "2026-07-25T00:00:00+00:00"
+    assert run["data_policy"] == "deny"

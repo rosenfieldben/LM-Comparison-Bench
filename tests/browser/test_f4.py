@@ -172,7 +172,7 @@ def test_rerun_of_other_card_keeps_arming(bench):
 
 
 CEILING_MESSAGE = (
-    "run refused before reaching upstream: estimated spend $1.50 reached "
+    "run refused before reaching upstream: recorded spend $1.50 reached "
     "the $1.00 ceiling (BENCH_SPEND_LIMIT_USD); no upstream call was made"
 )
 
@@ -283,6 +283,10 @@ def test_review_repro_session_spend_never_floors_to_zero(bench):
     shown = page.evaluate(
         """() => {
           BenchState.sessionStats.spend = 4.9e-5;
+          // Marked as an estimate so the bar keeps the tilde: this test is
+          // about the formatter's precision, not about which formatter the
+          // billed-versus-estimated split picks.
+          BenchState.sessionStats.estimated = 1;
           BenchState.renderStats();
           return document.querySelector('[data-testid=stat-spend]').textContent;
         }"""

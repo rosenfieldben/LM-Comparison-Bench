@@ -6,6 +6,13 @@ token, and every result card carries latency, time to first token,
 token counts and cost. Prompts can be saved as a reusable library
 and every run lands in SQLite history for later replay.
 
+This is a comparison workbench: it puts models side by side under
+identical conditions and records what happened, with enough provenance
+to say later what an old run actually was. The evaluation layer on top
+of it, datasets, repeated trials and scoring, is in progress and not
+here yet, so treat a comparison as evidence to read rather than a
+benchmark result to cite.
+
 ## Daily use
 
 ```sh
@@ -42,25 +49,49 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
-Cost per result is computed from OpenRouter's price list, fetched
-once at startup. If that fetch fails (offline, outage), the bench
-still boots and runs; cost just shows as unavailable for the
-session. Every cost figure the bench displays is an estimate and is
-marked with a tilde: catalog prices times the token counts providers
-report, not billed cost, and the pre-run figure covers the worst-case
-output side only (input is not estimated). The persisted generation
-id is the hook for reconciling against OpenRouter's authoritative
-per-generation numbers as future work. Results the session cannot
-price (offline catalog, missing usage, errors after tokens flowed)
-are counted next to the session total as "unpriced" rather than
-silently dropped.
+OpenRouter attaches a `usage` object to every response reporting what it
+actually charged, and that billed figure is the number a card and the
+session total show, without a tilde. The bench still degrades gracefully
+if a provider disagrees, since "always" is the platform's promise rather
+than something this code can enforce. Beside it the bench keeps its own
+estimate, computed from OpenRouter's price list fetched once at startup:
+catalog prices times the token counts providers report. The estimate is
+always marked with a tilde and stays reachable in the cost cell's
+tooltip, because a gap between the two says something about the provider
+that served the run. When no billed figure arrives, the estimate is the
+whole display, exactly as before. If the price fetch fails (offline,
+outage) the bench still boots and runs; only the estimate is
+unavailable for the session, and the pre-run figure (which is an
+estimate by nature, since nothing has been charged yet) covers the
+worst-case output side only, input not included.
+
+Results the session can price by neither route (no usage object, an
+offline catalog, errors after tokens flowed) are counted next to the
+session total as "unpriced" rather than silently dropped, and so is any
+run that reached a provider without producing a charge: stopped by hand,
+superseded by a new comparison or a history load, or failed after the
+call went out. Their billing depends on whether the provider supports
+cancellation, and routing picks the provider per request, so it is not
+knowable locally. A run that never got that far is not counted: cancelled
+while still queued, or refused by the spend ceiling, it verifiably cost
+nothing. A poisoned
+money value is treated as no value: a cost that is not a finite,
+non-negative number degrades to nothing, so it cannot subtract from a
+total or turn every ceiling comparison false.
+
+Each card also reports the hidden reasoning tokens the response burned
+(billed as completion tokens, counted against the budget, invisible in
+the answer) and the provider that served it. Routing is by throughput,
+so the provider is chosen per request and can differ between two runs of
+the same model; naming it per run makes the largest confound in a
+comparison visible rather than assumed away.
 
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
-cap estimated spend for the life of the process. An invalid value
+cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message
 naming the variable, rather than silently producing a ceiling that never
 trips. Once accumulated
-estimated spend reaches the ceiling, `/compare` and `/compare/stream`
+spend reaches the ceiling, `/compare` and `/compare/stream`
 refuse new runs with HTTP 402 and a message naming both figures,
 checked at entry before any upstream call so a refusal costs nothing;
 runs already in flight are never interrupted. Admission is rechecked
@@ -71,10 +102,12 @@ in history as an honest cut-short row. Worst-case overshoot is therefore
 bounded by the runs already executing when the ceiling trips, at most
 `MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
 cost, not by the size of the lineup. A full reservation ledger (atomic
-admission) is deliberately deferred. The ceiling tracks estimates, the
-same catalog-price times reported-token figures the cards show, so
-unpriced results (offline catalog, missing usage) do not count against
-it. It resets when the process restarts.
+admission) is deliberately deferred. The ceiling counts each result
+once, using its billed cost when the platform reported one and the
+catalog estimate otherwise: it is advisory, and advising from real
+charges beats advising from catalog arithmetic. Results that are
+unpriced by both routes do not count against it. It resets when the
+process restarts.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
@@ -108,8 +141,9 @@ silently at click time; the script order in index.html is load-bearing.
 All are served from the `/static` mount.
 
 A full-width command bar carries the brand plus live session stats:
-run count, estimated spend (with a count of unpriced results when any
-run could not be priced), mean TTFT of completed requests, and
+run count, spend (tilde-marked while any contribution to it was an
+estimate, with a count of unpriced results when any run could not be
+priced by either route), mean TTFT of completed requests, and
 lineup size. They are this browser session's totals and reset on
 reload.
 
@@ -133,7 +167,14 @@ stopped with no text, and its race row stops ticking. Stopping does not
 refund anything: spend already incurred stands, and each aborted request
 disconnects its stream, so the server persists a started run as an
 aborted record (visible on the next history load, since the client never
-receives a run id) and a still-queued run not at all. After a Stop the
+receives a run id) and a still-queued run not at all. A stopped run that
+had started joins the session bar's unpriced count rather than being
+counted as free: stopping the stream stops the charge only on providers
+that support cancellation, and routing picks the provider per request, so
+"billing unknown" is the honest reading. The same applies to a run
+superseded by a new comparison or a history load, which reaches the
+provider in exactly the same way. A run stopped while queued stays out of
+that count, because it verifiably spent nothing. After a Stop the
 in-flight count reaches zero, Run re-enables, and a fresh Run or a rerun
 works as usual.
 
@@ -207,7 +248,12 @@ measured latency or ttft. Every result also records OpenRouter's
 generation id and the provider's finish_reason, which make historical
 runs auditable against OpenRouter's generation API (actual provider,
 quantization, authoritative cost) and let budget analysis see
-truncation on runs that produced no error. If persisting a finished
+truncation on runs that produced no error. The generation id is read
+from the response header, which arrives before any chunk, so a run
+stopped mid-stream still records one. That ordering matters: stopping a
+stream only stops the charge on providers that support cancellation, so
+a stopped run is the one whose billing is least knowable locally and the
+one that most needs an id to reconcile against later. If persisting a finished
 run fails, both /compare and the streaming path log the failure and
 return the results with run_id null, because the money is already
 spent and losing history must not lose the response. The UI surfaces
@@ -259,6 +305,60 @@ is tightened to 0600 at startup with a log line, because umask is
 not a policy. Deleting the file deletes all history; there is no
 other copy.
 
+Each row carries provenance, so a run stays interpretable after the
+code, the prices, or the lineup have moved on. A group records the
+prompt and the ordered lineup as declared, before any model is called,
+which makes the group row the experiment record and fixes the group's
+prompt ahead of its first member. Each run records the commit that
+produced it (`app_sha`, best effort: None when git is unavailable), the
+timestamp of the price catalog it was costed against
+(`catalog_snapshot_at`, None on an offline boot), and the data-handling
+policy its payloads declared (`data_policy`). Each result records the
+column it occupied (`position`, so a replay rebuilds the original
+side-by-side layout from the rows instead of from a lineup that has
+since been edited) and the exact payload that was sent (`request_json`,
+authorization excluded, since auth travels in headers and never in the
+body). Each result also records what the platform reported about the
+exchange: the amount charged (`billed_cost_usd`), the hidden reasoning
+and discounted cached token counts (`reasoning_tokens`,
+`cached_tokens`), the host that served it (`provider`), and that host's
+own word for why generation ended (`native_finish_reason`, beside
+OpenRouter's normalized `finish_reason`). `quantization` is reserved for
+the reconcile path, since it is not reported in-band.
+
+Some of that is only knowable after the fact. A run stopped mid-stream
+never receives a usage object, and OpenRouter's `/generation` endpoint
+holds the record it does have. `python -m bench.reconcile` walks the
+result rows that carry a generation id but no billed cost, asks about
+each one, and prints what it would write:
+
+```sh
+.venv/bin/python -m bench.reconcile          # dry run, writes nothing
+.venv/bin/python -m bench.reconcile --apply  # take the writes
+```
+
+Dry run is the default because this is the only path in the bench that
+edits history. It fetches serially with a pause between lookups, and it
+writes only `billed_cost_usd`, `provider`, `quantization` and
+`native_finish_reason`. Response text, errors, timings and the local
+estimate are never touched: this adds what the platform knows, it does
+not revise what the bench observed. A field the endpoint does not report
+leaves whatever was captured live in place, and an expired record (the
+endpoint 404s for old generations) is reported and skipped. It is safe
+to run against a live bench, since the database is in WAL mode.
+`--limit N` walks the oldest rows first, and `--delay` sets the pause.
+
+Nothing runs it for you. Reconciliation is one upstream call per row, and
+doing that at boot or inside a request would make a comparison wait on an
+audit it did not ask for.
+
+Databases from before these columns existed are migrated in place on
+the next start, additively: nothing is renamed, dropped or retyped, old
+rows keep their values, and every new column reads back as None on
+them. `cost_usd` keeps its name and its meaning throughout, the local
+estimate from catalog prices; the billed figure lives beside it in its
+own column rather than overwriting the estimate's history.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
@@ -271,6 +371,42 @@ deliberate: it changes who serves the model, never what the model
 does, and because quantization varies by host it also stabilizes
 what is actually being measured. The preference lives in
 `PROVIDER_PREFS` in `bench/models.py`.
+
+## Where your prompts go
+
+Every prompt you run leaves this machine. It goes to OpenRouter, and
+OpenRouter forwards it to whichever provider it routes the request to.
+Nothing about running the bench locally changes that, and this
+application cannot see what a provider does with a prompt once it
+arrives.
+
+What it can do is state a data-handling preference on every request.
+`BENCH_DATA_POLICY` picks one for the life of the process:
+
+- `standard` (the default, and what an unset variable means) sends
+  today's payload unchanged and asks for nothing about data handling.
+  Providers that store prompts and may train on them are eligible.
+- `deny` asks OpenRouter to route only to providers that do not collect
+  user data (`data_collection: "deny"` in the provider preferences).
+- `zdr` asks for zero-data-retention endpoints only (`zdr: true`), and
+  sends `data_collection: "deny"` alongside it. The two settings govern
+  different things, retention versus collection, and a mode chosen for
+  confidential prompts should not leave the other one open.
+
+An unrecognized value fails boot with a message naming the variable,
+rather than quietly falling back to `standard`: a silent fallback would
+send prompts to training-eligible providers while you believed
+otherwise. The active policy is recorded per run in the `data_policy`
+column, and when it is not `standard` a badge appears beside the session
+stats so a confidential session is never ambiguous at a glance.
+
+The important limit: this is a request, not a guarantee. The routing
+constraint is OpenRouter's to honor, and the bench only shows you what
+it asked for. When no endpoint satisfies the policy, OpenRouter refuses
+the request and the card shows that refusal like any other provider
+failure. The field names are pinned against OpenRouter's provider
+routing documentation; the URL and the date it was read are in the
+comment above `DATA_POLICY_PREFS` in `bench/models.py`.
 
 ## Usage
 

@@ -24,7 +24,7 @@ DONE_TIMEOUT = 15_000
 # every visible string must match exactly.
 RECORDED: dict[str, dict[str, str]] = {}
 
-METRIC_KEYS = ("ttft", "total", "tok", "cost")
+METRIC_KEYS = ("ttft", "total", "tok", "reasoning", "cost")
 
 
 def cards(page):

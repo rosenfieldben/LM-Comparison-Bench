@@ -9,6 +9,7 @@
   const statSpend = document.querySelector("#stat-spend .v");
   const statTtft = document.querySelector("#stat-ttft .v");
   const statLineup = document.querySelector("#stat-lineup .v");
+  const policyBadge = document.getElementById("policy-badge");
 
   // ---- View epoch. The results area is owned by exactly one operation
   // ---- at a time. The reproduced races this exists to prevent: a rerun
@@ -48,10 +49,68 @@
     // ---- Command-bar session stats. Runs, spend and mean TTFT are this
     // ---- browser session's live totals, reset by a reload on purpose:
     // ---- the bar answers "what has this sitting cost me", not history.
-    sessionStats: { runs: 0, spend: 0, unpriced: 0, ttftSum: 0, ttftN: 0 },
+    // estimated counts the contributions that came from catalog arithmetic
+    // rather than from a billed figure. The total is a mix whenever it is
+    // nonzero, and one estimated contribution is enough to make the whole
+    // sum an estimate, which is what the tilde has to track.
+    //
+    // priced counts contributions of either kind. It exists because the
+    // amount cannot stand in for "has anything been priced yet": free
+    // models are real, and a session of them is priced at exactly zero.
+    // Keying the idle display on spend === 0 made such a session claim
+    // "nothing priced yet" and wear the estimate tilde over a figure the
+    // platform had actually confirmed.
+    sessionStats: {
+      runs: 0,
+      spend: 0,
+      unpriced: 0,
+      estimated: 0,
+      priced: 0,
+      ttftSum: 0,
+      ttftN: 0,
+    },
     newViewEpoch,
     renderStats,
+    setDataPolicy,
   };
+
+  // What each mode asks OpenRouter for, in the operator's terms. The
+  // wording deliberately says "asks": the routing constraint is
+  // OpenRouter's to honor, and this application cannot verify it.
+  const POLICY_LABELS = {
+    deny: {
+      text: "no-training routing",
+      title:
+        "BENCH_DATA_POLICY=deny: every request asks OpenRouter to route " +
+        "only to providers that do not collect user data. The guarantee " +
+        "is OpenRouter's, not this application's",
+    },
+    zdr: {
+      text: "zero-retention routing",
+      title:
+        "BENCH_DATA_POLICY=zdr: every request asks OpenRouter to route " +
+        "only to zero-data-retention endpoints, and to providers that do " +
+        "not collect user data. The guarantee is OpenRouter's, not this " +
+        "application's",
+    },
+  };
+
+  function setDataPolicy(policy) {
+    // Absence of the badge means the default. Anything unrecognized is
+    // treated as standard rather than rendered raw: a badge is a claim
+    // about where prompts go, and a claim assembled from an unknown
+    // server value is one this page cannot stand behind.
+    const label = POLICY_LABELS[policy];
+    if (!label) {
+      policyBadge.hidden = true;
+      policyBadge.textContent = "";
+      policyBadge.removeAttribute("title");
+      return;
+    }
+    policyBadge.textContent = label.text;
+    policyBadge.title = label.title;
+    policyBadge.hidden = false;
+  }
 
   function newViewEpoch() {
     state.viewEpoch += 1;
@@ -63,20 +122,49 @@
 
   function renderStats() {
     statRuns.textContent = String(state.sessionStats.runs).padStart(2, "0");
-    // Every figure here is an estimate from catalog prices, and results
-    // the session could not price are counted rather than silently
+    // Results the session could not price are counted rather than silently
     // dropped: a total that quietly understates spend is worse than none.
-    // fmtCost, the same significant-digit formatter the cards use, rather
-    // than toFixed(4): a real total below $0.00005 floored to "~$0.0000",
-    // so a session that had spent money reported zero. Only an untouched
+    // The significant-digit formatters the cards use, rather than
+    // toFixed(4): a real total below $0.00005 floored to "$0.0000", so a
+    // session that had spent money reported zero. The tilde survives only
+    // while some contribution was a catalog estimate; once every priced
+    // run in the session came back with a billed figure, the total is not
+    // an estimate and must not wear the estimate marker. Only an untouched
     // session shows the fixed zero, which keeps the idle bar readable and
     // is honest because nothing has been spent yet.
     const spend = state.sessionStats.spend;
+    // Idle means nothing has been priced AND nothing has accumulated.
+    // Either condition alone is enough to leave it: a nonzero total is
+    // self-evidently not idle, and a zero total after a priced run is a
+    // confirmed zero rather than an absence of information.
+    const idle = state.sessionStats.priced === 0 && spend === 0;
+    const fmt =
+      state.sessionStats.estimated > 0
+        ? window.BenchLib.fmtCost
+        : window.BenchLib.fmtBilled;
     statSpend.textContent =
-      (spend === 0 ? "~$0.0000" : window.BenchLib.fmtCost(spend)) +
+      (idle ? "~$0.0000" : fmt(spend)) +
       (state.sessionStats.unpriced > 0
         ? " + " + state.sessionStats.unpriced + " unpriced"
         : "");
+    // The tooltip is rewritten on every render rather than fixed in the
+    // markup, because what the total is made of changes as the session
+    // runs: a fixed string calling it an estimate became false the moment
+    // a billed figure landed in it.
+    const composition = idle
+      ? "nothing priced yet this session"
+      : state.sessionStats.estimated > 0
+        ? "part billed by OpenRouter, part estimated from catalog " +
+          "prices and reported tokens; the tilde marks that some of it " +
+          "is an estimate"
+        : "billed by OpenRouter, not estimated";
+    statSpend.title =
+      state.sessionStats.unpriced > 0
+        ? composition +
+          ". Unpriced counts runs with neither a billed nor an estimated " +
+          "cost, and runs stopped after they started, whose billing " +
+          "depends on whether the provider supports cancellation"
+        : composition;
     statTtft.textContent =
       state.sessionStats.ttftN > 0
         ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) +

@@ -168,16 +168,35 @@
       " from " +
       group.created_at.slice(0, 19).replace("T", " ") +
       " UTC";
-    // Cards in chip (lineup) order, matching the live layout. Runs
-    // persist in completion order, so run order alone would shuffle
-    // cards between replays; models no longer in the lineup keep run
-    // order at the end.
+    // Cards in the order the comparison actually had. Runs persist in
+    // completion order, so run order alone would shuffle cards between
+    // replays.
+    //
+    // The declared position wins when the row carries one: it was
+    // recorded at request time, so it reconstructs the original layout
+    // from the rows themselves. Sorting by the CURRENT chip order was the
+    // whole defect the column exists to fix, because the lineup drifts as
+    // it is edited and a replay would then rearrange an old comparison to
+    // match a lineup it never ran under.
+    //
+    // Chip order stays the fallback for rows written before the column
+    // existed, and positioned rows lead unpositioned ones so a group that
+    // mixes the two (a legacy group with a later rerun) is at least
+    // deterministic. Models no longer in the lineup keep run order at the
+    // end, as before.
     const results = group.runs.flatMap((r) => r.results);
     const rank = (m) => {
       const i = BenchControls.lineup.indexOf(m);
       return i === -1 ? BenchControls.lineup.length : i;
     };
-    results.sort((a, b) => rank(a.model) - rank(b.model));
+    results.sort((a, b) => {
+      const ap = a.position;
+      const bp = b.position;
+      if (ap != null && bp != null) return ap - bp;
+      if (ap != null) return -1;
+      if (bp != null) return 1;
+      return rank(a.model) - rank(b.model);
+    });
     for (const result of results) {
       BenchRender.fillColumn(
         BenchRender.makeColumn(result.model),

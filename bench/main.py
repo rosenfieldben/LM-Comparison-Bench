@@ -7,9 +7,11 @@ import logging
 import math
 import os
 import sqlite3
+import subprocess
 import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -25,8 +27,12 @@ from bench import store
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
+    DATA_POLICY_PREFS,
+    as_money,
+    as_text,
     fetch_catalog,
     keepalive_socket_options,
+    provider_preferences,
     run_model,
     stream_model,
 )
@@ -60,6 +66,14 @@ MAX_CONCURRENT_UPSTREAM = 5
 # completed. Bounding at the boundary makes the mismatch a 422 before
 # any money moves.
 MAX_SQLITE_ROWID = 2**63 - 1
+
+# Upper bound on a declared column index. Deliberately not the batch
+# endpoint's five-model cap: that cap belongs to /compare, while the
+# streaming path is one request per model and the browser lineup has no
+# size limit, so a wide comparison legitimately declares positions past
+# five. This is only here to keep an absurd value out of the schema; a
+# side-by-side visual comparison is tens of columns at the very most.
+MAX_POSITION = 999
 
 
 # Unknown fields are refused on every request model at the boundary, not
@@ -120,6 +134,20 @@ class ModelResult(BaseModel):
     # error strings; budget analysis needs it on truncated-but-successful
     # runs too.
     finish_reason: str | None = None
+    # Phase G provenance and billed truth. All default None so pre-G rows,
+    # and the paths that do not set them, stay valid. position is the
+    # column this result occupied; request_json is the exact payload sent,
+    # auth excluded; billed_cost_usd is what the platform actually charged,
+    # kept beside cost_usd rather than replacing it, because the estimate
+    # and the charge are different facts and history needs both.
+    position: int | None = None
+    request_json: str | None = None
+    billed_cost_usd: float | None = None
+    reasoning_tokens: int | None = None
+    cached_tokens: int | None = None
+    provider: str | None = None
+    quantization: str | None = None
+    native_finish_reason: str | None = None
 
 
 class StreamCompareRequest(BaseModel):
@@ -134,6 +162,14 @@ class StreamCompareRequest(BaseModel):
     prompt_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     group_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
     budget: Literal["standard", "extended"] = "standard"
+    # Which column this run occupied in the comparison. The frontend fans
+    # out one request per model, so only the client knows the layout; the
+    # batch endpoint derives the same thing from array order. Recorded so
+    # a replay can reconstruct the original side by side arrangement from
+    # the rows themselves rather than from the current chip order, which
+    # drifts as the lineup is edited. See MAX_POSITION for why the bound is
+    # not the batch endpoint's five-model cap.
+    position: int | None = Field(default=None, ge=0, le=MAX_POSITION)
 
 
 class CompareResponse(BaseModel):
@@ -184,9 +220,27 @@ class RunList(BaseModel):
 
 
 class GroupCreate(BaseModel):
-    # No fields: an empty JSON object is the whole contract, so this model
-    # exists only to refuse unknown ones. See FORBID_UNKNOWN.
+    # Both optional so an empty JSON object stays a valid body: that is
+    # what every pre-G client sends, and the empty object is load-bearing
+    # for the CORS preflight defense. When present they record what the
+    # comparison IS, before any upstream call, which is what makes the
+    # group row the experiment record and fixes the group's prompt ahead
+    # of its first member. See FORBID_UNKNOWN for the unknown-field rule.
     model_config = FORBID_UNKNOWN
+
+    prompt: str | None = Field(default=None, min_length=1)
+    # The ordered lineup as declared. Deliberately NOT CompareRequest's
+    # five-model cap: that cap bounds concurrent paid calls inside one
+    # batch request, while this is a record of a lineup the browser fans
+    # out one request at a time and never caps. Borrowing it here rejected
+    # every comparison wider than five, and because a failed group create
+    # degrades to ungrouped runs rather than erroring, those comparisons
+    # silently lost their history entry. Bounded at MAX_POSITION's scale
+    # for the same reason that constant exists: keep an absurd body out
+    # without capping real use.
+    models: list[str] | None = Field(
+        default=None, min_length=1, max_length=MAX_POSITION + 1
+    )
 
 
 class GroupCreated(BaseModel):
@@ -210,6 +264,12 @@ class CatalogResponse(BaseModel):
     # Lets the frontend tell an offline boot from an empty catalog and
     # switch to the exact-id fallback instead of a dead search box.
     fetched: bool
+    # The boot-scoped data-handling policy, so the page can say plainly
+    # that this session is not on the default routing. It rides the catalog
+    # response rather than a new endpoint because the frontend already
+    # fetches this once at boot, and one more round trip to learn one word
+    # is not worth an endpoint.
+    data_policy: str = "standard"
 
 
 class RunDetail(BaseModel):
@@ -218,12 +278,45 @@ class RunDetail(BaseModel):
     prompt_text: str
     prompt_id: int | None
     results: list[ModelResult]
+    # What this run actually was: the build that produced it, how old the
+    # prices it was costed against were, and the data-handling policy its
+    # payloads declared. None on every pre-G row.
+    app_sha: str | None = None
+    catalog_snapshot_at: str | None = None
+    data_policy: str | None = None
 
 
 class GroupDetail(BaseModel):
     id: int
     created_at: str
     runs: list[RunDetail]
+
+
+def _app_sha() -> str | None:
+    """The current commit, or None when that cannot be determined.
+
+    Provenance for "what code produced this row". Read once at boot rather
+    than per run: it cannot change while the process lives, and a
+    subprocess per request would be absurd. Degrades to None whenever git
+    is missing, the checkout is not a repository, or git is slow enough to
+    hit the timeout, because none of those are reasons to fail a boot. The
+    timeout is short for the same reason: this is a nice-to-have label,
+    not a dependency.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=Path(__file__).resolve().parent.parent,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return as_text(proc.stdout.strip()) or None
 
 
 def _parse_spend_limit(raw: str | None) -> float | None:
@@ -254,6 +347,28 @@ def _parse_spend_limit(raw: str | None) -> float | None:
     return limit
 
 
+def _parse_data_policy(raw: str | None) -> str:
+    """The validated per-boot data-handling policy, defaulting to standard.
+
+    Refused loudly at boot, like the spend ceiling, and for a sharper
+    reason: a typo silently falling back to standard would send prompts to
+    training-eligible providers while the operator believed otherwise, and
+    the run rows would record the fallback rather than the intent. Nothing
+    about that failure is visible after the fact, so it has to be visible
+    before the first request.
+    """
+    if not raw:
+        return "standard"
+    policy = raw.strip().lower()
+    if policy not in DATA_POLICY_PREFS:
+        allowed = ", ".join(sorted(DATA_POLICY_PREFS))
+        raise RuntimeError(
+            f"BENCH_DATA_POLICY must be one of {allowed}, got {raw!r}. "
+            "Unset it for standard."
+        )
+    return policy
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Fail at boot, not on the first request. A bench with a missing key
@@ -266,15 +381,28 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Per-boot spend ceiling, validated here next to the key check and
     # before any resource is allocated so a misconfigured limit fails fast
     # and loud like a missing key. Unset means no limit. The figure tracked
-    # is estimated spend (catalog prices times reported tokens), the same
-    # numbers the cards show, accumulated as a plain float: one event loop
-    # makes that safe without a lock. Results the session cannot price
-    # (offline catalog, missing usage) never move the counter, so the
-    # ceiling bounds known estimated spend, not a billed total.
+    # is what each result contributes through ceiling_cost: the platform's
+    # billed charge when it reported one, the catalog estimate otherwise,
+    # the same numbers the cards show. Accumulated as a plain float, which
+    # one event loop makes safe without a lock. Only results unpriced by
+    # BOTH routes leave the counter untouched, so an offline catalog no
+    # longer means an uncounted run: a usage object still prices it.
     app.state.spend_limit_usd = _parse_spend_limit(
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
     app.state.accumulated_spend_usd = 0.0
+    # Data-handling routing, validated beside the ceiling and before any
+    # request can be built. The resolved provider block is computed once
+    # here rather than per request: it is boot-scoped by design, so a run
+    # can never be sent under a policy other than the one its row records.
+    app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
+    app.state.provider_prefs = provider_preferences(app.state.data_policy)
+    if app.state.data_policy != "standard":
+        logger.info(
+            "data policy %s: provider preferences %s",
+            app.state.data_policy,
+            app.state.provider_prefs,
+        )
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -299,8 +427,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
+    app.state.app_sha = _app_sha()
     app.state.catalog = await fetch_catalog(app.state.client)
     app.state.prices = app.state.catalog["prices"]
+    # When the prices a run was costed against were read. None on an
+    # offline boot, where there is no snapshot to date: that absence is
+    # itself the provenance, since those runs have no estimate either.
+    app.state.catalog_snapshot_at = (
+        datetime.now(UTC).isoformat() if app.state.catalog["fetched"] else None
+    )
     # Per-model completion caps, derived once per boot so the budget
     # clamp is a dict lookup per request. Only published integer caps
     # participate. With the catalog fetched, an unknown cap means no clamp;
@@ -528,6 +663,21 @@ async def favicon() -> Response:
     )
 
 
+def run_provenance() -> dict[str, Any]:
+    """The run-level facts of this boot, stamped onto every run row.
+
+    Read from app.state at call time rather than captured once, so a test
+    that rebuilds state between clients sees its own values. data_policy is
+    filled by the privacy workstream; it is listed here so every writer
+    already carries the key.
+    """
+    return {
+        "app_sha": getattr(app.state, "app_sha", None),
+        "catalog_snapshot_at": getattr(app.state, "catalog_snapshot_at", None),
+        "data_policy": getattr(app.state, "data_policy", None),
+    }
+
+
 def cost_usd(result: dict[str, Any], prices: dict[str, Any]) -> float | None:
     """Cost of one result, or None when tokens or pricing are unknown.
 
@@ -574,8 +724,9 @@ def spend_ceiling_reached() -> bool:
     """True when an active ceiling has been reached by accumulated spend.
 
     The shared predicate behind the entry check and the post-admission
-    recheck. Unpriced results never moved the counter, so this bounds
-    known estimated spend, not billed cost.
+    recheck. Results the bench could price neither from the platform's
+    billed figure nor from the catalog never moved the counter, so this
+    bounds known spend, not all spend.
     """
     limit = app.state.spend_limit_usd
     if limit is None:
@@ -584,7 +735,7 @@ def spend_ceiling_reached() -> bool:
 
 
 def enforce_spend_limit() -> None:
-    """Refuse a run at the boundary once estimated spend hits the ceiling.
+    """Refuse a run at the boundary once recorded spend hits the ceiling.
 
     Checked at endpoint entry, before the semaphore and before any
     upstream call, so a refusal costs nothing. Money already in flight
@@ -596,7 +747,7 @@ def enforce_spend_limit() -> None:
     if spend_ceiling_reached():
         raise HTTPException(
             402,
-            "spend ceiling reached: estimated "
+            "spend ceiling reached: recorded "
             f"{format_usd(app.state.accumulated_spend_usd)} of "
             f"{format_usd(app.state.spend_limit_usd)} limit "
             "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it",
@@ -604,16 +755,40 @@ def enforce_spend_limit() -> None:
 
 
 def record_spend(cost: float | None) -> None:
-    """Add a priced result's estimate to the accumulated spend.
+    """Add one priced result to the accumulated spend.
 
-    None means the result could not be priced (offline catalog, missing
-    usage), and those never count against the ceiling by design. A
+    The caller chooses between billed cost and the estimate (ceiling_cost);
+    this only accumulates. None means the result could not be priced by
+    either route (offline catalog, missing usage), and those never count
+    against the ceiling by design. A
     non-finite cost is refused here too: cost_usd already screens it out,
     but the accumulator is the invariant's last line, and a single NaN
     summed in would make the ceiling comparison permanently false.
     """
     if cost is not None and math.isfinite(cost):
         app.state.accumulated_spend_usd += cost
+
+
+def ceiling_cost(result: dict[str, Any]) -> float | None:
+    """What one result contributes to the accumulated spend.
+
+    Billed cost when the platform reported one, the catalog estimate
+    otherwise. The ceiling is advisory, a guard against a runaway session
+    rather than an accounting ledger, and advising from what was actually
+    charged beats advising from catalog arithmetic over reported token
+    counts. Both figures stay on the row; only one of them counts here, so
+    a result can never be charged to the ceiling twice.
+
+    Both fields already passed the money rule at ingestion (as_money for
+    billed, the finiteness check in cost_usd for the estimate). Re-applying
+    as_money here is the accumulator's own last line rather than a
+    duplicate: this reads a plain dict that a persistence round trip or a
+    future writer could reach, and one poisoned value summed in would make
+    the ceiling comparison permanently false. None means the result is
+    unpriced by both routes, which by design never moves the counter.
+    """
+    billed = as_money(result.get("billed_cost_usd"))
+    return billed if billed is not None else as_money(result.get("cost_usd"))
 
 
 def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
@@ -650,7 +825,7 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "completion_tokens": None,
         "spend_refused": True,
         "error": (
-            "run refused before reaching upstream: estimated spend "
+            "run refused before reaching upstream: recorded spend "
             f"{format_usd(app.state.accumulated_spend_usd)} reached the "
             f"{format_usd(app.state.spend_limit_usd)} ceiling "
             "(BENCH_SPEND_LIMIT_USD); no upstream call was made"
@@ -660,6 +835,16 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "max_tokens": max_tokens,
         "generation_id": None,
         "finish_reason": None,
+        # Nothing was charged because nothing was sent. Present and None
+        # rather than absent so a reader of this dict sees the same fields
+        # a real result carries. request_json is the deliberate exception:
+        # both client functions always set it, and here there is no payload
+        # to record because none was built.
+        "billed_cost_usd": None,
+        "reasoning_tokens": None,
+        "cached_tokens": None,
+        "provider": None,
+        "native_finish_reason": None,
     }
 
 
@@ -676,16 +861,20 @@ def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
 
     Checked at endpoint entry, before the semaphore and any upstream call,
     so a mismatch is a 409 that spends nothing and never reaches the
-    post-spend degrade path (link resolution stays degrade-only). An empty
-    or unknown group accepts any prompt; the first member establishes the
-    group's prompt.
+    post-spend degrade path (link resolution stays degrade-only). An
+    unknown group, and a group with neither a declared prompt nor a member,
+    accepts any prompt.
 
-    Residual: two concurrent first members with different prompts can both
-    pass the empty-group check here, because group_prompt returns None for
-    both before either persists. Single-user localhost makes that a
-    non-path, the frontend cannot produce it (one Run creates one group
-    with one prompt), and rejecting after spend is forbidden by the
-    fault-boundary invariant, so the residual is accepted rather than
+    Residual, now confined to legacy groups: a group that declared its
+    prompt at creation is checked against a value that existed before any
+    member was sent, so two concurrent first members cannot both see an
+    empty group. Every group the current frontend creates declares one. The
+    old race survives only for groups created before that column existed,
+    or by a client that omits the prompt: there group_prompt still derives
+    from the first member and returns None for both racers. Those are
+    finite and historical, single-user localhost makes the window a
+    non-path anyway, and rejecting after spend is forbidden by the
+    fault-boundary invariant, so the remainder is accepted rather than
     closed with a lock.
     """
     if group_id is None:
@@ -778,6 +967,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 model,
                 app.state.client,
                 max_tokens=budget,
+                provider_prefs=app.state.provider_prefs,
             )
 
     # gather preserves input order, which the frontend relies on to map
@@ -786,8 +976,11 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     results = await asyncio.gather(*(limited(m) for m in request.models))
     # Seeded before the fault boundary so a failure inside it can never
     # leave a result missing the key the response model requires.
-    for result in results:
+    # position comes from array order here: gather preserves it, and for
+    # the batch endpoint the caller's array IS the declared layout.
+    for index, result in enumerate(results):
         result["cost_usd"] = None
+        result["position"] = index
     run_id = None
     # The invariant: after money is spent, no code path may convert
     # results into an error response. Everything between "upstream
@@ -801,12 +994,17 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # time.
         for result in results:
             result["cost_usd"] = cost_usd(result, app.state.prices)
-            record_spend(result["cost_usd"])
+            record_spend(ceiling_cost(result))
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )
         run_id = store.save_run(
-            app.state.db, request.prompt, list(results), prompt_id, group_id
+            app.state.db,
+            request.prompt,
+            list(results),
+            prompt_id,
+            group_id,
+            run_provenance(),
         )
     except Exception:
         logger.exception("post-upstream processing failed for /compare")
@@ -832,6 +1030,13 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         started = False
         acquired = False
         start = 0.0
+        # Injected state, not a protocol change: stream_model writes each
+        # fact here the moment it knows it, so the disconnect path below can
+        # persist what the server saw. A run cut short never reaches the
+        # done event, and it is the run whose billing is least knowable
+        # locally, so it is the row most in need of an id to reconcile
+        # against and of a record of what it asked for.
+        holder: dict[str, Any] = {}
 
         def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
@@ -894,7 +1099,12 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             start = time.perf_counter()
             yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             async for event in stream_model(
-                request.prompt, request.model, app.state.client, max_tokens=max_tokens
+                request.prompt,
+                request.model,
+                app.state.client,
+                max_tokens=max_tokens,
+                holder=holder,
+                provider_prefs=app.state.provider_prefs,
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -908,6 +1118,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 release_slot()
                 result = event["result"]
                 result["cost_usd"] = None
+                result["position"] = request.position
                 run_id = None
                 # Same invariant as /compare, and stricter here: the
                 # deltas are already on the wire, so after money is
@@ -917,12 +1128,17 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # failure degrades to run_id null with links dropped.
                 try:
                     result["cost_usd"] = cost_usd(result, app.state.prices)
-                    record_spend(result["cost_usd"])
+                    record_spend(ceiling_cost(result))
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
                     run_id = store.save_run(
-                        app.state.db, request.prompt, [result], prompt_id, group_id
+                        app.state.db,
+                        request.prompt,
+                        [result],
+                        prompt_id,
+                        group_id,
+                        run_provenance(),
                     )
                 except Exception:
                     logger.exception(
@@ -954,13 +1170,34 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     "cost_usd": None,
                     "ttft_ms": first_delta_ms,
                     "max_tokens": max_tokens,
+                    "position": request.position,
+                    # Plain dict lookups with defaults: no await, no
+                    # attribute access on a half-torn-down object, and no
+                    # way to raise during generator unwinding. Without them
+                    # the runs with the least knowable billing (cut short
+                    # mid-stream, so cancellation may or may not have
+                    # stopped the charge) were the only ones with no id to
+                    # reconcile against and no record of what was sent,
+                    # which made request_json absent from exactly the rows
+                    # the reconcile pass exists to visit.
+                    "generation_id": holder.get("generation_id"),
+                    "request_json": holder.get("request_json"),
+                    "provider": holder.get("provider"),
+                    # finish_reason and native_finish_reason stay absent on
+                    # purpose: this run did not finish, so any value here
+                    # would be a claim the server cannot make.
                 }
                 try:
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
                     store.save_run(
-                        app.state.db, request.prompt, [aborted], prompt_id, group_id
+                        app.state.db,
+                        request.prompt,
+                        [aborted],
+                        prompt_id,
+                        group_id,
+                        run_provenance(),
                     )
                 except Exception:
                     logger.exception("failed to persist aborted streamed run")
@@ -984,7 +1221,7 @@ def ensure_rowid(value: int) -> None:
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
 async def create_group(body: GroupCreate) -> dict[str, Any]:
-    return {"id": store.create_group(app.state.db)}
+    return {"id": store.create_group(app.state.db, body.prompt, body.models)}
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)
@@ -1001,6 +1238,7 @@ async def get_models() -> dict[str, Any]:
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
+        "data_policy": app.state.data_policy,
     }
 
 

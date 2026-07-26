@@ -10,11 +10,30 @@
     return slash === -1 ? id : id.slice(slash + 1);
   }
 
+  function usdDigits(c) {
+    // Exact zero written out rather than as an exponent. "$0.0e+0" is a
+    // needlessly cryptic way to write nothing, and a real zero is
+    // reachable: free models exist, and their billed cost is genuinely
+    // zero rather than absent.
+    if (c === 0) return "$0.0000";
+    // Exponential for the typical sub-cent run ($3.1e-5); plain decimals
+    // once a run costs enough for them to be readable. Shared so the
+    // estimate and the billed figure sit at the same scale on the card and
+    // only their prefix differs.
+    return "$" + (c < 0.01 ? c.toExponential(1) : c.toFixed(3));
+  }
+
   function fmtCost(c) {
-    // Exponential for the typical sub-cent run (~$3.1e-5); plain decimals
-    // once a run costs enough for them to be readable. The tilde is the
-    // honesty marker: catalog prices times reported tokens, not a bill.
-    return "~$" + (c < 0.01 ? c.toExponential(1) : c.toFixed(3));
+    // The tilde is the honesty marker: catalog prices times reported
+    // tokens, not a bill.
+    return "~" + usdDigits(c);
+  }
+
+  function fmtBilled(c) {
+    // No tilde, because this one is not an estimate: it is the amount
+    // OpenRouter reported charging for the request. The marker's absence
+    // is the whole signal, so the two formatters must never converge.
+    return usdDigits(c);
   }
 
   function fmtEstimate(v) {
@@ -101,6 +120,7 @@
   const BenchLib = {
     shortName,
     fmtCost,
+    fmtBilled,
     fmtEstimate,
     niceScale,
     tokenizeDiff,

@@ -9,7 +9,16 @@
   const runBtn = document.getElementById("run");
   const stopBtn = document.getElementById("stop");
 
-  async function runOne(prompt, model, promptId, groupId, budget, ui, epoch) {
+  async function runOne(
+    prompt,
+    model,
+    promptId,
+    groupId,
+    budget,
+    ui,
+    epoch,
+    position,
+  ) {
     // Superseded before it started: spend no money for a dead view.
     if (epoch !== BenchState.viewEpoch) return;
     const current = () => epoch === BenchState.viewEpoch;
@@ -34,6 +43,10 @@
     // node survives into the error state if the stream dies partway.
     let textNode = null;
     let finished = false;
+    // Whether the server said this run acquired an upstream slot. A stop
+    // before that point verifiably spent nothing; a stop after it may or
+    // may not have, which is the distinction the unpriced count now makes.
+    let sawStarted = false;
     function appendDelta(text) {
       if (textNode === null) {
         // First token: the thinking counter has done its job, and the
@@ -82,29 +95,55 @@
         BenchControls.updateRunState();
       }
       // Session accounting is view-independent: money spent by a
-      // superseded run is still money spent this session. A user-stopped
-      // run adds nothing: no cost frame ever arrived, which matches the
-      // server, where the disconnect path persists a started run as aborted
-      // with null cost and a queued run not at all. Stopping does not refund
-      // spend already incurred; it just is not counted here because the
-      // client never received it.
-      if (!result.stopped) {
-        if (result.cost_usd != null) {
-          BenchState.sessionStats.spend += result.cost_usd;
-        } else if (
-          result.response_text != null ||
-          result.prompt_tokens != null ||
-          result.completion_tokens != null
-        ) {
-          // Evidence of consumption with no price: offline catalog,
-          // missing usage, or an error after tokens flowed. Counted so
-          // the session total cannot quietly understate real spend.
-          BenchState.sessionStats.unpriced += 1;
-        }
-        if (result.error == null && result.ttft_ms != null) {
-          BenchState.sessionStats.ttftSum += result.ttft_ms;
-          BenchState.sessionStats.ttftN += 1;
-        }
+      // superseded run is still money spent this session.
+      //
+      // One rule for every way a run can end. A run contributes an AMOUNT
+      // when a charge arrived, and contributes UNCERTAINTY when the server
+      // would have spent but no charge did. sawStarted is that second
+      // condition, and it is deliberately the server's own: the disconnect
+      // path persists a run exactly when it had emitted started, so the
+      // bar reports billing-unknown on exactly the rows history keeps.
+      // Anything short of started verifiably cost nothing (a cancel while
+      // still queued, a spend refusal, a failure before the slot) and stays
+      // out of both counters.
+      //
+      // This was two branches, one for a user Stop and one for everything
+      // else, and only the Stop branch consulted sawStarted. A run
+      // superseded after started but before its first delta has no text and
+      // no token counts, so it fell through both and read as free while the
+      // server had already called upstream and kept the row. Stream
+      // cancellation stops the charge only on providers that support it,
+      // and throughput routing picks the provider per request, so "free" is
+      // a claim the bench cannot make about any run that reached one. Two
+      // branches applying one rule is how that gap opened; collapsing them
+      // is what keeps it shut.
+      const billed = result.billed_cost_usd;
+      // Billed first, estimate second, matching the card and the server's
+      // ceiling: one contribution per run, never both, so the bar cannot
+      // double-count a result that carries each. A stopped or superseded
+      // run carries neither, because no cost frame ever reached the client.
+      const charge = billed != null ? billed : result.cost_usd;
+      if (charge != null) {
+        BenchState.sessionStats.spend += charge;
+        BenchState.sessionStats.priced += 1;
+        if (billed == null) BenchState.sessionStats.estimated += 1;
+      } else if (
+        sawStarted ||
+        result.response_text != null ||
+        result.prompt_tokens != null ||
+        result.completion_tokens != null
+      ) {
+        // The evidence-of-consumption checks stay as a belt: they cover a
+        // done frame that somehow arrived without a started frame being
+        // observed, which the current server never sends but which no
+        // longer has to be assumed.
+        BenchState.sessionStats.unpriced += 1;
+      }
+      // A stopped run reports no ttft (its synthetic result carries none),
+      // so the null check is the whole guard here.
+      if (result.error == null && result.ttft_ms != null) {
+        BenchState.sessionStats.ttftSum += result.ttft_ms;
+        BenchState.sessionStats.ttftN += 1;
       }
       BenchState.renderStats();
       // A superseded run's view work ends here: dropped silently, its
@@ -145,7 +184,7 @@
         // refused card into a red error card on the first click.
         retry:
           result.error != null && !refused
-            ? { prompt, model, promptId, groupId, budget }
+            ? { prompt, model, promptId, groupId, budget, position }
             : null,
         // A user Stop renders as an honest stopped state, not done or error.
         stopped: result.stopped === true,
@@ -162,6 +201,12 @@
           prompt_id: promptId,
           group_id: groupId,
           budget: budget,
+          // Which column this run occupies, so a replay can rebuild the
+          // layout from the rows instead of from the current chip order,
+          // which drifts as the lineup is edited. A rerun re-sends the
+          // retried attempt's position (render.js passes it back) so the
+          // second sample lands in the same column as the first.
+          position: position,
         }),
         signal: controller.signal,
       });
@@ -204,7 +249,10 @@
           } else if (event.type === "started") {
             // The slot was just acquired. Restart the client clock here so
             // the TTFT estimate excludes queue wait, matching the server's
-            // post-acquire clock, and restore the thinking label.
+            // post-acquire clock, and restore the thinking label. This is
+            // also the line past which a stop can no longer claim the run
+            // was free.
+            sawStarted = true;
             const entry = BenchRender.tickers.get(ui);
             if (entry) entry.start = performance.now();
             ui.statusWord.textContent = "thinking";
@@ -283,13 +331,16 @@
     // decide whether to set one. The group POST's own finally closes it.
     BenchState.pendingBatchEpoch = epoch;
     try {
-      // The empty JSON body is load-bearing: the server requires
+      // A JSON body is load-bearing: the server requires
       // application/json on every POST so hostile cross-site senders
-      // are forced into a CORS preflight it never answers.
+      // are forced into a CORS preflight it never answers. It now also
+      // declares the experiment, the prompt and the ordered lineup,
+      // before any model is called, which is what lets the server fix
+      // the group's prompt ahead of its first member.
       const resp = await fetch("/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: "{}",
+        body: JSON.stringify({ prompt: prompt, models: models }),
         signal: groupController.signal,
       });
       if (resp.ok) groupId = (await resp.json()).id;
@@ -312,7 +363,16 @@
     try {
       await Promise.allSettled(
         models.map((model, i) =>
-          runOne(prompt, model, promptId, groupId, budget, columns[i], epoch),
+          runOne(
+            prompt,
+            model,
+            promptId,
+            groupId,
+            budget,
+            columns[i],
+            epoch,
+            i,
+          ),
         ),
       );
     } finally {
