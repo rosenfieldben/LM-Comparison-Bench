@@ -65,11 +65,14 @@ worst-case output side only, input not included.
 
 Results the session can price by neither route (no usage object, an
 offline catalog, errors after tokens flowed) are counted next to the
-session total as "unpriced" rather than silently dropped, and so are
-runs stopped after they started, whose billing depends on whether the
-provider supports cancellation and is therefore not knowable locally. A
-run stopped while still queued is not counted: it never reached a
-provider, so it verifiably cost nothing. A poisoned
+session total as "unpriced" rather than silently dropped, and so is any
+run that reached a provider without producing a charge: stopped by hand,
+superseded by a new comparison or a history load, or failed after the
+call went out. Their billing depends on whether the provider supports
+cancellation, and routing picks the provider per request, so it is not
+knowable locally. A run that never got that far is not counted: cancelled
+while still queued, or refused by the spend ceiling, it verifiably cost
+nothing. A poisoned
 money value is treated as no value: a cost that is not a finite,
 non-negative number degrades to nothing, so it cannot subtract from a
 total or turn every ceiling comparison false.
@@ -166,8 +169,10 @@ receives a run id) and a still-queued run not at all. A stopped run that
 had started joins the session bar's unpriced count rather than being
 counted as free: stopping the stream stops the charge only on providers
 that support cancellation, and routing picks the provider per request, so
-"billing unknown" is the honest reading. A run stopped while queued stays
-out of that count, because it verifiably spent nothing. After a Stop the
+"billing unknown" is the honest reading. The same applies to a run
+superseded by a new comparison or a history load, which reaches the
+provider in exactly the same way. A run stopped while queued stays out of
+that count, because it verifiably spent nothing. After a Stop the
 in-flight count reaches zero, Run re-enables, and a fresh Run or a rerun
 works as usual.
 

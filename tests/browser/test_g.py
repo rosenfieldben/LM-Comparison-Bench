@@ -328,3 +328,85 @@ def test_review_repro_a_zero_billed_session_is_not_reported_as_unpriced_idle(ben
     )
     assert shown["text"] == "$0.0000", shown
     assert "billed by OpenRouter" in shown["title"], shown
+
+
+# ---- Phase G.1: the supersession half of the unpriced rule.
+
+
+def test_review_repro_superseded_run_after_started_joins_unpriced(bench):
+    """Adversarial review: G4 taught the bar that a stopped run is not free,
+    but only through the Stop branch. A run superseded after the server's
+    started frame and before its first delta has no text and no token
+    counts, so it fell through both branches and was counted as costing
+    nothing, while the server had already called upstream and persisted the
+    row. The upstream reality is identical to a Stop; only the client-side
+    path that aborted it differs.
+
+    Driven through the real epoch machinery: newViewEpoch is what a History
+    click and a second Run both call, and stub/slow holds two seconds of
+    true wire silence after admission, which is exactly the window.
+    """
+    page = bench(["stub/slow"])
+    check_chip(page, 0)
+    start_run(page, "g1 superseded after started")
+
+    card = cards(page).first
+    # The started frame has been consumed (the label leaves "queued" for
+    # "thinking") and no delta has landed yet. An auto-retrying assertion,
+    # not a sleep: it settles the state supersession acts on.
+    expect(status_of(card)).to_contain_text("thinking", timeout=DONE_TIMEOUT)
+    assert (
+        card.get_by_test_id("card-body").inner_text().strip() == "awaiting first token"
+    ), "precondition: no delta has arrived yet"
+
+    page.evaluate("() => { BenchState.newViewEpoch(); }")
+
+    spend = page.get_by_test_id("stat-spend")
+    expect(spend).to_contain_text("+ 1 unpriced", timeout=DONE_TIMEOUT)
+    # Uncertainty, not an amount: nothing is added to the total.
+    expect(spend).to_contain_text("~$0.0000")
+    # And the server really did keep the run, which is what makes counting
+    # it the honest reading rather than a conservative one. Keyed on this
+    # test's own prompt, never on total history size: the suite shares one
+    # database.
+    persisted = page.evaluate(
+        """async () => {
+          const r = await fetch('/runs');
+          const runs = (await r.json()).runs;
+          return runs.filter(
+            (x) => x.prompt_text === 'g1 superseded after started',
+          ).length;
+        }"""
+    )
+    assert persisted == 1, persisted
+
+
+def test_a_run_that_never_started_is_still_free(bench):
+    """The other half of the same rule, so the fix cannot be read as "count
+    everything". A spend refusal is declined before any provider sees it, so
+    it moves neither counter.
+    """
+    page = bench(["stub/fast"])
+    refusal = (
+        'data: {"type":"done","result":{"model":"stub/fast",'
+        '"response_text":null,"latency_ms":null,"prompt_tokens":null,'
+        '"completion_tokens":null,"spend_refused":true,'
+        '"error":"run refused before reaching upstream: recorded spend '
+        "$1.50 reached the $1.00 ceiling (BENCH_SPEND_LIMIT_USD); no "
+        'upstream call was made","cost_usd":null,"ttft_ms":null,'
+        '"max_tokens":16384,"generation_id":null,"finish_reason":null},'
+        '"run_id":null}\n\n'
+    )
+    page.route(
+        "**/compare/stream",
+        lambda route: route.fulfill(
+            status=200, content_type="text/event-stream", body=refusal
+        ),
+    )
+    check_chip(page, 0)
+    start_run(page, "g1 refusal is still free")
+
+    expect(status_of(cards(page).first)).to_have_text("refused", timeout=DONE_TIMEOUT)
+    spend = page.get_by_test_id("stat-spend")
+    expect(spend).to_have_text("~$0.0000")
+    expect(spend).not_to_contain_text("unpriced")

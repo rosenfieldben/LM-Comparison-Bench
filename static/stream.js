@@ -95,42 +95,55 @@
         BenchControls.updateRunState();
       }
       // Session accounting is view-independent: money spent by a
-      // superseded run is still money spent this session. A user-stopped
-      // run contributes no amount, because no cost frame ever arrived, but
-      // it is not free either: stream cancellation stops the charge only on
-      // providers that support it, and throughput routing picks the
-      // provider per request, so a stopped run's billing is unknowable from
-      // here. Counting it in neither spend nor unpriced read as "cost
-      // nothing", which is a claim the bench cannot make. A run stopped
-      // while still queued is the one case that IS free: it never acquired
-      // a slot and never reached a provider, which is also why the server
-      // persists nothing for it.
-      if (result.stopped) {
-        if (sawStarted) BenchState.sessionStats.unpriced += 1;
-      } else {
-        // Billed first, estimate second, matching the card and the server's
-        // ceiling: one contribution per run, never both, so the bar cannot
-        // double-count a result that carries each.
-        const billed = result.billed_cost_usd;
-        const charge = billed != null ? billed : result.cost_usd;
-        if (charge != null) {
-          BenchState.sessionStats.spend += charge;
-          BenchState.sessionStats.priced += 1;
-          if (billed == null) BenchState.sessionStats.estimated += 1;
-        } else if (
-          result.response_text != null ||
-          result.prompt_tokens != null ||
-          result.completion_tokens != null
-        ) {
-          // Evidence of consumption with no price: offline catalog,
-          // missing usage, or an error after tokens flowed. Counted so
-          // the session total cannot quietly understate real spend.
-          BenchState.sessionStats.unpriced += 1;
-        }
-        if (result.error == null && result.ttft_ms != null) {
-          BenchState.sessionStats.ttftSum += result.ttft_ms;
-          BenchState.sessionStats.ttftN += 1;
-        }
+      // superseded run is still money spent this session.
+      //
+      // One rule for every way a run can end. A run contributes an AMOUNT
+      // when a charge arrived, and contributes UNCERTAINTY when the server
+      // would have spent but no charge did. sawStarted is that second
+      // condition, and it is deliberately the server's own: the disconnect
+      // path persists a run exactly when it had emitted started, so the
+      // bar reports billing-unknown on exactly the rows history keeps.
+      // Anything short of started verifiably cost nothing (a cancel while
+      // still queued, a spend refusal, a failure before the slot) and stays
+      // out of both counters.
+      //
+      // This was two branches, one for a user Stop and one for everything
+      // else, and only the Stop branch consulted sawStarted. A run
+      // superseded after started but before its first delta has no text and
+      // no token counts, so it fell through both and read as free while the
+      // server had already called upstream and kept the row. Stream
+      // cancellation stops the charge only on providers that support it,
+      // and throughput routing picks the provider per request, so "free" is
+      // a claim the bench cannot make about any run that reached one. Two
+      // branches applying one rule is how that gap opened; collapsing them
+      // is what keeps it shut.
+      const billed = result.billed_cost_usd;
+      // Billed first, estimate second, matching the card and the server's
+      // ceiling: one contribution per run, never both, so the bar cannot
+      // double-count a result that carries each. A stopped or superseded
+      // run carries neither, because no cost frame ever reached the client.
+      const charge = billed != null ? billed : result.cost_usd;
+      if (charge != null) {
+        BenchState.sessionStats.spend += charge;
+        BenchState.sessionStats.priced += 1;
+        if (billed == null) BenchState.sessionStats.estimated += 1;
+      } else if (
+        sawStarted ||
+        result.response_text != null ||
+        result.prompt_tokens != null ||
+        result.completion_tokens != null
+      ) {
+        // The evidence-of-consumption checks stay as a belt: they cover a
+        // done frame that somehow arrived without a started frame being
+        // observed, which the current server never sends but which no
+        // longer has to be assumed.
+        BenchState.sessionStats.unpriced += 1;
+      }
+      // A stopped run reports no ttft (its synthetic result carries none),
+      // so the null check is the whole guard here.
+      if (result.error == null && result.ttft_ms != null) {
+        BenchState.sessionStats.ttftSum += result.ttft_ms;
+        BenchState.sessionStats.ttftN += 1;
       }
       BenchState.renderStats();
       // A superseded run's view work ends here: dropped silently, its
