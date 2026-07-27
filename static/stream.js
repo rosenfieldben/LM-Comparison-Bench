@@ -3,6 +3,25 @@
 // runOne is the edge render.js calls back into for a rerun; startRun is
 // also driven by the browser suite through page.evaluate.
 (function () {
+  // Runs one block of ancillary work and never lets it escape. Used for
+  // everything finish() does AFTER the card's terminal render: the render
+  // is the point of the function, and no amount of bookkeeping failure
+  // may undo it or stop the rest of the bookkeeping from happening.
+  //
+  // Swallowing was the crime, so logging is mandatory. A field failure ran
+  // for a whole session with a perfectly silent console, which is most of
+  // why it was hard to see.
+  function guarded(what, fn) {
+    try {
+      fn();
+    } catch (err) {
+      console.error(
+        "bench: " + what + " failed after the terminal render",
+        err,
+      );
+    }
+  }
+
   const promptEl = document.getElementById("prompt");
   const resultsEl = document.getElementById("results");
   const runLabelEl = document.getElementById("run-label");
@@ -73,27 +92,141 @@
       }
       textNode.appendData(text);
     }
+    // The invariant this function holds: no exception anywhere in it, or
+    // in the catch that calls it, may leave a card non-terminal or vanish
+    // without a console.error.
+    //
+    // The order below is the fix. Rendering the card's terminal state is
+    // the point of finish(), so it happens first and nothing may preempt
+    // it. It used to happen last, after the session-stats render, and a
+    // TypeError in that render escaped before any card had been rendered.
+    // finished was already true by then, so the catch's recovery call to
+    // finish() returned immediately: every run finishing after the session
+    // went non-idle sat at "thinking" forever with its complete answer
+    // visible, the session bar half-mutated, and the console silent. A
+    // real field failure, diagnosed externally and verified by
+    // reproduction.
     function finish(result, runId) {
-      // Idempotence guard: a connection that dies after the done event
-      // was rendered must not stack a second set of metrics or errors.
+      // Prevents a SECOND terminal render, which is all this guard ever
+      // claimed to do. It cannot prevent the first, because the flag is
+      // set below only once a render has actually happened.
       if (finished) return;
-      finished = true;
-      BenchRender.stopTicker(ui);
+
+      // A superseded run renders nothing: its view is gone, and its
+      // accounting further down is the whole job it has left.
       if (current()) {
-        if (result.stopped) {
-          BenchRender.raceStopped(model);
-        } else if (result.spend_refused === true) {
-          // Refused before any provider saw it: the strip must not call
-          // that a failure, matching the card's own refused state.
-          BenchRender.raceRefused(model);
-        } else if (result.error != null) {
-          BenchRender.raceError(model);
-        } else {
-          BenchRender.raceDone(model, result.ttft_ms);
+        // Logged and rethrown rather than handled here. Rethrowing is what
+        // reaches the recovery: runOne's catch calls finish() again with a
+        // synthetic error result, and the flag below is still false, so
+        // that re-entry renders an error card. Logging is what keeps the
+        // invariant true, because a broken primary render is a fact a
+        // developer needs even when the card ends up saying something
+        // useful. The outer catch does not log, it puts the message on the
+        // card, so this is the only place it would be recorded.
+        try {
+          // Presentation only, never persisted: the stored error stays the
+          // server's exact words. The extended budget is the one knob the
+          // user can turn when reasoning burned the whole standard budget,
+          // so say so right where the failure is reported.
+          let shownError = result.error;
+          if (
+            shownError != null &&
+            budget === "standard" &&
+            shownError.includes("finish_reason: length")
+          ) {
+            shownError += "; try extended budget";
+          }
+          // The spend ceiling refusing a run is a working control, not a
+          // failure. It arrives as run_id null like a persistence failure
+          // does, so the marker the server sets is what tells them apart;
+          // keying on the error text would break the moment that prose is
+          // reworded.
+          const refused = result.spend_refused === true;
+          BenchRender.completeColumn(ui, result, model + " (live)", {
+            streamed: textNode !== null,
+            shownError: shownError,
+            budgetBadge: false,
+            // run_id null on the done event means the server spent the money
+            // and streamed the response but could not persist it. A refusal
+            // is run_id null too, but deliberately: it persists nothing
+            // because nothing happened, so it must not claim history was
+            // lost.
+            unsaved: runId === null && !refused,
+            refused: refused,
+            // Only this streaming path offers a rerun; historical replays go
+            // through fillColumn and never get one. A stopped run has no
+            // error, so it gets no rerun control, and neither does a
+            // refusal: the ceiling holds for the life of the process, so a
+            // rerun could only ever be refused again, and offering it would
+            // turn the honest refused card into a red error card on the
+            // first click.
+            retry:
+              result.error != null && !refused
+                ? { prompt, model, promptId, groupId, budget, position }
+                : null,
+            // A user Stop renders as an honest stopped state, not done or
+            // error.
+            stopped: result.stopped === true,
+          });
+        } catch (renderErr) {
+          console.error(
+            "bench: the terminal render failed for " + model,
+            renderErr,
+          );
+          throw renderErr;
         }
-        BenchState.inflightRuns -= 1;
-        BenchControls.updateRunState();
       }
+
+      // Set only after the render returned, which is what turns the guard
+      // above into a guard against double rendering rather than against
+      // recovery. If completeColumn itself throws, the exception escapes
+      // to runOne's catch, which calls finish() again with a synthetic
+      // error result; the flag is still false, so that re-entry renders
+      // the error card instead of no-oping.
+      //
+      // The accounting rule survives that re-entry, and this is the case
+      // to reason about: when the first render throws, nothing below this
+      // line has run, so no counter has moved. The re-entry then runs the
+      // whole tail exactly once, on the synthetic result, which carries no
+      // charge and so contributes uncertainty rather than an amount. One
+      // contribution either way. Losing the amount is the honest outcome
+      // when the client could not even render what it received.
+      //
+      // Residual, stated rather than papered over: if completeColumn ever
+      // throws PART WAY through, after it has already set the card's
+      // state, the re-entry renders over a partly rendered card and can
+      // duplicate a tool button. That is visible and recoverable, unlike
+      // the silent permanent strand this ordering exists to prevent, and
+      // the known failure (a missing formatter) throws in fillMetrics,
+      // before anything is appended.
+      finished = true;
+
+      // Idempotent, and the render already did it for a live card; this
+      // covers the superseded path, which renders nothing.
+      guarded("ticker teardown", () => {
+        BenchRender.stopTicker(ui);
+      });
+
+      if (current()) {
+        guarded("race strip update", () => {
+          if (result.stopped) {
+            BenchRender.raceStopped(model);
+          } else if (result.spend_refused === true) {
+            // Refused before any provider saw it: the strip must not call
+            // that a failure, matching the card's own refused state.
+            BenchRender.raceRefused(model);
+          } else if (result.error != null) {
+            BenchRender.raceError(model);
+          } else {
+            BenchRender.raceDone(model, result.ttft_ms);
+          }
+        });
+        guarded("in-flight bookkeeping", () => {
+          BenchState.inflightRuns -= 1;
+          BenchControls.updateRunState();
+        });
+      }
+
       // Session accounting is view-independent: money spent by a
       // superseded run is still money spent this session.
       //
@@ -107,87 +240,44 @@
       // still queued, a spend refusal, a failure before the slot) and stays
       // out of both counters.
       //
-      // This was two branches, one for a user Stop and one for everything
-      // else, and only the Stop branch consulted sawStarted. A run
-      // superseded after started but before its first delta has no text and
-      // no token counts, so it fell through both and read as free while the
-      // server had already called upstream and kept the row. Stream
-      // cancellation stops the charge only on providers that support it,
-      // and throughput routing picks the provider per request, so "free" is
-      // a claim the bench cannot make about any run that reached one. Two
-      // branches applying one rule is how that gap opened; collapsing them
-      // is what keeps it shut.
-      const billed = result.billed_cost_usd;
-      // Billed first, estimate second, matching the card and the server's
-      // ceiling: one contribution per run, never both, so the bar cannot
-      // double-count a result that carries each. A stopped or superseded
-      // run carries neither, because no cost frame ever reached the client.
-      const charge = billed != null ? billed : result.cost_usd;
-      if (charge != null) {
-        BenchState.sessionStats.spend += charge;
-        BenchState.sessionStats.priced += 1;
-        if (billed == null) BenchState.sessionStats.estimated += 1;
-      } else if (
-        sawStarted ||
-        result.response_text != null ||
-        result.prompt_tokens != null ||
-        result.completion_tokens != null
-      ) {
-        // The evidence-of-consumption checks stay as a belt: they cover a
-        // done frame that somehow arrived without a started frame being
-        // observed, which the current server never sends but which no
-        // longer has to be assumed.
-        BenchState.sessionStats.unpriced += 1;
-      }
-      // A stopped run reports no ttft (its synthetic result carries none),
-      // so the null check is the whole guard here.
-      if (result.error == null && result.ttft_ms != null) {
-        BenchState.sessionStats.ttftSum += result.ttft_ms;
-        BenchState.sessionStats.ttftN += 1;
-      }
-      BenchState.renderStats();
-      // A superseded run's view work ends here: dropped silently, its
-      // persistence already handled server-side.
-      if (!current()) return;
-      // Presentation only, never persisted: the stored error stays the
-      // server's exact words. The extended budget is the one knob the
-      // user can turn when reasoning burned the whole standard budget,
-      // so say so right where the failure is reported.
-      let shownError = result.error;
-      if (
-        shownError != null &&
-        budget === "standard" &&
-        shownError.includes("finish_reason: length")
-      ) {
-        shownError += "; try extended budget";
-      }
-      // The spend ceiling refusing a run is a working control, not a
-      // failure. It arrives as run_id null like a persistence failure does,
-      // so the marker the server sets is what tells them apart; keying on
-      // the error text would break the moment that prose is reworded.
-      const refused = result.spend_refused === true;
-      BenchRender.completeColumn(ui, result, model + " (live)", {
-        streamed: textNode !== null,
-        shownError: shownError,
-        budgetBadge: false,
-        // run_id null on the done event means the server spent the money
-        // and streamed the response but could not persist it. A refusal is
-        // run_id null too, but deliberately: it persists nothing because
-        // nothing happened, so it must not claim history was lost.
-        unsaved: runId === null && !refused,
-        refused: refused,
-        // Only this streaming path offers a rerun; historical replays go
-        // through fillColumn and never get one. A stopped run has no error,
-        // so it gets no rerun control, and neither does a refusal: the
-        // ceiling holds for the life of the process, so a rerun could only
-        // ever be refused again, and offering it would turn the honest
-        // refused card into a red error card on the first click.
-        retry:
-          result.error != null && !refused
-            ? { prompt, model, promptId, groupId, budget, position }
-            : null,
-        // A user Stop renders as an honest stopped state, not done or error.
-        stopped: result.stopped === true,
+      // Mutated in its own block, before the stats render, so a render
+      // failure leaves the counters consistent rather than half applied.
+      guarded("session accounting", () => {
+        const billed = result.billed_cost_usd;
+        // Billed first, estimate second, matching the card and the
+        // server's ceiling: one contribution per run, never both, so the
+        // bar cannot double-count a result that carries each. A stopped or
+        // superseded run carries neither, because no cost frame ever
+        // reached the client.
+        const charge = billed != null ? billed : result.cost_usd;
+        if (charge != null) {
+          BenchState.sessionStats.spend += charge;
+          BenchState.sessionStats.priced += 1;
+          if (billed == null) BenchState.sessionStats.estimated += 1;
+        } else if (
+          sawStarted ||
+          result.response_text != null ||
+          result.prompt_tokens != null ||
+          result.completion_tokens != null
+        ) {
+          // The evidence-of-consumption checks stay as a belt: they cover
+          // a done frame that somehow arrived without a started frame
+          // being observed, which the current server never sends but which
+          // no longer has to be assumed.
+          BenchState.sessionStats.unpriced += 1;
+        }
+        // A stopped run reports no ttft (its synthetic result carries
+        // none), so the null check is the whole guard here.
+        if (result.error == null && result.ttft_ms != null) {
+          BenchState.sessionStats.ttftSum += result.ttft_ms;
+          BenchState.sessionStats.ttftN += 1;
+        }
+      });
+
+      // The step that threw in the field. Guarded now, so a session bar
+      // that cannot render costs the session bar and nothing else.
+      guarded("session stats render", () => {
+        BenchState.renderStats();
       });
     }
 
@@ -273,14 +363,27 @@
       // run is unknown from here (its disconnect path usually does), so
       // no not-saved warning is claimed.
       const stopped = err.name === "AbortError" && current();
-      finish(
-        {
-          error: stopped ? null : "request failed: " + err.message,
-          response_text: textNode !== null ? textNode.data : null,
-          stopped: stopped,
-        },
-        undefined,
-      );
+      // This call is the recovery path, including for an exception thrown
+      // by finish's own terminal render, so it gets the last-resort guard:
+      // if even the synthetic error card cannot be drawn there is nothing
+      // further to try, but the failure must not leave runOne silently. No
+      // exception anywhere in finish or in this catch may leave a card
+      // non-terminal or vanish without a console.error.
+      try {
+        finish(
+          {
+            error: stopped ? null : "request failed: " + err.message,
+            response_text: textNode !== null ? textNode.data : null,
+            stopped: stopped,
+          },
+          undefined,
+        );
+      } catch (recoveryErr) {
+        console.error(
+          "bench: could not render the failure state for " + model,
+          recoveryErr,
+        );
+      }
     }
   }
 
