@@ -19,6 +19,7 @@ bar, which is what the field saw, because in the old order the session bar
 ran first.
 """
 
+import re
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,14 @@ pytestmark = pytest.mark.browser
 
 DONE_TIMEOUT = 15_000
 STATIC = Path(__file__).resolve().parents[2] / "static"
+
+# The bench's own document, the only one the badge-less test rewrites.
+INDEX_URL = re.compile(r"^http://localhost:\d+/$")
+
+# Matched rather than quoted verbatim so a future attribute on the badge
+# does not silently turn the strip into a no-op; the test proves the
+# element is gone once the page has loaded, so a miss fails loudly.
+BADGE_TAG = re.compile(r'<span id="policy-badge"[^>]*>\s*</span>')
 
 # Distinctive enough that finding it in a console line proves it came from
 # here and not from some unrelated warning.
@@ -66,6 +75,24 @@ def check_all_chips(page):
 def start_run(page, prompt):
     page.get_by_test_id("prompt-input").fill(prompt)
     page.get_by_test_id("run-button").click()
+
+
+def serve_without_the_policy_badge(route):
+    """The bench's real index with the badge element cut out of it.
+
+    Fetching the live response rather than reading index.html off disk
+    keeps the served document's own headers, the CSP included, so the page
+    still boots under the real policy and the asset URLs still carry the
+    version query the server put on them.
+    """
+    response = route.fetch()
+    route.fulfill(response=response, body=BADGE_TAG.sub("", response.text()))
+
+
+def collect_page_errors(page):
+    errors = []
+    page.on("pageerror", lambda exc: errors.append(str(exc)))
+    return errors
 
 
 def collect_console_errors(page):
@@ -150,6 +177,45 @@ def test_review_repro_a_broken_card_render_recovers_instead_of_stranding(page, b
         expect(card.get_by_test_id("card-error")).to_contain_text(INJECTED)
 
     assert any(INJECTED in line for line in errors), errors
+
+
+def test_review_repro_a_missing_policy_badge_cannot_brick_the_page(page, bench):
+    """setDataPolicy dereferenced the badge on every branch, the default
+    included, so any document without #policy-badge threw. That is not
+    hypothetical: the pre-G index has no badge, and the same cache skew
+    behind the strand could serve it beside a post-G state.js. The call
+    site is loadCatalog, which runs at boot, so the throw landed in the
+    middle of startup.
+
+    The badge is removed by rewriting the served document rather than by
+    deleting the node afterwards. state.js resolves the element once, at
+    load, into a const; removing it later leaves that const pointing at a
+    detached node that accepts every write the function makes, so a
+    post-load deletion cannot reproduce anything. The element has to be
+    missing when the module runs.
+
+    Both calls the spec names are made directly, because the default
+    branch and a recognized policy take different paths through the
+    function and only the guard covers both. On pre-fix code each throws.
+    """
+    page_errors = collect_page_errors(page)
+    page.route(INDEX_URL, serve_without_the_policy_badge)
+
+    bench(["stub/fast"])
+
+    # The strip landed: without this the rest of the test would pass on a
+    # document that still had its badge and would prove nothing.
+    expect(page.get_by_test_id("lineup-chip")).to_have_count(1)
+    assert page.evaluate("document.getElementById('policy-badge') === null")
+
+    page.evaluate("window.BenchState.setDataPolicy('standard')")
+    page.evaluate("window.BenchState.setDataPolicy('zdr')")
+
+    # Not bricked: the page still boots and still drives its controls.
+    check_all_chips(page)
+    page.get_by_test_id("prompt-input").fill("hotfix missing policy badge")
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+    assert page_errors == [], page_errors
 
 
 def test_a_working_page_logs_no_console_errors(page, bench):

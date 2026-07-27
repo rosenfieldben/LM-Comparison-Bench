@@ -96,6 +96,10 @@
   };
 
   function setDataPolicy(policy) {
+    // The badge is presentational, so its absence must never cost the page:
+    // this ran at boot from loadCatalog, and a throw here took the run
+    // button and the lineup down with it.
+    if (!policyBadge) return;
     // Absence of the badge means the default. Anything unrecognized is
     // treated as standard rather than rendered raw: a badge is a claim
     // about where prompts go, and a claim assembled from an unknown
