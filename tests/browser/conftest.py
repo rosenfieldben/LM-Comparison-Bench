@@ -166,6 +166,32 @@ def bench(page, bench_url):
 
 
 @pytest.fixture
+def open_history(page):
+    """Open the History panel and wait for its load to settle.
+
+    Shared rather than repeated per file because the wait is the whole
+    point. The panel empties itself the moment it opens and refills only
+    when its fetch returns, so any claim about its rows made while that is
+    in flight is worthless: a positive one races the load, and a negative
+    one is satisfied by it. Waiting on the list's own state attribute is
+    the panel saying it has finished, whatever the outcome was.
+
+    A bare click was enough on a fast machine and not on a loaded one.
+    It failed on CI twice, both times as a row that was really there
+    reading as absent.
+    """
+
+    def open_it():
+        page.get_by_test_id("history-toggle").click()
+        page.wait_for_function(
+            """() => ['ready', 'empty', 'error'].includes(
+                 document.getElementById('history-list').dataset.state)"""
+        )
+
+    return open_it
+
+
+@pytest.fixture
 def zdr_bench(page, zdr_bench_url):
     """The same page factory, pointed at the zdr-policy bench."""
 

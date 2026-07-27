@@ -51,10 +51,6 @@ def start_superseding_run(page, prompt):
     page.evaluate("() => { BenchStream.startRun(); }")
 
 
-def open_history(page):
-    page.get_by_test_id("history-toggle").click()
-
-
 def save_prompt(page, text, name):
     page.get_by_test_id("prompt-input").fill(text)
     page.get_by_test_id("save-prompt").click()
@@ -122,7 +118,7 @@ def test_review_repro_group_load_clears_view_synchronously_then_fails(bench):
     assert errors == []
 
 
-def test_review_repro_aborted_group_load_shows_failure(bench):
+def test_review_repro_aborted_group_load_shows_failure(bench, open_history):
     """Review finding 5: an aborted network request lands in the same
     standalone failure state, not stale cards behind the banner."""
     page = bench(["stub/fast"])
@@ -132,7 +128,7 @@ def test_review_repro_aborted_group_load_shows_failure(bench):
     expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
 
     page.route("**/groups/*", lambda route: route.abort())
-    open_history(page)
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="f2 group abort").click()
 
     expect(page.get_by_test_id("history-failure")).to_be_visible()
@@ -395,7 +391,7 @@ def test_review_repro_run_after_stop_streams_normally(bench):
     expect(fresh.get_by_test_id("card-body")).to_have_text("reply from stub/fast")
 
 
-def test_review_repro_stopped_run_persists_as_aborted_in_history(bench):
+def test_review_repro_stopped_run_persists_as_aborted_in_history(bench, open_history):
     """F2.4: stopping a started run preserves what streamed, in history as
     an aborted record on the next load (the client never gets a run id).
     The server disconnect persistence is unit-tested
@@ -417,7 +413,7 @@ def test_review_repro_stopped_run_persists_as_aborted_in_history(bench):
               .then(d => d.runs.some(x => x.prompt_text.includes(t)))""",
         arg="f2 stop persists",
     )
-    open_history(page)
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="f2 stop persists").click()
     replayed = cards(page).first
     expect(replayed.get_by_test_id("card-body")).to_contain_text(

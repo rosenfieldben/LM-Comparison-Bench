@@ -220,10 +220,13 @@ diff; errored live cards add rerun. History renders as a flat strip
 of rows (timestamp, prompt, and a model count that counts distinct
 models, noting attempts separately when a rerun pushed the total above
 them, as in "1 model · 2 attempts") with a client-side filter that
-matches prompt substrings and model ids, and loads only when expanded. Opening an entry clears the current cards, race and diff and
-shows a loading state before fetching; a load that fails becomes a
-standalone failure state, so a stale comparison is never left sitting
-under the banner.
+matches prompt substrings and model ids, and loads only when expanded.
+The list says which state it is in while it does that, since it empties
+itself on open and an empty panel would otherwise mean both "still
+loading" and "nothing to show". Opening an entry clears the current
+cards, race and diff and shows a loading state before fetching; a load
+that fails becomes a standalone failure state, so a stale comparison is
+never left sitting under the banner.
 
 ## Token budgets
 

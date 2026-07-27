@@ -250,3 +250,46 @@ def test_a_working_page_logs_no_console_errors(page, bench):
             "done", timeout=DONE_TIMEOUT
         )
     assert errors == [], errors
+
+
+# ---- The history panel says whether it is loading.
+
+
+def test_review_repro_a_loading_history_panel_does_not_look_empty(page, bench):
+    """The panel emptied itself the moment it opened and refilled only
+    when its fetch returned, so while that was in flight it was blank and
+    said nothing. On a slow link that reads as broken, and it made "no
+    rows" mean two different things at once.
+
+    It cost a real CI failure twice, in the same test both times, and the
+    same way: a row that was genuinely in the database read as absent
+    because the assertion landed inside that window. The first fix waited
+    for the row to be persisted, which was necessary and not sufficient,
+    since persistence says nothing about whether the panel has caught up.
+
+    The request is held open by a route handler that keeps the route
+    object instead of completing it, so the loading window lasts exactly
+    as long as this test wants and not one millisecond of sleep.
+    """
+    held = []
+    page.route("**/runs?*", lambda route: held.append(route))
+
+    bench(["stub/fast"])
+    check_all_chips(page)
+    start_run(page, "hotfix loading history panel")
+    expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
+
+    # The fixture is deliberately not used here: it waits for the settled
+    # state, which is the very window this test needs to observe.
+    page.get_by_test_id("history-toggle").click()
+    panel = page.get_by_test_id("history-list")
+    expect(panel).to_have_attribute("data-state", "loading")
+    expect(panel).to_have_text("loading history")
+
+    held[0].continue_()
+
+    expect(panel).to_have_attribute("data-state", "ready", timeout=DONE_TIMEOUT)
+    row = page.get_by_test_id("history-row").filter(
+        has_text="hotfix loading history panel"
+    )
+    expect(row).to_have_count(1)

@@ -93,7 +93,7 @@ def test_02_two_model_run_streams_in_checkbox_order(bench):
     RECORDED["stub/slow"] = capture_card(slow)
 
 
-def test_03_flaky_errors_then_rerun_recovers_in_same_group(bench):
+def test_03_flaky_errors_then_rerun_recovers_in_same_group(bench, open_history):
     page = bench(["stub/flaky"])
     check_all_chips(page)
     start_run(page, "flaky prompt")
@@ -110,7 +110,7 @@ def test_03_flaky_errors_then_rerun_recovers_in_same_group(bench):
     # The group holds one distinct model run twice, so the count reads by
     # unique model with the attempts noted separately (Phase F.2 changed
     # this from the old "2 models" wording, which mislabeled a rerun).
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     row = page.get_by_test_id("history-row").filter(has_text="flaky prompt")
     expect(row).to_have_count(1)
     expect(row.get_by_test_id("history-count")).to_have_text("1 model · 2 attempts")
@@ -147,11 +147,11 @@ def test_04_extended_budget_sends_65536_and_clamps_capped(bench, stub_url):
     )
 
 
-def test_05_history_replay_matches_live_run_exactly(bench):
+def test_05_history_replay_matches_live_run_exactly(bench, open_history):
     assert RECORDED, "test 02 must run first in this session"
     page = bench(["stub/fast", "stub/slow"])
 
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="two model run").click()
 
     expect(page.get_by_test_id("run-label")).to_contain_text("Historical comparison")
@@ -169,10 +169,10 @@ def test_05_history_replay_matches_live_run_exactly(bench):
             assert replayed[key] == live[key], (model, key)
 
 
-def test_06_diff_marks_changes_and_leaves_common_text_plain(bench):
+def test_06_diff_marks_changes_and_leaves_common_text_plain(bench, open_history):
     page = bench(["stub/fast", "stub/slow"])
 
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="two model run").click()
     expect(cards(page)).to_have_count(2)
 
