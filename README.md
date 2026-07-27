@@ -140,6 +140,21 @@ through the namespaces, so a load-order mistake fails loudly rather than
 silently at click time; the script order in index.html is load-bearing.
 All are served from the `/static` mount.
 
+Every response carries `Cache-Control: no-cache`, which means revalidate
+before reuse rather than do not store, so with the ETags the static mount
+already sets the usual cost of a reload is a 304. On top of that, the
+index served at `/` is rewritten at startup to append `?v=<rev>` to every
+asset URL, where the rev is a short hash of the static files' bytes. The
+committed `index.html` keeps plain URLs, so opening it straight off disk
+still works.
+
+Both exist for the same reason. Assets used to go out with validators but
+no `Cache-Control`, which let a browser apply heuristic freshness and
+reuse a cached file without asking, and after an upgrade a page could run
+fresh modules beside a stale one from the previous release. **Upgrading
+never requires a hard reload**, and if you have ever been told to clear
+the cache for this app, that advice is obsolete.
+
 A full-width command bar carries the brand plus live session stats:
 run count, spend (tilde-marked while any contribution to it was an
 estimate, with a count of unpriced results when any run could not be

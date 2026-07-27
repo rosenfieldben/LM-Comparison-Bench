@@ -1,11 +1,13 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
 import math
 import os
+import re
 import sqlite3
 import subprocess
 import time
@@ -17,7 +19,7 @@ from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import Headers, MutableHeaders
@@ -583,6 +585,22 @@ class LocalOnlyGuard:
                 headers = MutableHeaders(scope=message)
                 headers["x-frame-options"] = "DENY"
                 headers["content-security-policy"] = CONTENT_SECURITY_POLICY
+                # Only when the response has not already chosen its own
+                # caching. The conditional is load-bearing rather than
+                # defensive: the favicon deliberately declares a year of
+                # immutable caching, and a second Cache-Control on that
+                # response would be a defect, not a stricter rule.
+                #
+                # Assets were served with ETag and Last-Modified but no
+                # Cache-Control, which lets a browser apply heuristic
+                # freshness and reuse a cached file without asking. After an
+                # upgrade that produced a reproduced field failure: a page
+                # running fresh modules beside a stale one from the previous
+                # release. no-cache does not mean "do not store", it means
+                # "revalidate before reuse", so with the ETags already
+                # present the common case is a 304 and the skew is gone.
+                if "cache-control" not in headers:
+                    headers["cache-control"] = "no-cache"
             await send(message)
 
         # The socket-level check runs first, before anything a caller
@@ -632,6 +650,65 @@ app.add_middleware(LocalOnlyGuard)
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 INDEX_HTML = STATIC_DIR / "index.html"
 
+# Matches the src and href of every same-origin asset the index references.
+# Deliberately narrow: only the /static prefix, and only inside a double
+# quoted attribute, which is how every URL in that file is written.
+_STATIC_ATTR = re.compile(r'((?:src|href)=")(/static/[^"]*)(")')
+
+
+def static_rev(directory: Path) -> str:
+    """A short hash over every static file's path and bytes.
+
+    Content-derived rather than taken from the app commit: it works in a
+    checkout with no git, it changes exactly when an asset changes rather
+    than on every commit, and it is identical for every request of one
+    boot. Paths are mixed in so a rename counts as a change even when the
+    bytes do not, and the walk is sorted so the digest does not inherit
+    directory iteration order.
+    """
+    digest = hashlib.sha256()
+    for path in sorted(directory.rglob("*")):
+        if not path.is_file():
+            continue
+        digest.update(path.relative_to(directory).as_posix().encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def versioned_index(html: str, rev: str) -> str:
+    """The index with ?v=<rev> appended to every /static URL it references.
+
+    A mechanical rewrite at boot rather than a placeholder token in the
+    committed file, so opening static/index.html straight off disk keeps
+    working. StaticFiles ignores query parameters it does not recognize,
+    so the versioned URLs need no route changes.
+
+    The point is not to defeat caching, which Cache-Control already does.
+    It is that a changed asset gets a URL the browser has never seen, so
+    even a cache that ignored every header cannot serve the old bytes for
+    it. Belt and braces on the same failure, because the failure was a
+    page silently running half of two releases.
+    """
+
+    def add_rev(match: re.Match[str]) -> str:
+        prefix, url, suffix = match.groups()
+        # Append rather than assume there is no query already, so a future
+        # URL that carries one does not become nonsense.
+        separator = "&" if "?" in url else "?"
+        return f"{prefix}{url}{separator}v={rev}{suffix}"
+
+    return _STATIC_ATTR.sub(add_rev, html)
+
+
+# Computed at import rather than in the lifespan, because it is a pure
+# function of files already on disk: no env, no network, nothing that can
+# be absent. That also means the index route cannot meet a half-built
+# app.state, which is the failure mode this hotfix exists to remove rather
+# than reintroduce somewhere else.
+STATIC_REV = static_rev(STATIC_DIR)
+INDEX_DOCUMENT = versioned_index(INDEX_HTML.read_text(encoding="utf-8"), STATIC_REV)
+
 # Serve the static assets (vendored fonts now; the split-out stylesheet
 # and scripts later) from one mount. LocalOnlyGuard wraps the whole app
 # and GET is exempt from the JSON-POST rule, so the security posture is
@@ -649,8 +726,12 @@ FAVICON_SVG = (
 
 
 @app.get("/", include_in_schema=False)
-async def index() -> FileResponse:
-    return FileResponse(INDEX_HTML)
+async def index() -> HTMLResponse:
+    # From memory, not FileResponse: the document served is the rewritten
+    # one, with every asset URL carrying this boot's rev. Serving the file
+    # verbatim would hand the browser the unversioned URLs and lose half
+    # the fix.
+    return HTMLResponse(INDEX_DOCUMENT)
 
 
 @app.get("/favicon.ico", include_in_schema=False)
