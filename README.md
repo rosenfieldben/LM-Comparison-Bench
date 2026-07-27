@@ -140,9 +140,11 @@ through the namespaces, so a load-order mistake fails loudly rather than
 silently at click time; the script order in index.html is load-bearing.
 All are served from the `/static` mount.
 
-Every response carries `Cache-Control: no-cache`, which means revalidate
-before reuse rather than do not store, so with the ETags the static mount
-already sets the usual cost of a reload is a 304. On top of that, the
+Every response that does not choose its own caching carries
+`Cache-Control: no-cache`, which means revalidate before reuse rather than
+do not store, so with the ETags the static mount already sets the usual
+cost of a reload is a 304. The one response that chooses is the favicon,
+which declares a year of immutable caching on purpose. On top of that, the
 index served at `/` is rewritten at startup to append `?v=<rev>` to every
 asset URL, where the rev is a short hash of the static files' bytes. The
 committed `index.html` keeps plain URLs, so opening it straight off disk

@@ -11,14 +11,15 @@
   // Swallowing was the crime, so logging is mandatory. A field failure ran
   // for a whole session with a perfectly silent console, which is most of
   // why it was hard to see.
+  //
+  // The message names the block and stops there. Saying "after the
+  // terminal render" would read well for a live card and be false for a
+  // superseded one, which reaches these blocks having rendered nothing.
   function guarded(what, fn) {
     try {
       fn();
     } catch (err) {
-      console.error(
-        "bench: " + what + " failed after the terminal render",
-        err,
-      );
+      console.error("bench: " + what + " failed", err);
     }
   }
 

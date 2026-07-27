@@ -176,6 +176,12 @@ def test_review_repro_a_broken_card_render_recovers_instead_of_stranding(page, b
         assert "reply from" in body, body
         expect(card.get_by_test_id("card-error")).to_contain_text(INJECTED)
 
+    # The one-contribution rule survives the re-entry, which is the risk
+    # moving the flag created. Each run contributes exactly once, and the
+    # synthetic result carries no charge, so both land as uncertainty: two
+    # runs, two unpriced, no amount. A tail that ran twice would read four.
+    expect(page.get_by_test_id("stat-spend")).to_have_text("~$0.0000 + 2 unpriced")
+
     assert any(INJECTED in line for line in errors), errors
 
 
@@ -183,9 +189,7 @@ def test_review_repro_a_missing_policy_badge_cannot_brick_the_page(page, bench):
     """setDataPolicy dereferenced the badge on every branch, the default
     included, so any document without #policy-badge threw. That is not
     hypothetical: the pre-G index has no badge, and the same cache skew
-    behind the strand could serve it beside a post-G state.js. The call
-    site is loadCatalog, which runs at boot, so the throw landed in the
-    middle of startup.
+    behind the strand could serve it beside a post-G state.js.
 
     The badge is removed by rewriting the served document rather than by
     deleting the node afterwards. state.js resolves the element once, at
@@ -194,9 +198,15 @@ def test_review_repro_a_missing_policy_badge_cannot_brick_the_page(page, bench):
     post-load deletion cannot reproduce anything. The element has to be
     missing when the module runs.
 
-    Both calls the spec names are made directly, because the default
-    branch and a recognized policy take different paths through the
-    function and only the guard covers both. On pre-fix code each throws.
+    Two independent things fail here on pre-fix code, and the measured
+    scope of each is worth stating because it is smaller than "bricked".
+    The boot call from loadCatalog is fired without being awaited, so the
+    throw rejects that promise, skips the catalog-driven run-state
+    refresh, and surfaces as an uncaught error: page_errors catches it,
+    the lineup still paints, and the run button recovers on the first
+    keystroke. The two direct calls are the sharper half, and they are
+    both made because the default branch and a recognized policy take
+    different paths and only the guard covers both.
     """
     page_errors = collect_page_errors(page)
     page.route(INDEX_URL, serve_without_the_policy_badge)
@@ -211,10 +221,16 @@ def test_review_repro_a_missing_policy_badge_cannot_brick_the_page(page, bench):
     page.evaluate("window.BenchState.setDataPolicy('standard')")
     page.evaluate("window.BenchState.setDataPolicy('zdr')")
 
-    # Not bricked: the page still boots and still drives its controls.
+    # Controls still work. This part passes on pre-fix code too, since the
+    # rejection skipped a refresh rather than the wiring; it is here as the
+    # over-correction guard, so a "fix" that returned early on a good
+    # document would be caught.
     check_all_chips(page)
     page.get_by_test_id("prompt-input").fill("hotfix missing policy badge")
     expect(page.get_by_test_id("run-button")).to_be_enabled()
+
+    # The boot half of the tombstone: pre-fix this holds the uncaught
+    # TypeError from loadCatalog.
     assert page_errors == [], page_errors
 
 
