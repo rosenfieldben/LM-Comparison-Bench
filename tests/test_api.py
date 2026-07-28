@@ -1,5 +1,6 @@
 import json
 import math
+import re
 from pathlib import Path
 
 import httpx
@@ -2475,3 +2476,115 @@ def test_poisoned_provenance_never_breaks_a_paid_result(client):
     stored = client.get(f"/runs/{resp.json()['run_id']}").json()["results"][0]
     assert stored["provider"] is None
     assert stored["native_finish_reason"] is None
+
+
+# ---- Hotfix H1: the stale-asset skew becomes impossible.
+
+
+def test_review_repro_static_assets_must_revalidate(client):
+    """Field incident, diagnosed externally and verified by reproduction.
+
+    Static assets went out with ETag and Last-Modified but no
+    Cache-Control, so a browser was free to apply heuristic freshness and
+    reuse a cached file without asking. After the Phase G upgrade that
+    produced a page running fresh modules beside a stale pre-G lib.js with
+    no fmtBilled, and every card finishing after the session went non-idle
+    stranded silently at "thinking" with its answer visible.
+
+    no-cache does not mean "do not store", it means "revalidate before
+    reuse", so with the ETags already there the usual cost is a 304 and
+    the skew cannot happen.
+    """
+    for path in ("/", "/static/lib.js", "/static/volt.css"):
+        resp = client.get(path)
+        assert resp.status_code == 200, path
+        assert resp.headers.get("cache-control") == "no-cache", path
+
+
+def test_a_response_that_chose_its_own_caching_keeps_it(client):
+    """The injection is only-if-absent, and that is load-bearing rather
+    than defensive: the favicon declares a year of immutable caching on
+    purpose, and a second Cache-Control on that response would be a defect
+    rather than a stricter rule."""
+    resp = client.get("/favicon.ico")
+
+    assert resp.status_code == 200
+    values = resp.headers.get_list("cache-control")
+    assert len(values) == 1, values
+    assert values[0] == "public, max-age=31536000, immutable"
+
+
+def test_every_response_carries_exactly_one_cache_control(client):
+    """Duplicate directives are ambiguous to a cache, so the rule is one
+    header everywhere, whoever set it."""
+    for path in ("/", "/static/lib.js", "/favicon.ico", "/models", "/runs"):
+        resp = client.get(path)
+        assert len(resp.headers.get_list("cache-control")) == 1, path
+
+
+def test_the_served_index_versions_every_asset_url(client):
+    """Belt to the Cache-Control braces: a changed asset gets a URL the
+    browser has never seen, so even a cache ignoring every header cannot
+    serve the old bytes for it."""
+    body = client.get("/").text
+
+    referenced = re.findall(r'(?:src|href)="(/static/[^"]*)"', body)
+    # Every module in the load-bearing order, plus the stylesheet and the
+    # pre-paint theme script.
+    assert len(referenced) == 11, referenced
+    for url in referenced:
+        assert f"?v={main.STATIC_REV}" in url, url
+    # The committed file itself keeps plain URLs, so opening it straight
+    # off disk still works.
+    assert "?v=" not in main.INDEX_HTML.read_text(encoding="utf-8")
+
+
+def test_the_asset_rev_is_stable_within_a_boot(client):
+    """A rev that moved between requests would version the modules of one
+    page against each other, which is the skew rather than the fix."""
+    first = re.findall(r"\?v=([a-f0-9]+)", client.get("/").text)
+    second = re.findall(r"\?v=([a-f0-9]+)", client.get("/").text)
+
+    assert first == second
+    assert len(set(first)) == 1, first
+
+
+def test_the_asset_rev_changes_when_the_bytes_do(tmp_path):
+    """Content-derived, so it changes exactly when an asset changes: not
+    on every commit, and not never."""
+    (tmp_path / "a.js").write_text("one")
+    before = main.static_rev(tmp_path)
+
+    (tmp_path / "a.js").write_text("two")
+    assert main.static_rev(tmp_path) != before
+
+    # Stable when nothing changed, or it would bust caches every boot.
+    assert main.static_rev(tmp_path) == main.static_rev(tmp_path)
+
+
+def test_the_asset_rev_notices_a_rename(tmp_path):
+    """Paths are mixed into the digest, so moving bytes between filenames
+    is a change even though the bytes are not."""
+    (tmp_path / "a.js").write_text("same")
+    before = main.static_rev(tmp_path)
+
+    (tmp_path / "a.js").unlink()
+    (tmp_path / "b.js").write_text("same")
+
+    assert main.static_rev(tmp_path) != before
+
+
+def test_versioning_appends_to_a_url_that_already_has_a_query():
+    """No URL in the index carries one today; the rewrite must not turn
+    the first one that does into nonsense."""
+    out = main.versioned_index('<script src="/static/x.js?a=b"></script>', "abc")
+
+    assert out == '<script src="/static/x.js?a=b&v=abc"></script>'
+
+
+def test_versioning_leaves_foreign_urls_alone():
+    """Narrow on purpose: only same-origin /static URLs are ours to
+    version, and the CSP forbids the rest anyway."""
+    html = '<script src="https://cdn.example/x.js"></script><a href="/runs">r</a>'
+
+    assert main.versioned_index(html, "abc") == html

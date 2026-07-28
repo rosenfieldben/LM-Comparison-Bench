@@ -16,7 +16,7 @@ pytestmark = pytest.mark.browser
 DONE_TIMEOUT = 15_000
 
 
-def test_csp_enforced_clean_across_critical_path(page, bench):
+def test_csp_enforced_clean_across_critical_path(page, bench, open_history):
     # Arm the collectors before the bench fixture navigates, so a load-time
     # violation (a blocked script, style, or font) is caught too. The init
     # script runs before any page script, and console captures the mirror
@@ -74,7 +74,7 @@ def test_csp_enforced_clean_across_critical_path(page, bench):
     )
 
     # History: exercises GET /runs and a replay through GET /groups.
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     row = page.get_by_test_id("history-row").filter(has_text="csp path")
     expect(row).to_have_count(1, timeout=DONE_TIMEOUT)
     row.first.click()

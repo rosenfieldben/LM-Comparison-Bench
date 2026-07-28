@@ -275,7 +275,9 @@ def test_the_policy_reaches_the_wire_from_the_browser(zdr_bench):
 # ---- Phase G closing review.
 
 
-def test_review_repro_replay_uses_the_declared_position_not_the_chip_order(bench):
+def test_review_repro_replay_uses_the_declared_position_not_the_chip_order(
+    bench, open_history
+):
     """Closing review: the group replay sorted cards by the CURRENT chip
     order, which is the exact drift the position column was added to
     eliminate. Editing the lineup after a run rearranged that run's replay
@@ -296,7 +298,7 @@ def test_review_repro_replay_uses_the_declared_position_not_the_chip_order(bench
     # Reverse the lineup, which is what the old sort keyed on.
     page.evaluate("() => { BenchControls.lineup.reverse(); }")
 
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     page.get_by_test_id("history-row").filter(
         has_text="g-review declared order"
     ).click()

@@ -58,7 +58,7 @@ def collect_page_errors(page):
     return errors
 
 
-def test_superseded_run_never_touches_new_view(bench):
+def test_superseded_run_never_touches_new_view(bench, open_history):
     page = bench(["stub/slow", "stub/fast"])
     errors = collect_page_errors(page)
 
@@ -88,20 +88,25 @@ def test_superseded_run_never_touches_new_view(bench):
     expect(race_names.first).to_have_text("fast")
     assert errors == []
 
-    # The abort disconnected the stream, so the server persisted the
-    # first run through its existing disconnect path. Wait for that write
-    # to land before opening History: the list is fetched once per open, so
-    # an assertion made against an earlier fetch can never come true no
-    # matter how long it retries. Observed failing exactly that way, since
-    # the server only notices the disconnect when the stalled upstream read
-    # unwinds. This polls the API for the persisted row instead, the same
-    # deterministic wait the Stop persistence tombstone uses.
+    # Two different waits, and this test needed both. The first is for the
+    # write: the abort disconnected the stream, so the server persisted the
+    # first run through its existing disconnect path, and it only notices
+    # the disconnect when the stalled upstream read unwinds. The list is
+    # fetched once per open, so an assertion made against an earlier fetch
+    # can never come true no matter how long it retries. Observed failing
+    # exactly that way, which is why the poll below exists.
+    #
+    # The second is for the panel, and it lives in open_history now.
+    # Persistence says nothing about whether the panel has caught up, and
+    # a panel that has not is blank, so this test went on failing the same
+    # way on CI with only the poll in place. Necessary and not sufficient
+    # is the whole lesson here.
     page.wait_for_function(
         """(t) => fetch('/runs?limit=100').then(r => r.json())
               .then(d => d.runs.some(x => x.prompt_text.includes(t)))""",
         arg="first slow",
     )
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     row = page.get_by_test_id("history-row").filter(has_text="first slow")
     expect(row).to_have_count(1)
 
@@ -136,7 +141,7 @@ def test_in_flight_rerun_disables_run_and_never_touches_new_view(bench):
     assert errors == []
 
 
-def test_history_replay_mid_run_is_not_repainted(bench):
+def test_history_replay_mid_run_is_not_repainted(bench, open_history):
     page = bench(["stub/slow", "stub/fast"])
     errors = collect_page_errors(page)
 
@@ -151,7 +156,7 @@ def test_history_replay_mid_run_is_not_repainted(bench):
     start_run_via_ui(page, "live slow")
     expect(status_of(cards(page).first)).to_contain_text("thinking")
 
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="seed entry").click()
 
     expect(page.get_by_test_id("run-label")).to_contain_text("Historical")
@@ -170,7 +175,7 @@ def test_history_replay_mid_run_is_not_repainted(bench):
     assert errors == []
 
 
-def test_rapid_history_selections_last_click_wins(bench):
+def test_rapid_history_selections_last_click_wins(bench, open_history):
     page = bench(["stub/fast", "stub/html"])
     errors = collect_page_errors(page)
 
@@ -184,7 +189,7 @@ def test_rapid_history_selections_last_click_wins(bench):
     for i in range(2):
         expect(status_of(cards(page).nth(i))).to_have_text("done", timeout=DONE_TIMEOUT)
 
-    page.get_by_test_id("history-toggle").click()
+    open_history()
     page.get_by_test_id("history-row").filter(has_text="alpha entry").click()
     page.get_by_test_id("history-row").filter(has_text="beta entry").click()
 

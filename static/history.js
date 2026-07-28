@@ -29,11 +29,30 @@
   // is aborted rather than left to race the render.
   let historyListController = null;
 
+  // The panel is emptied the moment it opens and refilled only when the
+  // fetch comes back, so an empty list means two different things while
+  // one is in flight: still loading, or nothing to show. On a slow link
+  // that blank panel reads as broken, and anything watching for a row
+  // cannot tell a slow load from a missing row. So the list names its own
+  // state in words and in an attribute: idle before it has ever opened,
+  // then loading, then exactly one of ready, empty, or error.
+  //
+  // The attribute is not decoration. It is the only way to ask "has this
+  // finished" from outside, and a negative assertion about history is
+  // meaningless without it, because an unfinished load satisfies every
+  // one of them.
+  function setHistoryState(state, message) {
+    historyList.dataset.state = state;
+    // Assigning textContent also clears any previous rows, which is why
+    // the ready case passes an empty string before appending its own.
+    historyList.textContent = message;
+  }
+
   async function loadHistory() {
     if (historyListController !== null) historyListController.abort();
     const controller = new AbortController();
     historyListController = controller;
-    historyList.replaceChildren();
+    setHistoryState("loading", "loading history");
     historyNote.textContent = "";
     let data;
     try {
@@ -43,15 +62,19 @@
       if (!resp.ok) throw new Error("HTTP " + resp.status);
       data = await resp.json();
     } catch (err) {
+      // An aborted load has been superseded, so it leaves the state
+      // alone: the newer load already set its own, and overwriting it
+      // would report the loser's outcome.
       if (controller.signal.aborted) return;
-      historyList.textContent = "failed to load history: " + err.message;
+      setHistoryState("error", "failed to load history: " + err.message);
       return;
     }
     if (controller !== historyListController) return;
     if (data.runs.length === 0) {
-      historyList.textContent = "no runs yet";
+      setHistoryState("empty", "no runs yet");
       return;
     }
+    setHistoryState("ready", "");
     for (const run of data.runs) {
       // Buttons, not divs: rows must be reachable by keyboard.
       const row = document.createElement("button");
