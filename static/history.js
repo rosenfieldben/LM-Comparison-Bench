@@ -9,6 +9,7 @@
   const historyNote = document.getElementById("history-note");
   const resultsEl = document.getElementById("results");
   const runLabelEl = document.getElementById("run-label");
+  const runControlsEl = document.getElementById("run-controls");
 
   // ---- History. Loads on expand rather than page load: it is the
   // ---- rarely used half of the page and a stale list is worse than a
@@ -110,7 +111,21 @@
         countText += " · " + attempts + " attempts";
       }
       count.textContent = countText;
-      row.append(time, text, count);
+      // Badges for the controls this entry actually set, and nothing for a
+      // control it left to the provider. A group shows its declared record;
+      // a lone run shows what its payload proves, which never includes
+      // routing (see store._controls_from_request for why).
+      const badges = document.createElement("span");
+      badges.className = "hctl";
+      for (const badge of window.BenchLib.controlBadges(run.params)) {
+        const chip = document.createElement("span");
+        chip.className = "ctl-badge";
+        chip.dataset.testid = "history-control-badge";
+        chip.textContent = badge.text;
+        chip.title = badge.title;
+        badges.append(chip);
+      }
+      row.append(time, text, badges, count);
       row.title = run.models.join(", ");
       row.addEventListener("click", () =>
         run.type === "group" ? showGroup(run.id) : showRun(run.id),
@@ -127,6 +142,42 @@
     applyHistoryFilter();
   }
 
+  // The controls a replayed comparison ran under, badges plus the system
+  // prompt in full. The badge alone says only that a system prompt existed,
+  // which is the right amount for a one-line history row and not enough to
+  // reproduce the experiment; this is the view where the text belongs.
+  //
+  // Cleared by every path that takes over the view, including the failure
+  // and loading states, because a stale controls line under a new banner
+  // would attribute one comparison's experiment to another.
+  function renderRunControls(params) {
+    runControlsEl.replaceChildren();
+    const badges = window.BenchLib.controlBadges(params);
+    if (badges.length === 0) return;
+    const strip = document.createElement("div");
+    strip.className = "ctl-badges";
+    strip.dataset.testid = "run-control-badges";
+    for (const badge of badges) {
+      const chip = document.createElement("span");
+      chip.className = "ctl-badge";
+      chip.dataset.testid = "run-control-badge";
+      chip.textContent = badge.text;
+      chip.title = badge.title;
+      strip.append(chip);
+    }
+    runControlsEl.append(strip);
+    // textContent, never innerHTML: a system prompt is user text and gets
+    // the same no-HTML treatment model output does.
+    if (params?.system) {
+      const sys = document.createElement("div");
+      sys.className = "ctl-system";
+      sys.dataset.testid = "run-system-prompt";
+      sys.textContent = params.system;
+      sys.title = "the system prompt this comparison was run with";
+      runControlsEl.append(sys);
+    }
+  }
+
   // A history load owns the results area from the click, not from the
   // moment its fetch succeeds. Clearing the cards, race and diff and
   // showing a state up front is what keeps a failed or slow load from
@@ -134,6 +185,7 @@
   // always agree. The armed diff side survives (closeDiffPanel does not
   // disarm), so cross-replay diffing still works.
   function renderHistoryState(label, testid, cls, boxText) {
+    renderRunControls(null);
     resultsEl.replaceChildren();
     BenchRender.hideRace();
     BenchDiff.closeDiffPanel();
@@ -191,6 +243,9 @@
       " from " +
       group.created_at.slice(0, 19).replace("T", " ") +
       " UTC";
+    // The stored record, so a group can show a routing badge; a lone run
+    // cannot, since routing is not recoverable from a payload.
+    renderRunControls(group.params);
     // Cards in the order the comparison actually had. Runs persist in
     // completion order, so run order alone would shuffle cards between
     // replays.
@@ -268,6 +323,10 @@
       " from " +
       run.created_at.slice(0, 19).replace("T", " ") +
       " UTC";
+    // Derived from the payload rather than a stored record: this run has no
+    // group, so no controls set was ever declared for it. Any result of the
+    // run proves the same set, since one run sends one experiment.
+    renderRunControls(run.params);
     for (const result of run.results) {
       BenchRender.fillColumn(
         BenchRender.makeColumn(result.model),

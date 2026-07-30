@@ -991,3 +991,135 @@ def test_an_unreadable_params_column_reads_as_no_controls(tmp_path, stored):
         assert group["params"] is None
     finally:
         conn.close()
+
+
+def test_an_ungrouped_run_derives_its_controls_from_its_payload(tmp_path):
+    """Controls are declared on the group, so a run with no group has no
+    stored set. Its request_json is the payload that actually went out, and
+    four of the six controls appear there only because someone chose them,
+    which is enough to badge an ungrouped run the way a grouped one is."""
+    conn = store.connect(str(tmp_path / "e.db"))
+    try:
+        payload = {
+            "model": "m/a",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "p"},
+            ],
+            "temperature": 0.25,
+            "top_p": 0.9,
+            "seed": 7,
+            "reasoning": {"effort": "high"},
+            "provider": {"sort": "throughput"},
+        }
+        run_id = store.save_run(
+            conn,
+            "p",
+            [make_result(model="m/a", request_json=json.dumps(payload))],
+        )
+
+        run = store.get_run(conn, run_id)
+        assert run is not None
+        assert run["params"] == {
+            "system": "be terse",
+            "temperature": 0.25,
+            "top_p": 0.9,
+            "seed": 7,
+            "effort": "high",
+        }
+        entry = next(e for e in store.list_runs(conn) if e["id"] == run_id)
+        assert entry["params"] == run["params"]
+    finally:
+        conn.close()
+
+
+def test_routing_is_never_derived_from_a_payload(tmp_path):
+    """The interesting negative. provider.sort rides every payload the bench
+    has ever sent, because throughput is its own default, so a run carrying
+    sort=throughput is indistinguishable from one whose user asked for it.
+    Deriving a routing badge from that would render a default as a choice,
+    which is the exact truth defect rule two exists to prevent."""
+    conn = store.connect(str(tmp_path / "f.db"))
+    try:
+        for sort in ("throughput", "price", "default"):
+            run_id = store.save_run(
+                conn,
+                "p",
+                [
+                    make_result(
+                        model="m/a",
+                        request_json=json.dumps(
+                            {"messages": [], "provider": {"sort": sort}}
+                        ),
+                    )
+                ],
+            )
+            run = store.get_run(conn, run_id)
+            assert run is not None
+            assert run["params"] is None, sort
+    finally:
+        conn.close()
+
+
+def test_a_legacy_run_derives_no_controls_at_all(tmp_path):
+    """A pre-H payload has no controls in it, so nothing is claimed. Rows
+    with no request_json at all (pre-G) must also come back clean rather
+    than raising."""
+    conn = store.connect(str(tmp_path / "g.db"))
+    try:
+        pre_h = store.save_run(
+            conn,
+            "p",
+            [
+                make_result(
+                    model="m/a",
+                    request_json=json.dumps(
+                        {
+                            "model": "m/a",
+                            "messages": [{"role": "user", "content": "p"}],
+                            "max_tokens": 16384,
+                            "provider": {"sort": "throughput"},
+                        }
+                    ),
+                )
+            ],
+        )
+        pre_g = store.save_run(conn, "p", [make_result(model="m/b")])
+
+        for run_id in (pre_h, pre_g):
+            run = store.get_run(conn, run_id)
+            assert run is not None
+            assert run["params"] is None, run_id
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "not json",
+        "[1,2]",
+        "null",
+        '{"messages": "not a list"}',
+        '{"messages": [{"role": "user", "content": "p"}]}',
+        '{"messages": [{"role": "system"}]}',
+        '{"messages": [null]}',
+        '{"reasoning": "high"}',
+        '{"reasoning": {}}',
+        '{"temperature": null}',
+    ],
+)
+def test_a_malformed_payload_derives_nothing_rather_than_raising(tmp_path, payload):
+    """Repair on read: history has to render, and a row nobody can parse is
+    not evidence that a control was set. A raise here would take out the
+    whole list, which is the one view that could tell you the row is bad."""
+    conn = store.connect(str(tmp_path / "h.db"))
+    try:
+        run_id = store.save_run(
+            conn, "p", [make_result(model="m/a", request_json=payload)]
+        )
+        run = store.get_run(conn, run_id)
+        assert run is not None
+        assert run["params"] is None
+    finally:
+        conn.close()

@@ -267,6 +267,11 @@ class RunEntry(BaseModel):
     created_at: str
     prompt_text: str
     models: list[str]
+    # The controls this run was sent with, or None when it shows none.
+    # Derived from the recorded payload rather than stored, because
+    # controls live on the group and this run has none; see
+    # store._controls_from_request for why routing is never among them.
+    params: dict[str, Any] | None = None
 
 
 class GroupEntry(BaseModel):
@@ -276,6 +281,9 @@ class GroupEntry(BaseModel):
     prompt_text: str
     models: list[str]
     run_ids: list[int]
+    # The declared controls, straight off the group row. Only what was
+    # set, so history renders a badge for a choice and never for a default.
+    params: dict[str, Any] | None = None
 
 
 class RunList(BaseModel):
@@ -354,6 +362,11 @@ class RunDetail(BaseModel):
     app_sha: str | None = None
     catalog_snapshot_at: str | None = None
     data_policy: str | None = None
+    # The controls this run was sent with, derived from its recorded payload
+    # rather than stored: controls are declared on the group, and a run may
+    # have none. See store._controls_from_request for why routing is never
+    # among them.
+    params: dict[str, Any] | None = None
 
 
 class GroupDetail(BaseModel):

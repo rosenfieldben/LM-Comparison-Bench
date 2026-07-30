@@ -44,6 +44,9 @@
     checkedModels,
     updateRunState,
     autosizePrompt,
+    // Read by the stream client for the group POST and every stream
+    // request.
+    experimentParams,
     init,
   };
 
@@ -63,6 +66,88 @@
   const matchesEl = document.getElementById("model-matches");
   const themeBtn = document.getElementById("theme-btn");
   const motionBtn = document.getElementById("motion-btn");
+  const toggleControlsBtn = document.getElementById("toggle-controls");
+  const controlsPanel = document.getElementById("experiment-controls");
+  const controlsSummary = document.getElementById("controls-summary");
+  const controlsNote = document.getElementById("controls-note");
+
+  // Each experiment control, its input, and how to read a set value out of
+  // it. The reader returns null for "not set", which is the one thing every
+  // control has to be able to say: rule one is that a blank control does
+  // not reach the payload at all, and this is where blankness is decided.
+  //
+  // Number() rather than parseFloat: parseFloat("2abc") is 2, and a value
+  // the browser handed back as text that only starts like a number is not a
+  // number the user typed on purpose. An empty input is checked first, since
+  // Number("") is 0 and 0 is a legitimate temperature.
+  const CONTROL_INPUTS = [
+    ["system", "ctl-system", (el) => el.value.trim() || null],
+    ["temperature", "ctl-temperature", readNumber],
+    ["top_p", "ctl-top-p", readNumber],
+    ["seed", "ctl-seed", readNumber],
+    ["effort", "ctl-effort", (el) => el.value || null],
+    ["routing", "ctl-routing", (el) => el.value || null],
+  ];
+
+  function readNumber(el) {
+    if (el.value.trim() === "") return null;
+    const parsed = Number(el.value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const controlEls = new Map(
+    CONTROL_INPUTS.map(([name, id, read]) => [
+      name,
+      { el: document.getElementById(id), read },
+    ]),
+  );
+
+  // The controls the user has actually set, in the shape the API takes.
+  // Absent keys, never nulls: the server's ExperimentParams treats a
+  // present null as a set-to-null field and would reject it, and more to
+  // the point an object full of nulls is a record of nothing pretending to
+  // be a record.
+  function experimentParams() {
+    const out = {};
+    for (const [name, { el, read }] of controlEls) {
+      const value = read(el);
+      if (value !== null) out[name] = value;
+    }
+    return out;
+  }
+
+  // A control whose input the browser marks invalid (out of range, or a
+  // step it cannot honor) would 422 at the boundary once per model, which
+  // arrives as a card full of identical errors and no explanation. Saying
+  // so before the money moves is cheaper and truthful; Run stays disabled
+  // until it is fixed.
+  function invalidControls() {
+    const bad = [];
+    for (const [name, { el }] of controlEls) {
+      if (el.checkValidity && !el.checkValidity()) bad.push(name);
+    }
+    return bad;
+  }
+
+  // What the composer says about its own controls, so a controlled run is
+  // never started blind with the panel collapsed. Badges come from the same
+  // formatter history uses, so the row and the run agree by construction.
+  function renderControlsSummary() {
+    const bad = invalidControls();
+    controlsNote.textContent = bad.length
+      ? "out of range: " + bad.join(", ")
+      : "";
+    if (bad.length) {
+      controlsSummary.textContent = "check " + bad.join(", ");
+      controlsSummary.title = "these controls are out of range";
+      return;
+    }
+    const badges = window.BenchLib.controlBadges(experimentParams());
+    controlsSummary.textContent = badges.map((b) => b.text).join(" · ");
+    controlsSummary.title = badges.length
+      ? "controls set for the next run"
+      : "no controls set; every provider applies its own defaults";
+  }
 
   function saveLineup() {
     // Guarded like the pref helpers below: a quota or SecurityError must
@@ -263,8 +348,14 @@
 
   function updateRunState() {
     const checked = checkedModels().length;
+    // Summary first, because the disable below reads its validity check and
+    // the panel may be collapsed over the offending input.
+    renderControlsSummary();
     runBtn.disabled =
-      BS.inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
+      BS.inflightRuns > 0 ||
+      promptEl.value.trim() === "" ||
+      checked === 0 ||
+      invalidControls().length > 0;
     // Stop is live exactly while runs are: it acts on the in-flight
     // controllers and has nothing to do when the count is zero.
     stopBtn.disabled = BS.inflightRuns === 0;
@@ -427,6 +518,21 @@
       }
       queryInput.focus();
     });
+
+    toggleControlsBtn.addEventListener("click", () => {
+      controlsPanel.hidden = !controlsPanel.hidden;
+      toggleControlsBtn.setAttribute(
+        "aria-expanded",
+        String(!controlsPanel.hidden),
+      );
+    });
+    // input covers typing and the number spinners; change covers the two
+    // selects, which do not fire input on every browser. Both land on
+    // updateRunState because a control can turn Run off as well as on.
+    for (const { el } of controlEls.values()) {
+      el.addEventListener("input", updateRunState);
+      el.addEventListener("change", updateRunState);
+    }
 
     queryInput.addEventListener("input", renderMatches);
     queryInput.addEventListener("keydown", (e) => {

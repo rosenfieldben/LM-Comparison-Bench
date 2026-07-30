@@ -13,6 +13,7 @@ const {
   niceScale,
   tokenizeDiff,
   diffTokens,
+  controlBadges,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
 
@@ -123,4 +124,72 @@ test("an exact zero reads as zero, not as an exponent", () => {
   // is written.
   assert.equal(fmtBilled(0), "$0.0000");
   assert.equal(fmtCost(0), "~$0.0000");
+});
+
+test("controlBadges renders a badge for a set control and only a set one", () => {
+  assert.deepEqual(
+    controlBadges({ temperature: 0.2, seed: 7 }).map((b) => b.text),
+    ["t=0.2", "seed 7"],
+  );
+  // Fixed order regardless of key order, so two comparisons with the same
+  // controls read the same way.
+  assert.deepEqual(
+    controlBadges({
+      routing: "price",
+      seed: 7,
+      system: "be terse",
+      effort: "high",
+      top_p: 0.9,
+      temperature: 0.2,
+    }).map((b) => b.text),
+    ["sys", "t=0.2", "top_p=0.9", "seed 7", "effort high", "route price"],
+  );
+});
+
+test("controlBadges renders nothing when nothing was set", () => {
+  // Every absence spelling the server can produce, plus a controls object
+  // whose keys are all explicitly absent.
+  assert.deepEqual(controlBadges(null), []);
+  assert.deepEqual(controlBadges(undefined), []);
+  assert.deepEqual(controlBadges({}), []);
+  assert.deepEqual(
+    controlBadges({ temperature: null, seed: undefined, system: "" }),
+    [],
+  );
+});
+
+test("controlBadges treats zero as a value, not as blankness", () => {
+  // temperature 0 is the most deliberate setting there is: a falsy skip
+  // test would drop exactly the control that matters most.
+  assert.deepEqual(
+    controlBadges({ temperature: 0, top_p: 0, seed: 0 }).map((b) => b.text),
+    ["t=0", "top_p=0", "seed 0"],
+  );
+});
+
+test("controlBadges shows the system prompt as presence, not as text", () => {
+  // The row is one line, and a truncated prompt would invite comparing two
+  // comparisons on an excerpt that happens to match. The text belongs to
+  // the comparison view.
+  const [badge] = controlBadges({ system: "You are a helpful assistant." });
+  assert.equal(badge.text, "sys");
+  assert.ok(!badge.text.includes("helpful"));
+  assert.match(badge.title, /system prompt was set/);
+});
+
+test("controlBadges gives every badge a long-form title", () => {
+  const titles = controlBadges({
+    temperature: 0.2,
+    top_p: 0.9,
+    seed: 7,
+    effort: "low",
+    routing: "default",
+  }).map((b) => b.title);
+  assert.deepEqual(titles, [
+    "temperature 0.2",
+    "top_p 0.9",
+    "seed 7",
+    "reasoning effort low",
+    "provider routing: default",
+  ]);
 });

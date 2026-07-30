@@ -117,6 +117,48 @@
     return ops.reverse();
   }
 
+  // The badge vocabulary for experiment controls, in a fixed order so two
+  // comparisons with the same controls read the same way. Compact because
+  // a history row is one line that already carries a timestamp, a prompt
+  // excerpt and a model count; the long form lives in the title.
+  //
+  // The system prompt gets a presence badge and not its text. A prompt long
+  // enough to matter would swamp the row, and a truncated one invites the
+  // reader to compare two comparisons on an excerpt that happens to match.
+  // The full text belongs to the comparison view.
+  const CONTROL_BADGES = [
+    [
+      "system",
+      () => "sys",
+      () => "a system prompt was set for this comparison",
+    ],
+    ["temperature", (v) => "t=" + v, (v) => "temperature " + v],
+    ["top_p", (v) => "top_p=" + v, (v) => "top_p " + v],
+    ["seed", (v) => "seed " + v, (v) => "seed " + v],
+    ["effort", (v) => "effort " + v, (v) => "reasoning effort " + v],
+    ["routing", (v) => "route " + v, (v) => "provider routing: " + v],
+  ];
+
+  // Badges for the controls a comparison actually set, and only those.
+  // Rendering a control the user never chose would present a provider
+  // default as a decision, which is the truth defect the whole controls
+  // design exists to avoid, so absence has to survive all the way here.
+  //
+  // Zero is a value, not blankness: temperature 0 is the most deliberate
+  // setting there is, so the skip test is an explicit null check and never
+  // a falsy one. An empty string is skipped, because the API forbids one
+  // and a badge built from it would claim a prompt that is not there.
+  function controlBadges(params) {
+    if (!params) return [];
+    const out = [];
+    for (const [key, text, title] of CONTROL_BADGES) {
+      const value = params[key];
+      if (value === null || value === undefined || value === "") continue;
+      out.push({ text: text(value), title: title(value) });
+    }
+    return out;
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -125,6 +167,7 @@
     niceScale,
     tokenizeDiff,
     diffTokens,
+    controlBadges,
     DIFF_TOKEN_LIMIT,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;

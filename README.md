@@ -464,6 +464,27 @@ comparable. A group holds one experiment the way it holds one prompt, and a
 run whose controls disagree with its group's is refused with a 409 at
 entry, before any upstream call, naming the controls that conflict.
 
+In the browser they live behind **+ Controls** in the composer, collapsed
+by default and blank inside. Nothing is pre-filled, because a box showing
+`1.0` would look like a decision you had made. The collapsed row summarises
+what is set, so a controlled run is never started blind, and a control the
+browser can see is out of range disables Run and says which one rather than
+letting the request fail once per model. A rerun of a failed card replays
+the controls that card ran under, not whatever the panel holds by then: a
+rerun is a second sample of the same experiment.
+
+History shows the same controls as compact badges, `t=0.25`, `seed 7`,
+`sys`, `effort high`, `route price`, and shows them only for controls that
+were set. The system prompt gets a presence badge rather than its text,
+since a row is one line and a truncated prompt would invite comparing two
+comparisons on an excerpt that happens to match; open the comparison and
+the full text is there above the cards. One asymmetry worth knowing: an
+ungrouped run (a single-model rerun, or anything from before groups
+existed) derives its badges from its recorded payload, and routing cannot
+be recovered that way, because the bench's own throughput preference
+appears in every payload it has ever sent. Rather than present that as a
+choice, an ungrouped run shows no routing badge at all.
+
 Routing mode picks how OpenRouter chooses among the providers serving a
 model. `throughput` is the default and is what the bench has always sent;
 `price` prefers the cheapest; `default` sends no sort at all, which is the

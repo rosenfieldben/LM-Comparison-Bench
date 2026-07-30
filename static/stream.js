@@ -23,9 +23,19 @@
     }
   }
 
+  // Whether a controls object holds anything at all. Rule one lives here on
+  // the client side: an empty controls set must produce a body with no
+  // params key, not a body carrying an empty object, because the server
+  // stores the two identically but the wire should not have to be trusted
+  // to collapse them.
+  function hasControls(controls) {
+    return controls != null && Object.keys(controls).length > 0;
+  }
+
   const promptEl = document.getElementById("prompt");
   const resultsEl = document.getElementById("results");
   const runLabelEl = document.getElementById("run-label");
+  const runControlsEl = document.getElementById("run-controls");
   const runBtn = document.getElementById("run");
   const stopBtn = document.getElementById("stop");
 
@@ -38,6 +48,10 @@
     ui,
     epoch,
     position,
+    // The controls this run was sent with. Passed in rather than read from
+    // the composer, so a rerun issued minutes later replays the experiment
+    // it belongs to and not whatever the panel happens to hold by then.
+    controls,
   ) {
     // Superseded before it started: spend no money for a dead view.
     if (epoch !== BenchState.viewEpoch) return;
@@ -163,7 +177,15 @@
             // first click.
             retry:
               result.error != null && !refused
-                ? { prompt, model, promptId, groupId, budget, position }
+                ? {
+                    prompt,
+                    model,
+                    promptId,
+                    groupId,
+                    budget,
+                    position,
+                    controls,
+                  }
                 : null,
             // A user Stop renders as an honest stopped state, not done or
             // error.
@@ -292,6 +314,12 @@
           prompt_id: promptId,
           group_id: groupId,
           budget: budget,
+          // Sent on every stream request so the one experiment per group
+          // check has something to check. The group's stored copy, written
+          // before any upstream call, is the record; this is the claim being
+          // checked against it. Omitted entirely when nothing was set, which
+          // is what keeps a blank run's body what it always was.
+          ...(hasControls(controls) ? { params: controls } : {}),
           // Which column this run occupies, so a replay can rebuild the
           // layout from the rows instead of from the current chip order,
           // which drifts as the lineup is edited. A rerun re-sends the
@@ -397,6 +425,11 @@
     const promptId = BenchState.selectedPromptId;
     const budget = BenchControls.budgetValue;
     const models = BenchControls.checkedModels();
+    // Read once, here, and passed down. One comparison is one experiment, so
+    // every request in this batch has to carry the same controls; reading
+    // the panel per model would let an edit mid-batch split the group and
+    // trip the server's own one-experiment check.
+    const controls = BenchControls.experimentParams();
     const epoch = BenchState.newViewEpoch();
     // Reserve the in-flight registry synchronously, before the /groups
     // await below, so the Run button is disabled for the whole batch
@@ -407,6 +440,11 @@
     BenchState.inflightRuns += 1;
     resultsEl.replaceChildren();
     runLabelEl.textContent = "";
+    // A live run replaces a replay, so the replayed comparison's controls
+    // line goes with it. The composer's own summary is what says what THIS
+    // run is being sent with; leaving the old line up would attribute a
+    // stored experiment to a running one.
+    runControlsEl.replaceChildren();
     // A new comparison replaces the cards a shown diff came from.
     BenchDiff.closeDiffPanel();
     BenchDiff.disarmDiff();
@@ -444,7 +482,15 @@
       const resp = await fetch("/groups", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt: prompt, models: models }),
+        body: JSON.stringify({
+          prompt: prompt,
+          models: models,
+          // The experiment record. Declared here, before any upstream call,
+          // which is what makes the group row the thing later runs are
+          // checked against rather than a claim assembled after the money
+          // moved.
+          ...(hasControls(controls) ? { params: controls } : {}),
+        }),
         signal: groupController.signal,
       });
       if (resp.ok) groupId = (await resp.json()).id;
@@ -476,6 +522,7 @@
             columns[i],
             epoch,
             i,
+            controls,
           ),
         ),
       );

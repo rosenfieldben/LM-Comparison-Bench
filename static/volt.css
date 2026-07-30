@@ -778,3 +778,40 @@
   .htime { color: var(--text-faint); white-space: nowrap; }
   .hprompt { color: var(--text-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hcount { color: var(--hist-count); white-space: nowrap; }
+
+/* Experiment controls: the composer panel, the collapsed summary, and the
+   badges history and the replay banner share. Sized down like the rest of
+   the metadata furniture so the prompt and the answers stay the loudest
+   things on the page. */
+#controls-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+#controls-summary { font-size: 11px; color: var(--text-faint); }
+#experiment-controls { margin-top: 8px; display: grid; gap: 8px; }
+/* An explicit display on an id selector outranks the user agent's
+   [hidden] { display: none }, so the collapsed panel needs saying twice.
+   Same guard #name-row already carries, for the same reason. */
+#experiment-controls[hidden] { display: none; }
+#controls-scalars { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
+.ctl { display: flex; align-items: center; gap: 5px; font-size: 11px; }
+.ctl label { color: var(--text-faint); }
+.ctl input { width: 82px; }
+#controls-note { font-size: 11px; color: var(--warn, var(--text-faint)); }
+.hctl, .ctl-badges { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.ctl-badge {
+  font-size: 10px;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid var(--line);
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+#run-controls { display: grid; gap: 4px; }
+/* pre-wrap because a system prompt's line breaks are part of it, and a
+   prompt that reads differently here than it did on the wire would be a
+   quiet lie about the experiment. */
+.ctl-system {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: pre-wrap;
+  border-left: 2px solid var(--line);
+  padding-left: 8px;
+}
