@@ -1,7 +1,9 @@
 import json
 import math
 import re
+import typing
 from pathlib import Path
+from typing import Literal
 
 import httpx
 import pytest
@@ -2989,3 +2991,112 @@ def test_a_legacy_group_says_why_it_cannot_take_controls(client):
 
         assert bare.status_code == 409
         assert "do not match" in bare.json()["detail"]
+
+
+# ---- Phase H2 follow-through: the markup's bounds are the model's bounds.
+
+# Which control maps to which input, and which HTML attributes carry its
+# bound. The browser enforces these client side via checkValidity, which is
+# what lets the composer disable Run instead of letting a bad value 422 once
+# per model. That convenience duplicates the API's bounds in a second
+# language, and a duplicate that drifts LOW would wrongly block a run the
+# API would have accepted, which is the worse direction: the user is stopped
+# from doing something legal and told it is out of range.
+_MARKUP_BOUNDS = {
+    "temperature": "ctl-temperature",
+    "top_p": "ctl-top-p",
+    "seed": "ctl-seed",
+}
+_MARKUP_OPTIONS = {"effort": "ctl-effort", "routing": "ctl-routing"}
+
+
+def _input_attrs(html: str, testid: str) -> dict[str, str]:
+    tag = re.search(
+        rf'<(?:input|select|textarea)[^>]*data-testid="{testid}"[^>]*>', html
+    )
+    assert tag is not None, testid
+    return dict(re.findall(r'(\w[\w-]*)="([^"]*)"', tag.group(0)))
+
+
+def _select_values(html: str, testid: str) -> list[str]:
+    block = re.search(rf'<select[^>]*data-testid="{testid}".*?</select>', html, re.S)
+    assert block is not None, testid
+    return re.findall(r'<option value="([^"]*)"', block.group(0))
+
+
+def _model_bound(field: str, kind: str):
+    for constraint in main.ExperimentParams.model_fields[field].metadata:
+        if type(constraint).__name__ == kind:
+            return getattr(constraint, kind.lower())
+    return None
+
+
+def test_the_markup_bounds_match_the_shared_request_model():
+    """The client-side range guard is a convenience, not an authority: the
+    API's ExperimentParams is the single source of truth for every bound,
+    and the markup's min and max only exist so the composer can refuse a
+    value before it costs one request per model.
+
+    Two languages holding one rule is a drift hazard, so it is asserted
+    rather than reviewed. The direction that matters most is a markup bound
+    TIGHTER than the model's: it would block a run the API would have
+    accepted, and tell the user their legal value is out of range. A looser
+    markup bound is merely a 422 the composer failed to pre-empt.
+    """
+    html = (
+        Path(main.__file__).resolve().parent.parent / "static/index.html"
+    ).read_text()
+
+    for field, testid in _MARKUP_BOUNDS.items():
+        attrs = _input_attrs(html, testid)
+        for kind, attr in (("Ge", "min"), ("Le", "max")):
+            model_value = _model_bound(field, kind)
+            if attr not in attrs:
+                # An unbounded input is honest for seed, whose bound exists
+                # only to keep an absurd body out and is far outside
+                # anything a number input would help with.
+                assert field == "seed", f"{field} lost its {attr}"
+                continue
+            assert float(attrs[attr]) == float(model_value), (
+                f"{field}: markup {attr}={attrs[attr]} but model says {model_value}"
+            )
+
+    for field, testid in _MARKUP_OPTIONS.items():
+        allowed = typing.get_args(
+            next(
+                a
+                for a in typing.get_args(
+                    main.ExperimentParams.model_fields[field].annotation
+                )
+                if typing.get_origin(a) is Literal
+            )
+        )
+        offered = _select_values(html, testid)
+        # The empty option is the unset control, which is an absence rather
+        # than a value the model accepts; everything else must be a value
+        # the API would take.
+        assert offered[0] == "", f"{field} must offer unset first"
+        assert tuple(offered[1:]) == allowed, (
+            f"{field}: markup offers {offered[1:]} but model accepts {allowed}"
+        )
+
+
+def test_every_control_the_model_accepts_has_an_input(client):
+    """Drift in the other direction: a control added to the API with no way
+    to set it in the browser would be a scripting-only feature nobody
+    discovers, and one removed from the markup would silently stop being
+    holdable."""
+    html = (
+        Path(main.__file__).resolve().parent.parent / "static/index.html"
+    ).read_text()
+    ids = {
+        "system": "ctl-system",
+        **_MARKUP_BOUNDS,
+        **_MARKUP_OPTIONS,
+    }
+
+    assert set(ids) == set(main.ExperimentParams.model_fields), (
+        "a control gained or lost an input; update the markup and this map"
+    )
+    for testid in ids.values():
+        assert f'data-testid="{testid}"' in html, testid

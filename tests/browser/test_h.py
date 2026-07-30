@@ -28,9 +28,18 @@ def status_of(card):
 
 
 def check_all_chips(page):
+    """Check every chip, idempotently.
+
+    Clicking a chip toggles it, so a blind click sweep run twice unchecks
+    everything and leaves Run disabled. That is easy to write and confusing
+    to debug, since the failure surfaces as a timeout on Run rather than on
+    the lineup.
+    """
     chips = page.get_by_test_id("lineup-chip")
     for i in range(chips.count()):
-        chips.nth(i).click()
+        box = chips.nth(i).locator("input[type=checkbox]")
+        if not box.is_checked():
+            chips.nth(i).click()
 
 
 def open_controls(page):
@@ -256,3 +265,214 @@ def test_the_group_row_records_the_controls_the_run_declared(bench, bench_url):
     assert "routing" not in sent
     for absent in ("top_p", "seed", "reasoning"):
         assert absent not in sent, absent
+
+
+# ---- H3: reuse a comparison.
+
+
+def open_history(page):
+    page.get_by_test_id("history-toggle").click()
+    expect(page.get_by_test_id("history-list")).to_have_attribute(
+        "data-state", "ready", timeout=DONE_TIMEOUT
+    )
+
+
+def controls_now(page):
+    return page.evaluate("() => BenchControls.experimentParams()")
+
+
+def test_reuse_round_trips_prompt_controls_and_the_stored_record(bench):
+    """The round trip that makes then-versus-now possible: run a controlled
+    comparison, reuse it, run it again, and the second group's stored record
+    must equal the first's. Anything less and the two runs are not the same
+    experiment, which is the only reason to compare them.
+
+    The composer is read through BenchControls.experimentParams, the same
+    function the run path uses, so this asserts what would actually be sent
+    rather than what the inputs happen to display.
+    """
+    system = "You are terse.\nOne line only."
+    page = bench(["stub/fast", "stub/slow"])
+    open_controls(page)
+    page.get_by_test_id("ctl-system").fill(system)
+    page.get_by_test_id("ctl-temperature").fill("0.25")
+    page.get_by_test_id("ctl-seed").fill("7")
+    page.get_by_test_id("ctl-effort").select_option("high")
+    page.get_by_test_id("ctl-routing").select_option("price")
+    check_all_chips(page)
+    run_and_wait(page, "h3 reuse round trip", 2)
+
+    first = page.evaluate(
+        """() => fetch('/runs?limit=100').then((r) => r.json())
+              .then((d) => d.runs.find((e) =>
+                  e.prompt_text.includes('h3 reuse round trip')))"""
+    )
+    assert first["type"] == "group"
+
+    # Wipe the composer so the prefill has to do all the work, and prove the
+    # wipe took: a test that passed because the values were never cleared
+    # would assert nothing.
+    page.get_by_test_id("prompt-input").fill("something else entirely")
+    page.evaluate("() => BenchControls.setExperimentParams(null)")
+    assert controls_now(page) == {}
+
+    open_history(page)
+    row_for(page, "h3 reuse round trip").first.click()
+    expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
+    page.get_by_test_id("reuse-comparison").click()
+
+    # Prompt and every set control are back, read through the run path's own
+    # accessor.
+    expect(page.get_by_test_id("prompt-input")).to_have_value("h3 reuse round trip")
+    assert controls_now(page) == first["params"]
+    assert controls_now(page) == {
+        "system": system,
+        "temperature": 0.25,
+        "seed": 7,
+        "effort": "high",
+        "routing": "price",
+    }
+
+    # Prefill only: money moves on an explicit Run and on nothing else.
+    # Card count is the wrong signal here, because opening the row replayed
+    # the stored comparison and those cards are the replay's. What proves
+    # nothing ran is that the view is still the historical one and history
+    # still holds exactly one entry for this prompt.
+    expect(page.get_by_test_id("run-label")).to_contain_text("Historical")
+    assert (
+        page.evaluate(
+            """() => fetch('/runs?limit=100').then((r) => r.json())
+                  .then((d) => d.runs.filter((e) =>
+                      e.prompt_text.includes('h3 reuse round trip')).length)"""
+        )
+        == 1
+    )
+
+    # Run it again, and the new group's record equals the old one's.
+    check_all_chips(page)
+    run_and_wait(page, "h3 reuse round trip", 2)
+    second = page.evaluate(
+        """() => fetch('/runs?limit=100').then((r) => r.json())
+              .then((d) => d.runs.filter((e) =>
+                  e.prompt_text.includes('h3 reuse round trip')))"""
+    )
+    assert len(second) == 2, second
+    assert second[0]["params"] == second[1]["params"] == first["params"]
+    assert second[0]["id"] != first["id"]
+
+
+def test_reuse_leaves_the_lineup_alone(bench):
+    """The whole point of then-versus-now is running an old experiment
+    against today's models, so which models those are stays the user's
+    choice. Restoring the source's lineup would silently answer a question
+    the user was asking."""
+    page = bench(["stub/fast", "stub/slow"])
+    open_controls(page)
+    page.get_by_test_id("ctl-seed").fill("3")
+    page.get_by_test_id("lineup-chip").nth(0).click()
+    run_and_wait(page, "h3 lineup untouched", 1)
+
+    # Change the lineup selection to something the source never used.
+    page.get_by_test_id("lineup-chip").nth(0).click()
+    page.get_by_test_id("lineup-chip").nth(1).click()
+    before = page.evaluate("() => BenchControls.checkedModels()")
+    assert before == ["stub/slow"]
+
+    open_history(page)
+    row_for(page, "h3 lineup untouched").first.click()
+    page.get_by_test_id("reuse-comparison").click()
+
+    assert page.evaluate("() => BenchControls.checkedModels()") == before
+
+
+def test_reuse_clears_a_control_the_source_did_not_set(bench):
+    """Reuse reproduces an experiment, so a leftover value is not a
+    harmless convenience: it would make the new run a different experiment
+    wearing the reused label, and the server would refuse to group it with
+    its source for exactly that reason."""
+    page = bench(["stub/fast"])
+    open_controls(page)
+    page.get_by_test_id("ctl-seed").fill("5")
+    check_all_chips(page)
+    run_and_wait(page, "h3 only a seed", 1)
+
+    # Set controls the source never had.
+    page.get_by_test_id("ctl-temperature").fill("1.9")
+    page.get_by_test_id("ctl-effort").select_option("low")
+
+    open_history(page)
+    row_for(page, "h3 only a seed").first.click()
+    page.get_by_test_id("reuse-comparison").click()
+
+    assert controls_now(page) == {"seed": 5}
+    expect(page.get_by_test_id("ctl-temperature")).to_have_value("")
+    expect(page.get_by_test_id("ctl-effort")).to_have_value("")
+
+
+def test_reuse_of_a_comparison_with_no_controls_restores_only_the_prompt(bench):
+    """The legacy and no-controls edge. Nothing was set, so nothing is
+    restored, and the reuse action still offers itself because a prompt is
+    worth reusing on its own."""
+    page = bench(["stub/fast"])
+    check_all_chips(page)
+    run_and_wait(page, "h3 bare comparison", 1)
+
+    open_controls(page)
+    page.get_by_test_id("ctl-temperature").fill("0.8")
+
+    open_history(page)
+    row_for(page, "h3 bare comparison").first.click()
+    expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
+    page.get_by_test_id("reuse-comparison").click()
+
+    expect(page.get_by_test_id("prompt-input")).to_have_value("h3 bare comparison")
+    assert controls_now(page) == {}
+
+
+def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(page, bench_url):
+    """The documented lossy edge, surfaced rather than left silent.
+
+    An ungrouped run has no stored controls set; its controls are derived
+    from its recorded payload, and routing is the one control that
+    derivation cannot recover, because provider.sort rides every payload the
+    bench has ever sent so a stored throughput cannot be told from a chosen
+    one. Reuse from such a source is therefore lossy for routing by
+    construction, and guessing would be the same truth defect as any other
+    default rendered as a choice.
+
+    Lossy is acceptable. Quiet is not. The button says so before the click
+    and the composer says so after, and this test holds both.
+    """
+    # An ungrouped run with controls, built through the API rather than the
+    # UI: the browser always creates a group, so this shape comes from a
+    # scripted caller or from a pre-groups database.
+    made = page.request.post(
+        bench_url + "/compare",
+        data={
+            "prompt": "h3 ungrouped source",
+            "models": ["stub/fast"],
+            "params": {"temperature": 0.4, "routing": "price"},
+        },
+    )
+    assert made.ok, made.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row = row_for(page, "h3 ungrouped source")
+    expect(row).to_have_count(1)
+    # The row already shows the asymmetry: temperature is derivable, routing
+    # is not, so no route badge appears even though one was sent.
+    assert badge_texts(row.get_by_test_id("history-control-badge")) == ["t=0.4"]
+
+    row.first.click()
+    reuse = page.get_by_test_id("reuse-comparison")
+    expect(reuse).to_be_visible(timeout=DONE_TIMEOUT)
+    # Warned before the click.
+    assert "routing is not restored" in reuse.get_attribute("title")
+
+    reuse.click()
+
+    # Warned after it, too, and the prefill is honest about what it holds:
+    # the temperature it could recover, and no routing it could not.
+    expect(page.get_by_test_id("prompt-msg")).to_contain_text("routing is not restored")
+    assert controls_now(page) == {"temperature": 0.4}

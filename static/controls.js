@@ -45,8 +45,10 @@
     updateRunState,
     autosizePrompt,
     // Read by the stream client for the group POST and every stream
-    // request.
+    // request; written by the reuse action in history.
     experimentParams,
+    setExperimentParams,
+    reuseExperiment,
     init,
   };
 
@@ -116,11 +118,62 @@
     return out;
   }
 
+  // Prefill the controls from a stored experiment, for the reuse action.
+  //
+  // Fed the params OBJECT the API returns, never the badge strings the same
+  // data renders as. Badges are presentation and lossy on purpose: "sys"
+  // carries no text at all, "t=0.25" is a formatted number, and parsing
+  // either back would promote a display format into a data format and break
+  // the moment a badge was reworded. The data path is the only path.
+  //
+  // Absent controls are CLEARED rather than left alone. Reuse reproduces an
+  // experiment, so a temperature left in the box from an earlier edit would
+  // quietly make the new run a different experiment from the one being
+  // reused, which is the exact confusion this phase exists to remove. What
+  // the source did not set, the composer must not set either.
+  function setExperimentParams(params) {
+    const source = params || {};
+    for (const [name, { el }] of controlEls) {
+      const value = source[name];
+      el.value = value === null || value === undefined ? "" : String(value);
+    }
+  }
+
+  // Reuse a stored comparison: its prompt and its controls, and nothing
+  // else. The lineup is deliberately untouched, because the point of
+  // then-versus-now is running an old experiment against today's models,
+  // so which models those are stays the user's choice.
+  //
+  // Prefill only. Nothing here starts a run: money moves on an explicit
+  // Run click and on nothing else, and an action that spent money because
+  // the user clicked "reuse" would be a trap.
+  function reuseExperiment(source) {
+    promptEl.value = source.prompt || "";
+    // The reused text is a historical prompt, not a library selection, so
+    // the saved-prompt link goes with it. Leaving it would attach the new
+    // run to a library entry whose text it may no longer match, which is
+    // the lie the input handler below already clears on every keystroke.
+    BS.selectedPromptId = null;
+    savedSelect.value = "";
+    setExperimentParams(source.params);
+    autosizePrompt();
+    updateRunState();
+  }
+
   // A control whose input the browser marks invalid (out of range, or a
   // step it cannot honor) would 422 at the boundary once per model, which
   // arrives as a card full of identical errors and no explanation. Saying
   // so before the money moves is cheaper and truthful; Run stays disabled
   // until it is fixed.
+  //
+  // The bounds themselves are NOT defined here. checkValidity reads the min
+  // and max attributes in index.html, which mirror ExperimentParams in
+  // bench/main.py; that model is the single source of truth and the only
+  // thing that actually enforces a bound. This function is a convenience
+  // over it, never an authority, so it can only ever be wrong by being out
+  // of date. A test asserts the two sets match, because the drift that
+  // matters is a browser bound tighter than the API's: it would refuse a
+  // legal run and blame the user's value.
   function invalidControls() {
     const bad = [];
     for (const [name, { el }] of controlEls) {

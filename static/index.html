@@ -83,6 +83,14 @@
             title="Sampling and routing held constant across every model in the comparison">+ Controls</button>
     <span id="controls-summary" data-testid="controls-summary" role="status"></span>
   </div>
+  <!-- The min, max and option values below mirror ExperimentParams in
+       bench/main.py, which is the single source of truth for every bound.
+       They exist here only so the browser can refuse a value before it
+       costs one 422 per model; the API is what actually enforces them.
+       tests/test_api.py::test_the_markup_bounds_match_the_shared_request_model
+       asserts the two sets agree, because a markup bound tighter than the
+       model's would block a run the API would have accepted and tell the
+       user their legal value is out of range. -->
   <div id="experiment-controls" data-testid="experiment-controls" hidden>
     <label class="panel-label" for="ctl-system">System prompt</label>
     <textarea id="ctl-system" data-testid="ctl-system" rows="2"

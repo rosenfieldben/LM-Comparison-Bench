@@ -485,6 +485,36 @@ be recovered that way, because the bench's own throughput preference
 appears in every payload it has ever sent. Rather than present that as a
 choice, an ungrouped run shows no routing badge at all.
 
+### Then versus now
+
+Running an old experiment against today's models takes three steps, and the
+hard part was already built:
+
+1. **Reuse.** Open a comparison from History and press **reuse**. The
+   composer fills with its prompt and every control it set. Your lineup is
+   left exactly as it is, because which models you want to compare *now* is
+   the question you are asking. Nothing runs: money moves on Run and on
+   nothing else.
+2. **Run.** The new comparison is sent with the same controls, so it records
+   the same `params_json` as its source. Two runs of one experiment, months
+   apart.
+3. **Arm and diff.** Open the old comparison again, arm a card with
+   **diff**, then arm the matching card from the new run. The panel shows
+   what changed. This works because arming survives a history replay by
+   design, which the Phase F.2 work put in deliberately; nothing was added
+   here to enable it.
+
+There is no stored link between a reused comparison and its source. The
+prompt and controls match, which is what makes them comparable, but the
+bench does not claim a lineage it would have to maintain.
+
+One honest limit. Reuse from an **ungrouped** run cannot restore routing,
+for the same reason its badges cannot show it: routing is not recoverable
+from a payload. The reuse button says so before you click it and the
+composer says so after, so a prefill never quietly hands you a different
+experiment than the one you asked to repeat. Reuse from a group, which is
+what the browser always creates, restores every control exactly.
+
 Routing mode picks how OpenRouter chooses among the providers serving a
 model. `throughput` is the default and is what the bench has always sent;
 `price` prefers the cheapest; `default` sends no sort at all, which is the

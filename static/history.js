@@ -10,6 +10,7 @@
   const resultsEl = document.getElementById("results");
   const runLabelEl = document.getElementById("run-label");
   const runControlsEl = document.getElementById("run-controls");
+  const promptMsg = document.getElementById("prompt-msg");
 
   // ---- History. Loads on expand rather than page load: it is the
   // ---- rarely used half of the page and a stale list is worse than a
@@ -142,6 +143,22 @@
     applyHistoryFilter();
   }
 
+  // Whether routing is recoverable from this source. A group stores its
+  // declared controls, so reuse restores them exactly. An ungrouped run has
+  // no stored set at all; its controls are derived from its recorded
+  // payload, and routing is the one control that derivation cannot see,
+  // because provider.sort rides every payload the bench has ever sent and a
+  // stored throughput is indistinguishable from a chosen one.
+  //
+  // So reuse from an ungrouped run is lossy for routing BY CONSTRUCTION, and
+  // that is a documented consequence rather than a bug to fix: the
+  // alternative is guessing, and a guessed routing badge would be the same
+  // truth defect as any other default rendered as a choice. What is not
+  // acceptable is being quiet about it, so the button says so before the
+  // click and the composer says so after.
+  const UNGROUPED_ROUTING_NOTE =
+    "routing is not restored: an ungrouped run does not record it";
+
   // The controls a replayed comparison ran under, badges plus the system
   // prompt in full. The badge alone says only that a system prompt existed,
   // which is the right amount for a one-line history row and not enough to
@@ -150,22 +167,23 @@
   // Cleared by every path that takes over the view, including the failure
   // and loading states, because a stale controls line under a new banner
   // would attribute one comparison's experiment to another.
-  function renderRunControls(params) {
+  function renderRunControls(params, source) {
     runControlsEl.replaceChildren();
     const badges = window.BenchLib.controlBadges(params);
-    if (badges.length === 0) return;
-    const strip = document.createElement("div");
-    strip.className = "ctl-badges";
-    strip.dataset.testid = "run-control-badges";
-    for (const badge of badges) {
-      const chip = document.createElement("span");
-      chip.className = "ctl-badge";
-      chip.dataset.testid = "run-control-badge";
-      chip.textContent = badge.text;
-      chip.title = badge.title;
-      strip.append(chip);
+    if (badges.length > 0) {
+      const strip = document.createElement("div");
+      strip.className = "ctl-badges";
+      strip.dataset.testid = "run-control-badges";
+      for (const badge of badges) {
+        const chip = document.createElement("span");
+        chip.className = "ctl-badge";
+        chip.dataset.testid = "run-control-badge";
+        chip.textContent = badge.text;
+        chip.title = badge.title;
+        strip.append(chip);
+      }
+      runControlsEl.append(strip);
     }
-    runControlsEl.append(strip);
     // textContent, never innerHTML: a system prompt is user text and gets
     // the same no-HTML treatment model output does.
     if (params?.system) {
@@ -176,6 +194,41 @@
       sys.title = "the system prompt this comparison was run with";
       runControlsEl.append(sys);
     }
+    // The reuse action offers itself even when nothing was set, because the
+    // prompt alone is worth reusing and a comparison with no controls is
+    // still an experiment someone may want to repeat.
+    if (source) renderReuse(source);
+  }
+
+  function renderReuse(source) {
+    const lossy = source.kind === "run";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "tool";
+    btn.dataset.testid = "reuse-comparison";
+    btn.textContent = "reuse";
+    btn.title = lossy
+      ? "Fill the composer with this prompt and its controls, leaving your " +
+        "lineup alone. Nothing runs until you press Run. " +
+        UNGROUPED_ROUTING_NOTE
+      : "Fill the composer with this prompt and its controls, leaving your " +
+        "lineup alone. Nothing runs until you press Run";
+    btn.addEventListener("click", () => {
+      BenchControls.reuseExperiment(source);
+      // Say what happened, and say what did not. A prefill that silently
+      // dropped a control the source had would hand the user a different
+      // experiment wearing the same label.
+      promptMsg.textContent = lossy
+        ? "composer filled from run #" +
+          source.id +
+          "; " +
+          UNGROUPED_ROUTING_NOTE
+        : "composer filled from comparison #" + source.id;
+    });
+    const row = document.createElement("div");
+    row.className = "ctl-reuse";
+    row.append(btn);
+    runControlsEl.append(row);
   }
 
   // A history load owns the results area from the click, not from the
@@ -245,7 +298,12 @@
       " UTC";
     // The stored record, so a group can show a routing badge; a lone run
     // cannot, since routing is not recoverable from a payload.
-    renderRunControls(group.params);
+    renderRunControls(group.params, {
+      kind: "group",
+      id: group.id,
+      prompt: group.runs.length > 0 ? group.runs[0].prompt_text : "",
+      params: group.params,
+    });
     // Cards in the order the comparison actually had. Runs persist in
     // completion order, so run order alone would shuffle cards between
     // replays.
@@ -326,7 +384,12 @@
     // Derived from the payload rather than a stored record: this run has no
     // group, so no controls set was ever declared for it. Any result of the
     // run proves the same set, since one run sends one experiment.
-    renderRunControls(run.params);
+    renderRunControls(run.params, {
+      kind: "run",
+      id: run.id,
+      prompt: run.prompt_text,
+      params: run.params,
+    });
     for (const result of run.results) {
       BenchRender.fillColumn(
         BenchRender.makeColumn(result.model),
