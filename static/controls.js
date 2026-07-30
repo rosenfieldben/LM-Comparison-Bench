@@ -44,6 +44,11 @@
     checkedModels,
     updateRunState,
     autosizePrompt,
+    // Read by the stream client for the group POST and every stream
+    // request; written by the reuse action in history.
+    experimentParams,
+    setExperimentParams,
+    reuseExperiment,
     init,
   };
 
@@ -63,6 +68,149 @@
   const matchesEl = document.getElementById("model-matches");
   const themeBtn = document.getElementById("theme-btn");
   const motionBtn = document.getElementById("motion-btn");
+  const toggleControlsBtn = document.getElementById("toggle-controls");
+  const controlsPanel = document.getElementById("experiment-controls");
+  const controlsSummary = document.getElementById("controls-summary");
+  const controlsNote = document.getElementById("controls-note");
+
+  // Each experiment control, its input, and how to read a set value out of
+  // it. The reader returns null for "not set", which is the one thing every
+  // control has to be able to say: rule one is that a blank control does
+  // not reach the payload at all, and this is where blankness is decided.
+  //
+  // Number() rather than parseFloat: parseFloat("2abc") is 2, and a value
+  // the browser handed back as text that only starts like a number is not a
+  // number the user typed on purpose. An empty input is checked first, since
+  // Number("") is 0 and 0 is a legitimate temperature.
+  const CONTROL_INPUTS = [
+    // Trimmed to DECIDE blankness, sent RAW. A textarea holding only
+    // whitespace is a blank control, but a system prompt's own leading or
+    // trailing whitespace is content: prompts are pasted with indentation
+    // and end with deliberate newlines, and the record claims to be the
+    // exact text the comparison ran under. Returning the trimmed value
+    // would have quietly made that claim false.
+    [
+      "system",
+      "ctl-system",
+      (el) => (el.value.trim() === "" ? null : el.value),
+    ],
+    ["temperature", "ctl-temperature", readNumber],
+    ["top_p", "ctl-top-p", readNumber],
+    ["seed", "ctl-seed", readNumber],
+    ["effort", "ctl-effort", (el) => el.value || null],
+    ["routing", "ctl-routing", (el) => el.value || null],
+  ];
+
+  function readNumber(el) {
+    if (el.value.trim() === "") return null;
+    const parsed = Number(el.value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+
+  const controlEls = new Map(
+    CONTROL_INPUTS.map(([name, id, read]) => [
+      name,
+      { el: document.getElementById(id), read },
+    ]),
+  );
+
+  // The controls the user has actually set, in the shape the API takes.
+  // Absent keys, never nulls: the server's ExperimentParams treats a
+  // present null as a set-to-null field and would reject it, and more to
+  // the point an object full of nulls is a record of nothing pretending to
+  // be a record.
+  function experimentParams() {
+    const out = {};
+    for (const [name, { el, read }] of controlEls) {
+      const value = read(el);
+      if (value !== null) out[name] = value;
+    }
+    return out;
+  }
+
+  // Prefill the controls from a stored experiment, for the reuse action.
+  //
+  // Fed the params OBJECT the API returns, never the badge strings the same
+  // data renders as. Badges are presentation and lossy on purpose: "sys"
+  // carries no text at all, "t=0.25" is a formatted number, and parsing
+  // either back would promote a display format into a data format and break
+  // the moment a badge was reworded. The data path is the only path.
+  //
+  // Absent controls are CLEARED rather than left alone. Reuse reproduces an
+  // experiment, so a temperature left in the box from an earlier edit would
+  // quietly make the new run a different experiment from the one being
+  // reused, which is the exact confusion this phase exists to remove. What
+  // the source did not set, the composer must not set either.
+  function setExperimentParams(params) {
+    const source = params || {};
+    for (const [name, { el }] of controlEls) {
+      const value = source[name];
+      el.value = value === null || value === undefined ? "" : String(value);
+    }
+  }
+
+  // Reuse a stored comparison: its prompt and its controls, and nothing
+  // else. The lineup is deliberately untouched, because the point of
+  // then-versus-now is running an old experiment against today's models,
+  // so which models those are stays the user's choice.
+  //
+  // Prefill only. Nothing here starts a run: money moves on an explicit
+  // Run click and on nothing else, and an action that spent money because
+  // the user clicked "reuse" would be a trap.
+  function reuseExperiment(source) {
+    promptEl.value = source.prompt || "";
+    // The reused text is a historical prompt, not a library selection, so
+    // the saved-prompt link goes with it. Leaving it would attach the new
+    // run to a library entry whose text it may no longer match, which is
+    // the lie the input handler below already clears on every keystroke.
+    BS.selectedPromptId = null;
+    savedSelect.value = "";
+    setExperimentParams(source.params);
+    autosizePrompt();
+    updateRunState();
+  }
+
+  // A control whose input the browser marks invalid (out of range, or a
+  // step it cannot honor) would 422 at the boundary once per model, which
+  // arrives as a card full of identical errors and no explanation. Saying
+  // so before the money moves is cheaper and truthful; Run stays disabled
+  // until it is fixed.
+  //
+  // The bounds themselves are NOT defined here. checkValidity reads the min
+  // and max attributes in index.html, which mirror ExperimentParams in
+  // bench/main.py; that model is the single source of truth and the only
+  // thing that actually enforces a bound. This function is a convenience
+  // over it, never an authority, so it can only ever be wrong by being out
+  // of date. A test asserts the two sets match, because the drift that
+  // matters is a browser bound tighter than the API's: it would refuse a
+  // legal run and blame the user's value.
+  function invalidControls() {
+    const bad = [];
+    for (const [name, { el }] of controlEls) {
+      if (el.checkValidity && !el.checkValidity()) bad.push(name);
+    }
+    return bad;
+  }
+
+  // What the composer says about its own controls, so a controlled run is
+  // never started blind with the panel collapsed. Badges come from the same
+  // formatter history uses, so the row and the run agree by construction.
+  function renderControlsSummary() {
+    const bad = invalidControls();
+    controlsNote.textContent = bad.length
+      ? "out of range: " + bad.join(", ")
+      : "";
+    if (bad.length) {
+      controlsSummary.textContent = "check " + bad.join(", ");
+      controlsSummary.title = "these controls are out of range";
+      return;
+    }
+    const badges = window.BenchLib.controlBadges(experimentParams());
+    controlsSummary.textContent = badges.map((b) => b.text).join(" · ");
+    controlsSummary.title = badges.length
+      ? "controls set for the next run"
+      : "no controls set; every provider applies its own defaults";
+  }
 
   function saveLineup() {
     // Guarded like the pref helpers below: a quota or SecurityError must
@@ -263,8 +411,14 @@
 
   function updateRunState() {
     const checked = checkedModels().length;
+    // Summary first, because the disable below reads its validity check and
+    // the panel may be collapsed over the offending input.
+    renderControlsSummary();
     runBtn.disabled =
-      BS.inflightRuns > 0 || promptEl.value.trim() === "" || checked === 0;
+      BS.inflightRuns > 0 ||
+      promptEl.value.trim() === "" ||
+      checked === 0 ||
+      invalidControls().length > 0;
     // Stop is live exactly while runs are: it acts on the in-flight
     // controllers and has nothing to do when the count is zero.
     stopBtn.disabled = BS.inflightRuns === 0;
@@ -427,6 +581,21 @@
       }
       queryInput.focus();
     });
+
+    toggleControlsBtn.addEventListener("click", () => {
+      controlsPanel.hidden = !controlsPanel.hidden;
+      toggleControlsBtn.setAttribute(
+        "aria-expanded",
+        String(!controlsPanel.hidden),
+      );
+    });
+    // input covers typing and the number spinners; change covers the two
+    // selects, which do not fire input on every browser. Both land on
+    // updateRunState because a control can turn Run off as well as on.
+    for (const { el } of controlEls.values()) {
+      el.addEventListener("input", updateRunState);
+      el.addEventListener("change", updateRunState);
+    }
 
     queryInput.addEventListener("input", renderMatches);
     queryInput.addEventListener("keydown", (e) => {

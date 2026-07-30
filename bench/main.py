@@ -91,6 +91,73 @@ MAX_POSITION = 999
 FORBID_UNKNOWN = ConfigDict(extra="forbid")
 
 
+# A seed is an opaque integer to every provider, so the bound exists only to
+# keep an absurd body out, the same reason MAX_POSITION exists.
+#
+# 2**53 - 1, not signed 64-bit, and the difference is not cosmetic. This
+# value is recorded, served back as JSON, and read in a browser, where every
+# number is a double: measured rather than assumed, a stored seed of
+# 9223372036854775807 came back to the page as 9223372036854776000. That
+# would badge the wrong seed in history, and reuse would then prefill the
+# wrong one and be refused by the one-experiment check as a different
+# experiment, which is a legal run blocked by a silent corruption.
+#
+# So the bound is the largest integer the whole path can carry exactly. Nine
+# quadrillion distinct seeds is not a constraint anyone will feel, and a
+# value above it is now a 422 at the boundary instead of a lie in the
+# record. Number.MAX_SAFE_INTEGER in the browser is the same number.
+MAX_SEED = 2**53 - 1
+
+# Long enough for a real system prompt and short enough that the group row
+# stays a record rather than a document store. Bounded for the same reason
+# every other free-text field here is.
+MAX_SYSTEM_PROMPT = 8000
+
+
+class ExperimentParams(BaseModel):
+    """The controls one comparison holds constant across its models.
+
+    Every field optional and every default None, which is the boundary
+    expression of rule one: a control the user left blank is absent, not
+    zero and not the tool's own default. Absence means the provider's
+    default applies and the record can say so honestly. model_dump with
+    exclude_none is what turns that into the payload and the stored record.
+
+    One class referenced by all three request models rather than the same
+    six fields written out three times. Parity between the batch and
+    streaming surfaces is then structural: a field, a bound or a validator
+    cannot drift between them because there is only one of each. The
+    closing review for this phase hunts parity drift, and this is the shape
+    that makes the hunt vacuous.
+
+    Bounds are OpenRouter's own, pinned at implementation time; see
+    bench.models for the documentation URLs and the read dates.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    # min_length=1 rather than allowing "": an empty string is not a system
+    # prompt the user set, it is a blank control, and a client that sends
+    # one is confusing the two. Failing loudly here is what keeps a
+    # meaningless leading system message off the wire and out of the record.
+    system: str | None = Field(default=None, min_length=1, max_length=MAX_SYSTEM_PROMPT)
+    temperature: float | None = Field(default=None, ge=0.0, le=2.0)
+    top_p: float | None = Field(default=None, ge=0.0, le=1.0)
+    # Symmetric, unlike the signed-64 range this used to mirror. The bound
+    # is now JS's safe-integer range exactly (MIN_SAFE_INTEGER is
+    # -MAX_SAFE_INTEGER), because the limit that matters is what survives
+    # being read back in a browser. See MAX_SEED.
+    seed: int | None = Field(default=None, ge=-MAX_SEED, le=MAX_SEED)
+    # Three named tiers of the seven OpenRouter documents. A comparison
+    # holds one effort across models, and the widest set invites a
+    # per-model guess about what "xhigh" means where it is unsupported.
+    effort: Literal["low", "medium", "high"] | None = None
+    # throughput is today's behavior and stays the default; "default" means
+    # send no sort at all and let OpenRouter load balance. See
+    # bench.models.ROUTING_PREFS for why that is a value and not an absence.
+    routing: Literal["throughput", "price", "default"] | None = None
+
+
 class CompareRequest(BaseModel):
     model_config = FORBID_UNKNOWN
 
@@ -108,6 +175,11 @@ class CompareRequest(BaseModel):
     # Named tiers, not a free integer: two regimes of use exist and a
     # free field invites typos with dollar consequences.
     budget: Literal["standard", "extended"] = "standard"
+    # The experiment controls. /compare is the official scripting surface,
+    # so it carries the same controls the streaming path does; see the
+    # README's scripting section. See ExperimentParams for why one shared
+    # class is what guarantees that parity.
+    params: ExperimentParams | None = None
 
 
 class ModelResult(BaseModel):
@@ -172,6 +244,11 @@ class StreamCompareRequest(BaseModel):
     # drifts as the lineup is edited. See MAX_POSITION for why the bound is
     # not the batch endpoint's five-model cap.
     position: int | None = Field(default=None, ge=0, le=MAX_POSITION)
+    # Full parity with CompareRequest by construction; see ExperimentParams.
+    # The frontend sends these on every stream request so the one
+    # experiment per group check has something to check. The group's stored
+    # copy, written before any upstream call, is the record.
+    params: ExperimentParams | None = None
 
 
 class CompareResponse(BaseModel):
@@ -206,6 +283,11 @@ class RunEntry(BaseModel):
     created_at: str
     prompt_text: str
     models: list[str]
+    # The controls this run was sent with, or None when it shows none.
+    # Derived from the recorded payload rather than stored, because
+    # controls live on the group and this run has none; see
+    # store._controls_from_request for why routing is never among them.
+    params: dict[str, Any] | None = None
 
 
 class GroupEntry(BaseModel):
@@ -215,6 +297,9 @@ class GroupEntry(BaseModel):
     prompt_text: str
     models: list[str]
     run_ids: list[int]
+    # The declared controls, straight off the group row. Only what was
+    # set, so history renders a badge for a choice and never for a default.
+    params: dict[str, Any] | None = None
 
 
 class RunList(BaseModel):
@@ -243,6 +328,13 @@ class GroupCreate(BaseModel):
     models: list[str] | None = Field(
         default=None, min_length=1, max_length=MAX_POSITION + 1
     )
+    # The controls this comparison holds constant. Recorded on the group
+    # because they are experiment-level: one comparison, one controls set,
+    # applied to every model, which is the whole fairness argument. Written
+    # here before any upstream call, which is what makes it the record the
+    # per-run integrity check is checked against rather than a claim
+    # assembled after the money moved.
+    params: ExperimentParams | None = None
 
 
 class GroupCreated(BaseModel):
@@ -286,12 +378,22 @@ class RunDetail(BaseModel):
     app_sha: str | None = None
     catalog_snapshot_at: str | None = None
     data_policy: str | None = None
+    # The controls this run was sent with, derived from its recorded payload
+    # rather than stored: controls are declared on the group, and a run may
+    # have none. See store._controls_from_request for why routing is never
+    # among them.
+    params: dict[str, Any] | None = None
 
 
 class GroupDetail(BaseModel):
     id: int
     created_at: str
     runs: list[RunDetail]
+    # The controls the comparison was declared with, or None when it held
+    # none. Only set controls are present, so the detail view can render a
+    # chosen control and never a default dressed up as one. None on every
+    # pre-H group, which is a fact about those groups rather than a gap.
+    params: dict[str, Any] | None = None
 
 
 def _app_sha() -> str | None:
@@ -937,14 +1039,43 @@ def _excerpt(text: str, limit: int = 60) -> str:
     return one_line if len(one_line) <= limit else one_line[:limit] + "..."
 
 
-def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
-    """Reject a run whose group already holds a different prompt.
+def _control_conflicts(
+    established: dict[str, Any], requested: dict[str, Any]
+) -> list[str]:
+    """The control names on which two experiments disagree, sorted.
 
-    Checked at endpoint entry, before the semaphore and any upstream call,
-    so a mismatch is a 409 that spends nothing and never reaches the
-    post-spend degrade path (link resolution stays degrade-only). An
-    unknown group, and a group with neither a declared prompt nor a member,
-    accepts any prompt.
+    A control set on one side and absent on the other is a disagreement,
+    not a partial match: absence is a choice under rule one (the provider's
+    own default) and is exactly as meaningful as a value.
+    """
+    return sorted(
+        name
+        for name in set(established) | set(requested)
+        if established.get(name) != requested.get(name)
+    )
+
+
+def enforce_group_experiment(
+    prompt: str, params: dict[str, Any], group_id: int | None
+) -> None:
+    """Reject a run whose group already holds a different experiment.
+
+    One prompt per group became one experiment per group, because holding
+    the prompt constant while sampling varies is not a comparison anyone can
+    defend. Prompt and controls are checked together, at endpoint entry,
+    before the semaphore and any upstream call, so a mismatch is a 409 that
+    spends nothing and never reaches the post-spend degrade path (link
+    resolution stays degrade-only). An unknown group, and a group with
+    neither a declared prompt nor a member, accepts any prompt.
+
+    The controls half needs no derive-from-member fallback and deliberately
+    has none. A NULL params_json is not missing information: every pre-H
+    group predates the controls, so NULL is the affirmative fact that none
+    was set, and a legacy client that sends no controls matches it exactly.
+    What that buys is stricter than a fallback would be. A group recorded
+    with no controls now rejects a member that carries one, which is the
+    case a fallback would have waved through and which would have produced
+    a group whose record understated what it sent.
 
     Residual, now confined to legacy groups: a group that declared its
     prompt at creation is checked against a value that existed before any
@@ -967,6 +1098,27 @@ def enforce_group_prompt(prompt: str, group_id: int | None) -> None:
             "prompt does not match this group's established prompt "
             f"({_excerpt(established)!r}); a group holds one prompt across "
             "its runs",
+        )
+    group_controls = store.group_params(app.state.db, group_id)
+    conflicts = _control_conflicts(group_controls, params)
+    if conflicts:
+        named = ", ".join(conflicts)
+        if not group_controls:
+            # The legacy shape, and the one where the generic message would
+            # be useless: nothing "does not match" because there is nothing
+            # to match against. Every pre-H group lands here, so the detail
+            # has to say what the group is and what to do instead, not just
+            # that the request was refused.
+            raise HTTPException(
+                409,
+                "this group records no controls, so it cannot hold a run "
+                f"that sets them ({named}); start a new comparison to run "
+                "with controls",
+            )
+        raise HTTPException(
+            409,
+            f"controls do not match this group's experiment ({named}); "
+            "a group holds one controls set across its runs",
         )
 
 
@@ -1013,10 +1165,45 @@ def resolve_links(
     return prompt_id, group_id
 
 
+def request_controls(params: ExperimentParams | None) -> dict[str, Any]:
+    """The controls a request actually set, as a plain dict.
+
+    exclude_none is rule one at the boundary: every field defaults to None,
+    so what survives is exactly what the caller set and nothing else. This
+    is the single conversion from the Pydantic edge to the plain dicts the
+    internals pass, and it feeds three things that must agree, the payload,
+    the stored record and the integrity check, so there is one of it.
+    """
+    return params.model_dump(exclude_none=True) if params is not None else {}
+
+
+def request_provider_prefs(controls: dict[str, Any]) -> dict[str, Any]:
+    """The provider object for one request: the boot data policy, plus this
+    request's routing mode when it chose one.
+
+    Returns the boot-computed object unchanged when no routing was set, so a
+    blank controls set does not merely produce an equal provider block, it
+    produces the same one the code passed before this phase existed. That is
+    what the byte-identical payload tombstone rests on.
+
+    The privacy policy comes from boot and the routing from the request, and
+    they meet in provider_preferences rather than here, so there is exactly
+    one place that knows how the two merge.
+    """
+    routing = controls.get("routing")
+    if routing is None:
+        # Annotated because app.state is untyped; the boot value is built by
+        # provider_preferences and is this shape by construction.
+        boot_prefs: dict[str, Any] = app.state.provider_prefs
+        return boot_prefs
+    return provider_preferences(app.state.data_policy, routing)
+
+
 @app.post("/compare", response_model=CompareResponse)
 async def compare(request: CompareRequest) -> dict[str, Any]:
     enforce_spend_limit()
-    enforce_group_prompt(request.prompt, request.group_id)
+    controls = request_controls(request.params)
+    enforce_group_experiment(request.prompt, controls, request.group_id)
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -1048,7 +1235,8 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 model,
                 app.state.client,
                 max_tokens=budget,
-                provider_prefs=app.state.provider_prefs,
+                provider_prefs=request_provider_prefs(controls),
+                controls=controls,
             )
 
     # gather preserves input order, which the frontend relies on to map
@@ -1098,7 +1286,8 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # At entry, before the generator runs and so before the semaphore or
     # any upstream call: a refusal must spend nothing.
     enforce_spend_limit()
-    enforce_group_prompt(request.prompt, request.group_id)
+    controls = request_controls(request.params)
+    enforce_group_experiment(request.prompt, controls, request.group_id)
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -1185,7 +1374,8 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 app.state.client,
                 max_tokens=max_tokens,
                 holder=holder,
-                provider_prefs=app.state.provider_prefs,
+                provider_prefs=request_provider_prefs(controls),
+                controls=controls,
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -1302,7 +1492,14 @@ def ensure_rowid(value: int) -> None:
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
 async def create_group(body: GroupCreate) -> dict[str, Any]:
-    return {"id": store.create_group(app.state.db, body.prompt, body.models)}
+    return {
+        "id": store.create_group(
+            app.state.db,
+            body.prompt,
+            body.models,
+            request_controls(body.params) or None,
+        )
+    }
 
 
 @app.get("/groups/{group_id}", response_model=GroupDetail)

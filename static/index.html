@@ -77,6 +77,72 @@
     <div id="model-matches"></div>
   </div>
 
+  <div id="controls-row">
+    <button id="toggle-controls" data-testid="toggle-controls" type="button"
+            aria-expanded="false" aria-controls="experiment-controls"
+            title="Sampling and routing held constant across every model in the comparison">+ Controls</button>
+    <span id="controls-summary" data-testid="controls-summary" role="status"></span>
+  </div>
+  <!-- The min, max and option values below mirror ExperimentParams in
+       bench/main.py, which is the single source of truth for every bound.
+       They exist here only so the browser can refuse a value before it
+       costs one 422 per model; the API is what actually enforces them.
+       tests/test_api.py::test_the_markup_bounds_match_the_shared_request_model
+       asserts the two sets agree, because a markup bound tighter than the
+       model's would block a run the API would have accepted and tell the
+       user their legal value is out of range. -->
+  <div id="experiment-controls" data-testid="experiment-controls" hidden>
+    <label class="panel-label" for="ctl-system">System prompt</label>
+    <textarea id="ctl-system" data-testid="ctl-system" rows="2"
+              placeholder="Leave blank to send no system message"
+              title="Sent as a leading system message to every model. Blank sends none, which is what the bench has always done"></textarea>
+    <div id="controls-scalars">
+      <span class="ctl">
+        <label for="ctl-temperature">temperature</label>
+        <input id="ctl-temperature" data-testid="ctl-temperature" type="number"
+               min="0" max="2" step="0.01" placeholder="unset"
+               title="0 to 2. Lower is more predictable. Blank sends nothing, so each provider applies its own default (1.0 for most)">
+      </span>
+      <span class="ctl">
+        <label for="ctl-top-p">top_p</label>
+        <input id="ctl-top-p" data-testid="ctl-top-p" type="number"
+               min="0" max="1" step="0.01" placeholder="unset"
+               title="0 to 1. Limits sampling to the most likely tokens adding up to P. Blank sends nothing, so each provider applies its own default">
+      </span>
+      <span class="ctl">
+        <label for="ctl-seed">seed</label>
+        <input id="ctl-seed" data-testid="ctl-seed" type="number" step="1"
+               min="-9007199254740991" max="9007199254740991" placeholder="unset"
+               title="Passed through and recorded, nothing more. Providers differ in whether they accept a seed at all and in how deterministic they are with one; OpenRouter says the same seed SHOULD give the same result and that determinism is not guaranteed for some models. A run that came back different is a fact about the provider, not a bug here">
+      </span>
+      <span class="ctl">
+        <label for="ctl-effort">reasoning</label>
+        <span class="sel-wrap">
+          <select id="ctl-effort" data-testid="ctl-effort"
+                  title="How much of the budget a reasoning model spends thinking. Only some models support it; the rest ignore it, which OpenRouter documents. Blank sends nothing">
+            <option value="">unset</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </span>
+      </span>
+      <span class="ctl">
+        <label for="ctl-routing">routing</label>
+        <span class="sel-wrap">
+          <select id="ctl-routing" data-testid="ctl-routing"
+                  title="Which provider serves each model. Unset sends nothing and the bench's own throughput preference applies; picking throughput sends and records that same choice. price prefers the cheapest host. load balanced asks OpenRouter to choose, which is its own default">
+            <option value="">unset (throughput)</option>
+            <option value="throughput">throughput</option>
+            <option value="price">price</option>
+            <option value="default">load balanced</option>
+          </select>
+        </span>
+      </span>
+    </div>
+    <div id="controls-note" data-testid="controls-note" role="status"></div>
+  </div>
+
   <div id="run-row">
     <button id="run" data-testid="run-button" disabled>Run</button>
     <button id="stop" data-testid="stop-button" type="button" disabled>Stop</button>
@@ -104,6 +170,7 @@
 </section>
 
 <div id="run-label" data-testid="run-label" role="status"></div>
+<div id="run-controls" data-testid="run-controls"></div>
 <div id="results"></div>
 
 <div id="diff-panel" data-testid="diff-panel" class="panel" hidden>

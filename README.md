@@ -428,6 +428,136 @@ failure. The field names are pinned against OpenRouter's provider
 routing documentation; the URL and the date it was read are in the
 comment above `DATA_POLICY_PREFS` in `bench/models.py`.
 
+## Experiment controls
+
+By default the bench sends one user message and lets every provider apply
+its own sampling defaults, which means a comparison varies whatever the
+providers feel like varying. Six controls let one comparison hold that
+constant across its models:
+
+| Control | Sent as | Range |
+| --- | --- | --- |
+| system prompt | a leading `system` message | up to 8000 characters |
+| temperature | `temperature` | 0 to 2 |
+| top_p | `top_p` | 0 to 1 |
+| seed | `seed` | any integer |
+| reasoning effort | `reasoning.effort` | low, medium, high |
+| routing mode | `provider.sort` | throughput, price, default |
+
+Two rules govern all six.
+
+**A control you leave blank is not sent.** It does not appear in the
+payload at all, so the provider applies its own default and the record can
+say honestly that the bench did not choose one. The bench never fills in a
+value on your behalf, and with every control blank the outgoing payload is
+byte for byte what it was before these controls existed. A test asserts
+exactly that, against a request body captured from the previous release.
+
+**Only what you set is recorded.** `groups.params_json` holds the controls
+you chose and nothing else, so a history badge appears for a control you
+picked and never for a default. A group with no controls records nothing
+rather than an empty object.
+
+The controls belong to the comparison, not to a model: one comparison, one
+controls set, applied to every model, which is what makes the columns
+comparable. A group holds one experiment the way it holds one prompt, and a
+run whose controls disagree with its group's is refused with a 409 at
+entry, before any upstream call, naming the controls that conflict.
+
+In the browser they live behind **+ Controls** in the composer, collapsed
+by default and blank inside. Nothing is pre-filled, because a box showing
+`1.0` would look like a decision you had made. The collapsed row summarises
+what is set, so a controlled run is never started blind, and a control the
+browser can see is out of range disables Run and says which one rather than
+letting the request fail once per model. A rerun of a failed card replays
+the controls that card ran under, not whatever the panel holds by then: a
+rerun is a second sample of the same experiment.
+
+History shows the same controls as compact badges, `t=0.25`, `seed 7`,
+`sys`, `effort high`, `route price`, and shows them only for controls that
+were set. The system prompt gets a presence badge rather than its text,
+since a row is one line and a truncated prompt would invite comparing two
+comparisons on an excerpt that happens to match; open the comparison and
+the full text is there above the cards. One asymmetry worth knowing: an
+ungrouped run (a single-model rerun, or anything from before groups
+existed) derives its badges from its recorded payload, and routing cannot
+be recovered that way, because the bench's own throughput preference
+appears in every payload it has ever sent. Rather than present that as a
+choice, an ungrouped run shows no routing badge at all.
+
+### Then versus now
+
+Running an old experiment against today's models takes three steps, and the
+hard part was already built:
+
+1. **Reuse.** Open a comparison from History and press **reuse**. The
+   composer fills with its prompt and every control it set. Your lineup is
+   left exactly as it is, because which models you want to compare *now* is
+   the question you are asking. Nothing runs: money moves on Run and on
+   nothing else.
+2. **Run.** The new comparison is sent with the same controls, so it records
+   the same `params_json` as its source. Two runs of one experiment, months
+   apart.
+3. **Arm and diff.** Open the old comparison again, arm a card with
+   **diff**, then arm the matching card from the new run. The panel shows
+   what changed. This works because arming survives a history replay by
+   design, which the Phase F.2 work put in deliberately; nothing was added
+   here to enable it.
+
+There is no stored link between a reused comparison and its source. The
+prompt and controls match, which is what makes them comparable, but the
+bench does not claim a lineage it would have to maintain.
+
+One honest limit. Reuse from an **ungrouped** run cannot restore routing,
+for the same reason its badges cannot show it: routing is not recoverable
+from a payload. The reuse button says so before you click it and the
+composer says so after, so a prefill never quietly hands you a different
+experiment than the one you asked to repeat. Reuse from a group, which is
+what the browser always creates, restores every control exactly.
+
+Routing mode picks how OpenRouter chooses among the providers serving a
+model. `throughput` is the default and is what the bench has always sent;
+`price` prefers the cheapest; `default` sends no sort at all, which is the
+documented way to ask for OpenRouter's own price-weighted load balancing.
+Routing merges into the same provider object the data-handling policy uses,
+never displacing it.
+
+**About seeds.** Providers differ in whether they accept a seed at all and
+in how deterministic they are when they do. OpenRouter's own documentation
+says repeated requests with the same seed and parameters *should* return
+the same result and that determinism is not guaranteed for some models. The
+bench passes your seed through and records it. It promises nothing beyond
+that, and a run that came back different with the same seed is a fact about
+the provider, not a bug here.
+
+**Providers may silently ignore a control they do not support.** This is
+not a gap in the bench, it is OpenRouter's documented routing behavior:
+under the default strategy, a provider that does not support every
+parameter in your request still receives the request and ignores the
+parameters it does not know. Nothing errors and nothing warns. So a column
+in your comparison may have been generated at the provider's own
+temperature while the payload asked for yours, and neither the response nor
+the card can tell you that happened.
+
+Two things make it survivable. The exact payload is recorded per result in
+`request_json`, so a run whose temperature a provider ignored is still a
+run that can be shown to have asked for it. And the model's own catalog
+entry is where support is documented, so a control that matters to your
+comparison is worth checking against the models you picked.
+
+There is a routing flag that converts that silence into a hard failure,
+`require_parameters`, which restricts a request to providers supporting
+every parameter it carries. **The bench deliberately does not send it.**
+It would change which providers are eligible, and changing the eligible
+set changes what is being measured, which is the opposite of what these
+controls are for: you would be comparing a different population of
+providers depending on which controls you set. Choosing that tradeoff is a
+decision for a later phase, not a default to slip in with this one.
+
+Every field name, bound and behavior above is pinned against OpenRouter's
+current documentation, with the URLs and the dates they were read in the
+comments in `bench/models.py`.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
@@ -451,10 +581,30 @@ that errors or times out gets its `error` field set without affecting
 the other models in the run. Every `/compare` call is persisted and
 returns a `run_id`.
 
+`POST /compare` is the supported scripting surface, and that is a
+commitment rather than an accident of it existing. It carries every
+control the browser does, under the same `params` object, with the same
+validation and the same bounds:
+
+```sh
+curl -X POST localhost:8000/compare \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Say hello in five words.",
+       "models": ["deepseek/deepseek-chat"],
+       "params": {"system": "Be terse.", "temperature": 0, "seed": 7,
+                  "routing": "price"}}'
+```
+
+Parity with the streaming endpoint is structural, not maintained by hand:
+both request models reference one `ExperimentParams` class, so a field, a
+bound or a validator cannot drift between them. Send `group_id` alongside
+`params` and the one-experiment-per-group check applies to scripted runs
+exactly as it does to the browser's.
+
 The browser UI streams responses token by token via
 `POST /compare/stream` with `{"prompt": ..., "model": ...}` (one
-model per request) plus optional `prompt_id`, `group_id` and
-`budget`. The
+model per request) plus optional `prompt_id`, `group_id`, `budget` and
+`params`. The
 response is SSE-formatted (`data: {...}` lines): `delta` events carry
 text chunks, then one `done` event carries the full result and its
 `run_id`. Streamed results include `ttft_ms` (time to first token),

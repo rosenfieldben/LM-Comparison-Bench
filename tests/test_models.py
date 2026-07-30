@@ -5,7 +5,14 @@ import httpx
 import pytest
 import respx
 
-from bench.models import MODELS_URL, OPENROUTER_URL, fetch_catalog, run_model
+from bench.models import (
+    MODELS_URL,
+    OPENROUTER_URL,
+    control_messages,
+    control_payload,
+    fetch_catalog,
+    run_model,
+)
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -1470,3 +1477,229 @@ async def test_non_string_provenance_from_the_audit_path_degrades(client):
     assert record["provider"] is None
     assert record["native_finish_reason"] is None
     assert record["prompt_tokens"] is None
+
+
+# ---- Phase H1: experiment controls on the wire.
+
+PRE_H_PAYLOAD = json.loads(
+    (Path(__file__).parent / "fixtures" / "pre_h_payload.json").read_text()
+)
+
+
+@respx.mock
+async def test_review_repro_blank_controls_send_the_pre_h_payload_byte_for_byte(client):
+    """Both external reviews named uncontrolled sampling and routing as the
+    confound between "outputs I received" and "a comparison I can defend".
+    The controls that answer it come with a standing hazard: a tool that
+    helpfully fills in its own defaults would send temperature 1.0 and call
+    it the user's choice, and the record would then be unable to say that
+    nobody chose it.
+
+    So rule one is that a blank control does not appear in the payload at
+    all, and this is the floor that proves it. The fixture is not
+    hand-written: it is the raw request body captured by running main's
+    bench/models.py, the code that shipped before this phase, against
+    respx. The comparison is on the bytes rather than on a re-serialized
+    dict, so key order and formatting are locked too.
+
+    On pre-fix code there are no controls to leave blank, so this test
+    cannot fail there; its force is forward. It fails the moment any
+    control acquires a default that reaches the wire.
+    """
+    for kind, controls in (
+        ("run_model", None),
+        ("run_model", {}),
+        ("stream_model", {}),
+    ):
+        expected = PRE_H_PAYLOAD[kind]
+        route = respx.post(OPENROUTER_URL)
+        if kind == "run_model":
+            route.respond(json=FIXTURE)
+            await run_model(
+                "the prompt",
+                "vendor/model",
+                client,
+                max_tokens=16384,
+                controls=controls,
+            )
+        else:
+            route.mock(
+                return_value=httpx.Response(
+                    200, stream=ChunkStream([delta_chunk("hi"), DONE_MARKER])
+                )
+            )
+            async for _ in stream_model(
+                "the prompt",
+                "vendor/model",
+                client,
+                max_tokens=16384,
+                controls=controls,
+            ):
+                pass
+        sent = route.calls[-1].request.content.decode()
+        assert sent == expected, f"{kind} with controls={controls!r}"
+        respx.reset()
+
+
+@respx.mock
+async def test_every_set_control_reaches_the_payload_where_the_docs_put_it(client):
+    """Placement is pinned against OpenRouter's documentation, not guessed:
+    the three sampling fields are top-level keys, reasoning effort is a key
+    inside a top-level reasoning OBJECT, and the system prompt is a message
+    rather than a parameter. See bench.models for the URLs and read dates.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    await run_model(
+        "the prompt",
+        "vendor/model",
+        client,
+        controls={
+            "system": "be terse",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "seed": 7,
+            "effort": "high",
+            # Consumed by provider_preferences, never a top-level key.
+            "routing": "price",
+        },
+    )
+
+    body = json.loads(respx.calls[0].request.content)
+    assert body["temperature"] == 0.2
+    assert body["top_p"] == 0.9
+    assert body["seed"] == 7
+    assert body["reasoning"] == {"effort": "high"}
+    assert body["messages"] == [
+        {"role": "system", "content": "be terse"},
+        {"role": "user", "content": "the prompt"},
+    ]
+    # routing is not a chat-completions parameter; it belongs to the
+    # provider object, and putting it top-level would be a silent no-op.
+    assert "routing" not in body
+
+
+def test_control_payload_cannot_collide_with_the_payload_it_merges_into():
+    """The payload merges control_payload with **, so a control named like
+    an existing key would silently overwrite the model, the budget, the
+    provider block or the stream flag. The merge is only safe because the
+    emitted names are a closed set, so that set is asserted rather than
+    trusted.
+    """
+    everything = control_payload(
+        {
+            "system": "s",
+            "temperature": 1.0,
+            "top_p": 1.0,
+            "seed": 1,
+            "effort": "low",
+            "routing": "price",
+        }
+    )
+
+    assert set(everything) == {"temperature", "top_p", "seed", "reasoning"}
+    reserved = {
+        "model",
+        "messages",
+        "max_tokens",
+        "provider",
+        "stream",
+        "stream_options",
+    }
+    assert not set(everything) & reserved
+
+
+def test_control_payload_omits_what_was_not_set():
+    assert control_payload(None) == {}
+    assert control_payload({}) == {}
+    # Only the set control, and nothing standing in for the others.
+    assert control_payload({"temperature": 0.0}) == {"temperature": 0.0}
+    # Zero is a value a user can choose and is not blankness. Temperature 0
+    # is the whole point of a reproducibility run, so a falsy check here
+    # would drop exactly the control that matters most.
+    assert control_payload({"top_p": 0.0, "seed": 0}) == {"top_p": 0.0, "seed": 0}
+
+
+def test_control_messages_prepends_only_a_set_system_prompt():
+    plain = [{"role": "user", "content": "p"}]
+    assert control_messages("p", None) == plain
+    assert control_messages("p", {}) == plain
+    assert control_messages("p", {"temperature": 0.5}) == plain
+    assert control_messages("p", {"system": "s"}) == [
+        {"role": "system", "content": "s"},
+        {"role": "user", "content": "p"},
+    ]
+
+
+def test_provider_preferences_merges_routing_with_every_privacy_mode():
+    """The merge is where a regression would silently drop one side, and
+    both sides are promises: routing decides what is being measured, and
+    the privacy policy decides where the prompt is allowed to go. Every
+    combination is asserted because a union is easy to write and easy to
+    break in one direction only.
+    """
+    expected = {
+        ("throughput", "standard"): {"sort": "throughput"},
+        ("throughput", "deny"): {"sort": "throughput", "data_collection": "deny"},
+        ("throughput", "zdr"): {
+            "sort": "throughput",
+            "zdr": True,
+            "data_collection": "deny",
+        },
+        ("price", "standard"): {"sort": "price"},
+        ("price", "deny"): {"sort": "price", "data_collection": "deny"},
+        ("price", "zdr"): {"sort": "price", "zdr": True, "data_collection": "deny"},
+        # "default" is the absence of sort, which is the documented way to
+        # ask for OpenRouter's own load balancing. The privacy keys must
+        # survive that absence untouched.
+        ("default", "standard"): {},
+        ("default", "deny"): {"data_collection": "deny"},
+        ("default", "zdr"): {"zdr": True, "data_collection": "deny"},
+    }
+
+    for (routing, policy), want in expected.items():
+        got = provider_preferences(policy, routing)
+        assert got == want, (routing, policy)
+        # The zdr belt from G5 survives every routing choice: zdr mode
+        # always denies collection as well, which is the stricter reading
+        # the documentation does not require.
+        if policy == "zdr":
+            assert got["zdr"] is True and got["data_collection"] == "deny"
+        # No routing mode may displace a privacy key, and no privacy mode
+        # may invent a sort.
+        if routing == "default":
+            assert "sort" not in got
+
+
+def test_provider_preferences_default_is_todays_behaviour():
+    """Omitting the routing argument has to keep every existing caller, and
+    the boot-time provider block, exactly where they were."""
+    for policy in ("standard", "deny", "zdr"):
+        assert provider_preferences(policy) == provider_preferences(
+            policy, "throughput"
+        )
+
+
+def test_provider_preferences_refuses_an_unknown_routing_mode():
+    """Loud rather than silently standard: the request model validates the
+    value, so reaching here with a typo means the boundary was bypassed and
+    the run row would claim routing the payload never carried."""
+    with pytest.raises(KeyError):
+        provider_preferences("standard", "cheapest")
+
+
+@respx.mock
+async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
+    """The record rides along for free, which is what makes the documented
+    silent-drop behaviour survivable: a run whose temperature a provider
+    ignored is still a run that can be shown to have asked for it."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    result = await run_model(
+        "the prompt", "vendor/model", client, controls={"temperature": 0.2}
+    )
+
+    recorded = json.loads(result["request_json"])
+    assert recorded["temperature"] == 0.2
+    for absent in ("top_p", "seed", "reasoning"):
+        assert absent not in recorded, absent

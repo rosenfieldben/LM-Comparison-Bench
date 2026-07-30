@@ -387,8 +387,11 @@
       // side pointing at the attempt this is about to destroy.
       BenchDiff.disarmIfArmedOn(ui);
       resetColumn(ui);
-      // Same budget as the run being retried, not the current control
-      // value: a rerun is a second sample of the same experiment.
+      // Same budget and the same controls as the run being retried, not the
+      // current control values: a rerun is a second sample of the same
+      // experiment. Replaying it under whatever the composer holds now
+      // would also be refused by the server's one-experiment check, and
+      // rightly so.
       BenchStream.runOne(
         retry.prompt,
         retry.model,
@@ -400,6 +403,7 @@
         // Same column as the attempt being retried: a rerun is a second
         // sample in the same slot, not a new column.
         retry.position,
+        retry.controls,
       );
     });
     ui.tools.append(btn);
