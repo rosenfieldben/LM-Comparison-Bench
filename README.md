@@ -479,14 +479,33 @@ bench passes your seed through and records it. It promises nothing beyond
 that, and a run that came back different with the same seed is a fact about
 the provider, not a bug here.
 
-The same caveat applies more broadly: a provider that does not support a
-parameter receives the request and ignores that parameter, which is
-OpenRouter's documented behavior rather than something this bench hides.
-That is why the exact payload is recorded per result in `request_json`: a
-run whose temperature a provider ignored is still a run that can be shown
-to have asked for it. Every field name, bound and behavior above is pinned
-against OpenRouter's current documentation, with the URLs and the dates
-they were read in the comments in `bench/models.py`.
+**Providers may silently ignore a control they do not support.** This is
+not a gap in the bench, it is OpenRouter's documented routing behavior:
+under the default strategy, a provider that does not support every
+parameter in your request still receives the request and ignores the
+parameters it does not know. Nothing errors and nothing warns. So a column
+in your comparison may have been generated at the provider's own
+temperature while the payload asked for yours, and neither the response nor
+the card can tell you that happened.
+
+Two things make it survivable. The exact payload is recorded per result in
+`request_json`, so a run whose temperature a provider ignored is still a
+run that can be shown to have asked for it. And the model's own catalog
+entry is where support is documented, so a control that matters to your
+comparison is worth checking against the models you picked.
+
+There is a routing flag that converts that silence into a hard failure,
+`require_parameters`, which restricts a request to providers supporting
+every parameter it carries. **The bench deliberately does not send it.**
+It would change which providers are eligible, and changing the eligible
+set changes what is being measured, which is the opposite of what these
+controls are for: you would be comparing a different population of
+providers depending on which controls you set. Choosing that tradeoff is a
+decision for a later phase, not a default to slip in with this one.
+
+Every field name, bound and behavior above is pinned against OpenRouter's
+current documentation, with the URLs and the dates they were read in the
+comments in `bench/models.py`.
 
 ## Usage
 

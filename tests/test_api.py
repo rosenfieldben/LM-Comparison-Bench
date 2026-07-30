@@ -2845,3 +2845,147 @@ def test_a_set_control_reaches_the_stored_request_json(client):
     )
     assert recorded["seed"] == 7
     assert "temperature" not in recorded
+
+
+@respx.mock
+def test_group_controls_compare_as_parsed_structures_not_as_strings(client):
+    """The one-experiment check compares what the controls MEAN, never how
+    they happened to serialize. Two ways that distinction bites, both here:
+
+    Key order. JSON objects are unordered, so a client is free to send the
+    same controls in any order, and two different orders are the same
+    experiment. The stored copy is written with sorted keys for exactly this
+    reason, but sorting the stored side is not sufficient on its own; a
+    string comparison would still break against a shuffled request. The
+    comparison runs on parsed dicts, so order cannot reach it.
+
+    Numeric spelling. A client that sends temperature as the integer 1 means
+    the same thing as one that sends 1.0, and both surfaces coerce to float
+    at the boundary before anything is stored or compared. A string
+    comparison would see "1" against "1.0" and refuse a run that matches.
+
+    Either failure would be a 409 on a run that genuinely belongs to the
+    group, which is worse than useless: it blocks correct work while
+    claiming to protect the record.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    # Written one way, in an order that is not sorted, with an integer.
+    gid = client.post(
+        "/groups",
+        json={
+            "prompt": "p",
+            "params": {
+                "top_p": 0.9,
+                "temperature": 1,
+                "system": "be terse",
+                "seed": 7,
+                "routing": "price",
+                "effort": "high",
+            },
+        },
+    ).json()["id"]
+
+    # Sent back a different way: shuffled, and temperature still an integer.
+    shuffled = client.post(
+        "/compare",
+        json={
+            "prompt": "p",
+            "models": ["model/alpha"],
+            "group_id": gid,
+            "params": {
+                "seed": 7,
+                "effort": "high",
+                "temperature": 1,
+                "routing": "price",
+                "system": "be terse",
+                "top_p": 0.9,
+            },
+        },
+    )
+    assert shuffled.status_code == 200, shuffled.json()
+
+    # And once more with temperature spelled as a float, which is the same
+    # experiment by any reading.
+    as_float = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "p",
+            "model": "model/alpha",
+            "group_id": gid,
+            "params": {
+                "system": "be terse",
+                "temperature": 1.0,
+                "top_p": 0.9,
+                "seed": 7,
+                "effort": "high",
+                "routing": "price",
+            },
+        },
+    )
+    assert as_float.status_code == 200, as_float.read()
+
+    # A genuine change is still refused, so the test above is not passing
+    # by accident of the check being disabled.
+    real_clash = client.post(
+        "/compare",
+        json={
+            "prompt": "p",
+            "models": ["model/alpha"],
+            "group_id": gid,
+            "params": {
+                "system": "be terse",
+                "temperature": 1,
+                "top_p": 0.9,
+                "seed": 8,
+                "effort": "high",
+                "routing": "price",
+            },
+        },
+    )
+    assert real_clash.status_code == 409
+    assert "seed" in real_clash.json()["detail"]
+
+
+@respx.mock
+def test_a_legacy_group_says_why_it_cannot_take_controls(client):
+    """A pre-H group records no controls, so "controls do not match" would
+    be a lie about what happened and useless about what to do: there is
+    nothing to match against. The detail names the group's state and the
+    way forward, because the user's real question at that moment is not
+    whether the request was refused."""
+    with respx.mock:
+        route = respx.post(OPENROUTER_URL)
+        gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+
+        resp = client.post(
+            "/compare",
+            json={
+                "prompt": "p",
+                "models": ["model/alpha"],
+                "group_id": gid,
+                "params": {"temperature": 0.2, "seed": 7},
+            },
+        )
+
+        assert resp.status_code == 409
+        detail = resp.json()["detail"]
+        # What the group is, which controls were refused, and what to do.
+        assert "records no controls" in detail
+        assert "temperature" in detail and "seed" in detail
+        assert "start a new comparison" in detail
+        assert route.call_count == 0
+
+    # The reverse direction keeps the other message: there the group does
+    # hold an experiment, so "does not match" is the accurate wording.
+    with respx.mock:
+        respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+        controlled = client.post(
+            "/groups", json={"prompt": "q", "params": {"seed": 1}}
+        ).json()["id"]
+        bare = client.post(
+            "/compare",
+            json={"prompt": "q", "models": ["model/alpha"], "group_id": controlled},
+        )
+
+        assert bare.status_code == 409
+        assert "do not match" in bare.json()["detail"]

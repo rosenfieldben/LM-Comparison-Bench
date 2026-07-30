@@ -1070,11 +1070,25 @@ def enforce_group_experiment(
             f"({_excerpt(established)!r}); a group holds one prompt across "
             "its runs",
         )
-    conflicts = _control_conflicts(store.group_params(app.state.db, group_id), params)
+    group_controls = store.group_params(app.state.db, group_id)
+    conflicts = _control_conflicts(group_controls, params)
     if conflicts:
+        named = ", ".join(conflicts)
+        if not group_controls:
+            # The legacy shape, and the one where the generic message would
+            # be useless: nothing "does not match" because there is nothing
+            # to match against. Every pre-H group lands here, so the detail
+            # has to say what the group is and what to do instead, not just
+            # that the request was refused.
+            raise HTTPException(
+                409,
+                "this group records no controls, so it cannot hold a run "
+                f"that sets them ({named}); start a new comparison to run "
+                "with controls",
+            )
         raise HTTPException(
             409,
-            f"controls do not match this group's experiment ({', '.join(conflicts)}); "
+            f"controls do not match this group's experiment ({named}); "
             "a group holds one controls set across its runs",
         )
 
