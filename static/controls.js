@@ -83,7 +83,17 @@
   // number the user typed on purpose. An empty input is checked first, since
   // Number("") is 0 and 0 is a legitimate temperature.
   const CONTROL_INPUTS = [
-    ["system", "ctl-system", (el) => el.value.trim() || null],
+    // Trimmed to DECIDE blankness, sent RAW. A textarea holding only
+    // whitespace is a blank control, but a system prompt's own leading or
+    // trailing whitespace is content: prompts are pasted with indentation
+    // and end with deliberate newlines, and the record claims to be the
+    // exact text the comparison ran under. Returning the trimmed value
+    // would have quietly made that claim false.
+    [
+      "system",
+      "ctl-system",
+      (el) => (el.value.trim() === "" ? null : el.value),
+    ],
     ["temperature", "ctl-temperature", readNumber],
     ["top_p", "ctl-top-p", readNumber],
     ["seed", "ctl-seed", readNumber],

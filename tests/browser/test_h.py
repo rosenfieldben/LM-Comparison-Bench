@@ -476,3 +476,124 @@ def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(page, bench_
     # the temperature it could recover, and no routing it could not.
     expect(page.get_by_test_id("prompt-msg")).to_contain_text("routing is not restored")
     assert controls_now(page) == {"temperature": 0.4}
+
+
+def test_a_system_prompt_reaches_the_wire_exactly_as_typed(bench):
+    """Closing review. The composer read the system prompt through trim(),
+    which decides blankness correctly and alters content on the way past: a
+    prompt pasted with indentation or ending in a deliberate newline was
+    silently reshaped, while the comparison view went on calling it "the
+    system prompt this comparison was run with".
+
+    Whitespace still decides blankness, because a textarea holding only
+    spaces is a blank control. It just no longer decides the content.
+    """
+    system = "  You are terse.\n  Answer in one line.\n"
+    page = bench(["stub/fast"])
+    open_controls(page)
+    page.get_by_test_id("ctl-system").fill(system)
+
+    assert controls_now(page) == {"system": system}
+
+    check_all_chips(page)
+    run_and_wait(page, "h review exact system prompt", 1)
+
+    open_history(page)
+    row_for(page, "h review exact system prompt").first.click()
+    expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
+    # Stored and replayed byte for byte, including the leading spaces and
+    # the trailing newline.
+    stored = page.evaluate(
+        """() => fetch('/runs?limit=100').then((r) => r.json())
+              .then((d) => d.runs.find((e) =>
+                  e.prompt_text.includes('h review exact system prompt')).params)"""
+    )
+    assert stored["system"] == system
+
+    # And a whitespace-only prompt is still a blank control, not a system
+    # message made of spaces.
+    page.get_by_test_id("reuse-comparison").click()
+    page.get_by_test_id("ctl-system").fill("   \n  ")
+    assert controls_now(page) == {}
+
+
+def test_reuse_restores_a_system_only_experiment(bench):
+    """Closing review, the reuse edge the spec names: params carrying only a
+    system prompt. The row badge for it is presence-only, so this is the case
+    where reading badges instead of data would have lost the entire
+    experiment while appearing to restore it."""
+    system = "Only a system prompt was set."
+    page = bench(["stub/fast"])
+    open_controls(page)
+    page.get_by_test_id("ctl-system").fill(system)
+    check_all_chips(page)
+    run_and_wait(page, "h review system only", 1)
+
+    page.get_by_test_id("ctl-system").fill("")
+    page.get_by_test_id("ctl-seed").fill("99")
+    open_history(page)
+    row = row_for(page, "h review system only")
+    assert badge_texts(row.get_by_test_id("history-control-badge")) == ["sys"]
+
+    row.first.click()
+    page.get_by_test_id("reuse-comparison").click()
+
+    # The text is back from the data, and the seed the source never set is
+    # cleared rather than carried along.
+    assert controls_now(page) == {"system": system}
+
+
+def test_the_largest_allowed_seed_survives_the_browser_round_trip(page, bench_url):
+    """The other half of the seed-bound finding, asserted where it failed.
+
+    A seed is only useful if the value you set is the value recorded, badged
+    and reused. The old signed-64 bound broke that silently in the browser,
+    so this pins the boundary case end to end: set the maximum the API now
+    accepts, and the badge, the stored record and the reuse prefill must all
+    hold that exact integer.
+    """
+    biggest = 9007199254740991  # MAX_SEED, and Number.MAX_SAFE_INTEGER
+    made = page.request.post(
+        bench_url + "/compare",
+        data={
+            "prompt": "h review max seed",
+            "models": ["stub/fast"],
+            "params": {"seed": biggest},
+        },
+    )
+    assert made.ok, made.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row = row_for(page, "h review max seed")
+    # Read back through the page's own JSON parsing, which is where the
+    # corruption happened.
+    seen = page.evaluate(
+        """() => fetch('/runs?limit=100').then((r) => r.json())
+              .then((d) => d.runs.find((e) =>
+                  e.prompt_text.includes('h review max seed')).params.seed)"""
+    )
+    assert seen == biggest, f"browser read {seen}"
+    # The badge shows the seed that was actually set, digit for digit.
+    assert badge_texts(row.get_by_test_id("history-control-badge")) == [
+        f"seed {biggest}"
+    ]
+
+    row.first.click()
+    page.get_by_test_id("reuse-comparison").click()
+
+    assert controls_now(page) == {"seed": biggest}
+
+    # The invariant that makes the above sufficient: the API refuses a seed
+    # the page could not represent, so an unrepresentable one can never
+    # reach history at all. Without this the test would only show that the
+    # boundary works, not that nothing beyond it can get in.
+    refused = page.request.post(
+        bench_url + "/compare",
+        data={
+            "prompt": "h review seed too big",
+            "models": ["stub/fast"],
+            "params": {"seed": biggest + 1},
+        },
+    )
+    assert refused.status == 422, refused.text()

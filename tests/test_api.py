@@ -3051,12 +3051,7 @@ def test_the_markup_bounds_match_the_shared_request_model():
         attrs = _input_attrs(html, testid)
         for kind, attr in (("Ge", "min"), ("Le", "max")):
             model_value = _model_bound(field, kind)
-            if attr not in attrs:
-                # An unbounded input is honest for seed, whose bound exists
-                # only to keep an absurd body out and is far outside
-                # anything a number input would help with.
-                assert field == "seed", f"{field} lost its {attr}"
-                continue
+            assert attr in attrs, f"{field} lost its {attr}"
             assert float(attrs[attr]) == float(model_value), (
                 f"{field}: markup {attr}={attrs[attr]} but model says {model_value}"
             )
@@ -3100,3 +3095,152 @@ def test_every_control_the_model_accepts_has_an_input(client):
     )
     for testid in ids.values():
         assert f'data-testid="{testid}"' in html, testid
+
+
+# ---- Phase H closing review: blank-control paths above the byte floor.
+
+
+@respx.mock
+def test_an_explicitly_null_control_is_blank_not_set_to_null(client):
+    """Closing review, hunting above the byte-identical floor. A client can
+    spell a blank control as an explicit null rather than by omission, and
+    the two have to mean the same thing everywhere: in the payload, in the
+    stored record, and in the conflict check. If null survived as a set
+    value the group would record a control nobody chose, and the badge for
+    it would be the truth defect rule two exists to prevent."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "p",
+            "models": ["model/alpha"],
+            "params": {"temperature": None, "seed": None, "system": None},
+        },
+    )
+
+    assert resp.status_code == 200
+    body = json.loads(respx.calls[0].request.content)
+    # Byte-for-byte the blank payload: nulls reached neither the top level
+    # nor the message list.
+    assert set(body) == {"model", "messages", "max_tokens", "provider"}
+    assert body["messages"] == [{"role": "user", "content": "p"}]
+
+    gid = client.post(
+        "/groups", json={"prompt": "q", "params": {"temperature": None}}
+    ).json()["id"]
+    assert client.get(f"/groups/{gid}").json()["params"] is None
+    # And a group written that way still accepts a run that sets nothing,
+    # so the two spellings agree in the conflict check too.
+    assert (
+        client.post(
+            "/compare",
+            json={"prompt": "q", "models": ["model/alpha"], "group_id": gid},
+        ).status_code
+        == 200
+    )
+
+
+@respx.mock
+def test_zero_is_a_chosen_value_everywhere_it_travels(client):
+    """The control most likely to be lost to a falsy check, and the one that
+    matters most: temperature 0 is the whole point of a reproducibility run.
+    Walked end to end because a falsy test anywhere on the path (payload,
+    record, conflict check) would silently drop it."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    zeros = {"temperature": 0, "top_p": 0, "seed": 0}
+    gid = client.post("/groups", json={"prompt": "z", "params": zeros}).json()["id"]
+
+    # A 409 here would mean one side read a zero as blankness.
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "z",
+            "models": ["model/alpha"],
+            "group_id": gid,
+            "params": zeros,
+        },
+    )
+
+    assert resp.status_code == 200, resp.json()
+    body = json.loads(respx.calls[0].request.content)
+    assert body["temperature"] == 0 and body["top_p"] == 0 and body["seed"] == 0
+    assert client.get(f"/groups/{gid}").json()["params"] == zeros
+    # And it survives the derivation an ungrouped run relies on.
+    lone = client.post(
+        "/compare", json={"prompt": "z2", "models": ["model/alpha"], "params": zeros}
+    ).json()["run_id"]
+    assert client.get(f"/runs/{lone}").json()["params"] == zeros
+
+
+def test_both_compare_surfaces_share_one_params_class(client):
+    """Parity made structural in H1, asserted here so a future edit cannot
+    quietly split it into two classes that then drift. The closing review
+    hunts parity drift; this is what makes that hunt vacuous rather than
+    careful."""
+    for model in (main.CompareRequest, main.StreamCompareRequest, main.GroupCreate):
+        annotation = model.model_fields["params"].annotation
+        assert main.ExperimentParams in typing.get_args(annotation), model.__name__
+
+
+@respx.mock
+def test_the_zdr_belt_survives_every_routing_choice_through_the_endpoint(client):
+    """The provider merge asserted through the wiring, not only on the pure
+    function. The boot policy and the request's routing meet in app state,
+    and a regression there would send a payload weaker than the one the run
+    row claims, which is the failure the G5 belt exists to prevent."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    app.state.data_policy = "zdr"
+    app.state.provider_prefs = provider_preferences("zdr")
+    try:
+        for routing, expected in (
+            (None, {"sort": "throughput", "zdr": True, "data_collection": "deny"}),
+            (
+                "throughput",
+                {"sort": "throughput", "zdr": True, "data_collection": "deny"},
+            ),
+            ("price", {"sort": "price", "zdr": True, "data_collection": "deny"}),
+            ("default", {"zdr": True, "data_collection": "deny"}),
+        ):
+            body = {"prompt": "p", "models": ["model/alpha"]}
+            if routing is not None:
+                body["params"] = {"routing": routing}
+            assert client.post("/compare", json=body).status_code == 200
+            # calls[-1], not calls[0]: this loop makes several requests and
+            # indexing from the front reads the previous iteration's payload,
+            # which passes for whichever mode happens to come first and then
+            # blames the next one.
+            sent = json.loads(respx.calls[-1].request.content)
+            assert sent["provider"] == expected, routing
+    finally:
+        app.state.data_policy = "standard"
+        app.state.provider_prefs = provider_preferences("standard")
+
+
+def test_the_seed_bound_is_what_a_browser_can_read_back_exactly(client):
+    """Closing review finding. The seed bound was signed 64-bit, which the
+    API accepted and the browser could not represent: a stored
+    9223372036854775807 came back to the page as 9223372036854776000,
+    measured in Chromium rather than reasoned about.
+
+    Two consequences, both silent. History would badge a seed nobody chose,
+    and reuse would prefill that wrong seed and then be refused by the
+    one-experiment check as a different experiment, which is a legal run
+    blocked by a corruption the user cannot see. So the bound is now the
+    largest integer the whole path carries exactly, and a value above it is
+    a 422 at the boundary instead of a lie in the record.
+    """
+    assert main.MAX_SEED == 2**53 - 1
+
+    respx.post(OPENROUTER_URL)
+    for seed in (main.MAX_SEED, -main.MAX_SEED):
+        # Exactly representable: json round trips it unchanged, which is the
+        # property the browser needs.
+        assert json.loads(json.dumps(seed)) == seed
+        assert float(seed) == seed
+    for seed in (main.MAX_SEED + 1, -main.MAX_SEED - 1):
+        resp = client.post(
+            "/compare",
+            json={"prompt": "p", "models": ["model/alpha"], "params": {"seed": seed}},
+        )
+        assert resp.status_code == 422, seed

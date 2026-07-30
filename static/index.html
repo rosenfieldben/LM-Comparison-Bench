@@ -112,7 +112,7 @@
       <span class="ctl">
         <label for="ctl-seed">seed</label>
         <input id="ctl-seed" data-testid="ctl-seed" type="number" step="1"
-               placeholder="unset"
+               min="-9007199254740991" max="9007199254740991" placeholder="unset"
                title="Passed through and recorded, nothing more. Providers differ in whether they accept a seed at all and in how deterministic they are with one; OpenRouter says the same seed SHOULD give the same result and that determinism is not guaranteed for some models. A run that came back different is a fact about the provider, not a bug here">
       </span>
       <span class="ctl">

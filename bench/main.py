@@ -91,10 +91,22 @@ MAX_POSITION = 999
 FORBID_UNKNOWN = ConfigDict(extra="forbid")
 
 
-# A seed is an opaque integer to every provider, so the bound exists only
-# to keep an absurd body out, the same reason MAX_POSITION exists. Signed
-# 64-bit is the widest thing any of them could plausibly treat as a number.
-MAX_SEED = 2**63 - 1
+# A seed is an opaque integer to every provider, so the bound exists only to
+# keep an absurd body out, the same reason MAX_POSITION exists.
+#
+# 2**53 - 1, not signed 64-bit, and the difference is not cosmetic. This
+# value is recorded, served back as JSON, and read in a browser, where every
+# number is a double: measured rather than assumed, a stored seed of
+# 9223372036854775807 came back to the page as 9223372036854776000. That
+# would badge the wrong seed in history, and reuse would then prefill the
+# wrong one and be refused by the one-experiment check as a different
+# experiment, which is a legal run blocked by a silent corruption.
+#
+# So the bound is the largest integer the whole path can carry exactly. Nine
+# quadrillion distinct seeds is not a constraint anyone will feel, and a
+# value above it is now a 422 at the boundary instead of a lie in the
+# record. Number.MAX_SAFE_INTEGER in the browser is the same number.
+MAX_SEED = 2**53 - 1
 
 # Long enough for a real system prompt and short enough that the group row
 # stays a record rather than a document store. Bounded for the same reason
@@ -131,7 +143,11 @@ class ExperimentParams(BaseModel):
     system: str | None = Field(default=None, min_length=1, max_length=MAX_SYSTEM_PROMPT)
     temperature: float | None = Field(default=None, ge=0.0, le=2.0)
     top_p: float | None = Field(default=None, ge=0.0, le=1.0)
-    seed: int | None = Field(default=None, ge=-MAX_SEED - 1, le=MAX_SEED)
+    # Symmetric, unlike the signed-64 range this used to mirror. The bound
+    # is now JS's safe-integer range exactly (MIN_SAFE_INTEGER is
+    # -MAX_SAFE_INTEGER), because the limit that matters is what survives
+    # being read back in a browser. See MAX_SEED.
+    seed: int | None = Field(default=None, ge=-MAX_SEED, le=MAX_SEED)
     # Three named tiers of the seven OpenRouter documents. A comparison
     # holds one effort across models, and the widest set invites a
     # per-model guess about what "xhigh" means where it is unsupported.
