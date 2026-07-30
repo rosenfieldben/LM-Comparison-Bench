@@ -428,6 +428,66 @@ failure. The field names are pinned against OpenRouter's provider
 routing documentation; the URL and the date it was read are in the
 comment above `DATA_POLICY_PREFS` in `bench/models.py`.
 
+## Experiment controls
+
+By default the bench sends one user message and lets every provider apply
+its own sampling defaults, which means a comparison varies whatever the
+providers feel like varying. Six controls let one comparison hold that
+constant across its models:
+
+| Control | Sent as | Range |
+| --- | --- | --- |
+| system prompt | a leading `system` message | up to 8000 characters |
+| temperature | `temperature` | 0 to 2 |
+| top_p | `top_p` | 0 to 1 |
+| seed | `seed` | any integer |
+| reasoning effort | `reasoning.effort` | low, medium, high |
+| routing mode | `provider.sort` | throughput, price, default |
+
+Two rules govern all six.
+
+**A control you leave blank is not sent.** It does not appear in the
+payload at all, so the provider applies its own default and the record can
+say honestly that the bench did not choose one. The bench never fills in a
+value on your behalf, and with every control blank the outgoing payload is
+byte for byte what it was before these controls existed. A test asserts
+exactly that, against a request body captured from the previous release.
+
+**Only what you set is recorded.** `groups.params_json` holds the controls
+you chose and nothing else, so a history badge appears for a control you
+picked and never for a default. A group with no controls records nothing
+rather than an empty object.
+
+The controls belong to the comparison, not to a model: one comparison, one
+controls set, applied to every model, which is what makes the columns
+comparable. A group holds one experiment the way it holds one prompt, and a
+run whose controls disagree with its group's is refused with a 409 at
+entry, before any upstream call, naming the controls that conflict.
+
+Routing mode picks how OpenRouter chooses among the providers serving a
+model. `throughput` is the default and is what the bench has always sent;
+`price` prefers the cheapest; `default` sends no sort at all, which is the
+documented way to ask for OpenRouter's own price-weighted load balancing.
+Routing merges into the same provider object the data-handling policy uses,
+never displacing it.
+
+**About seeds.** Providers differ in whether they accept a seed at all and
+in how deterministic they are when they do. OpenRouter's own documentation
+says repeated requests with the same seed and parameters *should* return
+the same result and that determinism is not guaranteed for some models. The
+bench passes your seed through and records it. It promises nothing beyond
+that, and a run that came back different with the same seed is a fact about
+the provider, not a bug here.
+
+The same caveat applies more broadly: a provider that does not support a
+parameter receives the request and ignores that parameter, which is
+OpenRouter's documented behavior rather than something this bench hides.
+That is why the exact payload is recorded per result in `request_json`: a
+run whose temperature a provider ignored is still a run that can be shown
+to have asked for it. Every field name, bound and behavior above is pinned
+against OpenRouter's current documentation, with the URLs and the dates
+they were read in the comments in `bench/models.py`.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
@@ -451,10 +511,30 @@ that errors or times out gets its `error` field set without affecting
 the other models in the run. Every `/compare` call is persisted and
 returns a `run_id`.
 
+`POST /compare` is the supported scripting surface, and that is a
+commitment rather than an accident of it existing. It carries every
+control the browser does, under the same `params` object, with the same
+validation and the same bounds:
+
+```sh
+curl -X POST localhost:8000/compare \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Say hello in five words.",
+       "models": ["deepseek/deepseek-chat"],
+       "params": {"system": "Be terse.", "temperature": 0, "seed": 7,
+                  "routing": "price"}}'
+```
+
+Parity with the streaming endpoint is structural, not maintained by hand:
+both request models reference one `ExperimentParams` class, so a field, a
+bound or a validator cannot drift between them. Send `group_id` alongside
+`params` and the one-experiment-per-group check applies to scripted runs
+exactly as it does to the browser's.
+
 The browser UI streams responses token by token via
 `POST /compare/stream` with `{"prompt": ..., "model": ...}` (one
-model per request) plus optional `prompt_id`, `group_id` and
-`budget`. The
+model per request) plus optional `prompt_id`, `group_id`, `budget` and
+`params`. The
 response is SSE-formatted (`data: {...}` lines): `delta` events carry
 text chunks, then one `done` event carries the full result and its
 `run_id`. Streamed results include `ttft_ms` (time to first token),

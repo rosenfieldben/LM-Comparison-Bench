@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,
     prompt_text TEXT,
-    models_json TEXT
+    models_json TEXT,
+    params_json TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -119,6 +120,17 @@ MIGRATIONS = [
     ("results", "provider", "TEXT"),
     ("results", "quantization", "TEXT"),
     ("results", "native_finish_reason", "TEXT"),
+    # Phase H, experiment controls. The controls the user set for one
+    # comparison, on the group rather than the run, because they are
+    # experiment-level: one comparison, one controls set, applied to every
+    # model. That is the fairness point, and putting them anywhere else
+    # would let a single comparison hold two different experiments.
+    #
+    # NULL here is not missing information. Every pre-H group predates the
+    # controls entirely, so NULL is the affirmative fact that no control
+    # was set, which is why the params check needs no derive-from-member
+    # fallback of the kind group_prompt carries.
+    ("groups", "params_json", "TEXT"),
 ]
 
 
@@ -281,22 +293,35 @@ def create_group(
     conn: sqlite3.Connection,
     prompt_text: str | None = None,
     models: list[str] | None = None,
+    params: dict[str, Any] | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
-    The group is created before any upstream call, so the prompt and the
-    ordered lineup recorded here are the experiment as declared, not as it
-    turned out. Both stay optional: a caller that does not know them yet
-    (and every pre-G caller) still gets a plain group row.
+    The group is created before any upstream call, so the prompt, the
+    ordered lineup and the controls recorded here are the experiment as
+    declared, not as it turned out. All three stay optional: a caller that
+    does not know them yet (and every pre-G caller) still gets a plain
+    group row.
+
+    An empty params mapping stores NULL rather than "{}". Recording only
+    what was set is the rule, and an empty object is not a smaller record
+    of nothing, it is a second way to spell the same absence that every
+    reader would then have to know about.
+
+    sort_keys because this string is compared against a later request's
+    controls to enforce one experiment per group. Sorting cannot change
+    which controls were set, and without it two identical control sets
+    could serialize differently and read as a conflict.
     """
     with conn:
         cur = conn.execute(
-            "INSERT INTO groups (created_at, prompt_text, models_json)"
-            " VALUES (?, ?, ?)",
+            "INSERT INTO groups (created_at, prompt_text, models_json, params_json)"
+            " VALUES (?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
                 json.dumps(models) if models is not None else None,
+                json.dumps(params, sort_keys=True) if params else None,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
@@ -335,6 +360,40 @@ def group_prompt(conn: sqlite3.Connection, group_id: int) -> str | None:
         (group_id,),
     ).fetchone()
     return member["prompt_text"] if member else None
+
+
+def _decoded_params(raw: object) -> dict[str, Any]:
+    """One group's stored controls as a mapping, empty when it has none.
+
+    Repair on read, like every other column: a params_json that is absent,
+    not a string, unparseable, or parses to something other than an object
+    reads as no controls rather than propagating a broken value into a
+    comparison check. Empty is the honest answer for all of those, because
+    a record nobody can read is not evidence that a control was set.
+    """
+    if not isinstance(raw, str):
+        return {}
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def group_params(conn: sqlite3.Connection, group_id: int) -> dict[str, Any]:
+    """The controls a group was created with, empty when it has none.
+
+    No derive-from-member fallback, deliberately, and the asymmetry with
+    group_prompt is the point. A NULL prompt_text meant "unknown, ask the
+    first member", because groups existed before that column did and their
+    prompt was still knowable from a run. A NULL params_json means "no
+    control was set", which is true of every pre-H group by construction,
+    so there is nothing to derive and nothing to guess.
+    """
+    row = conn.execute(
+        "SELECT params_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    return _decoded_params(row["params_json"]) if row is not None else {}
 
 
 def save_run(
@@ -602,9 +661,18 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
 
 
 def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
-    """The group's runs with full results, run order by id."""
+    """The group's runs with full results, run order by id, plus the
+    controls the comparison was declared with.
+
+    params comes back decoded rather than as the stored string, so the one
+    place that knows how the controls are serialized is this module. It is
+    None rather than an empty mapping when nothing was set, because the
+    detail view has to render a set control and only a set control, and
+    None is the shape that cannot be mistaken for a control set to a
+    falsy value.
+    """
     row = conn.execute(
-        "SELECT id, created_at FROM groups WHERE id = ?", (group_id,)
+        "SELECT id, created_at, params_json FROM groups WHERE id = ?", (group_id,)
     ).fetchone()
     if row is None:
         return None
@@ -615,6 +683,8 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
         )
     ]
     out = dict(row)
+    params = _decoded_params(out.pop("params_json"))
+    out["params"] = params or None
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
 

@@ -2588,3 +2588,260 @@ def test_versioning_leaves_foreign_urls_alone():
     html = '<script src="https://cdn.example/x.js"></script><a href="/runs">r</a>'
 
     assert main.versioned_index(html, "abc") == html
+
+
+# ---- Phase H1: experiment controls at the boundary.
+
+# Every control set to a distinguishable value, so a test can tell a
+# dropped one from a defaulted one.
+ALL_CONTROLS = {
+    "system": "be terse",
+    "temperature": 0.25,
+    "top_p": 0.9,
+    "seed": 7,
+    "effort": "high",
+    "routing": "price",
+}
+
+
+@respx.mock
+def test_review_repro_group_rejects_a_second_experiment(client):
+    """Both external reviews named uncontrolled sampling and routing as the
+    confound standing between "outputs I received" and "a comparison I can
+    defend". Controls alone do not remove it: a group whose members were
+    sent different temperatures is exactly the uncontrolled comparison
+    wearing a controlled label, and it would look defensible in history.
+
+    So one prompt per group became one experiment per group, checked at
+    entry, pre-spend, like the prompt check beside it. The 409 names the
+    controls that conflict, and respx proves no upstream call was made,
+    because a rejection after spend would violate the fault boundary.
+    """
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post("/groups", json={"params": ALL_CONTROLS}).json()["id"]
+    body = {"prompt": "p", "models": ["model/alpha"], "group_id": gid}
+
+    first = client.post("/compare", json={**body, "params": ALL_CONTROLS})
+    assert first.status_code == 200
+    calls = route.call_count
+
+    # One control changed is a different experiment.
+    clash = client.post(
+        "/compare",
+        json={**body, "params": {**ALL_CONTROLS, "temperature": 1.5}},
+    )
+    assert clash.status_code == 409
+    assert "temperature" in clash.json()["detail"]
+    assert "one controls set" in clash.json()["detail"]
+    assert route.call_count == calls, "the refusal must spend nothing"
+
+    # Dropping a control is also a different experiment: absence is a
+    # choice under rule one, not a partial match.
+    dropped = dict(ALL_CONTROLS)
+    del dropped["seed"]
+    missing = client.post("/compare", json={**body, "params": dropped})
+    assert missing.status_code == 409
+    assert "seed" in missing.json()["detail"]
+    assert route.call_count == calls
+
+    # Sending no controls at all against a group that has them is refused
+    # too, and names every one of them.
+    none_at_all = client.post("/compare", json=body)
+    assert none_at_all.status_code == 409
+    for name in ALL_CONTROLS:
+        assert name in none_at_all.json()["detail"], name
+    assert route.call_count == calls
+
+    # The same experiment still passes: a rerun or a second model.
+    again = client.post("/compare", json={**body, "params": ALL_CONTROLS})
+    assert again.status_code == 200
+    assert route.call_count == calls + 1
+
+
+def test_the_stream_endpoint_enforces_the_same_experiment_check(client):
+    """The check lives at both entries or it lives nowhere: the frontend
+    fans out one stream request per model, so the streaming path is the one
+    a real divergence would travel."""
+    gid = client.post("/groups", json={"params": {"temperature": 0.25}}).json()["id"]
+
+    with respx.mock:
+        route = respx.post(OPENROUTER_URL)
+        clash = client.post(
+            "/compare/stream",
+            json={
+                "prompt": "p",
+                "model": "model/alpha",
+                "group_id": gid,
+                "params": {"temperature": 0.9},
+            },
+        )
+        assert clash.status_code == 409
+        assert "temperature" in clash.json()["detail"]
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_a_group_with_no_controls_accepts_a_run_with_no_controls(client):
+    """Every pre-H group and every pre-H client sends nothing, and nothing
+    matches nothing. This is the compatibility floor: the check must not
+    turn existing traffic into 409s."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+
+    resp = client.post(
+        "/compare", json={"prompt": "p", "models": ["model/alpha"], "group_id": gid}
+    )
+
+    assert resp.status_code == 200
+
+
+def test_a_group_with_no_controls_rejects_a_run_that_carries_one(client):
+    """NULL params is not missing information, so there is no
+    derive-from-member fallback here and this is what that buys. A group
+    recorded as uncontrolled whose member sent a temperature would be a
+    record that understates what it sent, which is the truth defect the
+    whole phase exists to prevent."""
+    with respx.mock:
+        route = respx.post(OPENROUTER_URL)
+        gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+
+        resp = client.post(
+            "/compare",
+            json={
+                "prompt": "p",
+                "models": ["model/alpha"],
+                "group_id": gid,
+                "params": {"seed": 1},
+            },
+        )
+
+        assert resp.status_code == 409
+        assert "seed" in resp.json()["detail"]
+        assert route.call_count == 0
+
+
+def test_the_group_records_exactly_the_controls_that_were_set(client):
+    """Rule two: params_json stores what the user set and nothing else. No
+    echoing of tool defaults, and no normalizing an absent control to null,
+    because a history badge that rendered a default as a choice would be a
+    truth defect."""
+    gid = client.post(
+        "/groups", json={"prompt": "p", "params": {"temperature": 0.25, "seed": 7}}
+    ).json()["id"]
+
+    stored = client.get(f"/groups/{gid}").json()["params"]
+
+    assert stored == {"temperature": 0.25, "seed": 7}
+
+
+def test_a_group_created_without_controls_records_none_not_an_empty_object(client):
+    """One spelling of absence. An empty object would be a second, and
+    every reader would then have to know both."""
+    gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+    assert client.get(f"/groups/{gid}").json()["params"] is None
+
+    # An explicitly empty params object collapses to the same absence
+    # rather than storing a record of nothing.
+    gid2 = client.post("/groups", json={"prompt": "p", "params": {}}).json()["id"]
+    assert client.get(f"/groups/{gid2}").json()["params"] is None
+
+
+@pytest.mark.parametrize(
+    "params,field",
+    [
+        ({"temperature": 2.01}, "temperature"),
+        ({"temperature": -0.01}, "temperature"),
+        ({"top_p": 1.01}, "top_p"),
+        ({"top_p": -0.01}, "top_p"),
+        ({"effort": "maximum"}, "effort"),
+        ({"routing": "cheapest"}, "routing"),
+        ({"system": ""}, "system"),
+        ({"nope": 1}, "nope"),
+    ],
+)
+@respx.mock
+def test_both_compare_surfaces_reject_the_same_bad_controls(client, params, field):
+    """Parity is structural (one ExperimentParams class, three references)
+    but the point of parity is that a scripted caller and the browser
+    cannot diverge, so it is asserted on both surfaces rather than assumed
+    from the class.
+
+    The empty system prompt is in this list deliberately: "" is not a
+    system prompt the user set, it is a blank control, and accepting it
+    would put a meaningless leading system message on the wire.
+    """
+    batch = client.post(
+        "/compare", json={"prompt": "p", "models": ["model/alpha"], "params": params}
+    )
+    stream = client.post(
+        "/compare/stream",
+        json={"prompt": "p", "model": "model/alpha", "params": params},
+    )
+    group = client.post("/groups", json={"prompt": "p", "params": params})
+
+    assert batch.status_code == 422, field
+    assert stream.status_code == 422, field
+    assert group.status_code == 422, field
+
+
+@respx.mock
+def test_both_compare_surfaces_accept_the_same_full_controls_set(client):
+    """The other half of parity: what one takes, the other takes."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    batch = client.post(
+        "/compare",
+        json={"prompt": "p", "models": ["model/alpha"], "params": ALL_CONTROLS},
+    )
+
+    assert batch.status_code == 200
+    body = json.loads(respx.calls[0].request.content)
+    assert body["temperature"] == 0.25
+    assert body["messages"][0] == {"role": "system", "content": "be terse"}
+    # Routing reached the provider object, and the boot privacy policy is
+    # still riding it.
+    assert body["provider"] == {"sort": "price"}
+
+
+@respx.mock
+def test_blank_controls_leave_the_boot_provider_block_untouched(client):
+    """The routing control must not become a way to lose the privacy
+    policy, and the no-routing path must not rebuild the block at all.
+
+    The key-absence assertions are the endpoint-level half of rule one, and
+    they are enumerated rather than spot-checked: an earlier draft asserted
+    only the provider block and the messages, and a deliberately injected
+    temperature default sailed straight through it while the payload
+    tombstone in test_models caught it. Absence is what this test is for,
+    so it has to name every key that must be absent.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    client.post("/compare", json={"prompt": "p", "models": ["model/alpha"]})
+
+    body = json.loads(respx.calls[0].request.content)
+    assert body["provider"] == {"sort": "throughput"}
+    assert body["messages"] == [{"role": "user", "content": "p"}]
+    for control_key in ("temperature", "top_p", "seed", "reasoning"):
+        assert control_key not in body, control_key
+    # The whole key set, so a control added later cannot slip in unnoticed
+    # by being absent from the list above.
+    assert set(body) == {"model", "messages", "max_tokens", "provider"}
+
+
+@respx.mock
+def test_a_set_control_reaches_the_stored_request_json(client):
+    """request_json is the reproducibility record, so the controls have to
+    be visible in the row and not only on the wire."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    run_id = client.post(
+        "/compare",
+        json={"prompt": "p", "models": ["model/alpha"], "params": {"seed": 7}},
+    ).json()["run_id"]
+
+    recorded = json.loads(
+        client.get(f"/runs/{run_id}").json()["results"][0]["request_json"]
+    )
+    assert recorded["seed"] == 7
+    assert "temperature" not in recorded

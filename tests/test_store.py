@@ -852,3 +852,142 @@ def test_run_provenance_columns_round_trip(db):
     assert run["app_sha"] == "abc123"
     assert run["catalog_snapshot_at"] == "2026-07-25T00:00:00+00:00"
     assert run["data_policy"] == "deny"
+
+
+PRE_H_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_h_schema.sql").read_text()
+
+
+def test_migration_onto_pre_h_database_is_additive_and_idempotent(tmp_path):
+    """Phase H lifts the schema freeze for exactly one additive column, so
+    the migration is proven against the schema that actually shipped rather
+    than a hand-written approximation. The fixture was generated from the
+    pre-H SCHEMA string itself, the same discipline the pre-G fixture uses.
+
+    Three things must hold, and the third is the one that matters for the
+    controls: the migration runs on a populated legacy database, a second
+    connect is a no-op rather than an error, and a legacy group reads back
+    with params None. That None is load-bearing. It is what tells
+    group_params that no control was set, which is true of every group that
+    predates the column, and it is why the params check needs no
+    derive-from-member fallback.
+    """
+    db_path = tmp_path / "pre_h.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_H_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json)
+           VALUES (1, '2026-01-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]')"""
+    )
+    # A second group with no declared prompt either: the oldest shape, and
+    # the one whose params must not be confused with an unreadable value.
+    legacy.execute(
+        "INSERT INTO groups (id, created_at) VALUES (2, '2026-01-01T00:00:00+00:00')"
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-01-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error, cost_usd)
+           VALUES (1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL, 2.9e-05)"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        # Additive: the column exists and every legacy row reads back
+        # through the normal paths with it absent rather than invented.
+        for gid in (1, 2):
+            group = store.get_group(conn, gid)
+            assert group is not None
+            assert group["params"] is None, gid
+            assert store.group_params(conn, gid) == {}, gid
+        # The rest of the legacy row is untouched by the migration.
+        assert store.group_prompt(conn, 1) == "legacy prompt"
+        run = store.get_run(conn, 1)
+        assert run is not None
+        assert run["results"][0]["response_text"] == "legacy text"
+    finally:
+        conn.close()
+
+    # Idempotent: connecting again neither errors nor duplicates the column.
+    again = store.connect(str(db_path))
+    try:
+        cols = [r["name"] for r in again.execute("PRAGMA table_info(groups)")]
+        assert cols.count("params_json") == 1, cols
+        # And a group created after the migration still records its controls.
+        gid = store.create_group(again, "new prompt", ["new/a"], {"seed": 7})
+        assert store.group_params(again, gid) == {"seed": 7}
+    finally:
+        again.close()
+
+
+def test_create_group_stores_no_controls_as_null(tmp_path):
+    """One spelling of absence, so no reader has to know two. An empty
+    mapping is not a smaller record of nothing."""
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        for params in (None, {}):
+            gid = store.create_group(conn, "p", ["m/a"], params)
+            raw = conn.execute(
+                "SELECT params_json FROM groups WHERE id = ?", (gid,)
+            ).fetchone()["params_json"]
+            assert raw is None, params
+            assert store.group_params(conn, gid) == {}
+    finally:
+        conn.close()
+
+
+def test_create_group_serializes_controls_with_sorted_keys(tmp_path):
+    """The stored string is compared against a later request's controls to
+    enforce one experiment per group. Sorting cannot change which controls
+    were set, and without it two identical sets could serialize differently
+    and read as a conflict."""
+    conn = store.connect(str(tmp_path / "c.db"))
+    try:
+        first = store.create_group(conn, "p", None, {"top_p": 0.9, "seed": 7})
+        second = store.create_group(conn, "p", None, {"seed": 7, "top_p": 0.9})
+
+        def raw(gid):
+            return conn.execute(
+                "SELECT params_json FROM groups WHERE id = ?", (gid,)
+            ).fetchone()["params_json"]
+
+        assert raw(first) == raw(second) == '{"seed": 7, "top_p": 0.9}'
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "stored",
+    [
+        "not json at all",
+        # Valid JSON that is not an object: a list or a bare scalar cannot
+        # name controls, so it is not evidence that any were set.
+        "[1, 2]",
+        '"a string"',
+        "17",
+        "null",
+    ],
+)
+def test_an_unreadable_params_column_reads_as_no_controls(tmp_path, stored):
+    """Repair on read, like every other column. A record nobody can parse
+    is not evidence that a control was set, and propagating the broken
+    value into the one-experiment check would turn a corrupt row into a
+    permanent 409 on its own group.
+    """
+    conn = store.connect(str(tmp_path / "d.db"))
+    try:
+        gid = store.create_group(conn, "p")
+        conn.execute("UPDATE groups SET params_json = ? WHERE id = ?", (stored, gid))
+        conn.commit()
+
+        assert store.group_params(conn, gid) == {}
+        group = store.get_group(conn, gid)
+        assert group is not None
+        assert group["params"] is None
+    finally:
+        conn.close()

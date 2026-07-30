@@ -6,7 +6,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from typing import Any
 
 import httpx
@@ -154,15 +154,136 @@ DATA_POLICY_PREFS: dict[str, dict[str, Any]] = {
 }
 
 
-def provider_preferences(data_policy: str) -> dict[str, Any]:
-    """The provider block for one data policy, throughput sort included.
+# Routing modes, and what each one puts in the provider object. Pinned
+# against OpenRouter's provider-routing documentation at
+# https://openrouter.ai/docs/guides/routing/provider-selection#provider-sorting
+# read 2026-07-30, not from memory: sort takes "price", "throughput" or
+# "latency", and "If you have sort or order set in your provider
+# preferences, load balancing will be disabled." So omitting sort is not a
+# neutral spelling of a default, it is the one way to ask for OpenRouter's
+# own price-weighted load balancing, which is why "default" maps to no key
+# at all rather than to a value.
+#
+# throughput is the bench's default because it is what the bench already
+# sent; see PROVIDER_PREFS above for why that choice was made. Keeping it
+# the default is what lets a blank controls set produce today's payload
+# byte for byte.
+ROUTING_PREFS: dict[str, dict[str, Any]] = {
+    "throughput": PROVIDER_PREFS,
+    "price": {"sort": "price"},
+    "default": {},
+}
 
-    Raises KeyError on an unknown policy, deliberately: the value is
-    validated once at boot (bench.main._parse_data_policy), and a typo
-    would otherwise silently send the standard payload while the run row
-    claimed something stricter.
+ROUTING_DEFAULT = "throughput"
+
+
+def provider_preferences(
+    data_policy: str, routing: str = ROUTING_DEFAULT
+) -> dict[str, Any]:
+    """The provider block for one data policy and routing mode.
+
+    The two merge into one object because OpenRouter gives them one object:
+    sort and the data-handling keys are siblings. Merging in this order
+    means the privacy policy is written last and can never be displaced by
+    a routing choice, which matters because the failure would be silent and
+    would understate what the payload promised about the prompt.
+
+    Raises KeyError on an unknown policy or routing mode, deliberately:
+    both are validated at their boundaries (bench.main._parse_data_policy
+    at boot, the request model per request), and a typo would otherwise
+    silently send something other than what the run row claimed.
     """
-    return {**PROVIDER_PREFS, **DATA_POLICY_PREFS[data_policy]}
+    return {**ROUTING_PREFS[routing], **DATA_POLICY_PREFS[data_policy]}
+
+
+# The controls that shape generation, and where each one goes on the wire.
+# Field names and bounds pinned at implementation time against OpenRouter's
+# current documentation, not from memory:
+#
+#   https://openrouter.ai/docs/api_reference/parameters  read 2026-07-30
+#   temperature: float 0.0 to 2.0, default 1.0
+#   top_p:       float 0.0 to 1.0, default 1.0
+#   seed:        integer. "If specified, the inferencing will sample
+#                deterministically, such that repeated requests with the
+#                same seed and parameters should return the same result.
+#                Determinism is not guaranteed for some models."
+#   All three are top-level keys of the chat-completions body.
+#
+#   https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+#   read 2026-07-30. reasoning is a top-level OBJECT, not a scalar, and
+#   effort is a key inside it. The documented values are max, xhigh, high,
+#   medium, low, minimal and none; the bench offers low, medium and high
+#   because three named tiers are what a comparison can hold constant
+#   without inviting a per-model guess.
+#
+# What happens on a model that does not support a control: OpenRouter
+# documents the silent path, so this is recorded rather than assumed.
+# "With the default routing strategy, providers that don't support all the
+# LLM parameters specified in your request can still receive the request,
+# but will ignore unknown parameters."
+# (.../provider-selection#requiring-providers-to-support-all-parameters,
+# read 2026-07-30.) So an unsupported sampling parameter is dropped by the
+# provider, not rejected, and that is documented behavior rather than a
+# defect this bench is hiding. For reasoning effort the mapping is stronger
+# still: "For models that only support reasoning.max_tokens, the effort
+# level will be set based on the percentages above", so effort is
+# translated rather than dropped there. require_parameters could force a
+# hard failure instead, and is deliberately not sent: it changes which
+# providers are eligible, which would silently change what is being
+# measured, and choosing that tradeoff is not this phase's business.
+#
+# The record is what makes the silence survivable. request_json holds the
+# exact payload per result, so a run whose temperature a provider ignored
+# is still a run that can be shown to have asked for it.
+_SAMPLING_KEYS = ("temperature", "top_p", "seed")
+
+
+def control_payload(controls: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The payload fragment for the controls that were actually set.
+
+    Never sends a default. A control the caller left out does not appear in
+    the returned mapping at all, so it does not appear on the wire, so the
+    provider applies its own default and the record can say honestly that
+    the bench did not choose one. With nothing set this returns an empty
+    mapping and the payload is byte for byte what the bench sent before
+    these controls existed.
+
+    Deliberately excludes the system prompt and the routing mode. Those two
+    are not top-level scalars: the system prompt is a message and routing
+    is a key of the provider object, so they are built by control_messages
+    and provider_preferences. Keeping this function to the keys it can
+    place directly is what makes its output a safe ** merge.
+    """
+    if not controls:
+        return {}
+    out: dict[str, Any] = {}
+    for key in _SAMPLING_KEYS:
+        value = controls.get(key)
+        if value is not None:
+            out[key] = value
+    effort = controls.get("effort")
+    if effort is not None:
+        out["reasoning"] = {"effort": effort}
+    return out
+
+
+def control_messages(
+    prompt: str, controls: Mapping[str, Any] | None
+) -> list[dict[str, str]]:
+    """The message list, the system prompt leading when one was set.
+
+    A system message is prepended rather than folded into the user turn:
+    the two roles are what the models are trained to distinguish, and
+    concatenating them would make the comparison measure something else.
+    With no system prompt this is the single user message the bench has
+    always sent, which is half of why a blank controls set reproduces
+    today's payload exactly.
+    """
+    user = {"role": "user", "content": prompt}
+    system = (controls or {}).get("system")
+    if not system:
+        return [user]
+    return [{"role": "system", "content": system}, user]
 
 
 # Extended-budget runs go silent for minutes while providers reason,
@@ -435,6 +556,7 @@ async def run_model(
     client: httpx.AsyncClient,
     max_tokens: int = BUDGET_STANDARD,
     provider_prefs: dict[str, Any] | None = None,
+    controls: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
@@ -465,20 +587,26 @@ async def run_model(
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": control_messages(prompt, controls),
         "max_tokens": max_tokens,
         # Injected rather than read from module state, so the boot-scoped
         # data policy reaches the wire without this function knowing where
         # policy lives. The default keeps a direct caller on today's
         # behavior.
         "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
+        # Last, and only the controls that were set. The merge is safe
+        # because control_payload emits from a fixed key list that shares
+        # nothing with the keys above; a test asserts that, so a future
+        # control cannot quietly overwrite the model or the budget.
+        **control_payload(controls),
     }
     # The reproducibility record: what was actually sent, not what was
     # intended. Serialized here, beside the dict that goes on the wire, so
     # the two cannot drift. Authorization lives in the client's headers and
     # never enters the payload, so nothing secret is recorded. Echoed even
     # on failure paths, because knowing what a failed request asked for is
-    # exactly when this matters.
+    # exactly when this matters. The controls ride along for free, which is
+    # what lets a run prove it asked for a temperature a provider ignored.
     result["request_json"] = _request_record(payload)
 
     start = time.perf_counter()
@@ -577,6 +705,7 @@ async def stream_model(
     max_tokens: int = BUDGET_STANDARD,
     holder: dict[str, Any] | None = None,
     provider_prefs: dict[str, Any] | None = None,
+    controls: Mapping[str, Any] | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
@@ -623,7 +752,7 @@ async def stream_model(
     }
     payload = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": control_messages(prompt, controls),
         "max_tokens": max_tokens,
         # See run_model: injected so the boot-scoped data policy reaches
         # the wire without this function knowing where policy lives.
@@ -637,6 +766,9 @@ async def stream_model(
         # (read 2026-07-25). The usage block arrives because the platform
         # sends it, not because this asks.
         "stream_options": {"include_usage": True},
+        # See run_model: last, and only what was set, so a blank controls
+        # set leaves this payload byte for byte what it was before.
+        **control_payload(controls),
     }
     # See run_model: the exact payload, auth excluded, recorded beside the
     # dict that goes on the wire. Mirrored into the holder in the same
