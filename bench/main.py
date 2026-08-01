@@ -1397,8 +1397,10 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
             # nothing recorded, and a model from a concurrent batch took
             # that slot and rechecked against a counter that had not moved.
             # Eight concurrent five-model batches against a ceiling worth
-            # half a result put 28 calls upstream where the documented
-            # bound promised about five.
+            # half a result put 23 calls upstream here (stable across five
+            # runs; the external report's figure was 28, and the exact
+            # number depends on scheduling) where the documented bound
+            # promised about five.
             #
             # With per-result settlement the bound is real and derivable: a
             # freed slot implies a recorded settlement, so once accumulated

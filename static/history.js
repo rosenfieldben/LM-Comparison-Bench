@@ -272,9 +272,20 @@
   function renderMissingMembers(group, results) {
     const declared = group.models;
     if (!Array.isArray(declared)) return;
-    const ran = new Set(results.map((r) => r.model));
+    // Counts, not a Set. A lineup may legitimately declare one model
+    // twice (neither /compare nor /groups rejects it, and with the seed
+    // control a same-model pair is a determinism check rather than a
+    // mistake), and set membership would let a single recorded run
+    // suppress BOTH placeholders. That is the same quiet shrink this
+    // function exists to stop, so it has to count.
+    const ran = new Map();
+    for (const r of results) ran.set(r.model, (ran.get(r.model) ?? 0) + 1);
     declared.forEach((model, index) => {
-      if (ran.has(model)) return;
+      const remaining = ran.get(model) ?? 0;
+      if (remaining > 0) {
+        ran.set(model, remaining - 1);
+        return;
+      }
       const card = document.createElement("div");
       card.className = "card missing";
       card.dataset.testid = "missing-member";

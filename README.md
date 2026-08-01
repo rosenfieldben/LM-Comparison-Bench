@@ -328,7 +328,22 @@ script elements, and the fonts, favicon, and every fetch and SSE endpoint
 are same-origin; the pre-paint theme script is a same-origin file
 (`static/theme-boot.js`) rather than an inline block, which is what lets
 `script-src` stay `'self'`. The headers are added on response start with
-no body buffering, so streaming is untouched. To serve the bench beyond
+no body buffering, so streaming is untouched.
+
+`Cache-Control` splits by what the response carries. Static assets and
+the index get `no-cache`, which means "revalidate before reuse" and not
+"do not store", so with ETags present the usual cost is a 304 and a
+stale script can never run beside a fresh one. Everything else gets
+`private, no-store`: run details, group details, compare responses and
+the SSE stream carry full prompts and full model answers, and those must
+not be written to disk by any cache on the path. The favicon sets its
+own year-long immutable directive and keeps it.
+
+FastAPI's `/docs`, `/redoc` and `/openapi.json` are disabled. Nothing
+here consumes them, and a machine-readable map of every route and bound
+is attack surface on a server holding a paid API key.
+
+To serve the bench beyond
 localhost deliberately, edit `TRUSTED_HOSTS`
 in `bench/main.py`, and put real authentication in front of it
 first.
@@ -352,8 +367,14 @@ which makes the group row the experiment record and fixes the group's
 prompt ahead of its first member. Each run records the commit that
 produced it (`app_sha`, best effort: None when git is unavailable), the
 timestamp of the price catalog it was costed against
-(`catalog_snapshot_at`, None on an offline boot), and the data-handling
-policy its payloads declared (`data_policy`). Each result records the
+(`catalog_snapshot_at`, None on an offline boot), the sha256 of the
+catalog bytes themselves (`catalog_digest`, so two boots a minute apart
+against a changed catalog are distinguishable and None on an offline
+boot), and the data-handling policy its payloads declared
+(`data_policy`). `app_sha` is suffixed `-dirty` when the checkout had
+uncommitted changes, and is None rather than a bare sha whenever that
+could not be determined, because a bare sha is itself the claim that the
+running code was exactly that commit. Each result records the
 column it occupied (`position`, so a replay rebuilds the original
 side-by-side layout from the rows instead of from a lineup that has
 since been edited) and the exact payload that was sent (`request_json`,
@@ -461,8 +482,10 @@ comment above `DATA_POLICY_PREFS` in `bench/models.py`.
 
 By default the bench sends one user message and lets every provider apply
 its own sampling defaults, which means a comparison varies whatever the
-providers feel like varying. Six controls let one comparison hold that
-constant across its models:
+providers feel like varying. Six controls let one comparison send the
+same values on every request instead. Sent, not enforced: what a provider
+does with them is its own business, and the "silently ignore" note below
+is the part of that story you have to plan around.
 
 | Control | Sent as | Range |
 | --- | --- | --- |

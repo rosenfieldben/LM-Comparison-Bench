@@ -656,6 +656,51 @@ def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url):
     assert page.evaluate("() => BenchState.sessionStats.runs") == 0
 
 
+def test_review_repro_a_duplicate_lineup_still_shows_its_gap(page, bench_url):
+    """Closing review. The gap detection matched declared members against
+    a Set of the models that ran, and a lineup may legitimately declare
+    one model twice: neither /compare nor /groups rejects a duplicate, and
+    with the seed control a same-model pair is a determinism check rather
+    than a mistake. One recorded run then suppressed BOTH placeholders and
+    the comparison replayed one-wide with nothing to show it had declared
+    two. That is exactly the quiet shrink the placeholders exist to stop,
+    surviving in the one lineup shape nobody tested.
+    """
+    gid = page.request.post(
+        bench_url + "/groups",
+        data={
+            "prompt": "h1 duplicate lineup",
+            "models": ["stub/fast", "stub/fast"],
+            "budget": "standard",
+        },
+    ).json()["id"]
+    ran = page.request.post(
+        bench_url + "/compare/stream",
+        data={
+            "prompt": "h1 duplicate lineup",
+            "model": "stub/fast",
+            "group_id": gid,
+            "position": 0,
+            "budget": "standard",
+        },
+    )
+    assert ran.ok, ran.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row_for(page, "h1 duplicate lineup").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # One ran, one did not: one card and one gap, naming the slot that is
+    # still empty rather than the one that filled.
+    expect(cards(page)).to_have_count(1)
+    gap = page.get_by_test_id("missing-member")
+    expect(gap).to_have_count(1)
+    expect(gap).to_contain_text("declared at position 1")
+
+
 def test_a_legacy_group_replays_without_printing_null(page, bench_url):
     """Legacy groups return null for every declared field, and a null
     reaching the composer would render the four characters "null" as if

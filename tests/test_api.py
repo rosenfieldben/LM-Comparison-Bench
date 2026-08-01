@@ -3456,8 +3456,10 @@ def test_review_repro_concurrent_batches_hold_the_ceiling_bound(monkeypatch, tmp
     The shape is the reviewer's reproduction: eight concurrent five-model
     batches, one deliberately slow member each so fast members finish and
     free slots while the batch is still open, a ceiling worth half of one
-    result. Pre-fix this measured 28 upstream calls; the stash proof is in
-    the commit body.
+    result. Reverting settlement to the post-gather loop makes this measure
+    23 upstream calls against a bound of 5, stable across five runs. The
+    external report said 28; the exact number is scheduling-dependent and
+    the assertion below is on the bound, not on any particular overshoot.
     """
     slow = threading.Event()
 
