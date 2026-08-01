@@ -1215,22 +1215,34 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # queue wait as model latency.
         budget = effective_budget(request.budget, model)
         async with app.state.upstream_semaphore:
-            # Recheck under the held slot, before run_model spends. This
-            # batch records its own spend only after the gather completes,
-            # so the recheck cannot observe an earlier model in this same
-            # batch; what it catches is spend a concurrent request (another
-            # /compare or a stream) recorded while this model waited for a
-            # slot. One batch is capped at five models, equal to
-            # MAX_CONCURRENT_UPSTREAM, so a batch's own overshoot already
-            # sits within the documented bound; the recheck stops a queued
-            # batch from spending once a concurrent run crossed the ceiling.
+            # Recheck under the held slot, before run_model spends.
+            #
+            # Settlement now happens below, inside this same held slot, so
+            # this recheck observes every result that has already settled,
+            # including earlier members of this very batch. That is the
+            # property the old comment lacked. It reasoned correctly about
+            # one batch and was never re-derived for N: settlement used to
+            # run after gather, so a fast member released its slot with
+            # nothing recorded, and a model from a concurrent batch took
+            # that slot and rechecked against a counter that had not moved.
+            # Eight concurrent five-model batches against a ceiling worth
+            # half a result put 28 calls upstream where the documented
+            # bound promised about five.
+            #
+            # With per-result settlement the bound is real and derivable: a
+            # freed slot implies a recorded settlement, so once accumulated
+            # spend crosses the ceiling, every subsequent slot acquisition
+            # sees it and refuses. Only the calls already executing when
+            # the ceiling tripped can overshoot, and there are at most
+            # MAX_CONCURRENT_UPSTREAM of those by construction.
+            #
             # On refusal return a synthetic result shaped like run_model's,
             # error set, with no upstream call. The batch persists as usual
             # with the refusal row included: honest history for a cut-short
             # run.
             if spend_ceiling_reached():
                 return spend_refusal_result(model, budget)
-            return await run_model(
+            result = await run_model(
                 request.prompt,
                 model,
                 app.state.client,
@@ -1238,17 +1250,30 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
             )
+            # Settle before the slot releases. This block is post-spend, so
+            # it carries its own fault boundary: the upstream call has
+            # already happened and nothing here may turn a paid result into
+            # an error. A failure pricing or recording degrades this
+            # result's cost to None, which contributes nothing to the
+            # ceiling, exactly as an unpriced result already does.
+            try:
+                result["cost_usd"] = cost_usd(result, app.state.prices)
+                record_spend(ceiling_cost(result))
+            except Exception:
+                logger.exception("settlement failed for %s", model)
+                result["cost_usd"] = None
+            return result
 
     # gather preserves input order, which the frontend relies on to map
     # result columns by position. run_model never raises, so no
-    # return_exceptions handling is needed here.
+    # return_exceptions handling is needed here, and limited() guarantees
+    # cost_usd is present on everything it returns, so the response model's
+    # required key needs no seeding pass.
     results = await asyncio.gather(*(limited(m) for m in request.models))
-    # Seeded before the fault boundary so a failure inside it can never
-    # leave a result missing the key the response model requires.
     # position comes from array order here: gather preserves it, and for
-    # the batch endpoint the caller's array IS the declared layout.
+    # the batch endpoint the caller's array IS the declared layout. Pure
+    # assignment, so it stays outside the fault boundary below.
     for index, result in enumerate(results):
-        result["cost_usd"] = None
         result["position"] = index
     run_id = None
     # The invariant: after money is spent, no code path may convert
@@ -1257,13 +1282,6 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # persistence) sits inside this one boundary; on any failure the
     # results go back intact with run_id null and the links dropped.
     try:
-        # Cost is a boundary concern: run_model stays a pure OpenRouter
-        # call and the price snapshot lives on app.state. Computed
-        # before save_run so history carries the cost as priced at run
-        # time.
-        for result in results:
-            result["cost_usd"] = cost_usd(result, app.state.prices)
-            record_spend(ceiling_cost(result))
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )

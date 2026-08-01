@@ -98,11 +98,27 @@ runs already in flight are never interrupted. Admission is rechecked
 once more the instant a run acquires its upstream slot, so a run admitted
 below the ceiling is still refused (before it spends) if a concurrent run
 crossed the ceiling in the meantime; that refusal costs nothing and lands
-in history as an honest cut-short row. Worst-case overshoot is therefore
-bounded by the runs already executing when the ceiling trips, at most
+in history as an honest cut-short row.
+
+Each result is settled against the ceiling inside the slot it holds,
+before that slot is released. That ordering is what makes the bound below
+true rather than merely intended: a freed slot implies a recorded
+settlement, so once spend crosses the ceiling every later acquisition sees
+it and refuses. Worst-case overshoot is therefore bounded by the runs
+already executing at the moment the ceiling trips, at most
 `MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
-cost, not by the size of the lineup. A full reservation ledger (atomic
-admission) is deliberately deferred. The ceiling counts each result
+cost, whatever the size of the lineup and however many comparisons are in
+flight at once.
+
+That last clause is the correction. Settlement used to run after a batch's
+whole fan-out completed, so a fast member released its slot having recorded
+nothing and a model from a concurrent batch rechecked against a counter
+that had not moved. The bound held for one comparison at a time and failed
+for several: eight concurrent five-model batches against a ceiling worth
+half a result put 23 calls upstream where this paragraph promised five. The
+documentation and the mechanism now state the same fact, and a regression
+test measures it. A full reservation ledger (atomic admission) is
+deliberately deferred. The ceiling counts each result
 once, using its billed cost when the platform reported one and the
 catalog estimate otherwise: it is advisory, and advising from real
 charges beats advising from catalog arithmetic. Results that are

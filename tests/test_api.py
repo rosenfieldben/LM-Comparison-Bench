@@ -1,6 +1,7 @@
 import json
 import math
 import re
+import threading
 import typing
 from pathlib import Path
 from typing import Literal
@@ -3244,3 +3245,95 @@ def test_the_seed_bound_is_what_a_browser_can_read_back_exactly(client):
             json={"prompt": "p", "models": ["model/alpha"], "params": {"seed": seed}},
         )
         assert resp.status_code == 422, seed
+
+
+# ---- Phase H1.1: the ceiling bound holds across concurrent batches.
+
+
+@respx.mock
+def test_review_repro_concurrent_batches_hold_the_ceiling_bound(monkeypatch, tmp_path):
+    """Third external review, HIGH: the documented ceiling bound did not
+    hold once more than one batch was in flight, and Phase H made /compare
+    the official scripting surface, which is exactly the concurrent-batch
+    path.
+
+    The mechanism. /compare acquired one slot per model and rechecked the
+    ceiling under the held slot, but settlement ran in a loop AFTER
+    asyncio.gather. So a fast member released its slot having recorded
+    nothing, a model from another batch took that slot, and its recheck read
+    a counter that had not moved. The comment inside limited() narrated the
+    same-batch blindness and then reasoned only about a single batch; nobody
+    re-derived it for N batches.
+
+    Why the post-fix bound is what it is. Settlement now happens inside the
+    held slot, strictly before release. So a freed slot implies a recorded
+    settlement. Once accumulated spend crosses the ceiling, every subsequent
+    acquisition observes it and refuses without calling upstream. Only calls
+    already executing at the moment the ceiling tripped can overshoot, and
+    the semaphore caps those at MAX_CONCURRENT_UPSTREAM by construction.
+    That is the whole derivation, and it is the bound asserted below.
+
+    The shape is the reviewer's reproduction: eight concurrent five-model
+    batches, one deliberately slow member each so fast members finish and
+    free slots while the batch is still open, a ceiling worth half of one
+    result. Pre-fix this measured 28 upstream calls; the stash proof is in
+    the commit body.
+    """
+    slow = threading.Event()
+
+    async def respond(request):
+        # One slow member per batch, by model id, so each batch has fast
+        # members that finish and release their slots early. That release
+        # is the whole mechanism: pre-fix it carried no settlement with it.
+        if b'"model/slow"' in request.content:
+            await asyncio.sleep(0.25)
+        return httpx.Response(
+            200,
+            json={
+                **FIXTURE,
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.01},
+            },
+        )
+
+    route = respx.post(OPENROUTER_URL).mock(side_effect=respond)
+    lineup = ["model/slow", "model/alpha", "model/beta", "model/gamma", "model/delta"]
+
+    # Half of one result: the very first settlement must close the gate.
+    with spend_client(monkeypatch, tmp_path, limit=0.005) as c:
+        statuses = []
+
+        def one_batch():
+            resp = c.post("/compare", json={"prompt": "p", "models": lineup})
+            statuses.append(resp)
+
+        threads = [threading.Thread(target=one_batch) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        slow.set()
+
+        assert all(r.status_code in (200, 402) for r in statuses), [
+            r.status_code for r in statuses
+        ]
+        # The bound, derived above. Pre-fix this was ~28.
+        assert len(route.calls) <= main.MAX_CONCURRENT_UPSTREAM, (
+            f"{len(route.calls)} calls reached upstream, bound is "
+            f"{main.MAX_CONCURRENT_UPSTREAM}"
+        )
+
+        # Nothing vanished: every one of the 40 requested models is
+        # accounted for as either an upstream call or a refusal. A bound met
+        # by dropping work would be a different defect wearing this test's
+        # green.
+        refused = 0
+        for resp in statuses:
+            if resp.status_code == 402:
+                refused += len(lineup)
+                continue
+            for result in resp.json()["results"]:
+                if result["error"] and "refused" in result["error"]:
+                    refused += 1
+        assert refused + len(route.calls) == 8 * len(lineup), (
+            f"{refused} refused + {len(route.calls)} called != 40"
+        )
