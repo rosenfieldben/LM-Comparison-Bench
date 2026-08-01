@@ -281,7 +281,14 @@ def test_review_repro_a_loading_history_panel_does_not_look_empty(page, bench):
 
     # The fixture is deliberately not used here: it waits for the settled
     # state, which is the very window this test needs to observe.
-    page.get_by_test_id("history-toggle").click()
+    #
+    # The synchronous claim (history.js) sets state=loading at click
+    # time, BEFORE the async toggle event runs loadHistory. "loading"
+    # therefore no longer implies the fetch exists, so the hold must
+    # be awaited explicitly rather than inferred from the state the
+    # assertions observe.
+    with page.expect_request("**/runs?*"):
+        page.get_by_test_id("history-toggle").click()
     panel = page.get_by_test_id("history-list")
     expect(panel).to_have_attribute("data-state", "loading")
     expect(panel).to_have_text("loading history")

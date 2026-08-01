@@ -13,6 +13,7 @@ import json
 import re
 
 import pytest
+from _pytest.outcomes import Failed
 from playwright.sync_api import expect
 
 pytestmark = pytest.mark.browser
@@ -199,6 +200,128 @@ def test_review_repro_superseded_load_stays_silent(bench):
     expect(page.get_by_test_id("history-failure")).to_have_count(0)
     expect(cards(page)).to_have_count(1)
     assert errors == []
+
+
+# ---- Flake fix: the history panel's error terminal must not read as
+# ---- success. These three test the harness itself, which is unusual and
+# ---- is the point: open_history is the shared precondition of every
+# ---- history assertion in this suite, and a precondition that reports
+# ---- "settled" for a load that never happened silently converts other
+# ---- tests' honest assertions into false ones.
+
+
+def abort_first_runs_fetch(page, times):
+    """Fail the next `times` GET /runs list fetches, then stop interfering.
+
+    Counted rather than toggled by a flag so the recovery is provably the
+    RETRY and not a race: attempt one cannot succeed, and attempt two
+    cannot fail. /runs/<id> detail fetches are left alone, since only the
+    list load is the panel's own.
+    """
+    seen = {"n": 0}
+
+    def handle(route):
+        if seen["n"] < times:
+            seen["n"] += 1
+            route.abort()
+        else:
+            route.continue_()
+
+    page.route(re.compile(r"/runs\?"), handle)
+    return seen
+
+
+def test_review_repro_a_failed_history_open_is_retried_not_believed(
+    bench, open_history
+):
+    """Third distinct layer of this test's history, verified from PR #48's
+    CI log. open_history waited for any settled state and treated "error"
+    as one of them. A transiently failed /runs fetch at open cleared the
+    rows and set state=error, the helper returned as though the panel had
+    loaded, and the assertion downstream ran against an honestly empty
+    list: the row it wanted really was absent, because nothing had been
+    fetched. Three rounds of forensics went into a panel that was
+    reporting its own failure correctly the entire time.
+
+    The row is real and the first fetch is guaranteed to fail, so a pass
+    here can only mean the retry ran and found it.
+    """
+    page = bench(["stub/fast"])
+    check_chip(page, 0)
+    start_run(page, "f2 history retry recovers")
+    expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
+
+    seen = abort_first_runs_fetch(page, times=1)
+    open_history()
+
+    assert seen["n"] == 1, "the first list fetch was supposed to fail"
+    expect(page.get_by_test_id("history-list")).to_have_attribute("data-state", "ready")
+    expect(
+        page.get_by_test_id("history-row").filter(has_text="f2 history retry recovers")
+    ).to_have_count(1)
+
+
+def test_a_history_open_that_fails_twice_fails_loudly(bench, open_history):
+    """The other half: a genuine outage is the run's result, not a flake
+    to absorb. It must fail with the panel's own words attached, so the
+    fourth occurrence of this diagnoses itself from the log.
+
+    pytest.fail raises Failed, so the assertion is that calling the
+    fixture raises it and that the message carries what the panel said.
+    """
+    page = bench(["stub/fast"])
+    abort_first_runs_fetch(page, times=2)
+
+    with pytest.raises(Failed) as excinfo:
+        open_history()
+
+    message = str(excinfo.value)
+    assert "failed to load twice" in message, message
+    # The panel's own text, not a paraphrase of it: this is the line that
+    # turns a future CI log into a diagnosis.
+    assert "failed to load history" in message, message
+
+
+def test_review_repro_a_reopened_panel_cannot_answer_with_the_previous_load(bench):
+    """The secondary path, and it was not hypothetical.
+
+    loadHistory sets state=loading before its first await, which is
+    necessary and was not sufficient: `toggle` on a <details> is
+    dispatched asynchronously, so between the click and loadHistory the
+    attribute still held the PREVIOUS load's terminal value. Measured on
+    the retry path above, where reopening a failed panel reported "error"
+    for a load that had not started: the retry could conclude the retry
+    had failed too, which would have converted the loud-failure branch
+    into a new flake wearing the old one's face.
+
+    The panel now claims its state in a click listener, synchronously,
+    before the default action opens it. Read in the same tick as the
+    click, which is the only reading that can tell the two apart: a poll
+    after the fact sees "loading" either way.
+    """
+    page = bench(["stub/fast"])
+    page.get_by_test_id("history-toggle").click()
+    # Whichever terminal this session's shared database produces; the
+    # point is only that a terminal is sitting on the attribute when the
+    # next click lands.
+    settled = page.wait_for_function(
+        """() => {
+             const s = document.getElementById('history-list').dataset.state;
+             return ['ready', 'empty'].includes(s) ? s : null;
+           }""",
+        timeout=DONE_TIMEOUT,
+    ).json_value()
+    page.get_by_test_id("history-toggle").click()
+
+    state_at_click = page.evaluate(
+        """() => {
+             document.querySelector('[data-testid="history-toggle"]').click();
+             return document.getElementById('history-list').dataset.state;
+           }"""
+    )
+
+    # Pre-fix this is `settled`, the answer to the load before this one.
+    assert state_at_click == "loading", (state_at_click, settled)
 
 
 # ---- F2.2: prompt-library ownership.

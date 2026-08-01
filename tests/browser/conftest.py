@@ -179,13 +179,54 @@ def open_history(page):
     A bare click was enough on a fast machine and not on a loaded one.
     It failed on CI twice, both times as a row that was really there
     reading as absent.
-    """
 
-    def open_it():
-        page.get_by_test_id("history-toggle").click()
+    The third failure was this helper's own doing. Waiting for any settled
+    state treated "error" as an outcome to proceed from, so a transiently
+    failed /runs fetch at open cleared the rows, set state=error, and every
+    assertion downstream then ran against an honestly empty panel. A
+    missing row read as a missing row. The state attribute was reporting
+    the truth the whole time and the wait was throwing it away.
+
+    So the outcome is now read, not just awaited. "ready" and "empty" are
+    answers to the question asked. "error" is not: it means the panel never
+    got to answer, which is exactly the transient this retries once, by
+    closing and reopening (the only reload the panel offers). A second
+    error is not a flake to absorb, it is the run's result, so it fails
+    loudly and quotes the panel's own message: a fourth occurrence of this
+    should diagnose itself from the log instead of costing another round
+    of forensics.
+    """
+    list_el = page.get_by_test_id("history-list")
+
+    def settle():
         page.wait_for_function(
             """() => ['ready', 'empty', 'error'].includes(
                  document.getElementById('history-list').dataset.state)"""
+        )
+        return list_el.get_attribute("data-state")
+
+    def open_it():
+        page.get_by_test_id("history-toggle").click()
+        if settle() != "error":
+            return
+        # Collapse and reopen: the toggle handler reloads on every open, so
+        # this is a genuine second fetch rather than a re-read of the
+        # failed one.
+        #
+        # The reopen depends on the panel claiming "loading" synchronously
+        # with the click. Without that the settle below reads the error
+        # still sitting on the attribute from the load that just failed and
+        # reports the retry as failed before it has started, which turns
+        # the loud branch into a new flake wearing the old one's face. It
+        # was measured doing exactly that; static/history.js closes it in
+        # a click listener, and a tombstone locks it.
+        page.get_by_test_id("history-toggle").click()
+        page.get_by_test_id("history-toggle").click()
+        if settle() != "error":
+            return
+        pytest.fail(
+            "history panel failed to load twice; the panel says: "
+            + repr(list_el.text_content())
         )
 
     return open_it
