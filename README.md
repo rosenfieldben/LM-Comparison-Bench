@@ -140,14 +140,18 @@ working/done/error, subtle live motion (pulse, shimmer, a blinking
 placeholder cursor). The OS color scheme picks the dark or light
 theme by default; a command-bar toggle cycles auto → dark → light,
 and a motion toggle kills the animation (elapsed counters keep
-updating as text). Both persist in this browser's localStorage, as
-does `prefers-reduced-motion`, which disables animation regardless
-of the toggle. All colors, spacing steps, radii and type sizes live
+updating as text). Both toggles persist in this browser's
+localStorage. The OS setting `prefers-reduced-motion` disables
+animation regardless of the motion toggle; it is read from the
+system on every page, not stored here, and nothing the bench writes
+locally can turn it back on. All colors, spacing steps, radii and type sizes live
 as CSS custom properties in one `:root` block at the top of
 `static/volt.css`, so the next visual change is a token edit, not
 a hunt through rules. The front end has no build step. `static/index.html`
 holds the markup, a pre-paint theme script, the stylesheet link, and the
-module script tags in dependency order. `static/lib.js` holds the pure,
+classic script tags in dependency order (classic, not modules: the load
+order is the dependency graph, so the order of those tags is
+load-bearing). `static/lib.js` holds the pure,
 DOM-free helpers, including the diff engine. The DOM logic is split by
 concern into small classic scripts, each assigning one `window.Bench*`
 namespace: `state`, `controls`, `render`, `diff`, `library`, `stream`,
@@ -283,7 +287,7 @@ queue quietly for a slot, and the wait never counts toward a model's
 measured latency or ttft. Every result also records OpenRouter's
 generation id and the provider's finish_reason, which make historical
 runs auditable against OpenRouter's generation API (actual provider,
-quantization, authoritative cost) and let budget analysis see
+authoritative cost) and let budget analysis see
 truncation on runs that produced no error. The generation id is read
 from the response header, which arrives before any chunk, so a run
 stopped mid-stream still records one. That ordering matters: stopping a
@@ -359,14 +363,20 @@ exchange: the amount charged (`billed_cost_usd`), the hidden reasoning
 and discounted cached token counts (`reasoning_tokens`,
 `cached_tokens`), the host that served it (`provider`), and that host's
 own word for why generation ended (`native_finish_reason`, beside
-OpenRouter's normalized `finish_reason`). `quantization` is reserved for
-the reconcile path, since it is not reported in-band.
+OpenRouter's normalized `finish_reason`). `quantization` is a column the
+bench has never filled. It is not reported in-band, and it is not in
+OpenRouter's published schema for the generation endpoint either, so the
+reconcile path reads the key opportunistically and stores whatever comes
+back. Nothing here has observed it come back: read a NULL there as "never
+reported", not as "the provider served unquantized weights".
 
 Some of that is only knowable after the fact. A run stopped mid-stream
 never receives a usage object, and OpenRouter's `/generation` endpoint
 holds the record it does have. `python -m bench.reconcile` walks the
-result rows that carry a generation id but no billed cost, asks about
-each one, and prints what it would write:
+result rows that carry a generation id and a gap the endpoint could
+close (no trustworthy billed cost, or no `provider`, or no
+`native_finish_reason`), asks about each one, and prints what it would
+write:
 
 ```sh
 .venv/bin/python -m bench.reconcile          # dry run, writes nothing
@@ -379,8 +389,11 @@ writes only `billed_cost_usd`, `provider`, `quantization` and
 `native_finish_reason`. Response text, errors, timings and the local
 estimate are never touched: this adds what the platform knows, it does
 not revise what the bench observed. A field the endpoint does not report
-leaves whatever was captured live in place, and an expired record (the
-endpoint 404s for old generations) is reported and skipped. It is safe
+leaves whatever was captured live in place (an unreported charge clears
+only a stored one no reader would trust anyway), and a row the endpoint
+cannot fill stays on the list and is asked about again next pass. An
+expired record (the endpoint 404s for old generations) is reported and
+skipped. It is safe
 to run against a live bench, since the database is in WAL mode.
 `--limit N` walks the oldest rows first, and `--delay` sets the pause.
 

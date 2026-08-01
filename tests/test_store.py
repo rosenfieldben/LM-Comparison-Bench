@@ -845,6 +845,7 @@ def test_run_provenance_columns_round_trip(db):
             "app_sha": "abc123",
             "catalog_snapshot_at": "2026-07-25T00:00:00+00:00",
             "data_policy": "deny",
+            "catalog_digest": "ab" * 32,
         },
     )
     run = store.get_run(db, run_id)
@@ -852,6 +853,9 @@ def test_run_provenance_columns_round_trip(db):
     assert run["app_sha"] == "abc123"
     assert run["catalog_snapshot_at"] == "2026-07-25T00:00:00+00:00"
     assert run["data_policy"] == "deny"
+    # Round trip, not just readable: a column read back but never written
+    # returns None for every row and reads as "this run had no digest".
+    assert run["catalog_digest"] == "ab" * 32
 
 
 PRE_H_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_h_schema.sql").read_text()

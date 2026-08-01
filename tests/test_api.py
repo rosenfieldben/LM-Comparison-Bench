@@ -27,6 +27,9 @@ TEST_PRICES = {
 }
 TEST_CATALOG = {
     "fetched": True,
+    # A real fetch hashes the response bytes; the stub carries a fixed
+    # stand-in so run rows have a concrete digest to be checked against.
+    "digest": "d1" * 32,
     "models": [
         {
             "id": "model/alpha",
@@ -2043,6 +2046,9 @@ def test_run_rows_carry_provenance_and_position(client):
 
     # catalog_snapshot_at is set because the test catalog reports fetched.
     assert detail["catalog_snapshot_at"] is not None
+    # And beside it, which bytes those prices came from. The timestamp
+    # alone cannot tell two boots against different catalogs apart.
+    assert detail["catalog_digest"] == TEST_CATALOG["digest"]
     # app_sha is best-effort: a string when git answers, None otherwise,
     # and never a reason to fail a run.
     assert detail["app_sha"] is None or isinstance(detail["app_sha"], str)
@@ -2055,6 +2061,64 @@ def test_run_rows_carry_provenance_and_position(client):
     assert sent["model"] == "model/alpha"
     assert sent["max_tokens"] == BUDGET_STANDARD
     assert "authorization" not in json.dumps(sent).lower()
+
+
+def test_review_repro_app_sha_marks_a_modified_tree(monkeypatch):
+    """A bare sha claims the running code IS that commit. Before this fix
+    _app_sha asked git only for rev-parse, so a checkout with uncommitted
+    edits signed a clean commit's name and every run row born from
+    modified code was provenance that pointed somewhere the code was not.
+    """
+    calls: list[list[str]] = []
+
+    def fake_git(args: list[str]) -> str | None:
+        calls.append(args)
+        if args[0] == "rev-parse":
+            return "abc1234\n"
+        return " M bench/main.py\n?? scratch.py\n"
+
+    monkeypatch.setattr(main, "_git", fake_git)
+    assert main._app_sha() == "abc1234-dirty"
+    # It asked the second question rather than inferring an answer.
+    assert calls == [["rev-parse", "HEAD"], ["status", "--porcelain"]]
+
+
+def test_app_sha_is_bare_on_a_clean_tree(monkeypatch):
+    """Empty --porcelain output is the clean answer, and clean is exactly
+    when the unqualified sha is true."""
+    monkeypatch.setattr(
+        main,
+        "_git",
+        lambda args: "abc1234\n" if args[0] == "rev-parse" else "",
+    )
+    assert main._app_sha() == "abc1234"
+
+
+def test_app_sha_degrades_to_none_when_the_tree_cannot_be_read(monkeypatch):
+    """An unqualified sha asserts a clean tree. When git answers the first
+    question and not the second, that assertion is unverified, so the
+    label is dropped rather than downgraded to the clean claim."""
+    monkeypatch.setattr(
+        main,
+        "_git",
+        lambda args: "abc1234\n" if args[0] == "rev-parse" else None,
+    )
+    assert main._app_sha() is None
+
+
+def test_app_sha_degrades_to_none_without_git(monkeypatch):
+    """No repository, no git, or git slower than the timeout: none of
+    those are reasons to fail a boot."""
+    monkeypatch.setattr(main, "_git", lambda args: None)
+    assert main._app_sha() is None
+
+
+@pytest.mark.parametrize("path", ["/docs", "/redoc", "/openapi.json"])
+def test_the_documentation_routes_are_not_served(client, path):
+    """The bench holds a paid API key and its only client is static/,
+    written against these endpoints by hand. A machine-readable map of
+    every route and bound is attack surface with no consumer here."""
+    assert client.get(path).status_code == 404
 
 
 @respx.mock
@@ -2545,6 +2609,75 @@ def test_every_response_carries_exactly_one_cache_control(client):
     for path in ("/", "/static/lib.js", "/favicon.ico", "/models", "/runs"):
         resp = client.get(path)
         assert len(resp.headers.get_list("cache-control")) == 1, path
+
+
+@respx.mock
+def test_review_repro_no_response_carrying_a_prompt_may_be_stored(client):
+    """One directive was applied to every response class alike.
+
+    no-cache means "revalidate before reuse", not "do not store": a
+    no-cache response may sit on a browser's disk indefinitely. That is
+    right for assets and it is what closed the stale-module skew. It was
+    wrong for everything else. Run details, group details and compare
+    responses carry the full prompt and the full model answer, and this
+    application's own documentation promises those go to OpenRouter and
+    nowhere else. The header said they could be written to disk by any
+    cache on the path.
+
+    The matrix below walks one response of every class the app produces,
+    so a future response class cannot quietly inherit the asset rule.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "secret"))
+    )
+    compare = client.post(
+        "/compare", json={"prompt": "secret", "models": ["model/alpha"]}
+    )
+    run_id = compare.json()["run_id"]
+    group = client.post("/groups", json={"budget": "standard"})
+    group_id = group.json()["id"]
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    # Assets revalidate: they hold no prompt, and a stale one is the skew.
+    revalidate = ("/", "/static/lib.js", "/static/volt.css")
+    # Everything else is not stored at all, including the errors, since a
+    # 404 body for /runs/999999 is still an answer about this bench.
+    never_stored = (
+        f"/runs/{run_id}",
+        f"/groups/{group_id}",
+        "/runs",
+        "/groups",
+        "/models",
+        "/runs/999999",
+    )
+
+    for path in revalidate:
+        assert client.get(path).headers.get("cache-control") == "no-cache", path
+    for path in never_stored:
+        resp = client.get(path)
+        assert resp.headers.get("cache-control") == "private, no-store", path
+        assert len(resp.headers.get_list("cache-control")) == 1, path
+
+    # The POST responses carry bodies too, and a compare response is the
+    # single largest concentration of prompt and answer in the app.
+    for resp in (compare, group):
+        assert resp.headers.get("cache-control") == "private, no-store"
+
+    # The SSE stream is the other path a full answer leaves by.
+    with client.stream(
+        "POST", "/compare/stream", json={"prompt": "secret", "model": "model/alpha"}
+    ) as stream:
+        assert stream.headers.get("cache-control") == "private, no-store"
+        stream.read()
+
+    # The favicon set its own and keeps it: it is the one response whose
+    # bytes are public and unchanging.
+    assert (
+        client.get("/favicon.ico").headers.get("cache-control")
+        == "public, max-age=31536000, immutable"
+    )
 
 
 def test_the_served_index_versions_every_asset_url(client):

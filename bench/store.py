@@ -521,18 +521,24 @@ def save_run(
     with missing or partial results in the history.
 
     provenance carries the run-level facts the caller knows and the store
-    does not: which build was running, how old the price catalog was, and
-    which data-handling policy the payloads declared. Optional, and every
-    key optional within it, so a caller that knows none of it still writes
-    a valid row with those columns None.
+    does not: which build was running, how old the price catalog was,
+    which bytes that catalog was, and which data-handling policy the
+    payloads declared. Optional, and every key optional within it, so a
+    caller that knows none of it still writes a valid row with those
+    columns None.
+
+    Every key here must appear in the INSERT below. A column that is
+    declared, migrated and read back but never written reads as an
+    absence, and an absence is a claim: it says this run had no such fact.
+    catalog_digest shipped that way for exactly one commit.
     """
     prov = provenance or {}
     with conn:
         cur = conn.execute(
             """INSERT INTO runs
                (prompt_id, group_id, prompt_text, created_at,
-                app_sha, catalog_snapshot_at, data_policy)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                app_sha, catalog_snapshot_at, data_policy, catalog_digest)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 prompt_id,
                 group_id,
@@ -541,6 +547,7 @@ def save_run(
                 prov.get("app_sha"),
                 prov.get("catalog_snapshot_at"),
                 prov.get("data_policy"),
+                prov.get("catalog_digest"),
             ),
         )
         # lastrowid is always set after this single-row INSERT; assert
@@ -839,7 +846,7 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
 def results_awaiting_reconciliation(
     conn: sqlite3.Connection, limit: int | None = None
 ) -> list[dict[str, Any]]:
-    """Result rows that have a generation id but no billed cost yet.
+    """Result rows with a generation id that the audit could still improve.
 
     The reconcile pass's work list. Aborted rows qualify by construction:
     they carry an id (captured from the response header before any chunk)
@@ -850,11 +857,27 @@ def results_awaiting_reconciliation(
     the same predicate, and the gap between them was a trap: a negative or
     non-numeric charge is NOT NULL to SQL while _repaired hands every
     reader None for it, so such a row displayed as unpriced forever AND was
-    invisible to the one pass that could have fixed it. The three clauses
-    below are as_money expressed in SQL, so a value no reader will trust is
-    a value this list still offers to replace. NaN needs no clause: SQLite
-    has no NaN and binds one as NULL, which the first clause already
-    catches.
+    invisible to the one pass that could have fixed it. The three money
+    clauses below are as_money expressed in SQL, so a value no reader will
+    trust is a value this list still offers to replace. NaN needs no
+    clause: SQLite has no NaN and binds one as NULL, which the first clause
+    already catches.
+
+    Money is not the only thing the endpoint knows. A stream that ends
+    without a usage object can still bill correctly through a later live
+    run of the same row's siblings, or arrive with a cost and no host: the
+    charge is trusted and `provider` or `native_finish_reason` is NULL, and
+    under a money-only predicate that row was permanently invisible to the
+    only pass that could have filled them. Those two columns join the
+    predicate for that reason. `quantization` deliberately does not: it is
+    absent from OpenRouter's published response schema (see
+    models.fetch_generation), so keying on it would park every row in this
+    list forever waiting for a field that may never be sent.
+
+    A row the endpoint genuinely cannot fill stays listed across passes.
+    That is the honest state (the gap is real and still open), it costs one
+    lookup per pass, and it ends on its own when the generation record
+    expires and the endpoint starts 404ing.
 
     Ordered by id so a run interrupted partway through resumes in a
     predictable place, and so a --limit run walks the oldest rows first.
@@ -865,7 +888,9 @@ def results_awaiting_reconciliation(
         "WHERE r.generation_id IS NOT NULL "
         "AND (r.billed_cost_usd IS NULL "
         "     OR typeof(r.billed_cost_usd) NOT IN ('real', 'integer') "
-        "     OR r.billed_cost_usd < 0) "
+        "     OR r.billed_cost_usd < 0 "
+        "     OR r.provider IS NULL "
+        "     OR r.native_finish_reason IS NULL) "
         "ORDER BY r.id"
     )
     params: tuple[Any, ...] = ()
@@ -894,21 +919,37 @@ def apply_reconciliation(
 
     COALESCE on the three text columns so a field the generation endpoint
     does not return cannot erase one captured in-band: absence there means
-    "not reported", never "known to be nothing". billed_cost_usd is
-    assigned outright because the work list only offers rows whose stored
-    charge no reader would trust anyway (results_awaiting_reconciliation),
-    so overwriting it with None loses nothing and replaces a poisoned value
-    with an honest absence.
+    "not reported", never "known to be nothing".
+
+    billed_cost_usd cannot use COALESCE, because a stored charge may be
+    poisoned rather than absent and an audit that skipped it would leave
+    the row unpriced forever. It cannot be assigned outright either, now
+    that the work list also offers rows whose charge is trusted and whose
+    provider or finish reason is missing: an unreported total_cost would
+    erase a good number to fetch a label. So the CASE below says what is
+    actually meant. A reported charge wins. An unreported one clears only a
+    value no reader would trust anyway (the money rule, the same three
+    clauses results_awaiting_reconciliation selects on), replacing a
+    poisoned value with an honest absence, and leaves a trusted one alone.
     """
     with conn:
         conn.execute(
             """UPDATE results
-               SET billed_cost_usd = ?,
+               SET billed_cost_usd = CASE
+                       WHEN ? IS NOT NULL THEN ?
+                       WHEN billed_cost_usd IS NULL
+                            OR typeof(billed_cost_usd)
+                               NOT IN ('real', 'integer')
+                            OR billed_cost_usd < 0
+                       THEN NULL
+                       ELSE billed_cost_usd
+                   END,
                    provider = COALESCE(?, provider),
                    quantization = COALESCE(?, quantization),
                    native_finish_reason = COALESCE(?, native_finish_reason)
                WHERE id = ?""",
             (
+                record["billed_cost_usd"],
                 record["billed_cost_usd"],
                 record["provider"],
                 record["quantization"],

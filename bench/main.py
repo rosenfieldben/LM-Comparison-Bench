@@ -420,20 +420,17 @@ class GroupDetail(BaseModel):
     params: dict[str, Any] | None = None
 
 
-def _app_sha() -> str | None:
-    """The current commit, or None when that cannot be determined.
+def _git(args: list[str]) -> str | None:
+    """One git command's stdout, or None when git could not answer.
 
-    Provenance for "what code produced this row". Read once at boot rather
-    than per run: it cannot change while the process lives, and a
-    subprocess per request would be absurd. Degrades to None whenever git
-    is missing, the checkout is not a repository, or git is slow enough to
-    hit the timeout, because none of those are reasons to fail a boot. The
-    timeout is short for the same reason: this is a nice-to-have label,
-    not a dependency.
+    Split out of _app_sha so both of that function's questions run under
+    one timeout and degrade discipline, and so a test can substitute a
+    runner without reaching into subprocess. A non-zero exit is an answer
+    the caller cannot use, which is the same as no answer.
     """
     try:
         proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
+            ["git", *args],
             capture_output=True,
             text=True,
             timeout=2,
@@ -444,7 +441,38 @@ def _app_sha() -> str | None:
         return None
     if proc.returncode != 0:
         return None
-    return as_text(proc.stdout.strip()) or None
+    return proc.stdout
+
+
+def _app_sha() -> str | None:
+    """The current commit, or None when that cannot be determined.
+
+    Provenance for "what code produced this row". Read once at boot rather
+    than per run: it cannot change while the process lives, and a
+    subprocess per request would be absurd. Degrades to None whenever git
+    is missing, the checkout is not a repository, or git is slow enough to
+    hit the timeout, because none of those are reasons to fail a boot. The
+    timeout is short for the same reason: this is a nice-to-have label,
+    not a dependency.
+
+    A bare sha claims the running code IS that commit, which is false for
+    every uncommitted edit, and a bench whose whole point is provenance
+    must not let altered code sign a clean commit's name. So the tree is
+    checked too and a modified one is labelled "<sha>-dirty". When that
+    second question cannot be answered the whole label degrades to None
+    rather than to the bare sha: an unqualified sha is the clean claim,
+    and asserting it unverified is exactly the lie this guards against.
+    """
+    sha = as_text((_git(["rev-parse", "HEAD"]) or "").strip()) or None
+    if sha is None:
+        return None
+    # --porcelain is the stable machine format; empty output means clean.
+    # Untracked files count as dirty here on purpose: an untracked module
+    # on the import path changes what runs just as an edited one does.
+    status = _git(["status", "--porcelain"])
+    if status is None:
+        return None
+    return f"{sha}-dirty" if status.strip() else sha
 
 
 def _parse_spend_limit(raw: str | None) -> float | None:
@@ -557,6 +585,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # renders as unavailable and the picker falls back to exact ids.
     app.state.app_sha = _app_sha()
     app.state.catalog = await fetch_catalog(app.state.client)
+    app.state.catalog_digest = app.state.catalog.get("digest")
     app.state.prices = app.state.catalog["prices"]
     # When the prices a run was costed against were read. None on an
     # offline boot, where there is no snapshot to date: that absence is
@@ -584,7 +613,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db.close()
 
 
-app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
+# The three documentation routes are off. Nothing here consumes them: the
+# only client is static/, which is written against these endpoints by
+# hand, and the API surface is documented in README.md for humans. What
+# they do provide is a machine-readable map of every route, parameter and
+# bound on a server that holds a paid API key, served to anything that
+# reaches the port, plus two pages of remotely-sourced script tags in the
+# default configuration. Turning them off removes attack surface that
+# exists only to serve a consumer this bench does not have.
+app = FastAPI(
+    title="LM Comparison Bench",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # The bench is a localhost tool holding a paid API key, which makes it a
 # target for the two ways a browser gets turned against local servers.
@@ -717,16 +760,29 @@ class LocalOnlyGuard:
                 # immutable caching, and a second Cache-Control on that
                 # response would be a defect, not a stricter rule.
                 #
-                # Assets were served with ETag and Last-Modified but no
-                # Cache-Control, which lets a browser apply heuristic
-                # freshness and reuse a cached file without asking. After an
-                # upgrade that produced a reproduced field failure: a page
-                # running fresh modules beside a stale one from the previous
-                # release. no-cache does not mean "do not store", it means
-                # "revalidate before reuse", so with the ETags already
-                # present the common case is a 304 and the skew is gone.
+                # Which directive depends on what the response carries, and
+                # that split is the correction. no-cache means "revalidate
+                # before reuse", NOT "do not store": a no-cache response is
+                # allowed to sit on disk indefinitely. For assets that is
+                # exactly right, and it is what closed the stale-module skew,
+                # since with the ETags already present the common case is a
+                # 304. For a dynamic response it was wrong. Run details,
+                # group details and compare responses carry full prompts and
+                # full model answers, and permitting a browser or an
+                # intermediary to store those was a privacy directive that
+                # said the opposite of what this application promises about
+                # where prompts go.
+                #
+                # So assets revalidate and everything else is not stored at
+                # all. private is belt to no-store's braces: no-store already
+                # forbids storage, and private states the intent for anything
+                # that honors one and not the other.
                 if "cache-control" not in headers:
-                    headers["cache-control"] = "no-cache"
+                    path = scope.get("path", "")
+                    asset = path == "/" or path.startswith("/static/")
+                    headers["cache-control"] = (
+                        "no-cache" if asset else "private, no-store"
+                    )
             await send(message)
 
         # The socket-level check runs first, before anything a caller
@@ -882,6 +938,9 @@ def run_provenance() -> dict[str, Any]:
         "app_sha": getattr(app.state, "app_sha", None),
         "catalog_snapshot_at": getattr(app.state, "catalog_snapshot_at", None),
         "data_policy": getattr(app.state, "data_policy", None),
+        # None on an offline boot, where there were no catalog bytes to
+        # hash. That None is a fact about the boot rather than a gap.
+        "catalog_digest": getattr(app.state, "catalog_digest", None),
     }
 
 
@@ -1114,7 +1173,9 @@ def _enforce_manifest(
                     409,
                     "this group's lineup is "
                     f"{', '.join(declared_models)}; the batch sent "
-                    f"{', '.join(models)}",
+                    f"{', '.join(models)}. To add or rerun individual "
+                    "members of a declared comparison, use /compare/stream, "
+                    "one request per model",
                 )
         elif model is not None:
             if model not in declared_models:
