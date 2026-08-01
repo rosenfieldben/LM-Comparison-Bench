@@ -816,3 +816,15 @@
   padding-left: 8px;
 }
 .ctl-reuse { margin-top: 2px; }
+
+/* A declared member with no recorded run. Muted on purpose: it is a gap in
+   the record, not a result, and it carries no controls at all. */
+.card.missing {
+  border: 1px dashed var(--border-2);
+  background: none;
+  padding: var(--pad-card);
+  border-radius: 6px;
+  color: var(--text-ghost);
+}
+.card.missing .cardname { color: var(--text-faint); }
+.missing-note { font-size: 11px; margin-top: 4px; }

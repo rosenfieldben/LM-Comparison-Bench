@@ -1,5 +1,6 @@
 """Core model-calling logic. Pure functions over an injected httpx client."""
 
+import hashlib
 import json
 import logging
 import math
@@ -330,11 +331,17 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
     stop the bench from booting; fetched=false is how the frontend
     tells an offline boot from an empty catalog.
     """
-    offline = {"fetched": False, "models": [], "prices": {}}
+    offline = {"fetched": False, "models": [], "prices": {}, "digest": None}
     try:
         response = await client.get(MODELS_URL, timeout=PRICES_TIMEOUT_S)
         if response.status_code != 200:
             return offline
+        # The bytes, hashed before parsing. catalog_snapshot_at already says
+        # WHEN the catalog was read; this says WHICH catalog, so two runs
+        # costed a minute apart can be told apart rather than merely dated.
+        # Over the raw body rather than the parsed structure, because the
+        # question is what arrived, not what this parser made of it.
+        digest = hashlib.sha256(response.content).hexdigest()
         entries = response.json()["data"]
         if not isinstance(entries, list):
             return offline
@@ -394,7 +401,7 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             model["prompt_price"] = None
             model["completion_price"] = None
         models.append(model)
-    return {"fetched": True, "models": models, "prices": prices}
+    return {"fetched": True, "models": models, "prices": prices, "digest": digest}
 
 
 def _request_record(payload: dict[str, Any]) -> str | None:

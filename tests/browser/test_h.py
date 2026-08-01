@@ -597,3 +597,144 @@ def test_the_largest_allowed_seed_survives_the_browser_round_trip(page, bench_ur
         },
     )
     assert refused.status == 422, refused.text()
+
+
+# ---- H1.2: an incomplete experiment looks incomplete.
+
+
+def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url):
+    """Third external review, HIGH: the group declared an ordered lineup
+    before any call and the detail showed only what actually ran, so a
+    comparison that declared four models and recorded two replayed as a
+    two-model comparison. That is a quieter lie than an error, because the
+    reader has no way to know anything is missing.
+
+    The placeholder is deliberately inert: no rerun control, no diff tools,
+    no race entry, nothing counted. There is no result to diff and no timing
+    to race, and running the missing member into its declared slot is a real
+    capability that this P0 branch is not the place to build.
+    """
+    gid = page.request.post(
+        bench_url + "/groups",
+        data={
+            "prompt": "h1 incomplete comparison",
+            "models": ["stub/fast", "stub/slow"],
+            "budget": "standard",
+        },
+    ).json()["id"]
+    # Only one of the two declared members actually runs.
+    ran = page.request.post(
+        bench_url + "/compare/stream",
+        data={
+            "prompt": "h1 incomplete comparison",
+            "model": "stub/fast",
+            "group_id": gid,
+            "position": 0,
+            "budget": "standard",
+        },
+    )
+    assert ran.ok, ran.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row_for(page, "h1 incomplete comparison").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # One real card, one gap, so the comparison reads as two-wide.
+    expect(cards(page)).to_have_count(1)
+    gap = page.get_by_test_id("missing-member")
+    expect(gap).to_have_count(1)
+    expect(gap.get_by_test_id("missing-member-model")).to_have_text("stub/slow")
+    expect(gap).to_contain_text("declared at position 1")
+
+    # Inert: none of the controls a real card carries.
+    for control in ("tool-rerun", "tool-diff", "tool-copy", "tool-fold"):
+        expect(gap.get_by_test_id(control)).to_have_count(0), control
+    # And it contributes nothing to the session counters.
+    assert page.evaluate("() => BenchState.sessionStats.runs") == 0
+
+
+def test_review_repro_a_duplicate_lineup_still_shows_its_gap(page, bench_url):
+    """Closing review. The gap detection matched declared members against
+    a Set of the models that ran, and a lineup may legitimately declare
+    one model twice: neither /compare nor /groups rejects a duplicate, and
+    with the seed control a same-model pair is a determinism check rather
+    than a mistake. One recorded run then suppressed BOTH placeholders and
+    the comparison replayed one-wide with nothing to show it had declared
+    two. That is exactly the quiet shrink the placeholders exist to stop,
+    surviving in the one lineup shape nobody tested.
+    """
+    gid = page.request.post(
+        bench_url + "/groups",
+        data={
+            "prompt": "h1 duplicate lineup",
+            "models": ["stub/fast", "stub/fast"],
+            "budget": "standard",
+        },
+    ).json()["id"]
+    ran = page.request.post(
+        bench_url + "/compare/stream",
+        data={
+            "prompt": "h1 duplicate lineup",
+            "model": "stub/fast",
+            "group_id": gid,
+            "position": 0,
+            "budget": "standard",
+        },
+    )
+    assert ran.ok, ran.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row_for(page, "h1 duplicate lineup").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # One ran, one did not: one card and one gap, naming the slot that is
+    # still empty rather than the one that filled.
+    expect(cards(page)).to_have_count(1)
+    gap = page.get_by_test_id("missing-member")
+    expect(gap).to_have_count(1)
+    expect(gap).to_contain_text("declared at position 1")
+
+
+def test_a_legacy_group_replays_without_printing_null(page, bench_url):
+    """Legacy groups return null for every declared field, and a null
+    reaching the composer would render the four characters "null" as if
+    someone had typed them. Absence has to render as absence.
+
+    Built through the API and then stripped of its declaration, which is the
+    shape every group in a pre-H.1 database has.
+    """
+    gid = page.request.post(
+        bench_url + "/groups",
+        data={"prompt": "h1 legacy replay", "budget": "standard"},
+    ).json()["id"]
+    ran = page.request.post(
+        bench_url + "/compare/stream",
+        data={
+            "prompt": "h1 legacy replay",
+            "model": "stub/fast",
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+    assert ran.ok, ran.text()
+
+    page.goto(bench_url)
+    open_history(page)
+    row_for(page, "h1 legacy replay").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # No declared lineup means no gaps to draw, not a gap for every model.
+    expect(page.get_by_test_id("missing-member")).to_have_count(0)
+
+    page.get_by_test_id("reuse-comparison").click()
+    prompt = page.get_by_test_id("prompt-input").input_value()
+    assert prompt == "h1 legacy replay", prompt
+    assert "null" not in prompt

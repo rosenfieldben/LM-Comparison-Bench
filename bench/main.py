@@ -335,6 +335,13 @@ class GroupCreate(BaseModel):
     # per-run integrity check is checked against rather than a claim
     # assembled after the money moved.
     params: ExperimentParams | None = None
+    # Required, unlike everything above it, and the asymmetry is the point.
+    # The others are optional because pre-G and pre-H clients existed that
+    # could not send them. Nothing has ever created a group without knowing
+    # its budget, and a comparison whose members ran at different token
+    # budgets is not one experiment, so accepting a group that declines to
+    # say would be creating the very hole this workstream closes.
+    budget: Literal["standard", "extended"]
 
 
 class GroupCreated(BaseModel):
@@ -378,6 +385,11 @@ class RunDetail(BaseModel):
     app_sha: str | None = None
     catalog_snapshot_at: str | None = None
     data_policy: str | None = None
+    # Which catalog bytes this run was costed against, beside the timestamp
+    # that says when they were read. The column lands with H1.2's migration
+    # so the schema changes once; the value is written by H1.3, so every row
+    # reads None until then and every legacy row reads None forever.
+    catalog_digest: str | None = None
     # The controls this run was sent with, derived from its recorded payload
     # rather than stored: controls are declared on the group, and a run may
     # have none. See store._controls_from_request for why routing is never
@@ -389,11 +401,47 @@ class GroupDetail(BaseModel):
     id: int
     created_at: str
     runs: list[RunDetail]
+    # The declaration, so the view can show what the comparison was meant
+    # to be and not only what happened to run. A declared model with no
+    # recorded run is the case this exists for: without these the detail
+    # showed an incomplete experiment as a smaller one.
+    #
+    # All None on a group that predates the columns, where NULL means
+    # unknown rather than empty (see store.group_manifest for why that is
+    # the opposite of what NULL means for params). A renderer must treat
+    # None as absence and never print it.
+    prompt: str | None = None
+    models: list[str] | None = None
+    budget: str | None = None
     # The controls the comparison was declared with, or None when it held
     # none. Only set controls are present, so the detail view can render a
     # chosen control and never a default dressed up as one. None on every
     # pre-H group, which is a fact about those groups rather than a gap.
     params: dict[str, Any] | None = None
+
+
+def _git(args: list[str]) -> str | None:
+    """One git command's stdout, or None when git could not answer.
+
+    Split out of _app_sha so both of that function's questions run under
+    one timeout and degrade discipline, and so a test can substitute a
+    runner without reaching into subprocess. A non-zero exit is an answer
+    the caller cannot use, which is the same as no answer.
+    """
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            cwd=Path(__file__).resolve().parent.parent,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout
 
 
 def _app_sha() -> str | None:
@@ -406,21 +454,25 @@ def _app_sha() -> str | None:
     hit the timeout, because none of those are reasons to fail a boot. The
     timeout is short for the same reason: this is a nice-to-have label,
     not a dependency.
+
+    A bare sha claims the running code IS that commit, which is false for
+    every uncommitted edit, and a bench whose whole point is provenance
+    must not let altered code sign a clean commit's name. So the tree is
+    checked too and a modified one is labelled "<sha>-dirty". When that
+    second question cannot be answered the whole label degrades to None
+    rather than to the bare sha: an unqualified sha is the clean claim,
+    and asserting it unverified is exactly the lie this guards against.
     """
-    try:
-        proc = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            cwd=Path(__file__).resolve().parent.parent,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError):
+    sha = as_text((_git(["rev-parse", "HEAD"]) or "").strip()) or None
+    if sha is None:
         return None
-    if proc.returncode != 0:
+    # --porcelain is the stable machine format; empty output means clean.
+    # Untracked files count as dirty here on purpose: an untracked module
+    # on the import path changes what runs just as an edited one does.
+    status = _git(["status", "--porcelain"])
+    if status is None:
         return None
-    return as_text(proc.stdout.strip()) or None
+    return f"{sha}-dirty" if status.strip() else sha
 
 
 def _parse_spend_limit(raw: str | None) -> float | None:
@@ -533,6 +585,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # renders as unavailable and the picker falls back to exact ids.
     app.state.app_sha = _app_sha()
     app.state.catalog = await fetch_catalog(app.state.client)
+    app.state.catalog_digest = app.state.catalog.get("digest")
     app.state.prices = app.state.catalog["prices"]
     # When the prices a run was costed against were read. None on an
     # offline boot, where there is no snapshot to date: that absence is
@@ -560,7 +613,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db.close()
 
 
-app = FastAPI(title="LM Comparison Bench", lifespan=lifespan)
+# The three documentation routes are off. Nothing here consumes them: the
+# only client is static/, which is written against these endpoints by
+# hand, and the API surface is documented in README.md for humans. What
+# they do provide is a machine-readable map of every route, parameter and
+# bound on a server that holds a paid API key, served to anything that
+# reaches the port, plus two pages of remotely-sourced script tags in the
+# default configuration. Turning them off removes attack surface that
+# exists only to serve a consumer this bench does not have.
+app = FastAPI(
+    title="LM Comparison Bench",
+    lifespan=lifespan,
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
 # The bench is a localhost tool holding a paid API key, which makes it a
 # target for the two ways a browser gets turned against local servers.
@@ -693,16 +760,29 @@ class LocalOnlyGuard:
                 # immutable caching, and a second Cache-Control on that
                 # response would be a defect, not a stricter rule.
                 #
-                # Assets were served with ETag and Last-Modified but no
-                # Cache-Control, which lets a browser apply heuristic
-                # freshness and reuse a cached file without asking. After an
-                # upgrade that produced a reproduced field failure: a page
-                # running fresh modules beside a stale one from the previous
-                # release. no-cache does not mean "do not store", it means
-                # "revalidate before reuse", so with the ETags already
-                # present the common case is a 304 and the skew is gone.
+                # Which directive depends on what the response carries, and
+                # that split is the correction. no-cache means "revalidate
+                # before reuse", NOT "do not store": a no-cache response is
+                # allowed to sit on disk indefinitely. For assets that is
+                # exactly right, and it is what closed the stale-module skew,
+                # since with the ETags already present the common case is a
+                # 304. For a dynamic response it was wrong. Run details,
+                # group details and compare responses carry full prompts and
+                # full model answers, and permitting a browser or an
+                # intermediary to store those was a privacy directive that
+                # said the opposite of what this application promises about
+                # where prompts go.
+                #
+                # So assets revalidate and everything else is not stored at
+                # all. private is belt to no-store's braces: no-store already
+                # forbids storage, and private states the intent for anything
+                # that honors one and not the other.
                 if "cache-control" not in headers:
-                    headers["cache-control"] = "no-cache"
+                    path = scope.get("path", "")
+                    asset = path == "/" or path.startswith("/static/")
+                    headers["cache-control"] = (
+                        "no-cache" if asset else "private, no-store"
+                    )
             await send(message)
 
         # The socket-level check runs first, before anything a caller
@@ -858,6 +938,9 @@ def run_provenance() -> dict[str, Any]:
         "app_sha": getattr(app.state, "app_sha", None),
         "catalog_snapshot_at": getattr(app.state, "catalog_snapshot_at", None),
         "data_policy": getattr(app.state, "data_policy", None),
+        # None on an offline boot, where there were no catalog bytes to
+        # hash. That None is a fact about the boot rather than a gap.
+        "catalog_digest": getattr(app.state, "catalog_digest", None),
     }
 
 
@@ -1055,8 +1138,83 @@ def _control_conflicts(
     )
 
 
+def _enforce_manifest(
+    manifest: dict[str, Any],
+    budget: str,
+    model: str | None,
+    position: int | None,
+    models: list[str] | None,
+) -> None:
+    """Reject a member that does not match what its group declared.
+
+    Membership, position and budget, checked against the declaration the
+    group wrote before any call. Called from both endpoints at entry, so
+    every refusal here is pre-spend.
+
+    NULL means UNKNOWN in this function, which is the opposite of what it
+    means for params, and the contrast is deliberate enough to state twice.
+    A NULL params_json is the affirmative fact that no control was set,
+    because controls arrived with the concept and every group predating
+    them genuinely set none; that is why the params check refuses a
+    controls-carrying member of a NULL-params group. A NULL models_json or
+    NULL budget is different: those groups were created before anything
+    recorded a lineup or a tier, so NULL is silence rather than a claim of
+    emptiness. Enforcing against silence would refuse correct work on every
+    legacy group, so a None declaration skips its check entirely.
+    """
+    declared_models = manifest["models"]
+    if declared_models is not None:
+        if models is not None:
+            # The batch surface declares its whole lineup in one array, so
+            # order is part of the claim: the same models in a different
+            # order is a different side-by-side comparison.
+            if models != declared_models:
+                raise HTTPException(
+                    409,
+                    "this group's lineup is "
+                    f"{', '.join(declared_models)}; the batch sent "
+                    f"{', '.join(models)}. To add or rerun individual "
+                    "members of a declared comparison, use /compare/stream, "
+                    "one request per model",
+                )
+        elif model is not None:
+            if model not in declared_models:
+                raise HTTPException(
+                    409,
+                    f"model {model} is not in this group's declared lineup "
+                    f"({', '.join(declared_models)})",
+                )
+            # Position is checked only when the caller declared one. A
+            # client that sends no position is not claiming a slot, and
+            # inventing one for it would refuse a run for a claim it never
+            # made.
+            if position is not None and declared_models[position : position + 1] != [
+                model
+            ]:
+                at = declared_models.index(model)
+                raise HTTPException(
+                    409,
+                    f"model {model} is declared at position {at} in this "
+                    f"group's lineup, got {position}",
+                )
+    declared_budget = manifest["budget"]
+    if declared_budget is not None and declared_budget != budget:
+        raise HTTPException(
+            409,
+            f"this group declared the {declared_budget} budget; this run "
+            f"asks for {budget}. A comparison holds one budget across its "
+            "members",
+        )
+
+
 def enforce_group_experiment(
-    prompt: str, params: dict[str, Any], group_id: int | None
+    prompt: str,
+    params: dict[str, Any],
+    group_id: int | None,
+    budget: str,
+    model: str | None = None,
+    position: int | None = None,
+    models: list[str] | None = None,
 ) -> None:
     """Reject a run whose group already holds a different experiment.
 
@@ -1100,6 +1258,9 @@ def enforce_group_experiment(
             "its runs",
         )
     group_controls = store.group_params(app.state.db, group_id)
+    _enforce_manifest(
+        store.group_manifest(app.state.db, group_id), budget, model, position, models
+    )
     conflicts = _control_conflicts(group_controls, params)
     if conflicts:
         named = ", ".join(conflicts)
@@ -1203,7 +1364,17 @@ def request_provider_prefs(controls: dict[str, Any]) -> dict[str, Any]:
 async def compare(request: CompareRequest) -> dict[str, Any]:
     enforce_spend_limit()
     controls = request_controls(request.params)
-    enforce_group_experiment(request.prompt, controls, request.group_id)
+    # request.budget, not effective_budget: the tier is the declaration, and
+    # the clamp is a per-model consequence of it. Two models with different
+    # published caps legitimately produce different token numbers inside one
+    # extended comparison, and refusing that would refuse a correct run.
+    enforce_group_experiment(
+        request.prompt,
+        controls,
+        request.group_id,
+        request.budget,
+        models=request.models,
+    )
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -1215,22 +1386,36 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # queue wait as model latency.
         budget = effective_budget(request.budget, model)
         async with app.state.upstream_semaphore:
-            # Recheck under the held slot, before run_model spends. This
-            # batch records its own spend only after the gather completes,
-            # so the recheck cannot observe an earlier model in this same
-            # batch; what it catches is spend a concurrent request (another
-            # /compare or a stream) recorded while this model waited for a
-            # slot. One batch is capped at five models, equal to
-            # MAX_CONCURRENT_UPSTREAM, so a batch's own overshoot already
-            # sits within the documented bound; the recheck stops a queued
-            # batch from spending once a concurrent run crossed the ceiling.
+            # Recheck under the held slot, before run_model spends.
+            #
+            # Settlement now happens below, inside this same held slot, so
+            # this recheck observes every result that has already settled,
+            # including earlier members of this very batch. That is the
+            # property the old comment lacked. It reasoned correctly about
+            # one batch and was never re-derived for N: settlement used to
+            # run after gather, so a fast member released its slot with
+            # nothing recorded, and a model from a concurrent batch took
+            # that slot and rechecked against a counter that had not moved.
+            # Eight concurrent five-model batches against a ceiling worth
+            # half a result put 23 calls upstream here (stable across five
+            # runs; the external report's figure was 28, and the exact
+            # number depends on scheduling) where the documented bound
+            # promised about five.
+            #
+            # With per-result settlement the bound is real and derivable: a
+            # freed slot implies a recorded settlement, so once accumulated
+            # spend crosses the ceiling, every subsequent slot acquisition
+            # sees it and refuses. Only the calls already executing when
+            # the ceiling tripped can overshoot, and there are at most
+            # MAX_CONCURRENT_UPSTREAM of those by construction.
+            #
             # On refusal return a synthetic result shaped like run_model's,
             # error set, with no upstream call. The batch persists as usual
             # with the refusal row included: honest history for a cut-short
             # run.
             if spend_ceiling_reached():
                 return spend_refusal_result(model, budget)
-            return await run_model(
+            result = await run_model(
                 request.prompt,
                 model,
                 app.state.client,
@@ -1238,17 +1423,30 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
             )
+            # Settle before the slot releases. This block is post-spend, so
+            # it carries its own fault boundary: the upstream call has
+            # already happened and nothing here may turn a paid result into
+            # an error. A failure pricing or recording degrades this
+            # result's cost to None, which contributes nothing to the
+            # ceiling, exactly as an unpriced result already does.
+            try:
+                result["cost_usd"] = cost_usd(result, app.state.prices)
+                record_spend(ceiling_cost(result))
+            except Exception:
+                logger.exception("settlement failed for %s", model)
+                result["cost_usd"] = None
+            return result
 
     # gather preserves input order, which the frontend relies on to map
     # result columns by position. run_model never raises, so no
-    # return_exceptions handling is needed here.
+    # return_exceptions handling is needed here, and limited() guarantees
+    # cost_usd is present on everything it returns, so the response model's
+    # required key needs no seeding pass.
     results = await asyncio.gather(*(limited(m) for m in request.models))
-    # Seeded before the fault boundary so a failure inside it can never
-    # leave a result missing the key the response model requires.
     # position comes from array order here: gather preserves it, and for
-    # the batch endpoint the caller's array IS the declared layout.
+    # the batch endpoint the caller's array IS the declared layout. Pure
+    # assignment, so it stays outside the fault boundary below.
     for index, result in enumerate(results):
-        result["cost_usd"] = None
         result["position"] = index
     run_id = None
     # The invariant: after money is spent, no code path may convert
@@ -1257,13 +1455,6 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # persistence) sits inside this one boundary; on any failure the
     # results go back intact with run_id null and the links dropped.
     try:
-        # Cost is a boundary concern: run_model stays a pure OpenRouter
-        # call and the price snapshot lives on app.state. Computed
-        # before save_run so history carries the cost as priced at run
-        # time.
-        for result in results:
-            result["cost_usd"] = cost_usd(result, app.state.prices)
-            record_spend(ceiling_cost(result))
         prompt_id, group_id = resolve_links(
             app.state.db, request.prompt_id, request.group_id
         )
@@ -1287,7 +1478,16 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # any upstream call: a refusal must spend nothing.
     enforce_spend_limit()
     controls = request_controls(request.params)
-    enforce_group_experiment(request.prompt, controls, request.group_id)
+    # See /compare: the requested tier is what the group declared, never the
+    # clamped token count computed on the next line.
+    enforce_group_experiment(
+        request.prompt,
+        controls,
+        request.group_id,
+        request.budget,
+        model=request.model,
+        position=request.position,
+    )
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -1498,6 +1698,7 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             body.prompt,
             body.models,
             request_controls(body.params) or None,
+            body.budget,
         )
     }
 

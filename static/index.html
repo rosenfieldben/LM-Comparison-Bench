@@ -80,7 +80,8 @@
   <div id="controls-row">
     <button id="toggle-controls" data-testid="toggle-controls" type="button"
             aria-expanded="false" aria-controls="experiment-controls"
-            title="Sampling and routing held constant across every model in the comparison">+ Controls</button>
+            title="Sampling and routing sent identically on every request in this comparison"
+            >+ Controls</button>
     <span id="controls-summary" data-testid="controls-summary" role="status"></span>
   </div>
   <!-- The min, max and option values below mirror ExperimentParams in
@@ -96,17 +97,23 @@
     <textarea id="ctl-system" data-testid="ctl-system" rows="2"
               placeholder="Leave blank to send no system message"
               title="Sent as a leading system message to every model. Blank sends none, which is what the bench has always done"></textarea>
+    <!-- step="any" on the two float inputs, not a hundredth. step is a
+         validity constraint, not a spinner hint: with step="0.01" the
+         browser marks 0.005 or 0.7071 invalid and refuses a value the API
+         accepts, which is the same "markup tighter than the model" failure
+         the bounds comment above guards against. seed keeps step="1"
+         because integer really is the constraint there. -->
     <div id="controls-scalars">
       <span class="ctl">
         <label for="ctl-temperature">temperature</label>
         <input id="ctl-temperature" data-testid="ctl-temperature" type="number"
-               min="0" max="2" step="0.01" placeholder="unset"
+               min="0" max="2" step="any" placeholder="unset"
                title="0 to 2. Lower is more predictable. Blank sends nothing, so each provider applies its own default (1.0 for most)">
       </span>
       <span class="ctl">
         <label for="ctl-top-p">top_p</label>
         <input id="ctl-top-p" data-testid="ctl-top-p" type="number"
-               min="0" max="1" step="0.01" placeholder="unset"
+               min="0" max="1" step="any" placeholder="unset"
                title="0 to 1. Limits sampling to the most likely tokens adding up to P. Blank sends nothing, so each provider applies its own default">
       </span>
       <span class="ctl">

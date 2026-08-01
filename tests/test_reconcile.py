@@ -84,14 +84,21 @@ def row_of(conn, run_id, index=0):
 
 
 @respx.mock
-async def test_the_work_list_is_rows_with_an_id_and_no_charge(conn):
+async def test_the_work_list_is_rows_with_an_id_and_a_closable_gap(conn):
     respx.get(GENERATION_URL).respond(json=audit_body("gen-a"))
     run_id = seed(
         conn,
         [
             completed_result("model/a", "gen-a"),
-            # Already billed: nothing to reconcile.
-            completed_result("model/b", "gen-b", billed_cost_usd=0.002),
+            # Nothing left to ask: charge, host and the host's own finish
+            # reason are all recorded.
+            completed_result(
+                "model/b",
+                "gen-b",
+                billed_cost_usd=0.002,
+                provider="Fireworks",
+                native_finish_reason="stop",
+            ),
             # No id: nothing to ask about.
             completed_result("model/c", None),
         ],
@@ -101,6 +108,63 @@ async def test_the_work_list_is_rows_with_an_id_and_no_charge(conn):
 
     assert [p["generation_id"] for p in pending] == ["gen-a"]
     assert store.get_run(conn, run_id) is not None
+
+
+@respx.mock
+async def test_review_repro_a_billed_row_missing_its_host_is_reconcilable(conn):
+    """The work list used to ask only about money. A row could arrive with
+    a trusted charge and no `provider` or `native_finish_reason` (the
+    usage object carries the cost; those two come from elsewhere and can
+    be absent), and it was then permanently invisible to the only pass
+    that could have filled them. The gap was real, open, and unreachable.
+    """
+    run_id = seed(
+        conn,
+        [
+            completed_result(
+                "model/a", "gen-a", billed_cost_usd=0.002, native_finish_reason="stop"
+            ),
+            completed_result(
+                "model/b", "gen-b", billed_cost_usd=0.002, provider="Fireworks"
+            ),
+        ],
+    )
+    pending = store.results_awaiting_reconciliation(conn)
+    assert [p["generation_id"] for p in pending] == ["gen-a", "gen-b"]
+
+    respx.get(GENERATION_URL).respond(
+        json=audit_body("gen-a", provider_name="Together", native_finish_reason="stop")
+    )
+    out = io.StringIO()
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=out)
+
+    filled = row_of(conn, run_id)
+    assert filled["provider"] == "Together"
+    assert filled["native_finish_reason"] == "stop"
+
+
+@respx.mock
+async def test_an_unreported_charge_does_not_erase_a_trusted_one(conn):
+    """A row on the list for a missing label still has good money on it.
+    The endpoint reporting no total_cost means "not reported", so the
+    write must leave the stored charge alone. Only an untrusted stored
+    value is cleared, which is what makes the poisoned-cost repair work.
+    """
+    run_id = seed(
+        conn,
+        [completed_result("model/a", "gen-a", billed_cost_usd=0.002)],
+    )
+    respx.get(GENERATION_URL).respond(
+        json=audit_body("gen-a", total_cost=None, provider_name="Together")
+    )
+    out = io.StringIO()
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=out)
+
+    row = row_of(conn, run_id)
+    assert row["billed_cost_usd"] == 0.002
+    assert row["provider"] == "Together"
 
 
 @respx.mock
@@ -363,8 +427,24 @@ async def test_review_repro_a_charge_no_reader_trusts_stays_reconcilable(
 async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
     """The guard against over-correcting: free models are real, and a
     confirmed zero is a charge, not an absence. It must stay out of the
-    work list or the pass would re-ask about it forever."""
+    work list or the pass would re-ask about it forever.
+
+    The row is seeded with its labels too, so money is the only predicate
+    that could put it on the list and the assertion still tests exactly
+    what it names.
+    """
     respx.get(GENERATION_URL).respond(json=audit_body("gen-free"))
-    seed(conn, [completed_result("model/free", "gen-free", billed_cost_usd=0.0)])
+    seed(
+        conn,
+        [
+            completed_result(
+                "model/free",
+                "gen-free",
+                billed_cost_usd=0.0,
+                provider="Together",
+                native_finish_reason="stop",
+            )
+        ],
+    )
 
     assert store.results_awaiting_reconciliation(conn) == []

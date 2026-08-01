@@ -250,6 +250,59 @@
     resultsEl.append(box);
   }
 
+  // Declared members with no recorded run, drawn as inert placeholders so
+  // an incomplete experiment looks incomplete rather than smaller. Without
+  // these a comparison that declared four models and recorded two replayed
+  // as a two-model comparison, which is a quieter lie than an error: the
+  // reader has no way to know anything is missing.
+  //
+  // Built here rather than through makeColumn, and that is the enforcement
+  // of its inertness rather than a style choice. A real column wires a
+  // rerun control, diff arming, a race entry and session accounting, and a
+  // placeholder must have none of those: there is no result to diff, no
+  // timing to race, nothing to count, and "run the missing member into its
+  // declared slot" is a real capability that this branch is not the place
+  // to build. Constructing a plain element cannot acquire any of that by
+  // accident.
+  //
+  // Appended after the recorded results rather than slotted at the declared
+  // index: the sort above is position-based and a member that never ran has
+  // no position, so each placeholder names its declared index instead of
+  // pretending to occupy it.
+  function renderMissingMembers(group, results) {
+    const declared = group.models;
+    if (!Array.isArray(declared)) return;
+    // Counts, not a Set. A lineup may legitimately declare one model
+    // twice (neither /compare nor /groups rejects it, and with the seed
+    // control a same-model pair is a determinism check rather than a
+    // mistake), and set membership would let a single recorded run
+    // suppress BOTH placeholders. That is the same quiet shrink this
+    // function exists to stop, so it has to count.
+    const ran = new Map();
+    for (const r of results) ran.set(r.model, (ran.get(r.model) ?? 0) + 1);
+    declared.forEach((model, index) => {
+      const remaining = ran.get(model) ?? 0;
+      if (remaining > 0) {
+        ran.set(model, remaining - 1);
+        return;
+      }
+      const card = document.createElement("div");
+      card.className = "card missing";
+      card.dataset.testid = "missing-member";
+      const name = document.createElement("div");
+      name.className = "cardname";
+      name.dataset.testid = "missing-member-model";
+      name.textContent = model;
+      const note = document.createElement("div");
+      note.className = "missing-note";
+      note.textContent = "declared at position " + index + ", never ran";
+      card.title =
+        "this comparison declared " + model + " but no run for it was recorded";
+      card.append(name, note);
+      resultsEl.append(card);
+    });
+  }
+
   async function showGroup(groupId) {
     // Owns the view from the click: in-flight runs for the old view are
     // aborted now, and this fetch is itself abortable by whatever
@@ -301,7 +354,15 @@
     renderRunControls(group.params, {
       kind: "group",
       id: group.id,
-      prompt: group.runs.length > 0 ? group.runs[0].prompt_text : "",
+      // The declaration first, since that is what the comparison WAS, with
+      // the first member's text as the fallback for groups created before
+      // the column existed. ?? and not ||, and the guard is the point:
+      // group.prompt is null on every legacy group, and a null reaching a
+      // textarea would render the four characters "null" as if someone had
+      // typed them. Absence has to render as absence.
+      prompt:
+        group.prompt ??
+        (group.runs.length > 0 ? group.runs[0].prompt_text : ""),
       params: group.params,
     });
     // Cards in the order the comparison actually had. Runs persist in
@@ -340,6 +401,7 @@
         result.model + ", comparison #" + group.id,
       );
     }
+    renderMissingMembers(group, results);
     window.scrollTo({ top: 0 });
   }
 

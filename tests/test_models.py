@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 
@@ -148,6 +149,24 @@ async def test_non_dict_usage_does_not_raise(client):
 
 
 @respx.mock
+async def test_the_catalog_digest_identifies_the_bytes_that_were_read(client):
+    """catalog_snapshot_at says WHEN prices were read; the digest says
+    WHICH bytes. Two boots a minute apart against a changed catalog were
+    otherwise indistinguishable in the provenance of the runs they costed.
+
+    It hashes the raw response body, before parsing, so it identifies what
+    OpenRouter actually sent rather than what this code made of it.
+    """
+    body = {"data": [{"id": "a/one", "pricing": {"prompt": "1", "completion": "2"}}]}
+    raw = json.dumps(body).encode()
+    respx.get(MODELS_URL).respond(content=raw, headers={"content-type": "text/json"})
+
+    catalog = await fetch_catalog(client)
+
+    assert catalog["digest"] == hashlib.sha256(raw).hexdigest()
+
+
+@respx.mock
 async def test_catalog_price_map_skips_malformed_entries(client):
     respx.get(MODELS_URL).respond(
         json={
@@ -174,7 +193,14 @@ async def test_catalog_price_map_skips_malformed_entries(client):
 async def test_fetch_catalog_http_error_reports_not_fetched(client):
     respx.get(MODELS_URL).respond(status_code=500)
     catalog = await fetch_catalog(client)
-    assert catalog == {"fetched": False, "models": [], "prices": {}}
+    # digest is None rather than absent: an offline boot read no bytes, and
+    # that absence is the provenance those runs get.
+    assert catalog == {
+        "fetched": False,
+        "models": [],
+        "prices": {},
+        "digest": None,
+    }
 
 
 from stream_helpers import DONE_MARKER, ChunkStream, sse
@@ -440,7 +466,14 @@ async def test_fetch_catalog_degrades_missing_fields_to_none(client):
 async def test_fetch_catalog_failure_reports_not_fetched(client):
     respx.get(MODELS_URL).mock(side_effect=httpx.ConnectError("offline"))
     catalog = await fetch_catalog(client)
-    assert catalog == {"fetched": False, "models": [], "prices": {}}
+    # digest is None rather than absent: an offline boot read no bytes, and
+    # that absence is the provenance those runs get.
+    assert catalog == {
+        "fetched": False,
+        "models": [],
+        "prices": {},
+        "digest": None,
+    }
 
 
 from bench.models import BUDGET_STANDARD
