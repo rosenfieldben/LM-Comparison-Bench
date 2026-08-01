@@ -54,6 +54,13 @@
     if (historyListController !== null) historyListController.abort();
     const controller = new AbortController();
     historyListController = controller;
+    // Synchronous, and that is load-bearing rather than incidental.
+    // Everything above this line runs before the function's first await,
+    // so by the time the toggle handler returns the panel already reads
+    // "loading". Without that, a reopened panel would still be showing
+    // the PREVIOUS load's terminal state, and anything waiting for the
+    // panel to settle would be satisfied by an answer to an older
+    // question. Do not move this below the fetch.
     setHistoryState("loading", "loading history");
     historyNote.textContent = "";
     let data;
@@ -68,6 +75,13 @@
       // alone: the newer load already set its own, and overwriting it
       // would report the loser's outcome.
       if (controller.signal.aborted) return;
+      // Observability parity with the finish() guards. A failure that
+      // exists only as a DOM attribute is a failure nothing watching the
+      // page can see, and this one hid for three rounds of a CI flake:
+      // the panel cleared its rows, set state=error, and a test then made
+      // an honest assertion against an honestly empty list. The console
+      // is where a page says it went wrong.
+      console.error("history load failed", err);
       setHistoryState("error", "failed to load history: " + err.message);
       return;
     }
@@ -463,6 +477,25 @@
   }
 
   function init() {
+    // The panel claims its own state synchronously with the click, and
+    // that is load-bearing rather than belt-and-braces. `toggle` is
+    // dispatched asynchronously, so between the click and loadHistory
+    // there is a real window in which data-state still holds the
+    // PREVIOUS load's terminal value. Anything waiting for the panel to
+    // settle can be answered inside that window by an answer to an older
+    // question: a panel reopened after a failure reported "error" for a
+    // load that had not started yet, which is precisely how a retry could
+    // conclude that the retry had also failed. Measured, not theorized.
+    //
+    // At click time `open` is still the old value, because the default
+    // action runs after listeners, so !open means "about to open".
+    // loadHistory sets the same state again on the toggle; assigning it
+    // twice is idempotent, and this one is only about closing the window.
+    historyEl.addEventListener("click", (event) => {
+      if (!historyEl.open && event.target.closest("summary")) {
+        setHistoryState("loading", "loading history");
+      }
+    });
     historyEl.addEventListener("toggle", () => {
       if (historyEl.open) loadHistory();
     });
