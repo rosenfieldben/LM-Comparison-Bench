@@ -335,6 +335,13 @@ class GroupCreate(BaseModel):
     # per-run integrity check is checked against rather than a claim
     # assembled after the money moved.
     params: ExperimentParams | None = None
+    # Required, unlike everything above it, and the asymmetry is the point.
+    # The others are optional because pre-G and pre-H clients existed that
+    # could not send them. Nothing has ever created a group without knowing
+    # its budget, and a comparison whose members ran at different token
+    # budgets is not one experiment, so accepting a group that declines to
+    # say would be creating the very hole this workstream closes.
+    budget: Literal["standard", "extended"]
 
 
 class GroupCreated(BaseModel):
@@ -378,6 +385,11 @@ class RunDetail(BaseModel):
     app_sha: str | None = None
     catalog_snapshot_at: str | None = None
     data_policy: str | None = None
+    # Which catalog bytes this run was costed against, beside the timestamp
+    # that says when they were read. The column lands with H1.2's migration
+    # so the schema changes once; the value is written by H1.3, so every row
+    # reads None until then and every legacy row reads None forever.
+    catalog_digest: str | None = None
     # The controls this run was sent with, derived from its recorded payload
     # rather than stored: controls are declared on the group, and a run may
     # have none. See store._controls_from_request for why routing is never
@@ -389,6 +401,18 @@ class GroupDetail(BaseModel):
     id: int
     created_at: str
     runs: list[RunDetail]
+    # The declaration, so the view can show what the comparison was meant
+    # to be and not only what happened to run. A declared model with no
+    # recorded run is the case this exists for: without these the detail
+    # showed an incomplete experiment as a smaller one.
+    #
+    # All None on a group that predates the columns, where NULL means
+    # unknown rather than empty (see store.group_manifest for why that is
+    # the opposite of what NULL means for params). A renderer must treat
+    # None as absence and never print it.
+    prompt: str | None = None
+    models: list[str] | None = None
+    budget: str | None = None
     # The controls the comparison was declared with, or None when it held
     # none. Only set controls are present, so the detail view can render a
     # chosen control and never a default dressed up as one. None on every
@@ -1055,8 +1079,81 @@ def _control_conflicts(
     )
 
 
+def _enforce_manifest(
+    manifest: dict[str, Any],
+    budget: str,
+    model: str | None,
+    position: int | None,
+    models: list[str] | None,
+) -> None:
+    """Reject a member that does not match what its group declared.
+
+    Membership, position and budget, checked against the declaration the
+    group wrote before any call. Called from both endpoints at entry, so
+    every refusal here is pre-spend.
+
+    NULL means UNKNOWN in this function, which is the opposite of what it
+    means for params, and the contrast is deliberate enough to state twice.
+    A NULL params_json is the affirmative fact that no control was set,
+    because controls arrived with the concept and every group predating
+    them genuinely set none; that is why the params check refuses a
+    controls-carrying member of a NULL-params group. A NULL models_json or
+    NULL budget is different: those groups were created before anything
+    recorded a lineup or a tier, so NULL is silence rather than a claim of
+    emptiness. Enforcing against silence would refuse correct work on every
+    legacy group, so a None declaration skips its check entirely.
+    """
+    declared_models = manifest["models"]
+    if declared_models is not None:
+        if models is not None:
+            # The batch surface declares its whole lineup in one array, so
+            # order is part of the claim: the same models in a different
+            # order is a different side-by-side comparison.
+            if models != declared_models:
+                raise HTTPException(
+                    409,
+                    "this group's lineup is "
+                    f"{', '.join(declared_models)}; the batch sent "
+                    f"{', '.join(models)}",
+                )
+        elif model is not None:
+            if model not in declared_models:
+                raise HTTPException(
+                    409,
+                    f"model {model} is not in this group's declared lineup "
+                    f"({', '.join(declared_models)})",
+                )
+            # Position is checked only when the caller declared one. A
+            # client that sends no position is not claiming a slot, and
+            # inventing one for it would refuse a run for a claim it never
+            # made.
+            if position is not None and declared_models[position : position + 1] != [
+                model
+            ]:
+                at = declared_models.index(model)
+                raise HTTPException(
+                    409,
+                    f"model {model} is declared at position {at} in this "
+                    f"group's lineup, got {position}",
+                )
+    declared_budget = manifest["budget"]
+    if declared_budget is not None and declared_budget != budget:
+        raise HTTPException(
+            409,
+            f"this group declared the {declared_budget} budget; this run "
+            f"asks for {budget}. A comparison holds one budget across its "
+            "members",
+        )
+
+
 def enforce_group_experiment(
-    prompt: str, params: dict[str, Any], group_id: int | None
+    prompt: str,
+    params: dict[str, Any],
+    group_id: int | None,
+    budget: str,
+    model: str | None = None,
+    position: int | None = None,
+    models: list[str] | None = None,
 ) -> None:
     """Reject a run whose group already holds a different experiment.
 
@@ -1100,6 +1197,9 @@ def enforce_group_experiment(
             "its runs",
         )
     group_controls = store.group_params(app.state.db, group_id)
+    _enforce_manifest(
+        store.group_manifest(app.state.db, group_id), budget, model, position, models
+    )
     conflicts = _control_conflicts(group_controls, params)
     if conflicts:
         named = ", ".join(conflicts)
@@ -1203,7 +1303,17 @@ def request_provider_prefs(controls: dict[str, Any]) -> dict[str, Any]:
 async def compare(request: CompareRequest) -> dict[str, Any]:
     enforce_spend_limit()
     controls = request_controls(request.params)
-    enforce_group_experiment(request.prompt, controls, request.group_id)
+    # request.budget, not effective_budget: the tier is the declaration, and
+    # the clamp is a per-model consequence of it. Two models with different
+    # published caps legitimately produce different token numbers inside one
+    # extended comparison, and refusing that would refuse a correct run.
+    enforce_group_experiment(
+        request.prompt,
+        controls,
+        request.group_id,
+        request.budget,
+        models=request.models,
+    )
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -1305,7 +1415,16 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # any upstream call: a refusal must spend nothing.
     enforce_spend_limit()
     controls = request_controls(request.params)
-    enforce_group_experiment(request.prompt, controls, request.group_id)
+    # See /compare: the requested tier is what the group declared, never the
+    # clamped token count computed on the next line.
+    enforce_group_experiment(
+        request.prompt,
+        controls,
+        request.group_id,
+        request.budget,
+        model=request.model,
+        position=request.position,
+    )
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -1516,6 +1635,7 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             body.prompt,
             body.models,
             request_controls(body.params) or None,
+            body.budget,
         )
     }
 

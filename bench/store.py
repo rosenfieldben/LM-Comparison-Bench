@@ -37,7 +37,8 @@ CREATE TABLE IF NOT EXISTS groups (
     created_at TEXT NOT NULL,
     prompt_text TEXT,
     models_json TEXT,
-    params_json TEXT
+    params_json TEXT,
+    budget TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -47,7 +48,8 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at TEXT NOT NULL,
     app_sha TEXT,
     catalog_snapshot_at TEXT,
-    data_policy TEXT
+    data_policy TEXT,
+    catalog_digest TEXT
 );
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
@@ -131,6 +133,22 @@ MIGRATIONS = [
     # was set, which is why the params check needs no derive-from-member
     # fallback of the kind group_prompt carries.
     ("groups", "params_json", "TEXT"),
+    # Phase H.1. Two columns, both nullable and additive.
+    #
+    # groups.budget completes the manifest. The group already declared its
+    # prompt, its ordered lineup and its controls before any call; the
+    # budget was the one part of "what this comparison is" that lived only
+    # on the members. A comparison whose members ran at different token
+    # budgets is not one experiment, and without this column nothing could
+    # say so.
+    #
+    # runs.catalog_digest is the provenance companion to
+    # catalog_snapshot_at: the timestamp says WHEN the price catalog was
+    # read, this says WHICH bytes were read, so two runs costed against
+    # catalogs that happened to be fetched a minute apart can be told
+    # apart. None on an offline boot, where there were no bytes.
+    ("groups", "budget", "TEXT"),
+    ("runs", "catalog_digest", "TEXT"),
 ]
 
 
@@ -294,6 +312,7 @@ def create_group(
     prompt_text: str | None = None,
     models: list[str] | None = None,
     params: dict[str, Any] | None = None,
+    budget: str | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -315,13 +334,15 @@ def create_group(
     """
     with conn:
         cur = conn.execute(
-            "INSERT INTO groups (created_at, prompt_text, models_json, params_json)"
-            " VALUES (?, ?, ?, ?)",
+            "INSERT INTO groups"
+            " (created_at, prompt_text, models_json, params_json, budget)"
+            " VALUES (?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
                 json.dumps(models) if models is not None else None,
                 json.dumps(params, sort_keys=True) if params else None,
+                budget,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
@@ -440,6 +461,50 @@ def group_params(conn: sqlite3.Connection, group_id: int) -> dict[str, Any]:
         "SELECT params_json FROM groups WHERE id = ?", (group_id,)
     ).fetchone()
     return _decoded_params(row["params_json"]) if row is not None else {}
+
+
+def group_manifest(conn: sqlite3.Connection, group_id: int) -> dict[str, Any]:
+    """What a group declared about itself before any call was made.
+
+    The prompt, the ordered lineup and the budget tier, returned as
+    declared: each is None when the group never declared it. Read by the
+    entry-time checks and by the detail view, so there is one place that
+    knows how a declaration is stored.
+
+    Every value here is either the affirmative declaration or None, and
+    the two NULL meanings in this file are NOT the same, which is why they
+    are read through different functions. group_params treats NULL as the
+    affirmative fact that no control was set, because controls arrived with
+    the concept and every pre-H group predates it. Here NULL means unknown:
+    models_json and budget exist on groups created before anything recorded
+    them, so a legacy group is silent about its lineup rather than
+    declaring it empty. A caller must therefore skip enforcement on None
+    and enforce on a value, and the check sites say so at the point of
+    decision.
+    """
+    row = conn.execute(
+        "SELECT prompt_text, models_json, budget FROM groups WHERE id = ?",
+        (group_id,),
+    ).fetchone()
+    if row is None:
+        return {"prompt": None, "models": None, "budget": None}
+    models = None
+    raw = row["models_json"]
+    if isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            decoded = None
+        # Repair on read: a lineup that is not a list of strings cannot be
+        # compared against a request, and enforcing against a broken
+        # declaration would refuse correct work. Unknown, not empty.
+        if isinstance(decoded, list) and all(isinstance(m, str) for m in decoded):
+            models = decoded
+    return {
+        "prompt": as_text(row["prompt_text"]),
+        "models": models,
+        "budget": as_text(row["budget"]),
+    }
 
 
 def save_run(
@@ -694,7 +759,7 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
 def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     run = conn.execute(
         """SELECT id, prompt_id, prompt_text, created_at,
-                  app_sha, catalog_snapshot_at, data_policy
+                  app_sha, catalog_snapshot_at, data_policy, catalog_digest
            FROM runs WHERE id = ?""",
         (run_id,),
     ).fetchone()
@@ -750,6 +815,11 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     ).fetchone()
     if row is None:
         return None
+    # The declaration, so the detail view can show what the comparison was
+    # supposed to be and not only what happened to run. Every field is None
+    # on a group that predates the column, which the view must render as
+    # absence rather than as a value.
+    manifest = group_manifest(conn, group_id)
     run_ids = [
         r["id"]
         for r in conn.execute(
@@ -759,6 +829,9 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     out = dict(row)
     params = _decoded_params(out.pop("params_json"))
     out["params"] = params or None
+    out["prompt"] = manifest["prompt"]
+    out["models"] = manifest["models"]
+    out["budget"] = manifest["budget"]
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
 

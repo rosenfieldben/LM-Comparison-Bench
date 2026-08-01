@@ -485,6 +485,11 @@
         body: JSON.stringify({
           prompt: prompt,
           models: models,
+          // Part of the manifest, and required by the server. A comparison
+          // whose members ran at different token budgets is not one
+          // experiment, so the tier is declared here with everything else
+          // the group fixes before its first call.
+          budget: budget,
           // The experiment record. Declared here, before any upstream call,
           // which is what makes the group row the thing later runs are
           // checked against rather than a claim assembled after the money

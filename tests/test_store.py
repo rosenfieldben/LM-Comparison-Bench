@@ -1123,3 +1123,117 @@ def test_a_malformed_payload_derives_nothing_rather_than_raising(tmp_path, paylo
         assert run["params"] is None
     finally:
         conn.close()
+
+
+PRE_H1_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_h1_schema.sql").read_text()
+
+
+def test_migration_onto_pre_h1_database_is_additive_and_idempotent(tmp_path):
+    """Phase H.1 adds exactly two columns, proven against the schema that
+    actually shipped rather than a hand-written approximation. The fixture
+    was generated from the pre-H.1 SCHEMA string itself, the same discipline
+    the pre-G and pre-H fixtures use.
+
+    The reads that matter are the NULL ones. A legacy group must come back
+    with no declared lineup and no declared budget, because that is what
+    tells the manifest check to skip enforcement: those groups predate the
+    concept, so NULL is silence and not a claim of emptiness. Enforcing
+    against silence would refuse correct work on every group in an existing
+    database.
+    """
+    db_path = tmp_path / "pre_h1.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_H1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json, params_json)
+           VALUES (1, '2026-01-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', '{"seed": 7}')"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at,
+                             app_sha, catalog_snapshot_at, data_policy)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-01-01T00:00:00+00:00',
+                   'abc1234', '2026-01-01T00:00:00+00:00', 'standard')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error, cost_usd)
+           VALUES (1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL, 2.9e-05)"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        manifest = store.group_manifest(conn, 1)
+        # Declared before the columns existed: prompt and lineup survive.
+        assert manifest["prompt"] == "legacy prompt"
+        assert manifest["models"] == ["legacy/a"]
+        # Silence, which is what makes the budget check skip this group.
+        assert manifest["budget"] is None
+        # The params rule is the opposite and still holds on the same row:
+        # a stored controls set reads back as set.
+        assert store.group_params(conn, 1) == {"seed": 7}
+        run = store.get_run(conn, 1)
+        assert run is not None
+        assert run["catalog_digest"] is None
+        assert run["app_sha"] == "abc1234"
+        assert run["results"][0]["response_text"] == "legacy text"
+        group = store.get_group(conn, 1)
+        assert group is not None
+        assert group["budget"] is None
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        for table, column in (("groups", "budget"), ("runs", "catalog_digest")):
+            cols = [r["name"] for r in again.execute(f"PRAGMA table_info({table})")]
+            assert cols.count(column) == 1, (table, column, cols)
+        gid = store.create_group(again, "new", ["new/a"], None, "extended")
+        assert store.group_manifest(again, gid) == {
+            "prompt": "new",
+            "models": ["new/a"],
+            "budget": "extended",
+        }
+    finally:
+        again.close()
+
+
+def test_a_group_with_no_declaration_reports_silence_not_emptiness(tmp_path):
+    """The distinction the manifest check depends on. None means the group
+    never said, so enforcement is skipped; an empty list would mean it
+    declared no models, which nothing has ever created and which would
+    refuse every member."""
+    conn = store.connect(str(tmp_path / "m.db"))
+    try:
+        gid = store.create_group(conn)
+        assert store.group_manifest(conn, gid) == {
+            "prompt": None,
+            "models": None,
+            "budget": None,
+        }
+        # A group id that does not exist reports the same silence rather
+        # than raising: the caller is an entry check on a request that may
+        # name anything.
+        assert store.group_manifest(conn, 99999)["models"] is None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "stored", ["not json", '"a string"', "17", "{}", '["ok", 5]', "null"]
+)
+def test_an_unreadable_lineup_reads_as_no_declaration(tmp_path, stored):
+    """Repair on read. A lineup that is not a list of strings cannot be
+    compared against a request, and enforcing against a broken declaration
+    would refuse correct work forever on that group. Unknown, not empty."""
+    conn = store.connect(str(tmp_path / "n.db"))
+    try:
+        gid = store.create_group(conn, "p", ["a/b"], None, "standard")
+        conn.execute("UPDATE groups SET models_json = ? WHERE id = ?", (stored, gid))
+        conn.commit()
+
+        assert store.group_manifest(conn, gid)["models"] is None
+    finally:
+        conn.close()

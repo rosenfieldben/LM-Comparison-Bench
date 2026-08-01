@@ -138,7 +138,7 @@ def test_group_flow_collapses_comparison_into_one_history_entry(client):
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
 
-    group_id = client.post("/groups", json={}).json()["id"]
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
     first = client.post(
         "/compare",
         json={"prompt": "hi", "models": ["model/alpha"], "group_id": group_id},
@@ -189,7 +189,7 @@ def test_review_repro_group_rejects_second_prompt(client):
     prompt. Entry now enforces one prompt per group with a 409 before any
     upstream call; same-prompt additions and empty/unknown groups pass."""
     route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
-    gid = client.post("/groups", json={}).json()["id"]
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
 
     r1 = client.post(
         "/compare",
@@ -223,7 +223,7 @@ def test_review_repro_stream_group_rejects_second_prompt(client):
     route = respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())
     )
-    gid = client.post("/groups", json={}).json()["id"]
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
 
     events = stream_events(
         client, {"prompt": "stream one", "model": "model/alpha", "group_id": gid}
@@ -532,7 +532,7 @@ def test_stream_endpoint_grouped_run_lands_in_group(client):
         return_value=httpx.Response(200, stream=alpha_stream())
     )
 
-    group_id = client.post("/groups", json={}).json()["id"]
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
     events = stream_events(
         client, {"prompt": "hi", "model": "model/alpha", "group_id": group_id}
     )
@@ -779,7 +779,7 @@ def test_group_create_requires_json_body(client):
     # every POST now needs the JSON content type, and the frontend
     # sends an empty JSON object on /groups.
     assert client.post("/groups").status_code == 415
-    assert client.post("/groups", json={}).status_code == 201
+    assert client.post("/groups", json={"budget": "standard"}).status_code == 201
 
 
 def test_models_endpoint_returns_catalog_with_pricing(client):
@@ -1269,7 +1269,7 @@ def test_review_repro_bodyless_cross_site_group_create_rejected(client):
 
     # The frontend path, a same-origin JSON POST with an empty object,
     # still works.
-    assert client.post("/groups", json={}).status_code == 201
+    assert client.post("/groups", json={"budget": "standard"}).status_code == 201
 
 
 # Reproduction 4 (world-readable bench.db) lives in test_store.py as
@@ -1845,7 +1845,11 @@ def test_legitimate_fields_still_accepted(client):
     """The control: every field the frontend and the suite actually send
     stays valid, on both compare shapes and the two other bodies."""
     respx.post(OPENROUTER_URL).respond(json=FIXTURE)
-    gid = client.post("/groups", json={}).json()["id"]
+    # One group per tier: a group declares its budget now, so the extended
+    # batch and the standard stream below belong to different comparisons.
+    # Mixing them in one group is refused, which is a tombstone of its own.
+    extended_gid = client.post("/groups", json={"budget": "extended"}).json()["id"]
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
     pid = client.post("/prompts", json={"name": "f47", "text": "t"}).json()["id"]
     full = client.post(
         "/compare",
@@ -1853,7 +1857,7 @@ def test_legitimate_fields_still_accepted(client):
             "prompt": "hi",
             "models": ["model/alpha"],
             "prompt_id": pid,
-            "group_id": gid,
+            "group_id": extended_gid,
             "budget": "extended",
         },
     )
@@ -1980,21 +1984,35 @@ def test_group_declares_prompt_and_lineup_before_any_member(client):
     route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
     gid = client.post(
         "/groups",
-        json={"prompt": "declared", "models": ["model/alpha", "model/bare"]},
+        json={
+            "prompt": "declared",
+            "models": ["model/alpha", "model/bare"],
+            "budget": "standard",
+        },
     ).json()["id"]
 
     # A different prompt is refused with no member present at all, which
     # the derive-from-first-member rule could never do.
     clash = client.post(
         "/compare",
-        json={"prompt": "different", "models": ["model/alpha"], "group_id": gid},
+        json={
+            "prompt": "different",
+            "models": ["model/alpha", "model/bare"],
+            "group_id": gid,
+        },
     )
     assert clash.status_code == 409
     assert route.call_count == 0
-    # The declared prompt passes.
+    # The declared prompt passes, sent as the declared lineup: a batch
+    # joining a group now has to send that lineup in order, since the array
+    # it sends is its claim about the comparison's shape.
     ok = client.post(
         "/compare",
-        json={"prompt": "declared", "models": ["model/alpha"], "group_id": gid},
+        json={
+            "prompt": "declared",
+            "models": ["model/alpha", "model/bare"],
+            "group_id": gid,
+        },
     )
     assert ok.status_code == 200
 
@@ -2002,7 +2020,7 @@ def test_group_declares_prompt_and_lineup_before_any_member(client):
 def test_empty_group_body_still_accepted(client):
     """The empty JSON object is load-bearing for the CORS preflight
     defense and is what every pre-G client sends; it must stay valid."""
-    assert client.post("/groups", json={}).status_code == 201
+    assert client.post("/groups", json={"budget": "standard"}).status_code == 201
 
 
 @respx.mock
@@ -2426,7 +2444,9 @@ def test_review_repro_wide_lineup_still_gets_a_group(client):
     what the group row exists to provide."""
     models = [f"model/m{i}" for i in range(7)]
 
-    resp = client.post("/groups", json={"prompt": "wide", "models": models})
+    resp = client.post(
+        "/groups", json={"prompt": "wide", "models": models, "budget": "standard"}
+    )
 
     assert resp.status_code == 201
     group_id = resp.json()["id"]
@@ -2440,7 +2460,9 @@ def test_the_group_body_is_still_bounded(client):
     """Bounded, just not at five. An absurd body is still refused at the
     boundary rather than written into the schema."""
     huge = [f"model/m{i}" for i in range(MAX_POSITION + 2)]
-    resp = client.post("/groups", json={"prompt": "absurd", "models": huge})
+    resp = client.post(
+        "/groups", json={"prompt": "absurd", "models": huge, "budget": "standard"}
+    )
     assert resp.status_code == 422
 
 
@@ -2621,7 +2643,9 @@ def test_review_repro_group_rejects_a_second_experiment(client):
     because a rejection after spend would violate the fault boundary.
     """
     route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
-    gid = client.post("/groups", json={"params": ALL_CONTROLS}).json()["id"]
+    gid = client.post(
+        "/groups", json={"params": ALL_CONTROLS, "budget": "standard"}
+    ).json()["id"]
     body = {"prompt": "p", "models": ["model/alpha"], "group_id": gid}
 
     first = client.post("/compare", json={**body, "params": ALL_CONTROLS})
@@ -2665,7 +2689,9 @@ def test_the_stream_endpoint_enforces_the_same_experiment_check(client):
     """The check lives at both entries or it lives nowhere: the frontend
     fans out one stream request per model, so the streaming path is the one
     a real divergence would travel."""
-    gid = client.post("/groups", json={"params": {"temperature": 0.25}}).json()["id"]
+    gid = client.post(
+        "/groups", json={"params": {"temperature": 0.25}, "budget": "standard"}
+    ).json()["id"]
 
     with respx.mock:
         route = respx.post(OPENROUTER_URL)
@@ -2689,7 +2715,9 @@ def test_a_group_with_no_controls_accepts_a_run_with_no_controls(client):
     matches nothing. This is the compatibility floor: the check must not
     turn existing traffic into 409s."""
     respx.post(OPENROUTER_URL).respond(json=FIXTURE)
-    gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+    gid = client.post("/groups", json={"prompt": "p", "budget": "standard"}).json()[
+        "id"
+    ]
 
     resp = client.post(
         "/compare", json={"prompt": "p", "models": ["model/alpha"], "group_id": gid}
@@ -2706,7 +2734,9 @@ def test_a_group_with_no_controls_rejects_a_run_that_carries_one(client):
     whole phase exists to prevent."""
     with respx.mock:
         route = respx.post(OPENROUTER_URL)
-        gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+        gid = client.post("/groups", json={"prompt": "p", "budget": "standard"}).json()[
+            "id"
+        ]
 
         resp = client.post(
             "/compare",
@@ -2729,7 +2759,12 @@ def test_the_group_records_exactly_the_controls_that_were_set(client):
     because a history badge that rendered a default as a choice would be a
     truth defect."""
     gid = client.post(
-        "/groups", json={"prompt": "p", "params": {"temperature": 0.25, "seed": 7}}
+        "/groups",
+        json={
+            "prompt": "p",
+            "params": {"temperature": 0.25, "seed": 7},
+            "budget": "standard",
+        },
     ).json()["id"]
 
     stored = client.get(f"/groups/{gid}").json()["params"]
@@ -2740,12 +2775,16 @@ def test_the_group_records_exactly_the_controls_that_were_set(client):
 def test_a_group_created_without_controls_records_none_not_an_empty_object(client):
     """One spelling of absence. An empty object would be a second, and
     every reader would then have to know both."""
-    gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+    gid = client.post("/groups", json={"prompt": "p", "budget": "standard"}).json()[
+        "id"
+    ]
     assert client.get(f"/groups/{gid}").json()["params"] is None
 
     # An explicitly empty params object collapses to the same absence
     # rather than storing a record of nothing.
-    gid2 = client.post("/groups", json={"prompt": "p", "params": {}}).json()["id"]
+    gid2 = client.post(
+        "/groups", json={"prompt": "p", "params": {}, "budget": "standard"}
+    ).json()["id"]
     assert client.get(f"/groups/{gid2}").json()["params"] is None
 
 
@@ -2780,7 +2819,9 @@ def test_both_compare_surfaces_reject_the_same_bad_controls(client, params, fiel
         "/compare/stream",
         json={"prompt": "p", "model": "model/alpha", "params": params},
     )
-    group = client.post("/groups", json={"prompt": "p", "params": params})
+    group = client.post(
+        "/groups", json={"prompt": "p", "params": params, "budget": "standard"}
+    )
 
     assert batch.status_code == 422, field
     assert stream.status_code == 422, field
@@ -2885,6 +2926,7 @@ def test_group_controls_compare_as_parsed_structures_not_as_strings(client):
                 "routing": "price",
                 "effort": "high",
             },
+            "budget": "standard",
         },
     ).json()["id"]
 
@@ -2958,7 +3000,9 @@ def test_a_legacy_group_says_why_it_cannot_take_controls(client):
     whether the request was refused."""
     with respx.mock:
         route = respx.post(OPENROUTER_URL)
-        gid = client.post("/groups", json={"prompt": "p"}).json()["id"]
+        gid = client.post("/groups", json={"prompt": "p", "budget": "standard"}).json()[
+            "id"
+        ]
 
         resp = client.post(
             "/compare",
@@ -2983,7 +3027,7 @@ def test_a_legacy_group_says_why_it_cannot_take_controls(client):
     with respx.mock:
         respx.post(OPENROUTER_URL).respond(json=FIXTURE)
         controlled = client.post(
-            "/groups", json={"prompt": "q", "params": {"seed": 1}}
+            "/groups", json={"prompt": "q", "params": {"seed": 1}, "budget": "standard"}
         ).json()["id"]
         bare = client.post(
             "/compare",
@@ -3128,7 +3172,8 @@ def test_an_explicitly_null_control_is_blank_not_set_to_null(client):
     assert body["messages"] == [{"role": "user", "content": "p"}]
 
     gid = client.post(
-        "/groups", json={"prompt": "q", "params": {"temperature": None}}
+        "/groups",
+        json={"prompt": "q", "params": {"temperature": None}, "budget": "standard"},
     ).json()["id"]
     assert client.get(f"/groups/{gid}").json()["params"] is None
     # And a group written that way still accepts a run that sets nothing,
@@ -3150,7 +3195,9 @@ def test_zero_is_a_chosen_value_everywhere_it_travels(client):
     record, conflict check) would silently drop it."""
     respx.post(OPENROUTER_URL).respond(json=FIXTURE)
     zeros = {"temperature": 0, "top_p": 0, "seed": 0}
-    gid = client.post("/groups", json={"prompt": "z", "params": zeros}).json()["id"]
+    gid = client.post(
+        "/groups", json={"prompt": "z", "params": zeros, "budget": "standard"}
+    ).json()["id"]
 
     # A 409 here would mean one side read a zero as blankness.
     resp = client.post(
@@ -3337,3 +3384,275 @@ def test_review_repro_concurrent_batches_hold_the_ceiling_bound(monkeypatch, tmp
         assert refused + len(route.calls) == 8 * len(lineup), (
             f"{refused} refused + {len(route.calls)} called != 40"
         )
+
+
+# ---- Phase H1.2: the manifest the group declares is enforced.
+
+
+def declared_group(client, models, budget="standard", prompt="declared"):
+    return client.post(
+        "/groups",
+        json={"prompt": prompt, "models": models, "budget": budget},
+    ).json()["id"]
+
+
+@respx.mock
+def test_review_repro_group_refuses_an_undeclared_model(client):
+    """Third external review, HIGH: the group stored an ordered lineup
+    before any call and presented itself as the experiment record, but
+    models_json was never read anywhere in production. Schema and migration
+    list only. The declaration was write-only, so a group declaring one
+    model accepted an undeclared one at both budget tiers and the detail
+    showed only what actually ran.
+
+    Both endpoints refuse it now, at entry, with respx proving no upstream
+    call: a refusal that spent money would trade one defect for a worse one.
+    """
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = declared_group(client, ["model/alpha"])
+
+    stream = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "declared",
+            "model": "model/bare",
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+    assert stream.status_code == 409
+    assert (
+        "model/bare is not in this group's declared lineup" in (stream.json()["detail"])
+    )
+
+    batch = client.post(
+        "/compare",
+        json={
+            "prompt": "declared",
+            "models": ["model/bare"],
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+    assert batch.status_code == 409
+    assert "lineup is model/alpha" in batch.json()["detail"]
+
+    assert route.call_count == 0, "a manifest refusal must spend nothing"
+
+
+@respx.mock
+def test_a_declared_member_at_the_wrong_position_is_refused(client):
+    """Position is part of the declaration: the lineup is ordered, and a
+    member claiming the wrong slot would rebuild the comparison in an order
+    it never ran in."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = declared_group(client, ["model/alpha", "model/bare"])
+    body = {"prompt": "declared", "group_id": gid, "budget": "standard"}
+
+    wrong = client.post(
+        "/compare/stream", json={**body, "model": "model/bare", "position": 0}
+    )
+    assert wrong.status_code == 409
+    assert "declared at position 1" in wrong.json()["detail"]
+    assert "got 0" in wrong.json()["detail"]
+    assert route.call_count == 0
+
+    right = client.post(
+        "/compare/stream", json={**body, "model": "model/bare", "position": 1}
+    )
+    assert right.status_code == 200
+    # A member that claims no slot is not checked against one: it made no
+    # claim, and inventing one for it would refuse a run for something it
+    # never said.
+    unclaimed = client.post("/compare/stream", json={**body, "model": "model/bare"})
+    assert unclaimed.status_code == 200
+
+
+@respx.mock
+def test_a_batch_that_reorders_the_declared_lineup_is_refused(client):
+    """The batch surface declares its whole lineup in one array, so order is
+    part of the claim: the same models side by side in a different order is
+    a different comparison."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = declared_group(client, ["model/alpha", "model/bare"])
+
+    reordered = client.post(
+        "/compare",
+        json={
+            "prompt": "declared",
+            "models": ["model/bare", "model/alpha"],
+            "group_id": gid,
+            "budget": "standard",
+        },
+    )
+
+    assert reordered.status_code == 409
+    detail = reordered.json()["detail"]
+    assert "lineup is model/alpha, model/bare" in detail
+    assert "the batch sent model/bare, model/alpha" in detail
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_a_member_at_the_wrong_budget_is_refused(client):
+    """Budget completes the manifest. A comparison whose members ran at
+    different token budgets is not one experiment, and until this column
+    existed nothing could say so: the reviewer's reproduction accepted an
+    undeclared model at BOTH tiers."""
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = declared_group(client, ["model/alpha"], budget="extended")
+
+    for path, extra in (
+        ("/compare", {"models": ["model/alpha"]}),
+        ("/compare/stream", {"model": "model/alpha"}),
+    ):
+        wrong = client.post(
+            path,
+            json={
+                "prompt": "declared",
+                "group_id": gid,
+                "budget": "standard",
+                **extra,
+            },
+        )
+        assert wrong.status_code == 409, path
+        assert "declared the extended budget" in wrong.json()["detail"]
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_the_budget_check_compares_the_requested_tier_not_the_clamped_tokens(
+    client,
+):
+    """The check is on the TIER the caller asked for, never on the token
+    count that tier resolves to.
+
+    Two models with different published completion caps legitimately produce
+    different effective token numbers inside one extended comparison: that is
+    what the clamp is for. Comparing clamped numbers would refuse a correct
+    run and call it a budget conflict, which is the same class of defect as
+    the drift that blocks a legal value, so it gets its own lock.
+    """
+    route = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    # model/alpha has no published cap in the fixture catalog; model/capped
+    # publishes a small one, so extended clamps differently for each.
+    gid = declared_group(client, ["model/alpha", "model/capped"], budget="extended")
+
+    both = client.post(
+        "/compare",
+        json={
+            "prompt": "declared",
+            "models": ["model/alpha", "model/capped"],
+            "group_id": gid,
+            "budget": "extended",
+        },
+    )
+
+    assert both.status_code == 200, both.json()
+    sent = [json.loads(call.request.content)["max_tokens"] for call in route.calls]
+    # The point of the test: the two effective budgets genuinely differ, and
+    # both members were accepted anyway.
+    assert len(set(sent)) == 2, sent
+
+
+@respx.mock
+def test_a_legacy_group_skips_membership_and_budget_enforcement(client):
+    """Two NULLs, two meanings, and this is the one the params rule does
+    NOT share.
+
+    A NULL params_json is the affirmative fact that no control was set,
+    because controls arrived with the concept and every group predating them
+    genuinely set none; that is why a NULL-params group refuses a
+    controls-carrying member. A NULL models_json or NULL budget is silence
+    instead: those groups were created before anything recorded a lineup or
+    a tier, so enforcing against them would refuse correct work on every
+    group in an existing database.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    # The legacy shape, written straight to the table: no lineup, no budget.
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    client.app.state.db.execute(
+        "UPDATE groups SET models_json = NULL, budget = NULL WHERE id = ?", (gid,)
+    )
+    client.app.state.db.commit()
+
+    for path, extra in (
+        ("/compare", {"models": ["model/bare"]}),
+        ("/compare/stream", {"model": "model/bare", "position": 3}),
+    ):
+        resp = client.post(
+            path,
+            json={
+                "prompt": "anything",
+                "group_id": gid,
+                "budget": "extended",
+                **extra,
+            },
+        )
+        assert resp.status_code == 200, (path, resp.text)
+
+    # The contrast, in the same test so the two rules are read together: the
+    # same group still refuses a controls-carrying member, because NULL
+    # params means none were set rather than unknown.
+    controlled = client.post(
+        "/compare",
+        json={
+            "prompt": "anything",
+            "models": ["model/bare"],
+            "group_id": gid,
+            "budget": "extended",
+            "params": {"seed": 1},
+        },
+    )
+    assert controlled.status_code == 409
+    assert "records no controls" in controlled.json()["detail"]
+
+
+@respx.mock
+def test_the_group_detail_exposes_what_was_declared(client):
+    """The declaration was write-only: the detail showed what ran and never
+    what was supposed to. An experiment record you cannot read back is not a
+    record."""
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    gid = declared_group(
+        client, ["model/alpha", "model/bare"], budget="extended", prompt="the ask"
+    )
+
+    detail = client.get(f"/groups/{gid}").json()
+
+    assert detail["prompt"] == "the ask"
+    assert detail["models"] == ["model/alpha", "model/bare"]
+    assert detail["budget"] == "extended"
+
+
+def test_a_legacy_group_detail_returns_nulls_not_strings(client):
+    """Legacy groups have no declaration, and the detail must say so with
+    nulls. The frontend guards on these: a null reaching a textarea would
+    render the four characters "null" as if someone had typed them, which is
+    absence rendered as a value."""
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    client.app.state.db.execute(
+        "UPDATE groups SET prompt_text = NULL, models_json = NULL, budget = NULL"
+        " WHERE id = ?",
+        (gid,),
+    )
+    client.app.state.db.commit()
+
+    detail = client.get(f"/groups/{gid}").json()
+
+    assert detail["prompt"] is None
+    assert detail["models"] is None
+    assert detail["budget"] is None
+    # And nothing stringified them on the way out.
+    assert "null" not in json.dumps(
+        {k: v for k, v in detail.items() if k != "runs"}
+    ).replace(": null", "")
+
+
+def test_the_group_budget_is_required(client):
+    """Required, unlike the rest of the manifest. Nothing has ever created a
+    group without knowing its budget, so accepting a group that declines to
+    say would leave the hole this workstream closes."""
+    assert client.post("/groups", json={"prompt": "p"}).status_code == 422
+    assert client.post("/groups", json={"budget": "standard"}).status_code == 201
+    assert client.post("/groups", json={"budget": "lavish"}).status_code == 422

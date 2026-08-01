@@ -617,6 +617,51 @@ bound or a validator cannot drift between them. Send `group_id` alongside
 `params` and the one-experiment-per-group check applies to scripted runs
 exactly as it does to the browser's.
 
+### Grouping scripted runs
+
+`POST /groups` declares what a comparison is, before any model is called.
+`budget` is **required**; `prompt`, `models` and `params` are optional but
+each one you send becomes enforceable:
+
+```sh
+curl -X POST localhost:8000/groups \
+  -H "Content-Type: application/json" \
+  -d '{"prompt": "Say hello in five words.",
+       "models": ["deepseek/deepseek-chat", "z-ai/glm-4.6"],
+       "budget": "standard"}'
+```
+
+Every run that then joins the group with `group_id` is checked against that
+declaration at entry, before any upstream call, and refused with a 409 that
+names the conflict:
+
+- a model not in the declared lineup;
+- a streamed member claiming a `position` the lineup gives to another model;
+- a batch whose `models` array is not the declared lineup **in order**;
+- a run whose `budget` tier differs from the group's;
+- and, as before, a different prompt or a different controls set.
+
+Two consequences worth knowing. A batch joining a group must send the whole
+declared lineup, so adding one model to an existing comparison goes through
+`/compare/stream`, one request per model, which is what the browser does.
+And the budget check compares the tier you asked for, not the token count it
+resolves to: two models with different published caps legitimately produce
+different effective token numbers inside one `extended` comparison, and both
+are accepted.
+
+Groups created before this existed declare nothing, and nothing is enforced
+against them. That is a different rule from the controls, deliberately: a
+group with no recorded controls is a group that set none, and it refuses a
+controls-carrying member, while a group with no recorded lineup or budget is
+one that never said, so it accepts anything. The comments at both check
+sites state the contrast.
+
+`GET /groups/{id}` returns the declaration beside the runs, so an
+experiment can be read back as it was declared and not only as it turned
+out. A declared model with no recorded run appears in a replay as a muted
+placeholder rather than vanishing, so an incomplete comparison looks
+incomplete instead of smaller.
+
 The browser UI streams responses token by token via
 `POST /compare/stream` with `{"prompt": ..., "model": ...}` (one
 model per request) plus optional `prompt_id`, `group_id`, `budget` and

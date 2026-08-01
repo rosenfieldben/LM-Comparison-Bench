@@ -9,6 +9,7 @@ synchronous tick, or a stalling stub personality, never with sleeps or
 timing luck.
 """
 
+import json
 import re
 
 import pytest
@@ -581,11 +582,18 @@ def test_review_repro_stop_of_standalone_rerun_leaves_no_mark(bench):
             # goes to the real backend rewritten onto the stalling stub
             # model: a fulfilled body would end the response and drain the
             # in-flight count, disabling Stop before it can be clicked.
-            route.continue_(
-                post_data=(route.request.post_data or "").replace(
-                    '"stub/fast"', '"stub/stall0"'
-                )
-            )
+            rewritten = json.loads(route.request.post_data or "{}")
+            rewritten["model"] = "stub/stall0"
+            # The rewrite makes this request a different model from the one
+            # the comparison declared, so it must stop claiming membership.
+            # H1.1 made the group's lineup enforceable at entry, and an
+            # undeclared member is precisely what that check refuses; a
+            # harness that kept the group_id here would be asserting the
+            # enforcement is broken. Dropping the link costs this attempt
+            # its history grouping and nothing this test measures.
+            rewritten.pop("group_id", None)
+            rewritten.pop("position", None)
+            route.continue_(post_data=json.dumps(rewritten))
         else:
             # The card rerun after the Stop must reach the network and
             # stream to completion. Pre-fix it never fetched at all.
