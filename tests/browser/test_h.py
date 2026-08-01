@@ -270,18 +270,11 @@ def test_the_group_row_records_the_controls_the_run_declared(bench, bench_url):
 # ---- H3: reuse a comparison.
 
 
-def open_history(page):
-    page.get_by_test_id("history-toggle").click()
-    expect(page.get_by_test_id("history-list")).to_have_attribute(
-        "data-state", "ready", timeout=DONE_TIMEOUT
-    )
-
-
 def controls_now(page):
     return page.evaluate("() => BenchControls.experimentParams()")
 
 
-def test_reuse_round_trips_prompt_controls_and_the_stored_record(bench):
+def test_reuse_round_trips_prompt_controls_and_the_stored_record(bench, open_history):
     """The round trip that makes then-versus-now possible: run a controlled
     comparison, reuse it, run it again, and the second group's stored record
     must equal the first's. Anything less and the two runs are not the same
@@ -316,7 +309,7 @@ def test_reuse_round_trips_prompt_controls_and_the_stored_record(bench):
     page.evaluate("() => BenchControls.setExperimentParams(null)")
     assert controls_now(page) == {}
 
-    open_history(page)
+    open_history()
     row_for(page, "h3 reuse round trip").first.click()
     expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
     page.get_by_test_id("reuse-comparison").click()
@@ -361,7 +354,7 @@ def test_reuse_round_trips_prompt_controls_and_the_stored_record(bench):
     assert second[0]["id"] != first["id"]
 
 
-def test_reuse_leaves_the_lineup_alone(bench):
+def test_reuse_leaves_the_lineup_alone(bench, open_history):
     """The whole point of then-versus-now is running an old experiment
     against today's models, so which models those are stays the user's
     choice. Restoring the source's lineup would silently answer a question
@@ -378,14 +371,14 @@ def test_reuse_leaves_the_lineup_alone(bench):
     before = page.evaluate("() => BenchControls.checkedModels()")
     assert before == ["stub/slow"]
 
-    open_history(page)
+    open_history()
     row_for(page, "h3 lineup untouched").first.click()
     page.get_by_test_id("reuse-comparison").click()
 
     assert page.evaluate("() => BenchControls.checkedModels()") == before
 
 
-def test_reuse_clears_a_control_the_source_did_not_set(bench):
+def test_reuse_clears_a_control_the_source_did_not_set(bench, open_history):
     """Reuse reproduces an experiment, so a leftover value is not a
     harmless convenience: it would make the new run a different experiment
     wearing the reused label, and the server would refuse to group it with
@@ -400,7 +393,7 @@ def test_reuse_clears_a_control_the_source_did_not_set(bench):
     page.get_by_test_id("ctl-temperature").fill("1.9")
     page.get_by_test_id("ctl-effort").select_option("low")
 
-    open_history(page)
+    open_history()
     row_for(page, "h3 only a seed").first.click()
     page.get_by_test_id("reuse-comparison").click()
 
@@ -409,7 +402,9 @@ def test_reuse_clears_a_control_the_source_did_not_set(bench):
     expect(page.get_by_test_id("ctl-effort")).to_have_value("")
 
 
-def test_reuse_of_a_comparison_with_no_controls_restores_only_the_prompt(bench):
+def test_reuse_of_a_comparison_with_no_controls_restores_only_the_prompt(
+    bench, open_history
+):
     """The legacy and no-controls edge. Nothing was set, so nothing is
     restored, and the reuse action still offers itself because a prompt is
     worth reusing on its own."""
@@ -420,7 +415,7 @@ def test_reuse_of_a_comparison_with_no_controls_restores_only_the_prompt(bench):
     open_controls(page)
     page.get_by_test_id("ctl-temperature").fill("0.8")
 
-    open_history(page)
+    open_history()
     row_for(page, "h3 bare comparison").first.click()
     expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
     page.get_by_test_id("reuse-comparison").click()
@@ -429,7 +424,9 @@ def test_reuse_of_a_comparison_with_no_controls_restores_only_the_prompt(bench):
     assert controls_now(page) == {}
 
 
-def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(page, bench_url):
+def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(
+    page, bench_url, open_history
+):
     """The documented lossy edge, surfaced rather than left silent.
 
     An ungrouped run has no stored controls set; its controls are derived
@@ -457,7 +454,7 @@ def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(page, bench_
     assert made.ok, made.text()
 
     page.goto(bench_url)
-    open_history(page)
+    open_history()
     row = row_for(page, "h3 ungrouped source")
     expect(row).to_have_count(1)
     # The row already shows the asymmetry: temperature is derivable, routing
@@ -478,7 +475,7 @@ def test_reuse_says_out_loud_that_an_ungrouped_source_loses_routing(page, bench_
     assert controls_now(page) == {"temperature": 0.4}
 
 
-def test_a_system_prompt_reaches_the_wire_exactly_as_typed(bench):
+def test_a_system_prompt_reaches_the_wire_exactly_as_typed(bench, open_history):
     """Closing review. The composer read the system prompt through trim(),
     which decides blankness correctly and alters content on the way past: a
     prompt pasted with indentation or ending in a deliberate newline was
@@ -498,7 +495,7 @@ def test_a_system_prompt_reaches_the_wire_exactly_as_typed(bench):
     check_all_chips(page)
     run_and_wait(page, "h review exact system prompt", 1)
 
-    open_history(page)
+    open_history()
     row_for(page, "h review exact system prompt").first.click()
     expect(page.get_by_test_id("reuse-comparison")).to_be_visible(timeout=DONE_TIMEOUT)
     # Stored and replayed byte for byte, including the leading spaces and
@@ -517,7 +514,7 @@ def test_a_system_prompt_reaches_the_wire_exactly_as_typed(bench):
     assert controls_now(page) == {}
 
 
-def test_reuse_restores_a_system_only_experiment(bench):
+def test_reuse_restores_a_system_only_experiment(bench, open_history):
     """Closing review, the reuse edge the spec names: params carrying only a
     system prompt. The row badge for it is presence-only, so this is the case
     where reading badges instead of data would have lost the entire
@@ -531,7 +528,7 @@ def test_reuse_restores_a_system_only_experiment(bench):
 
     page.get_by_test_id("ctl-system").fill("")
     page.get_by_test_id("ctl-seed").fill("99")
-    open_history(page)
+    open_history()
     row = row_for(page, "h review system only")
     assert badge_texts(row.get_by_test_id("history-control-badge")) == ["sys"]
 
@@ -543,7 +540,9 @@ def test_reuse_restores_a_system_only_experiment(bench):
     assert controls_now(page) == {"system": system}
 
 
-def test_the_largest_allowed_seed_survives_the_browser_round_trip(page, bench_url):
+def test_the_largest_allowed_seed_survives_the_browser_round_trip(
+    page, bench_url, open_history
+):
     """The other half of the seed-bound finding, asserted where it failed.
 
     A seed is only useful if the value you set is the value recorded, badged
@@ -564,7 +563,7 @@ def test_the_largest_allowed_seed_survives_the_browser_round_trip(page, bench_ur
     assert made.ok, made.text()
 
     page.goto(bench_url)
-    open_history(page)
+    open_history()
     row = row_for(page, "h review max seed")
     # Read back through the page's own JSON parsing, which is where the
     # corruption happened.
@@ -602,7 +601,7 @@ def test_the_largest_allowed_seed_survives_the_browser_round_trip(page, bench_ur
 # ---- H1.2: an incomplete experiment looks incomplete.
 
 
-def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url):
+def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url, open_history):
     """Third external review, HIGH: the group declared an ordered lineup
     before any call and the detail showed only what actually ran, so a
     comparison that declared four models and recorded two replayed as a
@@ -636,7 +635,7 @@ def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url):
     assert ran.ok, ran.text()
 
     page.goto(bench_url)
-    open_history(page)
+    open_history()
     row_for(page, "h1 incomplete comparison").first.click()
     expect(page.get_by_test_id("run-label")).to_contain_text(
         "Historical", timeout=DONE_TIMEOUT
@@ -656,7 +655,9 @@ def test_a_declared_member_that_never_ran_shows_as_a_gap(page, bench_url):
     assert page.evaluate("() => BenchState.sessionStats.runs") == 0
 
 
-def test_review_repro_a_duplicate_lineup_still_shows_its_gap(page, bench_url):
+def test_review_repro_a_duplicate_lineup_still_shows_its_gap(
+    page, bench_url, open_history
+):
     """Closing review. The gap detection matched declared members against
     a Set of the models that ran, and a lineup may legitimately declare
     one model twice: neither /compare nor /groups rejects a duplicate, and
@@ -687,7 +688,7 @@ def test_review_repro_a_duplicate_lineup_still_shows_its_gap(page, bench_url):
     assert ran.ok, ran.text()
 
     page.goto(bench_url)
-    open_history(page)
+    open_history()
     row_for(page, "h1 duplicate lineup").first.click()
     expect(page.get_by_test_id("run-label")).to_contain_text(
         "Historical", timeout=DONE_TIMEOUT
@@ -701,7 +702,7 @@ def test_review_repro_a_duplicate_lineup_still_shows_its_gap(page, bench_url):
     expect(gap).to_contain_text("declared at position 1")
 
 
-def test_a_legacy_group_replays_without_printing_null(page, bench_url):
+def test_a_legacy_group_replays_without_printing_null(page, bench_url, open_history):
     """Legacy groups return null for every declared field, and a null
     reaching the composer would render the four characters "null" as if
     someone had typed them. Absence has to render as absence.
@@ -725,7 +726,7 @@ def test_a_legacy_group_replays_without_printing_null(page, bench_url):
     assert ran.ok, ran.text()
 
     page.goto(bench_url)
-    open_history(page)
+    open_history()
     row_for(page, "h1 legacy replay").first.click()
     expect(page.get_by_test_id("run-label")).to_contain_text(
         "Historical", timeout=DONE_TIMEOUT
