@@ -981,10 +981,34 @@ easiest to cross:
 the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
 says passed, usable verdicts, and eligible trials. A pass rate over three
 verdicts out of forty eligible is not a pass rate anybody should act on,
-and the coverage figure is the only thing that says so. Thresholds live
-in the dataset, so without `dataset_path` the report publishes score
-means and no pass rates, and says which it is doing rather than leaving
-empty rates to look like "nothing passed".
+and the coverage figure is the only thing that says so.
+
+Thresholds live in the dataset file, so **the report says where it got
+the eligible population** in `thresholds_source`:
+
+- `dataset_file` when you passed `dataset_path`. The denominator is
+  exact: the file names every task that declared a cutoff, including the
+  ones nothing ever scored.
+- `score_rows` otherwise. `passed` is written from the task's own
+  threshold at scoring time and `judged_pass` returns null unless the
+  author declared one, so **a judge row with a non-null `passed` is
+  itself a record that a threshold existed**. The rate that comes out is
+  exact, because those verdicts were computed against the real cutoff.
+  The eligible count is a **floor**: a declared task whose trials were
+  never scored leaves no row to witness it. Supply the file for the full
+  denominator.
+
+Only judge rows witness. A deterministic scorer writes `passed`
+unconditionally, since it is the score restated rather than a cutoff
+anyone chose, and the loader permits `pass_threshold` only on `judge`.
+Counting those rows would make the same experiment report a different
+eligible population depending on whether a path was passed, and two
+answers from one dataset is the failure this layer exists to prevent.
+
+Losing the file used to delete the measurement outright: every verdict
+sat in the database, and the report published no rate at all because the
+denominator was never looked for. Refusing to answer is only honest when
+the answer is unknown, and here most of it was not.
 
 **The scoring-failure rate is its own reported number.** It is also the
 measurement the `response_format` decision in `bench/models.py` says to
@@ -1026,6 +1050,9 @@ experiment, which is why the row records the file's digest instead.
 
 ```sh
 curl -O localhost:8000/experiments/1/export.jsonl
+
+# with the dataset, so the artifact carries the pass thresholds too
+curl -O "localhost:8000/experiments/1/export.jsonl?dataset_path=bench-datasets/arithmetic.jsonl"
 ```
 
 JSONL. Line one is the manifest: which dataset by digest, which build,
@@ -1054,6 +1081,29 @@ an errored trial (axis one) and completed trials nobody scored (axis
 two), so a mean that confused them would come out different. An export
 that flattened either axis would still match on an experiment where
 everything succeeded, which is why that is not the experiment used.
+
+**The artifact labels its own sufficiency.** `dataset_path` on the export
+takes the same terms as start, score and report: the digest is checked
+against the one recorded at creation, and a mismatch is refused before a
+single byte is streamed, because a file half-written against the wrong
+dataset is worse than none. Supplying it embeds the minimal threshold
+slice in the manifest, task id to scorer kind and cutoff, declared tasks
+only. Prompts, references and rubrics stay out: no published number
+needs them, and the export already carries every prompt actually sent.
+
+The manifest always carries `thresholds_included`, so a reader holding an
+export with no thresholds can tell a dataset that declared none from an
+export nobody handed the file to. Those license different claims about
+the pass rate inside: with the slice the artifact re-derives the exact
+eligible denominator, without it the same floor the pathless report
+publishes. Both modes are byte-identical across two exports; the two
+modes are deliberately different artifacts and do not share a digest.
+
+Before this, the round trip could reproduce a model's mean exactly and
+was quietly unable to reproduce the coverage figure printed beside it,
+because eligibility lived in the file and nowhere else. The old test did
+not catch it: its fixture declared no thresholds, so the number it could
+not reproduce was never asked for.
 
 Each trial line carries the derived `outcome` **and** the fields it was
 derived from. That is not redundancy: a reader on a future version of

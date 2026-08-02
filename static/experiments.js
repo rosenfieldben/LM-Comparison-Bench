@@ -235,13 +235,20 @@
       " clusters, seed " +
       report.bootstrap.seed;
     el.append(estimand, detail);
-    if (!report.thresholds_available) {
+    if (report.thresholds_source === "score_rows") {
       const note = document.createElement("span");
       note.dataset.testid = "report-threshold-note";
       note.className = "report-note";
+      // The caveat travels with the number, not in a doc nobody opens.
+      // The rate itself is sound: those verdicts were computed against
+      // the real thresholds when the scoring pass ran. It is the
+      // DENOMINATOR that is incomplete, and that is the part a reader
+      // would otherwise assume was whole.
       note.textContent =
-        "no dataset file given, so pass rates are unavailable: " +
-        "thresholds live in the dataset, not the database.";
+        "no dataset file given, so the eligible count was recovered " +
+        "from the score rows and is a FLOOR: a task whose trials were " +
+        "never scored leaves no row to witness its threshold. Supply " +
+        "the file above for the full denominator.";
       el.append(note);
     }
     return el;

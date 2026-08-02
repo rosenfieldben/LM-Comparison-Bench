@@ -5345,7 +5345,7 @@ def test_pass_rates_ship_with_their_coverage_and_only_where_declared(client, tmp
     ).json()
     scorer = with_file["models"][0]["scorers"][0]
 
-    assert with_file["thresholds_available"] is True
+    assert with_file["thresholds_source"] == "dataset_file"
     # One task declared a threshold, one did not: eligible counts only
     # the declared one, and the rate is over usable verdicts within it.
     assert scorer["pass_rate"]["eligible"] == 1
@@ -5355,12 +5355,189 @@ def test_pass_rates_ship_with_their_coverage_and_only_where_declared(client, tmp
     # Both tasks still contribute to the mean.
     assert scorer["n"] == 2
 
-    # Without the file the report cannot define the population, so it
-    # says so rather than publishing a rate over an unknown denominator.
+    # Without the file the population is recovered from the score rows,
+    # and the report says which witness it used.
     without = client.get(f"/experiments/{eid}/report").json()
-    assert without["thresholds_available"] is False
-    assert without["models"][0]["scorers"][0]["pass_rate"]["rate"] is None
+    assert without["thresholds_source"] == "score_rows"
     assert without["models"][0]["scorers"][0]["mean"] == pytest.approx(0.9)
+
+    # The two witnesses agree here, which is the case that matters: every
+    # eligible task has a usable verdict, so the rows know everything the
+    # file knows. The silent task is the control, and it stays out of the
+    # population under BOTH witnesses: its rows carry passed None, which
+    # is what the file said too.
+    assert without["models"][0]["scorers"][0]["pass_rate"] == scorer["pass_rate"]
+
+
+@respx.mock
+def test_review_repro_pass_rates_survive_the_loss_of_the_dataset_file(client, tmp_path):
+    """A verdict in the database is evidence, and the report was throwing
+    it away.
+
+    Every `passed` here was computed against the real threshold when the
+    scoring pass ran, and every one of them is persisted. But ELIGIBILITY
+    was read from the file and nowhere else, so a report built without
+    the path published no pass rate at all: the numbers existed, the
+    denominator was simply not looked for. Losing a dataset file is
+    ordinary (moved, renamed, on the other laptop) and it should not
+    silently delete a published measurement.
+
+    So the rows witness their own threshold. `passed` is written from
+    judged_pass, which returns None unless the task's author declared a
+    cutoff, so a judge row with a non-None passed IS a record that a
+    threshold existed.
+
+    The honest limit is asserted here rather than only documented: t3 is
+    declared and never scored, so no row witnesses it and the recovered
+    eligible count is 2 where the file would say 3. A floor, and the
+    report labels itself as such.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    declared = {"kind": "judge", "pass_threshold": 0.5}
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": declared},
+        {"id": "t2", "prompt": "b", "rubric": "g", "scorer": declared},
+        {"id": "t3", "prompt": "c", "rubric": "g", "scorer": declared},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    # t3's rows deleted, standing in for the task nobody got round to
+    # scoring. Its trial is untouched, so it is still in the plan and
+    # still in the mean; only its witness is gone.
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 't3')"""
+    )
+    client.app.state.db.commit()
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    assert report["thresholds_source"] == "score_rows"
+    # The rate itself is exact: those two verdicts were judged against
+    # the real cutoff and 0.9 clears 0.5.
+    assert scorer["pass_rate"]["rate"] == 1.0
+    assert scorer["pass_rate"]["passed"] == 2
+    assert scorer["pass_rate"]["usable_verdicts"] == 2
+    # The floor. Three tasks declared a threshold; two left a row to say
+    # so, and the third is invisible without the file.
+    assert scorer["pass_rate"]["eligible"] == 2
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    assert with_file["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 3
+    assert with_file["thresholds_source"] == "dataset_file"
+
+
+@respx.mock
+def test_a_verdict_nobody_could_reach_never_creates_eligibility(client, tmp_path):
+    """The edge that keeps the fallback from inventing a population.
+
+    A judge row with `passed` None is exactly what an undeclared task or
+    an unparseable verdict leaves behind, and neither is evidence that a
+    threshold existed. Counting it would manufacture an eligible
+    denominator out of the scorer's own failures.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {"message": {"content": "no idea"}, "finish_reason": "stop"}
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "rubric": "g",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    # The verdict was unparseable, so passed is None and the row proves
+    # nothing about a threshold.
+    assert scorer["coverage"]["scoring_failed"] == 1
+    assert scorer["pass_rate"]["eligible"] == 0
+    assert scorer["pass_rate"]["rate"] is None
+
+
+@respx.mock
+def test_a_deterministic_pass_never_creates_eligibility(client, tmp_path):
+    """The other half of the same edge, and the reason judge_model gates
+    the witness.
+
+    A deterministic scorer writes `passed` unconditionally: it is the
+    score restated, not a threshold anybody declared, and the loader
+    permits pass_threshold only on judge. If those rows witnessed, the
+    same experiment would report a different eligible population with and
+    without a path, which is two answers from one dataset.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    without = client.get(f"/experiments/{eid}/report").json()
+
+    assert with_file["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 0
+    assert without["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 0
 
 
 @respx.mock
@@ -5505,11 +5682,155 @@ def two_axes_experiment(client, tmp_path):
     return eid, path
 
 
-def read_export(client, eid):
-    with client.stream("GET", f"/experiments/{eid}/export.jsonl") as resp:
+def read_export(client, eid, dataset_path=None):
+    params = {} if dataset_path is None else {"dataset_path": dataset_path}
+    with client.stream(
+        "GET", f"/experiments/{eid}/export.jsonl", params=params
+    ) as resp:
         assert resp.status_code == 200
         raw = resp.read()
     return raw
+
+
+def rebuild_from_export(lines, tasks_by_id):
+    """Run the report's own pure function over an export and nothing else.
+
+    The whole self-sufficiency claim in one helper: if the artifact
+    carries what it says it carries, this reproduces the served numbers
+    with no database in reach. tasks_by_id is what the caller could
+    recover from the manifest, so passing None here is not a shortcut,
+    it is the pathless artifact's actual situation.
+    """
+    manifest = lines[0]
+    groups, runs_by_group, scores_by_result = [], {}, {}
+    for trial in (x for x in lines if x["type"] == "trial"):
+        gid = trial["group_id"]
+        if gid not in runs_by_group:
+            groups.append(
+                {
+                    "id": gid,
+                    "task_id": trial["task_id"],
+                    "repeat_index": trial["repeat_index"],
+                    "rotation_index": trial["rotation_index"],
+                }
+            )
+            runs_by_group[gid] = []
+        run = next((r for r in runs_by_group[gid] if r["id"] == trial["run_id"]), None)
+        if run is None:
+            run = {
+                "id": trial["run_id"],
+                "data_policy": trial["data_policy"],
+                "app_sha": trial["app_sha"],
+                "catalog_digest": trial["catalog_digest"],
+                "prompt_text": trial["prompt_text"],
+                "results": [],
+            }
+            runs_by_group[gid].append(run)
+        run["results"].append(
+            {
+                "id": trial["result_id"],
+                "model": trial["model"],
+                "error": trial["error"],
+                "request_json": trial["request_json"],
+                "response_text": trial["response_text"],
+                "position": trial["position"],
+                "latency_ms": trial["latency_ms"],
+                "ttft_ms": trial["ttft_ms"],
+                "cost_usd": trial["cost_usd"],
+                "billed_cost_usd": trial["billed_cost_usd"],
+                "provider": trial["provider"],
+            }
+        )
+        scores_by_result[trial["result_id"]] = trial["scores"]
+    return build_report(
+        {
+            "id": manifest["experiment_id"],
+            "name": manifest["name"],
+            "estimand_mode": manifest["estimand_mode"],
+            "dataset_name": manifest["dataset_name"],
+            "dataset_digest": manifest["dataset_digest"],
+            "repeats": manifest["repeats"],
+            "status": manifest["status"],
+            "status_detail": manifest["status_detail"],
+            "lineup": manifest["lineup"],
+        },
+        groups,
+        runs_by_group,
+        scores_by_result,
+        tasks_by_id,
+        manifest["report_seed"],
+    )
+
+
+def tasks_from_manifest(manifest):
+    """The manifest's threshold slice, in the shape build_report reads.
+
+    None when the export was made without a file, which is the whole
+    point of thresholds_included: an empty slice and an absent one are
+    different artifacts and license different claims.
+    """
+    if not manifest["thresholds_included"]:
+        return None
+    return {tid: {"scorer": spec} for tid, spec in manifest["thresholds"].items()}
+
+
+def export_lines(client, eid, dataset_path=None):
+    return [
+        json.loads(x)
+        for x in read_export(client, eid, dataset_path).decode().strip().split("\n")
+    ]
+
+
+def threshold_experiment(client, tmp_path):
+    """Three declared tasks, one of them left without a witness.
+
+    Every task declares the same cutoff, so the file's eligible count is
+    three. t3's score rows are then deleted, standing in for the task a
+    scoring pass never reached: its trial is untouched, so it stays in
+    the plan and in the mean, and only its evidence of a threshold is
+    gone. That gap is the whole difference between the exact denominator
+    and the floor, which is what makes this the right shape to export
+    both ways.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    declared = {"kind": "judge", "pass_threshold": 0.5}
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": declared},
+        {"id": "t2", "prompt": "b", "rubric": "g", "scorer": declared},
+        {"id": "t3", "prompt": "c", "rubric": "g", "scorer": declared},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 't3')"""
+    )
+    client.app.state.db.commit()
+    return eid, path
 
 
 @respx.mock
@@ -5535,6 +5856,17 @@ def test_review_repro_two_exports_of_one_experiment_are_byte_identical(
         json.loads(first.decode().strip().split("\n")[-1])["digest"]
         == (json.loads(second.decode().strip().split("\n")[-1])["digest"])
     )
+
+    # And with the file supplied, because the threshold slice is a new
+    # mapping in the manifest and a mapping is exactly the thing whose
+    # iteration order could vary between two honest exports. sort_keys
+    # covers it; this is what says so.
+    pathed = read_export(client, eid, path)
+    assert pathed == read_export(client, eid, path)
+    # The two modes differ, which is the point of labeling them: an
+    # export that carried the thresholds and one that did not are
+    # different artifacts and must not share a digest.
+    assert pathed != first
 
 
 @respx.mock
@@ -5615,72 +5947,13 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
     eid, path = two_axes_experiment(client, tmp_path)
     served = client.get(f"/experiments/{eid}/report").json()
 
-    lines = [
-        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
-    ]
-    manifest = lines[0]
-    trials = [x for x in lines if x["type"] == "trial"]
+    lines = export_lines(client, eid)
 
-    # Rebuild the report's inputs from the export and nothing else.
-    groups, runs_by_group, scores_by_result = [], {}, {}
-    for trial in trials:
-        gid = trial["group_id"]
-        if gid not in runs_by_group:
-            groups.append(
-                {
-                    "id": gid,
-                    "task_id": trial["task_id"],
-                    "repeat_index": trial["repeat_index"],
-                    "rotation_index": trial["rotation_index"],
-                }
-            )
-            runs_by_group[gid] = []
-        run = next((r for r in runs_by_group[gid] if r["id"] == trial["run_id"]), None)
-        if run is None:
-            run = {
-                "id": trial["run_id"],
-                "data_policy": trial["data_policy"],
-                "app_sha": trial["app_sha"],
-                "catalog_digest": trial["catalog_digest"],
-                "prompt_text": trial["prompt_text"],
-                "results": [],
-            }
-            runs_by_group[gid].append(run)
-        run["results"].append(
-            {
-                "id": trial["result_id"],
-                "model": trial["model"],
-                "error": trial["error"],
-                "request_json": trial["request_json"],
-                "response_text": trial["response_text"],
-                "position": trial["position"],
-                "latency_ms": trial["latency_ms"],
-                "ttft_ms": trial["ttft_ms"],
-                "cost_usd": trial["cost_usd"],
-                "billed_cost_usd": trial["billed_cost_usd"],
-                "provider": trial["provider"],
-            }
-        )
-        scores_by_result[trial["result_id"]] = trial["scores"]
-
-    rebuilt = build_report(
-        {
-            "id": manifest["experiment_id"],
-            "name": manifest["name"],
-            "estimand_mode": manifest["estimand_mode"],
-            "dataset_name": manifest["dataset_name"],
-            "dataset_digest": manifest["dataset_digest"],
-            "repeats": manifest["repeats"],
-            "status": manifest["status"],
-            "status_detail": manifest["status_detail"],
-            "lineup": manifest["lineup"],
-        },
-        groups,
-        runs_by_group,
-        scores_by_result,
-        {},
-        manifest["report_seed"],
-    )
+    # The export carried no threshold slice, so the rebuild gets None and
+    # recovers eligibility from the rows, exactly as the served report
+    # did. Passing {} instead would tell build_report a file had been
+    # read and declared nothing, which is a different claim.
+    rebuilt = rebuild_from_export(lines, None)
 
     # The shape is the one the bug would have corrupted: an errored trial
     # and unscored completed trials, both present.
@@ -5716,6 +5989,88 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
             served_model["scorers"][0]["coverage"]
             == rebuilt_model["scorers"][0]["coverage"]
         )
+
+
+@respx.mock
+def test_review_repro_the_export_re_derives_the_pass_rate_it_says_it_can(
+    client, tmp_path
+):
+    """The self-sufficiency claim, extended to the number it did not
+    cover, in both of the modes the artifact can be in.
+
+    Every verdict was already in the export and the rate was already
+    re-derivable. ELIGIBILITY was not: it lived in the file, so an export
+    could reproduce a model's mean exactly and be quietly unable to
+    reproduce the denominator beside it. That made "self-sufficient"
+    false for precisely the coverage figure the README puts next to every
+    rate, and the round trip did not notice because its fixture declared
+    no thresholds at all.
+
+    Three declared tasks, one of them stripped of its score rows, so the
+    exact denominator and the floor are different numbers here and a
+    rebuild cannot pass both by accident:
+
+        with the file / labeled export    eligible 3, usable 2, rate 1.0
+        without       / pathless export   eligible 2, usable 2, rate 1.0
+    """
+    eid, path = threshold_experiment(client, tmp_path)
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()["models"][0]["scorers"][0]["pass_rate"]
+    without = client.get(f"/experiments/{eid}/report").json()["models"][0]["scorers"][
+        0
+    ]["pass_rate"]
+    assert with_file["eligible"] == 3
+    assert without["eligible"] == 2
+
+    labeled = export_lines(client, eid, path)
+    pathless = export_lines(client, eid)
+
+    # Each artifact says which it is, and neither has to be asked.
+    assert labeled[0]["thresholds_included"] is True
+    assert set(labeled[0]["thresholds"]) == {"t1", "t2", "t3"}
+    assert labeled[0]["thresholds"]["t1"] == {"kind": "judge", "pass_threshold": 0.5}
+    assert pathless[0]["thresholds_included"] is False
+    assert pathless[0]["thresholds"] == {}
+    # The slice is minimal: nothing that only a human reader would want.
+    assert set(labeled[0]["thresholds"]["t1"]) == {"kind", "pass_threshold"}
+
+    # The labeled export re-derives the exact denominator.
+    from_labeled = rebuild_from_export(labeled, tasks_from_manifest(labeled[0]))
+    assert from_labeled["models"][0]["scorers"][0]["pass_rate"] == with_file
+    assert from_labeled["thresholds_source"] == "dataset_file"
+
+    # The pathless one re-derives the floor, and matches the report that
+    # was served under the same handicap. Both are honest; only one is
+    # complete, and each says which.
+    from_pathless = rebuild_from_export(pathless, tasks_from_manifest(pathless[0]))
+    assert from_pathless["models"][0]["scorers"][0]["pass_rate"] == without
+    assert from_pathless["thresholds_source"] == "score_rows"
+
+
+@respx.mock
+def test_an_export_against_the_wrong_dataset_streams_nothing(client, tmp_path):
+    """Refused before a byte goes out, not part way through.
+
+    Raising from inside the generator would already have sent 200 and a
+    content-type, leaving the caller holding a truncated file that looks
+    like a whole one. An artifact is cited; a half-written one is worse
+    than none.
+    """
+    eid, path = threshold_experiment(client, tmp_path)
+    wrong = write_dataset(tmp_path, {"id": "z", "prompt": "other"}, name="wrong.jsonl")
+
+    resp = client.get(
+        f"/experiments/{eid}/export.jsonl", params={"dataset_path": wrong}
+    )
+
+    assert resp.status_code == 422
+    assert "dataset changed since this experiment was created" in resp.json()["detail"]
+    # An error body, not an artifact: no ndjson content type and not one
+    # manifest or trial line anywhere in what came back.
+    assert not resp.headers["content-type"].startswith("application/x-ndjson")
+    assert b"manifest" not in resp.content
+    assert b'"type"' not in resp.content
 
 
 @respx.mock

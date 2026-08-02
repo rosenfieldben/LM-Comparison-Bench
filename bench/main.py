@@ -2861,13 +2861,16 @@ async def experiment_report(
     outcome: a stored aggregate can disagree with the rows it came from,
     and the day it does there is no way to tell which is wrong.
 
-    dataset_path is optional and it changes what can be reported, not how
-    much. Pass thresholds live in the dataset file rather than in the
-    database, so without the file the report cannot say which tasks
-    declared one, and it publishes score means with no pass rates. That
-    is the honest degrade: a pass rate over a population the report
-    cannot define would be a rate over an unknown denominator, which is
-    the exact failure the coverage numbers exist to prevent.
+    dataset_path is optional and it changes how well the pass rate's
+    population is known, not whether there is one. Thresholds live in the
+    dataset file rather than in the database, so with the file the
+    eligible population is exact; without it the report recovers what it
+    can from the score rows, which is a floor rather than the full
+    denominator. Either way it publishes thresholds_source so the reader
+    knows which they are looking at. Degrading to no pass rate at all
+    was the older behavior and it threw away verdicts that were sitting
+    in the database, which is a different dishonesty from the one the
+    degrade was protecting against.
 
     When the file is given its digest is checked, because scoring one
     dataset's trials against another's thresholds is the same
@@ -2877,26 +2880,35 @@ async def experiment_report(
     experiment = store.get_experiment(app.state.db, experiment_id)
     if experiment is None:
         raise HTTPException(404, "no such experiment")
-    tasks: dict[str, Any] = {}
-    if dataset_path is not None:
-        dataset = read_dataset(dataset_path)
-        if dataset["digest"] != experiment["dataset_digest"]:
-            raise HTTPException(
-                422,
-                "dataset changed since this experiment was created: recorded "
-                f"{experiment['dataset_digest'][:12]}, file is "
-                f"{dataset['digest'][:12]}. Reporting against different "
-                "tasks would attribute one rubric's threshold to another.",
-            )
-        tasks = {t["id"]: t for t in dataset["tasks"]}
-    report = build_report(experiment, **_report_inputs(experiment_id, tasks))
-    # Said out loud rather than left to be inferred from empty pass
-    # rates, which look identical to "nothing passed".
-    report["thresholds_available"] = bool(tasks)
-    return report
+    # None rather than an empty mapping when no path was given: build_report
+    # reads the difference between "nobody asked the file" and "the file
+    # said nothing is declared".
+    tasks = None if dataset_path is None else dataset_tasks(experiment, dataset_path)
+    return build_report(experiment, **_report_inputs(experiment_id, tasks))
 
 
-def _report_inputs(experiment_id: int, tasks_by_id: dict[str, Any]) -> dict[str, Any]:
+def dataset_tasks(experiment: dict[str, Any], dataset_path: str) -> dict[str, Any]:
+    """The named file's tasks, refused unless it is the file that ran.
+
+    The run-start precedent, and this is its third use: start, score, and
+    now the two read paths. One rule in one shape, so a caller who has
+    met it once has met it everywhere.
+    """
+    dataset = read_dataset(dataset_path)
+    if dataset["digest"] != experiment["dataset_digest"]:
+        raise HTTPException(
+            422,
+            "dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}. Reporting against different "
+            "tasks would attribute one rubric's threshold to another.",
+        )
+    return {t["id"]: t for t in dataset["tasks"]}
+
+
+def _report_inputs(
+    experiment_id: int, tasks_by_id: dict[str, Any] | None
+) -> dict[str, Any]:
     """Every row the report needs, read once.
 
     Gathered here rather than inside build_report so that function stays
@@ -2922,9 +2934,45 @@ def _report_inputs(experiment_id: int, tasks_by_id: dict[str, Any]) -> dict[str,
     }
 
 
+def threshold_slice(tasks_by_id: dict[str, Any]) -> dict[str, Any]:
+    """The smallest part of a dataset an aggregate cannot be re-derived
+    without: which tasks declared a pass threshold, and what it was.
+
+    Declared tasks only, and per task only the scorer's kind and cutoff.
+    Prompts, references and rubrics stay out on purpose. No number the
+    report publishes needs them, and an export already carries every
+    prompt it actually SENT; copying the file's other columns in would
+    widen what the artifact discloses for nothing.
+    """
+    out: dict[str, Any] = {}
+    for task_id, task in tasks_by_id.items():
+        spec = (task or {}).get("scorer") or {}
+        if spec.get("pass_threshold") is not None:
+            out[task_id] = {
+                "kind": spec.get("kind"),
+                "pass_threshold": spec["pass_threshold"],
+            }
+    return out
+
+
 @app.get("/experiments/{experiment_id}/export.jsonl")
-async def experiment_export(experiment_id: int) -> StreamingResponse:
+async def experiment_export(
+    experiment_id: int, dataset_path: str | None = Query(default=None)
+) -> StreamingResponse:
     """The whole experiment as JSONL: manifest, trials, digest.
+
+    dataset_path is optional and takes the same terms as start, score and
+    report: the digest is checked against the one recorded at creation
+    and a mismatch is refused before a single byte is streamed, since an
+    artifact half-written against the wrong file is worse than none.
+
+    Supplying it embeds the threshold slice in the manifest, which is
+    what makes the artifact self-sufficient for the pass rate rather than
+    only for the score mean. Without it the export still re-derives a
+    pass rate from its own score rows, but the eligible denominator is a
+    floor. Either way the manifest carries thresholds_included, so the
+    file states its own sufficiency instead of leaving a reader to assume
+    it.
 
     Streams rather than buffers, because a MAX_TRIALS export is thousands
     of lines carrying full prompts and full responses, and holding all of
@@ -2951,6 +2999,16 @@ async def experiment_export(experiment_id: int) -> StreamingResponse:
     experiment = store.get_experiment(app.state.db, experiment_id)
     if experiment is None:
         raise HTTPException(404, "no such experiment")
+    # Read and checked out here rather than inside body(), so a mismatch
+    # is a 4xx with nothing written. Raising from inside the generator
+    # would already have sent 200 and a content-type, and the client
+    # would be left holding a truncated artifact that looks like a whole
+    # one.
+    thresholds = (
+        None
+        if dataset_path is None
+        else threshold_slice(dataset_tasks(experiment, dataset_path))
+    )
 
     async def body() -> AsyncIterator[str]:
         digest = hashlib.sha256()
@@ -2960,7 +3018,7 @@ async def experiment_export(experiment_id: int) -> StreamingResponse:
             digest.update(line.encode("utf-8"))
             return line
 
-        yield emit(export_manifest(experiment, REPORT_SEED))
+        yield emit(export_manifest(experiment, REPORT_SEED, thresholds))
         db = app.state.db
         for group in store.experiment_groups(db, experiment_id):
             detail = store.get_group(db, group["id"])

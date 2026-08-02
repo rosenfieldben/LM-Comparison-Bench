@@ -383,11 +383,10 @@ def test_the_report_leads_with_its_estimand_and_shows_both_axes(
     expect(page.get_by_test_id("report-scores")).to_be_visible()
     expect(page.get_by_test_id("report-banner")).to_contain_text("task clusters")
     expect(page.get_by_test_id("report-row")).to_have_count(2)
-    # No dataset path was given, so pass rates are unavailable and the
-    # view says so rather than leaving empty cells to read as failures.
-    expect(page.get_by_test_id("report-threshold-note")).to_contain_text(
-        "pass rates are unavailable"
-    )
+    # No dataset path was given, so the eligible count came from the
+    # score rows and is a floor. The caveat travels with the number
+    # rather than living in a doc nobody opens.
+    expect(page.get_by_test_id("report-threshold-note")).to_contain_text("FLOOR")
 
 
 def test_the_report_takes_a_dataset_path_and_says_so_when_it_does_not_match(

@@ -269,10 +269,17 @@ def build_report(
     groups: list[dict[str, Any]],
     runs_by_group: dict[int, list[dict[str, Any]]],
     scores_by_result: dict[int, list[dict[str, Any]]],
-    tasks_by_id: dict[str, dict[str, Any]],
+    tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
 ) -> dict[str, Any]:
     """One experiment's aggregates, per model.
+
+    tasks_by_id carries the dataset file's tasks, and None means no file
+    was supplied. None is not the same as an empty mapping: an empty one
+    means a file WAS read and declared no thresholds, which is an answer,
+    while None means nobody asked the file anything and the pass rate's
+    population has to be recovered from the score rows instead. The
+    report says which of the two it did, in thresholds_source.
 
     Pure: every row it needs is handed in, so the whole report can be
     rebuilt from an export without a database. That is not a stylistic
@@ -321,8 +328,13 @@ def build_report(
                     }
                 )
 
+    # Derived once over every model's rows, because a declared threshold
+    # is a fact about the task rather than about who answered it. Computed
+    # even when the file is present, so the cost is one pass over rows
+    # already in memory and the two witnesses can be compared in a test.
+    row_declared = rows_declaring_thresholds(trials)
     models = [
-        _model_report(model, by_task, tasks_by_id, seed)
+        _model_report(model, by_task, tasks_by_id, seed, row_declared)
         for model, by_task in trials.items()
     ]
     # Ranked on the primary score mean, min-rank so ties share a place.
@@ -340,6 +352,12 @@ def build_report(
         "repeats": experiment["repeats"],
         "status": experiment["status"],
         "status_detail": experiment["status_detail"],
+        # Where the pass rate's population came from. Said out loud
+        # because the two are not equally good: score_rows is a floor,
+        # since a declared task nobody scored leaves no row to witness
+        # its threshold, and a reader comparing two reports has to know
+        # which one had the file.
+        "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
         "bootstrap": {
             "seed": seed,
             "resamples": BOOTSTRAP_RESAMPLES,
@@ -355,8 +373,9 @@ def build_report(
 def _model_report(
     model: str,
     by_task: dict[str, list[dict[str, Any]]],
-    tasks_by_id: dict[str, dict[str, Any]],
+    tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
+    row_declared: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     flat = [t for trials in by_task.values() for t in trials]
     outcomes = {name: 0 for name in ("done", "error", "refused", "stopped", "missing")}
@@ -382,7 +401,8 @@ def _model_report(
     # and the models that fail most would look best.
     scorers = sorted({row["scorer"] for trial in flat for row in trial["scores"]})
     per_scorer = [
-        _scorer_report(scorer, by_task, tasks_by_id, seed) for scorer in scorers
+        _scorer_report(scorer, by_task, tasks_by_id, seed, row_declared)
+        for scorer in scorers
     ]
     primary = per_scorer[0] if per_scorer else {"mean": None, "interval": None}
 
@@ -418,11 +438,79 @@ def _model_report(
     }
 
 
+def rows_declaring_thresholds(
+    trials_by_model: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, set[str]]:
+    """scorer -> task ids whose score rows witness a declared threshold.
+
+    The fallback that keeps pass rates alive when the dataset file is
+    gone. Thresholds live in the file and nowhere else, so a report built
+    without it used to publish no pass rate at all, even with every
+    verdict sitting in the database. The verdicts are the evidence: I3
+    writes `passed` from judged_pass, which returns None unless the
+    task's author declared a cutoff, so a judge row with a non-None
+    `passed` IS a record that a threshold existed when that row was
+    written.
+
+    A JUDGE row, specifically, which is why judge_model gates the
+    witness. A deterministic scorer's `passed` is its own score restated
+    (`exact` either matched or did not) and it is written unconditionally,
+    so it says nothing about a threshold. Counting it would make the same
+    experiment report a different eligible population depending on
+    whether a path was passed, and two answers from one dataset is the
+    failure this whole layer exists to prevent. The loader permits
+    pass_threshold only on judge, so this gate is exactly the file rule
+    read off the rows.
+
+    Computed over EVERY model's trials, because a declared threshold is a
+    fact about the task. Deriving it per model would let a model whose
+    trials went unscored report a smaller eligible population than its
+    neighbour for the same task.
+
+    THE HONEST LIMIT: a task nobody ever scored leaves no row to witness
+    its declaration, so what this returns is a FLOOR. The dataset file
+    remains the only way to get the full denominator, and the report
+    labels which of the two it used.
+    """
+    declared: dict[str, set[str]] = {}
+    for by_task in trials_by_model.values():
+        for task_id, trials in by_task.items():
+            for trial in trials:
+                for row in trial["scores"]:
+                    if row.get("passed") is None or row.get("judge_model") is None:
+                        continue
+                    declared.setdefault(row["scorer"], set()).add(task_id)
+    return declared
+
+
+def _eligible_tasks(
+    scorer: str,
+    tasks_by_id: dict[str, dict[str, Any]] | None,
+    row_declared: dict[str, set[str]],
+) -> set[str]:
+    """Which tasks this scorer's pass rate is computed over.
+
+    tasks_by_id is None when no dataset file was supplied, and an empty
+    mapping when one was supplied that declared no thresholds. The two
+    are different facts and the sentinel keeps them apart: falling back
+    to the rows in the second case would answer a question the file has
+    already answered.
+    """
+    if tasks_by_id is None:
+        return set(row_declared.get(scorer, set()))
+    return {
+        task_id
+        for task_id, task in tasks_by_id.items()
+        if ((task or {}).get("scorer") or {}).get("pass_threshold") is not None
+    }
+
+
 def _scorer_report(
     scorer: str,
     by_task: dict[str, list[dict[str, Any]]],
-    tasks_by_id: dict[str, dict[str, Any]],
+    tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
+    row_declared: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     """One scorer's numbers for one model, with both axes reported.
 
@@ -433,6 +521,7 @@ def _scorer_report(
     that says so; without it the denominator shrinks silently and the
     rate looks like every other rate on the page.
     """
+    eligible_tasks = _eligible_tasks(scorer, tasks_by_id, row_declared or {})
     values_by_task: dict[str, list[float]] = {}
     scored = failed = unscored = 0
     passed = usable_verdicts = eligible = 0
@@ -492,9 +581,10 @@ def _scorer_report(
             # The pass rate's population: tasks whose author declared a
             # threshold. A task without one contributes to the mean and
             # not to the rate, which is what "pass rate where a threshold
-            # was declared" means.
-            spec = (tasks_by_id.get(task_id) or {}).get("scorer") or {}
-            if spec.get("pass_threshold") is not None:
+            # was declared" means. The set came from the file when one
+            # was supplied and from the score rows otherwise; see
+            # rows_declaring_thresholds for what the second one costs.
+            if task_id in eligible_tasks:
                 eligible += 1
                 if latest is not None and latest.get("passed") is not None:
                     usable_verdicts += 1
@@ -596,7 +686,11 @@ def export_line(payload: dict[str, Any]) -> str:
     )
 
 
-def export_manifest(experiment: dict[str, Any], seed: int) -> dict[str, Any]:
+def export_manifest(
+    experiment: dict[str, Any],
+    seed: int,
+    thresholds: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Line one: what this artifact IS.
 
     Everything a reader needs to know what they are holding before they
@@ -604,8 +698,23 @@ def export_manifest(experiment: dict[str, Any], seed: int) -> dict[str, Any]:
     catalog, which estimand, which seeds. A citation that names the
     artifact can be checked against the file rather than against a memory
     of how it was produced.
+
+    thresholds is the dataset's declared cutoffs, present when the
+    exporter was given the file. It is the difference between an artifact
+    that can re-derive the pass rate exactly and one that can only floor
+    its denominator, so the manifest states which it is rather than
+    leaving the reader to infer it from an empty mapping. None and {} are
+    different facts here, exactly as they are in build_report: the first
+    means nobody supplied the file, the second means the file declared
+    nothing.
     """
     return {
+        "thresholds": {} if thresholds is None else thresholds,
+        # The artifact labels its own sufficiency. Without this a reader
+        # holding an export with no thresholds cannot tell a dataset that
+        # declared none from an export nobody handed the file to, and
+        # those licence different claims about the pass rate inside.
+        "thresholds_included": thresholds is not None,
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         "experiment_id": experiment["id"],
