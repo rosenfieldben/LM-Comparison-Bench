@@ -2591,3 +2591,105 @@ async def get_run(run_id: int) -> dict[str, Any]:
     if run is None:
         raise HTTPException(404, "no such run")
     return run
+
+
+# ---- Phase I4: blind human rating on replay.
+
+# The rating scale, fixed rather than configurable. One scale everywhere
+# means a stored rating means the same thing in every row, which is the
+# property a report needs; a per-experiment scale would make "3" a
+# number nobody could interpret without also fetching its scale.
+#
+# Five points because it is the smallest scale with a middle and a
+# near-miss on each side, and because raters are reliably worse at
+# finer ones. Stored normalized to [0, 1] like every other score, so the
+# report averages human and machine scores without knowing which is
+# which; the raw point value stays in detail for anyone who wants it.
+RATING_MIN = 1
+RATING_MAX = 5
+
+
+def normalized_rating(rating: int) -> float:
+    """A 1-to-5 rating on the [0, 1] scale every score row uses."""
+    return (rating - RATING_MIN) / (RATING_MAX - RATING_MIN)
+
+
+class Rating(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    result_id: int
+    rating: int = Field(ge=RATING_MIN, le=RATING_MAX)
+    # The neutral label this card wore while it was being rated. Recorded
+    # so the rating-to-model mapping is auditable after the reveal: with
+    # it, someone checking the record can see that card "B" was
+    # model/beta and was rated 4. Without it, a blind rating is a number
+    # whose blindness has to be taken on faith.
+    label: str | None = Field(default=None, max_length=40)
+
+
+class RatingsSubmit(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
+    # Whether the rater could see the identities while rating. Sent by the
+    # client because only the client knows what was on screen, and
+    # recorded either way rather than enforced: a rating entered after the
+    # reveal is still a rating, and refusing it would lose real data over
+    # a condition the record can simply state.
+    blind: bool
+
+
+@app.post("/groups/{group_id}/ratings", status_code=201)
+async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
+    """Persist human ratings for one replayed comparison.
+
+    Every result named must belong to this group. That is not paranoia
+    about a hostile client (the bench answers only to loopback), it is
+    about a stale page: a tab holding a previous comparison's result ids
+    would otherwise write ratings onto the wrong models silently, and a
+    silent misattribution is the worst outcome this endpoint has.
+    """
+    ensure_rowid(group_id)
+    group = store.get_group(app.state.db, group_id)
+    if group is None:
+        raise HTTPException(404, "no such group")
+    belongs = {r["id"] for run in group["runs"] for r in run["results"]}
+    unknown = sorted({r.result_id for r in body.ratings} - belongs)
+    if unknown:
+        raise HTTPException(
+            422,
+            f"result ids {unknown} are not in comparison {group_id}. The "
+            "page may be showing an older comparison than the one it is "
+            "rating; reload it.",
+        )
+    written = 0
+    for rating in body.ratings:
+        store.add_score(
+            app.state.db,
+            rating.result_id,
+            {
+                "scorer": "human",
+                "score": normalized_rating(rating.rating),
+                # No pass verdict, for the same reason a judge without a
+                # declared threshold has none: nobody said what a passing
+                # rating is, and the bench inventing one would assert a
+                # cutoff the rater never chose.
+                "passed": None,
+                "detail": _rating_detail(rating),
+                "blind": body.blind,
+            },
+        )
+        written += 1
+    return {"group_id": group_id, "written": written, "blind": body.blind}
+
+
+def _rating_detail(rating: Rating) -> str:
+    """The raw rating, and the label it was given under.
+
+    The score column holds the normalized value so every scorer's numbers
+    are comparable; this keeps the point the rater actually clicked, so
+    "4 of 5" survives as what happened rather than as 0.75, which is a
+    number no rater ever saw.
+    """
+    base = f"{rating.rating} of {RATING_MAX}"
+    return f"{base}, shown as {rating.label}" if rating.label else base

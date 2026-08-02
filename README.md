@@ -850,6 +850,40 @@ pass over the same stored text at no extra model cost, so stopping the
 whole pass for one would trade a complete scoring run for nothing. Re-run
 the pass and the gaps fill in.
 
+## Blind human rating
+
+Replay a comparison and press "Rate blind". Every card's model id,
+provider, cost and timing is hidden, each card is given a neutral letter
+in a shuffled order, and you rate the answers 1 to 5. Only when every
+card is rated and the ratings are saved do the identities come back.
+
+Cost and timing are hidden along with the name, because a rater who knows
+one answer cost ten times another can often guess which model it was, and
+a guess is not a blind. The reveal happens after the save, not before: a
+rater who saw the identities and then changed their mind would be
+producing a sighted rating the record calls blind. If the save fails,
+nothing is revealed and you can retry.
+
+Ratings persist as `scores` rows with `scorer = "human"` and `blind = 1`,
+the normalized score in `score` and the point you actually clicked in
+`detail` ("4 of 5, shown as B"). The label is recorded so the
+rating-to-model mapping is auditable after the reveal. Ratings entered on
+a normal replay, without blind mode, persist with `blind = 0`: a sighted
+rating is still a rating, and what would be wrong is recording it as
+blind. No pass verdict is derived, for the same reason a judge without a
+declared threshold has none.
+
+**What blinding cannot do.** The bench hides everything it renders about
+a card. It cannot hide what the answer says, and a model that writes "as
+an AI assistant made by X" has identified itself. That is a limit of the
+method rather than of the implementation, and it is worth knowing before
+reading too much into a blind rating on prompts that invite
+self-description.
+
+The reveal is one way per replay. Re-blinding after it would produce a
+rating the record calls blind that was made by someone who had already
+seen the answer, which is worse than no blind rating at all.
+
 **Re-scoring appends.** Scoring is idempotent per (result, scorer, judge
 model) in the sense that re-running is safe, not in the sense that it is
 a no-op: the new row lands beside the old one and reports read the latest

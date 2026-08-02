@@ -2704,8 +2704,11 @@ def test_the_served_index_versions_every_asset_url(client):
 
     referenced = re.findall(r'(?:src|href)="(/static/[^"]*)"', body)
     # Every module in the load-bearing order, plus the stylesheet and the
-    # pre-paint theme script.
-    assert len(referenced) == 11, referenced
+    # pre-paint theme script. The count moves when a module is added, and
+    # it is asserted rather than derived on purpose: a new asset that the
+    # transform failed to version would otherwise pass unnoticed, since
+    # every OTHER url would still carry its rev.
+    assert len(referenced) == 12, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -4930,3 +4933,143 @@ def test_a_declared_pass_threshold_decides_a_judged_pass(client, tmp_path):
     assert by_task["lenient"]["passed"] == 1
     assert by_task["unstated"]["passed"] is None
     assert all(r["score"] == 0.6 for r in by_task.values())
+
+
+# ---- Phase I4: blind human rating on replay.
+
+from bench import store
+
+
+@respx.mock
+def rated_group(client):
+    """A two-model comparison with its result ids, ready to rate."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    for model in ("model/alpha", "model/beta"):
+        stream_events(
+            client,
+            {"prompt": "rate me", "model": model, "group_id": group_id},
+        )
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    return group_id, ids
+
+
+@respx.mock
+def test_ratings_persist_as_human_scores_with_their_conditions(client):
+    """The rating, the scale point the rater actually clicked, and the
+    label the card wore. All three, because the normalized score alone is
+    a number no rater ever saw and a blind nobody can audit."""
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [
+                {"result_id": ids[0], "rating": 5, "label": "B"},
+                {"result_id": ids[1], "rating": 1, "label": "A"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["written"] == 2
+    rows = store.scores_for_results(client.app.state.db, ids)
+    assert rows[ids[0]][0]["score"] == 1.0
+    assert rows[ids[0]][0]["detail"] == "5 of 5, shown as B"
+    assert rows[ids[1]][0]["score"] == 0.0
+    assert rows[ids[1]][0]["detail"] == "1 of 5, shown as A"
+    for result_id in ids:
+        row = rows[result_id][0]
+        assert row["scorer"] == "human"
+        assert row["blind"] is True
+        # No pass verdict: nobody said what a passing rating is, and the
+        # bench inventing one would assert a cutoff the rater never chose.
+        assert row["passed"] is None
+
+
+@respx.mock
+def test_the_middle_of_the_scale_normalizes_to_the_middle(client):
+    group_id, ids = rated_group(client)
+
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 3}]},
+    )
+
+    row = store.scores_for_results(client.app.state.db, ids)[ids[0]][0]
+    assert row["score"] == 0.5
+    assert row["detail"] == "3 of 5"
+
+
+@respx.mock
+def test_a_rating_after_the_reveal_persists_as_not_blind(client):
+    """Honesty about conditions, not a prohibition. A sighted rating is
+    still a rating; what would be wrong is recording it as blind."""
+    group_id, ids = rated_group(client)
+
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": False, "ratings": [{"result_id": ids[0], "rating": 4}]},
+    )
+
+    assert (
+        store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] is False
+    )
+
+
+@respx.mock
+def test_rating_a_result_from_another_comparison_is_refused(client):
+    """Not paranoia about a hostile client: a stale tab holding an older
+    comparison's result ids would otherwise write ratings onto the wrong
+    models, and a silent misattribution is the worst outcome here."""
+    group_id, ids = rated_group(client)
+    other_id, other_ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": other_ids[0], "rating": 5}]},
+    )
+
+    assert resp.status_code == 422
+    assert "are not in comparison" in resp.json()["detail"]
+    assert "reload it" in resp.json()["detail"]
+
+
+@respx.mock
+def test_an_out_of_range_rating_is_refused(client):
+    group_id, ids = rated_group(client)
+
+    for value in (0, 6, -1):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={"blind": True, "ratings": [{"result_id": ids[0], "rating": value}]},
+        )
+        assert resp.status_code == 422, value
+
+
+@respx.mock
+def test_unknown_rating_fields_are_rejected(client):
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [{"result_id": ids[0], "rating": 5, "confidence": "high"}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_rating_a_group_that_does_not_exist_404s(client):
+    resp = client.post(
+        "/groups/999999/ratings",
+        json={"blind": True, "ratings": [{"result_id": 1, "rating": 3}]},
+    )
+
+    assert resp.status_code == 404

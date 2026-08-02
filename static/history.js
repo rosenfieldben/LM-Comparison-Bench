@@ -242,6 +242,22 @@
     const row = document.createElement("div");
     row.className = "ctl-reuse";
     row.append(btn);
+    // Blind rating is offered on a comparison and not on a lone run: the
+    // whole method is hiding which of SEVERAL answers came from which
+    // model, and a single card has nothing to be blind between.
+    if (source.kind === "group" && source.resultIds.length > 1) {
+      const rate = document.createElement("button");
+      rate.type = "button";
+      rate.dataset.testid = "rate-blind";
+      rate.textContent = "Rate blind";
+      rate.title =
+        "hide identities, cost and timing, rate each answer, then reveal";
+      rate.addEventListener("click", () => {
+        rate.disabled = true;
+        window.BenchRating.start(source.id, source.resultIds);
+      });
+      row.append(rate);
+    }
     runControlsEl.append(row);
   }
 
@@ -317,6 +333,29 @@
     });
   }
 
+  // The card order for a replayed comparison, in one place because two
+  // callers need the same one: the cards are rendered in it, and the
+  // blind-rating control pairs result ids against the cards on screen by
+  // index. Two copies of this rule that drifted would silently attribute
+  // one model's rating to another, which is the worst failure this
+  // feature has.
+  function sortedResults(group) {
+    const results = group.runs.flatMap((r) => r.results);
+    const rank = (m) => {
+      const i = BenchControls.lineup.indexOf(m);
+      return i === -1 ? BenchControls.lineup.length : i;
+    };
+    results.sort((a, b) => {
+      const ap = a.position;
+      const bp = b.position;
+      if (ap != null && bp != null) return ap - bp;
+      if (ap != null) return -1;
+      if (bp != null) return 1;
+      return rank(a.model) - rank(b.model);
+    });
+    return results;
+  }
+
   async function showGroup(groupId) {
     // Owns the view from the click: in-flight runs for the old view are
     // aborted now, and this fetch is itself abortable by whatever
@@ -368,6 +407,9 @@
     renderRunControls(group.params, {
       kind: "group",
       id: group.id,
+      // In the same order the cards are appended below, because the
+      // rating module pairs them by index against what is on screen.
+      resultIds: sortedResults(group).map((r) => r.id),
       // The declaration first, since that is what the comparison WAS, with
       // the first member's text as the fallback for groups created before
       // the column existed. ?? and not ||, and the guard is the point:
@@ -395,19 +437,7 @@
     // mixes the two (a legacy group with a later rerun) is at least
     // deterministic. Models no longer in the lineup keep run order at the
     // end, as before.
-    const results = group.runs.flatMap((r) => r.results);
-    const rank = (m) => {
-      const i = BenchControls.lineup.indexOf(m);
-      return i === -1 ? BenchControls.lineup.length : i;
-    };
-    results.sort((a, b) => {
-      const ap = a.position;
-      const bp = b.position;
-      if (ap != null && bp != null) return ap - bp;
-      if (ap != null) return -1;
-      if (bp != null) return 1;
-      return rank(a.model) - rank(b.model);
-    });
+    const results = sortedResults(group);
     for (const result of results) {
       BenchRender.fillColumn(
         BenchRender.makeColumn(result.model),

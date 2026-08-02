@@ -589,6 +589,15 @@
     margin-top: 10px;
   }
   .card[data-state="working"] .metrics { margin-top: 0; border-top: none; }
+  /* Third instance of the same rule, and the first where getting it
+     wrong was a correctness failure rather than a cosmetic one: an
+     explicit display on a class selector outranks the user agent's
+     [hidden] { display: none }, so blind rating's concealed metrics
+     stayed on screen with the attribute set. Cost and timing identify a
+     model to anyone who knows the models, so that was a blind that was
+     not blind. See #name-row and #experiment-controls for the same
+     guard. */
+  .metrics[hidden] { display: none; }
   .mcell { background: var(--bg-panel); padding: var(--pad-cell); min-width: 0; }
   .mk { font-size: 8.5px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-dim); }
   .mv { font: 600 var(--fs-metric) var(--mono); color: var(--text); overflow: hidden; text-overflow: ellipsis; }
@@ -828,3 +837,42 @@
 }
 .card.missing .cardname { color: var(--text-faint); }
 .missing-note { font-size: 11px; margin-top: 4px; }
+
+/* Blind rating. Muted and compact: it sits under an answer the rater is
+   supposed to be reading, so it must not compete with it. */
+.rating-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-2);
+}
+.rating-label {
+  font-weight: 600;
+  color: var(--text-faint);
+  min-width: 1.5em;
+}
+.rating-button {
+  min-width: 28px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.rating-button.chosen {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.rating-button:disabled { cursor: default; opacity: 0.6; }
+.rating-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-ghost);
+}
