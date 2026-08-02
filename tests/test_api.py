@@ -38,6 +38,15 @@ TEST_CATALOG = {
             "prompt_price": 1e-06,
             "completion_price": 2e-06,
             "max_completion_tokens": None,
+            # Supports everything the bench can send, so it is the model
+            # strict mode accepts.
+            "supported_parameters": [
+                "max_tokens",
+                "reasoning",
+                "seed",
+                "temperature",
+                "top_p",
+            ],
         },
         {
             "id": "model/bare",
@@ -46,6 +55,10 @@ TEST_CATALOG = {
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # The catalog says nothing about its parameters, which strict
+            # mode treats as "cannot check" rather than "supports
+            # everything".
+            "supported_parameters": None,
         },
         # Publishes a completion cap below the extended budget, so the
         # per-model clamp has something to bite on.
@@ -56,6 +69,9 @@ TEST_CATALOG = {
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": 32000,
+            # Takes a budget and nothing else, so a temperature makes it
+            # ineligible under require_parameters.
+            "supported_parameters": ["max_tokens"],
         },
     ],
     "prices": TEST_PRICES,
@@ -5620,3 +5636,184 @@ def test_the_export_is_never_stored_by_a_cache(client, tmp_path):
 
 def test_exporting_a_missing_experiment_404s(client):
     assert client.get("/experiments/999999/export.jsonl").status_code == 404
+
+
+# ---- Phase I7: the underlying-model estimand.
+
+
+def strict_body(path, **overrides):
+    body = experiment_body(path, estimand_mode="underlying_model")
+    body["lineup"] = ["model/alpha"]
+    body.update(overrides)
+    return body
+
+
+def test_strict_mode_accepts_a_model_the_catalog_says_can_do_the_job(client, tmp_path):
+    """The scope control for every refusal below. model/alpha publishes
+    every parameter this request carries, so the check passes and the row
+    records the estimand it was created under."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, params={"temperature": 0.4, "effort": "low"}),
+    )
+
+    assert resp.status_code == 201, resp.text
+    detail = client.get(f"/experiments/{resp.json()['id']}").json()
+    assert detail["estimand_mode"] == "underlying_model"
+
+
+def test_strict_mode_refuses_a_control_the_model_does_not_support(client, tmp_path):
+    """Under require_parameters an unsupported parameter is not ignored,
+    it makes every provider ineligible. So the experiment would fail every
+    trial, and the place to say so is before the first one."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, lineup=["model/capped"], params={"temperature": 0.4}),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "model/capped does not support temperature" in detail
+    assert "require_parameters" in detail
+    # Names the remedy, and names the routed-service behavior it is
+    # different from, because "use the other estimand" is only actionable
+    # if the caller knows what the other one does with the same request.
+    assert "routed-service estimand" in detail
+
+
+def test_strict_mode_refuses_a_model_the_catalog_does_not_describe(client, tmp_path):
+    """Absence of evidence is not support. model/bare is in the catalog
+    with no supported_parameters, which is a different fact from an empty
+    list and must not be read as one."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=strict_body(path, lineup=["model/bare"]))
+
+    assert resp.status_code == 422
+    assert "publishes no supported_parameters" in resp.json()["detail"]
+
+
+def test_strict_mode_refuses_a_model_the_catalog_never_listed(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=strict_body(path, lineup=["model/ghost"]))
+
+    assert resp.status_code == 422
+    assert "does not list model/ghost" in resp.json()["detail"]
+
+
+def test_review_repro_an_offline_boot_refuses_to_create_a_strict_experiment(
+    monkeypatch, tmp_path
+):
+    """The check needs the catalog, so a boot without one cannot make the
+    promise the estimand's name makes.
+
+    Skipping the check silently would be the tempting version of this and
+    the wrong one: the rows would carry estimand_mode underlying_model
+    with nothing behind it, and no reader afterwards could tell those rows
+    from the ones where the check ran. A label nobody verified is worse
+    than no label. The refusal names the reason and both remedies.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}, "digest": None}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    with TestClient(app, base_url="http://localhost") as offline:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+        strict = offline.post("/experiments", json=strict_body(path))
+        routed = offline.post("/experiments", json=experiment_body(path))
+
+    assert strict.status_code == 422
+    detail = strict.json()["detail"]
+    assert "this boot has no catalog" in detail
+    assert "routed-service estimand, which makes no capability claim" in detail
+    # And the default estimand is untouched by any of this: it makes no
+    # capability claim, so it needs no catalog to make it.
+    assert routed.status_code == 201, routed.text
+
+
+def test_a_pin_for_a_model_outside_the_lineup_is_refused(client, tmp_path):
+    """A declaration that cannot be honored should not be stored as
+    though it will be."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/other": "Together"}),
+    )
+
+    assert resp.status_code == 422
+    assert "not in the lineup" in resp.json()["detail"]
+
+
+@respx.mock
+def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
+    """What actually rides the wire, read off the recorded request.
+
+    allow_fallbacks false travels with the order and never without it: an
+    order that can be departed from is a preference, and a pinned run
+    served by somebody else would record a constraint that did not hold.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "Together"}),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1
+    provider = sent[0]["provider"]
+    assert provider["require_parameters"] is True
+    assert provider["order"] == ["Together"]
+    assert provider["allow_fallbacks"] is False
+    # The privacy promise is written last and cannot be displaced by the
+    # estimand: the boot policy's keys survive the merge.
+    assert provider["sort"] == "throughput"
+
+
+@respx.mock
+def test_review_repro_the_routed_service_payload_is_unchanged_by_strict_mode(
+    client, tmp_path
+):
+    """The promise adding an estimand had to keep.
+
+    Byte for byte, not merely equal in the keys anybody thought to check.
+    If strict mode had leaked into the default path, every comparison this
+    bench has ever run would be measuring something different from the day
+    before, and the change would be invisible in the results.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(request.content),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1
+    payload = json.loads(sent[0])
+    assert payload["provider"] == {"sort": "throughput"}
+    assert "require_parameters" not in sent[0].decode()
+    assert "allow_fallbacks" not in sent[0].decode()

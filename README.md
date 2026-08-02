@@ -683,6 +683,70 @@ at creation. An experiment over that bound is refused with the arithmetic
 shown, because the caller has three levers and needs to know which one to
 pull.
 
+## Estimands
+
+Every experiment declares which of two questions it is answering, and
+every report, every export line and every row says which one produced it.
+A number without its estimand is a number about nothing in particular.
+
+**`routed_service` is the default**, and it is what this tool is actually
+used for: the OpenRouter-routed service path for a model under a stated
+routing mode. The provider is chosen dynamically per call, which is a
+confound rather than a defect, and the bench handles it in the open:
+repeats do the statistical work, the report counts which providers served
+each model as its own column, and Phase G's per-result provider field is
+what makes any result stratifiable after the fact. This estimand makes no
+capability claim, so it needs no catalog and sends no routing restriction
+beyond the data policy and the routing mode.
+
+**`underlying_model` is the opt-in strict estimand**, for when the claim
+is about the model itself rather than about the service in front of it.
+It narrows the eligible provider population on purpose:
+
+```sh
+curl -X POST localhost:8000/experiments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "strict sweep",
+       "dataset_path": "bench-datasets/arithmetic.jsonl",
+       "lineup": ["openai/gpt-4o-mini"],
+       "budget": "standard",
+       "estimand_mode": "underlying_model",
+       "provider_pins": {"openai/gpt-4o-mini": "OpenAI"},
+       "params": {"temperature": 0}}'
+```
+
+It sends `require_parameters: true`, so a provider that would have
+silently ignored the temperature is ineligible instead. The routed-service
+path deliberately does not send it, because changing which providers are
+eligible silently changes what is being measured; here that change is the
+whole point. `provider_pins` is strict-mode only, and a pin travels as
+`order` **with `allow_fallbacks: false`**, never without it: an order that
+can be departed from is a preference, and a pinned run served by somebody
+else would record a constraint that did not hold. A pin naming a model
+outside the lineup is refused, since a declaration that cannot be honored
+should not be stored as though it will be.
+
+Every control is capability-checked against the catalog at creation, not
+at trial one of three hundred, and the checks refuse rather than assume:
+
+- **No catalog, no strict experiment.** The check needs the catalog, so
+  an offline boot refuses creation and says so. Skipping it silently is
+  the tempting version and the wrong one: the rows would carry
+  `estimand_mode: underlying_model` with nothing behind it, and no reader
+  afterwards could tell them from rows where the check ran. A label nobody
+  verified is worse than no label. The routed-service estimand is
+  unaffected, because it never made the claim.
+- **A model the catalog does not list, or lists without
+  `supported_parameters`, is refused.** Absence of evidence is not
+  support. An empty list is a real answer and a different one.
+- **An unsupported control is refused**, with the model and the parameter
+  named. Under `require_parameters` an unsupported parameter is not
+  ignored, it makes every provider ineligible, so the experiment would
+  fail every trial rather than measure anything.
+
+`max_tokens` is checked even though no control sets it, because every
+payload the bench builds carries one.
+
 ## Running an experiment
 
 ```sh

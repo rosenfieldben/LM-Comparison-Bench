@@ -239,6 +239,105 @@ def provider_preferences(
 _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 
 
+# ---- The underlying-model estimand.
+#
+# Everything in this block applies ONLY when an experiment declared
+# estimand_mode "underlying_model". The routed-service estimand is the
+# default and must keep sending exactly the bytes it sent before this
+# block existed; a tombstone asserts that.
+#
+# Pinned against OpenRouter's provider-routing documentation at
+# https://openrouter.ai/docs/guides/routing/provider-selection, read
+# 2026-08-02, not from memory:
+#
+#   require_parameters (boolean, default false): "restrict to providers
+#   that support all parameters in your request". The routed-service
+#   estimand deliberately does not send it, for the reason written at
+#   _SAMPLING_KEYS above: it changes which providers are eligible, which
+#   silently changes what is being measured. Under this estimand that
+#   change is the entire point. A claim about a MODEL that was served by
+#   a provider which quietly dropped the temperature is a claim about a
+#   different configuration than the row records.
+#
+#   order (array of provider slugs), with allow_fallbacks false: try
+#   these and nothing else. Without allow_fallbacks false the order is a
+#   preference, so a pinned run could be served by anyone and the record
+#   would name a pin that did not hold. The pin exists to narrow the
+#   population; a pin that can be ignored narrows nothing.
+STRICT_PREFS: dict[str, Any] = {"require_parameters": True}
+
+
+def strict_provider_preferences(
+    base: Mapping[str, Any], pin: str | None = None
+) -> dict[str, Any]:
+    """The provider block for one strict-mode trial.
+
+    base is whatever the routed path would have sent (the boot data
+    policy merged with this request's routing mode), so the privacy
+    promise cannot be displaced by the estimand: it is written first and
+    the strict keys are additive.
+
+    A pin is a hard restriction rather than a preference, which is why
+    allow_fallbacks rides with it and never without it. Sending
+    allow_fallbacks false with no order would forbid fallback from a
+    provider nobody named, which is not a thing anyone asked for.
+    """
+    out = {**base, **STRICT_PREFS}
+    if pin is not None:
+        out["order"] = [pin]
+        out["allow_fallbacks"] = False
+    return out
+
+
+# Which supported_parameters token each control needs. The check runs
+# against the names the payload will actually carry, which is why
+# effort maps to "reasoning": control_payload emits it as a reasoning
+# object, and "effort" is a key inside that object rather than a
+# parameter name OpenRouter publishes.
+#
+# max_tokens is here even though no control sets it, because every
+# payload this bench builds carries one. Under require_parameters a
+# provider that does not support max_tokens is ineligible, so a model
+# whose catalog entry omits it has no eligible provider for any request
+# the bench can make, and saying that at creation is better than
+# discovering it at trial one.
+#
+# routing and system are absent on purpose. Routing is a key of the
+# provider object rather than a model parameter, and a system message is
+# a message.
+CONTROL_PARAMETERS: dict[str, str] = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "seed": "seed",
+    "effort": "reasoning",
+}
+
+
+def missing_parameters(
+    supported: list[str] | None, controls: Mapping[str, Any] | None
+) -> list[str]:
+    """Which of this request's parameters the model does not support.
+
+    supported is the catalog's supported_parameters for one model, and
+    None means the catalog did not say. That is NOT treated as "supports
+    everything": the caller refuses on it. A strict mode that skips its
+    check when the data is missing is a strict mode that isn't, which is
+    worse than none, because the run is then labelled with a guarantee
+    nobody verified.
+
+    This function reports; the caller decides. It returns the names in
+    the order a reader would find them useful, sorted, and never raises.
+    """
+    if supported is None:
+        return []
+    have = set(supported)
+    needed = {"max_tokens"}
+    for key, parameter in CONTROL_PARAMETERS.items():
+        if (controls or {}).get(key) is not None:
+            needed.add(parameter)
+    return sorted(needed - have)
+
+
 def control_payload(controls: Mapping[str, Any] | None) -> dict[str, Any]:
     """The payload fragment for the controls that were actually set.
 
@@ -364,7 +463,25 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # What the underlying-model estimand checks against. None
+            # means the catalog did not say, which strict mode treats as
+            # "cannot check" rather than as "supports everything": see
+            # missing_parameters. Pinned against OpenRouter's model
+            # listing at https://openrouter.ai/docs/api-reference/list-
+            # available-models, read 2026-08-02, where each model carries
+            # supported_parameters as an array of parameter names, the
+            # union over the providers that serve it.
+            "supported_parameters": None,
         }
+        supported = entry.get("supported_parameters")
+        if isinstance(supported, list):
+            # Strings only, so one malformed element degrades itself
+            # rather than the entry. An empty list is a real answer (this
+            # model takes no optional parameters) and stays a list, which
+            # is why the emptiness is not folded back into None.
+            model["supported_parameters"] = sorted(
+                {x for x in supported if isinstance(x, str)}
+            )
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.

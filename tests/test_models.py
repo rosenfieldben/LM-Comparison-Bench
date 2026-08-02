@@ -13,7 +13,9 @@ from bench.models import (
     control_payload,
     fetch_catalog,
     judge_response,
+    missing_parameters,
     run_model,
+    strict_provider_preferences,
 )
 
 FIXTURE = json.loads(
@@ -1897,3 +1899,104 @@ async def test_a_judge_answering_in_content_parts_is_read_the_same_way(client):
     out = await judge_response(client, "judge/one", "r", None, "a")
 
     assert out["score"] == 1.0
+
+
+# ---- Phase I7: the underlying-model estimand's pure parts.
+
+
+@respx.mock
+async def test_fetch_catalog_reads_supported_parameters_and_degrades_it(client):
+    """Three distinct states, and strict mode acts differently on each.
+
+    A list of strings is what the check runs against. A missing key is
+    "the catalog did not say", which is not the same fact as an empty
+    list and must not collapse into one: an empty list means the model
+    takes no optional parameters, and something has to be able to tell
+    those apart. A malformed element degrades itself rather than the
+    entry, the same rule the price fields follow.
+    """
+    respx.get(MODELS_URL).respond(
+        json={
+            "data": [
+                {"id": "a/full", "supported_parameters": ["temperature", "seed"]},
+                {"id": "b/silent"},
+                {"id": "c/empty", "supported_parameters": []},
+                {"id": "d/mixed", "supported_parameters": ["seed", 7, None, "seed"]},
+                {"id": "e/wrongtype", "supported_parameters": "temperature"},
+            ]
+        }
+    )
+
+    models = {m["id"]: m for m in (await fetch_catalog(client))["models"]}
+
+    assert models["a/full"]["supported_parameters"] == ["seed", "temperature"]
+    assert models["b/silent"]["supported_parameters"] is None
+    assert models["c/empty"]["supported_parameters"] == []
+    # Deduplicated and sorted, so two catalogs that listed the same
+    # support in a different order produce the same entry.
+    assert models["d/mixed"]["supported_parameters"] == ["seed"]
+    # A string is not a list of parameter names, whatever it contains.
+    assert models["e/wrongtype"]["supported_parameters"] is None
+
+
+def test_missing_parameters_checks_what_the_payload_will_carry():
+    """max_tokens is checked without any control setting it, because
+    every payload the bench builds carries one and require_parameters
+    would exclude a provider that does not support it."""
+    assert missing_parameters(["max_tokens"], {}) == []
+    assert missing_parameters([], {}) == ["max_tokens"]
+    # effort is checked as "reasoning", the name the payload uses.
+    assert missing_parameters(["max_tokens"], {"effort": "low"}) == ["reasoning"]
+    assert missing_parameters(["max_tokens", "reasoning"], {"effort": "low"}) == []
+    # Reported sorted and complete, not first-failure-only, so one
+    # refusal names everything the caller has to change.
+    assert missing_parameters([], {"temperature": 0.5, "top_p": 0.9}) == [
+        "max_tokens",
+        "temperature",
+        "top_p",
+    ]
+    # Controls that are not model parameters are not checked as if they
+    # were: routing is a key of the provider object and system is a
+    # message.
+    assert (
+        missing_parameters(["max_tokens"], {"routing": "price", "system": "hi"}) == []
+    )
+
+
+def test_missing_parameters_reports_nothing_when_the_catalog_said_nothing():
+    """It reports; the caller decides. Returning "nothing missing" here
+    would read as support if the caller did not check for None first,
+    which is why the refusal for an undescribed model lives at the
+    boundary and names that case in its own words."""
+    assert missing_parameters(None, {"temperature": 0.5}) == []
+
+
+def test_strict_preferences_add_to_the_base_without_displacing_it():
+    """The privacy promise is written first and the estimand's keys are
+    additive, so no estimand can quietly widen the provider population a
+    data policy narrowed."""
+    base = {"sort": "throughput", "data_collection": "deny", "zdr": True}
+
+    out = strict_provider_preferences(base)
+
+    assert out == {**base, "require_parameters": True}
+    assert base == {"sort": "throughput", "data_collection": "deny", "zdr": True}
+
+
+def test_a_pin_is_a_hard_restriction_and_never_a_preference():
+    """allow_fallbacks rides with the order and never without it. An
+    order that can be departed from is a preference, and a pinned run
+    served by somebody else would record a constraint that did not hold;
+    allow_fallbacks with no order would forbid fallback from a provider
+    nobody named."""
+    pinned = strict_provider_preferences({"sort": "price"}, "Together")
+    unpinned = strict_provider_preferences({"sort": "price"})
+
+    assert pinned == {
+        "sort": "price",
+        "require_parameters": True,
+        "order": ["Together"],
+        "allow_fallbacks": False,
+    }
+    assert "allow_fallbacks" not in unpinned
+    assert "order" not in unpinned

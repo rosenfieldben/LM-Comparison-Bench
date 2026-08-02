@@ -37,9 +37,11 @@ from bench.models import (
     fetch_catalog,
     judge_response,
     keepalive_socket_options,
+    missing_parameters,
     provider_preferences,
     run_model,
     stream_model,
+    strict_provider_preferences,
 )
 from bench.report import build_report, export_line, export_manifest, export_trial
 from bench.scoring import judged_pass, score_response
@@ -1924,6 +1926,94 @@ def read_dataset(path: str) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
 
 
+def catalog_entries() -> dict[str, dict[str, Any]]:
+    """The boot catalog keyed by model id, or an empty map when offline."""
+    catalog = getattr(app.state, "catalog", None) or {}
+    return {m["id"]: m for m in catalog.get("models", []) if isinstance(m, dict)}
+
+
+def enforce_strict_mode(
+    lineup: list[str], pins: dict[str, str] | None, controls: dict[str, Any]
+) -> None:
+    """Everything the underlying-model estimand must be able to promise.
+
+    Checked at creation, where it can only fail once, rather than at trial
+    one of three hundred. The claim strict mode makes is about the MODEL,
+    so every way the claim could turn out to be about something else is a
+    refusal here:
+
+    Without a catalog there is nothing to check against, so the whole
+    check is unavailable and the experiment cannot be created. Skipping it
+    silently on an offline boot would produce rows labelled
+    underlying_model whose capability check never ran, which is a strict
+    mode that isn't; a label nobody verified is worse than no label,
+    because a reader has no way to tell the two apart afterwards.
+
+    A model the catalog does not list, or lists without
+    supported_parameters, is the same problem one model down. Absence of
+    evidence is not support.
+
+    A parameter the model does not support is a refusal because strict
+    mode sends require_parameters: no provider would be eligible, so the
+    experiment would fail every trial rather than measure anything.
+
+    A pin naming a model outside the lineup is a contradiction in the
+    declaration itself, and a declaration that cannot be honored should
+    not be stored as though it will be.
+    """
+    catalog = getattr(app.state, "catalog", None) or {}
+    if not catalog.get("fetched"):
+        raise HTTPException(
+            422,
+            "the underlying-model estimand checks every control against "
+            "the model catalog, and this boot has no catalog: the "
+            "snapshot could not be fetched at startup. Restart with "
+            "OpenRouter reachable, or create this experiment under the "
+            "routed-service estimand, which makes no capability claim. "
+            "Creating it without the check would label the rows with a "
+            "guarantee nothing verified.",
+        )
+    entries = catalog_entries()
+    for model in lineup:
+        entry = entries.get(model)
+        if entry is None:
+            raise HTTPException(
+                422,
+                f"the catalog does not list {model}, so its parameter "
+                "support cannot be checked. The underlying-model estimand "
+                "refuses rather than assume support.",
+            )
+        supported = entry.get("supported_parameters")
+        if supported is None:
+            raise HTTPException(
+                422,
+                f"the catalog lists {model} but publishes no "
+                "supported_parameters for it, so there is nothing to "
+                "check the controls against. The underlying-model "
+                "estimand refuses rather than assume support.",
+            )
+        absent = missing_parameters(supported, controls)
+        if absent:
+            raise HTTPException(
+                422,
+                f"{model} does not support {', '.join(absent)} according "
+                "to the catalog, and the underlying-model estimand sends "
+                "require_parameters, so no provider would be eligible to "
+                "serve it. Drop the control, drop the model, or use the "
+                "routed-service estimand, where an unsupported parameter "
+                "is silently ignored by the provider and the request "
+                "record still shows it was asked for.",
+            )
+    for model in sorted(pins or {}):
+        if model not in lineup:
+            raise HTTPException(
+                422,
+                f"provider_pins names {model}, which is not in the "
+                "lineup. A pin for a model this experiment never runs "
+                "would be recorded as a constraint that never applied.",
+            )
+
+
 @app.post("/experiments", response_model=ExperimentCreated, status_code=201)
 async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     """Write the experiment manifest, after validating everything about it.
@@ -1960,6 +2050,8 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
             'estimand_mode to "underlying_model", which is the estimand '
             "that narrows the provider population on purpose.",
         )
+    if body.estimand_mode == "underlying_model":
+        enforce_strict_mode(body.lineup, body.provider_pins, controls)
     return {
         "id": store.create_experiment(
             app.state.db,
@@ -2000,6 +2092,28 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     if experiment is None:
         raise HTTPException(404, "no such experiment")
     return experiment
+
+
+def trial_provider_prefs(
+    experiment: dict[str, Any], model: str, controls: dict[str, Any]
+) -> dict[str, Any]:
+    """The provider block for one trial, estimand included.
+
+    Under the routed-service estimand this is request_provider_prefs and
+    nothing else, which is not an implementation detail but the promise:
+    the default path sends the same object it sent before strict mode
+    existed, so nothing about adding this estimand changed what the
+    bench's own comparisons measure. A tombstone asserts the payload
+    bytes.
+
+    Under the underlying-model estimand the strict keys are layered on
+    top of that same object, per model, because the pin is per model.
+    """
+    base = request_provider_prefs(controls)
+    if experiment.get("estimand_mode") != "underlying_model":
+        return base
+    pins = experiment.get("provider_pins") or {}
+    return strict_provider_preferences(base, pins.get(model))
 
 
 async def run_one_trial(
@@ -2050,7 +2164,7 @@ async def run_one_trial(
             app.state.client,
             max_tokens=max_tokens,
             holder=holder,
-            provider_prefs=request_provider_prefs(controls),
+            provider_prefs=trial_provider_prefs(experiment, model, controls),
             controls=controls,
         ):
             if event["type"] == "done":
