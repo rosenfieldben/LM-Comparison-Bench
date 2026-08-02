@@ -3,6 +3,30 @@
 Same reasoning as the injected httpx client in models.py: the caller
 owns the connection's lifecycle, tests hand in :memory:, and swapping
 sqlite for something else later touches only this module.
+
+THE CONTRACT: this module is SYNCHRONOUS BY DESIGN. Every public
+function materializes its result before returning (fetchall or fetchone,
+never a live cursor or a generator), and no cursor is ever held across an
+await. There is no async here and there must not be.
+
+That is not a style preference, it is the concurrency safety of the whole
+app. One connection is shared by every request, every experiment trial
+and every scoring pass in the process. On one event loop, a synchronous
+function that materializes before returning is an ATOMIC BLOCK: nothing
+else runs between its first statement and its last, so no second caller
+can interleave a write into the middle of a read or find the connection
+mid-statement. That property, rather than a lock somebody has to remember
+to take, is what makes one shared sqlite3 connection safe here at all.
+
+The day someone adds a single async helper, or hands back a live cursor
+for a caller to iterate across an await, the property is gone everywhere
+at once and NOTHING FAILS LOUDLY. The reads still work, until two callers
+overlap under load and one sees half of the other's transaction. So there
+is a test asserting this file contains no async or await tokens.
+
+Cross-PROCESS concurrency is a different problem with a different answer:
+WAL mode and the busy timeout, both set in connect(). This contract is
+about the one process that holds this connection.
 """
 
 import json

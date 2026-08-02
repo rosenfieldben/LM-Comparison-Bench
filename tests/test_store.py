@@ -1573,3 +1573,51 @@ def test_review_repro_a_pre_g_errored_row_classifies_as_error_not_refused(tmp_pa
         )
     finally:
         conn.close()
+
+
+# ---- The synchronous contract, guarded rather than only stated.
+
+
+def test_the_store_stays_synchronous():
+    """One shared connection is safe because this module cannot yield.
+
+    On one event loop a synchronous function that materializes before
+    returning is an atomic block: nothing interleaves between its first
+    statement and its last, so no second caller can slip a write into the
+    middle of a read or find the connection mid-statement. That property,
+    and not a lock anybody has to remember to take, is why a single
+    sqlite3 connection shared by every request, every experiment trial
+    and every scoring pass is safe here.
+
+    One innocent `async def` helper, or one function handing back a live
+    cursor for a caller to iterate across an await, removes the property
+    everywhere at once and NOTHING FAILS. The reads still work. They keep
+    working until two callers overlap under load and one of them sees
+    half of the other's transaction, which is a bug that reproduces on a
+    busy machine and never on the one where it is being debugged.
+
+    So the guard is a source scan, and it is deliberately crude. It is
+    not trying to prove the module is correct; it is trying to make the
+    day someone reaches for async here a day the suite goes red, with
+    this docstring attached to the failure. A subtler check that
+    understood intent would be a check that could be argued with.
+
+    Tokenized rather than string-matched, which is why the module
+    docstring above can name `async` and `await` while describing the
+    rule: only NAME tokens count, so prose and comments do not.
+    """
+    import io
+    import tokenize
+
+    source = (Path(store.__file__)).read_text(encoding="utf-8")
+    offenders = [
+        (token.start[0], token.string)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.NAME and token.string in ("async", "await")
+    ]
+
+    assert offenders == [], (
+        f"bench/store.py must stay synchronous; found {offenders}. "
+        "See the module docstring: one shared connection is safe only "
+        "because nothing in this file can yield mid-statement."
+    )

@@ -429,6 +429,18 @@ them. `cost_usd` keeps its name and its meaning throughout, the local
 estimate from catalog prices; the billed figure lives beside it in its
 own column rather than overwriting the estimate's history.
 
+**`bench/store.py` is synchronous by design, and a test enforces it.**
+Every function materializes before returning, and no cursor is held
+across an await. One connection is shared by every request, every
+experiment trial and every scoring pass, and on a single event loop a
+synchronous function that materializes before returning is an atomic
+block: nothing interleaves between its first statement and its last. That
+property, not a lock anyone has to remember to take, is what makes the
+shared connection safe. Adding one `async def` there would remove it
+everywhere at once and nothing would fail loudly, so the suite scans the
+module's tokens and goes red instead. Cross-process concurrency is a
+separate problem with a separate answer: WAL mode and the busy timeout.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
