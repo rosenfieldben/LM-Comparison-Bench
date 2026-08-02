@@ -12,6 +12,7 @@ from bench.models import (
     control_messages,
     control_payload,
     fetch_catalog,
+    judge_response,
     run_model,
 )
 
@@ -1736,3 +1737,163 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
     assert recorded["temperature"] == 0.2
     for absent in ("top_p", "seed", "reasoning"):
         assert absent not in recorded, absent
+
+
+# ---- Phase I3: rubric judging, blind by construction.
+
+from bench.models import JUDGE_MAX_TOKENS
+
+
+def judge_body(text):
+    return {
+        "id": "gen-judge-1",
+        "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 12, "cost": 0.00004},
+    }
+
+
+@respx.mock
+async def test_a_judge_verdict_becomes_a_score_with_its_charge(client):
+    respx.post(OPENROUTER_URL).respond(
+        json=judge_body('{"score": 0.5, "reason": "half of it"}')
+    )
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
+
+    assert out["score"] == 0.5
+    assert out["detail"] == "half of it"
+    assert out["error"] is None
+    assert out["generation_id"] == "gen-judge-1"
+    assert out["billed_cost_usd"] == 0.00004
+    # passed stays None on purpose: a rubric defines a graded score, and
+    # turning it into a pass needs a threshold the rubric never stated.
+    assert out["passed"] is None
+
+
+@respx.mock
+async def test_the_judge_payload_never_carries_a_model_identity(client):
+    """Blind by construction. The function is not given the model that
+    produced the response, so no edit inside it can leak one: the identity
+    is not in scope. A judge told which model it is grading has a
+    documented tendency to prefer some of them, and a blindness enforced
+    by "remember not to include it" is one careless edit from gone."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(
+        client,
+        "judge/one",
+        "grade this",
+        "the expected answer",
+        "the candidate answer",
+    )
+
+    sent = json.loads(respx.calls[-1].request.content)
+    blob = json.dumps(sent)
+    for identity in ("deepseek", "anthropic", "openai", "model/alpha", "gpt"):
+        assert identity not in blob.lower(), (identity, blob)
+    # What it does carry: the rubric, the reference and the response.
+    assert "grade this" in blob
+    assert "the expected answer" in blob
+    assert "the candidate answer" in blob
+    # And the judge's own id, which is the one model name a judge payload
+    # legitimately contains.
+    assert sent["model"] == "judge/one"
+
+
+@respx.mock
+async def test_the_judge_gets_its_own_modest_budget(client):
+    """A verdict is a number and a sentence. A judge inheriting an
+    extended-tier experiment would buy headroom no rubric needs, once per
+    scored trial, at the judge's own price."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(client, "judge/one", "r", None, "a")
+
+    assert json.loads(respx.calls[-1].request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+    assert JUDGE_MAX_TOKENS < BUDGET_STANDARD
+
+
+@respx.mock
+async def test_the_judge_payload_carries_the_privacy_policy(client):
+    """A judge call sends a run's response text, which is model output
+    about the user's prompt, so it is subject to the same data-handling
+    promise as the run itself."""
+    prefs = {"sort": "throughput", "data_collection": "deny"}
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(client, "judge/one", "r", None, "a", provider_prefs=prefs)
+
+    assert json.loads(respx.calls[-1].request.content)["provider"] == prefs
+
+
+@respx.mock
+async def test_a_malformed_verdict_is_a_scoring_failure_that_still_records_the_charge(
+    client,
+):
+    """Money spent is money spent, whatever came back for it. Capturing
+    the charge before parsing is what keeps an unparseable but paid-for
+    verdict from vanishing from the accounting."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body("it was pretty good I think"))
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] is None
+    assert "no JSON object" in out["error"]
+    assert out["billed_cost_usd"] == 0.00004
+    assert out["generation_id"] == "gen-judge-1"
+
+
+@respx.mock
+async def test_a_judge_refusal_is_recorded_not_raised(client):
+    """Never raises, the same contract the other client functions carry:
+    this runs in a loop over many results and one bad reply must not end
+    the pass."""
+    respx.post(OPENROUTER_URL).respond(status_code=429)
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] is None
+    assert out["error"] == "judge returned HTTP 429"
+
+
+@respx.mock
+async def test_a_judge_transport_failure_is_recorded_not_raised(client):
+    respx.post(OPENROUTER_URL).mock(side_effect=httpx.ConnectError("down"))
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["error"] == "judge request failed: ConnectError"
+
+
+async def test_a_trial_with_no_text_is_scored_without_asking_anyone(client):
+    """Nothing to grade, so paying a judge to say so would be spending
+    money to learn what the row already says. No respx mock here, which
+    is itself the assertion: reaching the network would fail the test."""
+    out = await judge_response(client, "judge/one", "r", None, None)
+
+    assert out["score"] == 0.0
+    assert out["detail"] == "no response text: the trial did not complete"
+    assert out["billed_cost_usd"] is None
+
+
+@respx.mock
+async def test_a_judge_answering_in_content_parts_is_read_the_same_way(client):
+    """Through _flatten_content, the extractor run_model uses. A second
+    extractor would be a second thing to keep in step with providers."""
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "id": "gen-judge-2",
+            "choices": [
+                {
+                    "message": {
+                        "content": [{"type": "text", "text": '{"score": 1.0}'}]
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] == 1.0

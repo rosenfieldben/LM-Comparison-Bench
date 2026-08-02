@@ -4460,3 +4460,402 @@ def test_result_ids_reach_the_replay_path_and_not_the_live_one(client):
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
     assert ids and all(isinstance(i, int) for i in ids)
+
+
+# ---- Phase I3: scoring passes, deterministic and judged.
+
+import time
+
+from bench.models import JUDGE_MAX_TOKENS
+from bench.scoring import latest_per_key
+
+
+def score_experiment_to_completion(client, eid, path, judge_model=None, timeout_s=20.0):
+    """Start a scoring pass and wait for it to finish.
+
+    Polled rather than streamed because scoring has no progress endpoint
+    of its own yet; the state flag on app.state is the truth and this
+    reads it directly rather than guessing at a duration.
+    """
+    body = {"dataset_path": path}
+    if judge_model is not None:
+        body["judge_model"] = judge_model
+    started = client.post(f"/experiments/{eid}/score", json=body)
+    assert started.status_code == 202, started.text
+    deadline = time.monotonic() + timeout_s
+    while client.app.state.scoring_run["active"] is not None:
+        assert time.monotonic() < deadline, "scoring pass did not finish"
+        # One cheap request drives the loop, since the background task
+        # only progresses while the test client's portal is running.
+        client.get("/models")
+    assert client.app.state.scoring_run["error"] is None, client.app.state.scoring_run[
+        "error"
+    ]
+
+
+def scores_in(client, eid):
+    rows = client.app.state.db.execute(
+        """SELECT s.* FROM scores s
+           JOIN results r ON r.id = s.result_id
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY s.id""",
+        (eid,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@respx.mock
+def test_a_deterministic_pass_scores_every_trial_including_the_failures(
+    client, tmp_path
+):
+    """Failures are scored, not skipped. A trial that errored is a trial
+    that failed the task, and leaving it unscored would let the report
+    drop it from the denominator."""
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        {
+            "id": "t2",
+            "prompt": "b",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path)
+
+    rows = scores_in(client, eid)
+    assert len(rows) == 2
+    assert {r["scorer"] for r in rows} == {"contains"}
+    # One passed on its text, one scored zero because it never produced
+    # any, and the row says which.
+    assert sorted(r["score"] for r in rows) == [0.0, 1.0]
+    failed = next(r for r in rows if r["score"] == 0.0)
+    assert failed["detail"] == "no response text: the trial did not complete"
+
+
+@respx.mock
+def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_path):
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] == "judge/one":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "gen-judge-9",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"score": 0.5, "reason": "partial"}'
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 9,
+                        "cost": 0.00002,
+                    },
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "rubric": "score it",
+            "scorer": {"kind": "judge"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    before = client.app.state.accumulated_spend_usd
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["scorer"] == "judge"
+    assert row["score"] == 0.5
+    assert row["detail"] == "partial"
+    assert row["judge_model"] == "judge/one"
+    assert row["judge_generation_id"] == "gen-judge-9"
+    assert row["judge_billed_cost_usd"] == 0.00002
+    # Judge spend is spend: it moves the same accumulator the ceiling
+    # reads, so a scoring pass cannot run for free against the limit.
+    assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00002)
+
+
+@respx.mock
+def test_no_judge_payload_ever_carries_a_lineup_identity(client, tmp_path):
+    """The blind-by-construction claim, asserted at the wire rather than
+    at the function boundary: whatever the pass does, no request that
+    reaches a judge may name a model the experiment is comparing."""
+    judge_payloads = []
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] == "judge/one":
+            judge_payloads.append(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta"]),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    assert len(judge_payloads) == 2
+    for payload in judge_payloads:
+        assert "model/alpha" not in payload
+        assert "model/beta" not in payload
+        assert "judge/one" in payload
+
+
+@respx.mock
+def test_a_judge_in_the_lineup_flags_every_row_it_produces(client, tmp_path):
+    """Self-judging is recorded, not prevented. The user may have good
+    reason; a silent absorption of the self-preference concern is what
+    would be wrong."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="model/alpha")
+
+    assert scores_in(client, eid)[0]["self_judged"] == 1
+
+
+@respx.mock
+def test_a_malformed_verdict_is_recorded_as_a_scoring_failure(client, tmp_path):
+    """Never a guessed number. The row exists, carries no score, and says
+    what went wrong, so the report can tell "unscorable" from "not scored
+    yet"."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": "seems fine to me"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["score"] is None
+    assert "no JSON object" in row["detail"]
+
+
+@respx.mock
+def test_a_ceiling_refusal_during_scoring_records_the_gap_and_the_pass_goes_on(
+    client, tmp_path
+):
+    """The interruption policy, and it is the opposite of the trial
+    runner's default on purpose. A refused trial can only be recovered by
+    paying for the model call again, so halting protects the budget for a
+    decision the user should make. A refused score can be filled in by a
+    later pass over the same stored text at no extra model cost, so
+    stopping the whole pass for one would trade a complete scoring run
+    for nothing.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+        {"id": "t2", "prompt": "b", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    # Close the gate before scoring starts, so every judge call refuses.
+    client.app.state.spend_limit_usd = 0.0000001
+    client.app.state.accumulated_spend_usd = 1.0
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    rows = scores_in(client, eid)
+    # Both results have a row: the pass covered everything rather than
+    # stopping at the first refusal.
+    assert len(rows) == 2
+    for row in rows:
+        assert row["score"] is None
+        assert "re-run the scoring pass to fill it in" in row["detail"]
+        assert row["judge_model"] == "judge/one"
+
+
+@respx.mock
+def test_rescoring_appends_and_the_latest_row_is_the_one_that_counts(client, tmp_path):
+    """Idempotent per (result, scorer, judge_model) means a second pass is
+    safe, not that it is a no-op. The new row lands beside the old one and
+    the report reads the newest; the older stays as the audit trail."""
+    verdicts = iter(['{"score": 0.0}', '{"score": 1.0}'])
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": next(verdicts)},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    rows = scores_in(client, eid)
+    assert [r["score"] for r in rows] == [0.0, 1.0]
+    latest = latest_per_key(rows)
+    assert [r["score"] for r in latest] == [1.0]
+
+
+def test_scoring_a_running_experiment_is_refused(client, tmp_path):
+    """A pass over a half-finished experiment would score whatever
+    happened to exist, and its own re-runnability would then hide that it
+    had done so."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    resp = client.post(f"/experiments/{eid}/score", json={"dataset_path": path})
+
+    assert resp.status_code == 409
+    assert "once its trials have finished" in resp.json()["detail"]
+
+
+@respx.mock
+def test_scoring_against_a_changed_dataset_is_refused(client, tmp_path):
+    """The rubrics live in the file. Scoring against different tasks would
+    attribute one rubric's verdict to another's trial."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    Path(path).write_text(
+        '{"id": "t1", "prompt": "a", "reference": "Goodbye", '
+        '"scorer": {"kind": "contains"}}\n',
+        encoding="utf-8",
+    )
+
+    resp = client.post(f"/experiments/{eid}/score", json={"dataset_path": path})
+
+    assert resp.status_code == 422
+    assert "dataset changed" in resp.json()["detail"]
+    assert "attribute one rubric's verdict to another's trial" in resp.json()["detail"]

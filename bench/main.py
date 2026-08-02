@@ -35,11 +35,13 @@ from bench.models import (
     as_money,
     as_text,
     fetch_catalog,
+    judge_response,
     keepalive_socket_options,
     provider_preferences,
     run_model,
     stream_model,
 )
+from bench.scoring import score_response
 
 logger = logging.getLogger(__name__)
 
@@ -431,6 +433,26 @@ class ExperimentStart(BaseModel):
     dataset_path: str = Field(min_length=1, max_length=4096)
 
 
+class ScoringStart(BaseModel):
+    """What a scoring pass needs: the tasks, and optionally a judge.
+
+    The dataset is named again for the same reason the runner names it
+    again: the rubrics and references live in the file, the experiment row
+    records only the digest of what was read, and re-checking that digest
+    is what stops a pass from grading one rubric's trials against
+    another's.
+
+    judge_model is optional because a dataset of deterministic scorers
+    needs no judge, and requiring one would make the cheap case pay for
+    the expensive one's configuration.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    dataset_path: str = Field(min_length=1, max_length=4096)
+    judge_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class ExperimentDetail(BaseModel):
     id: int
     name: str
@@ -692,6 +714,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         "task": None,
         "stop": asyncio.Event(),
         "dataset_path": None,
+    }
+    # The scoring pass, held separately from the trial runner. They are
+    # separate because they are separately useful: a finished experiment
+    # can be re-scored while nothing is running, and a running experiment
+    # must not be scored while its results are still arriving.
+    app.state.scoring_run = {
+        "active": None,
+        "task": None,
+        "stop": asyncio.Event(),
+        "tasks": {},
+        "error": None,
     }
     # Data-handling routing, validated beside the ceiling and before any
     # request can be built. The resolved provider block is computed once
@@ -2313,6 +2346,191 @@ async def experiment_progress(experiment_id: int) -> StreamingResponse:
             await asyncio.sleep(PROGRESS_POLL_S)
 
     return StreamingResponse(frames(), media_type="text/event-stream")
+
+
+async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
+    """Score every trial of an experiment, deterministic and judged alike.
+
+    Re-runnable and idempotent per (result, scorer, judge_model): a second
+    pass inserts new rows rather than editing old ones, and the report
+    reads the latest per key. That is what makes the interruption policy
+    below safe, and it is what keeps "the judge said 0.5 last week and 1.0
+    today" in the record instead of erasing it.
+
+    A ceiling refusal during the pass is recorded as that result's scoring
+    failure and the pass CONTINUES. This is the opposite of the trial
+    runner's default, and the asymmetry is the point: a refused trial can
+    never be recovered without paying for the model call again, so
+    halting protects the budget for a decision the user should make. A
+    refused score can be filled in by a later pass over the same stored
+    text at no extra model cost, so stopping the whole pass for one would
+    trade a complete scoring run for nothing.
+    """
+    db = app.state.db
+    experiment = store.get_experiment(db, experiment_id)
+    assert experiment is not None
+    state = app.state.scoring_run
+    try:
+        # Self-judging is recorded, not prevented. A judge grading its own
+        # output has a documented tendency toward itself, and the honest
+        # response is to flag every affected row and surface the flag in
+        # the report rather than to refuse the pass: the user may have
+        # good reason, and a silent absorption is what would be wrong.
+        self_judged = judge_model is not None and judge_model in experiment["lineup"]
+        for group in store.experiment_groups(db, experiment_id):
+            if state["stop"].is_set():
+                break
+            task = state["tasks"].get(group["task_id"])
+            if task is None or task["scorer"] is None:
+                continue
+            detail = store.get_group(db, group["id"])
+            if detail is None:
+                continue
+            for run in detail["runs"]:
+                for result in run["results"]:
+                    await score_one_result(
+                        experiment_id, task, result, judge_model, self_judged
+                    )
+    except Exception as exc:
+        logger.exception("scoring pass for experiment %s failed", experiment_id)
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        state["active"] = None
+
+
+async def score_one_result(
+    experiment_id: int,
+    task: dict[str, Any],
+    result: dict[str, Any],
+    judge_model: str | None,
+    self_judged: bool,
+) -> None:
+    """Score one stored result, writing exactly one row.
+
+    Every path writes a row, including the failures. A scoring pass that
+    silently skipped what it could not score would leave the report
+    unable to tell "not scored yet" from "scored and unscorable", and
+    those are different facts about the same trial.
+    """
+    spec = task["scorer"]
+    kind = spec["kind"]
+    if kind != "judge":
+        verdict = score_response(spec, task["reference"], result["response_text"])
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": kind,
+                "score": verdict["score"],
+                "passed": verdict["passed"],
+                "detail": verdict["detail"],
+                "blind": None,
+                "self_judged": None,
+            },
+        )
+        return
+
+    if judge_model is None:
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": None,
+                "passed": None,
+                "detail": "no judge model was given for this scoring pass",
+            },
+        )
+        return
+
+    # The ceiling applies to judge calls because judge calls are spend.
+    # A refusal here is this result's scoring failure and the pass goes
+    # on; see score_experiment for why that differs from a trial refusal.
+    if spend_ceiling_reached():
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": None,
+                "passed": None,
+                "detail": (
+                    "the per-boot spend ceiling was reached before this "
+                    "result could be judged; re-run the scoring pass to "
+                    "fill it in"
+                ),
+                "judge_model": judge_model,
+                "self_judged": self_judged,
+            },
+        )
+        return
+
+    async with app.state.upstream_semaphore:
+        verdict = await judge_response(
+            app.state.client,
+            judge_model,
+            task["rubric"],
+            task["reference"],
+            result["response_text"],
+            provider_prefs=app.state.provider_prefs,
+        )
+    # Post-spend. The call has happened, so nothing below may turn a paid
+    # verdict into an exception, and the charge is recorded whether or not
+    # the verdict parsed.
+    try:
+        record_spend(as_money(verdict["billed_cost_usd"]))
+    except Exception:
+        logger.exception("judge settlement failed")
+    store.add_score(
+        app.state.db,
+        result["id"],
+        {
+            "scorer": "judge",
+            "score": verdict["score"],
+            "passed": verdict["passed"],
+            "detail": verdict["error"] or verdict["detail"],
+            "judge_model": judge_model,
+            "judge_generation_id": verdict["generation_id"],
+            "judge_billed_cost_usd": verdict["billed_cost_usd"],
+            "self_judged": self_judged,
+        },
+    )
+
+
+@app.post("/experiments/{experiment_id}/score", status_code=202)
+async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any]:
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    if experiment["status"] in ("created", "running"):
+        raise HTTPException(
+            409,
+            f"experiment {experiment_id} is {experiment['status']}; score it "
+            "once its trials have finished, so the pass sees every result",
+        )
+    state = app.state.scoring_run
+    if state["active"] is not None:
+        raise HTTPException(
+            409, f"a scoring pass for experiment {state['active']} is running"
+        )
+    dataset = read_dataset(body.dataset_path)
+    if dataset["digest"] != experiment["dataset_digest"]:
+        raise HTTPException(
+            422,
+            "dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}. Scoring against different tasks "
+            "would attribute one rubric's verdict to another's trial.",
+        )
+    state["active"] = experiment_id
+    state["stop"] = asyncio.Event()
+    state["error"] = None
+    state["tasks"] = {t["id"]: t for t in dataset["tasks"]}
+    state["task"] = asyncio.create_task(
+        score_experiment(experiment_id, body.judge_model)
+    )
+    return {"id": experiment_id, "status": "scoring"}
 
 
 @app.get("/models", response_model=CatalogResponse)

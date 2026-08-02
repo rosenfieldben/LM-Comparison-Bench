@@ -766,6 +766,84 @@ silently end it. The progress stream is a view onto the run, not the run
 itself, and every frame carries absolute counters rather than deltas so a
 reconnecting client is caught up by the next frame.
 
+## Scoring
+
+Scoring is a separate pass over a finished experiment, so it can be run,
+re-run and changed without re-running a single model call.
+
+```sh
+curl -X POST localhost:8000/experiments/1/score \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_path": "bench-datasets/arithmetic.jsonl",
+       "judge_model": "openai/gpt-4o-mini"}'
+```
+
+Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
+are pure functions over the stored response text. `normalized_exact` and
+`contains` fold case and collapse whitespace; `exact` strips only the
+surrounding whitespace that chat completions add.
+
+**A trial with no response text scores zero and fails.** It is not
+skipped. An errored or stopped trial is a trial that failed the task, and
+excluding it from scoring is how a report ends up quietly reporting on
+survivors only. The score row's detail says "the trial did not complete",
+so a reader can tell a wrong answer from a missing one.
+
+**Judge scoring is absolute, not pairwise, and blind by construction.**
+The judge is sent the rubric, the reference if the task has one, and the
+response text. It is never sent the identity of the model that produced
+the response, and that is enforced by the shape of the code rather than
+by care: the function that builds the payload is not given the model
+name, so it is not in scope for any future edit inside it. Pairwise
+judging with position swapping is deliberately deferred; it arrives with
+its swap machinery or not at all.
+
+The judge is asked for `{"score": <0 to 1>, "reason": "..."}` and the
+reply is parsed defensively. A fenced or preamble-wrapped object is
+recovered, because that is the same object and refusing would discard
+correct verdicts over formatting. Anything else, including a score that
+is not a number or falls outside `[0, 1]`, is recorded as a scoring
+failure with the reason attached. **A guessed number is never written**:
+it would enter an average and change a conclusion while looking exactly
+like a measurement.
+
+`passed` stays empty for judge scores. A rubric defines a graded score,
+and turning it into a pass needs a threshold the rubric never stated;
+inventing one would be the bench asserting a cutoff nobody chose. Reports
+show judge results as score means and deterministic results as pass rates,
+and say which is which.
+
+**Judge calls are spend.** The billed cost is captured in band, recorded
+on the score row, and added to the same accumulator the ceiling reads, so
+a scoring pass cannot run free against the limit. Judges get their own
+modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
+experiment's tier, because a verdict is a number and a sentence and a
+judge inheriting an extended budget would buy headroom no rubric needs,
+once per scored trial. Judge payloads carry the boot data policy like
+every other request.
+
+**If the judge model is in the experiment's lineup**, every score it
+produces is flagged `self_judged` and the flag is surfaced in the report.
+The pass is not refused: you may have good reason, and silently absorbing
+the self-preference concern is what would be wrong.
+
+**A ceiling refusal during scoring is recorded as that result's scoring
+failure and the pass continues.** This is the opposite of the trial
+runner's default, deliberately. A refused trial can only be recovered by
+paying for the model call again, so halting protects the budget for a
+decision you should make. A refused score can be filled in by a later
+pass over the same stored text at no extra model cost, so stopping the
+whole pass for one would trade a complete scoring run for nothing. Re-run
+the pass and the gaps fill in.
+
+**Re-scoring appends.** Scoring is idempotent per (result, scorer, judge
+model) in the sense that re-running is safe, not in the sense that it is
+a no-op: the new row lands beside the old one and reports read the latest
+per key, ordered by timestamp and then by row id so two rows written in
+the same second cannot make a report nondeterministic. The older rows
+stay, because "the judge said 0.5 last week and 1.0 today" is exactly
+what an audit needs to see.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
