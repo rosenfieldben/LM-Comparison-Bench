@@ -486,12 +486,33 @@ class CatalogResponse(BaseModel):
     data_policy: str = "standard"
 
 
+class StoredModelResult(ModelResult):
+    """A result that has been persisted, and so has a row id.
+
+    A subclass rather than a nullable field on ModelResult, and the
+    distinction is structural rather than stylistic. A live /compare or
+    /compare/stream result has no id and never will have one at the
+    moment it is returned: persistence happens after the response is
+    built, and the post-spend invariant explicitly allows it to fail and
+    return run_id null. Declaring id on the live shape would declare a
+    field that is definitionally absent there, and every consumer would
+    then have to know which endpoint it was talking to in order to know
+    whether None meant "not saved" or "this endpoint does not say".
+
+    Phase I needs the id on the replay path only: a human rating or a
+    score row points at a result by id, and both are produced while
+    looking at stored history. The live paths are unchanged.
+    """
+
+    id: int
+
+
 class RunDetail(BaseModel):
     id: int
     created_at: str
     prompt_text: str
     prompt_id: int | None
-    results: list[ModelResult]
+    results: list[StoredModelResult]
     # What this run actually was: the build that produced it, how old the
     # prices it was costed against were, and the data-handling policy its
     # payloads declared. None on every pre-G row.
@@ -1900,8 +1921,10 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
         # record claiming a pin that never rode a payload.
         raise HTTPException(
             422,
-            "provider_pins apply only to estimand_mode underlying_model; "
-            "the routed-service estimand routes dynamically by definition",
+            "the routed-service estimand routes dynamically by definition, "
+            "so provider_pins cannot apply to it. To pin providers, set "
+            'estimand_mode to "underlying_model", which is the estimand '
+            "that narrows the provider population on purpose.",
         )
     return {
         "id": store.create_experiment(

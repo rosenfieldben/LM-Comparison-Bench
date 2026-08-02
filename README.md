@@ -732,6 +732,20 @@ case it is shuffled with that seed and the seed is recorded. There is no
 unseeded shuffle, because an order nobody can reproduce makes an
 experiment unrepeatable by its own author.
 
+Task order and halting interact, and the interaction is the reason to set
+a seed. Trials run task-major: all repeats of the first task, then all
+repeats of the second. That is deliberate, because an experiment cut
+short then leaves complete cells (every repeat of some tasks) rather than
+one repeat of everything, and complete cells are what a per-task number
+can actually be computed from. The cost is that the surviving subset is a
+prefix of the task order. In file order that prefix is whatever the
+author happened to put at the top of the file, so a halted run would
+report on the easy warm-up questions if they were written first, and
+would do it without saying so. A recorded seed makes the prefix an
+arbitrary but reproducible subset of the dataset instead of a privileged
+one. If you expect to hit the ceiling, or you are running a dataset you
+did not write, set the seed.
+
 **Interruption is honest.** A stop halts between trials, never inside
 one: a trial that reached upstream has already spent its money, and
 abandoning it would throw away a result you paid for. The experiment ends

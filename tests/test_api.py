@@ -161,8 +161,15 @@ def test_group_flow_collapses_comparison_into_one_history_entry(client):
 
     detail = client.get(f"/groups/{group_id}").json()
     assert [r["id"] for r in detail["runs"]] == [first["run_id"], second["run_id"]]
-    assert detail["runs"][0]["results"] == first["results"]
-    assert detail["runs"][1]["results"] == second["results"]
+
+    # Field by field, minus the row id the stored shape adds; see
+    # test_compare_persists_run_and_history_reflects_it for why the two
+    # shapes differ on purpose.
+    def without_ids(results):
+        return [{k: v for k, v in r.items() if k != "id"} for r in results]
+
+    assert without_ids(detail["runs"][0]["results"]) == first["results"]
+    assert without_ids(detail["runs"][1]["results"]) == second["results"]
 
     assert client.get("/groups/9999").status_code == 404
 
@@ -320,7 +327,16 @@ def test_compare_persists_run_and_history_reflects_it(client):
 
     detail = client.get(f"/runs/{compare['run_id']}").json()
     assert detail["prompt_text"] == long_prompt
-    assert detail["results"] == compare["results"]
+    # Everything the live response carried survives the round trip
+    # unchanged. Compared field by field rather than as whole dicts,
+    # because the stored shape deliberately carries one field the live
+    # one cannot: a persisted result has a row id and a live result does
+    # not, which is why StoredModelResult is a subclass rather than a
+    # nullable field. A plain equality here would have made that
+    # deliberate difference read as a regression.
+    stored = [{k: v for k, v in r.items() if k != "id"} for r in detail["results"]]
+    assert stored == compare["results"]
+    assert all(isinstance(r["id"], int) for r in detail["results"])
 
 
 @respx.mock
@@ -3909,7 +3925,11 @@ def test_provider_pins_are_refused_under_the_routed_service_estimand(client, tmp
     )
 
     assert resp.status_code == 422
-    assert "routed-service estimand routes dynamically" in resp.json()["detail"]
+    detail = resp.json()["detail"]
+    assert "routed-service estimand routes dynamically" in detail
+    # The refusal names the remedy. A 422 that says only what is wrong
+    # leaves the caller to guess which of two estimands they wanted.
+    assert 'estimand_mode to "underlying_model"' in detail
 
 
 def test_unknown_experiment_fields_are_rejected(client, tmp_path):
@@ -4335,3 +4355,108 @@ def test_stopping_an_experiment_that_is_not_running_409s(client, tmp_path):
 
     assert resp.status_code == 409
     assert "not running" in resp.json()["detail"]
+
+
+@respx.mock
+def test_continue_mode_records_a_refusal_and_keeps_going(client, tmp_path):
+    """halt_on_refusal false is an implemented path, not a declared one.
+
+    Written now rather than with I5's refusal-heavy aggregates, because
+    I5 will build its failure-inclusive denominators on top of this
+    branch. A path that was implemented dead would be discovered by the
+    thing that depends on it, which is the expensive order.
+
+    The shape is one refusal followed by proof of progress: the ceiling
+    trips on the first settlement, the second trial is refused, and the
+    runner reaches the third rather than stopping. Refusals cost no
+    upstream call, so the call count is what separates "kept going" from
+    "stopped and the counters lied".
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], halt_on_refusal=False),
+    ).json()["id"]
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    # Ran to the end rather than halting, and says so.
+    assert final["status"] == "done"
+    assert final["status_detail"] is None
+    assert final["trials_total"] == 3
+    # One paid trial before the ceiling closed, then two refusals: the
+    # runner passed the first refusal and reached the last task.
+    assert final["trials_done"] == 1
+    assert final["trials_refused"] == 2
+    # Conservation over the whole experiment, refusals included.
+    assert final["trials_done"] + final["trials_refused"] == final["trials_total"]
+    # A refusal spends nothing, so exactly one call reached upstream.
+    assert respx.calls.call_count == 1
+
+
+@respx.mock
+def test_result_ids_reach_the_replay_path_and_not_the_live_one(client):
+    """The exposure route for result ids, decided before I4 needs them.
+
+    Blind rating and every score row point at a result by id, and both are
+    produced while looking at stored history. So the replay path carries
+    the id and the live path does not, structurally: StoredModelResult is
+    a subclass rather than a nullable field, because a live result has no
+    id at the moment it is returned and never will. Persistence happens
+    after the response is built, and the post-spend invariant explicitly
+    permits it to fail and answer run_id null. A nullable id on one shape
+    would force every consumer to know which endpoint it was talking to
+    before it could read None correctly.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "hi"))
+    )
+    live = client.post("/compare", json={"prompt": "ids", "models": ["model/alpha"]})
+
+    assert "id" not in live.json()["results"][0]
+
+    stored = client.get(f"/runs/{live.json()['run_id']}").json()
+    assert isinstance(stored["results"][0]["id"], int)
+    # And through the group replay, which is the view blind rating uses.
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    frames = stream_events(
+        client, {"prompt": "ids", "model": "model/alpha", "group_id": group_id}
+    )
+    done = next(f for f in frames if f["type"] == "done")
+    # The live done frame is the same shape as the live batch response:
+    # no id, because there is not one yet.
+    assert "id" not in done["result"]
+
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    assert ids and all(isinstance(i, int) for i in ids)
