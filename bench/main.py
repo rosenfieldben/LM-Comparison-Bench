@@ -26,6 +26,7 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import store
+from bench.datasets import DatasetError, parse_dataset
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
@@ -346,6 +347,91 @@ class GroupCreate(BaseModel):
 
 class GroupCreated(BaseModel):
     id: int
+
+
+# The two estimands, named at the boundary so every experiment row, every
+# report and every export line says which question it answers.
+#
+# routed_service is the default and is what this tool is actually used
+# for: the OpenRouter-routed service path for a model under a stated
+# routing mode, provider chosen dynamically per call, repeats doing the
+# statistical work, results stratifiable by the provider Phase G already
+# records. underlying_model is the opt-in strict estimand for when the
+# claim is about the model itself; it narrows the eligible provider
+# population on purpose. See the README's estimands section.
+ESTIMAND_MODES = ("routed_service", "underlying_model")
+
+# Bounds on an experiment's shape. The dataset loader bounds the task
+# count; these bound what the runner will multiply it by, because
+# tasks * repeats * lineup is the number of paid calls and that product
+# is the thing worth refusing early rather than part way through.
+MAX_REPEATS = 20
+MAX_TRIALS = 5000
+
+
+class ExperimentCreate(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    name: str = Field(min_length=1, max_length=200)
+    # A path the user names. Read by the boundary, not by the loader:
+    # where the bench may read from is a question for the edge, and
+    # bench.datasets stays a pure function over bytes.
+    dataset_path: str = Field(min_length=1, max_length=4096)
+    # Same shape and same bound as GroupCreate.models, since every trial
+    # this experiment runs creates a group with exactly this lineup.
+    lineup: list[str] = Field(min_length=1, max_length=MAX_POSITION + 1)
+    budget: Literal["standard", "extended"]
+    # The same six controls as everywhere else, through the same class, so
+    # rule one and rule two apply to an experiment's payloads exactly as
+    # they apply to a hand-run comparison. Structural parity again: there
+    # is nothing here that could drift from what /compare sends.
+    params: ExperimentParams | None = None
+    repeats: int = Field(default=1, ge=1, le=MAX_REPEATS)
+    # Present means shuffle the task order with this seed and record it;
+    # absent means file order. Either way the order is reproducible, which
+    # is the only property that matters: a hidden shuffle would make an
+    # experiment unrepeatable by anyone including its author.
+    task_order_seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
+    estimand_mode: Literal["routed_service", "underlying_model"] = "routed_service"
+    # model id to provider name. Strict mode only; enforced with
+    # allow_fallbacks false, so a pinned provider that cannot serve is a
+    # recorded failure rather than a quiet reroute.
+    provider_pins: dict[str, str] | None = None
+    halt_on_refusal: bool = True
+
+
+class ExperimentCreated(BaseModel):
+    id: int
+
+
+class ExperimentDetail(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    dataset_name: str
+    dataset_digest: str
+    lineup: list[str]
+    budget: str
+    params: dict[str, Any] | None
+    repeats: int
+    task_order_seed: int | None
+    estimand_mode: str
+    provider_pins: dict[str, Any] | None
+    halt_on_refusal: bool
+    status: str
+    status_detail: str | None
+    app_sha: str | None
+    catalog_digest: str | None
+    data_policy: str | None
+    tasks_total: int
+    trials_total: int
+    trials_done: int
+    trials_refused: int
+    trials_failed: int
+
+
+class ExperimentList(BaseModel):
+    experiments: list[ExperimentDetail]
 
 
 class CatalogModel(BaseModel):
@@ -1710,6 +1796,114 @@ async def group_detail(group_id: int) -> dict[str, Any]:
     if group is None:
         raise HTTPException(404, "no such group")
     return group
+
+
+def read_dataset(path: str) -> dict[str, Any]:
+    """Load and validate a dataset the user named, or 422 with the reason.
+
+    The read lives at the boundary and the parse lives in bench.datasets,
+    which is the same split as everywhere else: the edge decides what may
+    be touched, the pure module decides what is valid.
+
+    No path restriction beyond what the operating system already enforces,
+    and that is deliberate rather than an omission. The bench answers only
+    to loopback clients (LocalOnlyGuard) and runs as the user, so a path
+    allowlist here would defend the user against themselves while blocking
+    the ordinary case of a dataset living wherever the user keeps their
+    work. It is worth being explicit that this is the reasoning, because
+    "reads any path the caller names" looks like a hole until you have the
+    threat model beside it.
+
+    Every failure is a 422 naming the file and the line, because the
+    caller's next action is to fix the file and a 500 would tell them
+    nothing about which line to open.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            422, f"cannot read dataset {path}: {exc.strerror}"
+        ) from None
+    try:
+        return parse_dataset(raw, name=Path(path).name)
+    except DatasetError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+@app.post("/experiments", response_model=ExperimentCreated, status_code=201)
+async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
+    """Write the experiment manifest, after validating everything about it.
+
+    Nothing runs here. The row is the declaration, written complete before
+    the first trial, exactly as a group row is written before the first
+    upstream call: the same discipline one level up.
+
+    Validation that can only fail later is validation in the wrong place.
+    The dataset is loaded and checked now, the trial count is bounded now,
+    and (in strict mode) every control is capability-checked against the
+    catalog now, so an experiment that cannot run does not get created and
+    then discovered at trial 300.
+    """
+    dataset = read_dataset(body.dataset_path)
+    controls = request_controls(body.params)
+    trials = len(dataset["tasks"]) * body.repeats * len(body.lineup)
+    if trials > MAX_TRIALS:
+        raise HTTPException(
+            422,
+            f"{len(dataset['tasks'])} tasks x {body.repeats} repeats x "
+            f"{len(body.lineup)} models is {trials} paid calls, over the "
+            f"{MAX_TRIALS} limit. Shorten the dataset or the lineup.",
+        )
+    if body.provider_pins and body.estimand_mode != "underlying_model":
+        # A pin under the routed-service estimand is a contradiction: the
+        # whole point of that estimand is that routing is dynamic. Refusing
+        # is kinder than silently ignoring the pins, which would produce a
+        # record claiming a pin that never rode a payload.
+        raise HTTPException(
+            422,
+            "provider_pins apply only to estimand_mode underlying_model; "
+            "the routed-service estimand routes dynamically by definition",
+        )
+    return {
+        "id": store.create_experiment(
+            app.state.db,
+            {
+                "name": body.name,
+                "dataset_name": dataset["name"],
+                "dataset_digest": dataset["digest"],
+                "lineup": body.lineup,
+                "budget": body.budget,
+                "params": controls or None,
+                "repeats": body.repeats,
+                "task_order_seed": body.task_order_seed,
+                "estimand_mode": body.estimand_mode,
+                "provider_pins": body.provider_pins,
+                "halt_on_refusal": body.halt_on_refusal,
+                # The same provenance every run row carries, recorded once
+                # on the experiment because it is fixed for the whole of
+                # it: the process does not change build or catalog mid-run.
+                "app_sha": getattr(app.state, "app_sha", None),
+                "catalog_digest": getattr(app.state, "catalog_digest", None),
+                "data_policy": app.state.data_policy,
+                "tasks_total": len(dataset["tasks"]),
+                "trials_total": trials,
+            },
+        )
+    }
+
+
+@app.get("/experiments", response_model=ExperimentList)
+async def list_experiments() -> dict[str, Any]:
+    return {"experiments": store.list_experiments(app.state.db)}
+
+
+@app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
+async def experiment_detail(experiment_id: int) -> dict[str, Any]:
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    return experiment
 
 
 @app.get("/models", response_model=CatalogResponse)

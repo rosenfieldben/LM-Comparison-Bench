@@ -32,13 +32,56 @@ CREATE TABLE IF NOT EXISTS prompts (
     text TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS experiments (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    dataset_name TEXT NOT NULL,
+    dataset_digest TEXT NOT NULL,
+    lineup_json TEXT NOT NULL,
+    budget TEXT NOT NULL,
+    params_json TEXT,
+    repeats INTEGER NOT NULL,
+    task_order_seed INTEGER,
+    estimand_mode TEXT NOT NULL,
+    provider_pins_json TEXT,
+    halt_on_refusal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    status_detail TEXT,
+    app_sha TEXT,
+    catalog_digest TEXT,
+    data_policy TEXT,
+    tasks_total INTEGER NOT NULL,
+    trials_total INTEGER NOT NULL,
+    trials_done INTEGER NOT NULL,
+    trials_refused INTEGER NOT NULL,
+    trials_failed INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS scores (
+    id INTEGER PRIMARY KEY,
+    result_id INTEGER NOT NULL REFERENCES results(id),
+    scorer TEXT NOT NULL,
+    score REAL,
+    passed INTEGER,
+    detail TEXT,
+    judge_model TEXT,
+    judge_generation_id TEXT,
+    judge_billed_cost_usd REAL,
+    blind INTEGER,
+    self_judged INTEGER,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY,
     created_at TEXT NOT NULL,
     prompt_text TEXT,
     models_json TEXT,
     params_json TEXT,
-    budget TEXT
+    budget TEXT,
+    experiment_id INTEGER NULL REFERENCES experiments(id),
+    task_id TEXT,
+    repeat_index INTEGER,
+    rotation_index INTEGER
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -82,6 +125,8 @@ CREATE TABLE IF NOT EXISTS results (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
+CREATE INDEX IF NOT EXISTS idx_groups_experiment_id ON groups(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
 """
 
 # Columns added after a table first shipped. CREATE IF NOT EXISTS skips
@@ -149,6 +194,28 @@ MIGRATIONS = [
     # apart. None on an offline boot, where there were no bytes.
     ("groups", "budget", "TEXT"),
     ("runs", "catalog_digest", "TEXT"),
+    # Phase I, the evaluation layer. Four columns on groups, all nullable
+    # and additive; the two new tables need no entry here because
+    # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
+    # new or old, which is what makes them additive by construction.
+    #
+    # The group stays exactly what H.1 made it: the atomic one-prompt
+    # record, created before any call, enforced at entry. These columns do
+    # not change that; they say which larger thing a group belongs to.
+    # experiments is an aggregate ABOVE groups, which is the shape the
+    # Phase G out-of-scope note promised: the concept waited for repeats
+    # to exist, repeats exist now, so it arrives as a layer rather than a
+    # rename of what was already there.
+    #
+    # NULL on all four is the affirmative fact that a group was run by
+    # hand rather than by an experiment, which is what every group in
+    # every pre-I database was. That reading needs no fallback and no
+    # derivation, so unlike models_json and budget these are never
+    # "unknown": a hand-run comparison genuinely has no task id.
+    ("groups", "experiment_id", "INTEGER NULL REFERENCES experiments(id)"),
+    ("groups", "task_id", "TEXT"),
+    ("groups", "repeat_index", "INTEGER"),
+    ("groups", "rotation_index", "INTEGER"),
 ]
 
 
@@ -313,6 +380,7 @@ def create_group(
     models: list[str] | None = None,
     params: dict[str, Any] | None = None,
     budget: str | None = None,
+    experiment: dict[str, Any] | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -331,18 +399,32 @@ def create_group(
     controls to enforce one experiment per group. Sorting cannot change
     which controls were set, and without it two identical control sets
     could serialize differently and read as a conflict.
+
+    experiment is the Phase I placement: which experiment this group
+    belongs to, and which cell of it (task, repeat, rotation). Absent for
+    every hand-run comparison, which is what NULL means on those four
+    columns. It is a plain dict rather than four parameters because the
+    four are meaningless apart: a task id without a repeat index does not
+    identify a cell, and letting them be passed separately would let a
+    caller record half a placement.
     """
+    place = experiment or {}
     with conn:
         cur = conn.execute(
             "INSERT INTO groups"
-            " (created_at, prompt_text, models_json, params_json, budget)"
-            " VALUES (?, ?, ?, ?, ?)",
+            " (created_at, prompt_text, models_json, params_json, budget,"
+            "  experiment_id, task_id, repeat_index, rotation_index)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
                 json.dumps(models) if models is not None else None,
                 json.dumps(params, sort_keys=True) if params else None,
                 budget,
+                place.get("experiment_id"),
+                place.get("task_id"),
+                place.get("repeat_index"),
+                place.get("rotation_index"),
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
@@ -780,8 +862,13 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
     # deterministic, which it does, though not gracefully: it compares a
     # zero-based column index against a rowid, so positioned rows would all
     # sort ahead of unpositioned ones rather than interleaving by place.
+    # id joins the projection for Phase I: a score row points at a result
+    # by id, so scoring and the export need it here rather than issuing a
+    # second query for something this one already read. The API's
+    # ModelResult does not declare it, so it stays out of every response
+    # body; it exists for callers inside the process.
     results = conn.execute(
-        """SELECT model, response_text, latency_ms, prompt_tokens,
+        """SELECT id, model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
                   billed_cost_usd, reasoning_tokens, cached_tokens,
@@ -957,3 +1044,263 @@ def apply_reconciliation(
                 result_id,
             ),
         )
+
+
+# ---- Phase I: experiments as the aggregate above groups, and scores.
+
+
+# What an experiment's status may say. Not an enum in the schema (the
+# derived-outcome rule elsewhere in this phase argues against baking
+# vocabularies into columns), but a tuple here so the writers agree and
+# a reader can see the whole vocabulary in one place.
+#
+# "created" is the row before the runner starts, which is a real state
+# and not a placeholder: the manifest is written complete before any
+# trial, so an experiment that never starts still has a full record of
+# what it was going to be.
+EXPERIMENT_STATUSES = (
+    "created",
+    "running",
+    "done",
+    "stopped",
+    "halted_on_refusal",
+    "failed",
+)
+
+
+def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
+    """Write the experiment manifest. Returns the experiment id.
+
+    Written complete before any trial runs, for the same reason the group
+    row is written before any upstream call: a manifest that is assembled
+    as it goes is a description of what happened, and the thing worth
+    having is a declaration of what was intended, against which what
+    happened can be checked. Every field here is known at creation.
+
+    trials_total is stored rather than derived so progress has a
+    denominator that cannot move. Deriving it later from the rows that
+    exist would make a halted experiment look complete, since the trials
+    it never ran leave nothing behind to count.
+    """
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO experiments
+               (name, created_at, dataset_name, dataset_digest, lineup_json,
+                budget, params_json, repeats, task_order_seed, estimand_mode,
+                provider_pins_json, halt_on_refusal, status, status_detail,
+                app_sha, catalog_digest, data_policy, tasks_total,
+                trials_total, trials_done, trials_refused, trials_failed)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?, 0, 0, 0)""",
+            (
+                spec["name"],
+                _now(),
+                spec["dataset_name"],
+                spec["dataset_digest"],
+                json.dumps(spec["lineup"]),
+                spec["budget"],
+                # Same rule as create_group: an empty controls mapping is
+                # NULL, not "{}", so absence has exactly one spelling.
+                json.dumps(spec["params"], sort_keys=True)
+                if spec.get("params")
+                else None,
+                spec["repeats"],
+                spec.get("task_order_seed"),
+                spec["estimand_mode"],
+                json.dumps(spec["provider_pins"], sort_keys=True)
+                if spec.get("provider_pins")
+                else None,
+                1 if spec["halt_on_refusal"] else 0,
+                "created",
+                None,
+                spec.get("app_sha"),
+                spec.get("catalog_digest"),
+                spec.get("data_policy"),
+                spec["tasks_total"],
+                spec["trials_total"],
+            ),
+        )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def _experiment_row(row: sqlite3.Row) -> dict[str, Any]:
+    """One experiment row decoded, with the JSON columns already parsed.
+
+    Decoding here rather than at every reader is the same argument
+    get_group makes: this module is the one place that knows how a lineup
+    or a pin map is serialized.
+    """
+    out = dict(row)
+    out["lineup"] = json.loads(out.pop("lineup_json"))
+    out["params"] = _decoded_params(out.pop("params_json")) or None
+    pins = out.pop("provider_pins_json")
+    out["provider_pins"] = _decoded_params(pins) or None
+    # Stored 0/1 because SQLite has no boolean; handed back as bool so no
+    # reader has to remember which spelling this column uses.
+    out["halt_on_refusal"] = bool(out["halt_on_refusal"])
+    return out
+
+
+def get_experiment(
+    conn: sqlite3.Connection, experiment_id: int
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM experiments WHERE id = ?", (experiment_id,)
+    ).fetchone()
+    return _experiment_row(row) if row is not None else None
+
+
+def list_experiments(
+    conn: sqlite3.Connection, limit: int = 100
+) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM experiments ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [_experiment_row(r) for r in rows]
+
+
+def set_experiment_status(
+    conn: sqlite3.Connection,
+    experiment_id: int,
+    status: str,
+    detail: str | None = None,
+) -> None:
+    """Move an experiment to a terminal or running state.
+
+    detail is where a halt says why in words the reader gets to see. A
+    status of halted_on_refusal with no detail would be true and useless.
+    """
+    assert status in EXPERIMENT_STATUSES, status
+    with conn:
+        conn.execute(
+            "UPDATE experiments SET status = ?, status_detail = ? WHERE id = ?",
+            (status, detail, experiment_id),
+        )
+
+
+def bump_experiment_counters(
+    conn: sqlite3.Connection,
+    experiment_id: int,
+    done: int = 0,
+    refused: int = 0,
+    failed: int = 0,
+) -> None:
+    """Add to the progress counters.
+
+    Relative rather than absolute so a counter update cannot lose a
+    concurrent one, and so the runner never has to hold a count in memory
+    that a restart would forget. These are for progress display only: the
+    report derives every number it publishes from the result rows, so a
+    counter that drifted could mislead a watcher but never a conclusion.
+    """
+    with conn:
+        conn.execute(
+            """UPDATE experiments
+               SET trials_done = trials_done + ?,
+                   trials_refused = trials_refused + ?,
+                   trials_failed = trials_failed + ?
+               WHERE id = ?""",
+            (done, refused, failed, experiment_id),
+        )
+
+
+def experiment_groups(
+    conn: sqlite3.Connection, experiment_id: int
+) -> list[dict[str, Any]]:
+    """Every group belonging to an experiment, in trial order.
+
+    Ordered by the cell coordinates rather than by id so the sequence is
+    the experiment's own structure and not the order the runner happened
+    to get to. An export or a report reading this gets the same order
+    every time, which is what makes a digest over it stable.
+    """
+    rows = conn.execute(
+        """SELECT id, created_at, prompt_text, models_json, budget,
+                  task_id, repeat_index, rotation_index
+           FROM groups WHERE experiment_id = ?
+           ORDER BY task_id, repeat_index, id""",
+        (experiment_id,),
+    ).fetchall()
+    out = []
+    for row in rows:
+        item = dict(row)
+        raw = item.pop("models_json")
+        item["models"] = json.loads(raw) if isinstance(raw, str) else None
+        out.append(item)
+    return out
+
+
+def add_score(conn: sqlite3.Connection, result_id: int, record: dict[str, Any]) -> int:
+    """Insert one score row. Never updates an existing one.
+
+    Re-scoring appends. A scoring pass that overwrote would destroy the
+    evidence that the score changed, and "the judge said 0.5 last week and
+    1.0 today" is exactly the fact someone auditing a claim needs. The
+    report picks the latest per (result, scorer, judge_model); the older
+    rows stay as the audit trail.
+
+    Every external number goes through the field-type functions on the way
+    in, judge output included: a judge is an upstream service like any
+    other, and a verdict carrying "score": "high" must land as None rather
+    than as a string in a REAL column.
+    """
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO scores
+               (result_id, scorer, score, passed, detail, judge_model,
+                judge_generation_id, judge_billed_cost_usd, blind,
+                self_judged, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                result_id,
+                record["scorer"],
+                as_metric(record.get("score")),
+                None if record.get("passed") is None else int(bool(record["passed"])),
+                as_text(record.get("detail")),
+                as_text(record.get("judge_model")),
+                as_text(record.get("judge_generation_id")),
+                as_money(record.get("judge_billed_cost_usd")),
+                None if record.get("blind") is None else int(bool(record["blind"])),
+                None
+                if record.get("self_judged") is None
+                else int(bool(record["self_judged"])),
+                _now(),
+            ),
+        )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def scores_for_results(
+    conn: sqlite3.Connection, result_ids: list[int]
+) -> dict[int, list[dict[str, Any]]]:
+    """Every score row for the given results, keyed by result id.
+
+    One query for the whole set rather than one per result: a report over
+    a 40-trial experiment would otherwise issue 40 queries to build one
+    table. Ordered by id so "latest per key" is the last one seen, which
+    is the rule the report applies.
+    """
+    if not result_ids:
+        return {}
+    marks = ",".join("?" for _ in result_ids)
+    rows = conn.execute(
+        f"SELECT * FROM scores WHERE result_id IN ({marks}) ORDER BY id",
+        tuple(result_ids),
+    ).fetchall()
+    out: dict[int, list[dict[str, Any]]] = {}
+    for row in rows:
+        item = dict(row)
+        # The three flag columns are stored 0/1/NULL; hand back bools and
+        # None so no reader has to know that.
+        for flag in ("passed", "blind", "self_judged"):
+            if item[flag] is not None:
+                item[flag] = bool(item[flag])
+        # Repair on read, like _repaired does for results: a score column
+        # written before this rule, or by a future writer that skipped
+        # add_score, must still read back as a number or as nothing.
+        item["score"] = as_metric(item["score"])
+        item["judge_billed_cost_usd"] = as_money(item["judge_billed_cost_usd"])
+        out.setdefault(item["result_id"], []).append(item)
+    return out

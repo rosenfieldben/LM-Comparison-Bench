@@ -3791,3 +3791,157 @@ def test_the_group_budget_is_required(client):
     assert client.post("/groups", json={"prompt": "p"}).status_code == 422
     assert client.post("/groups", json={"budget": "standard"}).status_code == 201
     assert client.post("/groups", json={"budget": "lavish"}).status_code == 422
+
+
+# ---- Phase I1: datasets as immutable files, experiments as the aggregate.
+
+
+def write_dataset(tmp_path, *rows, name="d.jsonl"):
+    path = tmp_path / name
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def experiment_body(path, **overrides):
+    body = {
+        "name": "smoke",
+        "dataset_path": path,
+        "lineup": ["model/alpha", "model/beta"],
+        "budget": "standard",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_creating_an_experiment_records_the_manifest_before_anything_runs(
+    client, tmp_path
+):
+    """The group-row discipline one level up. Everything knowable at
+    creation is written at creation, including which dataset bytes were
+    read, so an experiment that never starts still says what it was going
+    to be."""
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "hi"}, {"id": "t2", "prompt": "yo"}
+    )
+
+    created = client.post(
+        "/experiments",
+        json=experiment_body(path, params={"seed": 7}, repeats=3),
+    )
+
+    assert created.status_code == 201
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    assert detail["status"] == "created"
+    assert detail["dataset_name"] == "d.jsonl"
+    assert len(detail["dataset_digest"]) == 64
+    assert detail["lineup"] == ["model/alpha", "model/beta"]
+    assert detail["params"] == {"seed": 7}
+    assert detail["repeats"] == 3
+    assert detail["tasks_total"] == 2
+    # 2 tasks x 3 repeats x 2 models, the number of paid calls this will
+    # make, fixed now so a halt cannot make itself look complete.
+    assert detail["trials_total"] == 12
+    assert detail["trials_done"] == 0
+    assert detail["estimand_mode"] == "routed_service"
+    # The same provenance a run row carries, recorded once because it is
+    # fixed for the whole experiment.
+    assert detail["catalog_digest"] == TEST_CATALOG["digest"]
+    assert detail["data_policy"] == "standard"
+
+
+def test_an_experiment_records_only_the_controls_that_were_set(client, tmp_path):
+    """Rule two, one level up: an experiment that set nothing records
+    nothing, not an empty object and not a set of defaults."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    created = client.post("/experiments", json=experiment_body(path))
+
+    assert client.get(f"/experiments/{created.json()['id']}").json()["params"] is None
+
+
+def test_a_malformed_dataset_fails_creation_with_the_line(client, tmp_path):
+    """422 rather than 500, and the line number rather than a stack trace:
+    the caller's next action is to open that line."""
+    path = tmp_path / "bad.jsonl"
+    path.write_text('{"id": "t1", "prompt": "hi"}\n{"id": "t1", "prompt": "yo"}\n')
+
+    resp = client.post("/experiments", json=experiment_body(str(path)))
+
+    assert resp.status_code == 422
+    assert "line 2" in resp.json()["detail"]
+    assert "duplicate task id" in resp.json()["detail"]
+
+
+def test_a_missing_dataset_file_names_the_path(client, tmp_path):
+    resp = client.post(
+        "/experiments", json=experiment_body(str(tmp_path / "nope.jsonl"))
+    )
+
+    assert resp.status_code == 422
+    assert "cannot read dataset" in resp.json()["detail"]
+
+
+def test_an_experiment_too_large_to_run_is_refused_with_the_arithmetic(
+    client, tmp_path
+):
+    """The refusal shows its working, because the caller has three levers
+    (tasks, repeats, lineup) and needs to know which one to pull."""
+    rows = [{"id": f"t{i}", "prompt": "hi"} for i in range(600)]
+    path = write_dataset(tmp_path, *rows)
+
+    resp = client.post("/experiments", json=experiment_body(path, repeats=5))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "600 tasks x 5 repeats x 2 models is 6000" in detail
+    assert "5000 limit" in detail
+
+
+def test_provider_pins_are_refused_under_the_routed_service_estimand(client, tmp_path):
+    """A pin under an estimand defined by dynamic routing is a
+    contradiction. Refusing beats ignoring: a silently dropped pin would
+    leave a record claiming a pin that never rode a payload."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, provider_pins={"model/alpha": "Together"}),
+    )
+
+    assert resp.status_code == 422
+    assert "routed-service estimand routes dynamically" in resp.json()["detail"]
+
+
+def test_unknown_experiment_fields_are_rejected(client, tmp_path):
+    """extra="forbid" reaches the new surface too."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=experiment_body(path, temperature=0.5))
+
+    assert resp.status_code == 422
+
+
+def test_experiments_list_newest_first_and_a_missing_one_404s(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    first = client.post("/experiments", json=experiment_body(path, name="one")).json()
+    second = client.post("/experiments", json=experiment_body(path, name="two")).json()
+
+    listed = client.get("/experiments").json()["experiments"]
+
+    assert [e["id"] for e in listed[:2]] == [second["id"], first["id"]]
+    assert client.get("/experiments/999999").status_code == 404
+
+
+def test_the_experiment_endpoints_are_not_stored_by_any_cache(client, tmp_path):
+    """An experiment body carries every prompt in its dataset name and its
+    controls, so it belongs to the private, no-store class like every other
+    dynamic response."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    created = client.post("/experiments", json=experiment_body(path))
+
+    for resp in (
+        created,
+        client.get("/experiments"),
+        client.get(f"/experiments/{created.json()['id']}"),
+    ):
+        assert resp.headers.get("cache-control") == "private, no-store"

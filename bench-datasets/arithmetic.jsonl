@@ -1,0 +1,4 @@
+{"id": "add-1", "prompt": "What is 17 + 25? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
+{"id": "add-2", "prompt": "What is 100 - 58? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
+{"id": "mul-1", "prompt": "What is 6 times 7? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
+{"id": "digits-1", "prompt": "How many letters are in the word 'benchmark'? Reply with the number only.", "reference": "9", "scorer": {"kind": "regex", "pattern": "\\b9\\b"}}

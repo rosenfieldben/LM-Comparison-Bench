@@ -610,6 +610,79 @@ Every field name, bound and behavior above is pinned against OpenRouter's
 current documentation, with the URLs and the dates they were read in the
 comments in `bench/models.py`.
 
+## Datasets
+
+A dataset is a JSONL file, one task per line:
+
+```json
+{"id": "add-1", "prompt": "What is 17 + 25? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
+```
+
+`id` and `prompt` are required and every other field is optional. `system`
+is sent as that task's system message. `reference` is the expected answer
+for the comparing scorers. `rubric` is the scoring instruction for the
+judge. `scorer` names how the task is scored: `exact`,
+`normalized_exact`, `contains`, `regex` (with a `pattern`), or `judge`.
+Task ids must be unique within a file.
+
+**A dataset's version is its content.** There is no version field to keep
+in sync and no way to edit a file and leave a stale label behind: the
+identity is the sha256 of the raw bytes, recorded on every experiment that
+reads it, the same content-derived rule the asset revision and the catalog
+digest already follow. Two experiments citing the same digest read the
+same file, and that is checkable rather than promised. It is a digest over
+bytes, not over meaning: reordering the keys in a line changes the digest
+without changing the tasks, which is the honest limit of what a byte
+digest can claim.
+
+Validation happens when the experiment is created, not when scoring runs.
+A misspelled scorer name, a judge task with no rubric, or an `exact` task
+with no reference all fail at that point, naming the line, because
+discovering them after a run has paid for every trial is discovering them
+in the most expensive place available.
+
+Two examples ship in `bench-datasets/`: `arithmetic.jsonl` (deterministic
+scoring) and `summarize.jsonl` (rubric scoring). Your own files live
+wherever you keep them; the bench reads the path you name. There is no
+path allowlist, deliberately: the bench answers only to loopback clients
+and runs as you, so restricting the path would defend you against yourself
+while blocking the ordinary case.
+
+## Experiments
+
+An experiment is the aggregate above groups: one dataset, one lineup, one
+budget, one controls set, run for a stated number of repeats. Groups are
+unchanged, still the atomic one-prompt record created before any call and
+enforced at entry; each trial creates one, and four new columns say which
+experiment and which cell (task, repeat, rotation) it belongs to. A group
+with those columns NULL was run by hand, which is what every group in a
+pre-Phase-I database was.
+
+```sh
+curl -X POST localhost:8000/experiments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "arithmetic sweep",
+       "dataset_path": "bench-datasets/arithmetic.jsonl",
+       "lineup": ["openai/gpt-4o-mini", "anthropic/claude-3.5-haiku"],
+       "budget": "standard",
+       "repeats": 3,
+       "params": {"temperature": 0}}'
+```
+
+The row is written complete before anything runs, exactly as a group row
+is written before its first upstream call: it is the declaration, and what
+happened gets checked against it rather than assembled into it. That
+includes the dataset digest, the build (`app_sha`), the catalog digest,
+the data-handling policy, and the trial count. The trial count is stored
+rather than derived, because an experiment that halts leaves its un-run
+trials with nothing behind to count, and a denominator derived from
+existing rows would make a halt look like a completed run.
+
+`tasks x repeats x lineup` is the number of paid calls, and it is bounded
+at creation. An experiment over that bound is refused with the arithmetic
+shown, because the caller has three levers and needs to know which one to
+pull.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the
