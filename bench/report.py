@@ -41,7 +41,28 @@ BOOTSTRAP_ITERATIONS = 2000
 BOOTSTRAP_CONFIDENCE = 0.95
 
 
-def trial_outcome(result: dict[str, Any] | None) -> str:
+def provenance_era(run: dict[str, Any] | None) -> bool:
+    """Whether this run was written after provenance columns existed.
+
+    data_policy is the marker. It is written unconditionally on every run
+    the app has recorded since Phase G, including standard-policy boots:
+    _parse_data_policy returns "standard" rather than None when the
+    environment variable is unset, and the lifespan always sets it, so a
+    NULL there means the row predates the column rather than that the
+    boot declined to say.
+
+    That distinction is what makes the refusal rule below safe. Without
+    it the rule would read a pre-G errored row, whose request_json is
+    NULL only because the column did not exist yet, as a spend refusal.
+    A February error would become a February refusal in a report and in
+    an export, and the export is forever.
+    """
+    return run is not None and run.get("data_policy") is not None
+
+
+def trial_outcome(
+    result: dict[str, Any] | None, run: dict[str, Any] | None = None
+) -> str:
     """What happened to one trial, derived at read time from its row.
 
     Derived rather than stored as an enum column, which is this phase's
@@ -50,6 +71,12 @@ def trial_outcome(result: dict[str, Any] | None) -> str:
     migration and an old row cannot carry a label that predates the
     current rules.
 
+    run is the result's run row, and it is not optional in spirit even
+    though it defaults to None. It carries the era marker, and passing
+    None means "era unknown", which downgrades the refusal rule rather
+    than disabling the function. Callers that have the run row must pass
+    it; the report and the export both do.
+
     The rules, in order:
 
     None means the trial has no row at all. That happens when a group
@@ -57,12 +84,19 @@ def trial_outcome(result: dict[str, Any] | None) -> str:
     stopped experiment leaves behind, and calling it "missing" rather
     than omitting it is what keeps the denominator honest.
 
-    An error with NO request_json was never sent. request_json is written
-    before the request leaves, deliberately and on every path, so its
-    absence beside an error means the run was refused before anything was
-    built: the spend ceiling. This is structural rather than a match on
-    the refusal's wording, which the code that writes it explicitly warns
-    may be reworded.
+    An error with NO request_json, ON A ROW FROM THE PROVENANCE ERA, was
+    never sent. request_json is written before the request leaves,
+    deliberately and on every path, so its absence beside an error means
+    the run was refused before anything was built: the spend ceiling.
+    This is structural rather than a match on the refusal's wording,
+    which the code that writes it explicitly warns may be reworded.
+
+    The era gate is the whole reason provenance_era exists. A pre-G row
+    has a NULL request_json for an unrelated reason (the column postdates
+    it), so without the gate every legacy error would be reported as a
+    refusal. Outside the provenance era an error is simply an error: the
+    bench cannot prove a refusal there, and claiming one would be
+    inventing a fact about money that never moved.
 
     An error equal to ABORTED_ERROR is a run cut short by a client
     disconnect. Matched against the constant the writer uses, not against
@@ -76,7 +110,7 @@ def trial_outcome(result: dict[str, Any] | None) -> str:
     error = result.get("error")
     if error is None:
         return "done"
-    if result.get("request_json") is None:
+    if result.get("request_json") is None and provenance_era(run):
         return "refused"
     if error == ABORTED_ERROR:
         return "stopped"

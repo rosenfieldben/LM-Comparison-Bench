@@ -12,10 +12,14 @@ from bench.report import (
     ABORTED_ERROR,
     cluster_bootstrap,
     min_ranks,
+    provenance_era,
     scoring_state,
     summarize_metric,
     trial_outcome,
 )
+
+POST_G_RUN = {"data_policy": "standard"}
+PRE_G_RUN = {"data_policy": None}
 
 
 def result(**overrides):
@@ -52,8 +56,10 @@ def test_review_repro_a_refusal_is_told_from_an_error_structurally():
     refused = result(error="spend ceiling reached: recorded $1.00", request_json=None)
     upstream = result(error="HTTP 500 from OpenRouter")
 
-    assert trial_outcome(refused) == "refused"
-    assert trial_outcome(upstream) == "error"
+    # The run row is passed because the rule is era-gated; see
+    # test_review_repro_a_legacy_errored_row_is_not_a_refusal for why.
+    assert trial_outcome(refused, POST_G_RUN) == "refused"
+    assert trial_outcome(upstream, POST_G_RUN) == "error"
 
 
 def test_an_aborted_stream_is_stopped_not_errored():
@@ -66,7 +72,8 @@ def test_a_reworded_refusal_message_does_not_change_the_classification():
     """The point of the structural rule, stated as a test: the same row
     with completely different prose classifies the same way."""
     for message in ("spend ceiling reached", "out of money", "refused, sorry"):
-        assert trial_outcome(result(error=message, request_json=None)) == "refused"
+        row = result(error=message, request_json=None)
+        assert trial_outcome(row, POST_G_RUN) == "refused"
 
 
 # ---- Axis two: whether the bench could put a number on it.
@@ -238,3 +245,54 @@ def test_everything_tied_shares_the_top_rank():
 @pytest.mark.parametrize("values", [{}, {"a": None}])
 def test_ranking_nothing_ranks_nothing(values):
     assert min_ranks(values) == dict.fromkeys(values)
+
+
+# ---- The era gate. A legacy error is not a refusal.
+
+
+def test_review_repro_a_legacy_errored_row_is_not_a_refusal():
+    """The flank the structural rule left open.
+
+    A pre-G errored row has NULL request_json for a reason that has
+    nothing to do with money: the column postdates it. The naked
+    structural rule would read every February error as a spend refusal,
+    in a report and in an export, and the export is forever.
+    """
+    legacy = {"error": "HTTP 500 from OpenRouter", "request_json": None}
+
+    assert trial_outcome(legacy, PRE_G_RUN) == "error"
+    # The same row shape from the provenance era IS a refusal, which is
+    # what makes the gate a gate rather than a disabling of the rule.
+    assert trial_outcome(legacy, POST_G_RUN) == "refused"
+
+
+def test_an_unknown_era_is_treated_as_legacy():
+    """Passing no run means the caller could not say, and a rule that
+    cannot prove a refusal must not assert one. Downgrading to error is
+    the conservative direction: it under-reports refusals rather than
+    inventing them."""
+    row = {"error": "boom", "request_json": None}
+
+    assert trial_outcome(row) == "error"
+    assert trial_outcome(row, None) == "error"
+
+
+def test_the_era_marker_is_data_policy_and_standard_counts():
+    """A standard-policy boot writes "standard", not NULL, so the common
+    case is inside the era rather than outside it. If that were wrong the
+    gate would silently disable the refusal rule for almost every real
+    database."""
+    assert provenance_era({"data_policy": "standard"}) is True
+    assert provenance_era({"data_policy": "deny"}) is True
+    assert provenance_era({"data_policy": None}) is False
+    assert provenance_era(None) is False
+
+
+def test_the_gate_does_not_touch_the_other_outcomes():
+    """Only the refusal rule is era-sensitive; a legacy abort is still an
+    abort and a legacy success is still a success."""
+    assert trial_outcome({"error": None, "request_json": None}, PRE_G_RUN) == "done"
+    assert (
+        trial_outcome({"error": ABORTED_ERROR, "request_json": None}, PRE_G_RUN)
+        == "stopped"
+    )

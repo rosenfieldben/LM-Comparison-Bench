@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import store
+from bench import report, store
 
 
 @pytest.fixture
@@ -1525,3 +1525,51 @@ def test_scores_for_results_is_one_query_over_the_whole_set(db):
 
     assert sorted(out) == sorted(r["id"] for r in results)
     assert store.scores_for_results(db, []) == {}
+
+
+def test_review_repro_a_pre_g_errored_row_classifies_as_error_not_refused(tmp_path):
+    """The era gate, driven from the schema that actually shipped rather
+    than from a hand-built dict.
+
+    A pre-G errored row has NULL request_json because the column did not
+    exist yet, which has nothing to do with money. Ungated, the report's
+    structural refusal rule would read every legacy error as a spend
+    refusal, and the export would carry that misreading forever.
+
+    This is the closing review's legacy-fixture lens in test form: the
+    fixture is migrated by the real connect path, read back by the real
+    store, and classified by the real derivation.
+    """
+    db_path = tmp_path / "pre_g.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_G_SCHEMA)
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, NULL, 'legacy', '2026-02-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error)
+           VALUES (1, 'legacy/a', NULL, NULL, NULL, NULL,
+                   'HTTP 500 from OpenRouter')"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        run = store.get_run(conn, 1)
+        assert run is not None
+        result = run["results"][0]
+        # The two facts that would fool the ungated rule.
+        assert result["request_json"] is None
+        assert run["data_policy"] is None
+
+        assert report.trial_outcome(result, run) == "error"
+        # And the gate is a gate, not a disabling: the same row shape
+        # inside the provenance era is a refusal.
+        assert report.trial_outcome(result, {**run, "data_policy": "standard"}) == (
+            "refused"
+        )
+    finally:
+        conn.close()
