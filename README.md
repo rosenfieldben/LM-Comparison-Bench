@@ -870,10 +870,24 @@ reasons, so the vocabulary can change without a migration and no old row
 carries a label that predates the rules. A declared member that never ran
 counts as `missing` rather than vanishing.
 
+Two denominators go with those outcomes, and the difference between them
+matters enough that both are published. `planned` is every trial the plan
+called for. `attempted` is the subset where a request actually reached a
+provider: `done`, `error`, `stopped`. A `refused` trial was declined by
+the spend ceiling before the call went out and a `missing` trial never
+ran, so neither is an attempt. **`failure_rate` is `error / attempted`**
+and nothing else: a stop is the operator's decision, a refusal is the
+ceiling's, and a missing trial is the experiment's, so counting any of
+them would let a halted run read as a bad model. `refusal_rate` is
+`refused / planned`, because a refusal is a fact about the budget against
+the plan.
+
 *Axis two, scoring coverage:* `scored`, `scoring_failed`, `unscored`.
 This is what happened when the bench tried to put a number on a trial. A
 judge that returned gibberish, or a judge call the ceiling refused, lives
-here and only here.
+here and only here. A trial that never ran is on neither axis: it has no
+response to score, so calling it `unscored` would report a gap in
+coverage nobody could ever close.
 
 The two never mix, and the rule for the score mean is where they would be
 easiest to cross:

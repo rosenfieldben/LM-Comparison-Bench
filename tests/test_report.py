@@ -11,6 +11,7 @@ import pytest
 from bench.report import (
     ABORTED_ERROR,
     _cost_totals,
+    _model_report,
     _provider_counts,
     _scorer_report,
     cluster_bootstrap,
@@ -406,10 +407,70 @@ def test_a_failed_trial_is_a_zero_because_that_is_axis_one():
 
 def test_a_trial_that_never_ran_is_excluded_entirely():
     """An absence, not a zero. Scoring it zero would punish a model for
-    an experiment that was halted, which is a fact about a budget."""
+    an experiment that was halted, which is a fact about a budget.
+
+    Entirely means both axes. A trial with no response is not a scoring
+    gap either: calling it unscored would report coverage nobody could
+    ever close, so the mean, the coverage counters and the eligible count
+    all run over the same population.
+    """
     by_task = {"t1": [trial("done", 1.0)], "t2": [trial("missing", score=_MISSING)]}
 
     out = _scorer_report("judge", by_task, {}, seed=1)
 
     assert out["mean"] == 1.0
     assert out["n"] == 1
+    assert out["coverage"] == {
+        "scored": 1,
+        "scoring_failed": 0,
+        "unscored": 0,
+        "scoring_failure_rate": 0.0,
+    }
+
+
+# ---- The counter labels, which the export publishes forever.
+
+
+def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
+    """Labels are the contract, and a label that means something wider
+    than it says is the same class of defect as crossing the two axes.
+
+    The first version of _model_report reported every planned trial as
+    `attempted` and put `missing` in the failure-rate numerator beside
+    `error`. Halting an experiment therefore raised the failure rate of
+    every model that had trials left in the plan, and a spend ceiling
+    that declined a call was published as an attempt the model made.
+    Both are facts about the harness arriving in the model's column,
+    which is exactly what the two-axes work was for, one axis over.
+
+    Six trials: two done, one error, one stopped, one refused, one never
+    run. Attempted is four, because a refusal never left the process and
+    a missing trial never ran. The failure rate is 1/4, not 2/6.
+    """
+    by_task = {
+        "t1": [trial("done", 1.0), trial("error", score=_MISSING)],
+        "t2": [
+            trial("done", 1.0, task="t2"),
+            trial("stopped", score=_MISSING, task="t2"),
+        ],
+        "t3": [
+            trial("refused", score=_MISSING, task="t3"),
+            trial("missing", score=_MISSING, task="t3"),
+        ],
+    }
+
+    out = _model_report("m", by_task, {}, seed=1)
+    counts = out["trials"]
+
+    assert counts["planned"] == 6
+    assert counts["attempted"] == 4
+    # The outcome counters still partition the plan, not the attempts.
+    assert (
+        sum(counts[k] for k in ("done", "error", "refused", "stopped", "missing")) == 6
+    )
+    # One error over four attempts. The old rule read (1 error + 1
+    # missing) / 6 planned = 0.333, which is neither a rate the label
+    # describes nor a number about the model.
+    assert counts["failure_rate"] == pytest.approx(0.25)
+    # And the refusal is a rate against the plan it was measured over.
+    assert counts["refusal_rate"] == pytest.approx(1 / 6)

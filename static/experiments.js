@@ -51,7 +51,8 @@
       head([
         "model",
         "rank",
-        "asked",
+        "planned",
+        "attempted",
         "done",
         "error",
         "refused",
@@ -65,16 +66,32 @@
       const t = entry.trials;
       const tr = document.createElement("tr");
       tr.dataset.testid = "report-row";
+      // Two denominators because there are two populations: what the
+      // plan called for, and what actually reached a provider. A refused
+      // or never-run trial is in the first and not the second, and the
+      // failure rate is over the second, so it ships with its counts for
+      // the same reason the pass rate does.
       tr.append(
         cell(entry.model, "report-model"),
         cell(entry.rank == null ? "—" : String(entry.rank)),
+        cell(String(t.planned)),
         cell(String(t.attempted)),
         cell(String(t.done)),
         cell(String(t.error)),
         cell(String(t.refused)),
         cell(String(t.stopped)),
         cell(String(t.missing)),
-        cell(num(t.failure_rate, 2)),
+        cell(
+          t.failure_rate == null
+            ? "—"
+            : num(t.failure_rate, 2) +
+                " (" +
+                t.error +
+                "/" +
+                t.attempted +
+                " attempted)",
+          "report-failure-rate",
+        ),
       );
       body.append(tr);
     }

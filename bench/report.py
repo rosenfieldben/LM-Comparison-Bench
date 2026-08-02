@@ -362,7 +362,19 @@ def _model_report(
     outcomes = {name: 0 for name in ("done", "error", "refused", "stopped", "missing")}
     for trial in flat:
         outcomes[trial["outcome"]] += 1
-    attempted = len(flat)
+    # Three populations, and their names are the contract. Export field
+    # names are forever, so a counter whose label means something wider
+    # than the thing it counts is a defect of the same class as crossing
+    # the two axes: a fact about the harness arriving in the model's
+    # column.
+    #
+    # PLANNED is every trial the plan called for. ATTEMPTED is the subset
+    # where a request actually reached a provider: done, error, stopped.
+    # A refused trial was declined by the spend ceiling before the call
+    # went out, and a missing trial never ran at all, so neither is an
+    # attempt by anybody's reading of the word.
+    planned = len(flat)
+    attempted = outcomes["done"] + outcomes["error"] + outcomes["stopped"]
 
     # Score means over EVERY trial the model was asked to do, with a
     # failed trial scoring zero. That is the failure-inclusive rule: a
@@ -378,15 +390,20 @@ def _model_report(
     return {
         "model": model,
         "trials": {
+            "planned": planned,
             "attempted": attempted,
             **outcomes,
-            # Rates over everything asked, not over what came back.
-            "failure_rate": (
-                (outcomes["error"] + outcomes["missing"]) / attempted
-                if attempted
-                else None
-            ),
-            "refusal_rate": outcomes["refused"] / attempted if attempted else None,
+            # Failures over what the model was actually given, and errors
+            # only. A stop is the operator's decision, a refusal is the
+            # ceiling's, and a missing trial is the experiment's; none of
+            # the three is the model failing a task, and putting them
+            # here would let a halted run read as a bad model.
+            "failure_rate": outcomes["error"] / attempted if attempted else None,
+            # Refusals are a fact about the budget against the plan, so
+            # the plan is the denominator. Dividing them by the attempts
+            # they are definitionally not part of would be incoherent
+            # even though it happens to give the same number today.
+            "refusal_rate": outcomes["refused"] / planned if planned else None,
         },
         "scorers": per_scorer,
         "score": {"mean": primary.get("mean"), "interval": primary.get("interval")},
@@ -423,6 +440,14 @@ def _scorer_report(
     judge_models: set[str] = set()
     for task_id, trials in by_task.items():
         for trial in trials:
+            # A trial that never ran is on neither axis. It has no
+            # response to score, so calling it "unscored" would report a
+            # gap in scoring coverage that nobody could ever close, and
+            # would put a halted experiment into the scoring column. The
+            # mean and the eligible count already skip it; the coverage
+            # counters skip it here so all three share one population.
+            if trial["outcome"] == "missing":
+                continue
             rows = [r for r in trial["scores"] if r["scorer"] == scorer]
             state = scoring_state(trial["scores"], scorer)
             latest = rows[-1] if rows else None
@@ -455,11 +480,10 @@ def _scorer_report(
             # the crossing the two axes exist to prevent, and it would be
             # invisible in the result because it looks like a bad answer.
             #
-            # A trial that never ran contributes nothing either. It is an
-            # absence, and scoring it zero would punish a model for an
-            # experiment that was halted, which is a fact about a budget.
-            if trial["outcome"] == "missing":
-                continue
+            # A trial that never ran is already gone, skipped at the top
+            # of the loop. It is an absence, and scoring it zero would
+            # punish a model for an experiment that was halted, which is
+            # a fact about a budget.
             value = latest.get("score") if latest else None
             if trial["outcome"] not in COMPLETED:
                 values_by_task.setdefault(task_id, []).append(0.0)

@@ -5139,13 +5139,17 @@ def test_a_failed_trial_stays_in_the_denominator(client, tmp_path):
 
     report = client.get(f"/experiments/{eid}/report").json()
 
-    total = sum(m["trials"]["attempted"] for m in report["models"])
+    total = sum(m["trials"]["planned"] for m in report["models"])
     assert total == 8
     errored = [m for m in report["models"] if m["trials"]["error"] == 1]
     assert len(errored) == 1
     hurt = errored[0]
     # Four trials for this model, one errored: three score 1.0 and the
     # failure scores 0.0, so the mean is 0.75 exactly.
+    assert hurt["trials"]["planned"] == 4
+    # Nothing was refused and nothing was skipped, so every planned trial
+    # was also attempted and the two denominators coincide here. The
+    # tombstone in tests/test_report.py is where they do not.
     assert hurt["trials"]["attempted"] == 4
     assert hurt["score"]["mean"] == pytest.approx(0.75)
     assert hurt["trials"]["failure_rate"] == pytest.approx(0.25)
@@ -5171,12 +5175,14 @@ def test_the_two_axes_are_reported_separately(client, tmp_path):
             entry["trials"][k]
             for k in ("done", "error", "refused", "stopped", "missing")
         )
-        assert counted == entry["trials"]["attempted"]
-        # Axis two: every trial accounted for by scoring state.
+        assert counted == entry["trials"]["planned"]
+        # Axis two: every trial that produced a result accounted for by
+        # scoring state. A trial that never ran is on neither axis, so
+        # the population is the plan less what never ran.
         coverage = scorer["coverage"]
         assert (
             coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
-            == entry["trials"]["attempted"]
+            == entry["trials"]["planned"] - entry["trials"]["missing"]
         )
         # The scoring-failure rate is its own number, which is also the
         # response_format revisit measurement.
@@ -5469,6 +5475,27 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
     either would re-derive a different mean here while still matching on
     an experiment where everything succeeded.
 
+    The four rows the fixture actually produces, which is worth writing
+    down because an earlier description of this fixture named three
+    trials for model/beta when it has two:
+
+        model/alpha  task=scored    done   contains=1.0
+        model/beta   task=scored    error  contains=0.0
+        model/alpha  task=unscored  done   (no score rows)
+        model/beta   task=unscored  done   (no score rows)
+
+    Both wrong directions, as numbers, so the claim that this fixture
+    discriminates is checkable rather than asserted:
+
+        correct        alpha [1.0]      -> 1.0    beta [0.0]      -> 0.0
+        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 0.0] -> 0.0
+        B: drop failed alpha [1.0]      -> 1.0    beta []         -> None
+
+    So each direction is caught by one model and not the other: A moves
+    model/alpha and leaves model/beta at 0.0, B empties model/beta and
+    leaves model/alpha at 1.0. The pair is load-bearing, and asserting
+    only one of the two means would let one direction through.
+
     Re-derived by feeding the export's own rows back through the same
     pure function the report uses, which is what makes "self-sufficient"
     a check rather than a claim.
@@ -5554,6 +5581,16 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
         if s["scorer"] == "contains"
     ]
     assert coverage and any(c["unscored"] > 0 for c in coverage)
+
+    # Both discriminating values pinned, one per wrong direction. Each
+    # model catches the direction the other is blind to, per the table in
+    # the docstring.
+    means = {
+        m["model"]: (m["score"]["mean"], m["scorers"][0]["n"])
+        for m in rebuilt["models"]
+    }
+    assert means["model/alpha"] == (1.0, 1)  # direction A would read 0.5
+    assert means["model/beta"] == (0.0, 1)  # direction B would read None
 
     # And the export alone reproduces every model's mean and outcome
     # counts exactly.
