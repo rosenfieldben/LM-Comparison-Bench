@@ -5341,3 +5341,245 @@ def test_reporting_against_a_changed_dataset_is_refused(client, tmp_path):
 
 def test_a_report_for_a_missing_experiment_404s(client):
     assert client.get("/experiments/999999/report").status_code == 404
+
+
+# ---- Phase I6: the export artifact.
+
+import hashlib
+
+from bench.report import build_report
+
+
+@respx.mock
+def two_axes_experiment(client, tmp_path):
+    """An experiment shaped so the two-axes bug would corrupt its numbers.
+
+    Two tasks, two models. The second upstream call errors, so one trial
+    is an axis-one failure. Only the first task carries a scorer, so the
+    completed trials of the second task are axis-two unscored. A mean
+    that confused the two would read differently from the correct one,
+    which is what makes this the right shape to re-derive from an export.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "scored",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        # No scorer at all, so its trials stay unscored: the axis-two
+        # half of the shape.
+        {"id": "unscored", "prompt": "b"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+    return eid, path
+
+
+def read_export(client, eid):
+    with client.stream("GET", f"/experiments/{eid}/export.jsonl") as resp:
+        assert resp.status_code == 200
+        raw = resp.read()
+    return raw
+
+
+@respx.mock
+def test_review_repro_two_exports_of_one_experiment_are_byte_identical(
+    client, tmp_path
+):
+    """A citation names an artifact. An artifact that differs between two
+    honest exports of the same data cannot be checked against the
+    citation, so the digest would be decoration.
+
+    Line order is fixed by the query (task, repeat, position); key order
+    within a line is fixed by sort_keys. Both are needed, and this
+    asserts the pair rather than either alone.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    first = read_export(client, eid)
+    second = read_export(client, eid)
+
+    assert first == second
+    # Including the digest line, which is the part a citation quotes.
+    assert (
+        json.loads(first.decode().strip().split("\n")[-1])["digest"]
+        == (json.loads(second.decode().strip().split("\n")[-1])["digest"])
+    )
+
+
+@respx.mock
+def test_the_export_verifies_its_own_digest(client, tmp_path):
+    """Computed over the bytes as written, so the file checks itself with
+    no second pass and no sidecar to lose."""
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    raw = read_export(client, eid).decode()
+    lines = raw.split("\n")[:-1]
+    body = "\n".join(lines[:-1]) + "\n"
+    trailer = json.loads(lines[-1])
+
+    assert trailer["type"] == "digest"
+    assert trailer["algorithm"] == "sha256"
+    assert trailer["digest"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+@respx.mock
+def test_the_export_is_ordered_and_manifested(client, tmp_path):
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+
+    manifest = lines[0]
+    assert manifest["type"] == "manifest"
+    assert manifest["export_schema_version"] == 1
+    assert manifest["estimand_mode"] == "routed_service"
+    assert manifest["dataset_digest"]
+    assert manifest["bootstrap_unit"] == "task"
+    trials = [x for x in lines if x["type"] == "trial"]
+    # Deterministic ordering: task, then repeat, then position.
+    keys = [(t["task_id"], t["repeat_index"], t["position"]) for t in trials]
+    assert keys == sorted(keys)
+
+
+@respx.mock
+def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
+    client, tmp_path
+):
+    """The self-sufficiency claim, tested on the number most likely to be
+    wrong rather than on a lucky one.
+
+    The experiment has an errored trial (axis one) and completed trials
+    nobody scored (axis two). The score mean over it is only correct if
+    the export carried enough to keep those apart: the outcome per trial,
+    and the score rows with their nulls intact. An export that flattened
+    either would re-derive a different mean here while still matching on
+    an experiment where everything succeeded.
+
+    Re-derived by feeding the export's own rows back through the same
+    pure function the report uses, which is what makes "self-sufficient"
+    a check rather than a claim.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+    served = client.get(f"/experiments/{eid}/report").json()
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+    manifest = lines[0]
+    trials = [x for x in lines if x["type"] == "trial"]
+
+    # Rebuild the report's inputs from the export and nothing else.
+    groups, runs_by_group, scores_by_result = [], {}, {}
+    for trial in trials:
+        gid = trial["group_id"]
+        if gid not in runs_by_group:
+            groups.append(
+                {
+                    "id": gid,
+                    "task_id": trial["task_id"],
+                    "repeat_index": trial["repeat_index"],
+                    "rotation_index": trial["rotation_index"],
+                }
+            )
+            runs_by_group[gid] = []
+        run = next((r for r in runs_by_group[gid] if r["id"] == trial["run_id"]), None)
+        if run is None:
+            run = {
+                "id": trial["run_id"],
+                "data_policy": trial["data_policy"],
+                "app_sha": trial["app_sha"],
+                "catalog_digest": trial["catalog_digest"],
+                "prompt_text": trial["prompt_text"],
+                "results": [],
+            }
+            runs_by_group[gid].append(run)
+        run["results"].append(
+            {
+                "id": trial["result_id"],
+                "model": trial["model"],
+                "error": trial["error"],
+                "request_json": trial["request_json"],
+                "response_text": trial["response_text"],
+                "position": trial["position"],
+                "latency_ms": trial["latency_ms"],
+                "ttft_ms": trial["ttft_ms"],
+                "cost_usd": trial["cost_usd"],
+                "billed_cost_usd": trial["billed_cost_usd"],
+                "provider": trial["provider"],
+            }
+        )
+        scores_by_result[trial["result_id"]] = trial["scores"]
+
+    rebuilt = build_report(
+        {
+            "id": manifest["experiment_id"],
+            "name": manifest["name"],
+            "estimand_mode": manifest["estimand_mode"],
+            "dataset_name": manifest["dataset_name"],
+            "dataset_digest": manifest["dataset_digest"],
+            "repeats": manifest["repeats"],
+            "status": manifest["status"],
+            "status_detail": manifest["status_detail"],
+            "lineup": manifest["lineup"],
+        },
+        groups,
+        runs_by_group,
+        scores_by_result,
+        {},
+        manifest["report_seed"],
+    )
+
+    # The shape is the one the bug would have corrupted: an errored trial
+    # and unscored completed trials, both present.
+    outcomes = {m["model"]: m["trials"] for m in served["models"]}
+    assert sum(t["error"] for t in outcomes.values()) == 1
+    coverage = [
+        s["coverage"]
+        for m in served["models"]
+        for s in m["scorers"]
+        if s["scorer"] == "contains"
+    ]
+    assert coverage and any(c["unscored"] > 0 for c in coverage)
+
+    # And the export alone reproduces every model's mean and outcome
+    # counts exactly.
+    for served_model, rebuilt_model in zip(
+        served["models"], rebuilt["models"], strict=True
+    ):
+        assert served_model["model"] == rebuilt_model["model"]
+        assert served_model["trials"] == rebuilt_model["trials"]
+        assert served_model["score"]["mean"] == rebuilt_model["score"]["mean"]
+        assert (
+            served_model["scorers"][0]["coverage"]
+            == rebuilt_model["scorers"][0]["coverage"]
+        )
+
+
+@respx.mock
+def test_the_export_is_never_stored_by_a_cache(client, tmp_path):
+    """It carries every prompt and every answer in the experiment, which
+    makes it the most sensitive body the bench produces."""
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    with client.stream("GET", f"/experiments/{eid}/export.jsonl") as resp:
+        assert resp.headers.get("cache-control") == "private, no-store"
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        resp.read()
+
+
+def test_exporting_a_missing_experiment_404s(client):
+    assert client.get("/experiments/999999/export.jsonl").status_code == 404

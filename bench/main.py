@@ -41,7 +41,7 @@ from bench.models import (
     run_model,
     stream_model,
 )
-from bench.report import build_report
+from bench.report import build_report, export_line, export_manifest, export_trial
 from bench.scoring import judged_pass, score_response
 
 logger = logging.getLogger(__name__)
@@ -2780,3 +2780,89 @@ def _report_inputs(experiment_id: int, tasks_by_id: dict[str, Any]) -> dict[str,
         "tasks_by_id": tasks_by_id,
         "seed": REPORT_SEED,
     }
+
+
+@app.get("/experiments/{experiment_id}/export.jsonl")
+async def experiment_export(experiment_id: int) -> StreamingResponse:
+    """The whole experiment as JSONL: manifest, trials, digest.
+
+    Streams rather than buffers, because a MAX_TRIALS export is thousands
+    of lines carrying full prompts and full responses, and holding all of
+    it in memory to hand back at once is a cost with no benefit on a
+    localhost tool.
+
+    Ordered by task, then repeat, then position, so two exports of the
+    same experiment are byte-identical. Line order is fixed here; key
+    order within a line is fixed by export_line's sort_keys. Both are
+    needed: an artifact whose digest changes between two honest exports
+    of the same data cannot be cited, because the citation could never be
+    checked.
+
+    The last line is a digest over every preceding line, so a citation
+    can name the artifact it cites. It is sha256 over the bytes as
+    written, computed while streaming, which means the file verifies
+    itself with no second pass and no separate sidecar to lose.
+
+    private, no-store like every other dynamic body: this one carries
+    every prompt and every answer in the experiment, which makes it the
+    single most sensitive response the bench produces.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+
+    async def body() -> AsyncIterator[str]:
+        digest = hashlib.sha256()
+
+        def emit(payload: dict[str, Any]) -> str:
+            line = export_line(payload) + "\n"
+            digest.update(line.encode("utf-8"))
+            return line
+
+        yield emit(export_manifest(experiment, REPORT_SEED))
+        db = app.state.db
+        for group in store.experiment_groups(db, experiment_id):
+            detail = store.get_group(db, group["id"])
+            if detail is None:
+                continue
+            rows = [
+                (run, result) for run in detail["runs"] for result in run["results"]
+            ]
+            # Position, then result id as the tiebreak. A row with no
+            # position sorts last rather than crashing the comparison,
+            # and the id keeps two rows at the same position in a stable
+            # order, which is what byte-identical exports need.
+            rows.sort(
+                key=lambda pair: (
+                    pair[1].get("position") is None,
+                    pair[1].get("position") or 0,
+                    pair[1]["id"],
+                )
+            )
+            score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
+            for run, result in rows:
+                yield emit(
+                    export_trial(group, run, result, score_rows.get(result["id"], []))
+                )
+        # Not folded into the digest, obviously: it is the digest.
+        yield (
+            export_line(
+                {
+                    "type": "digest",
+                    "algorithm": "sha256",
+                    "digest": digest.hexdigest(),
+                }
+            )
+            + "\n"
+        )
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="experiment-{experiment_id}.jsonl"'
+            )
+        },
+    )

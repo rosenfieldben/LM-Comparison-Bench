@@ -22,6 +22,7 @@ eligible trials is not a pass rate anybody should act on, and the only
 way to know that is to see both numbers.
 """
 
+import json
 import math
 import random
 import statistics
@@ -536,3 +537,143 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
         if name:
             counts[name] = counts.get(name, 0) + 1
     return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])))
+
+
+# The export's own schema version, bumped when a line's shape changes in
+# a way a reader could not absorb. Not the app's version and not the
+# dataset's: a citation names an artifact, and the artifact has to say
+# which format it is in without anyone consulting a changelog.
+EXPORT_SCHEMA_VERSION = 1
+
+
+def export_line(payload: dict[str, Any]) -> str:
+    """One export line, serialized deterministically.
+
+    sort_keys, and that choice is the whole point rather than a
+    formatting preference. Line ORDER is fixed by the caller (task,
+    repeat, position); without a rule for key order within a line, two
+    honest exports of the same experiment would differ byte for byte
+    whenever a dict was built in a different order, and the digest over
+    them would differ too. An artifact that cannot reproduce its own
+    digest is not citation-grade, whatever else it carries.
+
+    sort_keys rather than a hand-written field order because a stated
+    order is a list someone has to remember to update, and the day they
+    forget it fails silently in exactly this way. Alphabetical is
+    arbitrary but it is also total, and it cannot fall out of date.
+
+    separators without spaces so the bytes are minimal and, more to the
+    point, so they are not a second thing to keep stable. ensure_ascii
+    off so a prompt in any script survives as itself rather than as
+    escapes: the export is meant to be read.
+    """
+    return json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    )
+
+
+def export_manifest(experiment: dict[str, Any], seed: int) -> dict[str, Any]:
+    """Line one: what this artifact IS.
+
+    Everything a reader needs to know what they are holding before they
+    read a single trial: which dataset by digest, which build, which
+    catalog, which estimand, which seeds. A citation that names the
+    artifact can be checked against the file rather than against a memory
+    of how it was produced.
+    """
+    return {
+        "type": "manifest",
+        "export_schema_version": EXPORT_SCHEMA_VERSION,
+        "experiment_id": experiment["id"],
+        "name": experiment["name"],
+        "created_at": experiment["created_at"],
+        "estimand_mode": experiment["estimand_mode"],
+        "dataset_name": experiment["dataset_name"],
+        "dataset_digest": experiment["dataset_digest"],
+        "lineup": experiment["lineup"],
+        "budget": experiment["budget"],
+        "params": experiment["params"],
+        "repeats": experiment["repeats"],
+        "task_order_seed": experiment["task_order_seed"],
+        "provider_pins": experiment["provider_pins"],
+        "halt_on_refusal": experiment["halt_on_refusal"],
+        "status": experiment["status"],
+        "status_detail": experiment["status_detail"],
+        "app_sha": experiment["app_sha"],
+        "catalog_digest": experiment["catalog_digest"],
+        "data_policy": experiment["data_policy"],
+        "trials_total": experiment["trials_total"],
+        "report_seed": seed,
+        "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
+        "bootstrap_unit": "task",
+    }
+
+
+def export_trial(
+    group: dict[str, Any],
+    run: dict[str, Any],
+    result: dict[str, Any],
+    scores: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """One trial line: everything needed to re-derive any published number.
+
+    The outcome is written out rather than left to be re-derived, and the
+    fields it was derived FROM are written beside it. That is not
+    redundancy: a reader on a future version of these rules can see both
+    what this bench concluded and what it concluded it from, and can tell
+    a rule change from a data change. data_policy rides along for the
+    same reason, since it is the era marker the refusal rule gates on.
+
+    Scores carry their own coverage-relevant fields (a null score with a
+    detail is a scoring failure, not a zero), because keeping the two
+    axes separate downstream is the whole reason to export scores at all
+    rather than just a mean.
+    """
+    return {
+        "type": "trial",
+        "task_id": group["task_id"],
+        "repeat_index": group["repeat_index"],
+        "rotation_index": group["rotation_index"],
+        "position": result.get("position"),
+        "model": result["model"],
+        "outcome": trial_outcome(result, run),
+        "group_id": group["id"],
+        "run_id": run["id"],
+        "result_id": result["id"],
+        "prompt_text": run["prompt_text"],
+        "request_json": result.get("request_json"),
+        "response_text": result.get("response_text"),
+        "error": result.get("error"),
+        "finish_reason": result.get("finish_reason"),
+        "native_finish_reason": result.get("native_finish_reason"),
+        "generation_id": result.get("generation_id"),
+        "provider": result.get("provider"),
+        "latency_ms": result.get("latency_ms"),
+        "ttft_ms": result.get("ttft_ms"),
+        "prompt_tokens": result.get("prompt_tokens"),
+        "completion_tokens": result.get("completion_tokens"),
+        "reasoning_tokens": result.get("reasoning_tokens"),
+        "cached_tokens": result.get("cached_tokens"),
+        "max_tokens": result.get("max_tokens"),
+        "cost_usd": result.get("cost_usd"),
+        "billed_cost_usd": result.get("billed_cost_usd"),
+        "app_sha": run.get("app_sha"),
+        "catalog_digest": run.get("catalog_digest"),
+        "data_policy": run.get("data_policy"),
+        "scores": [
+            {
+                "scorer": s["scorer"],
+                "score": s["score"],
+                "passed": s["passed"],
+                "detail": s["detail"],
+                "judge_model": s["judge_model"],
+                "judge_generation_id": s["judge_generation_id"],
+                "judge_billed_cost_usd": s["judge_billed_cost_usd"],
+                "blind": s["blind"],
+                "self_judged": s["self_judged"],
+                "created_at": s["created_at"],
+                "id": s["id"],
+            }
+            for s in scores
+        ],
+    }

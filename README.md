@@ -924,6 +924,48 @@ thing this layer exists to stop. The estimand leads the banner, and the
 `self-judged` and `blind` flags are surfaced per scorer row rather than
 folded into the numbers.
 
+## Export
+
+```sh
+curl -O localhost:8000/experiments/1/export.jsonl
+```
+
+JSONL. Line one is the manifest: which dataset by digest, which build,
+which catalog, which estimand, which seeds, what the experiment declared
+itself to be. Every following line is one trial with its full provenance,
+including the payload sent, the response, the timings, the token counts,
+both cost figures, the serving provider, and every score row attached.
+The last line is a sha256 over the preceding bytes, so a citation can
+name the artifact it cites and anyone can check the name.
+
+**Two exports of the same experiment are byte-identical.** Line order is
+task, then repeat, then position; key order within a line is sorted.
+Both rules are needed, and neither alone is enough: an artifact whose
+digest changes between two honest exports of the same data cannot be
+cited, because the citation could never be checked. Keys are sorted
+rather than listed in a stated order, because a stated order is a list
+someone must remember to update and the day they forget it fails
+silently in exactly this way.
+
+**The export is self-sufficient**, and that is tested rather than
+claimed. The round-trip test parses every line, verifies the digest, and
+rebuilds a report from the export alone by feeding its rows back through
+the same pure function the served report uses. The experiment it does
+this on is chosen to be the one a two-axes mistake would corrupt: it has
+an errored trial (axis one) and completed trials nobody scored (axis
+two), so a mean that confused them would come out different. An export
+that flattened either axis would still match on an experiment where
+everything succeeded, which is why that is not the experiment used.
+
+Each trial line carries the derived `outcome` **and** the fields it was
+derived from. That is not redundancy: a reader on a future version of
+these rules can see both what this bench concluded and what it concluded
+it from, and can tell a rule change from a data change.
+
+The response streams and carries `private, no-store` like every other
+dynamic body. It holds every prompt and every answer in the experiment,
+which makes it the most sensitive thing the bench will hand you.
+
 ## Blind human rating
 
 Replay a comparison and press "Rate blind". Every card's model id,
