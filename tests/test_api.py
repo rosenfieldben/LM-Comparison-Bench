@@ -4859,3 +4859,74 @@ def test_scoring_against_a_changed_dataset_is_refused(client, tmp_path):
     assert resp.status_code == 422
     assert "dataset changed" in resp.json()["detail"]
     assert "attribute one rubric's verdict to another's trial" in resp.json()["detail"]
+
+
+@respx.mock
+def test_a_declared_pass_threshold_decides_a_judged_pass(client, tmp_path):
+    """The threshold rides the task's scorer spec into the score row.
+    Without one, passed stays empty and the report says score mean; with
+    one, the author's own cutoff decides."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.6}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "strict",
+            "prompt": "a",
+            "rubric": "grade",
+            "scorer": {"kind": "judge", "pass_threshold": 0.75},
+        },
+        {
+            "id": "lenient",
+            "prompt": "b",
+            "rubric": "grade",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+        {
+            "id": "unstated",
+            "prompt": "c",
+            "rubric": "grade",
+            "scorer": {"kind": "judge"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    by_task = {}
+    for row in client.app.state.db.execute(
+        """SELECT g.task_id, s.passed, s.score FROM scores s
+           JOIN results r ON r.id = s.result_id
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ?""",
+        (eid,),
+    ):
+        by_task[row["task_id"]] = dict(row)
+
+    # The same 0.6 verdict, three different answers, all of them the
+    # rubric author's own.
+    assert by_task["strict"]["passed"] == 0
+    assert by_task["lenient"]["passed"] == 1
+    assert by_task["unstated"]["passed"] is None
+    assert all(r["score"] == 0.6 for r in by_task.values())

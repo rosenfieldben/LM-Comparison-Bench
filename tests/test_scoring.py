@@ -10,7 +10,12 @@ from hypothesis import given
 from hypothesis import strategies as st
 
 from bench.models import parse_verdict
-from bench.scoring import MAX_SUBJECT_CHARS, latest_per_key, score_response
+from bench.scoring import (
+    MAX_SUBJECT_CHARS,
+    judged_pass,
+    latest_per_key,
+    score_response,
+)
 
 
 def spec(kind, **extra):
@@ -236,3 +241,28 @@ def test_review_repro_rows_in_the_same_second_are_settled_by_id():
 
 def test_an_empty_set_is_empty():
     assert latest_per_key([]) == []
+
+
+# ---- judged_pass: a cutoff only when the rubric's author named one.
+
+
+def test_no_threshold_means_no_pass_verdict():
+    """The bench never defaults it. A report then says score mean rather
+    than manufacturing a pass rate out of a cutoff nobody chose."""
+    assert judged_pass({"kind": "judge"}, 0.9) is None
+    assert judged_pass({"kind": "judge"}, 0.0) is None
+
+
+def test_a_declared_threshold_decides_the_pass():
+    spec = {"kind": "judge", "pass_threshold": 0.75}
+
+    assert judged_pass(spec, 0.75) is True
+    assert judged_pass(spec, 1.0) is True
+    assert judged_pass(spec, 0.7) is False
+
+
+def test_a_scoring_failure_is_not_a_failed_answer():
+    """None in, None out. An unparseable verdict has no score, and
+    collapsing that into a fail would put the judge's own malfunctions
+    into the model's pass rate."""
+    assert judged_pass({"kind": "judge", "pass_threshold": 0.5}, None) is None

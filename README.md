@@ -807,11 +807,25 @@ failure with the reason attached. **A guessed number is never written**:
 it would enter an average and change a conclusion while looking exactly
 like a measurement.
 
-`passed` stays empty for judge scores. A rubric defines a graded score,
-and turning it into a pass needs a threshold the rubric never stated;
-inventing one would be the bench asserting a cutoff nobody chose. Reports
-show judge results as score means and deterministic results as pass rates,
-and say which is which.
+**A judged pass needs a threshold you declare.** A rubric defines a
+graded score, and 0.5 might mean "covered half the required points" in
+one rubric and "wrong but polite" in another, so the bench never supplies
+a cutoff. Add `pass_threshold` to a judge scorer and `passed` is derived
+from it; leave it out and `passed` stays empty:
+
+```json
+{"id": "sum-1", "prompt": "...", "rubric": "...", "scorer": {"kind": "judge", "pass_threshold": 0.75}}
+```
+
+Reports therefore say **pass rate where a threshold was declared, score
+mean otherwise**, and mean it. `pass_threshold` is refused on a
+deterministic scorer, which already produces a pass, for the same reason
+every other inert key is refused: accepting a setting that does nothing
+is worse than saying no to it.
+
+An unparseable verdict has no score and so no pass either, rather than
+counting as a failure. Collapsing the two would put the judge's own
+malfunctions into the model's pass rate.
 
 **Judge calls are spend.** The billed cost is captured in band, recorded
 on the score row, and added to the same accumulator the ceiling reads, so

@@ -109,3 +109,24 @@ def latest_per_key(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for row in sorted(rows, key=lambda r: (r["created_at"], r["id"])):
         best[(row["scorer"], row.get("judge_model"))] = row
     return list(best.values())
+
+
+def judged_pass(spec: dict[str, Any], score: float | None) -> bool | None:
+    """Whether a judged score counts as a pass, or None if nobody said.
+
+    A rubric defines a graded score. Turning that into a pass needs a
+    cutoff, and the only person who can name one is whoever wrote the
+    rubric: 0.5 might be "covered half the required points" in one rubric
+    and "wrong but politely" in another. So the threshold is optional on
+    the task's scorer spec and the bench never supplies a default.
+    Absent means None, and the report says "score mean" rather than
+    manufacturing a pass rate out of a cutoff nobody chose.
+
+    None in means None out: an unparseable verdict has no score, and a
+    scoring failure is not a failed answer. Collapsing the two would put
+    the judge's own malfunctions into the model's pass rate.
+    """
+    threshold = spec.get("pass_threshold")
+    if threshold is None or score is None:
+        return None
+    return bool(score >= float(threshold))

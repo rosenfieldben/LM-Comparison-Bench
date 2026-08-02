@@ -243,3 +243,102 @@ def test_any_well_formed_file_round_trips_its_ids_in_order(pairs):
     out = parse_dataset(raw)
 
     assert [t["id"] for t in out["tasks"]] == [i for i, _ in pairs]
+
+
+def test_a_judge_scorer_takes_an_optional_pass_threshold():
+    """The cutoff is the rubric author's to state. 0.5 might be "covered
+    half the required points" in one rubric and "wrong but polite" in
+    another, so the bench never supplies a default."""
+    out = parse_dataset(
+        dataset(
+            line(
+                id="t1",
+                prompt="a",
+                rubric="grade it",
+                scorer={"kind": "judge", "pass_threshold": 0.75},
+            )
+        )
+    )
+
+    assert out["tasks"][0]["scorer"] == {"kind": "judge", "pass_threshold": 0.75}
+
+
+def test_a_judge_scorer_without_a_threshold_records_none():
+    out = parse_dataset(
+        dataset(line(id="t1", prompt="a", rubric="grade", scorer={"kind": "judge"}))
+    )
+
+    assert out["tasks"][0]["scorer"] == {"kind": "judge"}
+
+
+def test_a_pass_threshold_outside_the_unit_interval_is_refused():
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1",
+                    prompt="a",
+                    rubric="g",
+                    scorer={"kind": "judge", "pass_threshold": 5},
+                )
+            )
+        )
+
+    assert "outside [0, 1]" in str(exc.value)
+
+
+def test_a_boolean_pass_threshold_is_refused():
+    """bool is an int in Python, so the type check has to say so
+    explicitly or True would become the threshold 1.0."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1",
+                    prompt="a",
+                    rubric="g",
+                    scorer={"kind": "judge", "pass_threshold": True},
+                )
+            )
+        )
+
+    assert "must be a number, got bool" in str(exc.value)
+
+
+def test_a_pass_threshold_on_a_deterministic_scorer_is_refused():
+    """Per-kind allowed keys, not one flat set. A deterministic scorer
+    already produces a pass, so a threshold there means nothing, and
+    accepting it silently would be exactly the ignored-setting failure the
+    unknown-key rule exists to stop."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1",
+                    prompt="a",
+                    reference="b",
+                    scorer={"kind": "exact", "pass_threshold": 0.5},
+                )
+            )
+        )
+
+    assert "unknown keys: pass_threshold" in str(exc.value)
+
+
+def test_a_pattern_on_a_non_regex_scorer_is_refused():
+    """The same rule in the other direction: pattern means nothing to
+    exact, and accepting it would accept a scoring setting that does
+    nothing."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1",
+                    prompt="a",
+                    reference="b",
+                    scorer={"kind": "exact", "pattern": "x"},
+                )
+            )
+        )
+
+    assert "unknown keys: pattern" in str(exc.value)

@@ -112,10 +112,36 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
         except re.error as exc:
             _fail(line_no, f"scorer.pattern is not a valid regex: {exc}")
         out["pattern"] = pattern
+    if kind == JUDGE_SCORER and "pass_threshold" in spec:
+        # The cutoff, when the rubric's author states one. Optional, and
+        # the bench never supplies a default: a rubric defines a graded
+        # score, so turning it into a pass or a fail is a decision only
+        # the person who wrote the rubric can make. Absent means the
+        # score stands alone and the report says so.
+        raw = spec["pass_threshold"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            _fail(
+                line_no,
+                f"scorer.pass_threshold must be a number, got {type(raw).__name__}",
+            )
+        threshold = float(raw)
+        if not 0.0 <= threshold <= 1.0:
+            _fail(line_no, f"scorer.pass_threshold {threshold} is outside [0, 1]")
+        out["pass_threshold"] = threshold
     # Unknown keys are refused rather than ignored, the same rule the API
     # boundary applies with extra="forbid". A silently dropped key in a
     # dataset is a scoring setting the author believes is in force.
-    allowed = {"kind", "pattern"}
+    #
+    # Per kind, not one flat set, and that is the difference between a
+    # rule and the appearance of one: pattern means nothing to exact, and
+    # pass_threshold means nothing to a deterministic scorer that already
+    # produces a pass. Allowing them everywhere would accept both and
+    # ignore both, which is the very failure this check exists to stop.
+    allowed = {"kind"}
+    if kind == "regex":
+        allowed.add("pattern")
+    if kind == JUDGE_SCORER:
+        allowed.add("pass_threshold")
     extra = sorted(set(spec) - allowed)
     if extra:
         _fail(line_no, f"scorer has unknown keys: {', '.join(extra)}")

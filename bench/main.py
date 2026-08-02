@@ -41,7 +41,7 @@ from bench.models import (
     run_model,
     stream_model,
 )
-from bench.scoring import score_response
+from bench.scoring import judged_pass, score_response
 
 logger = logging.getLogger(__name__)
 
@@ -2487,7 +2487,10 @@ async def score_one_result(
         {
             "scorer": "judge",
             "score": verdict["score"],
-            "passed": verdict["passed"],
+            # From the task's own threshold when its author declared one,
+            # and None otherwise. judge_response cannot decide this: it is
+            # a client function and has never seen the dataset spec.
+            "passed": judged_pass(spec, verdict["score"]),
             "detail": verdict["error"] or verdict["detail"],
             "judge_model": judge_model,
             "judge_generation_id": verdict["generation_id"],

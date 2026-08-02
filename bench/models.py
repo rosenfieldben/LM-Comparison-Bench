@@ -1019,6 +1019,14 @@ JUDGE_TIMEOUT_S = 60.0
 # structured output is a per-model capability. Paying provider
 # eligibility for a partial guarantee that removes no code is a bad
 # trade, so the shape is asked for in words and verified on arrival.
+#
+# Revisit this if the scoring-failure rate in real reports shows
+# unparseable verdicts are material in practice. The trade above assumes
+# they are rare; if a report shows judges losing a noticeable share of
+# their verdicts to formatting, the narrowed provider pool becomes the
+# cheaper cost and this should send response_format. The number to look
+# at is the count of judge score rows with a null score and a parse
+# error in detail, against the total judged.
 JUDGE_SYSTEM = (
     "You are grading one response against a rubric. Reply with JSON only, "
     'no prose and no code fence, exactly: {"score": <number between 0 and '
