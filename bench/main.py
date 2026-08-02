@@ -27,6 +27,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import store
 from bench.datasets import DatasetError, parse_dataset
+from bench.experiments import plan_trials, seed_for_repeat
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
@@ -368,6 +369,15 @@ ESTIMAND_MODES = ("routed_service", "underlying_model")
 MAX_REPEATS = 20
 MAX_TRIALS = 5000
 
+# How often the progress stream re-reads the counters. Polling rather
+# than a subscription because the runner writes progress to the database
+# and the database is the shared truth: a subscription would need the
+# runner to know about its watchers, and a watcher that joined late would
+# have to be caught up from the database anyway. A quarter second is far
+# below the pace of anything it reports (a trial is a network round trip)
+# and far above the cost of one indexed row read.
+PROGRESS_POLL_S = 0.25
+
 
 class ExperimentCreate(BaseModel):
     model_config = FORBID_UNKNOWN
@@ -402,6 +412,23 @@ class ExperimentCreate(BaseModel):
 
 class ExperimentCreated(BaseModel):
     id: int
+
+
+class ExperimentStart(BaseModel):
+    """The dataset to read at start time.
+
+    Asked for again rather than stored on the experiment row, and the
+    asymmetry is deliberate: the row records the digest of what was read
+    at creation, which is the claim about what the experiment IS. The path
+    is where those bytes happened to live, which can change without the
+    experiment changing. Re-reading and re-checking the digest at start is
+    what turns "the file moved" into a refusal instead of a silent run
+    over different tasks.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    dataset_path: str = Field(min_length=1, max_length=4096)
 
 
 class ExperimentDetail(BaseModel):
@@ -633,6 +660,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
     app.state.accumulated_spend_usd = 0.0
+    # The one experiment runner. Per process, because the semaphore and
+    # the ceiling it competes for are per process: two runners would
+    # interleave through the same five slots and each would measure the
+    # other's queueing. active is the running experiment's id or None,
+    # task holds a strong reference so asyncio does not collect a running
+    # task, and stop is the between-trials halt.
+    app.state.experiment_run = {
+        "active": None,
+        "task": None,
+        "stop": asyncio.Event(),
+        "dataset_path": None,
+    }
     # Data-handling routing, validated beside the ceiling and before any
     # request can be built. The resolved provider block is computed once
     # here rather than per request: it is boot-scoped by design, so a run
@@ -1904,6 +1943,353 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     if experiment is None:
         raise HTTPException(404, "no such experiment")
     return experiment
+
+
+async def run_one_trial(
+    experiment: dict[str, Any],
+    task: dict[str, Any],
+    model: str,
+    position: int,
+    group_id: int,
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    """One model against one task, through the machinery every run uses.
+
+    The same semaphore, the same post-admission ceiling recheck, the same
+    settlement inside the held slot, the same never-raises client. The
+    runner gets no faster path and no larger share: an experiment
+    competing with a browser run for the five slots is correct, because
+    both are spending the same money against the same ceiling.
+
+    Streaming rather than the batch call because ttft is a measurement the
+    report publishes, and only the streaming path can observe it. The
+    frames go nowhere: this is the one consumer of stream_model with no
+    client attached, which is also why there is no disconnect path here.
+    The runner is the client, and it does not disconnect.
+
+    Returns the result dict. Never raises for an upstream failure, which
+    is the same contract run_model and stream_model carry, because a
+    failed trial is data and must not end the experiment.
+    """
+    max_tokens = effective_budget(experiment["budget"], model)
+    holder: dict[str, Any] = {}
+    parts: list[str] = []
+    first_delta_ms: float | None = None
+    acquired = False
+    result: dict[str, Any] | None = None
+    try:
+        await app.state.upstream_semaphore.acquire()
+        acquired = True
+        # The recheck every admitted run gets, before the clock and before
+        # any upstream call. An experiment is exactly the case this
+        # protects against: hundreds of trials admitted over minutes, with
+        # the ceiling crossed somewhere in the middle.
+        if spend_ceiling_reached():
+            return spend_refusal_result(model, max_tokens)
+        start = time.perf_counter()
+        async for event in stream_model(
+            task["prompt"],
+            model,
+            app.state.client,
+            max_tokens=max_tokens,
+            holder=holder,
+            provider_prefs=request_provider_prefs(controls),
+            controls=controls,
+        ):
+            if event["type"] == "done":
+                result = event["result"]
+                break
+            if first_delta_ms is None:
+                first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
+            parts.append(event["text"])
+    finally:
+        # Released before persistence, exactly as the streaming endpoint
+        # releases before saving: a slot is for the upstream exchange, and
+        # holding one through a database write is a lie about how many
+        # paid calls are in flight.
+        if acquired:
+            app.state.upstream_semaphore.release()
+
+    if result is None:
+        # stream_model ended without a done event. Its own contract makes
+        # that nearly impossible, but "nearly" is not a thing to persist a
+        # silent success for: build the same shape the disconnect path
+        # builds, so the trial lands as the failure it was.
+        result = {
+            "model": model,
+            "response_text": "".join(parts) or None,
+            "latency_ms": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "error": "stream ended without a terminal event",
+            "cost_usd": None,
+            "ttft_ms": first_delta_ms,
+            "max_tokens": max_tokens,
+            "generation_id": holder.get("generation_id"),
+            "request_json": holder.get("request_json"),
+            "provider": holder.get("provider"),
+        }
+    result["position"] = position
+    # Post-spend, so its own fault boundary: the call has happened and
+    # nothing here may turn a paid result into an error.
+    try:
+        result["cost_usd"] = cost_usd(result, app.state.prices)
+        record_spend(ceiling_cost(result))
+    except Exception:
+        logger.exception("settlement failed for %s", model)
+        result["cost_usd"] = None
+    try:
+        store.save_run(
+            app.state.db,
+            task["prompt"],
+            [result],
+            None,
+            group_id,
+            run_provenance(),
+        )
+    except Exception:
+        # Same rule as both endpoints: the money is already spent, and
+        # losing history must not lose the response. The counters still
+        # move, so progress stays honest about what was attempted.
+        logger.exception("failed to persist experiment trial for %s", model)
+    return result
+
+
+async def run_experiment(experiment_id: int) -> None:
+    """Walk every cell of an experiment, one trial at a time.
+
+    Owned by app.state as a background task, which is what lets it outlive
+    the request that started it. That is the deliberate opposite of the
+    per-run disconnect contract: a browser run belongs to the tab that
+    started it and is abandoned when the tab goes away, because nobody is
+    watching it any more. An experiment belongs to the bench, not to a
+    watcher, and a laptop lid closing halfway through a paid sweep must
+    not silently end it. The progress stream is a view onto the run, not
+    the run itself.
+
+    Creates every group through the same entry-checked path any client
+    uses. There is no bypass: enforce_group_experiment runs on this
+    runner's own trials, so experiment-to-group consistency is the law
+    H1.2 already wrote rather than a promise this workstream makes.
+    """
+    db = app.state.db
+    experiment = store.get_experiment(db, experiment_id)
+    assert experiment is not None
+    state = app.state.experiment_run
+    lineup = experiment["lineup"]
+    controls_base = experiment["params"] or {}
+    try:
+        dataset = read_dataset(state["dataset_path"])
+    except HTTPException as exc:
+        # The file moved or became unreadable between creation and start.
+        # Not a crash: the experiment records why it never ran.
+        store.set_experiment_status(db, experiment_id, "failed", str(exc.detail))
+        return
+    if dataset["digest"] != experiment["dataset_digest"]:
+        # The bytes changed under it. Refusing is the whole point of
+        # recording a content digest: running anyway would produce a
+        # record citing one dataset and containing another, which is the
+        # single most misleading artifact this phase could emit.
+        store.set_experiment_status(
+            db,
+            experiment_id,
+            "failed",
+            f"dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}",
+        )
+        return
+    store.set_experiment_status(db, experiment_id, "running")
+    plan = plan_trials(
+        dataset["tasks"], lineup, experiment["repeats"], experiment["task_order_seed"]
+    )
+    status, detail = "done", None
+    try:
+        for cell in plan:
+            if state["stop"].is_set():
+                status, detail = "stopped", "stopped between trials"
+                break
+            task = cell["task"]
+            # The seed this repeat sends. Derived rather than fixed so
+            # repeats sample variation instead of buying the same sample
+            # N times; absent stays absent, which is rule one.
+            controls = dict(controls_base)
+            seeded = seed_for_repeat(controls_base.get("seed"), cell["repeat_index"])
+            if seeded is not None:
+                controls["seed"] = seeded
+            # A task's own system prompt overrides the experiment's, since
+            # it is the more specific declaration. Recorded on the group
+            # like any other control, so the record says what was sent.
+            if task["system"] is not None:
+                controls["system"] = task["system"]
+            group_id = store.create_group(
+                db,
+                task["prompt"],
+                lineup,
+                controls or None,
+                experiment["budget"],
+                {
+                    "experiment_id": experiment_id,
+                    "task_id": task["id"],
+                    "repeat_index": cell["repeat_index"],
+                    "rotation_index": cell["rotation_index"],
+                },
+            )
+            halted = False
+            for model in cell["order"]:
+                if state["stop"].is_set():
+                    status, detail = "stopped", "stopped between trials"
+                    halted = True
+                    break
+                # Position is the model's place in the DECLARED lineup, not
+                # its place in this cell's rotated entry order. The rotation
+                # changes who asks first; it does not change which column a
+                # model occupies, and a report that mixed the two would
+                # attribute one model's results to another's slot.
+                position = lineup.index(model)
+                # The entry checks, on the runner's own trial, exactly as a
+                # client's request gets them. Force a mismatch and this
+                # 409s the runner too, which is the point.
+                enforce_group_experiment(
+                    task["prompt"],
+                    controls,
+                    group_id,
+                    experiment["budget"],
+                    model=model,
+                    position=position,
+                )
+                result = await run_one_trial(
+                    experiment, task, model, position, group_id, controls
+                )
+                refused = bool(result.get("spend_refused"))
+                failed = not refused and result.get("error") is not None
+                store.bump_experiment_counters(
+                    db,
+                    experiment_id,
+                    done=0 if refused else 1,
+                    refused=1 if refused else 0,
+                    failed=1 if failed else 0,
+                )
+                if refused and experiment["halt_on_refusal"]:
+                    # The default. A ceiling refusal means the money ran
+                    # out, and continuing would produce a record whose
+                    # later rows are all refusals: technically honest,
+                    # practically noise, and expensive in wall time. The
+                    # un-run remainder is visible through the same
+                    # declared-but-missing machinery a partial comparison
+                    # already uses.
+                    status = "halted_on_refusal"
+                    detail = (
+                        "the per-boot spend ceiling was reached; "
+                        f"{model} on task {task['id']} was refused before "
+                        "reaching upstream"
+                    )
+                    halted = True
+                    break
+            if halted:
+                break
+    except Exception as exc:
+        logger.exception("experiment %s failed", experiment_id)
+        status, detail = "failed", f"{type(exc).__name__}: {exc}"
+    finally:
+        store.set_experiment_status(db, experiment_id, status, detail)
+        state["active"] = None
+
+
+@app.post("/experiments/{experiment_id}/start", status_code=202)
+async def start_experiment(experiment_id: int, body: ExperimentStart) -> dict[str, Any]:
+    """Start the runner. One at a time, and it says so when refusing.
+
+    One active experiment rather than a queue, because the semaphore and
+    the ceiling are process-wide: two experiments would interleave their
+    trials through the same five slots and each would measure the other's
+    queueing. That is not a limitation to apologize for, it is the only
+    arrangement in which an experiment's latency numbers mean anything.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    if experiment["status"] != "created":
+        raise HTTPException(
+            409,
+            f"experiment {experiment_id} is {experiment['status']}; an "
+            "experiment runs once. Create another to run it again.",
+        )
+    state = app.state.experiment_run
+    if state["active"] is not None:
+        raise HTTPException(
+            409,
+            f"experiment {state['active']} is already running. One at a "
+            "time: they share the upstream slots and the spend ceiling, "
+            "so concurrent experiments would measure each other.",
+        )
+    state["active"] = experiment_id
+    state["stop"] = asyncio.Event()
+    state["dataset_path"] = body.dataset_path
+    # Held on app.state so the task is not garbage collected mid-run, and
+    # so a stop can be issued against it. asyncio keeps only a weak
+    # reference to a bare create_task.
+    state["task"] = asyncio.create_task(run_experiment(experiment_id))
+    return {"id": experiment_id, "status": "running"}
+
+
+@app.post("/experiments/{experiment_id}/stop", status_code=202)
+async def stop_experiment(experiment_id: int) -> dict[str, Any]:
+    """Ask the runner to halt between trials.
+
+    Between trials, never inside one. A trial that has reached upstream
+    has already spent its money, and abandoning it would throw away a
+    result the user paid for; the same reasoning as the streaming path's
+    disconnect persistence, one level up.
+    """
+    ensure_rowid(experiment_id)
+    state = app.state.experiment_run
+    if state["active"] != experiment_id:
+        raise HTTPException(409, f"experiment {experiment_id} is not running")
+    state["stop"].set()
+    return {"id": experiment_id, "status": "stopping"}
+
+
+@app.get("/experiments/{experiment_id}/progress")
+async def experiment_progress(experiment_id: int) -> StreamingResponse:
+    """Counters as SSE, rejoinable, and never the thing that keeps the
+    run alive.
+
+    A client that disconnects and reconnects gets the current counters
+    immediately and then updates, because every frame carries absolute
+    values rather than deltas. Absolute frames also mean a dropped frame
+    costs nothing, which is what makes reconnection cheap enough to be
+    the ordinary case rather than an error path.
+    """
+    ensure_rowid(experiment_id)
+    if store.get_experiment(app.state.db, experiment_id) is None:
+        raise HTTPException(404, "no such experiment")
+
+    async def frames() -> AsyncIterator[str]:
+        last = None
+        while True:
+            experiment = store.get_experiment(app.state.db, experiment_id)
+            if experiment is None:
+                return
+            frame = {
+                "type": "progress",
+                "status": experiment["status"],
+                "status_detail": experiment["status_detail"],
+                "trials_total": experiment["trials_total"],
+                "trials_done": experiment["trials_done"],
+                "trials_refused": experiment["trials_refused"],
+                "trials_failed": experiment["trials_failed"],
+                "spend_usd": app.state.accumulated_spend_usd,
+            }
+            if frame != last:
+                yield "data: " + json.dumps(frame) + "\n\n"
+                last = frame
+            if experiment["status"] not in ("created", "running"):
+                return
+            await asyncio.sleep(PROGRESS_POLL_S)
+
+    return StreamingResponse(frames(), media_type="text/event-stream")
 
 
 @app.get("/models", response_model=CatalogResponse)

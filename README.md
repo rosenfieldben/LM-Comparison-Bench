@@ -683,6 +683,75 @@ at creation. An experiment over that bound is refused with the arithmetic
 shown, because the caller has three levers and needs to know which one to
 pull.
 
+## Running an experiment
+
+```sh
+curl -X POST localhost:8000/experiments/1/start \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_path": "bench-datasets/arithmetic.jsonl"}'
+
+curl -N localhost:8000/experiments/1/progress    # SSE counters
+curl -X POST localhost:8000/experiments/1/stop -H "Content-Type: application/json" -d '{}'
+```
+
+The path is given again at start, and the digest is re-checked against
+the one recorded at creation. A file that changed in between stops the
+experiment before it spends anything, because running would produce a
+record citing one dataset and containing another.
+
+One experiment runs at a time. They share the five upstream slots and the
+spend ceiling, so two at once would interleave through the same queue and
+each would measure the other's waiting; a second start gets a 409 saying
+exactly that. Every trial goes through the same semaphore, the same
+post-admission ceiling recheck, the same settlement inside the held slot
+and the same entry checks as any browser run. The runner creates its
+groups through the normal path with no bypass, so experiment-to-group
+consistency is the law the manifest check already enforces rather than a
+promise the runner makes about itself.
+
+**Repeats and seeds.** Repeats exist to sample variation. If the
+experiment's controls carry a seed, repeat N sends `seed + N`: the whole
+set stays reproducible while each repeat differs, where one fixed seed
+would buy the same sample N times at N times the price. If no seed was
+set, none is sent and each provider applies its own default, which is
+rule one unchanged. The derived seed rides `request_json` on every result
+like any other control, so the record says what was actually sent.
+
+**Rotation.** Models enter the semaphore in lineup order, so under
+saturation the first-listed model reliably gets a slot first and the
+last-listed reliably waits. That is a systematic advantage to being
+listed first, and repeats do not average it away because it points the
+same direction every time. The entry order therefore rotates per cell,
+and the rotation index is recorded on the group. Over a full cycle every
+model occupies every entry position an equal number of times. Position in
+the report is still the model's place in the declared lineup; rotation
+changes who asks first, not which column a model owns.
+
+**Task order** is file order unless `task_order_seed` is set, in which
+case it is shuffled with that seed and the seed is recorded. There is no
+unseeded shuffle, because an order nobody can reproduce makes an
+experiment unrepeatable by its own author.
+
+**Interruption is honest.** A stop halts between trials, never inside
+one: a trial that reached upstream has already spent its money, and
+abandoning it would throw away a result you paid for. The experiment ends
+`stopped` with its partial record intact, and the trials that never ran
+are visible as the gap between `trials_done` and `trials_total`. If the
+spend ceiling refuses a trial, the default (`halt_on_refusal`) stops the
+experiment and says so in `status_detail`; set it false to record
+refusals and keep going. Either way the conservation property holds
+across the whole experiment: every requested trial is accounted for as
+completed, failed, refused, or never attempted.
+
+**Progress survives disconnection**, and this is the one place in the
+bench where continuing after a client goes away is the point rather than
+a bug. A browser run belongs to the tab that started it and is abandoned
+when that tab closes, because nobody is watching. An experiment belongs
+to the bench: a laptop lid closing halfway through a paid sweep must not
+silently end it. The progress stream is a view onto the run, not the run
+itself, and every frame carries absolute counters rather than deltas so a
+reconnecting client is caught up by the next frame.
+
 ## Usage
 
 Open http://localhost:8000 in a browser. Type a prompt, check the

@@ -3945,3 +3945,393 @@ def test_the_experiment_endpoints_are_not_stored_by_any_cache(client, tmp_path):
         client.get(f"/experiments/{created.json()['id']}"),
     ):
         assert resp.headers.get("cache-control") == "private, no-store"
+
+
+# ---- Phase I2: the runner. Repeats, rotation, and honest interruption.
+
+
+def run_experiment_to_completion(client, experiment_id, path, timeout_s=20.0):
+    """Start the runner and drain its progress stream to a terminal state.
+
+    Draining the SSE stream rather than polling in a loop is what makes
+    this deterministic: the stream ends exactly when the experiment
+    reaches a terminal status, so there is no sleep to tune and no race
+    between the assertion and the runner.
+    """
+    started = client.post(
+        f"/experiments/{experiment_id}/start", json={"dataset_path": path}
+    )
+    assert started.status_code == 202, started.text
+    last = None
+    with client.stream("GET", f"/experiments/{experiment_id}/progress") as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                last = json.loads(line[5:])
+    return last
+
+
+@respx.mock
+def test_an_experiment_runs_every_cell_and_records_each_as_a_group(client, tmp_path):
+    """The end to end shape: two tasks, two repeats, two models is eight
+    trials, each one a group with its own cell coordinates and its own
+    persisted run."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "first"}, {"id": "t2", "prompt": "second"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done"
+    assert final["trials_done"] == 8
+    assert final["trials_total"] == 8
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["status"] == "done"
+    assert detail["trials_done"] == 8
+    # One group per cell, four cells, each carrying its coordinates.
+    rows = client.app.state.db.execute(
+        """SELECT task_id, repeat_index, rotation_index FROM groups
+           WHERE experiment_id = ? ORDER BY task_id, repeat_index""",
+        (eid,),
+    ).fetchall()
+    assert [(r["task_id"], r["repeat_index"]) for r in rows] == [
+        ("t1", 0),
+        ("t1", 1),
+        ("t2", 0),
+        ("t2", 1),
+    ]
+
+
+@respx.mock
+def test_rotation_is_recorded_and_actually_rotates_the_entry_order(client, tmp_path):
+    """The position-effect answer, asserted from the record rather than
+    from the plan: the rotation index on each group must advance, and the
+    request order upstream must follow it.
+
+    Models enter the semaphore in lineup order, so without rotation the
+    first-listed model would get a slot first on every single trial. That
+    is a systematic advantage that averaging cannot remove, because it
+    points the same way every time.
+    """
+    order = []
+
+    def route(request):
+        order.append(json.loads(request.content)["model"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, repeats=3, lineup=["model/alpha", "model/beta", "model/bare"]
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    rows = client.app.state.db.execute(
+        "SELECT rotation_index FROM groups WHERE experiment_id = ? ORDER BY repeat_index",
+        (eid,),
+    ).fetchall()
+    assert [r["rotation_index"] for r in rows] == [0, 1, 2]
+    # Three repeats of three models, each repeat starting one later.
+    assert order == [
+        "model/alpha",
+        "model/beta",
+        "model/bare",
+        "model/beta",
+        "model/bare",
+        "model/alpha",
+        "model/bare",
+        "model/alpha",
+        "model/beta",
+    ]
+
+
+@respx.mock
+def test_repeats_send_derived_seeds_and_an_unseeded_experiment_sends_none(
+    client, tmp_path
+):
+    """Rule one survives the repeat machinery in both directions: a seeded
+    experiment sends base+N so the repeats sample rather than repeat, and
+    an unseeded one sends no seed at all."""
+    seeds = []
+
+    def route(request):
+        seeds.append(json.loads(request.content).get("seed"))
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+
+    seeded = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, repeats=3, lineup=["model/alpha"], params={"seed": 100}
+        ),
+    ).json()["id"]
+    run_experiment_to_completion(client, seeded, path)
+    assert seeds == [100, 101, 102]
+
+    seeds.clear()
+    bare = client.post(
+        "/experiments", json=experiment_body(path, repeats=2, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, bare, path)
+    assert seeds == [None, None]
+
+
+@respx.mock
+def test_a_tasks_own_system_prompt_reaches_the_wire(client, tmp_path):
+    """The more specific declaration wins, and it is recorded on the group
+    like any other control so the record says what was sent."""
+    sent = []
+
+    def route(request):
+        sent.append(json.loads(request.content)["messages"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "body", "system": "be terse"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert sent[0][0] == {"role": "system", "content": "be terse"}
+    assert sent[0][1] == {"role": "user", "content": "body"}
+
+
+@respx.mock
+def test_a_second_experiment_cannot_start_while_one_runs(client, tmp_path):
+    """One at a time, said plainly. They share the upstream slots and the
+    ceiling, so concurrent experiments would measure each other."""
+    # An asyncio gate, not a threading one. The runner is a task on the
+    # same loop that serves requests, so a blocking wait inside the route
+    # would stall the very request that has to observe the 409. Awaiting
+    # yields the loop, which makes the ordering deterministic rather than
+    # a race between a sleep and the scheduler.
+    gate = asyncio.Event()
+
+    async def route(request):
+        await gate.wait()
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    first = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    second = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    assert (
+        client.post(
+            f"/experiments/{first}/start", json={"dataset_path": path}
+        ).status_code
+        == 202
+    )
+    blocked = client.post(f"/experiments/{second}/start", json={"dataset_path": path})
+
+    assert blocked.status_code == 409
+    assert "already running" in blocked.json()["detail"]
+    assert "measure each other" in blocked.json()["detail"]
+    gate.set()
+    with client.stream("GET", f"/experiments/{first}/progress") as resp:
+        for _ in resp.iter_lines():
+            pass
+
+
+@respx.mock
+def test_an_experiment_runs_once(client, tmp_path):
+    """A finished experiment is a record, not a template. Re-running into
+    the same row would mix two runs' trials under one manifest."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    again = client.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+
+    assert again.status_code == 409
+    assert "is done" in again.json()["detail"]
+
+
+@respx.mock
+def test_a_dataset_changed_since_creation_is_refused_rather_than_run(client, tmp_path):
+    """The whole point of recording a content digest. Running anyway would
+    produce a record citing one dataset and containing another, which is
+    the most misleading artifact this phase could emit."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "original"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    Path(path).write_text('{"id": "t1", "prompt": "edited"}\n', encoding="utf-8")
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "failed"
+    assert "dataset changed since this experiment was created" in final["status_detail"]
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_a_stop_halts_between_trials_and_leaves_an_honest_partial(client, tmp_path):
+    """A stopped experiment is a partial record, not a failed one, and it
+    says which it is. The trials that ran are real and stay; the ones that
+    did not are visible as the difference between done and total."""
+    seen = {"n": 0}
+    eid_box = {}
+
+    async def route(request):
+        # The stop endpoint's own body, awaited on the loop the runner
+        # lives on, rather than a nested synchronous client.post from
+        # inside the route. A nested request would re-enter the test
+        # client's portal while its loop is mid-trial, which passed in
+        # isolation and failed in the full suite: the runner ended
+        # "failed" instead of "stopped" and the reason was the harness,
+        # not the product. Awaiting the endpoint exercises the same code
+        # including its 409 guard, and is deterministic.
+        seen["n"] += 1
+        if seen["n"] == 1:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "stopped"
+    assert final["status_detail"] == "stopped between trials"
+    # The first trial completed and is real history; the rest never ran.
+    assert final["trials_done"] == 1
+    assert final["trials_total"] == 3
+    assert seen["n"] == 1
+
+
+@respx.mock
+def test_the_ceiling_halts_the_experiment_and_says_why(client, tmp_path, monkeypatch):
+    """A refusal means the money ran out. Halting beats continuing: every
+    later row would be a refusal, which is technically honest, practically
+    noise, and expensive in wall time."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    # Half of one result's charge: the first settlement closes the gate.
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "halted_on_refusal"
+    assert "spend ceiling" in final["status_detail"]
+    assert final["trials_done"] == 1
+    assert final["trials_refused"] == 1
+    # Conservation: every requested trial is accounted for as run,
+    # refused, or never attempted because the run halted.
+    assert final["trials_done"] + final["trials_refused"] <= final["trials_total"]
+    assert respx.calls.call_count == 1
+
+
+@respx.mock
+def test_conservation_holds_across_a_whole_experiment(client, tmp_path):
+    """The property the ceiling machinery has carried since F.3, stated
+    over an experiment rather than a batch: refusals plus upstream calls
+    account for every trial the experiment attempted."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    attempted = final["trials_done"] + final["trials_refused"] + final["trials_failed"]
+    assert attempted == final["trials_total"]
+    assert respx.calls.call_count + final["trials_refused"] == final["trials_total"]
+
+
+@respx.mock
+def test_progress_frames_are_absolute_so_a_reconnect_costs_nothing(client, tmp_path):
+    """Every frame carries totals rather than deltas, which is what makes
+    a dropped frame free and reconnection the ordinary case rather than an
+    error path."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    # Rejoining a finished experiment still gets its state, immediately,
+    # rather than hanging or 404ing.
+    with client.stream("GET", f"/experiments/{eid}/progress") as resp:
+        frames = [
+            json.loads(line[5:])
+            for line in resp.iter_lines()
+            if line.startswith("data:")
+        ]
+
+    assert frames[-1]["status"] == "done"
+    assert frames[-1]["trials_done"] == 1
+    assert "spend_usd" in frames[-1]
+
+
+def test_stopping_an_experiment_that_is_not_running_409s(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    resp = client.post(f"/experiments/{eid}/stop", json={})
+
+    assert resp.status_code == 409
+    assert "not running" in resp.json()["detail"]
