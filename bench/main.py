@@ -2605,6 +2605,10 @@ async def get_run(run_id: int) -> dict[str, Any]:
 # finer ones. Stored normalized to [0, 1] like every other score, so the
 # report averages human and machine scores without knowing which is
 # which; the raw point value stays in detail for anyone who wants it.
+# static/rating.js declares the same pair and renders one button per
+# point; test_the_rating_scale_matches_the_server_constant asserts the two
+# agree, because a client scale wider than this renders a button whose
+# click is refused and a narrower one makes the top unreachable.
 RATING_MIN = 1
 RATING_MAX = 5
 

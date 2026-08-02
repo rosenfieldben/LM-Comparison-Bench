@@ -8,6 +8,8 @@ the ratings are already in the database.
 """
 
 import json
+import re
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import expect
@@ -15,6 +17,7 @@ from playwright.sync_api import expect
 pytestmark = pytest.mark.browser
 
 DONE_TIMEOUT = 15_000
+STATIC = Path(__file__).resolve().parents[2] / "static"
 
 
 def cards(page):
@@ -261,3 +264,57 @@ def test_a_view_change_ends_the_rating_session(bench, open_history):
     expect(page.get_by_test_id("rating-row")).to_have_count(0)
     # And the new cards show their identities: nothing stayed concealed.
     assert "stub/fast" in bench_chrome(page)
+
+
+def test_the_global_hidden_rule_beats_a_selector_that_declares_display(page, bench):
+    """The rule that replaced three per-selector guards.
+
+    The user agent sheet hides [hidden] elements, but any explicit
+    display in volt.css outranks it, which is why #name-row,
+    #experiment-controls and .metrics each needed saying twice. The last
+    of those was not cosmetic: cost and timing stayed on screen through a
+    blind rating, and a rater who can see those can often name the model.
+
+    Asserted against a live class that declares display rather than
+    against the stylesheet text, because the question is which rule wins
+    in the browser and only the browser can answer it.
+    """
+    bench(["stub/fast"])
+
+    hidden_but_displayed = page.evaluate(
+        """() => {
+             const probe = document.createElement("div");
+             // .metrics declares display: grid, .rating-row declares
+             // display: flex. Either would have defeated the user agent
+             // rule on its own.
+             probe.className = "metrics";
+             probe.hidden = true;
+             probe.textContent = "probe";
+             document.getElementById("results").append(probe);
+             const shown = getComputedStyle(probe).display;
+             probe.remove();
+             return shown;
+           }"""
+    )
+
+    assert hidden_but_displayed == "none"
+
+
+def test_the_rating_scale_matches_the_server_constant():
+    """The H2 bounds precedent applied to the rating scale.
+
+    The client renders one button per point and the server validates the
+    same range, so the two constants are a pair that can drift. A client
+    scale wider than the server's would render a button whose click is
+    refused; a narrower one would quietly make the top of the scale
+    unreachable, and nothing on screen would say so.
+    """
+    from bench.main import RATING_MAX, RATING_MIN
+
+    source = (STATIC / "rating.js").read_text(encoding="utf-8")
+    declared = re.search(r"const RATING_MAX = (\d+);", source)
+    declared_min = re.search(r"const RATING_MIN = (\d+);", source)
+
+    assert declared, "static/rating.js must declare RATING_MAX"
+    assert int(declared.group(1)) == RATING_MAX
+    assert declared_min and int(declared_min.group(1)) == RATING_MIN

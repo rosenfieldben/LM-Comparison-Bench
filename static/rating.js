@@ -16,6 +16,17 @@
   // one is already being nudged.
   const LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 
+  // The rating scale, and it must equal RATING_MIN and RATING_MAX in
+  // bench/main.py. The server validates the range it receives, so a
+  // client scale wider than the server's renders a button whose click is
+  // refused, and a narrower one quietly makes the top of the scale
+  // unreachable with nothing on screen to say so.
+  // tests/browser/test_i4.py::test_the_rating_scale_matches_the_server_constant
+  // asserts the pair agrees, the same guard the controls markup carries
+  // against ExperimentParams.
+  const RATING_MIN = 1;
+  const RATING_MAX = 5;
+
   // The active blind session, or null. One at a time and per group: a
   // second session over the same group would be rating cards that are no
   // longer on screen.
@@ -97,14 +108,14 @@
     tag.dataset.testid = "rating-label";
     tag.textContent = label;
     row.append(tag);
-    for (let value = 1; value <= 5; value++) {
+    for (let value = RATING_MIN; value <= RATING_MAX; value++) {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "rating-button";
       button.dataset.testid = "rating-" + value;
       button.dataset.value = String(value);
       button.textContent = String(value);
-      button.setAttribute("aria-label", "rate " + value + " of 5");
+      button.setAttribute("aria-label", "rate " + value + " of " + RATING_MAX);
       button.addEventListener("click", () => {
         if (!current()) return;
         session.ratings.set(resultId, { rating: value, label: label });
