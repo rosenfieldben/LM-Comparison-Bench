@@ -41,6 +41,7 @@ from bench.models import (
     run_model,
     stream_model,
 )
+from bench.report import build_report
 from bench.scoring import judged_pass, score_response
 
 logger = logging.getLogger(__name__)
@@ -2697,3 +2698,85 @@ def _rating_detail(rating: Rating) -> str:
     """
     base = f"{rating.rating} of {RATING_MAX}"
     return f"{base}, shown as {rating.label}" if rating.label else base
+
+
+# ---- Phase I5: the report.
+
+# The seed the report's intervals are built from. Fixed rather than
+# random, so two loads of the same report agree: an interval that moved
+# between refreshes would read as instability in the data rather than in
+# the method. Recorded in every report and every export, so anyone
+# holding the artifact can recompute the same bounds.
+REPORT_SEED = 20260801
+
+
+@app.get("/experiments/{experiment_id}/report")
+async def experiment_report(
+    experiment_id: int, dataset_path: str | None = Query(default=None)
+) -> dict[str, Any]:
+    """Aggregates for one experiment, computed at read time.
+
+    Nothing is cached and nothing is stored. The numbers are derived from
+    the rows every time, which is the same discipline as the derived
+    outcome: a stored aggregate can disagree with the rows it came from,
+    and the day it does there is no way to tell which is wrong.
+
+    dataset_path is optional and it changes what can be reported, not how
+    much. Pass thresholds live in the dataset file rather than in the
+    database, so without the file the report cannot say which tasks
+    declared one, and it publishes score means with no pass rates. That
+    is the honest degrade: a pass rate over a population the report
+    cannot define would be a rate over an unknown denominator, which is
+    the exact failure the coverage numbers exist to prevent.
+
+    When the file is given its digest is checked, because scoring one
+    dataset's trials against another's thresholds is the same
+    misattribution the scoring pass refuses.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    tasks: dict[str, Any] = {}
+    if dataset_path is not None:
+        dataset = read_dataset(dataset_path)
+        if dataset["digest"] != experiment["dataset_digest"]:
+            raise HTTPException(
+                422,
+                "dataset changed since this experiment was created: recorded "
+                f"{experiment['dataset_digest'][:12]}, file is "
+                f"{dataset['digest'][:12]}. Reporting against different "
+                "tasks would attribute one rubric's threshold to another.",
+            )
+        tasks = {t["id"]: t for t in dataset["tasks"]}
+    report = build_report(experiment, **_report_inputs(experiment_id, tasks))
+    # Said out loud rather than left to be inferred from empty pass
+    # rates, which look identical to "nothing passed".
+    report["thresholds_available"] = bool(tasks)
+    return report
+
+
+def _report_inputs(experiment_id: int, tasks_by_id: dict[str, Any]) -> dict[str, Any]:
+    """Every row the report needs, read once.
+
+    Gathered here rather than inside build_report so that function stays
+    pure and can be run over an export instead of a database, which is
+    what makes the export's self-sufficiency claim checkable rather than
+    asserted.
+    """
+    db = app.state.db
+    groups = store.experiment_groups(db, experiment_id)
+    runs_by_group: dict[int, list[dict[str, Any]]] = {}
+    result_ids: list[int] = []
+    for group in groups:
+        detail = store.get_group(db, group["id"])
+        runs = detail["runs"] if detail else []
+        runs_by_group[group["id"]] = runs
+        result_ids.extend(r["id"] for run in runs for r in run["results"])
+    return {
+        "groups": groups,
+        "runs_by_group": runs_by_group,
+        "scores_by_result": store.scores_for_results(db, result_ids),
+        "tasks_by_id": tasks_by_id,
+        "seed": REPORT_SEED,
+    }

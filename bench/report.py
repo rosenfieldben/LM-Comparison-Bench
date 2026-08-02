@@ -33,11 +33,20 @@ from typing import Any
 # uses is what makes the match a definition instead of a guess.
 ABORTED_ERROR = "stream aborted before completion"
 
-# How many resamples the interval is built from, and how wide it is.
-# 2000 is enough for a percentile interval to be stable to the two
-# decimal places a report prints, and cheap enough (a few milliseconds
-# for a realistic experiment) to run inline on a request.
-BOOTSTRAP_ITERATIONS = 2000
+# How many times the task clusters are resampled to build one interval.
+# Named rather than inline because it is the knob that trades interval
+# stability against report latency, and an unnamed 2000 buried in a loop
+# is a knob nobody can find.
+#
+# 2000 is enough that the percentile bounds are stable to the two decimal
+# places a report prints: the Monte Carlo error on a 95 percent
+# percentile bound falls as 1/sqrt(resamples), so 2000 puts it well
+# below the rounding. Raising it buys precision the display throws away;
+# lowering it makes two loads of the same report disagree in their last
+# digit, which reads as instability in the data rather than in the
+# method. The seed is what makes a given report reproducible; this is
+# what makes it stable enough to be worth reproducing.
+BOOTSTRAP_RESAMPLES = 2000
 BOOTSTRAP_CONFIDENCE = 0.95
 
 
@@ -174,7 +183,7 @@ def summarize_metric(values: list[float]) -> dict[str, Any]:
 
 
 def cluster_bootstrap(
-    by_task: dict[str, list[float]], seed: int, iterations: int = BOOTSTRAP_ITERATIONS
+    by_task: dict[str, list[float]], seed: int, resamples: int = BOOTSTRAP_RESAMPLES
 ) -> dict[str, Any]:
     """A percentile interval for the mean, resampling TASKS not trials.
 
@@ -212,7 +221,7 @@ def cluster_bootstrap(
         }
     rng = random.Random(seed)
     means: list[float] = []
-    for _ in range(iterations):
+    for _ in range(resamples):
         drawn: list[float] = []
         for _ in range(len(tasks)):
             drawn.extend(tasks[rng.randrange(len(tasks))])
@@ -252,3 +261,278 @@ def min_ranks(scores: dict[str, float | None]) -> dict[str, int | None]:
         else:
             out[name] = index + 1
     return out
+
+
+def build_report(
+    experiment: dict[str, Any],
+    groups: list[dict[str, Any]],
+    runs_by_group: dict[int, list[dict[str, Any]]],
+    scores_by_result: dict[int, list[dict[str, Any]]],
+    tasks_by_id: dict[str, dict[str, Any]],
+    seed: int,
+) -> dict[str, Any]:
+    """One experiment's aggregates, per model.
+
+    Pure: every row it needs is handed in, so the whole report can be
+    rebuilt from an export without a database. That is not a stylistic
+    preference, it is what makes the export's self-sufficiency claim
+    checkable, since the check is "run this function over the export and
+    get the same numbers".
+
+    The two axes never mix. Trial outcomes drive failure rates and the
+    denominators of score means; scoring coverage drives the pass rate's
+    coverage figure and the scoring-failure rate. A judge that could not
+    answer never touches a model's failure count.
+    """
+    lineup = experiment["lineup"]
+    # trials[model][task_id] = list of per-trial records, so the bootstrap
+    # can resample by task without a second pass over the rows.
+    trials: dict[str, dict[str, list[dict[str, Any]]]] = {m: {} for m in lineup}
+    for group in groups:
+        task_id = group["task_id"]
+        seen: set[str] = set()
+        for run in runs_by_group.get(group["id"], []):
+            for result in run["results"]:
+                model = result["model"]
+                if model not in trials:
+                    continue
+                seen.add(model)
+                trials[model].setdefault(task_id, []).append(
+                    {
+                        "outcome": trial_outcome(result, run),
+                        "result": result,
+                        "scores": scores_by_result.get(result["id"], []),
+                        "task_id": task_id,
+                    }
+                )
+        # Declared members with no row at all. Recorded as missing rather
+        # than skipped, because a halted experiment's un-run trials are
+        # part of what was asked and leaving them out would quietly shrink
+        # every denominator they belong to.
+        for model in lineup:
+            if model not in seen:
+                trials[model].setdefault(task_id, []).append(
+                    {
+                        "outcome": "missing",
+                        "result": None,
+                        "scores": [],
+                        "task_id": task_id,
+                    }
+                )
+
+    models = [
+        _model_report(model, by_task, tasks_by_id, seed)
+        for model, by_task in trials.items()
+    ]
+    # Ranked on the primary score mean, min-rank so ties share a place.
+    ranks = min_ranks({m["model"]: m["score"]["mean"] for m in models})
+    for entry in models:
+        entry["rank"] = ranks[entry["model"]]
+    return {
+        "experiment_id": experiment["id"],
+        "name": experiment["name"],
+        # Every report says which question it answers. A number without
+        # its estimand is a number about nothing in particular.
+        "estimand_mode": experiment["estimand_mode"],
+        "dataset_name": experiment["dataset_name"],
+        "dataset_digest": experiment["dataset_digest"],
+        "repeats": experiment["repeats"],
+        "status": experiment["status"],
+        "status_detail": experiment["status_detail"],
+        "bootstrap": {
+            "seed": seed,
+            "resamples": BOOTSTRAP_RESAMPLES,
+            "confidence": BOOTSTRAP_CONFIDENCE,
+            # Named in the report because the reader has to know which
+            # unit was resampled to know what the interval claims.
+            "unit": "task",
+        },
+        "models": sorted(models, key=lambda m: lineup.index(m["model"])),
+    }
+
+
+def _model_report(
+    model: str,
+    by_task: dict[str, list[dict[str, Any]]],
+    tasks_by_id: dict[str, dict[str, Any]],
+    seed: int,
+) -> dict[str, Any]:
+    flat = [t for trials in by_task.values() for t in trials]
+    outcomes = {name: 0 for name in ("done", "error", "refused", "stopped", "missing")}
+    for trial in flat:
+        outcomes[trial["outcome"]] += 1
+    attempted = len(flat)
+
+    # Score means over EVERY trial the model was asked to do, with a
+    # failed trial scoring zero. That is the failure-inclusive rule: a
+    # mean over only the trials that came back is a mean over survivors,
+    # and the models that fail most would look best.
+    scorers = sorted({row["scorer"] for trial in flat for row in trial["scores"]})
+    per_scorer = [
+        _scorer_report(scorer, by_task, tasks_by_id, seed) for scorer in scorers
+    ]
+    primary = per_scorer[0] if per_scorer else {"mean": None, "interval": None}
+
+    completed = [t["result"] for t in flat if t["outcome"] in COMPLETED]
+    return {
+        "model": model,
+        "trials": {
+            "attempted": attempted,
+            **outcomes,
+            # Rates over everything asked, not over what came back.
+            "failure_rate": (
+                (outcomes["error"] + outcomes["missing"]) / attempted
+                if attempted
+                else None
+            ),
+            "refusal_rate": outcomes["refused"] / attempted if attempted else None,
+        },
+        "scorers": per_scorer,
+        "score": {"mean": primary.get("mean"), "interval": primary.get("interval")},
+        "latency_ms": summarize_metric([r.get("latency_ms") for r in completed]),
+        "ttft_ms": summarize_metric([r.get("ttft_ms") for r in completed]),
+        "cost": _cost_totals(completed),
+        # The routed-service estimand made visible. Under dynamic routing
+        # the provider is chosen per call, so it is the largest confound
+        # in any comparison the bench draws; counting them is what turns
+        # the confound from an assumption into a column.
+        "providers": _provider_counts(completed),
+    }
+
+
+def _scorer_report(
+    scorer: str,
+    by_task: dict[str, list[dict[str, Any]]],
+    tasks_by_id: dict[str, dict[str, Any]],
+    seed: int,
+) -> dict[str, Any]:
+    """One scorer's numbers for one model, with both axes reported.
+
+    The pass rate is passed over USABLE VERDICTS among tasks that
+    declared a threshold, and it always ships with its coverage. A pass
+    rate over three verdicts out of forty eligible trials is not a pass
+    rate anybody should act on, and the coverage number is the only thing
+    that says so; without it the denominator shrinks silently and the
+    rate looks like every other rate on the page.
+    """
+    values_by_task: dict[str, list[float]] = {}
+    scored = failed = unscored = 0
+    passed = usable_verdicts = eligible = 0
+    blind_rows = self_judged_rows = 0
+    judge_models: set[str] = set()
+    for task_id, trials in by_task.items():
+        for trial in trials:
+            rows = [r for r in trial["scores"] if r["scorer"] == scorer]
+            state = scoring_state(trial["scores"], scorer)
+            latest = rows[-1] if rows else None
+            # Axis two, counted on its own.
+            if state == "scored":
+                scored += 1
+            elif state == "scoring_failed":
+                failed += 1
+            else:
+                unscored += 1
+            if latest is not None:
+                if latest.get("blind"):
+                    blind_rows += 1
+                if latest.get("self_judged"):
+                    self_judged_rows += 1
+                if latest.get("judge_model"):
+                    judge_models.add(latest["judge_model"])
+            # The score mean, and this is where the two axes could most
+            # easily be crossed, so the rule is spelled out.
+            #
+            # A trial that FAILED contributes zero. That is the
+            # failure-inclusive rule: an errored or aborted trial is a
+            # trial that failed the task, and dropping it would average
+            # over survivors and flatter the models that fail most.
+            #
+            # A trial that SUCCEEDED but has no usable score contributes
+            # NOTHING. Its absence is axis two: nobody scored it, or the
+            # judge could not answer. Scoring it zero would put the
+            # judge's malfunction into the model's mean, which is exactly
+            # the crossing the two axes exist to prevent, and it would be
+            # invisible in the result because it looks like a bad answer.
+            #
+            # A trial that never ran contributes nothing either. It is an
+            # absence, and scoring it zero would punish a model for an
+            # experiment that was halted, which is a fact about a budget.
+            if trial["outcome"] == "missing":
+                continue
+            value = latest.get("score") if latest else None
+            if trial["outcome"] not in COMPLETED:
+                values_by_task.setdefault(task_id, []).append(0.0)
+            elif value is not None:
+                values_by_task.setdefault(task_id, []).append(value)
+            # The pass rate's population: tasks whose author declared a
+            # threshold. A task without one contributes to the mean and
+            # not to the rate, which is what "pass rate where a threshold
+            # was declared" means.
+            spec = (tasks_by_id.get(task_id) or {}).get("scorer") or {}
+            if spec.get("pass_threshold") is not None:
+                eligible += 1
+                if latest is not None and latest.get("passed") is not None:
+                    usable_verdicts += 1
+                    if latest["passed"]:
+                        passed += 1
+
+    flat = [v for values in values_by_task.values() for v in values]
+    total_states = scored + failed + unscored
+    return {
+        "scorer": scorer,
+        "mean": sum(flat) / len(flat) if flat else None,
+        "n": len(flat),
+        "interval": cluster_bootstrap(values_by_task, seed) if flat else None,
+        # Axis two, reported as its own numbers rather than folded into
+        # anything. scoring_failure_rate is also the measurement the
+        # response_format decision in bench/models.py says to revisit
+        # against, which is why it is computed even when nothing reads it.
+        "coverage": {
+            "scored": scored,
+            "scoring_failed": failed,
+            "unscored": unscored,
+            "scoring_failure_rate": failed / total_states if total_states else None,
+        },
+        "pass_rate": {
+            "rate": passed / usable_verdicts if usable_verdicts else None,
+            "passed": passed,
+            "usable_verdicts": usable_verdicts,
+            "eligible": eligible,
+        },
+        "blind": blind_rows,
+        "self_judged": self_judged_rows,
+        "judge_models": sorted(judge_models),
+    }
+
+
+def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Billed first, estimate as the fallback, and both counts shown.
+
+    The same rule the ceiling uses: what the platform charged beats what
+    the catalog implies. Reporting the two counts beside the total is
+    what keeps a total that is mostly estimate from reading like a bill.
+    """
+    billed = [
+        r["billed_cost_usd"] for r in results if r.get("billed_cost_usd") is not None
+    ]
+    estimated = [
+        r["cost_usd"]
+        for r in results
+        if r.get("billed_cost_usd") is None and r.get("cost_usd") is not None
+    ]
+    unpriced = len(results) - len(billed) - len(estimated)
+    return {
+        "total_usd": sum(billed) + sum(estimated),
+        "billed_trials": len(billed),
+        "estimated_trials": len(estimated),
+        "unpriced_trials": unpriced,
+    }
+
+
+def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for result in results:
+        name = result.get("provider")
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items(), key=lambda pair: (-pair[1], pair[0])))

@@ -2708,7 +2708,7 @@ def test_the_served_index_versions_every_asset_url(client):
     # it is asserted rather than derived on purpose: a new asset that the
     # transform failed to version would otherwise pass unnoticed, since
     # every OTHER url would still carry its rev.
-    assert len(referenced) == 12, referenced
+    assert len(referenced) == 13, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -5073,3 +5073,271 @@ def test_rating_a_group_that_does_not_exist_404s(client):
     )
 
     assert resp.status_code == 404
+
+
+# ---- Phase I5: the report.
+
+
+@respx.mock
+def scored_experiment(client, tmp_path, *, fail_second=False):
+    """A two-model, two-task, two-repeat experiment, run and scored."""
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if fail_second and calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        {
+            "id": "t2",
+            "prompt": "b",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+    return eid, path
+
+
+@respx.mock
+def test_the_report_names_its_estimand_and_its_resampling_unit(client, tmp_path):
+    """A number without its estimand is a number about nothing in
+    particular, and an interval without its resampling unit does not say
+    what it is an interval over."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["estimand_mode"] == "routed_service"
+    assert report["bootstrap"]["unit"] == "task"
+    assert report["bootstrap"]["seed"] == main.REPORT_SEED
+    assert report["bootstrap"]["resamples"] == 2000
+    assert report["dataset_digest"]
+
+
+@respx.mock
+def test_a_failed_trial_stays_in_the_denominator(client, tmp_path):
+    """Hand-computable, which is the point: eight trials, one of them
+    errored, and the errored one scores zero rather than vanishing. A
+    mean over survivors would read 1.0 and flatter the model that
+    failed."""
+    eid, path = scored_experiment(client, tmp_path, fail_second=True)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    total = sum(m["trials"]["attempted"] for m in report["models"])
+    assert total == 8
+    errored = [m for m in report["models"] if m["trials"]["error"] == 1]
+    assert len(errored) == 1
+    hurt = errored[0]
+    # Four trials for this model, one errored: three score 1.0 and the
+    # failure scores 0.0, so the mean is 0.75 exactly.
+    assert hurt["trials"]["attempted"] == 4
+    assert hurt["score"]["mean"] == pytest.approx(0.75)
+    assert hurt["trials"]["failure_rate"] == pytest.approx(0.25)
+    # The other model was untouched and reads 1.0, which is what makes
+    # the difference attributable.
+    clean = next(m for m in report["models"] if m["model"] != hurt["model"])
+    assert clean["score"]["mean"] == pytest.approx(1.0)
+
+
+@respx.mock
+def test_the_two_axes_are_reported_separately(client, tmp_path):
+    """A judge's malfunction is scoring coverage, not a model failure.
+    The trial counts and the coverage counts are different numbers over
+    the same trials, and neither leaks into the other."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    for entry in report["models"]:
+        scorer = entry["scorers"][0]
+        # Axis one: every trial accounted for by outcome.
+        counted = sum(
+            entry["trials"][k]
+            for k in ("done", "error", "refused", "stopped", "missing")
+        )
+        assert counted == entry["trials"]["attempted"]
+        # Axis two: every trial accounted for by scoring state.
+        coverage = scorer["coverage"]
+        assert (
+            coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
+            == entry["trials"]["attempted"]
+        )
+        # The scoring-failure rate is its own number, which is also the
+        # response_format revisit measurement.
+        assert coverage["scoring_failure_rate"] == 0.0
+
+
+@respx.mock
+def test_pass_rates_ship_with_their_coverage_and_only_where_declared(client, tmp_path):
+    """Pass rate where a threshold was declared, score mean otherwise,
+    and the coverage number is what keeps a shrinking denominator
+    visible."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "declared",
+            "prompt": "a",
+            "rubric": "g",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+        {"id": "silent", "prompt": "b", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    scorer = with_file["models"][0]["scorers"][0]
+
+    assert with_file["thresholds_available"] is True
+    # One task declared a threshold, one did not: eligible counts only
+    # the declared one, and the rate is over usable verdicts within it.
+    assert scorer["pass_rate"]["eligible"] == 1
+    assert scorer["pass_rate"]["usable_verdicts"] == 1
+    assert scorer["pass_rate"]["passed"] == 1
+    assert scorer["pass_rate"]["rate"] == 1.0
+    # Both tasks still contribute to the mean.
+    assert scorer["n"] == 2
+
+    # Without the file the report cannot define the population, so it
+    # says so rather than publishing a rate over an unknown denominator.
+    without = client.get(f"/experiments/{eid}/report").json()
+    assert without["thresholds_available"] is False
+    assert without["models"][0]["scorers"][0]["pass_rate"]["rate"] is None
+    assert without["models"][0]["scorers"][0]["mean"] == pytest.approx(0.9)
+
+
+@respx.mock
+def test_the_report_surfaces_the_self_judged_flag(client, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="model/alpha")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    assert scorer["self_judged"] == 1
+    assert scorer["judge_models"] == ["model/alpha"]
+
+
+@respx.mock
+def test_human_ratings_appear_as_their_own_scorer_row_with_the_blind_flag(
+    client, tmp_path
+):
+    """Human ratings are scores like any other, and the condition they
+    were made under travels with them."""
+    eid, path = scored_experiment(client, tmp_path)
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
+        },
+    )
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    human = [
+        s for m in report["models"] for s in m["scorers"] if s["scorer"] == "human"
+    ]
+    assert human, [s["scorer"] for m in report["models"] for s in m["scorers"]]
+    assert all(row["blind"] >= 1 for row in human)
+    assert all(row["mean"] == pytest.approx(0.75) for row in human)
+
+
+@respx.mock
+def test_the_report_shows_which_providers_actually_served(client, tmp_path):
+    """The routed-service estimand made visible: under dynamic routing
+    the provider is chosen per call, so it is the largest confound in any
+    comparison and counting it turns an assumption into a column."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    # The column exists on every model. The counts are empty here
+    # because the browser stub does not name a provider, which is a
+    # limit of the fixture rather than of the code; the counting itself
+    # is asserted in tests/test_report.py where the input is controlled.
+    assert all(isinstance(m["providers"], dict) for m in report["models"])
+
+
+@respx.mock
+def test_reporting_against_a_changed_dataset_is_refused(client, tmp_path):
+    eid, path = scored_experiment(client, tmp_path)
+    Path(path).write_text('{"id": "t1", "prompt": "different"}\n', encoding="utf-8")
+
+    resp = client.get(f"/experiments/{eid}/report", params={"dataset_path": path})
+
+    assert resp.status_code == 422
+    assert "attribute one rubric's threshold to another" in resp.json()["detail"]
+
+
+def test_a_report_for_a_missing_experiment_404s(client):
+    assert client.get("/experiments/999999/report").status_code == 404

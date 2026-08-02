@@ -10,6 +10,9 @@ import pytest
 
 from bench.report import (
     ABORTED_ERROR,
+    _cost_totals,
+    _provider_counts,
+    _scorer_report,
     cluster_bootstrap,
     min_ranks,
     provenance_era,
@@ -296,3 +299,117 @@ def test_the_gate_does_not_touch_the_other_outcomes():
         trial_outcome({"error": ABORTED_ERROR, "request_json": None}, PRE_G_RUN)
         == "stopped"
     )
+
+
+# ---- Cost and provider columns.
+
+
+def test_costs_prefer_the_billed_figure_and_show_both_counts():
+    """Billed beats estimate, the same rule the ceiling uses, and the two
+    counts beside the total are what stop a total that is mostly estimate
+    from reading like a bill."""
+    out = _cost_totals(
+        [
+            {"billed_cost_usd": 0.10, "cost_usd": 0.99},
+            {"billed_cost_usd": None, "cost_usd": 0.02},
+            {"billed_cost_usd": None, "cost_usd": None},
+        ]
+    )
+
+    assert out["total_usd"] == pytest.approx(0.12)
+    assert out["billed_trials"] == 1
+    assert out["estimated_trials"] == 1
+    assert out["unpriced_trials"] == 1
+
+
+def test_provider_counts_are_ordered_by_frequency_then_name():
+    """The routed-service estimand made visible. Under dynamic routing
+    the provider is chosen per call, so it is the largest confound in any
+    comparison the bench draws."""
+    out = _provider_counts(
+        [
+            {"provider": "Together"},
+            {"provider": "Fireworks"},
+            {"provider": "Together"},
+            {"provider": None},
+        ]
+    )
+
+    assert list(out.items()) == [("Together", 2), ("Fireworks", 1)]
+
+
+def test_a_provider_nobody_recorded_is_not_a_provider():
+    """An unnamed host is an absence, not a category called None."""
+    assert _provider_counts([{"provider": None}, {}]) == {}
+
+
+# ---- The crossing the two axes exist to prevent.
+
+
+def trial(outcome, score=None, scorer="judge", task="t1"):
+    scores = [] if score is _MISSING else [{"scorer": scorer, "score": score}]
+    return {"outcome": outcome, "result": {}, "scores": scores, "task_id": task}
+
+
+_MISSING = object()
+
+
+def test_review_repro_an_unscored_trial_is_not_a_zero_in_the_mean():
+    """The two-axes rule at its sharpest, and a defect this code had.
+
+    A trial the model completed but nobody scored contributes NOTHING to
+    the mean. Scoring it zero would put a gap in scoring coverage into
+    the model's score, where it is indistinguishable from a bad answer.
+    The first version of _scorer_report did exactly that, and it showed
+    up as a human-rating mean of 0.375 on a model every rater had given
+    four out of five: the unrated trials were being counted as failures
+    by the model rather than as work the rater had not done.
+    """
+    by_task = {
+        "t1": [trial("done", 1.0)],
+        "t2": [trial("done", score=_MISSING)],
+    }
+
+    out = _scorer_report("judge", by_task, {}, seed=1)
+
+    # One usable score, so the mean is that score.
+    assert out["mean"] == 1.0
+    assert out["n"] == 1
+    # And the gap is reported, on the other axis, where it belongs.
+    assert out["coverage"]["scored"] == 1
+    assert out["coverage"]["unscored"] == 1
+
+
+def test_a_judge_that_could_not_answer_is_not_a_zero_either():
+    """Same rule, different cause. An unparseable verdict is the bench's
+    machinery failing, not the model's answer being bad."""
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("done", None)]}
+
+    out = _scorer_report("judge", by_task, {}, seed=1)
+
+    assert out["mean"] == 1.0
+    assert out["coverage"]["scoring_failed"] == 1
+    assert out["coverage"]["scoring_failure_rate"] == 0.5
+
+
+def test_a_failed_trial_is_a_zero_because_that_is_axis_one():
+    """The other direction, so the fix above cannot be read as excluding
+    everything awkward. A trial that errored is a trial that failed the
+    task, and it belongs in the denominator at zero."""
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("error", score=_MISSING)]}
+
+    out = _scorer_report("judge", by_task, {}, seed=1)
+
+    assert out["mean"] == 0.5
+    assert out["n"] == 2
+
+
+def test_a_trial_that_never_ran_is_excluded_entirely():
+    """An absence, not a zero. Scoring it zero would punish a model for
+    an experiment that was halted, which is a fact about a budget."""
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("missing", score=_MISSING)]}
+
+    out = _scorer_report("judge", by_task, {}, seed=1)
+
+    assert out["mean"] == 1.0
+    assert out["n"] == 1

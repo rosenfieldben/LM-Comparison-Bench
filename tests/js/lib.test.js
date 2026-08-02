@@ -11,6 +11,7 @@ const {
   fmtBilled,
   fmtEstimate,
   niceScale,
+  minRanks,
   tokenizeDiff,
   diffTokens,
   controlBadges,
@@ -192,4 +193,21 @@ test("controlBadges gives every badge a long-form title", () => {
     "reasoning effort low",
     "provider routing: default",
   ]);
+});
+
+test("minRanks lets equal values share a place and skips the next", () => {
+  // Two models that measured identically are tied, and numbering them
+  // anyway would show a difference that is not in the data.
+  assert.deepEqual(minRanks([10, 20, 20, 30]), [1, 2, 2, 4]);
+  assert.deepEqual(minRanks([5, 5, 5]), [1, 1, 1]);
+  assert.deepEqual(minRanks([1, 2, 3]), [1, 2, 3]);
+  assert.deepEqual(minRanks([]), []);
+  assert.deepEqual(minRanks([7]), [1]);
+});
+
+test("minRanks ties at the top so every tied leader is fastest", () => {
+  // The race highlights rank 1. With a tie at the front that must be
+  // every tied row, not whichever one the sort happened to put first.
+  const ranks = minRanks([12.5, 12.5, 40]);
+  assert.equal(ranks.filter((r) => r === 1).length, 2);
 });

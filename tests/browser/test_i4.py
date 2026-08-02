@@ -318,3 +318,76 @@ def test_the_rating_scale_matches_the_server_constant():
     assert declared, "static/rating.js must declare RATING_MAX"
     assert int(declared.group(1)) == RATING_MAX
     assert declared_min and int(declared_min.group(1)) == RATING_MIN
+
+
+# ---- Phase I5: the report view.
+
+
+def test_the_report_leads_with_its_estimand_and_shows_both_axes(
+    page, bench, bench_url, tmp_path
+):
+    """The view's job is to be hard to misread. The estimand leads,
+    because a number without it is a number about nothing in particular;
+    the trial outcomes and the scoring coverage appear as separate
+    tables, because they are separate questions.
+    """
+    dataset = tmp_path / "d.jsonl"
+    dataset.write_text(
+        '{"id": "t1", "prompt": "hi", "reference": "reply", '
+        '"scorer": {"kind": "contains"}}\n',
+        encoding="utf-8",
+    )
+    created = page.request.post(
+        bench_url + "/experiments",
+        data={
+            "name": "i5 report view",
+            "dataset_path": str(dataset),
+            "lineup": ["stub/fast", "stub/slow"],
+            "budget": "standard",
+        },
+    )
+    assert created.ok, created.text()
+    eid = created.json()["id"]
+    started = page.request.post(
+        bench_url + f"/experiments/{eid}/start",
+        data={"dataset_path": str(dataset)},
+    )
+    assert started.ok, started.text()
+    # Drain progress to a terminal state, the same deterministic wait the
+    # API tests use.
+    for _ in range(200):
+        detail = page.request.get(bench_url + f"/experiments/{eid}").json()
+        if detail["status"] not in ("created", "running"):
+            break
+        page.wait_for_timeout(50)
+    assert detail["status"] == "done", detail
+
+    bench(["stub/fast"])
+    page.evaluate("(id) => window.BenchReport.show(id)", eid)
+    expect(page.get_by_test_id("report-panel")).to_be_visible()
+    expect(page.get_by_test_id("report-estimand")).to_contain_text(
+        "routed-service estimand"
+    )
+    # Two axes, two tables, and the interval's resampling unit named.
+    expect(page.get_by_test_id("report-outcomes")).to_be_visible()
+    expect(page.get_by_test_id("report-scores")).to_be_visible()
+    expect(page.get_by_test_id("report-banner")).to_contain_text("task clusters")
+    expect(page.get_by_test_id("report-row")).to_have_count(2)
+    # No dataset path was given, so pass rates are unavailable and the
+    # view says so rather than leaving empty cells to read as failures.
+    expect(page.get_by_test_id("report-threshold-note")).to_contain_text(
+        "pass rates are unavailable"
+    )
+
+
+def test_the_experiment_list_names_its_own_state(page, bench):
+    """Same discipline as the history panel: an empty list means two
+    different things while a fetch is in flight, so the panel says which
+    rather than leaving a blank to be read as "none"."""
+    bench(["stub/fast"])
+
+    page.get_by_test_id("experiments-toggle").click()
+
+    expect(page.get_by_test_id("experiment-list")).to_have_attribute(
+        "data-state", re.compile(r"ready|empty"), timeout=DONE_TIMEOUT
+    )

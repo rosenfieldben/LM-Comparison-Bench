@@ -880,3 +880,48 @@
   font-size: 12px;
   color: var(--text-ghost);
 }
+
+/* The experiment report. Plain tables on purpose: a chart of four means
+   invites the eye to read a difference the intervals do not support, and
+   this layer exists to stop that. */
+#report-panel {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.report-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+}
+.report-banner strong { color: var(--accent); font-size: 12px; }
+.report-note { color: var(--text-ghost); }
+#report-panel table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 10px;
+  font: 11px var(--mono);
+}
+#report-panel th {
+  text-align: left;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--hairline);
+  padding: 3px 6px;
+}
+#report-panel td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+#report-panel td.report-model { color: var(--text); }
+#report-panel td.report-flags { color: var(--text-faint); }

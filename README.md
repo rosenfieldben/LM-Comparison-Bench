@@ -850,6 +850,80 @@ pass over the same stored text at no extra model cost, so stopping the
 whole pass for one would trade a complete scoring run for nothing. Re-run
 the pass and the gaps fill in.
 
+## Reports
+
+```sh
+curl "localhost:8000/experiments/1/report?dataset_path=bench-datasets/arithmetic.jsonl"
+```
+
+Computed at read time from the rows, never cached and never stored. A
+stored aggregate can disagree with the rows it came from, and the day it
+does there is no way to tell which is wrong.
+
+**The report keeps two axes apart, everywhere.**
+
+*Axis one, trial outcomes:* `done`, `error`, `refused`, `stopped`,
+`missing`. This is what happened when the bench asked a model to do a
+task, and it is where a model's failure rate comes from. Outcomes are
+derived at read time from fields that were already recorded for their own
+reasons, so the vocabulary can change without a migration and no old row
+carries a label that predates the rules. A declared member that never ran
+counts as `missing` rather than vanishing.
+
+*Axis two, scoring coverage:* `scored`, `scoring_failed`, `unscored`.
+This is what happened when the bench tried to put a number on a trial. A
+judge that returned gibberish, or a judge call the ceiling refused, lives
+here and only here.
+
+The two never mix, and the rule for the score mean is where they would be
+easiest to cross:
+
+- A trial that **failed** contributes zero. That is the
+  failure-inclusive rule: an errored trial is a trial that failed the
+  task, and averaging over survivors would flatter the models that fail
+  most.
+- A trial that **succeeded but has no usable score** contributes nothing.
+  Its absence belongs to axis two. Scoring it zero would put the judge's
+  malfunction into the model's mean, where it is indistinguishable from a
+  bad answer.
+- A trial that **never ran** contributes nothing. It is an absence, and
+  scoring it zero would punish a model for an experiment that was halted,
+  which is a fact about a budget.
+
+**Pass rate where a threshold was declared, score mean otherwise**, and
+the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
+says passed, usable verdicts, and eligible trials. A pass rate over three
+verdicts out of forty eligible is not a pass rate anybody should act on,
+and the coverage figure is the only thing that says so. Thresholds live
+in the dataset, so without `dataset_path` the report publishes score
+means and no pass rates, and says which it is doing rather than leaving
+empty rates to look like "nothing passed".
+
+**The scoring-failure rate is its own reported number.** It is also the
+measurement the `response_format` decision in `bench/models.py` says to
+revisit against, so the report computes it whether or not anything reads
+it that day.
+
+**Intervals are 95% percentile bootstrap over TASK clusters**, seeded and
+recorded. Every repeat of a sampled task is kept together, because
+repeats of one task share that task's difficulty and are correlated;
+resampling trials independently would treat forty correlated trials as
+forty independent ones and narrow the interval below what the data
+supports. An overconfident interval is worse than none: it is false
+precision wearing the costume of rigor. With `repeats: 1` the two schemes
+coincide exactly. One task gets no interval at all, because a single
+cluster cannot be resampled into anything but itself.
+
+**Ties share a rank**, in the report and in the live race. Two models
+that measured identically are tied, and ordering them anyway would show a
+difference that is not in the data.
+
+The view is plain tables, deliberately. A bar chart of four means invites
+the eye to read a difference the intervals do not support, which is the
+thing this layer exists to stop. The estimand leads the banner, and the
+`self-judged` and `blind` flags are surfaced per scorer row rather than
+folded into the numbers.
+
 ## Blind human rating
 
 Replay a comparison and press "Rate blind". Every card's model id,
