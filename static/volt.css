@@ -902,6 +902,19 @@
 }
 .report-banner strong { color: var(--accent); font-size: 12px; }
 .report-note { color: var(--text-ghost); }
+/* Above the banner and above the tables, because it decides what the
+   tables can say. The input grows and the button does not. */
+.report-dataset {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.report-dataset .panel-label { margin: 0; white-space: nowrap; }
+.report-dataset input[type="text"] { flex: 1; min-width: 0; }
+/* A mismatch reads as a mismatch. The same error colour every other
+   failed load in this app uses. */
+[data-testid="report-state"][data-state="error"] { color: var(--err-text); }
 #report-panel table {
   border-collapse: collapse;
   width: 100%;

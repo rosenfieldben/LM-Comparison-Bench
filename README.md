@@ -938,6 +938,17 @@ thing this layer exists to stop. The estimand leads the banner, and the
 `self-judged` and `blind` flags are surfaced per scorer row rather than
 folded into the numbers.
 
+The report view has its own **dataset file** box, following the run-start
+precedent: the path is sent with the read, its digest is checked against
+the one recorded at creation, and a mismatch is refused in the server's
+own words rather than as a status code, naming both digests so the reader
+knows which of the two was wrong. The box stays on screen through the
+refusal, because a path you cannot see is a path you cannot correct.
+Without a file the report degrades to score means and says so. The path
+is remembered in a variable for as long as the tab is open and nowhere
+else: it is a fact about the operator's filesystem, not about the
+experiment, which is why the row records the file's digest instead.
+
 ## Export
 
 ```sh

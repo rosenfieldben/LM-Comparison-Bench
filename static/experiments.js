@@ -247,29 +247,98 @@
     return el;
   }
 
+  // The dataset path the operator last typed, held in a variable for as
+  // long as the tab is open and nowhere else. Not in localStorage and
+  // not sent anywhere to be stored: it is a path on their own machine,
+  // which is a fact about their filesystem rather than about the
+  // experiment, and the experiment row deliberately records the file's
+  // digest instead. The same reasoning the prompt library follows for
+  // what it will and will not keep.
+  let rememberedPath = "";
+
+  function datasetForm(experimentId, path) {
+    const form = document.createElement("form");
+    form.className = "report-dataset";
+    form.dataset.testid = "report-dataset-form";
+    const label = document.createElement("label");
+    label.className = "panel-label";
+    label.setAttribute("for", "report-dataset-path");
+    label.textContent = "Dataset file";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.id = "report-dataset-path";
+    input.dataset.testid = "report-dataset-path";
+    input.value = path;
+    input.placeholder = "leave blank for score means without pass rates";
+    input.title =
+      "Thresholds live in the dataset file, not the database, so pass " +
+      "rates need the file the experiment was created from. The digest " +
+      "is checked against the one recorded at creation and a mismatch " +
+      "is refused. Remembered for this tab only, never stored.";
+    const apply = document.createElement("button");
+    apply.type = "submit";
+    apply.dataset.testid = "report-dataset-apply";
+    apply.textContent = "apply";
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      rememberedPath = input.value.trim();
+      show(experimentId, rememberedPath);
+    });
+    form.append(label, input, apply);
+    return form;
+  }
+
+  async function fetchReport(experimentId, datasetPath) {
+    const url =
+      "/experiments/" +
+      experimentId +
+      "/report" +
+      (datasetPath ? "?dataset_path=" + encodeURIComponent(datasetPath) : "");
+    const resp = await fetch(url);
+    if (resp.ok) return resp.json();
+    // The server's own words rather than "HTTP 422". A digest mismatch
+    // is the one failure here the operator can act on, and the only
+    // thing naming both the recorded digest and the file's is the detail
+    // the server wrote. Collapsing it to a status code would leave them
+    // guessing which of the two was wrong.
+    let detail = "HTTP " + resp.status;
+    try {
+      const body = await resp.json();
+      if (body?.detail) detail = body.detail;
+    } catch (err) {
+      // A body that is not JSON leaves the status code, which is still
+      // more than nothing. Logged so it is never only in a variable.
+      console.error("report error body was not JSON", err);
+    }
+    throw new Error(detail);
+  }
+
   async function show(experimentId, datasetPath) {
+    // Undefined means "whatever the operator last applied", which is how
+    // opening a second experiment keeps their file. An explicit empty
+    // string means they cleared it, and that has to survive.
+    const path = datasetPath === undefined ? rememberedPath : datasetPath;
     panel.replaceChildren();
     panel.hidden = false;
+    panel.dataset.state = "loading";
     const note = document.createElement("div");
     note.dataset.testid = "report-state";
     note.textContent = "loading report";
-    panel.append(note);
+    // The form goes on the page before the fetch and stays there through
+    // a failure. A mismatch the operator cannot correct without
+    // reopening the panel would be a dead end, and the path they need to
+    // fix is the one already in the box.
+    panel.append(datasetForm(experimentId, path), note);
     let report;
     try {
-      const url =
-        "/experiments/" +
-        experimentId +
-        "/report" +
-        (datasetPath ? "?dataset_path=" + encodeURIComponent(datasetPath) : "");
-      const resp = await fetch(url);
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      report = await resp.json();
+      report = await fetchReport(experimentId, path);
     } catch (err) {
       // Same rule as every other load in this app: the failure is on the
       // page and on the console, never only in a variable.
       console.error("report load failed", err);
       note.textContent = "failed to load report: " + err.message;
       note.dataset.state = "error";
+      panel.dataset.state = "error";
       return;
     }
     note.remove();

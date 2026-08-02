@@ -323,13 +323,11 @@ def test_the_rating_scale_matches_the_server_constant():
 # ---- Phase I5: the report view.
 
 
-def test_the_report_leads_with_its_estimand_and_shows_both_axes(
-    page, bench, bench_url, tmp_path
-):
-    """The view's job is to be hard to misread. The estimand leads,
-    because a number without it is a number about nothing in particular;
-    the trial outcomes and the scoring coverage appear as separate
-    tables, because they are separate questions.
+def finished_experiment(page, bench_url, tmp_path, name):
+    """One two-model experiment over one scored task, run to done.
+
+    Shared by the report-view tests so they differ in what they assert
+    rather than in how they got there.
     """
     dataset = tmp_path / "d.jsonl"
     dataset.write_text(
@@ -340,7 +338,7 @@ def test_the_report_leads_with_its_estimand_and_shows_both_axes(
     created = page.request.post(
         bench_url + "/experiments",
         data={
-            "name": "i5 report view",
+            "name": name,
             "dataset_path": str(dataset),
             "lineup": ["stub/fast", "stub/slow"],
             "budget": "standard",
@@ -361,6 +359,18 @@ def test_the_report_leads_with_its_estimand_and_shows_both_axes(
             break
         page.wait_for_timeout(50)
     assert detail["status"] == "done", detail
+    return eid, dataset
+
+
+def test_the_report_leads_with_its_estimand_and_shows_both_axes(
+    page, bench, bench_url, tmp_path
+):
+    """The view's job is to be hard to misread. The estimand leads,
+    because a number without it is a number about nothing in particular;
+    the trial outcomes and the scoring coverage appear as separate
+    tables, because they are separate questions.
+    """
+    eid, _dataset = finished_experiment(page, bench_url, tmp_path, "i5 report view")
 
     bench(["stub/fast"])
     page.evaluate("(id) => window.BenchReport.show(id)", eid)
@@ -378,6 +388,62 @@ def test_the_report_leads_with_its_estimand_and_shows_both_axes(
     expect(page.get_by_test_id("report-threshold-note")).to_contain_text(
         "pass rates are unavailable"
     )
+
+
+def test_the_report_takes_a_dataset_path_and_says_so_when_it_does_not_match(
+    page, bench, bench_url, tmp_path
+):
+    """The run-start precedent, applied to the read side.
+
+    Thresholds live in the dataset file rather than in the database, so
+    pass rates need the file. The path is digest-verified against the one
+    recorded at creation, a mismatch is refused in the server's own
+    words, and the form survives the refusal so the operator can correct
+    the path they can see. Without a path the report degrades to score
+    means and says which it is doing.
+    """
+    eid, dataset = finished_experiment(page, bench_url, tmp_path, "i5 dataset input")
+    wrong = tmp_path / "wrong.jsonl"
+    wrong.write_text(
+        '{"id": "t1", "prompt": "different", "reference": "reply", '
+        '"scorer": {"kind": "contains"}}\n',
+        encoding="utf-8",
+    )
+
+    bench(["stub/fast"])
+    page.evaluate("(id) => window.BenchReport.show(id)", eid)
+    # Degraded and honest about it, with the box there to fix that.
+    expect(page.get_by_test_id("report-threshold-note")).to_be_visible()
+    expect(page.get_by_test_id("report-dataset-path")).to_have_value("")
+
+    page.get_by_test_id("report-dataset-path").fill(str(wrong))
+    page.get_by_test_id("report-dataset-apply").click()
+
+    # Loud, and in the server's words: a status code alone would not say
+    # which of the two digests was the one it recorded.
+    state = page.get_by_test_id("report-state")
+    expect(state).to_have_attribute("data-state", "error")
+    expect(state).to_contain_text("dataset changed since this experiment")
+    # And the form is still there, holding the path that needs fixing.
+    expect(page.get_by_test_id("report-dataset-path")).to_have_value(str(wrong))
+
+    page.get_by_test_id("report-dataset-path").fill(str(dataset))
+    page.get_by_test_id("report-dataset-apply").click()
+
+    # The right file, so pass rates become available and the note that
+    # said they were not goes away.
+    expect(page.get_by_test_id("report-panel")).to_have_attribute(
+        "data-state", "ready", timeout=DONE_TIMEOUT
+    )
+    expect(page.get_by_test_id("report-threshold-note")).to_have_count(0)
+    # Remembered for the tab and nowhere else: reopening the report with
+    # no argument keeps the file, and no storage holds it. A filesystem
+    # path is a fact about the operator's machine, and the experiment row
+    # deliberately records the file's digest instead.
+    page.evaluate("(id) => window.BenchReport.show(id)", eid)
+    expect(page.get_by_test_id("report-dataset-path")).to_have_value(str(dataset))
+    stored = page.evaluate("() => Object.values(window.localStorage).join('\\u0000')")
+    assert str(dataset) not in stored
 
 
 def test_the_experiment_list_names_its_own_state(page, bench):
