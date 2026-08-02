@@ -2334,10 +2334,17 @@ async def run_experiment(experiment_id: int) -> None:
                 )
                 refused = bool(result.get("spend_refused"))
                 failed = not refused and result.get("error") is not None
+                # Three disjoint buckets, which is what the conservation
+                # property means: done plus failed plus refused is the
+                # number of trials that finished, and the gap to
+                # trials_total is what never ran. Counting a failed trial
+                # as done as well would make trials_done mean "finished"
+                # while sitting beside a column named trials_failed, and
+                # the sum would exceed the total.
                 store.bump_experiment_counters(
                     db,
                     experiment_id,
-                    done=0 if refused else 1,
+                    done=0 if (refused or failed) else 1,
                     refused=1 if refused else 0,
                     failed=1 if failed else 0,
                 )
@@ -2561,7 +2568,7 @@ async def score_one_result(
     # The ceiling applies to judge calls because judge calls are spend.
     # A refusal here is this result's scoring failure and the pass goes
     # on; see score_experiment for why that differs from a trial refusal.
-    if spend_ceiling_reached():
+    def refuse_for_ceiling() -> None:
         store.add_score(
             app.state.db,
             result["id"],
@@ -2578,15 +2585,34 @@ async def score_one_result(
                 "self_judged": self_judged,
             },
         )
+
+    # Before the queue, so a pass that has already blown the ceiling does
+    # not spend minutes waiting for slots it will refuse anyway.
+    if spend_ceiling_reached():
+        refuse_for_ceiling()
         return
 
     async with app.state.upstream_semaphore:
+        # And again inside the held slot, which is the check that actually
+        # protects the money. Admission is not permission to spend: this
+        # call can sit behind five others for as long as they take, and a
+        # pass over three hundred results is exactly the case where the
+        # ceiling is crossed during that wait. Checking only before the
+        # queue is the F1.2 defect, one layer up.
+        if spend_ceiling_reached():
+            refuse_for_ceiling()
+            return
         verdict = await judge_response(
             app.state.client,
             judge_model,
             task["rubric"],
             task["reference"],
             result["response_text"],
+            # Routed-service prefs even under the underlying-model
+            # estimand. The estimand is a claim about the models being
+            # MEASURED; the judge is the bench's own instrument and is
+            # not one of them, and pinning it to a provider chosen for
+            # somebody else's lineup would be a claim nobody made.
             provider_prefs=app.state.provider_prefs,
         )
     # Post-spend. The call has happened, so nothing below may turn a paid

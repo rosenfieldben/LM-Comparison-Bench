@@ -467,10 +467,11 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             # means the catalog did not say, which strict mode treats as
             # "cannot check" rather than as "supports everything": see
             # missing_parameters. Pinned against OpenRouter's model
-            # listing at https://openrouter.ai/docs/api-reference/list-
-            # available-models, read 2026-08-02, where each model carries
+            # listing, read 2026-08-02, where each model carries
             # supported_parameters as an array of parameter names, the
-            # union over the providers that serve it.
+            # union over the providers that serve it. Not split across
+            # lines, because a wrapped URL is a URL nobody can click:
+            # https://openrouter.ai/docs/api-reference/list-available-models
             "supported_parameters": None,
         }
         supported = entry.get("supported_parameters")

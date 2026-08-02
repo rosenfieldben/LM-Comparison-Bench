@@ -209,16 +209,27 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
         # A judge scorer with no rubric cannot be run: the rubric IS the
         # scoring instruction, and a judge asked to score against nothing
         # would return an opinion about something nobody specified.
-        if scorer and scorer["kind"] == JUDGE_SCORER and task["rubric"] is None:
-            _fail(line_no, "scorer kind judge requires a rubric")
+        #
+        # Empty counts as absent here, unlike the optional fields above.
+        # A blank rubric is not a rubric, and the difference between
+        # omitting the key and writing "" is a typo away.
+        if scorer and scorer["kind"] == JUDGE_SCORER and not task["rubric"]:
+            _fail(line_no, "scorer kind judge requires a non-empty rubric")
         # The reference-comparing scorers have the same problem in the
-        # other direction.
+        # other direction, and an empty reference is worse than a missing
+        # one because it scores rather than failing: every response
+        # contains the empty string, so a `contains` task with reference
+        # "" gives every model on every repeat a perfect 1.0 and the
+        # report has no way to know the number is meaningless.
         if (
             scorer
             and scorer["kind"] in ("exact", "normalized_exact", "contains")
-            and task["reference"] is None
+            and not task["reference"]
         ):
-            _fail(line_no, f"scorer kind {scorer['kind']} requires a reference")
+            _fail(
+                line_no,
+                f"scorer kind {scorer['kind']} requires a non-empty reference",
+            )
         tasks.append(task)
 
     if not tasks:

@@ -641,6 +641,15 @@ with no reference all fail at that point, naming the line, because
 discovering them after a run has paid for every trial is discovering them
 in the most expensive place available.
 
+**Empty counts as missing** for a rubric or a comparing scorer's
+reference, and the empty case is the more dangerous of the two because it
+scores rather than failing: every string contains the empty string, so a
+`contains` task with `"reference": ""` would hand every model on every
+repeat a perfect 1.0, and nothing downstream could tell that number from
+a real one. The trial completed, the scorer ran, the score is in range,
+and the coverage counters say it was scored. The dataset file is the only
+place the meaninglessness is visible, so the refusal lives there.
+
 Two examples ship in `bench-datasets/`: `arithmetic.jsonl` (deterministic
 scoring) and `summarize.jsonl` (rubric scoring). Your own files live
 wherever you keep them; the bench reads the path you name. There is no

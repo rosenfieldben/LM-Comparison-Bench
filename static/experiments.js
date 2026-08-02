@@ -396,13 +396,27 @@
       name.textContent = experiment.name;
       const meta = document.createElement("span");
       meta.className = "hcount";
+      // Progress is trials FINISHED, which is the three disjoint buckets
+      // added up. Showing trials_done alone would leave an experiment
+      // whose trials are failing looking stuck rather than failing, and
+      // the two are the opposite of each other to act on.
+      const finished =
+        experiment.trials_done +
+        experiment.trials_failed +
+        experiment.trials_refused;
+      const trouble = [];
+      if (experiment.trials_failed > 0)
+        trouble.push(experiment.trials_failed + " failed");
+      if (experiment.trials_refused > 0)
+        trouble.push(experiment.trials_refused + " refused");
       meta.textContent =
         experiment.status +
         " · " +
-        experiment.trials_done +
+        finished +
         "/" +
         experiment.trials_total +
-        " trials";
+        " trials" +
+        (trouble.length ? " (" + trouble.join(", ") + ")" : "");
       row.append(time, name, meta);
       row.addEventListener("click", () => show(experiment.id));
       listEl.append(row);

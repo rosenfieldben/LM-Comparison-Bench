@@ -155,7 +155,7 @@ def test_a_reference_scorer_without_a_reference_is_refused():
     with pytest.raises(DatasetError) as exc:
         parse_dataset(dataset(line(id="t1", prompt="a", scorer={"kind": "exact"})))
 
-    assert "requires a reference" in str(exc.value)
+    assert "requires a non-empty reference" in str(exc.value)
 
 
 def test_a_judge_scorer_without_a_rubric_is_refused():
@@ -164,7 +164,39 @@ def test_a_judge_scorer_without_a_rubric_is_refused():
     with pytest.raises(DatasetError) as exc:
         parse_dataset(dataset(line(id="t1", prompt="a", scorer={"kind": "judge"})))
 
-    assert "requires a rubric" in str(exc.value)
+    assert "requires a non-empty rubric" in str(exc.value)
+
+
+def test_review_repro_an_empty_reference_is_refused_like_a_missing_one():
+    """Empty is worse than missing here, because it scores rather than
+    failing.
+
+    Every string contains the empty string, so a `contains` task with
+    reference "" gives every model on every repeat a perfect 1.0. Nothing
+    downstream can tell that number from a real one: the trial completed,
+    the scorer ran, the score is in range, and the coverage counters say
+    it was scored. The only place the meaninglessness is visible is the
+    dataset file, so the refusal belongs there.
+    """
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(id="t1", prompt="a", reference="", scorer={"kind": "contains"})
+            )
+        )
+
+    assert "requires a non-empty reference" in str(exc.value)
+
+
+def test_an_empty_rubric_is_refused_like_a_missing_one():
+    """A blank rubric is not a rubric, and omitting the key is a typo
+    away from writing an empty one."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(line(id="t1", prompt="a", rubric="", scorer={"kind": "judge"}))
+        )
+
+    assert "requires a non-empty rubric" in str(exc.value)
 
 
 def test_an_invalid_regex_is_refused_at_load():

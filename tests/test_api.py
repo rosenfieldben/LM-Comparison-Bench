@@ -4339,6 +4339,47 @@ def test_conservation_holds_across_a_whole_experiment(client, tmp_path):
 
 
 @respx.mock
+def test_review_repro_a_failed_trial_is_not_also_a_done_trial(client, tmp_path):
+    """The conservation test above passed vacuously.
+
+    Its fixture never fails a trial, so the sum it checks could not
+    detect double counting, and the runner was doing exactly that: a
+    failed trial bumped trials_done AND trials_failed. The README states
+    the property as four disjoint buckets (completed, failed, refused,
+    never attempted), and with one failure in four the sum was five out
+    of four.
+
+    Stated over a fixture that actually fails something, which is the
+    only way this assertion is worth making.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["trials_total"] == 4
+    assert final["trials_failed"] == 1
+    assert final["trials_refused"] == 0
+    # Three succeeded, one failed, none refused, none skipped.
+    assert final["trials_done"] == 3
+    assert (
+        final["trials_done"] + final["trials_failed"] + final["trials_refused"]
+        == final["trials_total"]
+    )
+
+
+@respx.mock
 def test_progress_frames_are_absolute_so_a_reconnect_costs_nothing(client, tmp_path):
     """Every frame carries totals rather than deltas, which is what makes
     a dropped frame free and reconnection the ordinary case rather than an
@@ -4789,6 +4830,61 @@ def test_a_ceiling_refusal_during_scoring_records_the_gap_and_the_pass_goes_on(
         assert row["score"] is None
         assert "re-run the scoring pass to fill it in" in row["detail"]
         assert row["judge_model"] == "judge/one"
+
+
+@respx.mock
+def test_review_repro_the_judge_rechecks_the_ceiling_after_admission(
+    client, tmp_path, monkeypatch
+):
+    """F1.2's invariant, which the scoring pass was missing.
+
+    The pass checked the ceiling and then queued for one of the five
+    upstream slots, with no check after admission. Those are minutes
+    apart on a pass over three hundred results, and the ceiling being
+    crossed during the wait is the ordinary case rather than the exotic
+    one; the trial runner rechecks inside the held slot for exactly this
+    reason and the judge did not.
+
+    The fake reports a clear ceiling on the call before the queue and a
+    reached one after, which is the sequence the real gap produces. It
+    also records the semaphore's free-slot count at each call, because
+    the claim is about POSITION relative to admission and a second check
+    placed just before the queue would pass a call-count assertion while
+    leaving the invariant broken.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    # _value rather than a public accessor because nothing public reports
+    # how many slots are free; the suite already reads it for the same
+    # reason in the semaphore-honesty tests.
+    free_slots = []
+    answers = iter([False, True])
+
+    def fake_ceiling():
+        free_slots.append(client.app.state.upstream_semaphore._value)
+        return next(answers, True)
+
+    monkeypatch.setattr(main, "spend_ceiling_reached", fake_ceiling)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["score"] is None
+    assert "re-run the scoring pass to fill it in" in row["detail"]
+    # Twice, and the second time with a slot held: one fewer free than
+    # the first, which is what "after admission" means here.
+    assert len(free_slots) == 2
+    assert free_slots[1] == free_slots[0] - 1
 
 
 @respx.mock
