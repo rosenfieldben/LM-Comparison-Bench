@@ -101,7 +101,7 @@ def test_the_seed_control_says_what_it_does_and_does_not_promise(bench):
     assert "recorded" in title.lower(), title
 
 
-def test_history_badges_render_for_set_controls_and_nothing_else(bench):
+def test_history_badges_render_for_set_controls_and_nothing_else(bench, open_history):
     """Two controls set, two badges, and not a third. The negative half is
     the point: temperature and seed were chosen here, top_p and reasoning
     effort were not, and a badge for either of those would be inventing a
@@ -117,10 +117,7 @@ def test_history_badges_render_for_set_controls_and_nothing_else(bench):
     check_all_chips(page)
     run_and_wait(page, "h2 two controls", 2)
 
-    page.get_by_test_id("history-toggle").click()
-    expect(page.get_by_test_id("history-list")).to_have_attribute(
-        "data-state", "ready", timeout=DONE_TIMEOUT
-    )
+    open_history()
     row = row_for(page, "h2 two controls")
     expect(row).to_have_count(1)
 
@@ -130,7 +127,7 @@ def test_history_badges_render_for_set_controls_and_nothing_else(bench):
     ]
 
 
-def test_a_blank_controls_run_renders_no_badges_at_all(bench):
+def test_a_blank_controls_run_renders_no_badges_at_all(bench, open_history):
     """The floor for rule two in the view: a comparison that chose nothing
     must say nothing, not "t=1" or "route throughput". Throughput in
     particular is the bench's own default and rides every payload ever
@@ -139,17 +136,14 @@ def test_a_blank_controls_run_renders_no_badges_at_all(bench):
     check_all_chips(page)
     run_and_wait(page, "h2 no controls at all", 1)
 
-    page.get_by_test_id("history-toggle").click()
-    expect(page.get_by_test_id("history-list")).to_have_attribute(
-        "data-state", "ready", timeout=DONE_TIMEOUT
-    )
+    open_history()
     row = row_for(page, "h2 no controls at all")
     expect(row).to_have_count(1)
 
     expect(row.get_by_test_id("history-control-badge")).to_have_count(0)
 
 
-def test_the_system_prompt_round_trips_into_the_comparison_view(bench):
+def test_the_system_prompt_round_trips_into_the_comparison_view(bench, open_history):
     """The row badge says only that a system prompt existed, which is all a
     one-line row can honestly carry; a truncated prompt would invite
     comparing two comparisons on an excerpt that happens to match. The text
@@ -164,10 +158,7 @@ def test_the_system_prompt_round_trips_into_the_comparison_view(bench):
     check_all_chips(page)
     run_and_wait(page, "h2 system prompt round trip", 1)
 
-    page.get_by_test_id("history-toggle").click()
-    expect(page.get_by_test_id("history-list")).to_have_attribute(
-        "data-state", "ready", timeout=DONE_TIMEOUT
-    )
+    open_history()
     row = row_for(page, "h2 system prompt round trip")
     # Presence, not text, in the row.
     assert badge_texts(row.get_by_test_id("history-control-badge")) == [
@@ -187,7 +178,7 @@ def test_the_system_prompt_round_trips_into_the_comparison_view(bench):
     ]
 
 
-def test_a_replayed_comparisons_controls_do_not_outlive_it(bench):
+def test_a_replayed_comparisons_controls_do_not_outlive_it(bench, open_history):
     """A stale controls line under a new banner would attribute one
     comparison's experiment to another, which is the same class of defect as
     a badge for an unchosen control: the view would state something nobody
@@ -198,10 +189,7 @@ def test_a_replayed_comparisons_controls_do_not_outlive_it(bench):
     check_all_chips(page)
     run_and_wait(page, "h2 controls then a bare run", 1)
 
-    page.get_by_test_id("history-toggle").click()
-    expect(page.get_by_test_id("history-list")).to_have_attribute(
-        "data-state", "ready", timeout=DONE_TIMEOUT
-    )
+    open_history()
     row_for(page, "h2 controls then a bare run").first.click()
     expect(page.get_by_test_id("run-control-badge")).to_have_count(
         1, timeout=DONE_TIMEOUT
