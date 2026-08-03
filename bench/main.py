@@ -1249,14 +1249,31 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     before reaching upstream, so the persisted row is unambiguous that no
     money moved.
 
-    spend_refused marks the frame so the client can tell a working control
-    from a broken one. Both arrive as run_id null, but the meanings are
-    opposite: a refusal deliberately persists nothing, while a genuine
-    post-spend persistence failure means money moved and history lost it.
-    Without the marker the UI described the ceiling as a failure. An extra
-    field is additive by the client contract (unknown fields are ignored),
-    and it is a marker rather than an error-string match because the error
-    text is prose that may be reworded.
+    Three callers, and they do not all treat it the same way, so the
+    difference is written down rather than left to be rediscovered:
+
+    /compare PERSISTS it. The refusal rides in the batch and the batch
+    saves as usual, which is honest history for a cut-short run.
+
+    /compare/stream persists nothing and emits a done frame with run_id
+    null. spend_refused marks that frame so the client can tell a working
+    control from a broken one: a refusal and a genuine post-spend
+    persistence failure both arrive as run_id null and the meanings are
+    opposite, one being "no money moved" and the other "money moved and
+    history lost it". Without the marker the UI described the ceiling as
+    a failure. An extra field is additive by the client contract (unknown
+    fields are ignored), and it is a marker rather than an error-string
+    match because the error text is prose that may be reworded.
+
+    run_one_trial PERSISTS it, and that is what this phase changed. An
+    experiment's report classifies every cell of its plan, and a refusal
+    with no row is indistinguishable from a cell the runner never
+    reached: a budget fact would be published as a gap in the record.
+    Persisted, the row carries the refusal error beside a NULL
+    request_json, which is exactly the pair the era-gated derivation
+    reads as "refused". The marker itself is never stored anywhere: no
+    column holds it, and the classification is structural so none is
+    needed.
 
     The marker rides the streaming frame only. /compare serializes through
     ModelResult, which declares no such field and therefore drops it; that
@@ -2156,23 +2173,32 @@ async def run_one_trial(
         # protects against: hundreds of trials admitted over minutes, with
         # the ceiling crossed somewhere in the middle.
         if spend_ceiling_reached():
-            return spend_refusal_result(model, max_tokens)
-        start = time.perf_counter()
-        async for event in stream_model(
-            task["prompt"],
-            model,
-            app.state.client,
-            max_tokens=max_tokens,
-            holder=holder,
-            provider_prefs=trial_provider_prefs(experiment, model, controls),
-            controls=controls,
-        ):
-            if event["type"] == "done":
-                result = event["result"]
-                break
-            if first_delta_ms is None:
-                first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
-            parts.append(event["text"])
+            # Set rather than returned, so the refusal falls through to
+            # the same persistence the other outcomes get. The endpoints
+            # deliberately persist nothing for a refusal; the runner must,
+            # because an experiment's report classifies every cell of its
+            # plan and a refusal with no row is indistinguishable from a
+            # cell that was never reached. The row is the refusal's only
+            # evidence: error text beside a NULL request_json, which is
+            # exactly what the era-gated derivation reads as "refused".
+            result = spend_refusal_result(model, max_tokens)
+        else:
+            start = time.perf_counter()
+            async for event in stream_model(
+                task["prompt"],
+                model,
+                app.state.client,
+                max_tokens=max_tokens,
+                holder=holder,
+                provider_prefs=trial_provider_prefs(experiment, model, controls),
+                controls=controls,
+            ):
+                if event["type"] == "done":
+                    result = event["result"]
+                    break
+                if first_delta_ms is None:
+                    first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
+                parts.append(event["text"])
     finally:
         # Released before persistence, exactly as the streaming endpoint
         # releases before saving: a slot is for the upstream exchange, and
@@ -2202,13 +2228,18 @@ async def run_one_trial(
         }
     result["position"] = position
     # Post-spend, so its own fault boundary: the call has happened and
-    # nothing here may turn a paid result into an error.
-    try:
-        result["cost_usd"] = cost_usd(result, app.state.prices)
-        record_spend(ceiling_cost(result))
-    except Exception:
-        logger.exception("settlement failed for %s", model)
-        result["cost_usd"] = None
+    # nothing here may turn a paid result into an error. A refusal skips
+    # it entirely rather than settling to zero: no call happened, so there
+    # is nothing to price and nothing to add to the ceiling, and running
+    # the settlement anyway would put a refusal into the spend record as
+    # a zero-cost call that was made.
+    if not result.get("spend_refused"):
+        try:
+            result["cost_usd"] = cost_usd(result, app.state.prices)
+            record_spend(ceiling_cost(result))
+        except Exception:
+            logger.exception("settlement failed for %s", model)
+            result["cost_usd"] = None
     try:
         store.save_run(
             app.state.db,

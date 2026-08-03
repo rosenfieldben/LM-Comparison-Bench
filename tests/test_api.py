@@ -4317,6 +4317,266 @@ def test_the_ceiling_halts_the_experiment_and_says_why(client, tmp_path, monkeyp
 
 
 @respx.mock
+def test_review_repro_a_halted_plan_reports_everything_it_owed(client, tmp_path):
+    """Eight trials planned, two run. The report must say eight.
+
+    The plan was read off the groups that happened to exist, so halting
+    early SHRANK the reported plan to exactly what ran. Two of eight came
+    back and the report said two of two: the act of stopping erased the
+    evidence that anything was skipped, and a reader had nothing on the
+    page telling them six trials were owed. That is the worst direction
+    for this defect to point, because a truncated run reads as a complete
+    one and every rate on it looks trustworthy.
+
+    Four tasks, two models, one repeat: eight trials. The stop lands
+    after the first cell, so one cell of two models ran and three cells
+    never existed at all. Those three are not_run, which is a different
+    fact from missing: missing is a hole inside a cell that ran.
+    """
+    seen = {"n": 0}
+    eid_box = {}
+
+    async def route(request):
+        # Awaited on the runner's own loop, for the reason written out in
+        # test_a_stop_halts_between_trials_and_leaves_an_honest_partial: a
+        # nested synchronous client.post re-enters the test client's
+        # portal while its loop is mid-trial, which passes alone and fails
+        # in the full suite.
+        seen["n"] += 1
+        if seen["n"] == 2:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+        {"id": "t4", "prompt": "d"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+    assert final["status"] == "stopped"
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    # The plan is published as arithmetic, so the counters can be checked
+    # against it rather than trusted.
+    assert report["plan"] == {
+        "tasks": 4,
+        "repeats": 1,
+        "models": 2,
+        "cells": 4,
+        "trials": 8,
+        "cells_recorded": 1,
+    }
+    total_planned = sum(m["trials"]["planned"] for m in report["models"])
+    total_not_run = sum(m["trials"]["not_run"] for m in report["models"])
+    assert total_planned == 8
+    assert total_not_run == 6
+    for entry in report["models"]:
+        counts = entry["trials"]
+        assert counts["planned"] == 4
+        assert counts["not_run"] == 3
+        # Every outcome still partitions the plan, not the rows on disk.
+        assert sum(counts[k] for k in OUTCOMES) == counts["planned"]
+
+
+@respx.mock
+def test_review_repro_a_refused_trial_is_reported_as_refused_not_missing(
+    client, tmp_path
+):
+    """The refusal derivation was right and had nothing to read.
+
+    trial_outcome classifies an in-era error beside a NULL request_json as
+    "refused", structurally and deliberately. But the runner returned from
+    its refusal branch before persisting anything, so no such row ever
+    existed: the mechanism was complete and unreachable. A refused trial
+    therefore surfaced as `missing`, which says the cell ran and this
+    model left no row, when what happened is that the budget declined the
+    call. A budget fact was being reported as a gap in the record.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, lineup=["model/alpha", "model/beta"], halt_on_refusal=False
+        ),
+    ).json()["id"]
+    # The first settlement closes the gate, so the second model in the
+    # same cell is refused. One cell, two models, one of each outcome.
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["trials_refused"] == 1
+    report = client.get(f"/experiments/{eid}/report").json()
+    outcomes = {m["model"]: m["trials"] for m in report["models"]}
+    assert outcomes["model/alpha"]["done"] == 1
+    assert outcomes["model/beta"]["refused"] == 1
+    # The point of the tombstone: not missing, and not silently absent.
+    assert outcomes["model/beta"]["missing"] == 0
+    assert outcomes["model/beta"]["not_run"] == 0
+    assert outcomes["model/beta"]["refusal_rate"] == 1.0
+    # And it is a row, so the export carries it and the artifact can be
+    # audited without the database.
+    lines = export_lines(client, eid)
+    refused = [x for x in lines if x["type"] == "trial" and x["model"] == "model/beta"]
+    assert len(refused) == 1
+    assert refused[0]["outcome"] == "refused"
+    assert refused[0]["request_json"] is None
+
+
+def assert_three_surfaces_agree(client, eid):
+    """Counters, report and export tell one story about one experiment.
+
+    Three surfaces, three different derivations of the same facts, and a
+    reader can reach any of them: the progress counters while it runs, the
+    report afterwards, the export forever. If they disagree, at least one
+    published number is wrong and nothing on the page says which, so the
+    agreement is the property worth asserting rather than any one of them
+    in isolation.
+    """
+    detail = client.get(f"/experiments/{eid}").json()
+    report = client.get(f"/experiments/{eid}/report").json()
+    lines = export_lines(client, eid)
+    trials = [x for x in lines if x["type"] == "trial"]
+
+    totals = {name: 0 for name in OUTCOMES}
+    for entry in report["models"]:
+        for name in OUTCOMES:
+            totals[name] += entry["trials"][name]
+
+    # Surface one against surface two. The counters count what the runner
+    # did; the report classifies what it left behind.
+    assert detail["trials_done"] == totals["done"]
+    assert detail["trials_refused"] == totals["refused"]
+    assert detail["trials_failed"] == totals["error"] + totals["stopped"]
+    # The plan is the same number on both, and it is the declared one.
+    assert detail["trials_total"] == sum(
+        m["trials"]["planned"] for m in report["models"]
+    )
+    assert detail["trials_total"] == report["plan"]["trials"]
+
+    # Surface three. Exactly the outcomes that produced a row appear as
+    # lines; the two absences produce none, which is what they are.
+    assert len(trials) == (
+        totals["done"] + totals["error"] + totals["refused"] + totals["stopped"]
+    )
+    by_outcome: dict[str, int] = {}
+    for trial in trials:
+        by_outcome[trial["outcome"]] = by_outcome.get(trial["outcome"], 0) + 1
+    for name in ("done", "error", "refused", "stopped"):
+        assert by_outcome.get(name, 0) == totals[name], name
+    # And the artifact alone can say how much never ran.
+    assert (
+        lines[0]["tasks_total"] * lines[0]["repeats"] * len(lines[0]["lineup"])
+        == detail["trials_total"]
+    )
+
+
+@respx.mock
+def test_review_repro_the_three_surfaces_agree_on_a_halted_run(client, tmp_path):
+    """A halt is where the surfaces used to diverge.
+
+    The counters knew the plan (trials_total is stored at creation), the
+    report read it off the groups, and the export could only be counted.
+    So a stopped experiment reported one plan to a watcher and a smaller
+    one to a reader, with the export unable to arbitrate. All three now
+    derive from the same declared arithmetic.
+    """
+    eid_box = {}
+    seen = {"n": 0}
+
+    async def route(request):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "stopped"
+    assert_three_surfaces_agree(client, eid)
+
+
+@respx.mock
+def test_the_three_surfaces_agree_when_refusals_do_not_halt(client, tmp_path):
+    """Continue mode, the other shape. Refusals now leave rows, so the
+    export gains lines a halted run never had, and the three surfaces have
+    to stay in step across that difference too."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, halt_on_refusal=False)
+    ).json()["id"]
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    # Everything after the first settlement is refused, and the run ran to
+    # the end of the plan rather than halting.
+    assert final["status"] == "done"
+    assert final["trials_refused"] == 3
+    assert_three_surfaces_agree(client, eid)
+
+
+@respx.mock
 def test_conservation_holds_across_a_whole_experiment(client, tmp_path):
     """The property the ceiling machinery has carried since F.3, stated
     over an experiment rather than a batch: refusals plus upstream calls
@@ -5642,7 +5902,7 @@ def test_a_report_for_a_missing_experiment_404s(client):
 
 import hashlib
 
-from bench.report import build_report
+from bench.report import OUTCOMES, build_report
 
 
 @respx.mock
@@ -5753,6 +6013,10 @@ def rebuild_from_export(lines, tasks_by_id):
             "status": manifest["status"],
             "status_detail": manifest["status_detail"],
             "lineup": manifest["lineup"],
+            # The plan's arithmetic, which is what lets the artifact say
+            # how much never ran. Counting the trial lines can only say
+            # what did.
+            "tasks_total": manifest["tasks_total"],
         },
         groups,
         runs_by_group,

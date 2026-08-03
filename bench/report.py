@@ -133,6 +133,19 @@ def trial_outcome(
 # separate "the model answered badly" from "the model did not answer".
 COMPLETED = ("done",)
 
+# Every axis-one outcome, in the order a reader walks them: what happened,
+# then the three ways nothing happened. Named once so the counters, the
+# export and the tests cannot drift apart by one label.
+#
+# missing and not_run are both absences and they are NOT the same absence.
+# A missing trial has a cell: the group exists, the other models in the
+# lineup have rows in it, and this one does not, which is a hole in a cell
+# that ran. A not_run trial has no cell at all: the runner halted or was
+# stopped before it got there, so nothing about it was ever written. One
+# is a gap in the record and the other is a plan that was abandoned, and a
+# reader deciding whether to trust a comparison needs to tell them apart.
+OUTCOMES = ("done", "error", "refused", "stopped", "missing", "not_run")
+
 
 def scoring_state(scores: list[dict[str, Any]], scorer: str) -> str:
     """Whether this trial has a usable number from this scorer.
@@ -328,13 +341,25 @@ def build_report(
                     }
                 )
 
+    # The plan, from the manifest's own arithmetic rather than from the
+    # groups that happen to exist. Every model owes one trial per (task,
+    # repeat) cell, so the cells a halted runner never created are the
+    # difference between what was declared and what is on disk.
+    #
+    # Deriving this from rows instead is the defect that makes a halt
+    # invisible: the act of stopping early would shrink the reported plan
+    # to exactly what ran, and nothing anywhere would say what was owed.
+    cells_planned = int(experiment.get("tasks_total") or 0) * int(
+        experiment.get("repeats") or 0
+    )
+    not_run = max(0, cells_planned - len(groups))
     # Derived once over every model's rows, because a declared threshold
     # is a fact about the task rather than about who answered it. Computed
     # even when the file is present, so the cost is one pass over rows
     # already in memory and the two witnesses can be compared in a test.
     row_declared = rows_declaring_thresholds(trials)
     models = [
-        _model_report(model, by_task, tasks_by_id, seed, row_declared)
+        _model_report(model, by_task, tasks_by_id, seed, row_declared, not_run)
         for model, by_task in trials.items()
     ]
     # Ranked on the primary score mean, min-rank so ties share a place.
@@ -352,6 +377,17 @@ def build_report(
         "repeats": experiment["repeats"],
         "status": experiment["status"],
         "status_detail": experiment["status_detail"],
+        # The plan as arithmetic, published so a reader can check the
+        # outcome counters against it instead of trusting them. This is
+        # also what makes not_run derivable from an export alone.
+        "plan": {
+            "tasks": int(experiment.get("tasks_total") or 0),
+            "repeats": int(experiment.get("repeats") or 0),
+            "models": len(lineup),
+            "cells": cells_planned,
+            "trials": cells_planned * len(lineup),
+            "cells_recorded": len(groups),
+        },
         # Where the pass rate's population came from. Said out loud
         # because the two are not equally good: score_rows is a floor,
         # since a declared task nobody scored leaves no row to witness
@@ -376,23 +412,37 @@ def _model_report(
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
     row_declared: dict[str, set[str]] | None = None,
+    not_run: int = 0,
 ) -> dict[str, Any]:
     flat = [t for trials in by_task.values() for t in trials]
-    outcomes = {name: 0 for name in ("done", "error", "refused", "stopped", "missing")}
+    outcomes = {name: 0 for name in OUTCOMES}
     for trial in flat:
         outcomes[trial["outcome"]] += 1
+    # not_run has no per-trial record to count, by definition: the runner
+    # never created the cell, so there is no group, no run and no row.
+    # It arrives as a number derived from the manifest's arithmetic and
+    # is added here rather than synthesized as fake trials, because a
+    # fabricated record is exactly what an export must not contain.
+    outcomes["not_run"] = not_run
     # Three populations, and their names are the contract. Export field
     # names are forever, so a counter whose label means something wider
     # than the thing it counts is a defect of the same class as crossing
     # the two axes: a fact about the harness arriving in the model's
     # column.
     #
-    # PLANNED is every trial the plan called for. ATTEMPTED is the subset
-    # where a request actually reached a provider: done, error, stopped.
-    # A refused trial was declined by the spend ceiling before the call
-    # went out, and a missing trial never ran at all, so neither is an
-    # attempt by anybody's reading of the word.
-    planned = len(flat)
+    # PLANNED is every trial the plan called for, and it comes from the
+    # PLAN rather than from the rows. Counting rows would make a halted
+    # experiment report a smaller plan than it declared, so the very act
+    # of halting would hide how much was skipped: eight planned trials
+    # stopped after two would have reported a plan of two, with nothing
+    # anywhere saying six were owed.
+    #
+    # ATTEMPTED is the subset where a request actually reached a
+    # provider: done, error, stopped. A refused trial was declined by the
+    # spend ceiling before the call went out; a missing trial has a cell
+    # but no row; a not_run trial has no cell at all. None of the three
+    # is an attempt by anybody's reading of the word.
+    planned = len(flat) + not_run
     attempted = outcomes["done"] + outcomes["error"] + outcomes["stopped"]
 
     # Score means over EVERY trial the model was asked to do, with a
@@ -736,6 +786,12 @@ def export_manifest(
         "catalog_digest": experiment["catalog_digest"],
         "data_policy": experiment["data_policy"],
         "trials_total": experiment["trials_total"],
+        # The plan's arithmetic, so not_run is derivable from the artifact
+        # alone. Without tasks_total a reader holding only this file can
+        # count the trial lines but cannot say how many were owed, and
+        # "how much of the plan actually ran" is the first question anyone
+        # citing a halted experiment has to answer.
+        "tasks_total": experiment["tasks_total"],
         "report_seed": seed,
         "bootstrap_resamples": BOOTSTRAP_RESAMPLES,
         "bootstrap_unit": "task",

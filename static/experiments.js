@@ -58,6 +58,7 @@
         "refused",
         "stopped",
         "missing",
+        "not run",
         "failure rate",
       ]),
     );
@@ -80,7 +81,12 @@
         cell(String(t.error)),
         cell(String(t.refused)),
         cell(String(t.stopped)),
+        // Two absences, kept apart on the page as they are in the data.
+        // A missing trial has a cell it left no row in; a not-run trial
+        // has no cell, because the plan was abandoned before it. Folding
+        // them into one column would hide a halt inside a gap.
         cell(String(t.missing)),
+        cell(String(t.not_run)),
         cell(
           t.failure_rate == null
             ? "—"

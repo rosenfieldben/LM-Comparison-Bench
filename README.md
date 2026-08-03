@@ -948,24 +948,52 @@ does there is no way to tell which is wrong.
 **The report keeps two axes apart, everywhere.**
 
 *Axis one, trial outcomes:* `done`, `error`, `refused`, `stopped`,
-`missing`. This is what happened when the bench asked a model to do a
-task, and it is where a model's failure rate comes from. Outcomes are
-derived at read time from fields that were already recorded for their own
-reasons, so the vocabulary can change without a migration and no old row
-carries a label that predates the rules. A declared member that never ran
-counts as `missing` rather than vanishing.
+`missing`, `not_run`. This is what happened when the bench asked a model
+to do a task, and it is where a model's failure rate comes from. Outcomes
+are derived at read time from fields that were already recorded for their
+own reasons, so the vocabulary can change without a migration and no old
+row carries a label that predates the rules.
 
-Two denominators go with those outcomes, and the difference between them
-matters enough that both are published. `planned` is every trial the plan
-called for. `attempted` is the subset where a request actually reached a
-provider: `done`, `error`, `stopped`. A `refused` trial was declined by
-the spend ceiling before the call went out and a `missing` trial never
-ran, so neither is an attempt. **`failure_rate` is `error / attempted`**
+**Two absences, and they are different facts.** `missing` means the cell
+exists (the group was created, other models in the lineup have rows in it)
+and this model left none: a hole in a cell that ran. `not_run` means the
+cell was never created at all, because the runner halted or was stopped
+before reaching it: a plan abandoned. Folding the two together would hide
+a halt inside a gap.
+
+**The plan comes from the plan, not from the rows.** `planned` is
+`tasks x repeats` per model, read off the experiment's own recorded counts
+rather than off the groups that happen to exist. That is not a detail:
+deriving it from rows is what makes a halt invisible, because eight trials
+stopped after two would report a plan of two and nothing on the page would
+say six were owed. The report publishes the arithmetic as its own `plan`
+block so the counters can be checked against it instead of trusted, and
+the export manifest carries `tasks_total` so `not_run` is derivable from
+the artifact alone.
+
+**A refusal is a row.** When the spend ceiling declines a trial the runner
+persists a result carrying the refusal error beside a NULL `request_json`,
+which is exactly the pair the era-gated derivation reads as `refused`. The
+derivation was always there and had nothing to read: the runner returned
+before writing anything, so a refused trial surfaced as `missing` and a
+budget fact was published as a gap in the record.
+
+`attempted` is the subset where a request actually reached a provider:
+`done`, `error`, `stopped`. A refused trial was declined before the call
+went out, a missing trial left no row, a not-run trial has no cell, so
+none of the three is an attempt. **`failure_rate` is `error / attempted`**
 and nothing else: a stop is the operator's decision, a refusal is the
-ceiling's, and a missing trial is the experiment's, so counting any of
+ceiling's, and the two absences are the experiment's, so counting any of
 them would let a halted run read as a bad model. `refusal_rate` is
 `refused / planned`, because a refusal is a fact about the budget against
 the plan.
+
+**Three surfaces agree, and that is asserted.** The progress counters, the
+report's outcome counts and the export's lines are three derivations of the
+same facts, reachable at three different times. If they disagree at least
+one published number is wrong and nothing says which, so the agreement is
+tested directly, over a halted run and over a continue-mode run where
+refusals leave rows the halted one never had.
 
 *Axis two, scoring coverage:* `scored`, `scoring_failed`, `unscored`.
 This is what happened when the bench tried to put a number on a trial. A
