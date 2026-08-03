@@ -159,12 +159,32 @@
     return out;
   }
 
+  // Min-rank over ascending values: equal values share a place and the
+  // next one skips, so a three-way tie reads 1, 1, 1, 4. Two runs that
+  // measured identically are tied, and numbering them anyway would show
+  // a difference that is not in the data.
+  //
+  // Pure and here rather than inline in the race, because the same rule
+  // governs the report's model ranking and a rule with two
+  // implementations is a rule with two behaviors. Takes an already
+  // sorted list of numbers and returns their ranks in the same order.
+  function minRanks(sortedValues) {
+    const ranks = [];
+    for (let i = 0; i < sortedValues.length; i++) {
+      ranks.push(
+        i > 0 && sortedValues[i] === sortedValues[i - 1] ? ranks[i - 1] : i + 1,
+      );
+    }
+    return ranks;
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
     fmtBilled,
     fmtEstimate,
     niceScale,
+    minRanks,
     tokenizeDiff,
     diffTokens,
     controlBadges,

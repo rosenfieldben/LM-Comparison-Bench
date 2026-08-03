@@ -117,6 +117,24 @@
 
   /* ==== Base ==== */
   * { box-sizing: border-box; }
+  /* One rule instead of a guard per selector, because the per-selector
+     version failed three times and the third failure was not cosmetic.
+     The user agent sheet says [hidden] { display: none }, but any
+     explicit display in this file outranks it, so an element toggled by
+     the hidden attribute stays on screen unless someone remembers to say
+     so again. #name-row needed it, then #experiment-controls needed it,
+     then blind rating's .metrics needed it, and that last one meant cost
+     and timing were visible on cards the page was calling blind: a
+     rater who can see those can often name the model.
+
+     !important because that is what beats a more specific selector's
+     display, which is exactly the case that keeps recurring. The three
+     per-selector guards are removed rather than kept: leaving them would
+     imply this rule is not enough, and the next person adding a
+     display'd element would copy the pattern instead of relying on it.
+     tests/browser/test_i4.py proves the rule wins over a class that
+     declares display. */
+  [hidden] { display: none !important; }
   html { background: var(--bg-page); }
   body {
     margin: 0;
@@ -240,7 +258,6 @@
   #prompt-msg { color: var(--err-text); }
   #prompt-actions { display: flex; gap: 6px; margin-left: auto; align-items: center; }
   #name-row { display: inline-flex; gap: 6px; }
-  #name-row[hidden] { display: none; }
   .sel-wrap { position: relative; display: inline-flex; }
   .sel-wrap::after {
     content: "▾";
@@ -786,10 +803,6 @@
 #controls-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
 #controls-summary { font-size: 11px; color: var(--text-faint); }
 #experiment-controls { margin-top: 8px; display: grid; gap: 8px; }
-/* An explicit display on an id selector outranks the user agent's
-   [hidden] { display: none }, so the collapsed panel needs saying twice.
-   Same guard #name-row already carries, for the same reason. */
-#experiment-controls[hidden] { display: none; }
 #controls-scalars { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; }
 .ctl { display: flex; align-items: center; gap: 5px; font-size: 11px; }
 .ctl label { color: var(--text-faint); }
@@ -828,3 +841,100 @@
 }
 .card.missing .cardname { color: var(--text-faint); }
 .missing-note { font-size: 11px; margin-top: 4px; }
+
+/* Blind rating. Muted and compact: it sits under an answer the rater is
+   supposed to be reading, so it must not compete with it. */
+.rating-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-2);
+}
+.rating-label {
+  font-weight: 600;
+  color: var(--text-faint);
+  min-width: 1.5em;
+}
+.rating-button {
+  min-width: 28px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-2);
+  border-radius: 4px;
+  background: none;
+  color: var(--text-2);
+  cursor: pointer;
+}
+.rating-button.chosen {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.rating-button:disabled { cursor: default; opacity: 0.6; }
+.rating-panel {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--text-ghost);
+}
+
+/* The experiment report. Plain tables on purpose: a chart of four means
+   invites the eye to read a difference the intervals do not support, and
+   this layer exists to stop that. */
+#report-panel {
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px solid var(--border-2);
+  border-radius: 6px;
+  overflow-x: auto;
+}
+.report-banner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+}
+.report-banner strong { color: var(--accent); font-size: 12px; }
+.report-note { color: var(--text-ghost); }
+/* Above the banner and above the tables, because it decides what the
+   tables can say. The input grows and the button does not. */
+.report-dataset {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+.report-dataset .panel-label { margin: 0; white-space: nowrap; }
+.report-dataset input[type="text"] { flex: 1; min-width: 0; }
+/* A mismatch reads as a mismatch. The same error colour every other
+   failed load in this app uses. */
+[data-testid="report-state"][data-state="error"] { color: var(--err-text); }
+#report-panel table {
+  border-collapse: collapse;
+  width: 100%;
+  margin-bottom: 10px;
+  font: 11px var(--mono);
+}
+#report-panel th {
+  text-align: left;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+  border-bottom: 1px solid var(--hairline);
+  padding: 3px 6px;
+}
+#report-panel td {
+  padding: 3px 6px;
+  border-bottom: 1px solid var(--hairline);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+#report-panel td.report-model { color: var(--text); }
+#report-panel td.report-flags { color: var(--text-faint); }

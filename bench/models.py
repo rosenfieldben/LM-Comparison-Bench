@@ -239,6 +239,105 @@ def provider_preferences(
 _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 
 
+# ---- The underlying-model estimand.
+#
+# Everything in this block applies ONLY when an experiment declared
+# estimand_mode "underlying_model". The routed-service estimand is the
+# default and must keep sending exactly the bytes it sent before this
+# block existed; a tombstone asserts that.
+#
+# Pinned against OpenRouter's provider-routing documentation at
+# https://openrouter.ai/docs/guides/routing/provider-selection, read
+# 2026-08-02, not from memory:
+#
+#   require_parameters (boolean, default false): "restrict to providers
+#   that support all parameters in your request". The routed-service
+#   estimand deliberately does not send it, for the reason written at
+#   _SAMPLING_KEYS above: it changes which providers are eligible, which
+#   silently changes what is being measured. Under this estimand that
+#   change is the entire point. A claim about a MODEL that was served by
+#   a provider which quietly dropped the temperature is a claim about a
+#   different configuration than the row records.
+#
+#   order (array of provider slugs), with allow_fallbacks false: try
+#   these and nothing else. Without allow_fallbacks false the order is a
+#   preference, so a pinned run could be served by anyone and the record
+#   would name a pin that did not hold. The pin exists to narrow the
+#   population; a pin that can be ignored narrows nothing.
+STRICT_PREFS: dict[str, Any] = {"require_parameters": True}
+
+
+def strict_provider_preferences(
+    base: Mapping[str, Any], pin: str | None = None
+) -> dict[str, Any]:
+    """The provider block for one strict-mode trial.
+
+    base is whatever the routed path would have sent (the boot data
+    policy merged with this request's routing mode), so the privacy
+    promise cannot be displaced by the estimand: it is written first and
+    the strict keys are additive.
+
+    A pin is a hard restriction rather than a preference, which is why
+    allow_fallbacks rides with it and never without it. Sending
+    allow_fallbacks false with no order would forbid fallback from a
+    provider nobody named, which is not a thing anyone asked for.
+    """
+    out = {**base, **STRICT_PREFS}
+    if pin is not None:
+        out["order"] = [pin]
+        out["allow_fallbacks"] = False
+    return out
+
+
+# Which supported_parameters token each control needs. The check runs
+# against the names the payload will actually carry, which is why
+# effort maps to "reasoning": control_payload emits it as a reasoning
+# object, and "effort" is a key inside that object rather than a
+# parameter name OpenRouter publishes.
+#
+# max_tokens is here even though no control sets it, because every
+# payload this bench builds carries one. Under require_parameters a
+# provider that does not support max_tokens is ineligible, so a model
+# whose catalog entry omits it has no eligible provider for any request
+# the bench can make, and saying that at creation is better than
+# discovering it at trial one.
+#
+# routing and system are absent on purpose. Routing is a key of the
+# provider object rather than a model parameter, and a system message is
+# a message.
+CONTROL_PARAMETERS: dict[str, str] = {
+    "temperature": "temperature",
+    "top_p": "top_p",
+    "seed": "seed",
+    "effort": "reasoning",
+}
+
+
+def missing_parameters(
+    supported: list[str] | None, controls: Mapping[str, Any] | None
+) -> list[str]:
+    """Which of this request's parameters the model does not support.
+
+    supported is the catalog's supported_parameters for one model, and
+    None means the catalog did not say. That is NOT treated as "supports
+    everything": the caller refuses on it. A strict mode that skips its
+    check when the data is missing is a strict mode that isn't, which is
+    worse than none, because the run is then labelled with a guarantee
+    nobody verified.
+
+    This function reports; the caller decides. It returns the names in
+    the order a reader would find them useful, sorted, and never raises.
+    """
+    if supported is None:
+        return []
+    have = set(supported)
+    needed = {"max_tokens"}
+    for key, parameter in CONTROL_PARAMETERS.items():
+        if (controls or {}).get(key) is not None:
+            needed.add(parameter)
+    return sorted(needed - have)
+
+
 def control_payload(controls: Mapping[str, Any] | None) -> dict[str, Any]:
     """The payload fragment for the controls that were actually set.
 
@@ -364,7 +463,26 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # What the underlying-model estimand checks against. None
+            # means the catalog did not say, which strict mode treats as
+            # "cannot check" rather than as "supports everything": see
+            # missing_parameters. Pinned against OpenRouter's model
+            # listing, read 2026-08-02, where each model carries
+            # supported_parameters as an array of parameter names, the
+            # union over the providers that serve it. Not split across
+            # lines, because a wrapped URL is a URL nobody can click:
+            # https://openrouter.ai/docs/api-reference/list-available-models
+            "supported_parameters": None,
         }
+        supported = entry.get("supported_parameters")
+        if isinstance(supported, list):
+            # Strings only, so one malformed element degrades itself
+            # rather than the entry. An empty list is a real answer (this
+            # model takes no optional parameters) and stays a list, which
+            # is why the emptiness is not folded back into None.
+            model["supported_parameters"] = sorted(
+                {x for x in supported if isinstance(x, str)}
+            )
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
@@ -995,3 +1113,205 @@ async def fetch_generation(
     record["reasoning_tokens"] = as_token_count(data.get("native_tokens_reasoning"))
     record["cached_tokens"] = as_token_count(data.get("native_tokens_cached"))
     return record
+
+
+# ---- Phase I: rubric judging.
+
+# The judge's completion budget. Deliberately small and deliberately its
+# own constant rather than the experiment's tier: a verdict is a number
+# and a sentence, and a judge inheriting an extended-budget experiment
+# would buy headroom no rubric needs, once per scored trial, at the
+# judge's own price. Large enough that a reasoning model's preamble plus
+# the verdict fits; nowhere near large enough to pay for an essay.
+JUDGE_MAX_TOKENS = 512
+
+JUDGE_TIMEOUT_S = 60.0
+
+# The instruction that constrains the verdict's shape. Prompt-level
+# rather than response_format, and the choice is worth stating.
+# OpenRouter does document response_format
+# ({"type": "json_object"} at https://openrouter.ai/docs/api_reference/parameters,
+# read 2026-08-01), but it guarantees valid JSON, not the right keys, so
+# the defensive parse below is required either way. What sending it would
+# add is a narrowing of which providers can serve the judge, since
+# structured output is a per-model capability. Paying provider
+# eligibility for a partial guarantee that removes no code is a bad
+# trade, so the shape is asked for in words and verified on arrival.
+#
+# Revisit this if the scoring-failure rate in real reports shows
+# unparseable verdicts are material in practice. The trade above assumes
+# they are rare; if a report shows judges losing a noticeable share of
+# their verdicts to formatting, the narrowed provider pool becomes the
+# cheaper cost and this should send response_format. The number to look
+# at is the count of judge score rows with a null score and a parse
+# error in detail, against the total judged.
+JUDGE_SYSTEM = (
+    "You are grading one response against a rubric. Reply with JSON only, "
+    'no prose and no code fence, exactly: {"score": <number between 0 and '
+    '1>, "reason": "<one short sentence>"}. Use the rubric to choose the '
+    "score. If the response is empty or does not address the task at all, "
+    "score 0."
+)
+
+
+def judge_messages(
+    rubric: str, reference: str | None, response_text: str
+) -> list[dict[str, str]]:
+    """The judge payload's messages, carrying no identity of any kind.
+
+    Blind by construction rather than by discipline. This function is not
+    given the model that produced the response, so no future edit inside
+    it can leak one: the identity is not in scope. That matters because a
+    judge told which model it is grading has a documented tendency to
+    prefer some of them, and a blindness enforced by "remember not to
+    include it" is a blindness one careless edit away from gone.
+
+    The reference, when the task has one, is given as the expected answer
+    rather than as another candidate. A judge shown two answers without
+    being told which is which is doing pairwise comparison, which is a
+    different method with its own position-bias machinery and is
+    deliberately out of scope for this phase.
+    """
+    parts = [f"Rubric:\n{rubric}"]
+    if reference is not None:
+        parts.append(f"Expected answer:\n{reference}")
+    parts.append(f"Response to grade:\n{response_text}")
+    return [
+        {"role": "system", "content": JUDGE_SYSTEM},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def parse_verdict(text: str | None) -> dict[str, Any]:
+    """A judge's reply turned into a score, or an honest scoring failure.
+
+    Never guesses. An unparseable verdict, a score that is not a number,
+    or a number outside [0, 1] all become a recorded scoring failure with
+    the reason attached, because a guessed number here would enter an
+    average and change a conclusion while looking exactly like a real
+    measurement.
+
+    A fenced or preamble-wrapped object is recovered by taking the
+    outermost braces, which is not guessing: it is the same object, and
+    models wrap JSON in fences often enough that refusing would discard
+    correct verdicts over formatting. Anything past that is refused.
+    """
+    raw = as_text(text)
+    if raw is None or not raw.strip():
+        return {"error": "judge returned no text"}
+    start, end = raw.find("{"), raw.rfind("}")
+    if start == -1 or end <= start:
+        return {"error": "judge reply contained no JSON object"}
+    try:
+        data = json.loads(raw[start : end + 1])
+    except ValueError as exc:
+        return {"error": f"judge reply was not valid JSON: {exc}"}
+    if not isinstance(data, dict):
+        return {"error": "judge reply was not a JSON object"}
+    # as_metric, not float(): a bool is not a score, a string is not a
+    # score, and a NaN must not become one. Same total-field rule every
+    # other upstream number goes through.
+    score = as_metric(data.get("score"))
+    if score is None:
+        return {"error": f"judge score was not a number: {data.get('score')!r}"}
+    if not 0.0 <= score <= 1.0:
+        return {"error": f"judge score {score} is outside [0, 1]"}
+    return {"score": score, "reason": as_text(data.get("reason"))}
+
+
+async def judge_response(
+    client: httpx.AsyncClient,
+    judge_model: str,
+    rubric: str,
+    reference: str | None,
+    response_text: str | None,
+    provider_prefs: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """One rubric score from a judge model, or an error saying why not.
+
+    Never raises, the same contract run_model and stream_model carry, for
+    the same reason: this runs in a loop over many results and one bad
+    reply must not end the pass.
+
+    provider_prefs carries the boot data policy exactly as it rides every
+    other payload. A judge call sends the response text of a run, which is
+    model output about the user's prompt, so it is subject to the same
+    data-handling promise as the run itself. There is no path here that
+    can send it under a different policy.
+    """
+    if response_text is None:
+        # A trial that produced no text. Scored without asking anyone,
+        # because there is nothing to grade and paying a judge to say so
+        # would be spending money to learn what the row already says.
+        return {
+            "score": 0.0,
+            "passed": None,
+            "detail": "no response text: the trial did not complete",
+            "generation_id": None,
+            "billed_cost_usd": None,
+            "error": None,
+        }
+    out: dict[str, Any] = {
+        "score": None,
+        "passed": None,
+        "detail": None,
+        "generation_id": None,
+        "billed_cost_usd": None,
+        "error": None,
+    }
+    payload: dict[str, Any] = {
+        "model": judge_model,
+        "messages": judge_messages(rubric, reference, response_text),
+        "max_tokens": JUDGE_MAX_TOKENS,
+    }
+    if provider_prefs:
+        payload["provider"] = provider_prefs
+    try:
+        response = await client.post(
+            OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
+        )
+    except httpx.HTTPError as exc:
+        out["error"] = f"judge request failed: {type(exc).__name__}"
+        return out
+    if response.status_code != 200:
+        out["error"] = f"judge returned HTTP {response.status_code}"
+        return out
+    try:
+        data = response.json()
+    except ValueError:
+        out["error"] = "judge returned a malformed body"
+        return out
+    if not isinstance(data, dict):
+        out["error"] = "judge returned a malformed body"
+        return out
+
+    # Captured before the verdict is parsed, so a judge that charged for
+    # an unparseable reply still records what it charged. Money spent is
+    # money spent, whatever came back for it.
+    out["generation_id"] = _as_label(data.get("id"))
+    usage = data.get("usage")
+    if isinstance(usage, dict):
+        out["billed_cost_usd"] = as_money(usage.get("cost"))
+
+    # Through _flatten_content, the same extractor run_model uses, so a
+    # provider that answers in content parts rather than a bare string is
+    # read identically here. A second extractor would be a second thing
+    # to keep in step with providers.
+    try:
+        content = data["choices"][0]["message"]["content"]
+    except (LookupError, TypeError):
+        out["error"] = "judge returned a malformed body"
+        return out
+    verdict = parse_verdict(_flatten_content(content))
+    if "error" in verdict:
+        out["error"] = verdict["error"]
+        return out
+    out["score"] = verdict["score"]
+    out["detail"] = verdict["reason"]
+    # passed stays None for a judge, deliberately. A rubric defines a
+    # graded score; turning it into a pass or a fail needs a threshold
+    # the rubric never stated, and inventing one here would be the bench
+    # asserting a cutoff nobody chose. That is rule two applied to the
+    # scorer's own output. The report shows judge scores as means and
+    # says so, rather than quietly manufacturing a pass rate.
+    return out

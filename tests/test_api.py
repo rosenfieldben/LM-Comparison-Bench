@@ -38,6 +38,15 @@ TEST_CATALOG = {
             "prompt_price": 1e-06,
             "completion_price": 2e-06,
             "max_completion_tokens": None,
+            # Supports everything the bench can send, so it is the model
+            # strict mode accepts.
+            "supported_parameters": [
+                "max_tokens",
+                "reasoning",
+                "seed",
+                "temperature",
+                "top_p",
+            ],
         },
         {
             "id": "model/bare",
@@ -46,6 +55,10 @@ TEST_CATALOG = {
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # The catalog says nothing about its parameters, which strict
+            # mode treats as "cannot check" rather than "supports
+            # everything".
+            "supported_parameters": None,
         },
         # Publishes a completion cap below the extended budget, so the
         # per-model clamp has something to bite on.
@@ -56,6 +69,9 @@ TEST_CATALOG = {
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": 32000,
+            # Takes a budget and nothing else, so a temperature makes it
+            # ineligible under require_parameters.
+            "supported_parameters": ["max_tokens"],
         },
     ],
     "prices": TEST_PRICES,
@@ -161,8 +177,15 @@ def test_group_flow_collapses_comparison_into_one_history_entry(client):
 
     detail = client.get(f"/groups/{group_id}").json()
     assert [r["id"] for r in detail["runs"]] == [first["run_id"], second["run_id"]]
-    assert detail["runs"][0]["results"] == first["results"]
-    assert detail["runs"][1]["results"] == second["results"]
+
+    # Field by field, minus the row id the stored shape adds; see
+    # test_compare_persists_run_and_history_reflects_it for why the two
+    # shapes differ on purpose.
+    def without_ids(results):
+        return [{k: v for k, v in r.items() if k != "id"} for r in results]
+
+    assert without_ids(detail["runs"][0]["results"]) == first["results"]
+    assert without_ids(detail["runs"][1]["results"]) == second["results"]
 
     assert client.get("/groups/9999").status_code == 404
 
@@ -320,7 +343,16 @@ def test_compare_persists_run_and_history_reflects_it(client):
 
     detail = client.get(f"/runs/{compare['run_id']}").json()
     assert detail["prompt_text"] == long_prompt
-    assert detail["results"] == compare["results"]
+    # Everything the live response carried survives the round trip
+    # unchanged. Compared field by field rather than as whole dicts,
+    # because the stored shape deliberately carries one field the live
+    # one cannot: a persisted result has a row id and a live result does
+    # not, which is why StoredModelResult is a subclass rather than a
+    # nullable field. A plain equality here would have made that
+    # deliberate difference read as a regression.
+    stored = [{k: v for k, v in r.items() if k != "id"} for r in detail["results"]]
+    assert stored == compare["results"]
+    assert all(isinstance(r["id"], int) for r in detail["results"])
 
 
 @respx.mock
@@ -2688,8 +2720,11 @@ def test_the_served_index_versions_every_asset_url(client):
 
     referenced = re.findall(r'(?:src|href)="(/static/[^"]*)"', body)
     # Every module in the load-bearing order, plus the stylesheet and the
-    # pre-paint theme script.
-    assert len(referenced) == 11, referenced
+    # pre-paint theme script. The count moves when a module is added, and
+    # it is asserted rather than derived on purpose: a new asset that the
+    # transform failed to version would otherwise pass unnoticed, since
+    # every OTHER url would still carry its rev.
+    assert len(referenced) == 13, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -3791,3 +3826,2445 @@ def test_the_group_budget_is_required(client):
     assert client.post("/groups", json={"prompt": "p"}).status_code == 422
     assert client.post("/groups", json={"budget": "standard"}).status_code == 201
     assert client.post("/groups", json={"budget": "lavish"}).status_code == 422
+
+
+# ---- Phase I1: datasets as immutable files, experiments as the aggregate.
+
+
+def write_dataset(tmp_path, *rows, name="d.jsonl"):
+    path = tmp_path / name
+    path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def experiment_body(path, **overrides):
+    body = {
+        "name": "smoke",
+        "dataset_path": path,
+        "lineup": ["model/alpha", "model/beta"],
+        "budget": "standard",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_creating_an_experiment_records_the_manifest_before_anything_runs(
+    client, tmp_path
+):
+    """The group-row discipline one level up. Everything knowable at
+    creation is written at creation, including which dataset bytes were
+    read, so an experiment that never starts still says what it was going
+    to be."""
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "hi"}, {"id": "t2", "prompt": "yo"}
+    )
+
+    created = client.post(
+        "/experiments",
+        json=experiment_body(path, params={"seed": 7}, repeats=3),
+    )
+
+    assert created.status_code == 201
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    assert detail["status"] == "created"
+    assert detail["dataset_name"] == "d.jsonl"
+    assert len(detail["dataset_digest"]) == 64
+    assert detail["lineup"] == ["model/alpha", "model/beta"]
+    assert detail["params"] == {"seed": 7}
+    assert detail["repeats"] == 3
+    assert detail["tasks_total"] == 2
+    # 2 tasks x 3 repeats x 2 models, the number of paid calls this will
+    # make, fixed now so a halt cannot make itself look complete.
+    assert detail["trials_total"] == 12
+    assert detail["trials_done"] == 0
+    assert detail["estimand_mode"] == "routed_service"
+    # The same provenance a run row carries, recorded once because it is
+    # fixed for the whole experiment.
+    assert detail["catalog_digest"] == TEST_CATALOG["digest"]
+    assert detail["data_policy"] == "standard"
+
+
+def test_an_experiment_records_only_the_controls_that_were_set(client, tmp_path):
+    """Rule two, one level up: an experiment that set nothing records
+    nothing, not an empty object and not a set of defaults."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    created = client.post("/experiments", json=experiment_body(path))
+
+    assert client.get(f"/experiments/{created.json()['id']}").json()["params"] is None
+
+
+def test_a_malformed_dataset_fails_creation_with_the_line(client, tmp_path):
+    """422 rather than 500, and the line number rather than a stack trace:
+    the caller's next action is to open that line."""
+    path = tmp_path / "bad.jsonl"
+    path.write_text('{"id": "t1", "prompt": "hi"}\n{"id": "t1", "prompt": "yo"}\n')
+
+    resp = client.post("/experiments", json=experiment_body(str(path)))
+
+    assert resp.status_code == 422
+    assert "line 2" in resp.json()["detail"]
+    assert "duplicate task id" in resp.json()["detail"]
+
+
+def test_a_missing_dataset_file_names_the_path(client, tmp_path):
+    resp = client.post(
+        "/experiments", json=experiment_body(str(tmp_path / "nope.jsonl"))
+    )
+
+    assert resp.status_code == 422
+    assert "cannot read dataset" in resp.json()["detail"]
+
+
+def test_an_experiment_too_large_to_run_is_refused_with_the_arithmetic(
+    client, tmp_path
+):
+    """The refusal shows its working, because the caller has three levers
+    (tasks, repeats, lineup) and needs to know which one to pull."""
+    rows = [{"id": f"t{i}", "prompt": "hi"} for i in range(600)]
+    path = write_dataset(tmp_path, *rows)
+
+    resp = client.post("/experiments", json=experiment_body(path, repeats=5))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "600 tasks x 5 repeats x 2 models is 6000" in detail
+    assert "5000 limit" in detail
+
+
+def test_provider_pins_are_refused_under_the_routed_service_estimand(client, tmp_path):
+    """A pin under an estimand defined by dynamic routing is a
+    contradiction. Refusing beats ignoring: a silently dropped pin would
+    leave a record claiming a pin that never rode a payload."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, provider_pins={"model/alpha": "Together"}),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "routed-service estimand routes dynamically" in detail
+    # The refusal names the remedy. A 422 that says only what is wrong
+    # leaves the caller to guess which of two estimands they wanted.
+    assert 'estimand_mode to "underlying_model"' in detail
+
+
+def test_unknown_experiment_fields_are_rejected(client, tmp_path):
+    """extra="forbid" reaches the new surface too."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=experiment_body(path, temperature=0.5))
+
+    assert resp.status_code == 422
+
+
+def test_experiments_list_newest_first_and_a_missing_one_404s(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    first = client.post("/experiments", json=experiment_body(path, name="one")).json()
+    second = client.post("/experiments", json=experiment_body(path, name="two")).json()
+
+    listed = client.get("/experiments").json()["experiments"]
+
+    assert [e["id"] for e in listed[:2]] == [second["id"], first["id"]]
+    assert client.get("/experiments/999999").status_code == 404
+
+
+def test_the_experiment_endpoints_are_not_stored_by_any_cache(client, tmp_path):
+    """An experiment body carries every prompt in its dataset name and its
+    controls, so it belongs to the private, no-store class like every other
+    dynamic response."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    created = client.post("/experiments", json=experiment_body(path))
+
+    for resp in (
+        created,
+        client.get("/experiments"),
+        client.get(f"/experiments/{created.json()['id']}"),
+    ):
+        assert resp.headers.get("cache-control") == "private, no-store"
+
+
+# ---- Phase I2: the runner. Repeats, rotation, and honest interruption.
+
+
+def run_experiment_to_completion(client, experiment_id, path, timeout_s=20.0):
+    """Start the runner and drain its progress stream to a terminal state.
+
+    Draining the SSE stream rather than polling in a loop is what makes
+    this deterministic: the stream ends exactly when the experiment
+    reaches a terminal status, so there is no sleep to tune and no race
+    between the assertion and the runner.
+    """
+    started = client.post(
+        f"/experiments/{experiment_id}/start", json={"dataset_path": path}
+    )
+    assert started.status_code == 202, started.text
+    last = None
+    with client.stream("GET", f"/experiments/{experiment_id}/progress") as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                last = json.loads(line[5:])
+    return last
+
+
+@respx.mock
+def test_an_experiment_runs_every_cell_and_records_each_as_a_group(client, tmp_path):
+    """The end to end shape: two tasks, two repeats, two models is eight
+    trials, each one a group with its own cell coordinates and its own
+    persisted run."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "first"}, {"id": "t2", "prompt": "second"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done"
+    assert final["trials_done"] == 8
+    assert final["trials_total"] == 8
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["status"] == "done"
+    assert detail["trials_done"] == 8
+    # One group per cell, four cells, each carrying its coordinates.
+    rows = client.app.state.db.execute(
+        """SELECT task_id, repeat_index, rotation_index FROM groups
+           WHERE experiment_id = ? ORDER BY task_id, repeat_index""",
+        (eid,),
+    ).fetchall()
+    assert [(r["task_id"], r["repeat_index"]) for r in rows] == [
+        ("t1", 0),
+        ("t1", 1),
+        ("t2", 0),
+        ("t2", 1),
+    ]
+
+
+@respx.mock
+def test_rotation_is_recorded_and_actually_rotates_the_entry_order(client, tmp_path):
+    """The position-effect answer, asserted from the record rather than
+    from the plan: the rotation index on each group must advance, and the
+    request order upstream must follow it.
+
+    Models enter the semaphore in lineup order, so without rotation the
+    first-listed model would get a slot first on every single trial. That
+    is a systematic advantage that averaging cannot remove, because it
+    points the same way every time.
+    """
+    order = []
+
+    def route(request):
+        order.append(json.loads(request.content)["model"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, repeats=3, lineup=["model/alpha", "model/beta", "model/bare"]
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    rows = client.app.state.db.execute(
+        "SELECT rotation_index FROM groups WHERE experiment_id = ? ORDER BY repeat_index",
+        (eid,),
+    ).fetchall()
+    assert [r["rotation_index"] for r in rows] == [0, 1, 2]
+    # Three repeats of three models, each repeat starting one later.
+    assert order == [
+        "model/alpha",
+        "model/beta",
+        "model/bare",
+        "model/beta",
+        "model/bare",
+        "model/alpha",
+        "model/bare",
+        "model/alpha",
+        "model/beta",
+    ]
+
+
+@respx.mock
+def test_repeats_send_derived_seeds_and_an_unseeded_experiment_sends_none(
+    client, tmp_path
+):
+    """Rule one survives the repeat machinery in both directions: a seeded
+    experiment sends base+N so the repeats sample rather than repeat, and
+    an unseeded one sends no seed at all."""
+    seeds = []
+
+    def route(request):
+        seeds.append(json.loads(request.content).get("seed"))
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+
+    seeded = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, repeats=3, lineup=["model/alpha"], params={"seed": 100}
+        ),
+    ).json()["id"]
+    run_experiment_to_completion(client, seeded, path)
+    assert seeds == [100, 101, 102]
+
+    seeds.clear()
+    bare = client.post(
+        "/experiments", json=experiment_body(path, repeats=2, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, bare, path)
+    assert seeds == [None, None]
+
+
+@respx.mock
+def test_a_tasks_own_system_prompt_reaches_the_wire(client, tmp_path):
+    """The more specific declaration wins, and it is recorded on the group
+    like any other control so the record says what was sent."""
+    sent = []
+
+    def route(request):
+        sent.append(json.loads(request.content)["messages"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "body", "system": "be terse"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert sent[0][0] == {"role": "system", "content": "be terse"}
+    assert sent[0][1] == {"role": "user", "content": "body"}
+
+
+@respx.mock
+def test_a_second_experiment_cannot_start_while_one_runs(client, tmp_path):
+    """One at a time, said plainly. They share the upstream slots and the
+    ceiling, so concurrent experiments would measure each other."""
+    # An asyncio gate, not a threading one. The runner is a task on the
+    # same loop that serves requests, so a blocking wait inside the route
+    # would stall the very request that has to observe the 409. Awaiting
+    # yields the loop, which makes the ordering deterministic rather than
+    # a race between a sleep and the scheduler.
+    gate = asyncio.Event()
+
+    async def route(request):
+        await gate.wait()
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    first = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    second = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    assert (
+        client.post(
+            f"/experiments/{first}/start", json={"dataset_path": path}
+        ).status_code
+        == 202
+    )
+    blocked = client.post(f"/experiments/{second}/start", json={"dataset_path": path})
+
+    assert blocked.status_code == 409
+    assert "already running" in blocked.json()["detail"]
+    assert "measure each other" in blocked.json()["detail"]
+    gate.set()
+    with client.stream("GET", f"/experiments/{first}/progress") as resp:
+        for _ in resp.iter_lines():
+            pass
+
+
+@respx.mock
+def test_an_experiment_runs_once(client, tmp_path):
+    """A finished experiment is a record, not a template. Re-running into
+    the same row would mix two runs' trials under one manifest."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "only"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    again = client.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+
+    assert again.status_code == 409
+    assert "is done" in again.json()["detail"]
+
+
+@respx.mock
+def test_a_dataset_changed_since_creation_is_refused_rather_than_run(client, tmp_path):
+    """The whole point of recording a content digest. Running anyway would
+    produce a record citing one dataset and containing another, which is
+    the most misleading artifact this phase could emit."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "original"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    Path(path).write_text('{"id": "t1", "prompt": "edited"}\n', encoding="utf-8")
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "failed"
+    assert "dataset changed since this experiment was created" in final["status_detail"]
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_a_stop_halts_between_trials_and_leaves_an_honest_partial(client, tmp_path):
+    """A stopped experiment is a partial record, not a failed one, and it
+    says which it is. The trials that ran are real and stay; the ones that
+    did not are visible as the difference between done and total."""
+    seen = {"n": 0}
+    eid_box = {}
+
+    async def route(request):
+        # The stop endpoint's own body, awaited on the loop the runner
+        # lives on, rather than a nested synchronous client.post from
+        # inside the route. A nested request would re-enter the test
+        # client's portal while its loop is mid-trial, which passed in
+        # isolation and failed in the full suite: the runner ended
+        # "failed" instead of "stopped" and the reason was the harness,
+        # not the product. Awaiting the endpoint exercises the same code
+        # including its 409 guard, and is deterministic.
+        seen["n"] += 1
+        if seen["n"] == 1:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "stopped"
+    assert final["status_detail"] == "stopped between trials"
+    # The first trial completed and is real history; the rest never ran.
+    assert final["trials_done"] == 1
+    assert final["trials_total"] == 3
+    assert seen["n"] == 1
+
+
+@respx.mock
+def test_the_ceiling_halts_the_experiment_and_says_why(client, tmp_path, monkeypatch):
+    """A refusal means the money ran out. Halting beats continuing: every
+    later row would be a refusal, which is technically honest, practically
+    noise, and expensive in wall time."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    # Half of one result's charge: the first settlement closes the gate.
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "halted_on_refusal"
+    assert "spend ceiling" in final["status_detail"]
+    assert final["trials_done"] == 1
+    assert final["trials_refused"] == 1
+    # Conservation: every requested trial is accounted for as run,
+    # refused, or never attempted because the run halted.
+    assert final["trials_done"] + final["trials_refused"] <= final["trials_total"]
+    assert respx.calls.call_count == 1
+
+
+@respx.mock
+def test_conservation_holds_across_a_whole_experiment(client, tmp_path):
+    """The property the ceiling machinery has carried since F.3, stated
+    over an experiment rather than a batch: refusals plus upstream calls
+    account for every trial the experiment attempted."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    attempted = final["trials_done"] + final["trials_refused"] + final["trials_failed"]
+    assert attempted == final["trials_total"]
+    assert respx.calls.call_count + final["trials_refused"] == final["trials_total"]
+
+
+@respx.mock
+def test_review_repro_a_failed_trial_is_not_also_a_done_trial(client, tmp_path):
+    """The conservation test above passed vacuously.
+
+    Its fixture never fails a trial, so the sum it checks could not
+    detect double counting, and the runner was doing exactly that: a
+    failed trial bumped trials_done AND trials_failed. The README states
+    the property as four disjoint buckets (completed, failed, refused,
+    never attempted), and with one failure in four the sum was five out
+    of four.
+
+    Stated over a fixture that actually fails something, which is the
+    only way this assertion is worth making.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["trials_total"] == 4
+    assert final["trials_failed"] == 1
+    assert final["trials_refused"] == 0
+    # Three succeeded, one failed, none refused, none skipped.
+    assert final["trials_done"] == 3
+    assert (
+        final["trials_done"] + final["trials_failed"] + final["trials_refused"]
+        == final["trials_total"]
+    )
+
+
+@respx.mock
+def test_progress_frames_are_absolute_so_a_reconnect_costs_nothing(client, tmp_path):
+    """Every frame carries totals rather than deltas, which is what makes
+    a dropped frame free and reconnection the ordinary case rather than an
+    error path."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    # Rejoining a finished experiment still gets its state, immediately,
+    # rather than hanging or 404ing.
+    with client.stream("GET", f"/experiments/{eid}/progress") as resp:
+        frames = [
+            json.loads(line[5:])
+            for line in resp.iter_lines()
+            if line.startswith("data:")
+        ]
+
+    assert frames[-1]["status"] == "done"
+    assert frames[-1]["trials_done"] == 1
+    assert "spend_usd" in frames[-1]
+
+
+def test_stopping_an_experiment_that_is_not_running_409s(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    resp = client.post(f"/experiments/{eid}/stop", json={})
+
+    assert resp.status_code == 409
+    assert "not running" in resp.json()["detail"]
+
+
+@respx.mock
+def test_continue_mode_records_a_refusal_and_keeps_going(client, tmp_path):
+    """halt_on_refusal false is an implemented path, not a declared one.
+
+    Written now rather than with I5's refusal-heavy aggregates, because
+    I5 will build its failure-inclusive denominators on top of this
+    branch. A path that was implemented dead would be discovered by the
+    thing that depends on it, which is the expensive order.
+
+    The shape is one refusal followed by proof of progress: the ceiling
+    trips on the first settlement, the second trial is refused, and the
+    runner reaches the third rather than stopping. Refusals cost no
+    upstream call, so the call count is what separates "kept going" from
+    "stopped and the counters lied".
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], halt_on_refusal=False),
+    ).json()["id"]
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    # Ran to the end rather than halting, and says so.
+    assert final["status"] == "done"
+    assert final["status_detail"] is None
+    assert final["trials_total"] == 3
+    # One paid trial before the ceiling closed, then two refusals: the
+    # runner passed the first refusal and reached the last task.
+    assert final["trials_done"] == 1
+    assert final["trials_refused"] == 2
+    # Conservation over the whole experiment, refusals included.
+    assert final["trials_done"] + final["trials_refused"] == final["trials_total"]
+    # A refusal spends nothing, so exactly one call reached upstream.
+    assert respx.calls.call_count == 1
+
+
+@respx.mock
+def test_result_ids_reach_the_replay_path_and_not_the_live_one(client):
+    """The exposure route for result ids, decided before I4 needs them.
+
+    Blind rating and every score row point at a result by id, and both are
+    produced while looking at stored history. So the replay path carries
+    the id and the live path does not, structurally: StoredModelResult is
+    a subclass rather than a nullable field, because a live result has no
+    id at the moment it is returned and never will. Persistence happens
+    after the response is built, and the post-spend invariant explicitly
+    permits it to fail and answer run_id null. A nullable id on one shape
+    would force every consumer to know which endpoint it was talking to
+    before it could read None correctly.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "hi"))
+    )
+    live = client.post("/compare", json={"prompt": "ids", "models": ["model/alpha"]})
+
+    assert "id" not in live.json()["results"][0]
+
+    stored = client.get(f"/runs/{live.json()['run_id']}").json()
+    assert isinstance(stored["results"][0]["id"], int)
+    # And through the group replay, which is the view blind rating uses.
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    frames = stream_events(
+        client, {"prompt": "ids", "model": "model/alpha", "group_id": group_id}
+    )
+    done = next(f for f in frames if f["type"] == "done")
+    # The live done frame is the same shape as the live batch response:
+    # no id, because there is not one yet.
+    assert "id" not in done["result"]
+
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    assert ids and all(isinstance(i, int) for i in ids)
+
+
+# ---- Phase I3: scoring passes, deterministic and judged.
+
+import time
+
+from bench.models import JUDGE_MAX_TOKENS
+from bench.scoring import latest_per_key
+
+
+def score_experiment_to_completion(client, eid, path, judge_model=None, timeout_s=20.0):
+    """Start a scoring pass and wait for it to finish.
+
+    Polled rather than streamed because scoring has no progress endpoint
+    of its own yet; the state flag on app.state is the truth and this
+    reads it directly rather than guessing at a duration.
+    """
+    body = {"dataset_path": path}
+    if judge_model is not None:
+        body["judge_model"] = judge_model
+    started = client.post(f"/experiments/{eid}/score", json=body)
+    assert started.status_code == 202, started.text
+    deadline = time.monotonic() + timeout_s
+    while client.app.state.scoring_run["active"] is not None:
+        assert time.monotonic() < deadline, "scoring pass did not finish"
+        # One cheap request drives the loop, since the background task
+        # only progresses while the test client's portal is running.
+        client.get("/models")
+    assert client.app.state.scoring_run["error"] is None, client.app.state.scoring_run[
+        "error"
+    ]
+
+
+def scores_in(client, eid):
+    rows = client.app.state.db.execute(
+        """SELECT s.* FROM scores s
+           JOIN results r ON r.id = s.result_id
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY s.id""",
+        (eid,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+@respx.mock
+def test_a_deterministic_pass_scores_every_trial_including_the_failures(
+    client, tmp_path
+):
+    """Failures are scored, not skipped. A trial that errored is a trial
+    that failed the task, and leaving it unscored would let the report
+    drop it from the denominator."""
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        {
+            "id": "t2",
+            "prompt": "b",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path)
+
+    rows = scores_in(client, eid)
+    assert len(rows) == 2
+    assert {r["scorer"] for r in rows} == {"contains"}
+    # One passed on its text, one scored zero because it never produced
+    # any, and the row says which.
+    assert sorted(r["score"] for r in rows) == [0.0, 1.0]
+    failed = next(r for r in rows if r["score"] == 0.0)
+    assert failed["detail"] == "no response text: the trial did not complete"
+
+
+@respx.mock
+def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_path):
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] == "judge/one":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "gen-judge-9",
+                    "choices": [
+                        {
+                            "message": {
+                                "content": '{"score": 0.5, "reason": "partial"}'
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 30,
+                        "completion_tokens": 9,
+                        "cost": 0.00002,
+                    },
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "rubric": "score it",
+            "scorer": {"kind": "judge"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    before = client.app.state.accumulated_spend_usd
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["scorer"] == "judge"
+    assert row["score"] == 0.5
+    assert row["detail"] == "partial"
+    assert row["judge_model"] == "judge/one"
+    assert row["judge_generation_id"] == "gen-judge-9"
+    assert row["judge_billed_cost_usd"] == 0.00002
+    # Judge spend is spend: it moves the same accumulator the ceiling
+    # reads, so a scoring pass cannot run for free against the limit.
+    assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00002)
+
+
+@respx.mock
+def test_no_judge_payload_ever_carries_a_lineup_identity(client, tmp_path):
+    """The blind-by-construction claim, asserted at the wire rather than
+    at the function boundary: whatever the pass does, no request that
+    reaches a judge may name a model the experiment is comparing."""
+    judge_payloads = []
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] == "judge/one":
+            judge_payloads.append(request.content.decode())
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta"]),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    assert len(judge_payloads) == 2
+    for payload in judge_payloads:
+        assert "model/alpha" not in payload
+        assert "model/beta" not in payload
+        assert "judge/one" in payload
+
+
+@respx.mock
+def test_a_judge_in_the_lineup_flags_every_row_it_produces(client, tmp_path):
+    """Self-judging is recorded, not prevented. The user may have good
+    reason; a silent absorption of the self-preference concern is what
+    would be wrong."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="model/alpha")
+
+    assert scores_in(client, eid)[0]["self_judged"] == 1
+
+
+@respx.mock
+def test_a_malformed_verdict_is_recorded_as_a_scoring_failure(client, tmp_path):
+    """Never a guessed number. The row exists, carries no score, and says
+    what went wrong, so the report can tell "unscorable" from "not scored
+    yet"."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": "seems fine to me"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["score"] is None
+    assert "no JSON object" in row["detail"]
+
+
+@respx.mock
+def test_a_ceiling_refusal_during_scoring_records_the_gap_and_the_pass_goes_on(
+    client, tmp_path
+):
+    """The interruption policy, and it is the opposite of the trial
+    runner's default on purpose. A refused trial can only be recovered by
+    paying for the model call again, so halting protects the budget for a
+    decision the user should make. A refused score can be filled in by a
+    later pass over the same stored text at no extra model cost, so
+    stopping the whole pass for one would trade a complete scoring run
+    for nothing.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+        {"id": "t2", "prompt": "b", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    # Close the gate before scoring starts, so every judge call refuses.
+    client.app.state.spend_limit_usd = 0.0000001
+    client.app.state.accumulated_spend_usd = 1.0
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    rows = scores_in(client, eid)
+    # Both results have a row: the pass covered everything rather than
+    # stopping at the first refusal.
+    assert len(rows) == 2
+    for row in rows:
+        assert row["score"] is None
+        assert "re-run the scoring pass to fill it in" in row["detail"]
+        assert row["judge_model"] == "judge/one"
+
+
+@respx.mock
+def test_review_repro_the_judge_rechecks_the_ceiling_after_admission(
+    client, tmp_path, monkeypatch
+):
+    """F1.2's invariant, which the scoring pass was missing.
+
+    The pass checked the ceiling and then queued for one of the five
+    upstream slots, with no check after admission. Those are minutes
+    apart on a pass over three hundred results, and the ceiling being
+    crossed during the wait is the ordinary case rather than the exotic
+    one; the trial runner rechecks inside the held slot for exactly this
+    reason and the judge did not.
+
+    The fake reports a clear ceiling on the call before the queue and a
+    reached one after, which is the sequence the real gap produces. It
+    also records the semaphore's free-slot count at each call, because
+    the claim is about POSITION relative to admission and a second check
+    placed just before the queue would pass a call-count assertion while
+    leaving the invariant broken.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    # _value rather than a public accessor because nothing public reports
+    # how many slots are free; the suite already reads it for the same
+    # reason in the semaphore-honesty tests.
+    free_slots = []
+    answers = iter([False, True])
+
+    def fake_ceiling():
+        free_slots.append(client.app.state.upstream_semaphore._value)
+        return next(answers, True)
+
+    monkeypatch.setattr(main, "spend_ceiling_reached", fake_ceiling)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    row = scores_in(client, eid)[0]
+    assert row["score"] is None
+    assert "re-run the scoring pass to fill it in" in row["detail"]
+    # Twice, and the second time with a slot held: one fewer free than
+    # the first, which is what "after admission" means here.
+    assert len(free_slots) == 2
+    assert free_slots[1] == free_slots[0] - 1
+
+
+@respx.mock
+def test_rescoring_appends_and_the_latest_row_is_the_one_that_counts(client, tmp_path):
+    """Idempotent per (result, scorer, judge_model) means a second pass is
+    safe, not that it is a no-op. The new row lands beside the old one and
+    the report reads the newest; the older stays as the audit trail."""
+    verdicts = iter(['{"score": 0.0}', '{"score": 1.0}'])
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": next(verdicts)},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "grade", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    rows = scores_in(client, eid)
+    assert [r["score"] for r in rows] == [0.0, 1.0]
+    latest = latest_per_key(rows)
+    assert [r["score"] for r in latest] == [1.0]
+
+
+def test_scoring_a_running_experiment_is_refused(client, tmp_path):
+    """A pass over a half-finished experiment would score whatever
+    happened to exist, and its own re-runnability would then hide that it
+    had done so."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    resp = client.post(f"/experiments/{eid}/score", json={"dataset_path": path})
+
+    assert resp.status_code == 409
+    assert "once its trials have finished" in resp.json()["detail"]
+
+
+@respx.mock
+def test_scoring_against_a_changed_dataset_is_refused(client, tmp_path):
+    """The rubrics live in the file. Scoring against different tasks would
+    attribute one rubric's verdict to another's trial."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    Path(path).write_text(
+        '{"id": "t1", "prompt": "a", "reference": "Goodbye", '
+        '"scorer": {"kind": "contains"}}\n',
+        encoding="utf-8",
+    )
+
+    resp = client.post(f"/experiments/{eid}/score", json={"dataset_path": path})
+
+    assert resp.status_code == 422
+    assert "dataset changed" in resp.json()["detail"]
+    assert "attribute one rubric's verdict to another's trial" in resp.json()["detail"]
+
+
+@respx.mock
+def test_a_declared_pass_threshold_decides_a_judged_pass(client, tmp_path):
+    """The threshold rides the task's scorer spec into the score row.
+    Without one, passed stays empty and the report says score mean; with
+    one, the author's own cutoff decides."""
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] == JUDGE_MAX_TOKENS:
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.6}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "strict",
+            "prompt": "a",
+            "rubric": "grade",
+            "scorer": {"kind": "judge", "pass_threshold": 0.75},
+        },
+        {
+            "id": "lenient",
+            "prompt": "b",
+            "rubric": "grade",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+        {
+            "id": "unstated",
+            "prompt": "c",
+            "rubric": "grade",
+            "scorer": {"kind": "judge"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    by_task = {}
+    for row in client.app.state.db.execute(
+        """SELECT g.task_id, s.passed, s.score FROM scores s
+           JOIN results r ON r.id = s.result_id
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ?""",
+        (eid,),
+    ):
+        by_task[row["task_id"]] = dict(row)
+
+    # The same 0.6 verdict, three different answers, all of them the
+    # rubric author's own.
+    assert by_task["strict"]["passed"] == 0
+    assert by_task["lenient"]["passed"] == 1
+    assert by_task["unstated"]["passed"] is None
+    assert all(r["score"] == 0.6 for r in by_task.values())
+
+
+# ---- Phase I4: blind human rating on replay.
+
+from bench import store
+
+
+@respx.mock
+def rated_group(client):
+    """A two-model comparison with its result ids, ready to rate."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    for model in ("model/alpha", "model/beta"):
+        stream_events(
+            client,
+            {"prompt": "rate me", "model": model, "group_id": group_id},
+        )
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    return group_id, ids
+
+
+@respx.mock
+def test_ratings_persist_as_human_scores_with_their_conditions(client):
+    """The rating, the scale point the rater actually clicked, and the
+    label the card wore. All three, because the normalized score alone is
+    a number no rater ever saw and a blind nobody can audit."""
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [
+                {"result_id": ids[0], "rating": 5, "label": "B"},
+                {"result_id": ids[1], "rating": 1, "label": "A"},
+            ],
+        },
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["written"] == 2
+    rows = store.scores_for_results(client.app.state.db, ids)
+    assert rows[ids[0]][0]["score"] == 1.0
+    assert rows[ids[0]][0]["detail"] == "5 of 5, shown as B"
+    assert rows[ids[1]][0]["score"] == 0.0
+    assert rows[ids[1]][0]["detail"] == "1 of 5, shown as A"
+    for result_id in ids:
+        row = rows[result_id][0]
+        assert row["scorer"] == "human"
+        assert row["blind"] is True
+        # No pass verdict: nobody said what a passing rating is, and the
+        # bench inventing one would assert a cutoff the rater never chose.
+        assert row["passed"] is None
+
+
+@respx.mock
+def test_the_middle_of_the_scale_normalizes_to_the_middle(client):
+    group_id, ids = rated_group(client)
+
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 3}]},
+    )
+
+    row = store.scores_for_results(client.app.state.db, ids)[ids[0]][0]
+    assert row["score"] == 0.5
+    assert row["detail"] == "3 of 5"
+
+
+@respx.mock
+def test_a_rating_after_the_reveal_persists_as_not_blind(client):
+    """Honesty about conditions, not a prohibition. A sighted rating is
+    still a rating; what would be wrong is recording it as blind."""
+    group_id, ids = rated_group(client)
+
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": False, "ratings": [{"result_id": ids[0], "rating": 4}]},
+    )
+
+    assert (
+        store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] is False
+    )
+
+
+@respx.mock
+def test_rating_a_result_from_another_comparison_is_refused(client):
+    """Not paranoia about a hostile client: a stale tab holding an older
+    comparison's result ids would otherwise write ratings onto the wrong
+    models, and a silent misattribution is the worst outcome here."""
+    group_id, ids = rated_group(client)
+    other_id, other_ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": other_ids[0], "rating": 5}]},
+    )
+
+    assert resp.status_code == 422
+    assert "are not in comparison" in resp.json()["detail"]
+    assert "reload it" in resp.json()["detail"]
+
+
+@respx.mock
+def test_an_out_of_range_rating_is_refused(client):
+    group_id, ids = rated_group(client)
+
+    for value in (0, 6, -1):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={"blind": True, "ratings": [{"result_id": ids[0], "rating": value}]},
+        )
+        assert resp.status_code == 422, value
+
+
+@respx.mock
+def test_unknown_rating_fields_are_rejected(client):
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [{"result_id": ids[0], "rating": 5, "confidence": "high"}],
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_rating_a_group_that_does_not_exist_404s(client):
+    resp = client.post(
+        "/groups/999999/ratings",
+        json={"blind": True, "ratings": [{"result_id": 1, "rating": 3}]},
+    )
+
+    assert resp.status_code == 404
+
+
+# ---- Phase I5: the report.
+
+
+@respx.mock
+def scored_experiment(client, tmp_path, *, fail_second=False):
+    """A two-model, two-task, two-repeat experiment, run and scored."""
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if fail_second and calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        {
+            "id": "t2",
+            "prompt": "b",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+    return eid, path
+
+
+@respx.mock
+def test_the_report_names_its_estimand_and_its_resampling_unit(client, tmp_path):
+    """A number without its estimand is a number about nothing in
+    particular, and an interval without its resampling unit does not say
+    what it is an interval over."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["estimand_mode"] == "routed_service"
+    assert report["bootstrap"]["unit"] == "task"
+    assert report["bootstrap"]["seed"] == main.REPORT_SEED
+    assert report["bootstrap"]["resamples"] == 2000
+    assert report["dataset_digest"]
+
+
+@respx.mock
+def test_a_failed_trial_stays_in_the_denominator(client, tmp_path):
+    """Hand-computable, which is the point: eight trials, one of them
+    errored, and the errored one scores zero rather than vanishing. A
+    mean over survivors would read 1.0 and flatter the model that
+    failed."""
+    eid, path = scored_experiment(client, tmp_path, fail_second=True)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    total = sum(m["trials"]["planned"] for m in report["models"])
+    assert total == 8
+    errored = [m for m in report["models"] if m["trials"]["error"] == 1]
+    assert len(errored) == 1
+    hurt = errored[0]
+    # Four trials for this model, one errored: three score 1.0 and the
+    # failure scores 0.0, so the mean is 0.75 exactly.
+    assert hurt["trials"]["planned"] == 4
+    # Nothing was refused and nothing was skipped, so every planned trial
+    # was also attempted and the two denominators coincide here. The
+    # tombstone in tests/test_report.py is where they do not.
+    assert hurt["trials"]["attempted"] == 4
+    assert hurt["score"]["mean"] == pytest.approx(0.75)
+    assert hurt["trials"]["failure_rate"] == pytest.approx(0.25)
+    # The other model was untouched and reads 1.0, which is what makes
+    # the difference attributable.
+    clean = next(m for m in report["models"] if m["model"] != hurt["model"])
+    assert clean["score"]["mean"] == pytest.approx(1.0)
+
+
+@respx.mock
+def test_the_two_axes_are_reported_separately(client, tmp_path):
+    """A judge's malfunction is scoring coverage, not a model failure.
+    The trial counts and the coverage counts are different numbers over
+    the same trials, and neither leaks into the other."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    for entry in report["models"]:
+        scorer = entry["scorers"][0]
+        # Axis one: every trial accounted for by outcome.
+        counted = sum(
+            entry["trials"][k]
+            for k in ("done", "error", "refused", "stopped", "missing")
+        )
+        assert counted == entry["trials"]["planned"]
+        # Axis two: every trial that produced a result accounted for by
+        # scoring state. A trial that never ran is on neither axis, so
+        # the population is the plan less what never ran.
+        coverage = scorer["coverage"]
+        assert (
+            coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
+            == entry["trials"]["planned"] - entry["trials"]["missing"]
+        )
+        # The scoring-failure rate is its own number, which is also the
+        # response_format revisit measurement.
+        assert coverage["scoring_failure_rate"] == 0.0
+
+
+@respx.mock
+def test_pass_rates_ship_with_their_coverage_and_only_where_declared(client, tmp_path):
+    """Pass rate where a threshold was declared, score mean otherwise,
+    and the coverage number is what keeps a shrinking denominator
+    visible."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "declared",
+            "prompt": "a",
+            "rubric": "g",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+        {"id": "silent", "prompt": "b", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    scorer = with_file["models"][0]["scorers"][0]
+
+    assert with_file["thresholds_source"] == "dataset_file"
+    # One task declared a threshold, one did not: eligible counts only
+    # the declared one, and the rate is over usable verdicts within it.
+    assert scorer["pass_rate"]["eligible"] == 1
+    assert scorer["pass_rate"]["usable_verdicts"] == 1
+    assert scorer["pass_rate"]["passed"] == 1
+    assert scorer["pass_rate"]["rate"] == 1.0
+    # Both tasks still contribute to the mean.
+    assert scorer["n"] == 2
+
+    # Without the file the population is recovered from the score rows,
+    # and the report says which witness it used.
+    without = client.get(f"/experiments/{eid}/report").json()
+    assert without["thresholds_source"] == "score_rows"
+    assert without["models"][0]["scorers"][0]["mean"] == pytest.approx(0.9)
+
+    # The two witnesses agree here, which is the case that matters: every
+    # eligible task has a usable verdict, so the rows know everything the
+    # file knows. The silent task is the control, and it stays out of the
+    # population under BOTH witnesses: its rows carry passed None, which
+    # is what the file said too.
+    assert without["models"][0]["scorers"][0]["pass_rate"] == scorer["pass_rate"]
+
+
+@respx.mock
+def test_review_repro_pass_rates_survive_the_loss_of_the_dataset_file(client, tmp_path):
+    """A verdict in the database is evidence, and the report was throwing
+    it away.
+
+    Every `passed` here was computed against the real threshold when the
+    scoring pass ran, and every one of them is persisted. But ELIGIBILITY
+    was read from the file and nowhere else, so a report built without
+    the path published no pass rate at all: the numbers existed, the
+    denominator was simply not looked for. Losing a dataset file is
+    ordinary (moved, renamed, on the other laptop) and it should not
+    silently delete a published measurement.
+
+    So the rows witness their own threshold. `passed` is written from
+    judged_pass, which returns None unless the task's author declared a
+    cutoff, so a judge row with a non-None passed IS a record that a
+    threshold existed.
+
+    The honest limit is asserted here rather than only documented: t3 is
+    declared and never scored, so no row witnesses it and the recovered
+    eligible count is 2 where the file would say 3. A floor, and the
+    report labels itself as such.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    declared = {"kind": "judge", "pass_threshold": 0.5}
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": declared},
+        {"id": "t2", "prompt": "b", "rubric": "g", "scorer": declared},
+        {"id": "t3", "prompt": "c", "rubric": "g", "scorer": declared},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    # t3's rows deleted, standing in for the task nobody got round to
+    # scoring. Its trial is untouched, so it is still in the plan and
+    # still in the mean; only its witness is gone.
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 't3')"""
+    )
+    client.app.state.db.commit()
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    assert report["thresholds_source"] == "score_rows"
+    # The rate itself is exact: those two verdicts were judged against
+    # the real cutoff and 0.9 clears 0.5.
+    assert scorer["pass_rate"]["rate"] == 1.0
+    assert scorer["pass_rate"]["passed"] == 2
+    assert scorer["pass_rate"]["usable_verdicts"] == 2
+    # The floor. Three tasks declared a threshold; two left a row to say
+    # so, and the third is invisible without the file.
+    assert scorer["pass_rate"]["eligible"] == 2
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    assert with_file["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 3
+    assert with_file["thresholds_source"] == "dataset_file"
+
+
+@respx.mock
+def test_a_verdict_nobody_could_reach_never_creates_eligibility(client, tmp_path):
+    """The edge that keeps the fallback from inventing a population.
+
+    A judge row with `passed` None is exactly what an undeclared task or
+    an unparseable verdict leaves behind, and neither is evidence that a
+    threshold existed. Counting it would manufacture an eligible
+    denominator out of the scorer's own failures.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {"message": {"content": "no idea"}, "finish_reason": "stop"}
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "rubric": "g",
+            "scorer": {"kind": "judge", "pass_threshold": 0.5},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    # The verdict was unparseable, so passed is None and the row proves
+    # nothing about a threshold.
+    assert scorer["coverage"]["scoring_failed"] == 1
+    assert scorer["pass_rate"]["eligible"] == 0
+    assert scorer["pass_rate"]["rate"] is None
+
+
+@respx.mock
+def test_a_deterministic_pass_never_creates_eligibility(client, tmp_path):
+    """The other half of the same edge, and the reason judge_model gates
+    the witness.
+
+    A deterministic scorer writes `passed` unconditionally: it is the
+    score restated, not a threshold anybody declared, and the loader
+    permits pass_threshold only on judge. If those rows witnessed, the
+    same experiment would report a different eligible population with and
+    without a path, which is two answers from one dataset.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    without = client.get(f"/experiments/{eid}/report").json()
+
+    assert with_file["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 0
+    assert without["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 0
+
+
+@respx.mock
+def test_the_report_surfaces_the_self_judged_flag(client, tmp_path):
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 1.0}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="model/alpha")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    scorer = report["models"][0]["scorers"][0]
+    assert scorer["self_judged"] == 1
+    assert scorer["judge_models"] == ["model/alpha"]
+
+
+@respx.mock
+def test_human_ratings_appear_as_their_own_scorer_row_with_the_blind_flag(
+    client, tmp_path
+):
+    """Human ratings are scores like any other, and the condition they
+    were made under travels with them."""
+    eid, path = scored_experiment(client, tmp_path)
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
+        },
+    )
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    human = [
+        s for m in report["models"] for s in m["scorers"] if s["scorer"] == "human"
+    ]
+    assert human, [s["scorer"] for m in report["models"] for s in m["scorers"]]
+    assert all(row["blind"] >= 1 for row in human)
+    assert all(row["mean"] == pytest.approx(0.75) for row in human)
+
+
+@respx.mock
+def test_the_report_shows_which_providers_actually_served(client, tmp_path):
+    """The routed-service estimand made visible: under dynamic routing
+    the provider is chosen per call, so it is the largest confound in any
+    comparison and counting it turns an assumption into a column."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    # The column exists on every model. The counts are empty here
+    # because the browser stub does not name a provider, which is a
+    # limit of the fixture rather than of the code; the counting itself
+    # is asserted in tests/test_report.py where the input is controlled.
+    assert all(isinstance(m["providers"], dict) for m in report["models"])
+
+
+@respx.mock
+def test_reporting_against_a_changed_dataset_is_refused(client, tmp_path):
+    eid, path = scored_experiment(client, tmp_path)
+    Path(path).write_text('{"id": "t1", "prompt": "different"}\n', encoding="utf-8")
+
+    resp = client.get(f"/experiments/{eid}/report", params={"dataset_path": path})
+
+    assert resp.status_code == 422
+    assert "attribute one rubric's threshold to another" in resp.json()["detail"]
+
+
+def test_a_report_for_a_missing_experiment_404s(client):
+    assert client.get("/experiments/999999/report").status_code == 404
+
+
+# ---- Phase I6: the export artifact.
+
+import hashlib
+
+from bench.report import build_report
+
+
+@respx.mock
+def two_axes_experiment(client, tmp_path):
+    """An experiment shaped so the two-axes bug would corrupt its numbers.
+
+    Two tasks, two models. The second upstream call errors, so one trial
+    is an axis-one failure. Only the first task carries a scorer, so the
+    completed trials of the second task are axis-two unscored. A mean
+    that confused the two would read differently from the correct one,
+    which is what makes this the right shape to re-derive from an export.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            return httpx.Response(500)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "scored",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+        # No scorer at all, so its trials stay unscored: the axis-two
+        # half of the shape.
+        {"id": "unscored", "prompt": "b"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+    return eid, path
+
+
+def read_export(client, eid, dataset_path=None):
+    params = {} if dataset_path is None else {"dataset_path": dataset_path}
+    with client.stream(
+        "GET", f"/experiments/{eid}/export.jsonl", params=params
+    ) as resp:
+        assert resp.status_code == 200
+        raw = resp.read()
+    return raw
+
+
+def rebuild_from_export(lines, tasks_by_id):
+    """Run the report's own pure function over an export and nothing else.
+
+    The whole self-sufficiency claim in one helper: if the artifact
+    carries what it says it carries, this reproduces the served numbers
+    with no database in reach. tasks_by_id is what the caller could
+    recover from the manifest, so passing None here is not a shortcut,
+    it is the pathless artifact's actual situation.
+    """
+    manifest = lines[0]
+    groups, runs_by_group, scores_by_result = [], {}, {}
+    for trial in (x for x in lines if x["type"] == "trial"):
+        gid = trial["group_id"]
+        if gid not in runs_by_group:
+            groups.append(
+                {
+                    "id": gid,
+                    "task_id": trial["task_id"],
+                    "repeat_index": trial["repeat_index"],
+                    "rotation_index": trial["rotation_index"],
+                }
+            )
+            runs_by_group[gid] = []
+        run = next((r for r in runs_by_group[gid] if r["id"] == trial["run_id"]), None)
+        if run is None:
+            run = {
+                "id": trial["run_id"],
+                "data_policy": trial["data_policy"],
+                "app_sha": trial["app_sha"],
+                "catalog_digest": trial["catalog_digest"],
+                "prompt_text": trial["prompt_text"],
+                "results": [],
+            }
+            runs_by_group[gid].append(run)
+        run["results"].append(
+            {
+                "id": trial["result_id"],
+                "model": trial["model"],
+                "error": trial["error"],
+                "request_json": trial["request_json"],
+                "response_text": trial["response_text"],
+                "position": trial["position"],
+                "latency_ms": trial["latency_ms"],
+                "ttft_ms": trial["ttft_ms"],
+                "cost_usd": trial["cost_usd"],
+                "billed_cost_usd": trial["billed_cost_usd"],
+                "provider": trial["provider"],
+            }
+        )
+        scores_by_result[trial["result_id"]] = trial["scores"]
+    return build_report(
+        {
+            "id": manifest["experiment_id"],
+            "name": manifest["name"],
+            "estimand_mode": manifest["estimand_mode"],
+            "dataset_name": manifest["dataset_name"],
+            "dataset_digest": manifest["dataset_digest"],
+            "repeats": manifest["repeats"],
+            "status": manifest["status"],
+            "status_detail": manifest["status_detail"],
+            "lineup": manifest["lineup"],
+        },
+        groups,
+        runs_by_group,
+        scores_by_result,
+        tasks_by_id,
+        manifest["report_seed"],
+    )
+
+
+def tasks_from_manifest(manifest):
+    """The manifest's threshold slice, in the shape build_report reads.
+
+    None when the export was made without a file, which is the whole
+    point of thresholds_included: an empty slice and an absent one are
+    different artifacts and license different claims.
+    """
+    if not manifest["thresholds_included"]:
+        return None
+    return {tid: {"scorer": spec} for tid, spec in manifest["thresholds"].items()}
+
+
+def export_lines(client, eid, dataset_path=None):
+    return [
+        json.loads(x)
+        for x in read_export(client, eid, dataset_path).decode().strip().split("\n")
+    ]
+
+
+def threshold_experiment(client, tmp_path):
+    """Three declared tasks, one of them left without a witness.
+
+    Every task declares the same cutoff, so the file's eligible count is
+    three. t3's score rows are then deleted, standing in for the task a
+    scoring pass never reached: its trial is untouched, so it stays in
+    the plan and in the mean, and only its evidence of a threshold is
+    gone. That gap is the whole difference between the exact denominator
+    and the floor, which is what makes this the right shape to export
+    both ways.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    declared = {"kind": "judge", "pass_threshold": 0.5}
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": declared},
+        {"id": "t2", "prompt": "b", "rubric": "g", "scorer": declared},
+        {"id": "t3", "prompt": "c", "rubric": "g", "scorer": declared},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 't3')"""
+    )
+    client.app.state.db.commit()
+    return eid, path
+
+
+@respx.mock
+def test_review_repro_two_exports_of_one_experiment_are_byte_identical(
+    client, tmp_path
+):
+    """A citation names an artifact. An artifact that differs between two
+    honest exports of the same data cannot be checked against the
+    citation, so the digest would be decoration.
+
+    Line order is fixed by the query (task, repeat, position); key order
+    within a line is fixed by sort_keys. Both are needed, and this
+    asserts the pair rather than either alone.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    first = read_export(client, eid)
+    second = read_export(client, eid)
+
+    assert first == second
+    # Including the digest line, which is the part a citation quotes.
+    assert (
+        json.loads(first.decode().strip().split("\n")[-1])["digest"]
+        == (json.loads(second.decode().strip().split("\n")[-1])["digest"])
+    )
+
+    # And with the file supplied, because the threshold slice is a new
+    # mapping in the manifest and a mapping is exactly the thing whose
+    # iteration order could vary between two honest exports. sort_keys
+    # covers it; this is what says so.
+    pathed = read_export(client, eid, path)
+    assert pathed == read_export(client, eid, path)
+    # The two modes differ, which is the point of labeling them: an
+    # export that carried the thresholds and one that did not are
+    # different artifacts and must not share a digest.
+    assert pathed != first
+
+
+@respx.mock
+def test_the_export_verifies_its_own_digest(client, tmp_path):
+    """Computed over the bytes as written, so the file checks itself with
+    no second pass and no sidecar to lose."""
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    raw = read_export(client, eid).decode()
+    lines = raw.split("\n")[:-1]
+    body = "\n".join(lines[:-1]) + "\n"
+    trailer = json.loads(lines[-1])
+
+    assert trailer["type"] == "digest"
+    assert trailer["algorithm"] == "sha256"
+    assert trailer["digest"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+@respx.mock
+def test_the_export_is_ordered_and_manifested(client, tmp_path):
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+
+    manifest = lines[0]
+    assert manifest["type"] == "manifest"
+    assert manifest["export_schema_version"] == 1
+    assert manifest["estimand_mode"] == "routed_service"
+    assert manifest["dataset_digest"]
+    assert manifest["bootstrap_unit"] == "task"
+    trials = [x for x in lines if x["type"] == "trial"]
+    # Deterministic ordering: task, then repeat, then position.
+    keys = [(t["task_id"], t["repeat_index"], t["position"]) for t in trials]
+    assert keys == sorted(keys)
+
+
+@respx.mock
+def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
+    client, tmp_path
+):
+    """The self-sufficiency claim, tested on the number most likely to be
+    wrong rather than on a lucky one.
+
+    The experiment has an errored trial (axis one) and completed trials
+    nobody scored (axis two). The score mean over it is only correct if
+    the export carried enough to keep those apart: the outcome per trial,
+    and the score rows with their nulls intact. An export that flattened
+    either would re-derive a different mean here while still matching on
+    an experiment where everything succeeded.
+
+    The four rows the fixture actually produces, which is worth writing
+    down because an earlier description of this fixture named three
+    trials for model/beta when it has two:
+
+        model/alpha  task=scored    done   contains=1.0
+        model/beta   task=scored    error  contains=0.0
+        model/alpha  task=unscored  done   (no score rows)
+        model/beta   task=unscored  done   (no score rows)
+
+    Both wrong directions, as numbers, so the claim that this fixture
+    discriminates is checkable rather than asserted:
+
+        correct        alpha [1.0]      -> 1.0    beta [0.0]      -> 0.0
+        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 0.0] -> 0.0
+        B: drop failed alpha [1.0]      -> 1.0    beta []         -> None
+
+    So each direction is caught by one model and not the other: A moves
+    model/alpha and leaves model/beta at 0.0, B empties model/beta and
+    leaves model/alpha at 1.0. The pair is load-bearing, and asserting
+    only one of the two means would let one direction through.
+
+    Re-derived by feeding the export's own rows back through the same
+    pure function the report uses, which is what makes "self-sufficient"
+    a check rather than a claim.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+    served = client.get(f"/experiments/{eid}/report").json()
+
+    lines = export_lines(client, eid)
+
+    # The export carried no threshold slice, so the rebuild gets None and
+    # recovers eligibility from the rows, exactly as the served report
+    # did. Passing {} instead would tell build_report a file had been
+    # read and declared nothing, which is a different claim.
+    rebuilt = rebuild_from_export(lines, None)
+
+    # The shape is the one the bug would have corrupted: an errored trial
+    # and unscored completed trials, both present.
+    outcomes = {m["model"]: m["trials"] for m in served["models"]}
+    assert sum(t["error"] for t in outcomes.values()) == 1
+    coverage = [
+        s["coverage"]
+        for m in served["models"]
+        for s in m["scorers"]
+        if s["scorer"] == "contains"
+    ]
+    assert coverage and any(c["unscored"] > 0 for c in coverage)
+
+    # Both discriminating values pinned, one per wrong direction. Each
+    # model catches the direction the other is blind to, per the table in
+    # the docstring.
+    means = {
+        m["model"]: (m["score"]["mean"], m["scorers"][0]["n"])
+        for m in rebuilt["models"]
+    }
+    assert means["model/alpha"] == (1.0, 1)  # direction A would read 0.5
+    assert means["model/beta"] == (0.0, 1)  # direction B would read None
+
+    # And the export alone reproduces every model's mean and outcome
+    # counts exactly.
+    for served_model, rebuilt_model in zip(
+        served["models"], rebuilt["models"], strict=True
+    ):
+        assert served_model["model"] == rebuilt_model["model"]
+        assert served_model["trials"] == rebuilt_model["trials"]
+        assert served_model["score"]["mean"] == rebuilt_model["score"]["mean"]
+        assert (
+            served_model["scorers"][0]["coverage"]
+            == rebuilt_model["scorers"][0]["coverage"]
+        )
+
+
+@respx.mock
+def test_review_repro_the_export_re_derives_the_pass_rate_it_says_it_can(
+    client, tmp_path
+):
+    """The self-sufficiency claim, extended to the number it did not
+    cover, in both of the modes the artifact can be in.
+
+    Every verdict was already in the export and the rate was already
+    re-derivable. ELIGIBILITY was not: it lived in the file, so an export
+    could reproduce a model's mean exactly and be quietly unable to
+    reproduce the denominator beside it. That made "self-sufficient"
+    false for precisely the coverage figure the README puts next to every
+    rate, and the round trip did not notice because its fixture declared
+    no thresholds at all.
+
+    Three declared tasks, one of them stripped of its score rows, so the
+    exact denominator and the floor are different numbers here and a
+    rebuild cannot pass both by accident:
+
+        with the file / labeled export    eligible 3, usable 2, rate 1.0
+        without       / pathless export   eligible 2, usable 2, rate 1.0
+    """
+    eid, path = threshold_experiment(client, tmp_path)
+    with_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()["models"][0]["scorers"][0]["pass_rate"]
+    without = client.get(f"/experiments/{eid}/report").json()["models"][0]["scorers"][
+        0
+    ]["pass_rate"]
+    assert with_file["eligible"] == 3
+    assert without["eligible"] == 2
+
+    labeled = export_lines(client, eid, path)
+    pathless = export_lines(client, eid)
+
+    # Each artifact says which it is, and neither has to be asked.
+    assert labeled[0]["thresholds_included"] is True
+    assert set(labeled[0]["thresholds"]) == {"t1", "t2", "t3"}
+    assert labeled[0]["thresholds"]["t1"] == {"kind": "judge", "pass_threshold": 0.5}
+    assert pathless[0]["thresholds_included"] is False
+    assert pathless[0]["thresholds"] == {}
+    # The slice is minimal: nothing that only a human reader would want.
+    assert set(labeled[0]["thresholds"]["t1"]) == {"kind", "pass_threshold"}
+
+    # The labeled export re-derives the exact denominator.
+    from_labeled = rebuild_from_export(labeled, tasks_from_manifest(labeled[0]))
+    assert from_labeled["models"][0]["scorers"][0]["pass_rate"] == with_file
+    assert from_labeled["thresholds_source"] == "dataset_file"
+
+    # The pathless one re-derives the floor, and matches the report that
+    # was served under the same handicap. Both are honest; only one is
+    # complete, and each says which.
+    from_pathless = rebuild_from_export(pathless, tasks_from_manifest(pathless[0]))
+    assert from_pathless["models"][0]["scorers"][0]["pass_rate"] == without
+    assert from_pathless["thresholds_source"] == "score_rows"
+
+
+@respx.mock
+def test_an_export_against_the_wrong_dataset_streams_nothing(client, tmp_path):
+    """Refused before a byte goes out, not part way through.
+
+    Raising from inside the generator would already have sent 200 and a
+    content-type, leaving the caller holding a truncated file that looks
+    like a whole one. An artifact is cited; a half-written one is worse
+    than none.
+    """
+    eid, path = threshold_experiment(client, tmp_path)
+    wrong = write_dataset(tmp_path, {"id": "z", "prompt": "other"}, name="wrong.jsonl")
+
+    resp = client.get(
+        f"/experiments/{eid}/export.jsonl", params={"dataset_path": wrong}
+    )
+
+    assert resp.status_code == 422
+    assert "dataset changed since this experiment was created" in resp.json()["detail"]
+    # An error body, not an artifact: no ndjson content type and not one
+    # manifest or trial line anywhere in what came back.
+    assert not resp.headers["content-type"].startswith("application/x-ndjson")
+    assert b"manifest" not in resp.content
+    assert b'"type"' not in resp.content
+
+
+@respx.mock
+def test_the_export_is_never_stored_by_a_cache(client, tmp_path):
+    """It carries every prompt and every answer in the experiment, which
+    makes it the most sensitive body the bench produces."""
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    with client.stream("GET", f"/experiments/{eid}/export.jsonl") as resp:
+        assert resp.headers.get("cache-control") == "private, no-store"
+        assert resp.headers["content-type"].startswith("application/x-ndjson")
+        resp.read()
+
+
+def test_exporting_a_missing_experiment_404s(client):
+    assert client.get("/experiments/999999/export.jsonl").status_code == 404
+
+
+# ---- Phase I7: the underlying-model estimand.
+
+
+def strict_body(path, **overrides):
+    body = experiment_body(path, estimand_mode="underlying_model")
+    body["lineup"] = ["model/alpha"]
+    body.update(overrides)
+    return body
+
+
+def test_strict_mode_accepts_a_model_the_catalog_says_can_do_the_job(client, tmp_path):
+    """The scope control for every refusal below. model/alpha publishes
+    every parameter this request carries, so the check passes and the row
+    records the estimand it was created under."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, params={"temperature": 0.4, "effort": "low"}),
+    )
+
+    assert resp.status_code == 201, resp.text
+    detail = client.get(f"/experiments/{resp.json()['id']}").json()
+    assert detail["estimand_mode"] == "underlying_model"
+
+
+def test_strict_mode_refuses_a_control_the_model_does_not_support(client, tmp_path):
+    """Under require_parameters an unsupported parameter is not ignored,
+    it makes every provider ineligible. So the experiment would fail every
+    trial, and the place to say so is before the first one."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, lineup=["model/capped"], params={"temperature": 0.4}),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "model/capped does not support temperature" in detail
+    assert "require_parameters" in detail
+    # Names the remedy, and names the routed-service behavior it is
+    # different from, because "use the other estimand" is only actionable
+    # if the caller knows what the other one does with the same request.
+    assert "routed-service estimand" in detail
+
+
+def test_strict_mode_refuses_a_model_the_catalog_does_not_describe(client, tmp_path):
+    """Absence of evidence is not support. model/bare is in the catalog
+    with no supported_parameters, which is a different fact from an empty
+    list and must not be read as one."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=strict_body(path, lineup=["model/bare"]))
+
+    assert resp.status_code == 422
+    assert "publishes no supported_parameters" in resp.json()["detail"]
+
+
+def test_strict_mode_refuses_a_model_the_catalog_never_listed(client, tmp_path):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post("/experiments", json=strict_body(path, lineup=["model/ghost"]))
+
+    assert resp.status_code == 422
+    assert "does not list model/ghost" in resp.json()["detail"]
+
+
+def test_review_repro_an_offline_boot_refuses_to_create_a_strict_experiment(
+    monkeypatch, tmp_path
+):
+    """The check needs the catalog, so a boot without one cannot make the
+    promise the estimand's name makes.
+
+    Skipping the check silently would be the tempting version of this and
+    the wrong one: the rows would carry estimand_mode underlying_model
+    with nothing behind it, and no reader afterwards could tell those rows
+    from the ones where the check ran. A label nobody verified is worse
+    than no label. The refusal names the reason and both remedies.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline_catalog(client):
+        return {"fetched": False, "models": [], "prices": {}, "digest": None}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
+    with TestClient(app, base_url="http://localhost") as offline:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+        strict = offline.post("/experiments", json=strict_body(path))
+        routed = offline.post("/experiments", json=experiment_body(path))
+
+    assert strict.status_code == 422
+    detail = strict.json()["detail"]
+    assert "this boot has no catalog" in detail
+    assert "routed-service estimand, which makes no capability claim" in detail
+    # And the default estimand is untouched by any of this: it makes no
+    # capability claim, so it needs no catalog to make it.
+    assert routed.status_code == 201, routed.text
+
+
+def test_a_pin_for_a_model_outside_the_lineup_is_refused(client, tmp_path):
+    """A declaration that cannot be honored should not be stored as
+    though it will be."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+
+    resp = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/other": "Together"}),
+    )
+
+    assert resp.status_code == 422
+    assert "not in the lineup" in resp.json()["detail"]
+
+
+@respx.mock
+def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
+    """What actually rides the wire, read off the recorded request.
+
+    allow_fallbacks false travels with the order and never without it: an
+    order that can be departed from is a preference, and a pinned run
+    served by somebody else would record a constraint that did not hold.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "Together"}),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1
+    provider = sent[0]["provider"]
+    assert provider["require_parameters"] is True
+    assert provider["order"] == ["Together"]
+    assert provider["allow_fallbacks"] is False
+    # The privacy promise is written last and cannot be displaced by the
+    # estimand: the boot policy's keys survive the merge.
+    assert provider["sort"] == "throughput"
+
+
+@respx.mock
+def test_review_repro_the_routed_service_payload_is_unchanged_by_strict_mode(
+    client, tmp_path
+):
+    """The promise adding an estimand had to keep.
+
+    Byte for byte, not merely equal in the keys anybody thought to check.
+    If strict mode had leaked into the default path, every comparison this
+    bench has ever run would be measuring something different from the day
+    before, and the change would be invisible in the results.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(request.content),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1
+    payload = json.loads(sent[0])
+    assert payload["provider"] == {"sort": "throughput"}
+    assert "require_parameters" not in sent[0].decode()
+    assert "allow_fallbacks" not in sent[0].decode()

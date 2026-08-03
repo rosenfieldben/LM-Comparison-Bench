@@ -12,7 +12,10 @@ from bench.models import (
     control_messages,
     control_payload,
     fetch_catalog,
+    judge_response,
+    missing_parameters,
     run_model,
+    strict_provider_preferences,
 )
 
 FIXTURE = json.loads(
@@ -1736,3 +1739,264 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
     assert recorded["temperature"] == 0.2
     for absent in ("top_p", "seed", "reasoning"):
         assert absent not in recorded, absent
+
+
+# ---- Phase I3: rubric judging, blind by construction.
+
+from bench.models import JUDGE_MAX_TOKENS
+
+
+def judge_body(text):
+    return {
+        "id": "gen-judge-1",
+        "choices": [{"message": {"content": text}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 40, "completion_tokens": 12, "cost": 0.00004},
+    }
+
+
+@respx.mock
+async def test_a_judge_verdict_becomes_a_score_with_its_charge(client):
+    respx.post(OPENROUTER_URL).respond(
+        json=judge_body('{"score": 0.5, "reason": "half of it"}')
+    )
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
+
+    assert out["score"] == 0.5
+    assert out["detail"] == "half of it"
+    assert out["error"] is None
+    assert out["generation_id"] == "gen-judge-1"
+    assert out["billed_cost_usd"] == 0.00004
+    # passed stays None on purpose: a rubric defines a graded score, and
+    # turning it into a pass needs a threshold the rubric never stated.
+    assert out["passed"] is None
+
+
+@respx.mock
+async def test_the_judge_payload_never_carries_a_model_identity(client):
+    """Blind by construction. The function is not given the model that
+    produced the response, so no edit inside it can leak one: the identity
+    is not in scope. A judge told which model it is grading has a
+    documented tendency to prefer some of them, and a blindness enforced
+    by "remember not to include it" is one careless edit from gone."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(
+        client,
+        "judge/one",
+        "grade this",
+        "the expected answer",
+        "the candidate answer",
+    )
+
+    sent = json.loads(respx.calls[-1].request.content)
+    blob = json.dumps(sent)
+    for identity in ("deepseek", "anthropic", "openai", "model/alpha", "gpt"):
+        assert identity not in blob.lower(), (identity, blob)
+    # What it does carry: the rubric, the reference and the response.
+    assert "grade this" in blob
+    assert "the expected answer" in blob
+    assert "the candidate answer" in blob
+    # And the judge's own id, which is the one model name a judge payload
+    # legitimately contains.
+    assert sent["model"] == "judge/one"
+
+
+@respx.mock
+async def test_the_judge_gets_its_own_modest_budget(client):
+    """A verdict is a number and a sentence. A judge inheriting an
+    extended-tier experiment would buy headroom no rubric needs, once per
+    scored trial, at the judge's own price."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(client, "judge/one", "r", None, "a")
+
+    assert json.loads(respx.calls[-1].request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+    assert JUDGE_MAX_TOKENS < BUDGET_STANDARD
+
+
+@respx.mock
+async def test_the_judge_payload_carries_the_privacy_policy(client):
+    """A judge call sends a run's response text, which is model output
+    about the user's prompt, so it is subject to the same data-handling
+    promise as the run itself."""
+    prefs = {"sort": "throughput", "data_collection": "deny"}
+    respx.post(OPENROUTER_URL).respond(json=judge_body('{"score": 1.0}'))
+
+    await judge_response(client, "judge/one", "r", None, "a", provider_prefs=prefs)
+
+    assert json.loads(respx.calls[-1].request.content)["provider"] == prefs
+
+
+@respx.mock
+async def test_a_malformed_verdict_is_a_scoring_failure_that_still_records_the_charge(
+    client,
+):
+    """Money spent is money spent, whatever came back for it. Capturing
+    the charge before parsing is what keeps an unparseable but paid-for
+    verdict from vanishing from the accounting."""
+    respx.post(OPENROUTER_URL).respond(json=judge_body("it was pretty good I think"))
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] is None
+    assert "no JSON object" in out["error"]
+    assert out["billed_cost_usd"] == 0.00004
+    assert out["generation_id"] == "gen-judge-1"
+
+
+@respx.mock
+async def test_a_judge_refusal_is_recorded_not_raised(client):
+    """Never raises, the same contract the other client functions carry:
+    this runs in a loop over many results and one bad reply must not end
+    the pass."""
+    respx.post(OPENROUTER_URL).respond(status_code=429)
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] is None
+    assert out["error"] == "judge returned HTTP 429"
+
+
+@respx.mock
+async def test_a_judge_transport_failure_is_recorded_not_raised(client):
+    respx.post(OPENROUTER_URL).mock(side_effect=httpx.ConnectError("down"))
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["error"] == "judge request failed: ConnectError"
+
+
+async def test_a_trial_with_no_text_is_scored_without_asking_anyone(client):
+    """Nothing to grade, so paying a judge to say so would be spending
+    money to learn what the row already says. No respx mock here, which
+    is itself the assertion: reaching the network would fail the test."""
+    out = await judge_response(client, "judge/one", "r", None, None)
+
+    assert out["score"] == 0.0
+    assert out["detail"] == "no response text: the trial did not complete"
+    assert out["billed_cost_usd"] is None
+
+
+@respx.mock
+async def test_a_judge_answering_in_content_parts_is_read_the_same_way(client):
+    """Through _flatten_content, the extractor run_model uses. A second
+    extractor would be a second thing to keep in step with providers."""
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "id": "gen-judge-2",
+            "choices": [
+                {
+                    "message": {
+                        "content": [{"type": "text", "text": '{"score": 1.0}'}]
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+    )
+
+    out = await judge_response(client, "judge/one", "r", None, "a")
+
+    assert out["score"] == 1.0
+
+
+# ---- Phase I7: the underlying-model estimand's pure parts.
+
+
+@respx.mock
+async def test_fetch_catalog_reads_supported_parameters_and_degrades_it(client):
+    """Three distinct states, and strict mode acts differently on each.
+
+    A list of strings is what the check runs against. A missing key is
+    "the catalog did not say", which is not the same fact as an empty
+    list and must not collapse into one: an empty list means the model
+    takes no optional parameters, and something has to be able to tell
+    those apart. A malformed element degrades itself rather than the
+    entry, the same rule the price fields follow.
+    """
+    respx.get(MODELS_URL).respond(
+        json={
+            "data": [
+                {"id": "a/full", "supported_parameters": ["temperature", "seed"]},
+                {"id": "b/silent"},
+                {"id": "c/empty", "supported_parameters": []},
+                {"id": "d/mixed", "supported_parameters": ["seed", 7, None, "seed"]},
+                {"id": "e/wrongtype", "supported_parameters": "temperature"},
+            ]
+        }
+    )
+
+    models = {m["id"]: m for m in (await fetch_catalog(client))["models"]}
+
+    assert models["a/full"]["supported_parameters"] == ["seed", "temperature"]
+    assert models["b/silent"]["supported_parameters"] is None
+    assert models["c/empty"]["supported_parameters"] == []
+    # Deduplicated and sorted, so two catalogs that listed the same
+    # support in a different order produce the same entry.
+    assert models["d/mixed"]["supported_parameters"] == ["seed"]
+    # A string is not a list of parameter names, whatever it contains.
+    assert models["e/wrongtype"]["supported_parameters"] is None
+
+
+def test_missing_parameters_checks_what_the_payload_will_carry():
+    """max_tokens is checked without any control setting it, because
+    every payload the bench builds carries one and require_parameters
+    would exclude a provider that does not support it."""
+    assert missing_parameters(["max_tokens"], {}) == []
+    assert missing_parameters([], {}) == ["max_tokens"]
+    # effort is checked as "reasoning", the name the payload uses.
+    assert missing_parameters(["max_tokens"], {"effort": "low"}) == ["reasoning"]
+    assert missing_parameters(["max_tokens", "reasoning"], {"effort": "low"}) == []
+    # Reported sorted and complete, not first-failure-only, so one
+    # refusal names everything the caller has to change.
+    assert missing_parameters([], {"temperature": 0.5, "top_p": 0.9}) == [
+        "max_tokens",
+        "temperature",
+        "top_p",
+    ]
+    # Controls that are not model parameters are not checked as if they
+    # were: routing is a key of the provider object and system is a
+    # message.
+    assert (
+        missing_parameters(["max_tokens"], {"routing": "price", "system": "hi"}) == []
+    )
+
+
+def test_missing_parameters_reports_nothing_when_the_catalog_said_nothing():
+    """It reports; the caller decides. Returning "nothing missing" here
+    would read as support if the caller did not check for None first,
+    which is why the refusal for an undescribed model lives at the
+    boundary and names that case in its own words."""
+    assert missing_parameters(None, {"temperature": 0.5}) == []
+
+
+def test_strict_preferences_add_to_the_base_without_displacing_it():
+    """The privacy promise is written first and the estimand's keys are
+    additive, so no estimand can quietly widen the provider population a
+    data policy narrowed."""
+    base = {"sort": "throughput", "data_collection": "deny", "zdr": True}
+
+    out = strict_provider_preferences(base)
+
+    assert out == {**base, "require_parameters": True}
+    assert base == {"sort": "throughput", "data_collection": "deny", "zdr": True}
+
+
+def test_a_pin_is_a_hard_restriction_and_never_a_preference():
+    """allow_fallbacks rides with the order and never without it. An
+    order that can be departed from is a preference, and a pinned run
+    served by somebody else would record a constraint that did not hold;
+    allow_fallbacks with no order would forbid fallback from a provider
+    nobody named."""
+    pinned = strict_provider_preferences({"sort": "price"}, "Together")
+    unpinned = strict_provider_preferences({"sort": "price"})
+
+    assert pinned == {
+        "sort": "price",
+        "require_parameters": True,
+        "order": ["Together"],
+        "allow_fallbacks": False,
+    }
+    assert "allow_fallbacks" not in unpinned
+    assert "order" not in unpinned

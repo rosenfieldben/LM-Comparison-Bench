@@ -8,3 +8,4 @@ BenchLibrary.init();
 BenchDiff.init();
 BenchStream.init();
 BenchHistory.init();
+BenchReport.init();

@@ -26,6 +26,8 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import store
+from bench.datasets import DatasetError, parse_dataset
+from bench.experiments import plan_trials, seed_for_repeat
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
@@ -33,11 +35,16 @@ from bench.models import (
     as_money,
     as_text,
     fetch_catalog,
+    judge_response,
     keepalive_socket_options,
+    missing_parameters,
     provider_preferences,
     run_model,
     stream_model,
+    strict_provider_preferences,
 )
+from bench.report import build_report, export_line, export_manifest, export_trial
+from bench.scoring import judged_pass, score_response
 
 logger = logging.getLogger(__name__)
 
@@ -348,6 +355,137 @@ class GroupCreated(BaseModel):
     id: int
 
 
+# The two estimands, named at the boundary so every experiment row, every
+# report and every export line says which question it answers.
+#
+# routed_service is the default and is what this tool is actually used
+# for: the OpenRouter-routed service path for a model under a stated
+# routing mode, provider chosen dynamically per call, repeats doing the
+# statistical work, results stratifiable by the provider Phase G already
+# records. underlying_model is the opt-in strict estimand for when the
+# claim is about the model itself; it narrows the eligible provider
+# population on purpose. See the README's estimands section.
+ESTIMAND_MODES = ("routed_service", "underlying_model")
+
+# Bounds on an experiment's shape. The dataset loader bounds the task
+# count; these bound what the runner will multiply it by, because
+# tasks * repeats * lineup is the number of paid calls and that product
+# is the thing worth refusing early rather than part way through.
+MAX_REPEATS = 20
+MAX_TRIALS = 5000
+
+# How often the progress stream re-reads the counters. Polling rather
+# than a subscription because the runner writes progress to the database
+# and the database is the shared truth: a subscription would need the
+# runner to know about its watchers, and a watcher that joined late would
+# have to be caught up from the database anyway. A quarter second is far
+# below the pace of anything it reports (a trial is a network round trip)
+# and far above the cost of one indexed row read.
+PROGRESS_POLL_S = 0.25
+
+
+class ExperimentCreate(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    name: str = Field(min_length=1, max_length=200)
+    # A path the user names. Read by the boundary, not by the loader:
+    # where the bench may read from is a question for the edge, and
+    # bench.datasets stays a pure function over bytes.
+    dataset_path: str = Field(min_length=1, max_length=4096)
+    # Same shape and same bound as GroupCreate.models, since every trial
+    # this experiment runs creates a group with exactly this lineup.
+    lineup: list[str] = Field(min_length=1, max_length=MAX_POSITION + 1)
+    budget: Literal["standard", "extended"]
+    # The same six controls as everywhere else, through the same class, so
+    # rule one and rule two apply to an experiment's payloads exactly as
+    # they apply to a hand-run comparison. Structural parity again: there
+    # is nothing here that could drift from what /compare sends.
+    params: ExperimentParams | None = None
+    repeats: int = Field(default=1, ge=1, le=MAX_REPEATS)
+    # Present means shuffle the task order with this seed and record it;
+    # absent means file order. Either way the order is reproducible, which
+    # is the only property that matters: a hidden shuffle would make an
+    # experiment unrepeatable by anyone including its author.
+    task_order_seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
+    estimand_mode: Literal["routed_service", "underlying_model"] = "routed_service"
+    # model id to provider name. Strict mode only; enforced with
+    # allow_fallbacks false, so a pinned provider that cannot serve is a
+    # recorded failure rather than a quiet reroute.
+    provider_pins: dict[str, str] | None = None
+    halt_on_refusal: bool = True
+
+
+class ExperimentCreated(BaseModel):
+    id: int
+
+
+class ExperimentStart(BaseModel):
+    """The dataset to read at start time.
+
+    Asked for again rather than stored on the experiment row, and the
+    asymmetry is deliberate: the row records the digest of what was read
+    at creation, which is the claim about what the experiment IS. The path
+    is where those bytes happened to live, which can change without the
+    experiment changing. Re-reading and re-checking the digest at start is
+    what turns "the file moved" into a refusal instead of a silent run
+    over different tasks.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    dataset_path: str = Field(min_length=1, max_length=4096)
+
+
+class ScoringStart(BaseModel):
+    """What a scoring pass needs: the tasks, and optionally a judge.
+
+    The dataset is named again for the same reason the runner names it
+    again: the rubrics and references live in the file, the experiment row
+    records only the digest of what was read, and re-checking that digest
+    is what stops a pass from grading one rubric's trials against
+    another's.
+
+    judge_model is optional because a dataset of deterministic scorers
+    needs no judge, and requiring one would make the cheap case pay for
+    the expensive one's configuration.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    dataset_path: str = Field(min_length=1, max_length=4096)
+    judge_model: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+class ExperimentDetail(BaseModel):
+    id: int
+    name: str
+    created_at: str
+    dataset_name: str
+    dataset_digest: str
+    lineup: list[str]
+    budget: str
+    params: dict[str, Any] | None
+    repeats: int
+    task_order_seed: int | None
+    estimand_mode: str
+    provider_pins: dict[str, Any] | None
+    halt_on_refusal: bool
+    status: str
+    status_detail: str | None
+    app_sha: str | None
+    catalog_digest: str | None
+    data_policy: str | None
+    tasks_total: int
+    trials_total: int
+    trials_done: int
+    trials_refused: int
+    trials_failed: int
+
+
+class ExperimentList(BaseModel):
+    experiments: list[ExperimentDetail]
+
+
 class CatalogModel(BaseModel):
     id: str
     name: str | None
@@ -373,12 +511,33 @@ class CatalogResponse(BaseModel):
     data_policy: str = "standard"
 
 
+class StoredModelResult(ModelResult):
+    """A result that has been persisted, and so has a row id.
+
+    A subclass rather than a nullable field on ModelResult, and the
+    distinction is structural rather than stylistic. A live /compare or
+    /compare/stream result has no id and never will have one at the
+    moment it is returned: persistence happens after the response is
+    built, and the post-spend invariant explicitly allows it to fail and
+    return run_id null. Declaring id on the live shape would declare a
+    field that is definitionally absent there, and every consumer would
+    then have to know which endpoint it was talking to in order to know
+    whether None meant "not saved" or "this endpoint does not say".
+
+    Phase I needs the id on the replay path only: a human rating or a
+    score row points at a result by id, and both are produced while
+    looking at stored history. The live paths are unchanged.
+    """
+
+    id: int
+
+
 class RunDetail(BaseModel):
     id: int
     created_at: str
     prompt_text: str
     prompt_id: int | None
-    results: list[ModelResult]
+    results: list[StoredModelResult]
     # What this run actually was: the build that produced it, how old the
     # prices it was costed against were, and the data-handling policy its
     # payloads declared. None on every pre-G row.
@@ -547,6 +706,29 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
     app.state.accumulated_spend_usd = 0.0
+    # The one experiment runner. Per process, because the semaphore and
+    # the ceiling it competes for are per process: two runners would
+    # interleave through the same five slots and each would measure the
+    # other's queueing. active is the running experiment's id or None,
+    # task holds a strong reference so asyncio does not collect a running
+    # task, and stop is the between-trials halt.
+    app.state.experiment_run = {
+        "active": None,
+        "task": None,
+        "stop": asyncio.Event(),
+        "dataset_path": None,
+    }
+    # The scoring pass, held separately from the trial runner. They are
+    # separate because they are separately useful: a finished experiment
+    # can be re-scored while nothing is running, and a running experiment
+    # must not be scored while its results are still arriving.
+    app.state.scoring_run = {
+        "active": None,
+        "task": None,
+        "stop": asyncio.Event(),
+        "tasks": {},
+        "error": None,
+    }
     # Data-handling routing, validated beside the ceiling and before any
     # request can be built. The resolved provider block is computed once
     # here rather than per request: it is boot-scoped by design, so a run
@@ -1712,6 +1894,789 @@ async def group_detail(group_id: int) -> dict[str, Any]:
     return group
 
 
+def read_dataset(path: str) -> dict[str, Any]:
+    """Load and validate a dataset the user named, or 422 with the reason.
+
+    The read lives at the boundary and the parse lives in bench.datasets,
+    which is the same split as everywhere else: the edge decides what may
+    be touched, the pure module decides what is valid.
+
+    No path restriction beyond what the operating system already enforces,
+    and that is deliberate rather than an omission. The bench answers only
+    to loopback clients (LocalOnlyGuard) and runs as the user, so a path
+    allowlist here would defend the user against themselves while blocking
+    the ordinary case of a dataset living wherever the user keeps their
+    work. It is worth being explicit that this is the reasoning, because
+    "reads any path the caller names" looks like a hole until you have the
+    threat model beside it.
+
+    Every failure is a 422 naming the file and the line, because the
+    caller's next action is to fix the file and a 500 would tell them
+    nothing about which line to open.
+    """
+    try:
+        raw = Path(path).read_bytes()
+    except OSError as exc:
+        raise HTTPException(
+            422, f"cannot read dataset {path}: {exc.strerror}"
+        ) from None
+    try:
+        return parse_dataset(raw, name=Path(path).name)
+    except DatasetError as exc:
+        raise HTTPException(422, str(exc)) from None
+
+
+def catalog_entries() -> dict[str, dict[str, Any]]:
+    """The boot catalog keyed by model id, or an empty map when offline."""
+    catalog = getattr(app.state, "catalog", None) or {}
+    return {m["id"]: m for m in catalog.get("models", []) if isinstance(m, dict)}
+
+
+def enforce_strict_mode(
+    lineup: list[str], pins: dict[str, str] | None, controls: dict[str, Any]
+) -> None:
+    """Everything the underlying-model estimand must be able to promise.
+
+    Checked at creation, where it can only fail once, rather than at trial
+    one of three hundred. The claim strict mode makes is about the MODEL,
+    so every way the claim could turn out to be about something else is a
+    refusal here:
+
+    Without a catalog there is nothing to check against, so the whole
+    check is unavailable and the experiment cannot be created. Skipping it
+    silently on an offline boot would produce rows labelled
+    underlying_model whose capability check never ran, which is a strict
+    mode that isn't; a label nobody verified is worse than no label,
+    because a reader has no way to tell the two apart afterwards.
+
+    A model the catalog does not list, or lists without
+    supported_parameters, is the same problem one model down. Absence of
+    evidence is not support.
+
+    A parameter the model does not support is a refusal because strict
+    mode sends require_parameters: no provider would be eligible, so the
+    experiment would fail every trial rather than measure anything.
+
+    A pin naming a model outside the lineup is a contradiction in the
+    declaration itself, and a declaration that cannot be honored should
+    not be stored as though it will be.
+    """
+    catalog = getattr(app.state, "catalog", None) or {}
+    if not catalog.get("fetched"):
+        raise HTTPException(
+            422,
+            "the underlying-model estimand checks every control against "
+            "the model catalog, and this boot has no catalog: the "
+            "snapshot could not be fetched at startup. Restart with "
+            "OpenRouter reachable, or create this experiment under the "
+            "routed-service estimand, which makes no capability claim. "
+            "Creating it without the check would label the rows with a "
+            "guarantee nothing verified.",
+        )
+    entries = catalog_entries()
+    for model in lineup:
+        entry = entries.get(model)
+        if entry is None:
+            raise HTTPException(
+                422,
+                f"the catalog does not list {model}, so its parameter "
+                "support cannot be checked. The underlying-model estimand "
+                "refuses rather than assume support.",
+            )
+        supported = entry.get("supported_parameters")
+        if supported is None:
+            raise HTTPException(
+                422,
+                f"the catalog lists {model} but publishes no "
+                "supported_parameters for it, so there is nothing to "
+                "check the controls against. The underlying-model "
+                "estimand refuses rather than assume support.",
+            )
+        absent = missing_parameters(supported, controls)
+        if absent:
+            raise HTTPException(
+                422,
+                f"{model} does not support {', '.join(absent)} according "
+                "to the catalog, and the underlying-model estimand sends "
+                "require_parameters, so no provider would be eligible to "
+                "serve it. Drop the control, drop the model, or use the "
+                "routed-service estimand, where an unsupported parameter "
+                "is silently ignored by the provider and the request "
+                "record still shows it was asked for.",
+            )
+    for model in sorted(pins or {}):
+        if model not in lineup:
+            raise HTTPException(
+                422,
+                f"provider_pins names {model}, which is not in the "
+                "lineup. A pin for a model this experiment never runs "
+                "would be recorded as a constraint that never applied.",
+            )
+
+
+@app.post("/experiments", response_model=ExperimentCreated, status_code=201)
+async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
+    """Write the experiment manifest, after validating everything about it.
+
+    Nothing runs here. The row is the declaration, written complete before
+    the first trial, exactly as a group row is written before the first
+    upstream call: the same discipline one level up.
+
+    Validation that can only fail later is validation in the wrong place.
+    The dataset is loaded and checked now, the trial count is bounded now,
+    and (in strict mode) every control is capability-checked against the
+    catalog now, so an experiment that cannot run does not get created and
+    then discovered at trial 300.
+    """
+    dataset = read_dataset(body.dataset_path)
+    controls = request_controls(body.params)
+    trials = len(dataset["tasks"]) * body.repeats * len(body.lineup)
+    if trials > MAX_TRIALS:
+        raise HTTPException(
+            422,
+            f"{len(dataset['tasks'])} tasks x {body.repeats} repeats x "
+            f"{len(body.lineup)} models is {trials} paid calls, over the "
+            f"{MAX_TRIALS} limit. Shorten the dataset or the lineup.",
+        )
+    if body.provider_pins and body.estimand_mode != "underlying_model":
+        # A pin under the routed-service estimand is a contradiction: the
+        # whole point of that estimand is that routing is dynamic. Refusing
+        # is kinder than silently ignoring the pins, which would produce a
+        # record claiming a pin that never rode a payload.
+        raise HTTPException(
+            422,
+            "the routed-service estimand routes dynamically by definition, "
+            "so provider_pins cannot apply to it. To pin providers, set "
+            'estimand_mode to "underlying_model", which is the estimand '
+            "that narrows the provider population on purpose.",
+        )
+    if body.estimand_mode == "underlying_model":
+        enforce_strict_mode(body.lineup, body.provider_pins, controls)
+    return {
+        "id": store.create_experiment(
+            app.state.db,
+            {
+                "name": body.name,
+                "dataset_name": dataset["name"],
+                "dataset_digest": dataset["digest"],
+                "lineup": body.lineup,
+                "budget": body.budget,
+                "params": controls or None,
+                "repeats": body.repeats,
+                "task_order_seed": body.task_order_seed,
+                "estimand_mode": body.estimand_mode,
+                "provider_pins": body.provider_pins,
+                "halt_on_refusal": body.halt_on_refusal,
+                # The same provenance every run row carries, recorded once
+                # on the experiment because it is fixed for the whole of
+                # it: the process does not change build or catalog mid-run.
+                "app_sha": getattr(app.state, "app_sha", None),
+                "catalog_digest": getattr(app.state, "catalog_digest", None),
+                "data_policy": app.state.data_policy,
+                "tasks_total": len(dataset["tasks"]),
+                "trials_total": trials,
+            },
+        )
+    }
+
+
+@app.get("/experiments", response_model=ExperimentList)
+async def list_experiments() -> dict[str, Any]:
+    return {"experiments": store.list_experiments(app.state.db)}
+
+
+@app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
+async def experiment_detail(experiment_id: int) -> dict[str, Any]:
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    return experiment
+
+
+def trial_provider_prefs(
+    experiment: dict[str, Any], model: str, controls: dict[str, Any]
+) -> dict[str, Any]:
+    """The provider block for one trial, estimand included.
+
+    Under the routed-service estimand this is request_provider_prefs and
+    nothing else, which is not an implementation detail but the promise:
+    the default path sends the same object it sent before strict mode
+    existed, so nothing about adding this estimand changed what the
+    bench's own comparisons measure. A tombstone asserts the payload
+    bytes.
+
+    Under the underlying-model estimand the strict keys are layered on
+    top of that same object, per model, because the pin is per model.
+    """
+    base = request_provider_prefs(controls)
+    if experiment.get("estimand_mode") != "underlying_model":
+        return base
+    pins = experiment.get("provider_pins") or {}
+    return strict_provider_preferences(base, pins.get(model))
+
+
+async def run_one_trial(
+    experiment: dict[str, Any],
+    task: dict[str, Any],
+    model: str,
+    position: int,
+    group_id: int,
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    """One model against one task, through the machinery every run uses.
+
+    The same semaphore, the same post-admission ceiling recheck, the same
+    settlement inside the held slot, the same never-raises client. The
+    runner gets no faster path and no larger share: an experiment
+    competing with a browser run for the five slots is correct, because
+    both are spending the same money against the same ceiling.
+
+    Streaming rather than the batch call because ttft is a measurement the
+    report publishes, and only the streaming path can observe it. The
+    frames go nowhere: this is the one consumer of stream_model with no
+    client attached, which is also why there is no disconnect path here.
+    The runner is the client, and it does not disconnect.
+
+    Returns the result dict. Never raises for an upstream failure, which
+    is the same contract run_model and stream_model carry, because a
+    failed trial is data and must not end the experiment.
+    """
+    max_tokens = effective_budget(experiment["budget"], model)
+    holder: dict[str, Any] = {}
+    parts: list[str] = []
+    first_delta_ms: float | None = None
+    acquired = False
+    result: dict[str, Any] | None = None
+    try:
+        await app.state.upstream_semaphore.acquire()
+        acquired = True
+        # The recheck every admitted run gets, before the clock and before
+        # any upstream call. An experiment is exactly the case this
+        # protects against: hundreds of trials admitted over minutes, with
+        # the ceiling crossed somewhere in the middle.
+        if spend_ceiling_reached():
+            return spend_refusal_result(model, max_tokens)
+        start = time.perf_counter()
+        async for event in stream_model(
+            task["prompt"],
+            model,
+            app.state.client,
+            max_tokens=max_tokens,
+            holder=holder,
+            provider_prefs=trial_provider_prefs(experiment, model, controls),
+            controls=controls,
+        ):
+            if event["type"] == "done":
+                result = event["result"]
+                break
+            if first_delta_ms is None:
+                first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
+            parts.append(event["text"])
+    finally:
+        # Released before persistence, exactly as the streaming endpoint
+        # releases before saving: a slot is for the upstream exchange, and
+        # holding one through a database write is a lie about how many
+        # paid calls are in flight.
+        if acquired:
+            app.state.upstream_semaphore.release()
+
+    if result is None:
+        # stream_model ended without a done event. Its own contract makes
+        # that nearly impossible, but "nearly" is not a thing to persist a
+        # silent success for: build the same shape the disconnect path
+        # builds, so the trial lands as the failure it was.
+        result = {
+            "model": model,
+            "response_text": "".join(parts) or None,
+            "latency_ms": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "error": "stream ended without a terminal event",
+            "cost_usd": None,
+            "ttft_ms": first_delta_ms,
+            "max_tokens": max_tokens,
+            "generation_id": holder.get("generation_id"),
+            "request_json": holder.get("request_json"),
+            "provider": holder.get("provider"),
+        }
+    result["position"] = position
+    # Post-spend, so its own fault boundary: the call has happened and
+    # nothing here may turn a paid result into an error.
+    try:
+        result["cost_usd"] = cost_usd(result, app.state.prices)
+        record_spend(ceiling_cost(result))
+    except Exception:
+        logger.exception("settlement failed for %s", model)
+        result["cost_usd"] = None
+    try:
+        store.save_run(
+            app.state.db,
+            task["prompt"],
+            [result],
+            None,
+            group_id,
+            run_provenance(),
+        )
+    except Exception:
+        # Same rule as both endpoints: the money is already spent, and
+        # losing history must not lose the response. The counters still
+        # move, so progress stays honest about what was attempted.
+        logger.exception("failed to persist experiment trial for %s", model)
+    return result
+
+
+async def run_experiment(experiment_id: int) -> None:
+    """Walk every cell of an experiment, one trial at a time.
+
+    Owned by app.state as a background task, which is what lets it outlive
+    the request that started it. That is the deliberate opposite of the
+    per-run disconnect contract: a browser run belongs to the tab that
+    started it and is abandoned when the tab goes away, because nobody is
+    watching it any more. An experiment belongs to the bench, not to a
+    watcher, and a laptop lid closing halfway through a paid sweep must
+    not silently end it. The progress stream is a view onto the run, not
+    the run itself.
+
+    Creates every group through the same entry-checked path any client
+    uses. There is no bypass: enforce_group_experiment runs on this
+    runner's own trials, so experiment-to-group consistency is the law
+    H1.2 already wrote rather than a promise this workstream makes.
+    """
+    db = app.state.db
+    experiment = store.get_experiment(db, experiment_id)
+    assert experiment is not None
+    state = app.state.experiment_run
+    lineup = experiment["lineup"]
+    controls_base = experiment["params"] or {}
+    try:
+        dataset = read_dataset(state["dataset_path"])
+    except HTTPException as exc:
+        # The file moved or became unreadable between creation and start.
+        # Not a crash: the experiment records why it never ran.
+        store.set_experiment_status(db, experiment_id, "failed", str(exc.detail))
+        return
+    if dataset["digest"] != experiment["dataset_digest"]:
+        # The bytes changed under it. Refusing is the whole point of
+        # recording a content digest: running anyway would produce a
+        # record citing one dataset and containing another, which is the
+        # single most misleading artifact this phase could emit.
+        store.set_experiment_status(
+            db,
+            experiment_id,
+            "failed",
+            f"dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}",
+        )
+        return
+    store.set_experiment_status(db, experiment_id, "running")
+    plan = plan_trials(
+        dataset["tasks"], lineup, experiment["repeats"], experiment["task_order_seed"]
+    )
+    status, detail = "done", None
+    try:
+        for cell in plan:
+            if state["stop"].is_set():
+                status, detail = "stopped", "stopped between trials"
+                break
+            task = cell["task"]
+            # The seed this repeat sends. Derived rather than fixed so
+            # repeats sample variation instead of buying the same sample
+            # N times; absent stays absent, which is rule one.
+            controls = dict(controls_base)
+            seeded = seed_for_repeat(controls_base.get("seed"), cell["repeat_index"])
+            if seeded is not None:
+                controls["seed"] = seeded
+            # A task's own system prompt overrides the experiment's, since
+            # it is the more specific declaration. Recorded on the group
+            # like any other control, so the record says what was sent.
+            if task["system"] is not None:
+                controls["system"] = task["system"]
+            group_id = store.create_group(
+                db,
+                task["prompt"],
+                lineup,
+                controls or None,
+                experiment["budget"],
+                {
+                    "experiment_id": experiment_id,
+                    "task_id": task["id"],
+                    "repeat_index": cell["repeat_index"],
+                    "rotation_index": cell["rotation_index"],
+                },
+            )
+            halted = False
+            for model in cell["order"]:
+                if state["stop"].is_set():
+                    status, detail = "stopped", "stopped between trials"
+                    halted = True
+                    break
+                # Position is the model's place in the DECLARED lineup, not
+                # its place in this cell's rotated entry order. The rotation
+                # changes who asks first; it does not change which column a
+                # model occupies, and a report that mixed the two would
+                # attribute one model's results to another's slot.
+                position = lineup.index(model)
+                # The entry checks, on the runner's own trial, exactly as a
+                # client's request gets them. Force a mismatch and this
+                # 409s the runner too, which is the point.
+                enforce_group_experiment(
+                    task["prompt"],
+                    controls,
+                    group_id,
+                    experiment["budget"],
+                    model=model,
+                    position=position,
+                )
+                result = await run_one_trial(
+                    experiment, task, model, position, group_id, controls
+                )
+                refused = bool(result.get("spend_refused"))
+                failed = not refused and result.get("error") is not None
+                # Three disjoint buckets, which is what the conservation
+                # property means: done plus failed plus refused is the
+                # number of trials that finished, and the gap to
+                # trials_total is what never ran. Counting a failed trial
+                # as done as well would make trials_done mean "finished"
+                # while sitting beside a column named trials_failed, and
+                # the sum would exceed the total.
+                store.bump_experiment_counters(
+                    db,
+                    experiment_id,
+                    done=0 if (refused or failed) else 1,
+                    refused=1 if refused else 0,
+                    failed=1 if failed else 0,
+                )
+                if refused and experiment["halt_on_refusal"]:
+                    # The default. A ceiling refusal means the money ran
+                    # out, and continuing would produce a record whose
+                    # later rows are all refusals: technically honest,
+                    # practically noise, and expensive in wall time. The
+                    # un-run remainder is visible through the same
+                    # declared-but-missing machinery a partial comparison
+                    # already uses.
+                    status = "halted_on_refusal"
+                    detail = (
+                        "the per-boot spend ceiling was reached; "
+                        f"{model} on task {task['id']} was refused before "
+                        "reaching upstream"
+                    )
+                    halted = True
+                    break
+            if halted:
+                break
+    except Exception as exc:
+        logger.exception("experiment %s failed", experiment_id)
+        status, detail = "failed", f"{type(exc).__name__}: {exc}"
+    finally:
+        store.set_experiment_status(db, experiment_id, status, detail)
+        state["active"] = None
+
+
+@app.post("/experiments/{experiment_id}/start", status_code=202)
+async def start_experiment(experiment_id: int, body: ExperimentStart) -> dict[str, Any]:
+    """Start the runner. One at a time, and it says so when refusing.
+
+    One active experiment rather than a queue, because the semaphore and
+    the ceiling are process-wide: two experiments would interleave their
+    trials through the same five slots and each would measure the other's
+    queueing. That is not a limitation to apologize for, it is the only
+    arrangement in which an experiment's latency numbers mean anything.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    if experiment["status"] != "created":
+        raise HTTPException(
+            409,
+            f"experiment {experiment_id} is {experiment['status']}; an "
+            "experiment runs once. Create another to run it again.",
+        )
+    state = app.state.experiment_run
+    if state["active"] is not None:
+        raise HTTPException(
+            409,
+            f"experiment {state['active']} is already running. One at a "
+            "time: they share the upstream slots and the spend ceiling, "
+            "so concurrent experiments would measure each other.",
+        )
+    state["active"] = experiment_id
+    state["stop"] = asyncio.Event()
+    state["dataset_path"] = body.dataset_path
+    # Held on app.state so the task is not garbage collected mid-run, and
+    # so a stop can be issued against it. asyncio keeps only a weak
+    # reference to a bare create_task.
+    state["task"] = asyncio.create_task(run_experiment(experiment_id))
+    return {"id": experiment_id, "status": "running"}
+
+
+@app.post("/experiments/{experiment_id}/stop", status_code=202)
+async def stop_experiment(experiment_id: int) -> dict[str, Any]:
+    """Ask the runner to halt between trials.
+
+    Between trials, never inside one. A trial that has reached upstream
+    has already spent its money, and abandoning it would throw away a
+    result the user paid for; the same reasoning as the streaming path's
+    disconnect persistence, one level up.
+    """
+    ensure_rowid(experiment_id)
+    state = app.state.experiment_run
+    if state["active"] != experiment_id:
+        raise HTTPException(409, f"experiment {experiment_id} is not running")
+    state["stop"].set()
+    return {"id": experiment_id, "status": "stopping"}
+
+
+@app.get("/experiments/{experiment_id}/progress")
+async def experiment_progress(experiment_id: int) -> StreamingResponse:
+    """Counters as SSE, rejoinable, and never the thing that keeps the
+    run alive.
+
+    A client that disconnects and reconnects gets the current counters
+    immediately and then updates, because every frame carries absolute
+    values rather than deltas. Absolute frames also mean a dropped frame
+    costs nothing, which is what makes reconnection cheap enough to be
+    the ordinary case rather than an error path.
+    """
+    ensure_rowid(experiment_id)
+    if store.get_experiment(app.state.db, experiment_id) is None:
+        raise HTTPException(404, "no such experiment")
+
+    async def frames() -> AsyncIterator[str]:
+        last = None
+        while True:
+            experiment = store.get_experiment(app.state.db, experiment_id)
+            if experiment is None:
+                return
+            frame = {
+                "type": "progress",
+                "status": experiment["status"],
+                "status_detail": experiment["status_detail"],
+                "trials_total": experiment["trials_total"],
+                "trials_done": experiment["trials_done"],
+                "trials_refused": experiment["trials_refused"],
+                "trials_failed": experiment["trials_failed"],
+                "spend_usd": app.state.accumulated_spend_usd,
+            }
+            if frame != last:
+                yield "data: " + json.dumps(frame) + "\n\n"
+                last = frame
+            if experiment["status"] not in ("created", "running"):
+                return
+            await asyncio.sleep(PROGRESS_POLL_S)
+
+    return StreamingResponse(frames(), media_type="text/event-stream")
+
+
+async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
+    """Score every trial of an experiment, deterministic and judged alike.
+
+    Re-runnable and idempotent per (result, scorer, judge_model): a second
+    pass inserts new rows rather than editing old ones, and the report
+    reads the latest per key. That is what makes the interruption policy
+    below safe, and it is what keeps "the judge said 0.5 last week and 1.0
+    today" in the record instead of erasing it.
+
+    A ceiling refusal during the pass is recorded as that result's scoring
+    failure and the pass CONTINUES. This is the opposite of the trial
+    runner's default, and the asymmetry is the point: a refused trial can
+    never be recovered without paying for the model call again, so
+    halting protects the budget for a decision the user should make. A
+    refused score can be filled in by a later pass over the same stored
+    text at no extra model cost, so stopping the whole pass for one would
+    trade a complete scoring run for nothing.
+    """
+    db = app.state.db
+    experiment = store.get_experiment(db, experiment_id)
+    assert experiment is not None
+    state = app.state.scoring_run
+    try:
+        # Self-judging is recorded, not prevented. A judge grading its own
+        # output has a documented tendency toward itself, and the honest
+        # response is to flag every affected row and surface the flag in
+        # the report rather than to refuse the pass: the user may have
+        # good reason, and a silent absorption is what would be wrong.
+        self_judged = judge_model is not None and judge_model in experiment["lineup"]
+        for group in store.experiment_groups(db, experiment_id):
+            if state["stop"].is_set():
+                break
+            task = state["tasks"].get(group["task_id"])
+            if task is None or task["scorer"] is None:
+                continue
+            detail = store.get_group(db, group["id"])
+            if detail is None:
+                continue
+            for run in detail["runs"]:
+                for result in run["results"]:
+                    await score_one_result(
+                        experiment_id, task, result, judge_model, self_judged
+                    )
+    except Exception as exc:
+        logger.exception("scoring pass for experiment %s failed", experiment_id)
+        state["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        state["active"] = None
+
+
+async def score_one_result(
+    experiment_id: int,
+    task: dict[str, Any],
+    result: dict[str, Any],
+    judge_model: str | None,
+    self_judged: bool,
+) -> None:
+    """Score one stored result, writing exactly one row.
+
+    Every path writes a row, including the failures. A scoring pass that
+    silently skipped what it could not score would leave the report
+    unable to tell "not scored yet" from "scored and unscorable", and
+    those are different facts about the same trial.
+    """
+    spec = task["scorer"]
+    kind = spec["kind"]
+    if kind != "judge":
+        verdict = score_response(spec, task["reference"], result["response_text"])
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": kind,
+                "score": verdict["score"],
+                "passed": verdict["passed"],
+                "detail": verdict["detail"],
+                "blind": None,
+                "self_judged": None,
+            },
+        )
+        return
+
+    if judge_model is None:
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": None,
+                "passed": None,
+                "detail": "no judge model was given for this scoring pass",
+            },
+        )
+        return
+
+    # The ceiling applies to judge calls because judge calls are spend.
+    # A refusal here is this result's scoring failure and the pass goes
+    # on; see score_experiment for why that differs from a trial refusal.
+    def refuse_for_ceiling() -> None:
+        store.add_score(
+            app.state.db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": None,
+                "passed": None,
+                "detail": (
+                    "the per-boot spend ceiling was reached before this "
+                    "result could be judged; re-run the scoring pass to "
+                    "fill it in"
+                ),
+                "judge_model": judge_model,
+                "self_judged": self_judged,
+            },
+        )
+
+    # Before the queue, so a pass that has already blown the ceiling does
+    # not spend minutes waiting for slots it will refuse anyway.
+    if spend_ceiling_reached():
+        refuse_for_ceiling()
+        return
+
+    async with app.state.upstream_semaphore:
+        # And again inside the held slot, which is the check that actually
+        # protects the money. Admission is not permission to spend: this
+        # call can sit behind five others for as long as they take, and a
+        # pass over three hundred results is exactly the case where the
+        # ceiling is crossed during that wait. Checking only before the
+        # queue is the F1.2 defect, one layer up.
+        if spend_ceiling_reached():
+            refuse_for_ceiling()
+            return
+        verdict = await judge_response(
+            app.state.client,
+            judge_model,
+            task["rubric"],
+            task["reference"],
+            result["response_text"],
+            # Routed-service prefs even under the underlying-model
+            # estimand. The estimand is a claim about the models being
+            # MEASURED; the judge is the bench's own instrument and is
+            # not one of them, and pinning it to a provider chosen for
+            # somebody else's lineup would be a claim nobody made.
+            provider_prefs=app.state.provider_prefs,
+        )
+    # Post-spend. The call has happened, so nothing below may turn a paid
+    # verdict into an exception, and the charge is recorded whether or not
+    # the verdict parsed.
+    try:
+        record_spend(as_money(verdict["billed_cost_usd"]))
+    except Exception:
+        logger.exception("judge settlement failed")
+    store.add_score(
+        app.state.db,
+        result["id"],
+        {
+            "scorer": "judge",
+            "score": verdict["score"],
+            # From the task's own threshold when its author declared one,
+            # and None otherwise. judge_response cannot decide this: it is
+            # a client function and has never seen the dataset spec.
+            "passed": judged_pass(spec, verdict["score"]),
+            "detail": verdict["error"] or verdict["detail"],
+            "judge_model": judge_model,
+            "judge_generation_id": verdict["generation_id"],
+            "judge_billed_cost_usd": verdict["billed_cost_usd"],
+            "self_judged": self_judged,
+        },
+    )
+
+
+@app.post("/experiments/{experiment_id}/score", status_code=202)
+async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any]:
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    if experiment["status"] in ("created", "running"):
+        raise HTTPException(
+            409,
+            f"experiment {experiment_id} is {experiment['status']}; score it "
+            "once its trials have finished, so the pass sees every result",
+        )
+    state = app.state.scoring_run
+    if state["active"] is not None:
+        raise HTTPException(
+            409, f"a scoring pass for experiment {state['active']} is running"
+        )
+    dataset = read_dataset(body.dataset_path)
+    if dataset["digest"] != experiment["dataset_digest"]:
+        raise HTTPException(
+            422,
+            "dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}. Scoring against different tasks "
+            "would attribute one rubric's verdict to another's trial.",
+        )
+    state["active"] = experiment_id
+    state["stop"] = asyncio.Event()
+    state["error"] = None
+    state["tasks"] = {t["id"]: t for t in dataset["tasks"]}
+    state["task"] = asyncio.create_task(
+        score_experiment(experiment_id, body.judge_model)
+    )
+    return {"id": experiment_id, "status": "scoring"}
+
+
 @app.get("/models", response_model=CatalogResponse)
 async def get_models() -> dict[str, Any]:
     return {
@@ -1767,3 +2732,335 @@ async def get_run(run_id: int) -> dict[str, Any]:
     if run is None:
         raise HTTPException(404, "no such run")
     return run
+
+
+# ---- Phase I4: blind human rating on replay.
+
+# The rating scale, fixed rather than configurable. One scale everywhere
+# means a stored rating means the same thing in every row, which is the
+# property a report needs; a per-experiment scale would make "3" a
+# number nobody could interpret without also fetching its scale.
+#
+# Five points because it is the smallest scale with a middle and a
+# near-miss on each side, and because raters are reliably worse at
+# finer ones. Stored normalized to [0, 1] like every other score, so the
+# report averages human and machine scores without knowing which is
+# which; the raw point value stays in detail for anyone who wants it.
+# static/rating.js declares the same pair and renders one button per
+# point; test_the_rating_scale_matches_the_server_constant asserts the two
+# agree, because a client scale wider than this renders a button whose
+# click is refused and a narrower one makes the top unreachable.
+RATING_MIN = 1
+RATING_MAX = 5
+
+
+def normalized_rating(rating: int) -> float:
+    """A 1-to-5 rating on the [0, 1] scale every score row uses."""
+    return (rating - RATING_MIN) / (RATING_MAX - RATING_MIN)
+
+
+class Rating(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    result_id: int
+    rating: int = Field(ge=RATING_MIN, le=RATING_MAX)
+    # The neutral label this card wore while it was being rated. Recorded
+    # so the rating-to-model mapping is auditable after the reveal: with
+    # it, someone checking the record can see that card "B" was
+    # model/beta and was rated 4. Without it, a blind rating is a number
+    # whose blindness has to be taken on faith.
+    label: str | None = Field(default=None, max_length=40)
+
+
+class RatingsSubmit(BaseModel):
+    model_config = FORBID_UNKNOWN
+
+    ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
+    # Whether the rater could see the identities while rating. Sent by the
+    # client because only the client knows what was on screen, and
+    # recorded either way rather than enforced: a rating entered after the
+    # reveal is still a rating, and refusing it would lose real data over
+    # a condition the record can simply state.
+    blind: bool
+
+
+@app.post("/groups/{group_id}/ratings", status_code=201)
+async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
+    """Persist human ratings for one replayed comparison.
+
+    Every result named must belong to this group. That is not paranoia
+    about a hostile client (the bench answers only to loopback), it is
+    about a stale page: a tab holding a previous comparison's result ids
+    would otherwise write ratings onto the wrong models silently, and a
+    silent misattribution is the worst outcome this endpoint has.
+    """
+    ensure_rowid(group_id)
+    group = store.get_group(app.state.db, group_id)
+    if group is None:
+        raise HTTPException(404, "no such group")
+    belongs = {r["id"] for run in group["runs"] for r in run["results"]}
+    unknown = sorted({r.result_id for r in body.ratings} - belongs)
+    if unknown:
+        raise HTTPException(
+            422,
+            f"result ids {unknown} are not in comparison {group_id}. The "
+            "page may be showing an older comparison than the one it is "
+            "rating; reload it.",
+        )
+    written = 0
+    for rating in body.ratings:
+        store.add_score(
+            app.state.db,
+            rating.result_id,
+            {
+                "scorer": "human",
+                "score": normalized_rating(rating.rating),
+                # No pass verdict, for the same reason a judge without a
+                # declared threshold has none: nobody said what a passing
+                # rating is, and the bench inventing one would assert a
+                # cutoff the rater never chose.
+                "passed": None,
+                "detail": _rating_detail(rating),
+                "blind": body.blind,
+            },
+        )
+        written += 1
+    return {"group_id": group_id, "written": written, "blind": body.blind}
+
+
+def _rating_detail(rating: Rating) -> str:
+    """The raw rating, and the label it was given under.
+
+    The score column holds the normalized value so every scorer's numbers
+    are comparable; this keeps the point the rater actually clicked, so
+    "4 of 5" survives as what happened rather than as 0.75, which is a
+    number no rater ever saw.
+    """
+    base = f"{rating.rating} of {RATING_MAX}"
+    return f"{base}, shown as {rating.label}" if rating.label else base
+
+
+# ---- Phase I5: the report.
+
+# The seed the report's intervals are built from. Fixed rather than
+# random, so two loads of the same report agree: an interval that moved
+# between refreshes would read as instability in the data rather than in
+# the method. Recorded in every report and every export, so anyone
+# holding the artifact can recompute the same bounds.
+REPORT_SEED = 20260801
+
+
+@app.get("/experiments/{experiment_id}/report")
+async def experiment_report(
+    experiment_id: int, dataset_path: str | None = Query(default=None)
+) -> dict[str, Any]:
+    """Aggregates for one experiment, computed at read time.
+
+    Nothing is cached and nothing is stored. The numbers are derived from
+    the rows every time, which is the same discipline as the derived
+    outcome: a stored aggregate can disagree with the rows it came from,
+    and the day it does there is no way to tell which is wrong.
+
+    dataset_path is optional and it changes how well the pass rate's
+    population is known, not whether there is one. Thresholds live in the
+    dataset file rather than in the database, so with the file the
+    eligible population is exact; without it the report recovers what it
+    can from the score rows, which is a floor rather than the full
+    denominator. Either way it publishes thresholds_source so the reader
+    knows which they are looking at. Degrading to no pass rate at all
+    was the older behavior and it threw away verdicts that were sitting
+    in the database, which is a different dishonesty from the one the
+    degrade was protecting against.
+
+    When the file is given its digest is checked, because scoring one
+    dataset's trials against another's thresholds is the same
+    misattribution the scoring pass refuses.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    # None rather than an empty mapping when no path was given: build_report
+    # reads the difference between "nobody asked the file" and "the file
+    # said nothing is declared".
+    tasks = None if dataset_path is None else dataset_tasks(experiment, dataset_path)
+    return build_report(experiment, **_report_inputs(experiment_id, tasks))
+
+
+def dataset_tasks(experiment: dict[str, Any], dataset_path: str) -> dict[str, Any]:
+    """The named file's tasks, refused unless it is the file that ran.
+
+    The run-start precedent, and this is its third use: start, score, and
+    now the two read paths. One rule in one shape, so a caller who has
+    met it once has met it everywhere.
+    """
+    dataset = read_dataset(dataset_path)
+    if dataset["digest"] != experiment["dataset_digest"]:
+        raise HTTPException(
+            422,
+            "dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}. Reporting against different "
+            "tasks would attribute one rubric's threshold to another.",
+        )
+    return {t["id"]: t for t in dataset["tasks"]}
+
+
+def _report_inputs(
+    experiment_id: int, tasks_by_id: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Every row the report needs, read once.
+
+    Gathered here rather than inside build_report so that function stays
+    pure and can be run over an export instead of a database, which is
+    what makes the export's self-sufficiency claim checkable rather than
+    asserted.
+    """
+    db = app.state.db
+    groups = store.experiment_groups(db, experiment_id)
+    runs_by_group: dict[int, list[dict[str, Any]]] = {}
+    result_ids: list[int] = []
+    for group in groups:
+        detail = store.get_group(db, group["id"])
+        runs = detail["runs"] if detail else []
+        runs_by_group[group["id"]] = runs
+        result_ids.extend(r["id"] for run in runs for r in run["results"])
+    return {
+        "groups": groups,
+        "runs_by_group": runs_by_group,
+        "scores_by_result": store.scores_for_results(db, result_ids),
+        "tasks_by_id": tasks_by_id,
+        "seed": REPORT_SEED,
+    }
+
+
+def threshold_slice(tasks_by_id: dict[str, Any]) -> dict[str, Any]:
+    """The smallest part of a dataset an aggregate cannot be re-derived
+    without: which tasks declared a pass threshold, and what it was.
+
+    Declared tasks only, and per task only the scorer's kind and cutoff.
+    Prompts, references and rubrics stay out on purpose. No number the
+    report publishes needs them, and an export already carries every
+    prompt it actually SENT; copying the file's other columns in would
+    widen what the artifact discloses for nothing.
+    """
+    out: dict[str, Any] = {}
+    for task_id, task in tasks_by_id.items():
+        spec = (task or {}).get("scorer") or {}
+        if spec.get("pass_threshold") is not None:
+            out[task_id] = {
+                "kind": spec.get("kind"),
+                "pass_threshold": spec["pass_threshold"],
+            }
+    return out
+
+
+@app.get("/experiments/{experiment_id}/export.jsonl")
+async def experiment_export(
+    experiment_id: int, dataset_path: str | None = Query(default=None)
+) -> StreamingResponse:
+    """The whole experiment as JSONL: manifest, trials, digest.
+
+    dataset_path is optional and takes the same terms as start, score and
+    report: the digest is checked against the one recorded at creation
+    and a mismatch is refused before a single byte is streamed, since an
+    artifact half-written against the wrong file is worse than none.
+
+    Supplying it embeds the threshold slice in the manifest, which is
+    what makes the artifact self-sufficient for the pass rate rather than
+    only for the score mean. Without it the export still re-derives a
+    pass rate from its own score rows, but the eligible denominator is a
+    floor. Either way the manifest carries thresholds_included, so the
+    file states its own sufficiency instead of leaving a reader to assume
+    it.
+
+    Streams rather than buffers, because a MAX_TRIALS export is thousands
+    of lines carrying full prompts and full responses, and holding all of
+    it in memory to hand back at once is a cost with no benefit on a
+    localhost tool.
+
+    Ordered by task, then repeat, then position, so two exports of the
+    same experiment are byte-identical. Line order is fixed here; key
+    order within a line is fixed by export_line's sort_keys. Both are
+    needed: an artifact whose digest changes between two honest exports
+    of the same data cannot be cited, because the citation could never be
+    checked.
+
+    The last line is a digest over every preceding line, so a citation
+    can name the artifact it cites. It is sha256 over the bytes as
+    written, computed while streaming, which means the file verifies
+    itself with no second pass and no separate sidecar to lose.
+
+    private, no-store like every other dynamic body: this one carries
+    every prompt and every answer in the experiment, which makes it the
+    single most sensitive response the bench produces.
+    """
+    ensure_rowid(experiment_id)
+    experiment = store.get_experiment(app.state.db, experiment_id)
+    if experiment is None:
+        raise HTTPException(404, "no such experiment")
+    # Read and checked out here rather than inside body(), so a mismatch
+    # is a 4xx with nothing written. Raising from inside the generator
+    # would already have sent 200 and a content-type, and the client
+    # would be left holding a truncated artifact that looks like a whole
+    # one.
+    thresholds = (
+        None
+        if dataset_path is None
+        else threshold_slice(dataset_tasks(experiment, dataset_path))
+    )
+
+    async def body() -> AsyncIterator[str]:
+        digest = hashlib.sha256()
+
+        def emit(payload: dict[str, Any]) -> str:
+            line = export_line(payload) + "\n"
+            digest.update(line.encode("utf-8"))
+            return line
+
+        yield emit(export_manifest(experiment, REPORT_SEED, thresholds))
+        db = app.state.db
+        for group in store.experiment_groups(db, experiment_id):
+            detail = store.get_group(db, group["id"])
+            if detail is None:
+                continue
+            rows = [
+                (run, result) for run in detail["runs"] for result in run["results"]
+            ]
+            # Position, then result id as the tiebreak. A row with no
+            # position sorts last rather than crashing the comparison,
+            # and the id keeps two rows at the same position in a stable
+            # order, which is what byte-identical exports need.
+            rows.sort(
+                key=lambda pair: (
+                    pair[1].get("position") is None,
+                    pair[1].get("position") or 0,
+                    pair[1]["id"],
+                )
+            )
+            score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
+            for run, result in rows:
+                yield emit(
+                    export_trial(group, run, result, score_rows.get(result["id"], []))
+                )
+        # Not folded into the digest, obviously: it is the digest.
+        yield (
+            export_line(
+                {
+                    "type": "digest",
+                    "algorithm": "sha256",
+                    "digest": digest.hexdigest(),
+                }
+            )
+            + "\n"
+        )
+
+    return StreamingResponse(
+        body(),
+        media_type="application/x-ndjson",
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="experiment-{experiment_id}.jsonl"'
+            )
+        },
+    )

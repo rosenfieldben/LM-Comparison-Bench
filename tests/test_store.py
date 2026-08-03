@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from bench import store
+from bench import report, store
 
 
 @pytest.fixture
@@ -1241,3 +1241,383 @@ def test_an_unreadable_lineup_reads_as_no_declaration(tmp_path, stored):
         assert store.group_manifest(conn, gid)["models"] is None
     finally:
         conn.close()
+
+
+# ---- Phase I: experiments as the aggregate above groups, and scores.
+
+
+PRE_I_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_i_schema.sql").read_text()
+
+
+def test_migration_onto_pre_i_database_is_additive_and_idempotent(tmp_path):
+    """Phase I adds two tables and four columns, proven against the schema
+    that actually shipped: the fixture was extracted from the SCHEMA string
+    at the pre-I merge commit rather than written by hand.
+
+    The two tables need no MIGRATIONS entry, and this is the test that says
+    so out loud: CREATE TABLE IF NOT EXISTS in SCHEMA runs on every connect,
+    so a pre-I database grows them on the next boot with no ALTER at all.
+    A migration entry for a whole table would be the wrong tool.
+
+    The NULL reading here is the third one in this file and the simplest.
+    experiment_id, task_id, repeat_index and rotation_index are NULL on
+    every legacy group, and that is the affirmative fact that the group was
+    run by hand. Unlike models_json it needs no derive-from-member
+    fallback, and unlike params_json it is not a claim about controls: a
+    hand-run comparison genuinely has no task id.
+    """
+    db_path = tmp_path / "pre_i.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_I_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget)
+           VALUES (1, '2026-01-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', '{"seed": 7}', 'standard')"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at,
+                             app_sha, catalog_snapshot_at, data_policy,
+                             catalog_digest)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-01-01T00:00:00+00:00',
+                   'abc1234', '2026-01-01T00:00:00+00:00', 'standard', 'dd')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error, cost_usd)
+           VALUES (1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL, 2.9e-05)"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        # Everything H.1 and G established still reads.
+        assert store.group_manifest(conn, 1) == {
+            "prompt": "legacy prompt",
+            "models": ["legacy/a"],
+            "budget": "standard",
+        }
+        assert store.group_params(conn, 1) == {"seed": 7}
+        run = store.get_run(conn, 1)
+        assert run is not None
+        assert run["catalog_digest"] == "dd"
+        assert run["results"][0]["response_text"] == "legacy text"
+        # The legacy group belongs to no experiment, which is the truth
+        # about it rather than a gap in it.
+        row = conn.execute(
+            """SELECT experiment_id, task_id, repeat_index, rotation_index
+               FROM groups WHERE id = 1"""
+        ).fetchone()
+        assert dict(row) == {
+            "experiment_id": None,
+            "task_id": None,
+            "repeat_index": None,
+            "rotation_index": None,
+        }
+        # The new tables exist on a database that never had them, and are
+        # empty rather than absent.
+        assert conn.execute("SELECT count(*) c FROM experiments").fetchone()["c"] == 0
+        assert conn.execute("SELECT count(*) c FROM scores").fetchone()["c"] == 0
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        for column in ("experiment_id", "task_id", "repeat_index", "rotation_index"):
+            cols = [r["name"] for r in again.execute("PRAGMA table_info(groups)")]
+            assert cols.count(column) == 1, (column, cols)
+        # A second connect adds nothing and breaks nothing.
+        assert store.get_run(again, 1) is not None
+    finally:
+        again.close()
+
+
+def experiment_spec(**overrides):
+    spec = {
+        "name": "spec",
+        "dataset_name": "d.jsonl",
+        "dataset_digest": "ab" * 32,
+        "lineup": ["m/a", "m/b"],
+        "budget": "standard",
+        "params": {"seed": 7},
+        "repeats": 2,
+        "task_order_seed": None,
+        "estimand_mode": "routed_service",
+        "provider_pins": None,
+        "halt_on_refusal": True,
+        "app_sha": "abc1234",
+        "catalog_digest": "cd" * 32,
+        "data_policy": "standard",
+        "tasks_total": 3,
+        "trials_total": 12,
+    }
+    spec.update(overrides)
+    return spec
+
+
+def test_the_experiment_row_is_complete_before_anything_runs(db):
+    """The manifest discipline one level up from the group row: everything
+    knowable at creation is written at creation, so an experiment that
+    never starts still records what it was going to be."""
+    eid = store.create_experiment(db, experiment_spec())
+
+    exp = store.get_experiment(db, eid)
+    assert exp is not None
+    assert exp["status"] == "created"
+    assert exp["lineup"] == ["m/a", "m/b"]
+    assert exp["params"] == {"seed": 7}
+    assert exp["repeats"] == 2
+    assert exp["dataset_digest"] == "ab" * 32
+    assert exp["trials_total"] == 12
+    assert exp["trials_done"] == 0
+    assert exp["halt_on_refusal"] is True
+    assert exp["app_sha"] == "abc1234"
+
+
+def test_empty_controls_store_as_absence_not_as_an_empty_object(db):
+    """Same rule as create_group. An empty object is not a smaller record
+    of nothing, it is a second spelling of the same absence that every
+    reader would then have to know about."""
+    eid = store.create_experiment(db, experiment_spec(params={}))
+
+    assert store.get_experiment(db, eid)["params"] is None
+    raw = db.execute(
+        "SELECT params_json FROM experiments WHERE id = ?", (eid,)
+    ).fetchone()
+    assert raw["params_json"] is None
+
+
+def test_trials_total_is_stored_rather_than_derived(db):
+    """A halted experiment's un-run trials leave nothing behind to count,
+    so a denominator derived from existing rows would make a halt look like
+    a completed run."""
+    eid = store.create_experiment(db, experiment_spec(trials_total=12))
+    store.bump_experiment_counters(db, eid, done=4)
+    store.set_experiment_status(db, eid, "halted_on_refusal", "spend ceiling reached")
+
+    exp = store.get_experiment(db, eid)
+    assert (exp["trials_done"], exp["trials_total"]) == (4, 12)
+    assert exp["status_detail"] == "spend ceiling reached"
+
+
+def test_counters_accumulate_rather_than_being_assigned(db):
+    eid = store.create_experiment(db, experiment_spec())
+
+    store.bump_experiment_counters(db, eid, done=2)
+    store.bump_experiment_counters(db, eid, done=1, failed=1)
+    store.bump_experiment_counters(db, eid, refused=3)
+
+    exp = store.get_experiment(db, eid)
+    assert (exp["trials_done"], exp["trials_failed"], exp["trials_refused"]) == (
+        3,
+        1,
+        3,
+    )
+
+
+def test_experiment_groups_come_back_in_cell_order(db):
+    """Ordered by the experiment's own structure, not by the order the
+    runner happened to get to, so an export's digest is stable."""
+    eid = store.create_experiment(db, experiment_spec())
+    for task, rep in (("t2", 1), ("t1", 1), ("t2", 0), ("t1", 0)):
+        store.create_group(
+            db,
+            "p",
+            ["m/a"],
+            None,
+            "standard",
+            {
+                "experiment_id": eid,
+                "task_id": task,
+                "repeat_index": rep,
+                "rotation_index": rep % 1,
+            },
+        )
+    # A hand-run group in the same database must not appear.
+    store.create_group(db, "unrelated", ["m/a"], None, "standard")
+
+    cells = [
+        (g["task_id"], g["repeat_index"]) for g in store.experiment_groups(db, eid)
+    ]
+
+    assert cells == [("t1", 0), ("t1", 1), ("t2", 0), ("t2", 1)]
+
+
+def test_a_group_records_its_cell_or_records_none_of_it(db):
+    """The four columns are meaningless apart: a task id with no repeat
+    index does not identify a cell. Passing them as one mapping is what
+    makes half a placement unrepresentable."""
+    plain = store.create_group(db, "p", ["m/a"], None, "standard")
+
+    row = db.execute("SELECT * FROM groups WHERE id = ?", (plain,)).fetchone()
+    assert row["experiment_id"] is None
+    assert row["task_id"] is None
+    assert row["repeat_index"] is None
+    assert row["rotation_index"] is None
+
+
+def test_rescoring_appends_rather_than_overwriting(db):
+    """The audit trail is the point. "The judge said 0.5 last week and 1.0
+    today" is exactly the fact someone checking a claim needs, and an
+    update would destroy it."""
+    run_id = store.save_run(db, "p", [make_result()])
+    result_id = store.get_run(db, run_id)["results"][0]["id"]
+
+    store.add_score(db, result_id, {"scorer": "judge", "score": 0.5, "passed": False})
+    store.add_score(db, result_id, {"scorer": "judge", "score": 1.0, "passed": True})
+
+    rows = store.scores_for_results(db, [result_id])[result_id]
+    assert [r["score"] for r in rows] == [0.5, 1.0]
+    assert [r["passed"] for r in rows] == [False, True]
+
+
+def test_score_fields_go_through_the_field_type_functions(db):
+    """A judge is an upstream service like any other. A verdict carrying
+    "score": "high" must land as None, not as a string in a REAL column,
+    and a negative judge charge must land as None like every other money
+    value that fails the rule."""
+    run_id = store.save_run(db, "p", [make_result()])
+    result_id = store.get_run(db, run_id)["results"][0]["id"]
+
+    store.add_score(
+        db,
+        result_id,
+        {
+            "scorer": "judge",
+            "score": "high",
+            "passed": None,
+            "judge_billed_cost_usd": -1.0,
+            "judge_model": 42,
+        },
+    )
+
+    row = store.scores_for_results(db, [result_id])[result_id][0]
+    assert row["score"] is None
+    assert row["passed"] is None
+    assert row["judge_billed_cost_usd"] is None
+    assert row["judge_model"] is None
+
+
+def test_score_flags_read_back_as_booleans(db):
+    run_id = store.save_run(db, "p", [make_result()])
+    result_id = store.get_run(db, run_id)["results"][0]["id"]
+
+    store.add_score(
+        db,
+        result_id,
+        {"scorer": "human", "score": 1.0, "passed": True, "blind": 1, "self_judged": 0},
+    )
+
+    row = store.scores_for_results(db, [result_id])[result_id][0]
+    assert row["blind"] is True
+    assert row["self_judged"] is False
+    assert row["passed"] is True
+
+
+def test_scores_for_results_is_one_query_over_the_whole_set(db):
+    run_id = store.save_run(db, "p", [make_result(), make_result(model="m/b")])
+    results = store.get_run(db, run_id)["results"]
+    for r in results:
+        store.add_score(db, r["id"], {"scorer": "exact", "score": 1.0})
+
+    out = store.scores_for_results(db, [r["id"] for r in results])
+
+    assert sorted(out) == sorted(r["id"] for r in results)
+    assert store.scores_for_results(db, []) == {}
+
+
+def test_review_repro_a_pre_g_errored_row_classifies_as_error_not_refused(tmp_path):
+    """The era gate, driven from the schema that actually shipped rather
+    than from a hand-built dict.
+
+    A pre-G errored row has NULL request_json because the column did not
+    exist yet, which has nothing to do with money. Ungated, the report's
+    structural refusal rule would read every legacy error as a spend
+    refusal, and the export would carry that misreading forever.
+
+    This is the closing review's legacy-fixture lens in test form: the
+    fixture is migrated by the real connect path, read back by the real
+    store, and classified by the real derivation.
+    """
+    db_path = tmp_path / "pre_g.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_G_SCHEMA)
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, NULL, 'legacy', '2026-02-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error)
+           VALUES (1, 'legacy/a', NULL, NULL, NULL, NULL,
+                   'HTTP 500 from OpenRouter')"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        run = store.get_run(conn, 1)
+        assert run is not None
+        result = run["results"][0]
+        # The two facts that would fool the ungated rule.
+        assert result["request_json"] is None
+        assert run["data_policy"] is None
+
+        assert report.trial_outcome(result, run) == "error"
+        # And the gate is a gate, not a disabling: the same row shape
+        # inside the provenance era is a refusal.
+        assert report.trial_outcome(result, {**run, "data_policy": "standard"}) == (
+            "refused"
+        )
+    finally:
+        conn.close()
+
+
+# ---- The synchronous contract, guarded rather than only stated.
+
+
+def test_the_store_stays_synchronous():
+    """One shared connection is safe because this module cannot yield.
+
+    On one event loop a synchronous function that materializes before
+    returning is an atomic block: nothing interleaves between its first
+    statement and its last, so no second caller can slip a write into the
+    middle of a read or find the connection mid-statement. That property,
+    and not a lock anybody has to remember to take, is why a single
+    sqlite3 connection shared by every request, every experiment trial
+    and every scoring pass is safe here.
+
+    One innocent `async def` helper, or one function handing back a live
+    cursor for a caller to iterate across an await, removes the property
+    everywhere at once and NOTHING FAILS. The reads still work. They keep
+    working until two callers overlap under load and one of them sees
+    half of the other's transaction, which is a bug that reproduces on a
+    busy machine and never on the one where it is being debugged.
+
+    So the guard is a source scan, and it is deliberately crude. It is
+    not trying to prove the module is correct; it is trying to make the
+    day someone reaches for async here a day the suite goes red, with
+    this docstring attached to the failure. A subtler check that
+    understood intent would be a check that could be argued with.
+
+    Tokenized rather than string-matched, which is why the module
+    docstring above can name `async` and `await` while describing the
+    rule: only NAME tokens count, so prose and comments do not.
+    """
+    import io
+    import tokenize
+
+    source = (Path(store.__file__)).read_text(encoding="utf-8")
+    offenders = [
+        (token.start[0], token.string)
+        for token in tokenize.generate_tokens(io.StringIO(source).readline)
+        if token.type == tokenize.NAME and token.string in ("async", "await")
+    ]
+
+    assert offenders == [], (
+        f"bench/store.py must stay synchronous; found {offenders}. "
+        "See the module docstring: one shared connection is safe only "
+        "because nothing in this file can yield mid-statement."
+    )

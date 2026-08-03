@@ -126,9 +126,23 @@
       "live",
       rows.some((r) => r.status === "working"),
     );
+    // Min-rank: equal times share a place and the next one skips, so a
+    // three-way tie reads 1, 1, 1, 4 rather than 1, 2, 3, 4. Two models
+    // that measured identically are tied, and numbering them anyway
+    // would show a difference that is not in the data, which is the same
+    // defect the report's ranking avoids for the same reason. Ties are
+    // not hypothetical: ttft is rounded to a tenth of a millisecond, and
+    // on a fast local stub two models routinely land on the same value.
+    // Min-rank: equal times share a place and the next one skips. Two
+    // models that measured identically are tied, and numbering them
+    // anyway would show a difference that is not in the data, the same
+    // rule the report's ranking follows. Ties are not hypothetical here:
+    // ttft is rounded to a tenth of a millisecond, so on a fast local
+    // stub two models routinely land on the same value.
     for (const r of rows) r.rankN = null;
+    const places = window.BenchLib.minRanks(ranked.map((r) => r.ttft));
     ranked.forEach((r, i) => {
-      r.rankN = i + 1;
+      r.rankN = places[i];
     });
     for (const r of rows) {
       r.wrap.className =

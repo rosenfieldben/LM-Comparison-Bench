@@ -429,6 +429,18 @@ them. `cost_usd` keeps its name and its meaning throughout, the local
 estimate from catalog prices; the billed figure lives beside it in its
 own column rather than overwriting the estimate's history.
 
+**`bench/store.py` is synchronous by design, and a test enforces it.**
+Every function materializes before returning, and no cursor is held
+across an await. One connection is shared by every request, every
+experiment trial and every scoring pass, and on a single event loop a
+synchronous function that materializes before returning is an atomic
+block: nothing interleaves between its first statement and its last. That
+property, not a lock anyone has to remember to take, is what makes the
+shared connection safe. Adding one `async def` there would remove it
+everywhere at once and nothing would fail loudly, so the suite scans the
+module's tokens and goes red instead. Cross-process concurrency is a
+separate problem with a separate answer: WAL mode and the busy timeout.
+
 ## Provider routing
 
 Every request asks OpenRouter to sort providers by throughput
@@ -609,6 +621,552 @@ decision for a later phase, not a default to slip in with this one.
 Every field name, bound and behavior above is pinned against OpenRouter's
 current documentation, with the URLs and the dates they were read in the
 comments in `bench/models.py`.
+
+## Datasets
+
+A dataset is a JSONL file, one task per line:
+
+```json
+{"id": "add-1", "prompt": "What is 17 + 25? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
+```
+
+`id` and `prompt` are required and every other field is optional. `system`
+is sent as that task's system message. `reference` is the expected answer
+for the comparing scorers. `rubric` is the scoring instruction for the
+judge. `scorer` names how the task is scored: `exact`,
+`normalized_exact`, `contains`, `regex` (with a `pattern`), or `judge`.
+Task ids must be unique within a file.
+
+**A dataset's version is its content.** There is no version field to keep
+in sync and no way to edit a file and leave a stale label behind: the
+identity is the sha256 of the raw bytes, recorded on every experiment that
+reads it, the same content-derived rule the asset revision and the catalog
+digest already follow. Two experiments citing the same digest read the
+same file, and that is checkable rather than promised. It is a digest over
+bytes, not over meaning: reordering the keys in a line changes the digest
+without changing the tasks, which is the honest limit of what a byte
+digest can claim.
+
+Validation happens when the experiment is created, not when scoring runs.
+A misspelled scorer name, a judge task with no rubric, or an `exact` task
+with no reference all fail at that point, naming the line, because
+discovering them after a run has paid for every trial is discovering them
+in the most expensive place available.
+
+**Empty counts as missing** for a rubric or a comparing scorer's
+reference, and the empty case is the more dangerous of the two because it
+scores rather than failing: every string contains the empty string, so a
+`contains` task with `"reference": ""` would hand every model on every
+repeat a perfect 1.0, and nothing downstream could tell that number from
+a real one. The trial completed, the scorer ran, the score is in range,
+and the coverage counters say it was scored. The dataset file is the only
+place the meaninglessness is visible, so the refusal lives there.
+
+Two examples ship in `bench-datasets/`: `arithmetic.jsonl` (deterministic
+scoring) and `summarize.jsonl` (rubric scoring). Your own files live
+wherever you keep them; the bench reads the path you name. There is no
+path allowlist, deliberately: the bench answers only to loopback clients
+and runs as you, so restricting the path would defend you against yourself
+while blocking the ordinary case.
+
+## Experiments
+
+An experiment is the aggregate above groups: one dataset, one lineup, one
+budget, one controls set, run for a stated number of repeats. Groups are
+unchanged, still the atomic one-prompt record created before any call and
+enforced at entry; each trial creates one, and four new columns say which
+experiment and which cell (task, repeat, rotation) it belongs to. A group
+with those columns NULL was run by hand, which is what every group in a
+pre-Phase-I database was.
+
+```sh
+curl -X POST localhost:8000/experiments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "arithmetic sweep",
+       "dataset_path": "bench-datasets/arithmetic.jsonl",
+       "lineup": ["openai/gpt-4o-mini", "anthropic/claude-3.5-haiku"],
+       "budget": "standard",
+       "repeats": 3,
+       "params": {"temperature": 0}}'
+```
+
+The row is written complete before anything runs, exactly as a group row
+is written before its first upstream call: it is the declaration, and what
+happened gets checked against it rather than assembled into it. That
+includes the dataset digest, the build (`app_sha`), the catalog digest,
+the data-handling policy, and the trial count. The trial count is stored
+rather than derived, because an experiment that halts leaves its un-run
+trials with nothing behind to count, and a denominator derived from
+existing rows would make a halt look like a completed run.
+
+`tasks x repeats x lineup` is the number of paid calls, and it is bounded
+at creation. An experiment over that bound is refused with the arithmetic
+shown, because the caller has three levers and needs to know which one to
+pull.
+
+## Estimands
+
+Every experiment declares which of two questions it is answering, and
+every report, every export line and every row says which one produced it.
+A number without its estimand is a number about nothing in particular.
+
+**`routed_service` is the default**, and it is what this tool is actually
+used for: the OpenRouter-routed service path for a model under a stated
+routing mode. The provider is chosen dynamically per call, which is a
+confound rather than a defect, and the bench handles it in the open:
+repeats do the statistical work, the report counts which providers served
+each model as its own column, and Phase G's per-result provider field is
+what makes any result stratifiable after the fact. This estimand makes no
+capability claim, so it needs no catalog and sends no routing restriction
+beyond the data policy and the routing mode.
+
+**`underlying_model` is the opt-in strict estimand**, for when the claim
+is about the model itself rather than about the service in front of it.
+It narrows the eligible provider population on purpose:
+
+```sh
+curl -X POST localhost:8000/experiments \
+  -H "Content-Type: application/json" \
+  -d '{"name": "strict sweep",
+       "dataset_path": "bench-datasets/arithmetic.jsonl",
+       "lineup": ["openai/gpt-4o-mini"],
+       "budget": "standard",
+       "estimand_mode": "underlying_model",
+       "provider_pins": {"openai/gpt-4o-mini": "OpenAI"},
+       "params": {"temperature": 0}}'
+```
+
+It sends `require_parameters: true`, so a provider that would have
+silently ignored the temperature is ineligible instead. The routed-service
+path deliberately does not send it, because changing which providers are
+eligible silently changes what is being measured; here that change is the
+whole point. `provider_pins` is strict-mode only, and a pin travels as
+`order` **with `allow_fallbacks: false`**, never without it: an order that
+can be departed from is a preference, and a pinned run served by somebody
+else would record a constraint that did not hold. A pin naming a model
+outside the lineup is refused, since a declaration that cannot be honored
+should not be stored as though it will be.
+
+Every control is capability-checked against the catalog at creation, not
+at trial one of three hundred, and the checks refuse rather than assume:
+
+- **No catalog, no strict experiment.** The check needs the catalog, so
+  an offline boot refuses creation and says so. Skipping it silently is
+  the tempting version and the wrong one: the rows would carry
+  `estimand_mode: underlying_model` with nothing behind it, and no reader
+  afterwards could tell them from rows where the check ran. A label nobody
+  verified is worse than no label. The routed-service estimand is
+  unaffected, because it never made the claim.
+- **A model the catalog does not list, or lists without
+  `supported_parameters`, is refused.** Absence of evidence is not
+  support. An empty list is a real answer and a different one.
+- **An unsupported control is refused**, with the model and the parameter
+  named. Under `require_parameters` an unsupported parameter is not
+  ignored, it makes every provider ineligible, so the experiment would
+  fail every trial rather than measure anything.
+
+`max_tokens` is checked even though no control sets it, because every
+payload the bench builds carries one.
+
+## Running an experiment
+
+```sh
+curl -X POST localhost:8000/experiments/1/start \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_path": "bench-datasets/arithmetic.jsonl"}'
+
+curl -N localhost:8000/experiments/1/progress    # SSE counters
+curl -X POST localhost:8000/experiments/1/stop -H "Content-Type: application/json" -d '{}'
+```
+
+The path is given again at start, and the digest is re-checked against
+the one recorded at creation. A file that changed in between stops the
+experiment before it spends anything, because running would produce a
+record citing one dataset and containing another.
+
+One experiment runs at a time. They share the five upstream slots and the
+spend ceiling, so two at once would interleave through the same queue and
+each would measure the other's waiting; a second start gets a 409 saying
+exactly that. Every trial goes through the same semaphore, the same
+post-admission ceiling recheck, the same settlement inside the held slot
+and the same entry checks as any browser run. The runner creates its
+groups through the normal path with no bypass, so experiment-to-group
+consistency is the law the manifest check already enforces rather than a
+promise the runner makes about itself.
+
+**Repeats and seeds.** Repeats exist to sample variation. If the
+experiment's controls carry a seed, repeat N sends `seed + N`: the whole
+set stays reproducible while each repeat differs, where one fixed seed
+would buy the same sample N times at N times the price. If no seed was
+set, none is sent and each provider applies its own default, which is
+rule one unchanged. The derived seed rides `request_json` on every result
+like any other control, so the record says what was actually sent.
+
+**Rotation.** Models enter the semaphore in lineup order, so under
+saturation the first-listed model reliably gets a slot first and the
+last-listed reliably waits. That is a systematic advantage to being
+listed first, and repeats do not average it away because it points the
+same direction every time. The entry order therefore rotates per cell,
+and the rotation index is recorded on the group. Over a full cycle every
+model occupies every entry position an equal number of times. Position in
+the report is still the model's place in the declared lineup; rotation
+changes who asks first, not which column a model owns.
+
+**Task order** is file order unless `task_order_seed` is set, in which
+case it is shuffled with that seed and the seed is recorded. There is no
+unseeded shuffle, because an order nobody can reproduce makes an
+experiment unrepeatable by its own author.
+
+Task order and halting interact, and the interaction is the reason to set
+a seed. Trials run task-major: all repeats of the first task, then all
+repeats of the second. That is deliberate, because an experiment cut
+short then leaves complete cells (every repeat of some tasks) rather than
+one repeat of everything, and complete cells are what a per-task number
+can actually be computed from. The cost is that the surviving subset is a
+prefix of the task order. In file order that prefix is whatever the
+author happened to put at the top of the file, so a halted run would
+report on the easy warm-up questions if they were written first, and
+would do it without saying so. A recorded seed makes the prefix an
+arbitrary but reproducible subset of the dataset instead of a privileged
+one. If you expect to hit the ceiling, or you are running a dataset you
+did not write, set the seed.
+
+**Interruption is honest.** A stop halts between trials, never inside
+one: a trial that reached upstream has already spent its money, and
+abandoning it would throw away a result you paid for. The experiment ends
+`stopped` with its partial record intact, and the trials that never ran
+are visible as the gap between `trials_done` and `trials_total`. If the
+spend ceiling refuses a trial, the default (`halt_on_refusal`) stops the
+experiment and says so in `status_detail`; set it false to record
+refusals and keep going. Either way the conservation property holds
+across the whole experiment: every requested trial is accounted for as
+completed, failed, refused, or never attempted.
+
+**Progress survives disconnection**, and this is the one place in the
+bench where continuing after a client goes away is the point rather than
+a bug. A browser run belongs to the tab that started it and is abandoned
+when that tab closes, because nobody is watching. An experiment belongs
+to the bench: a laptop lid closing halfway through a paid sweep must not
+silently end it. The progress stream is a view onto the run, not the run
+itself, and every frame carries absolute counters rather than deltas so a
+reconnecting client is caught up by the next frame.
+
+## Scoring
+
+Scoring is a separate pass over a finished experiment, so it can be run,
+re-run and changed without re-running a single model call.
+
+```sh
+curl -X POST localhost:8000/experiments/1/score \
+  -H "Content-Type: application/json" \
+  -d '{"dataset_path": "bench-datasets/arithmetic.jsonl",
+       "judge_model": "openai/gpt-4o-mini"}'
+```
+
+Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
+are pure functions over the stored response text. `normalized_exact` and
+`contains` fold case and collapse whitespace; `exact` strips only the
+surrounding whitespace that chat completions add.
+
+**A trial with no response text scores zero and fails.** It is not
+skipped. An errored or stopped trial is a trial that failed the task, and
+excluding it from scoring is how a report ends up quietly reporting on
+survivors only. The score row's detail says "the trial did not complete",
+so a reader can tell a wrong answer from a missing one.
+
+**Judge scoring is absolute, not pairwise, and blind by construction.**
+The judge is sent the rubric, the reference if the task has one, and the
+response text. It is never sent the identity of the model that produced
+the response, and that is enforced by the shape of the code rather than
+by care: the function that builds the payload is not given the model
+name, so it is not in scope for any future edit inside it. Pairwise
+judging with position swapping is deliberately deferred; it arrives with
+its swap machinery or not at all.
+
+The judge is asked for `{"score": <0 to 1>, "reason": "..."}` and the
+reply is parsed defensively. A fenced or preamble-wrapped object is
+recovered, because that is the same object and refusing would discard
+correct verdicts over formatting. Anything else, including a score that
+is not a number or falls outside `[0, 1]`, is recorded as a scoring
+failure with the reason attached. **A guessed number is never written**:
+it would enter an average and change a conclusion while looking exactly
+like a measurement.
+
+**A judged pass needs a threshold you declare.** A rubric defines a
+graded score, and 0.5 might mean "covered half the required points" in
+one rubric and "wrong but polite" in another, so the bench never supplies
+a cutoff. Add `pass_threshold` to a judge scorer and `passed` is derived
+from it; leave it out and `passed` stays empty:
+
+```json
+{"id": "sum-1", "prompt": "...", "rubric": "...", "scorer": {"kind": "judge", "pass_threshold": 0.75}}
+```
+
+Reports therefore say **pass rate where a threshold was declared, score
+mean otherwise**, and mean it. `pass_threshold` is refused on a
+deterministic scorer, which already produces a pass, for the same reason
+every other inert key is refused: accepting a setting that does nothing
+is worse than saying no to it.
+
+An unparseable verdict has no score and so no pass either, rather than
+counting as a failure. Collapsing the two would put the judge's own
+malfunctions into the model's pass rate.
+
+**Judge calls are spend.** The billed cost is captured in band, recorded
+on the score row, and added to the same accumulator the ceiling reads, so
+a scoring pass cannot run free against the limit. Judges get their own
+modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
+experiment's tier, because a verdict is a number and a sentence and a
+judge inheriting an extended budget would buy headroom no rubric needs,
+once per scored trial. Judge payloads carry the boot data policy like
+every other request.
+
+**If the judge model is in the experiment's lineup**, every score it
+produces is flagged `self_judged` and the flag is surfaced in the report.
+The pass is not refused: you may have good reason, and silently absorbing
+the self-preference concern is what would be wrong.
+
+**A ceiling refusal during scoring is recorded as that result's scoring
+failure and the pass continues.** This is the opposite of the trial
+runner's default, deliberately. A refused trial can only be recovered by
+paying for the model call again, so halting protects the budget for a
+decision you should make. A refused score can be filled in by a later
+pass over the same stored text at no extra model cost, so stopping the
+whole pass for one would trade a complete scoring run for nothing. Re-run
+the pass and the gaps fill in.
+
+## Reports
+
+```sh
+curl "localhost:8000/experiments/1/report?dataset_path=bench-datasets/arithmetic.jsonl"
+```
+
+Computed at read time from the rows, never cached and never stored. A
+stored aggregate can disagree with the rows it came from, and the day it
+does there is no way to tell which is wrong.
+
+**The report keeps two axes apart, everywhere.**
+
+*Axis one, trial outcomes:* `done`, `error`, `refused`, `stopped`,
+`missing`. This is what happened when the bench asked a model to do a
+task, and it is where a model's failure rate comes from. Outcomes are
+derived at read time from fields that were already recorded for their own
+reasons, so the vocabulary can change without a migration and no old row
+carries a label that predates the rules. A declared member that never ran
+counts as `missing` rather than vanishing.
+
+Two denominators go with those outcomes, and the difference between them
+matters enough that both are published. `planned` is every trial the plan
+called for. `attempted` is the subset where a request actually reached a
+provider: `done`, `error`, `stopped`. A `refused` trial was declined by
+the spend ceiling before the call went out and a `missing` trial never
+ran, so neither is an attempt. **`failure_rate` is `error / attempted`**
+and nothing else: a stop is the operator's decision, a refusal is the
+ceiling's, and a missing trial is the experiment's, so counting any of
+them would let a halted run read as a bad model. `refusal_rate` is
+`refused / planned`, because a refusal is a fact about the budget against
+the plan.
+
+*Axis two, scoring coverage:* `scored`, `scoring_failed`, `unscored`.
+This is what happened when the bench tried to put a number on a trial. A
+judge that returned gibberish, or a judge call the ceiling refused, lives
+here and only here. A trial that never ran is on neither axis: it has no
+response to score, so calling it `unscored` would report a gap in
+coverage nobody could ever close.
+
+The two never mix, and the rule for the score mean is where they would be
+easiest to cross:
+
+- A trial that **failed** contributes zero. That is the
+  failure-inclusive rule: an errored trial is a trial that failed the
+  task, and averaging over survivors would flatter the models that fail
+  most.
+- A trial that **succeeded but has no usable score** contributes nothing.
+  Its absence belongs to axis two. Scoring it zero would put the judge's
+  malfunction into the model's mean, where it is indistinguishable from a
+  bad answer.
+- A trial that **never ran** contributes nothing. It is an absence, and
+  scoring it zero would punish a model for an experiment that was halted,
+  which is a fact about a budget.
+
+**Pass rate where a threshold was declared, score mean otherwise**, and
+the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
+says passed, usable verdicts, and eligible trials. A pass rate over three
+verdicts out of forty eligible is not a pass rate anybody should act on,
+and the coverage figure is the only thing that says so.
+
+Thresholds live in the dataset file, so **the report says where it got
+the eligible population** in `thresholds_source`:
+
+- `dataset_file` when you passed `dataset_path`. The denominator is
+  exact: the file names every task that declared a cutoff, including the
+  ones nothing ever scored.
+- `score_rows` otherwise. `passed` is written from the task's own
+  threshold at scoring time and `judged_pass` returns null unless the
+  author declared one, so **a judge row with a non-null `passed` is
+  itself a record that a threshold existed**. The rate that comes out is
+  exact, because those verdicts were computed against the real cutoff.
+  The eligible count is a **floor**: a declared task whose trials were
+  never scored leaves no row to witness it. Supply the file for the full
+  denominator.
+
+Only judge rows witness. A deterministic scorer writes `passed`
+unconditionally, since it is the score restated rather than a cutoff
+anyone chose, and the loader permits `pass_threshold` only on `judge`.
+Counting those rows would make the same experiment report a different
+eligible population depending on whether a path was passed, and two
+answers from one dataset is the failure this layer exists to prevent.
+
+Losing the file used to delete the measurement outright: every verdict
+sat in the database, and the report published no rate at all because the
+denominator was never looked for. Refusing to answer is only honest when
+the answer is unknown, and here most of it was not.
+
+**The scoring-failure rate is its own reported number.** It is also the
+measurement the `response_format` decision in `bench/models.py` says to
+revisit against, so the report computes it whether or not anything reads
+it that day.
+
+**Intervals are 95% percentile bootstrap over TASK clusters**, seeded and
+recorded. Every repeat of a sampled task is kept together, because
+repeats of one task share that task's difficulty and are correlated;
+resampling trials independently would treat forty correlated trials as
+forty independent ones and narrow the interval below what the data
+supports. An overconfident interval is worse than none: it is false
+precision wearing the costume of rigor. With `repeats: 1` the two schemes
+coincide exactly. One task gets no interval at all, because a single
+cluster cannot be resampled into anything but itself.
+
+**Ties share a rank**, in the report and in the live race. Two models
+that measured identically are tied, and ordering them anyway would show a
+difference that is not in the data.
+
+The view is plain tables, deliberately. A bar chart of four means invites
+the eye to read a difference the intervals do not support, which is the
+thing this layer exists to stop. The estimand leads the banner, and the
+`self-judged` and `blind` flags are surfaced per scorer row rather than
+folded into the numbers.
+
+The report view has its own **dataset file** box, following the run-start
+precedent: the path is sent with the read, its digest is checked against
+the one recorded at creation, and a mismatch is refused in the server's
+own words rather than as a status code, naming both digests so the reader
+knows which of the two was wrong. The box stays on screen through the
+refusal, because a path you cannot see is a path you cannot correct.
+Without a file the report degrades to score means and says so. The path
+is remembered in a variable for as long as the tab is open and nowhere
+else: it is a fact about the operator's filesystem, not about the
+experiment, which is why the row records the file's digest instead.
+
+## Export
+
+```sh
+curl -O localhost:8000/experiments/1/export.jsonl
+
+# with the dataset, so the artifact carries the pass thresholds too
+curl -O "localhost:8000/experiments/1/export.jsonl?dataset_path=bench-datasets/arithmetic.jsonl"
+```
+
+JSONL. Line one is the manifest: which dataset by digest, which build,
+which catalog, which estimand, which seeds, what the experiment declared
+itself to be. Every following line is one trial with its full provenance,
+including the payload sent, the response, the timings, the token counts,
+both cost figures, the serving provider, and every score row attached.
+The last line is a sha256 over the preceding bytes, so a citation can
+name the artifact it cites and anyone can check the name.
+
+**Two exports of the same experiment are byte-identical.** Line order is
+task, then repeat, then position; key order within a line is sorted.
+Both rules are needed, and neither alone is enough: an artifact whose
+digest changes between two honest exports of the same data cannot be
+cited, because the citation could never be checked. Keys are sorted
+rather than listed in a stated order, because a stated order is a list
+someone must remember to update and the day they forget it fails
+silently in exactly this way.
+
+**The export is self-sufficient**, and that is tested rather than
+claimed. The round-trip test parses every line, verifies the digest, and
+rebuilds a report from the export alone by feeding its rows back through
+the same pure function the served report uses. The experiment it does
+this on is chosen to be the one a two-axes mistake would corrupt: it has
+an errored trial (axis one) and completed trials nobody scored (axis
+two), so a mean that confused them would come out different. An export
+that flattened either axis would still match on an experiment where
+everything succeeded, which is why that is not the experiment used.
+
+**The artifact labels its own sufficiency.** `dataset_path` on the export
+takes the same terms as start, score and report: the digest is checked
+against the one recorded at creation, and a mismatch is refused before a
+single byte is streamed, because a file half-written against the wrong
+dataset is worse than none. Supplying it embeds the minimal threshold
+slice in the manifest, task id to scorer kind and cutoff, declared tasks
+only. Prompts, references and rubrics stay out: no published number
+needs them, and the export already carries every prompt actually sent.
+
+The manifest always carries `thresholds_included`, so a reader holding an
+export with no thresholds can tell a dataset that declared none from an
+export nobody handed the file to. Those license different claims about
+the pass rate inside: with the slice the artifact re-derives the exact
+eligible denominator, without it the same floor the pathless report
+publishes. Both modes are byte-identical across two exports; the two
+modes are deliberately different artifacts and do not share a digest.
+
+Before this, the round trip could reproduce a model's mean exactly and
+was quietly unable to reproduce the coverage figure printed beside it,
+because eligibility lived in the file and nowhere else. The old test did
+not catch it: its fixture declared no thresholds, so the number it could
+not reproduce was never asked for.
+
+Each trial line carries the derived `outcome` **and** the fields it was
+derived from. That is not redundancy: a reader on a future version of
+these rules can see both what this bench concluded and what it concluded
+it from, and can tell a rule change from a data change.
+
+The response streams and carries `private, no-store` like every other
+dynamic body. It holds every prompt and every answer in the experiment,
+which makes it the most sensitive thing the bench will hand you.
+
+## Blind human rating
+
+Replay a comparison and press "Rate blind". Every card's model id,
+provider, cost and timing is hidden, each card is given a neutral letter
+in a shuffled order, and you rate the answers 1 to 5. Only when every
+card is rated and the ratings are saved do the identities come back.
+
+Cost and timing are hidden along with the name, because a rater who knows
+one answer cost ten times another can often guess which model it was, and
+a guess is not a blind. The reveal happens after the save, not before: a
+rater who saw the identities and then changed their mind would be
+producing a sighted rating the record calls blind. If the save fails,
+nothing is revealed and you can retry.
+
+Ratings persist as `scores` rows with `scorer = "human"` and `blind = 1`,
+the normalized score in `score` and the point you actually clicked in
+`detail` ("4 of 5, shown as B"). The label is recorded so the
+rating-to-model mapping is auditable after the reveal. Ratings entered on
+a normal replay, without blind mode, persist with `blind = 0`: a sighted
+rating is still a rating, and what would be wrong is recording it as
+blind. No pass verdict is derived, for the same reason a judge without a
+declared threshold has none.
+
+**What blinding cannot do.** The bench hides everything it renders about
+a card. It cannot hide what the answer says, and a model that writes "as
+an AI assistant made by X" has identified itself. That is a limit of the
+method rather than of the implementation, and it is worth knowing before
+reading too much into a blind rating on prompts that invite
+self-description.
+
+The reveal is one way per replay. Re-blinding after it would produce a
+rating the record calls blind that was made by someone who had already
+seen the answer, which is worse than no blind rating at all.
+
+**Re-scoring appends.** Scoring is idempotent per (result, scorer, judge
+model) in the sense that re-running is safe, not in the sense that it is
+a no-op: the new row lands beside the old one and reports read the latest
+per key, ordered by timestamp and then by row id so two rows written in
+the same second cannot make a report nondeterministic. The older rows
+stay, because "the judge said 0.5 last week and 1.0 today" is exactly
+what an audit needs to see.
 
 ## Usage
 
