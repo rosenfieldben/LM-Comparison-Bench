@@ -1002,20 +1002,46 @@ here and only here. A trial that never ran is on neither axis: it has no
 response to score, so calling it `unscored` would report a gap in
 coverage nobody could ever close.
 
-The two never mix, and the rule for the score mean is where they would be
-easiest to cross:
+**One gate decides which trials a quality number may speak for**, and the
+mean, the interval's clusters, the pass rate's denominator and both
+coverage counters all sit behind it, so they cannot drift into disagreeing
+about their population.
 
-- A trial that **failed** contributes zero. That is the
-  failure-inclusive rule: an errored trial is a trial that failed the
-  task, and averaging over survivors would flatter the models that fail
-  most.
-- A trial that **succeeded but has no usable score** contributes nothing.
-  Its absence belongs to axis two. Scoring it zero would put the judge's
-  malfunction into the model's mean, where it is indistinguishable from a
-  bad answer.
-- A trial that **never ran** contributes nothing. It is an absence, and
-  scoring it zero would punish a model for an experiment that was halted,
-  which is a fact about a budget.
+In: `done` and `error`. A completed trial is evidence about quality; an
+errored one is a trial that failed the task, and dropping it would average
+over survivors and flatter the models that fail most.
+
+Out: `refused`, `stopped`, `missing`, `not_run`. Each for its own reason,
+and none of them about the model. A refusal is the spend ceiling declining
+to buy the answer, a stop is the operator ending the run, and the two
+absences are the experiment's. Scoring any of them zero publishes a budget,
+an operator or an abandoned plan as capability. Counting them as `unscored`
+would be no better: that reports a coverage gap nobody could ever close.
+
+This is what the previous rule got wrong, and the shape of the mistake is
+worth keeping. The two-axes design was specified precisely for `error` and
+for unscored trials, and the tests pinned exactly those two; `refused` and
+`stopped` were left to inference and fell through the failure-inclusive
+branch. One perfect answer beside one refused trial published **0.5**: the
+model looked half as good because the operator ran out of money. The rules
+were right and the coverage of the rules was not, so the treatment of every
+outcome is now a matrix test with a row per outcome, and the next outcome
+anyone adds gets an empty row that fails until it is filled in deliberately.
+
+Inside the population there are exactly two rules. An errored trial
+contributes zero. A completed trial with no usable score contributes
+nothing, because its absence belongs to axis two and scoring it zero would
+put the judge's malfunction into the model's mean.
+
+**A score row on a stopped trial is neither deleted nor obeyed.** It stays
+in the database and in the export as the audit trail of what the scoring
+pass did, and it never reaches a published number.
+
+**A task the exclusions hollow out leaves the bootstrap.** If every trial
+of a task was refused, stopped or never run, it contributes no cluster
+rather than an empty one, and the interval's stated `n_clusters` says so.
+An interval claiming twenty tasks when six are empty is false precision
+arriving by the back door, which is the thing this layer exists to stop.
 
 **A scorer answers only for the tasks that declared it.** Each scorer gets
 its own section, computed over its own tasks and no others. A section that

@@ -627,3 +627,136 @@ def test_nothing_scored_is_its_own_answer():
 
     assert out["metric"] is None
     assert out["reason"] == "nothing has been scored"
+
+
+# ---- The per-outcome matrix: every outcome's treatment, locked.
+
+
+def matrix_report(outcome, *, score=1.0, task="t2"):
+    """One clean 1.0 trial plus one trial with the outcome under test.
+
+    Two tasks so the interval has something to resample, and so the
+    hollowing rule has a task to hollow out.
+    """
+    by_task = {
+        "t1": [trial("done", 1.0)],
+        task: [trial(outcome, score=score)],
+    }
+    return _scorer_report(
+        "judge", by_task, None, seed=3, row_scored=declared("t1", task)
+    )
+
+
+@pytest.mark.parametrize(
+    ("outcome", "in_mean", "mean", "n", "clusters"),
+    [
+        # The model answered. Its score is the evidence.
+        ("done", True, 1.0, 2, 2),
+        # The model failed the task. Zero, and the denominator keeps it:
+        # a mean over survivors would flatter the models that fail most.
+        ("error", True, 0.5, 2, 2),
+        # The spend ceiling declined to buy the answer. Not the model.
+        ("refused", False, 1.0, 1, 1),
+        # The operator ended the run. Not the model.
+        ("stopped", False, 1.0, 1, 1),
+        # A cell that ran, with no row from this model.
+        ("missing", False, 1.0, 1, 1),
+        # No cell at all: the plan was abandoned before it.
+        ("not_run", False, 1.0, 1, 1),
+    ],
+)
+def test_the_outcome_matrix_locks_every_treatment(outcome, in_mean, mean, n, clusters):
+    """One row per axis-one outcome, and the whole point is that this is a
+    MATRIX rather than four hand-picked cases.
+
+    The two-axes design was specified precisely for `error` and for
+    unscored trials, and the tests pinned exactly those two. `refused`
+    and `stopped` were left to inference and drifted: both fell through
+    the failure-inclusive branch and were scored zero, so a spend ceiling
+    and an operator's stop were being published as model quality. The
+    rules were right; the coverage of the rules was not.
+
+    Every outcome is listed here, with its treatment in the mean, in the
+    cluster count, and in both axes' counters, so the next outcome anyone
+    adds has an empty row that fails until it is filled in deliberately.
+    """
+    out = matrix_report(outcome, score=0.0 if outcome == "error" else 1.0)
+
+    assert out["mean"] == pytest.approx(mean)
+    assert out["n"] == n
+    # The addendum: a task hollowed out by the exclusions leaves the
+    # bootstrap population rather than contributing an empty cluster, and
+    # the interval's stated n_clusters reflects that.
+    assert out["interval"]["n_clusters"] == clusters
+    # Axis two counts exactly the trials the mean was willing to speak
+    # for, so the two can never disagree about their population.
+    coverage = out["coverage"]
+    states = coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
+    assert states == (2 if in_mean else 1)
+
+
+def test_review_repro_a_refusal_beside_a_perfect_score_does_not_halve_it():
+    """The reviewer's case, and the sharpest statement of the defect.
+
+    One task answered perfectly, one trial refused by the spend ceiling.
+    The refusal fell through the failure-inclusive branch and scored
+    zero, so the report published 0.5: the model looked half as good
+    because the operator ran out of money. The budget was being reported
+    as capability.
+
+    1.0 is the answer, with the refusal visible on axis one where it
+    belongs. The report has both numbers and does not mix them.
+    """
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("refused", score=_MISSING)]}
+
+    out = _scorer_report(
+        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2")
+    )
+
+    assert out["mean"] == 1.0
+    assert out["n"] == 1
+    # And the refusal did not sneak in as a hollow cluster either.
+    assert out["interval"]["n_clusters"] == 1
+
+
+def test_a_score_row_on_a_stopped_trial_survives_and_stays_out_of_the_mean():
+    """Both halves matter. The row is the audit trail of what the scoring
+    pass actually did, so it is not deleted; it simply never reaches a
+    published quality number, and the gate that stops it is the one gate
+    every quality number sits behind."""
+    by_task = {
+        "t1": [trial("done", 1.0)],
+        "t2": [trial("stopped", 0.0)],  # scored, and the row stays
+    }
+
+    out = _scorer_report(
+        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2")
+    )
+
+    assert out["mean"] == 1.0
+    assert out["n"] == 1
+    # Not counted as coverage either: it is outside the population, not
+    # a gap inside it.
+    assert out["coverage"]["scored"] == 1
+
+
+def test_a_task_whose_every_trial_was_refused_leaves_the_bootstrap():
+    """The addendum, at its sharpest: not a smaller cluster, no cluster.
+
+    Two repeats of t2, both refused. If the task contributed an empty
+    cluster the resampler would draw it and add nothing, quietly widening
+    or narrowing the interval depending on the draw, and n_clusters would
+    claim a population the exclusions had already hollowed out.
+    """
+    by_task = {
+        "t1": [trial("done", 1.0), trial("done", 0.0)],
+        "t2": [trial("refused", score=_MISSING), trial("refused", score=_MISSING)],
+        "t3": [trial("done", 1.0), trial("done", 1.0)],
+    }
+
+    out = _scorer_report(
+        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2", "t3")
+    )
+
+    assert out["n"] == 4
+    assert out["interval"]["n_clusters"] == 2

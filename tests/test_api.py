@@ -5543,18 +5543,17 @@ def test_the_two_axes_are_reported_separately(client, tmp_path):
     for entry in report["models"]:
         scorer = entry["scorers"][0]
         # Axis one: every trial accounted for by outcome.
-        counted = sum(
-            entry["trials"][k]
-            for k in ("done", "error", "refused", "stopped", "missing")
-        )
-        assert counted == entry["trials"]["planned"]
-        # Axis two: every trial that produced a result accounted for by
-        # scoring state. A trial that never ran is on neither axis, so
-        # the population is the plan less what never ran.
+        counts = entry["trials"]
+        counted = sum(counts[k] for k in OUTCOMES)
+        assert counted == counts["planned"]
+        # Axis two counts exactly the quality population: the trials a
+        # mean is willing to speak for, which is done plus error. A
+        # refusal, a stop, a missing row and an un-run cell are outside
+        # it, not gaps inside it, so they are not coverage either.
         coverage = scorer["coverage"]
         assert (
             coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
-            == entry["trials"]["planned"] - entry["trials"]["missing"]
+            == counts["done"] + counts["error"]
         )
         # The scoring-failure rate is its own number, which is also the
         # response_format revisit measurement.

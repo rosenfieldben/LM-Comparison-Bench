@@ -150,6 +150,17 @@ COMPLETED = ("done",)
 # reader deciding whether to trust a comparison needs to tell them apart.
 OUTCOMES = ("done", "error", "refused", "stopped", "missing", "not_run")
 
+# The outcomes a quality number may be computed from: the model answered,
+# or the model failed to. Everything else on axis one happened for a
+# reason that is not about the model (a spend ceiling, an operator, an
+# abandoned plan), and letting any of them near a mean, an interval, a
+# pass rate or a coverage count would publish that reason as quality.
+#
+# This is the one gate. The mean, the bootstrap's clusters, the pass
+# rate's denominator and both coverage counters all sit behind it, so
+# they cannot drift into disagreeing about which trials they speak for.
+QUALITY_OUTCOMES = ("done", "error")
+
 
 def scoring_state(scores: list[dict[str, Any]], scorer: str) -> str:
     """Whether this trial has a usable number from this scorer.
@@ -222,6 +233,16 @@ def cluster_bootstrap(
     than the module-level functions for the same reason the task shuffle
     uses one: a shared generator would make the interval depend on
     whatever else in the process drew a number first.
+
+    A TASK WITH NO QUALITY DATA IS NOT A CLUSTER. The quality gate can
+    hollow a task out entirely: every trial of it refused, stopped or
+    never run leaves nothing to resample. Such a task must drop out of the
+    population rather than contribute an empty cluster, and n_clusters
+    must say so, because n_clusters is the interval's stated population
+    and an interval claiming twenty tasks when six of them are empty is
+    false precision arriving by the back door. The caller never builds an
+    empty list (it appends or it does not), and the filter here is the
+    second lock on the same door.
     """
     tasks = [values for values in by_task.values() if values]
     flat = [v for values in tasks for v in values]
@@ -728,13 +749,32 @@ def _scorer_report(
             # its absent rows are not this scorer's coverage gap.
             continue
         for trial in trials:
-            # A trial that never ran is on neither axis. It has no
-            # response to score, so calling it "unscored" would report a
-            # gap in scoring coverage that nobody could ever close, and
-            # would put a halted experiment into the scoring column. The
-            # mean and the eligible count already skip it; the coverage
-            # counters skip it here so all three share one population.
-            if trial["outcome"] == "missing":
+            # THE QUALITY POPULATION, and everything below it shares this
+            # one gate: the mean, the interval's clusters, the pass rate's
+            # denominator, and both coverage counters.
+            #
+            # done and error are in. A completed trial is evidence about
+            # quality; an errored one is a trial that failed the task, and
+            # dropping it would average over survivors and flatter the
+            # models that fail most.
+            #
+            # refused, stopped, missing and not_run are out, and each for
+            # its own reason, none of them about the model. A refusal is
+            # the spend ceiling declining to buy the answer. A stop is the
+            # operator ending the run. A missing trial left no row in a
+            # cell that ran; a not_run trial has no cell. Scoring any of
+            # them zero would put a budget, an operator or an abandoned
+            # plan into a model's quality number, where it is
+            # indistinguishable from a bad answer. Calling them
+            # "unscored" would be no better: it would report a gap in
+            # coverage that nobody could ever close.
+            #
+            # A score row on a stopped trial is not deleted and is not
+            # ignored. It stays in the database and in the export as the
+            # audit trail of what the scoring pass did; it simply never
+            # reaches a published quality number, which is enforced HERE,
+            # by this gate, and nowhere else.
+            if trial["outcome"] not in QUALITY_OUTCOMES:
                 continue
             rows = [r for r in trial["scores"] if r["scorer"] == scorer]
             state = scoring_state(trial["scores"], scorer)
@@ -753,25 +793,17 @@ def _scorer_report(
                     self_judged_rows += 1
                 if latest.get("judge_model"):
                     judge_models.add(latest["judge_model"])
-            # The score mean, and this is where the two axes could most
-            # easily be crossed, so the rule is spelled out.
+            # Inside the quality population there are exactly two rules,
+            # and this is where the axes would be easiest to cross.
             #
-            # A trial that FAILED contributes zero. That is the
-            # failure-inclusive rule: an errored or aborted trial is a
-            # trial that failed the task, and dropping it would average
-            # over survivors and flatter the models that fail most.
+            # An ERRORED trial contributes zero. It is a trial that failed
+            # the task, and that is a fact about the model.
             #
-            # A trial that SUCCEEDED but has no usable score contributes
-            # NOTHING. Its absence is axis two: nobody scored it, or the
-            # judge could not answer. Scoring it zero would put the
-            # judge's malfunction into the model's mean, which is exactly
-            # the crossing the two axes exist to prevent, and it would be
-            # invisible in the result because it looks like a bad answer.
-            #
-            # A trial that never ran is already gone, skipped at the top
-            # of the loop. It is an absence, and scoring it zero would
-            # punish a model for an experiment that was halted, which is
-            # a fact about a budget.
+            # A COMPLETED trial with no usable score contributes NOTHING.
+            # Its absence is axis two: nobody scored it, or the judge
+            # could not answer. Scoring it zero would put the judge's
+            # malfunction into the model's mean, where it is
+            # indistinguishable from a bad answer.
             value = latest.get("score") if latest else None
             if trial["outcome"] not in COMPLETED:
                 values_by_task.setdefault(task_id, []).append(0.0)
