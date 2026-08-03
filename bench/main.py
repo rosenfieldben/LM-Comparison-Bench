@@ -408,6 +408,13 @@ class ExperimentCreate(BaseModel):
     # experiment unrepeatable by anyone including its author.
     task_order_seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
     estimand_mode: Literal["routed_service", "underlying_model"] = "routed_service"
+    # Which scorer a ranking is computed on. Absent means none declared,
+    # and the report then publishes per-scorer sections with no
+    # cross-scorer ranking rather than picking one alphabetically.
+    # Validated at creation against what this dataset can actually
+    # produce, because a primary naming a scorer nothing runs would be a
+    # declaration that silently never applies.
+    primary_metric: str | None = Field(default=None, min_length=1, max_length=50)
     # model id to provider name. Strict mode only; enforced with
     # allow_fallbacks false, so a pinned provider that cannot serve is a
     # recorded failure rather than a quiet reroute.
@@ -468,6 +475,7 @@ class ExperimentDetail(BaseModel):
     repeats: int
     task_order_seed: int | None
     estimand_mode: str
+    primary_metric: str | None
     provider_pins: dict[str, Any] | None
     halt_on_refusal: bool
     status: str
@@ -1943,6 +1951,43 @@ def read_dataset(path: str) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
 
 
+# The one scorer no dataset can declare. A person decides to rate a
+# trial after the fact, so `human` never appears in a file, and refusing
+# it as a primary metric would make the only numbers an actual human
+# produced the only ones a report may not be ordered by.
+HUMAN_SCORER = "human"
+
+
+def enforce_primary_metric(metric: str, dataset: dict[str, Any]) -> None:
+    """A primary metric has to name something this experiment can produce.
+
+    Checked at creation, where the dataset is already open and the answer
+    is knowable, rather than at report time where the only available
+    response is an empty column. A primary naming a scorer no task
+    declares is a declaration that silently never applies, and the report
+    would then rank every model on None and call it a ranking.
+    """
+    declared = sorted(
+        {
+            kind
+            for task in dataset["tasks"]
+            if isinstance(kind := (task.get("scorer") or {}).get("kind"), str)
+        }
+    )
+    if metric in declared or metric == HUMAN_SCORER:
+        return
+    allowed = ", ".join([*declared, HUMAN_SCORER])
+    raise HTTPException(
+        422,
+        f"primary_metric {metric!r} is not produced by this experiment. "
+        f"This dataset declares {allowed or 'no scorers'}, and a primary "
+        "metric naming something nothing runs would order every model on "
+        "an empty column. Name one of those, or leave it unset and the "
+        "report will publish each scorer's section without a "
+        "cross-scorer ranking.",
+    )
+
+
 def catalog_entries() -> dict[str, dict[str, Any]]:
     """The boot catalog keyed by model id, or an empty map when offline."""
     catalog = getattr(app.state, "catalog", None) or {}
@@ -2067,6 +2112,8 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
             'estimand_mode to "underlying_model", which is the estimand '
             "that narrows the provider population on purpose.",
         )
+    if body.primary_metric is not None:
+        enforce_primary_metric(body.primary_metric, dataset)
     if body.estimand_mode == "underlying_model":
         enforce_strict_mode(body.lineup, body.provider_pins, controls)
     return {
@@ -2082,6 +2129,7 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 "repeats": body.repeats,
                 "task_order_seed": body.task_order_seed,
                 "estimand_mode": body.estimand_mode,
+                "primary_metric": body.primary_metric,
                 "provider_pins": body.provider_pins,
                 "halt_on_refusal": body.halt_on_refusal,
                 # The same provenance every run row carries, recorded once

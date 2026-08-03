@@ -4,10 +4,14 @@ Two axes, kept apart everywhere in this module, because collapsing them
 is the single easiest way to publish a misleading number.
 
 Axis one is the TRIAL outcome: what happened when the bench asked a model
-to do a task. done, error, refused, stopped, missing. A model's failure
-rate comes from here, and "failure-inclusive denominators" means these
-failures: an errored trial is a trial that failed the task, and dropping
-it would report on survivors.
+to do a task. done, error, refused, stopped, missing, not_run. A model's
+failure rate comes from here, and "failure-inclusive denominators" means
+these failures: an errored trial is a trial that failed the task, and
+dropping it would report on survivors.
+
+Sections are the third thing kept apart, and the newest. A scorer answers
+only for the tasks that declared it: see applicable_tasks for what a
+section that iterated every task was doing to its neighbours' numbers.
 
 Axis two is SCORING COVERAGE: what happened when the bench tried to put a
 number on a trial. scored, scoring_failed, unscored. A judge that
@@ -358,12 +362,30 @@ def build_report(
     # even when the file is present, so the cost is one pass over rows
     # already in memory and the two witnesses can be compared in a test.
     row_declared = rows_declaring_thresholds(trials)
+    row_scored = rows_scoring_tasks(trials)
     models = [
-        _model_report(model, by_task, tasks_by_id, seed, row_declared, not_run)
+        _model_report(
+            model, by_task, tasks_by_id, seed, row_declared, not_run, row_scored
+        )
         for model, by_task in trials.items()
     ]
-    # Ranked on the primary score mean, min-rank so ties share a place.
-    ranks = min_ranks({m["model"]: m["score"]["mean"] for m in models})
+    ranking = choose_metric(experiment.get("primary_metric"), models)
+    metric = ranking["metric"]
+    for entry in models:
+        section = next((s for s in entry["scorers"] if s["scorer"] == metric), None)
+        entry["score"] = {
+            "metric": metric,
+            "mean": (section or {}).get("mean"),
+            "interval": (section or {}).get("interval"),
+        }
+    # Min-rank so ties share a place, and only when a metric was chosen.
+    # A rank with no named metric is a claim about which model is better
+    # with nothing behind it.
+    ranks = (
+        min_ranks({m["model"]: m["score"]["mean"] for m in models})
+        if metric is not None
+        else {m["model"]: None for m in models}
+    )
     for entry in models:
         entry["rank"] = ranks[entry["model"]]
     return {
@@ -394,6 +416,10 @@ def build_report(
         # its threshold, and a reader comparing two reports has to know
         # which one had the file.
         "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
+        # The ranking always names the metric that produced it, or says
+        # plainly that there is none. An unlabelled leaderboard is the
+        # single easiest way to publish a claim nobody made.
+        "ranking": ranking,
         "bootstrap": {
             "seed": seed,
             "resamples": BOOTSTRAP_RESAMPLES,
@@ -406,6 +432,57 @@ def build_report(
     }
 
 
+def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[str, Any]:
+    """Which scorer the ranking is computed on, and why, or none at all.
+
+    A RANKING IS A CLAIM. It says one model did better than another, and
+    that claim only means something once somebody has said better AT
+    WHAT. The previous rule took per_scorer[0], the first of a sorted
+    list, so an experiment scored by both `contains` and `judge` was
+    ranked on `contains` because c sorts before j. Nobody chose that, the
+    report did not say it, and adding a scorer named `accuracy` would
+    have silently reordered the leaderboard.
+
+    Three cases, and the report names which one it is in:
+
+    A declared primary_metric wins. Validated at creation against the
+    dataset's scorers, so it cannot name something nothing produces.
+
+    Exactly one scorer across the whole experiment ranks on that scorer,
+    because there is no choice to make and refusing to rank would be
+    pedantry.
+
+    Otherwise NO RANKING. Sections are still published in full, with
+    every mean, interval and pass rate; what is withheld is the single
+    ordering, because inventing one would be putting the report's name to
+    a preference its author never expressed.
+    """
+    available = sorted({s["scorer"] for m in models for s in m["scorers"]})
+    if declared is not None:
+        return {
+            "metric": declared,
+            "reason": "declared as the experiment's primary metric",
+            "available": available,
+        }
+    if len(available) == 1:
+        return {
+            "metric": available[0],
+            "reason": "the only scorer in this experiment",
+            "available": available,
+        }
+    if not available:
+        return {"metric": None, "reason": "nothing has been scored", "available": []}
+    return {
+        "metric": None,
+        "reason": (
+            "more than one scorer and no primary_metric declared, so this "
+            "report publishes each scorer's section and no cross-scorer "
+            "ranking: ordering models needs somebody to say better at what"
+        ),
+        "available": available,
+    }
+
+
 def _model_report(
     model: str,
     by_task: dict[str, list[dict[str, Any]]],
@@ -413,6 +490,7 @@ def _model_report(
     seed: int,
     row_declared: dict[str, set[str]] | None = None,
     not_run: int = 0,
+    row_scored: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     flat = [t for trials in by_task.values() for t in trials]
     outcomes = {name: 0 for name in OUTCOMES}
@@ -451,10 +529,9 @@ def _model_report(
     # and the models that fail most would look best.
     scorers = sorted({row["scorer"] for trial in flat for row in trial["scores"]})
     per_scorer = [
-        _scorer_report(scorer, by_task, tasks_by_id, seed, row_declared)
+        _scorer_report(scorer, by_task, tasks_by_id, seed, row_declared, row_scored)
         for scorer in scorers
     ]
-    primary = per_scorer[0] if per_scorer else {"mean": None, "interval": None}
 
     completed = [t["result"] for t in flat if t["outcome"] in COMPLETED]
     return {
@@ -476,7 +553,6 @@ def _model_report(
             "refusal_rate": outcomes["refused"] / planned if planned else None,
         },
         "scorers": per_scorer,
-        "score": {"mean": primary.get("mean"), "interval": primary.get("interval")},
         "latency_ms": summarize_metric([r.get("latency_ms") for r in completed]),
         "ttft_ms": summarize_metric([r.get("ttft_ms") for r in completed]),
         "cost": _cost_totals(completed),
@@ -486,6 +562,68 @@ def _model_report(
         # the confound from an assumption into a column.
         "providers": _provider_counts(completed),
     }
+
+
+def rows_scoring_tasks(
+    trials_by_model: dict[str, dict[str, list[dict[str, Any]]]],
+) -> dict[str, set[str]]:
+    """scorer -> task ids that have at least one row from that scorer.
+
+    Which tasks a scorer APPLIES to, witnessed by the rows. Same floor
+    semantics as rows_declaring_thresholds and for the same reason: a
+    task nobody scored leaves nothing behind to say the scorer was meant
+    to run on it.
+
+    Computed over every model, because applicability is a fact about the
+    task. Per model, a model whose trials went unscored would report a
+    smaller population than its neighbour for the same task.
+    """
+    scored: dict[str, set[str]] = {}
+    for by_task in trials_by_model.values():
+        for task_id, trials in by_task.items():
+            for trial in trials:
+                for row in trial["scores"]:
+                    scored.setdefault(row["scorer"], set()).add(task_id)
+    return scored
+
+
+def applicable_tasks(
+    scorer: str,
+    tasks_by_id: dict[str, dict[str, Any]] | None,
+    row_scored: dict[str, set[str]],
+) -> set[str]:
+    """The tasks one scorer's section is computed over.
+
+    A scorer answers for the tasks that declared it and for no others.
+    Without this a section iterated EVERY task in the experiment, so a
+    task scored by `contains` contributed to the `judge` section: its
+    errored trials added zeros to the judge's mean and its completed
+    trials added to the judge's unscored coverage, both for a scorer that
+    was never meant to look at it. One scorer's tasks were dragging
+    another scorer's numbers around, and the two-axes work could not see
+    it because the crossing was not between the axes but between the
+    sections.
+
+    The file is authoritative for any scorer it mentions, exactly as it is
+    for thresholds. Where it says nothing, the rows are the witness, with
+    the same floor limit: a task nobody scored cannot testify.
+
+    A scorer the file NEVER mentions falls to the rows even when a file
+    was supplied, and human ratings are why. No dataset declares `human`;
+    a person decides to rate a trial after the fact. Reading the file's
+    silence as "this scorer applies to nothing" would delete every human
+    mean from any report built with a dataset path, which is absence read
+    as denial, the same mistake the threshold fallback exists to avoid.
+    """
+    if tasks_by_id is not None:
+        declared = {
+            task_id
+            for task_id, task in tasks_by_id.items()
+            if ((task or {}).get("scorer") or {}).get("kind") == scorer
+        }
+        if declared:
+            return declared
+    return set(row_scored.get(scorer, set()))
 
 
 def rows_declaring_thresholds(
@@ -561,8 +699,13 @@ def _scorer_report(
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
     row_declared: dict[str, set[str]] | None = None,
+    row_scored: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
     """One scorer's numbers for one model, with both axes reported.
+
+    Computed over the tasks that DECLARED this scorer and no others; see
+    applicable_tasks for why a section that iterated every task was
+    dragging one scorer's tasks through another scorer's numbers.
 
     The pass rate is passed over USABLE VERDICTS among tasks that
     declared a threshold, and it always ships with its coverage. A pass
@@ -572,12 +715,18 @@ def _scorer_report(
     rate looks like every other rate on the page.
     """
     eligible_tasks = _eligible_tasks(scorer, tasks_by_id, row_declared or {})
+    mine = applicable_tasks(scorer, tasks_by_id, row_scored or {})
     values_by_task: dict[str, list[float]] = {}
     scored = failed = unscored = 0
     passed = usable_verdicts = eligible = 0
     blind_rows = self_judged_rows = 0
     judge_models: set[str] = set()
     for task_id, trials in by_task.items():
+        if task_id not in mine:
+            # Another scorer's task. Not this section's business, on
+            # either axis: its zeros are not this scorer's failures and
+            # its absent rows are not this scorer's coverage gap.
+            continue
         for trial in trials:
             # A trial that never ran is on neither axis. It has no
             # response to score, so calling it "unscored" would report a
@@ -771,6 +920,10 @@ def export_manifest(
         "name": experiment["name"],
         "created_at": experiment["created_at"],
         "estimand_mode": experiment["estimand_mode"],
+        # Which scorer any ranking in this artifact was computed on, or
+        # null when none was declared. A leaderboard whose metric is not
+        # in the file is a leaderboard nobody can check.
+        "primary_metric": experiment["primary_metric"],
         "dataset_name": experiment["dataset_name"],
         "dataset_digest": experiment["dataset_digest"],
         "lineup": experiment["lineup"],

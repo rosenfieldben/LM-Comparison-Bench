@@ -5909,36 +5909,52 @@ from bench.report import OUTCOMES, build_report
 def two_axes_experiment(client, tmp_path):
     """An experiment shaped so the two-axes bug would corrupt its numbers.
 
-    Two tasks, two models. The second upstream call errors, so one trial
-    is an axis-one failure. Only the first task carries a scorer, so the
-    completed trials of the second task are axis-two unscored. A mean
-    that confused the two would read differently from the correct one,
-    which is what makes this the right shape to re-derive from an export.
+    Two tasks, two models. Both models' second call errors, so two trials
+    are axis-one failures. Both tasks declare `contains`, and one model's
+    score rows on the second task are then deleted, so its trial there is
+    axis-two unscored: completed, meant to be scored, and not scored.
+
+    The deletion is how the gap is built, and the reason is J2. A task
+    that declares NO scorer is now outside every section, so it can no
+    longer serve as the axis-two half: it is not that scorer's business
+    at all. A real unscored trial is one on a task that DID declare the
+    scorer, which the other model's rows witness. That cross-model
+    witnessing is exactly the asymmetry applicable_tasks is built on, so
+    the fixture now exercises it rather than sitting beside it.
     """
     calls = {"n": 0}
 
     def route(request):
         calls["n"] += 1
+        # Call 2 is model/beta on `scored`. Task-major with rotation, so
+        # the second task's entry order is reversed: 3 is beta on `gap`
+        # and 4 is alpha on `gap`. Getting that backwards is easy and the
+        # numbers below depend on it, so it is written down.
         if calls["n"] == 2:
             return httpx.Response(500)
         return httpx.Response(200, stream=alpha_stream())
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
+    scorer = {"kind": "contains"}
     path = write_dataset(
         tmp_path,
-        {
-            "id": "scored",
-            "prompt": "a",
-            "reference": "Hello",
-            "scorer": {"kind": "contains"},
-        },
-        # No scorer at all, so its trials stay unscored: the axis-two
-        # half of the shape.
-        {"id": "unscored", "prompt": "b"},
+        {"id": "scored", "prompt": "a", "reference": "Hello", "scorer": scorer},
+        {"id": "gap", "prompt": "b", "reference": "Hello", "scorer": scorer},
     )
     eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
     run_experiment_to_completion(client, eid, path)
     score_experiment_to_completion(client, eid, path)
+    # model/alpha's verdict on `gap` removed: the trial completed and
+    # nobody scored it. model/beta's row on the same task survives, so
+    # the task is still witnessed as declaring `contains`.
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 'gap' AND r.model = 'model/alpha')"""
+    )
+    client.app.state.db.commit()
     return eid, path
 
 
@@ -6183,26 +6199,26 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
     either would re-derive a different mean here while still matching on
     an experiment where everything succeeded.
 
-    The four rows the fixture actually produces, which is worth writing
-    down because an earlier description of this fixture named three
-    trials for model/beta when it has two:
+    The four rows the fixture actually produces, rewritten for J2: both
+    tasks now declare `contains`, because a task declaring no scorer is
+    outside every section and can no longer carry the axis-two half.
 
-        model/alpha  task=scored    done   contains=1.0
-        model/beta   task=scored    error  contains=0.0
-        model/alpha  task=unscored  done   (no score rows)
-        model/beta   task=unscored  done   (no score rows)
+        model/alpha  task=scored  done   contains=1.0
+        model/beta   task=scored  error  contains=0.0
+        model/beta   task=gap     done   contains=1.0
+        model/alpha  task=gap     done   (rows deleted: unscored)
 
     Both wrong directions, as numbers, so the claim that this fixture
     discriminates is checkable rather than asserted:
 
-        correct        alpha [1.0]      -> 1.0    beta [0.0]      -> 0.0
-        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 0.0] -> 0.0
-        B: drop failed alpha [1.0]      -> 1.0    beta []         -> None
+        correct        alpha [1.0]      -> 1.0    beta [0.0, 1.0] -> 0.5
+        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 1.0] -> 0.5
+        B: drop failed alpha [1.0]      -> 1.0    beta [1.0]      -> 1.0
 
     So each direction is caught by one model and not the other: A moves
-    model/alpha and leaves model/beta at 0.0, B empties model/beta and
-    leaves model/alpha at 1.0. The pair is load-bearing, and asserting
-    only one of the two means would let one direction through.
+    model/alpha off 1.0 and leaves model/beta at 0.5, B moves model/beta
+    off 0.5 and leaves model/alpha at 1.0. The pair is load-bearing, and
+    asserting only one of the two means would let one direction through.
 
     Re-derived by feeding the export's own rows back through the same
     pure function the report uses, which is what makes "self-sufficient"
@@ -6239,7 +6255,7 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
         for m in rebuilt["models"]
     }
     assert means["model/alpha"] == (1.0, 1)  # direction A would read 0.5
-    assert means["model/beta"] == (0.0, 1)  # direction B would read None
+    assert means["model/beta"] == (0.5, 2)  # direction B would read 1.0
 
     # And the export alone reproduces every model's mean and outcome
     # counts exactly.
@@ -6532,3 +6548,64 @@ def test_review_repro_the_routed_service_payload_is_unchanged_by_strict_mode(
     assert payload["provider"] == {"sort": "throughput"}
     assert "require_parameters" not in sent[0].decode()
     assert "allow_fallbacks" not in sent[0].decode()
+
+
+# ---- Phase I.2 J2: the primary metric.
+
+
+@respx.mock
+def test_a_primary_metric_must_name_something_the_dataset_produces(client, tmp_path):
+    """Checked at creation, where the dataset is open and the answer is
+    knowable. At report time the only available response is an empty
+    column, and a report that ranked every model on None would still call
+    itself a ranking."""
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "reference": "b", "scorer": {"kind": "contains"}},
+    )
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, primary_metric="judge")
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "not produced by this experiment" in detail
+    # Names what it would accept, including the one scorer no dataset can
+    # declare.
+    assert "contains, human" in detail
+
+
+@respx.mock
+def test_the_primary_metric_may_be_human_even_though_no_file_declares_it(
+    client, tmp_path
+):
+    """A person decides to rate a trial after the fact, so `human` never
+    appears in a dataset. Refusing it would make the only numbers an
+    actual human produced the only ones a report may not be ordered by."""
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "reference": "b", "scorer": {"kind": "contains"}},
+    )
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, primary_metric="human")
+    )
+
+    assert resp.status_code == 201
+    detail = client.get(f"/experiments/{resp.json()['id']}").json()
+    assert detail["primary_metric"] == "human"
+
+
+@respx.mock
+def test_the_report_names_the_metric_its_ranking_used(client, tmp_path):
+    """One scorer, so no declaration is needed and the report says which
+    one it used rather than leaving the rank column unexplained."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["ranking"]["metric"] == "contains"
+    assert report["ranking"]["available"] == ["contains"]
+    assert report["models"][0]["score"]["metric"] == "contains"
+    assert report["models"][0]["rank"] is not None

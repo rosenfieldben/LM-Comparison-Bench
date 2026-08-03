@@ -14,6 +14,7 @@ from bench.report import (
     _model_report,
     _provider_counts,
     _scorer_report,
+    choose_metric,
     cluster_bootstrap,
     min_ranks,
     provenance_era,
@@ -352,6 +353,18 @@ def trial(outcome, score=None, scorer="judge", task="t1"):
     return {"outcome": outcome, "result": {}, "scores": scores, "task_id": task}
 
 
+def declared(*task_ids, scorer="judge"):
+    """Which tasks declared this scorer, in the shape _scorer_report takes.
+
+    Passed explicitly because applicability is now an input rather than
+    an assumption. In build_report it is derived across EVERY model, so a
+    task one model's trials were scored on counts as declared for the
+    model whose trials were not: that asymmetry is exactly what makes an
+    unscored trial visible as coverage rather than invisible.
+    """
+    return {scorer: set(task_ids)}
+
+
 _MISSING = object()
 
 
@@ -371,7 +384,9 @@ def test_review_repro_an_unscored_trial_is_not_a_zero_in_the_mean():
         "t2": [trial("done", score=_MISSING)],
     }
 
-    out = _scorer_report("judge", by_task, {}, seed=1)
+    out = _scorer_report(
+        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+    )
 
     # One usable score, so the mean is that score.
     assert out["mean"] == 1.0
@@ -386,7 +401,9 @@ def test_a_judge_that_could_not_answer_is_not_a_zero_either():
     machinery failing, not the model's answer being bad."""
     by_task = {"t1": [trial("done", 1.0)], "t2": [trial("done", None)]}
 
-    out = _scorer_report("judge", by_task, {}, seed=1)
+    out = _scorer_report(
+        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+    )
 
     assert out["mean"] == 1.0
     assert out["coverage"]["scoring_failed"] == 1
@@ -399,7 +416,9 @@ def test_a_failed_trial_is_a_zero_because_that_is_axis_one():
     task, and it belongs in the denominator at zero."""
     by_task = {"t1": [trial("done", 1.0)], "t2": [trial("error", score=_MISSING)]}
 
-    out = _scorer_report("judge", by_task, {}, seed=1)
+    out = _scorer_report(
+        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+    )
 
     assert out["mean"] == 0.5
     assert out["n"] == 2
@@ -416,7 +435,9 @@ def test_a_trial_that_never_ran_is_excluded_entirely():
     """
     by_task = {"t1": [trial("done", 1.0)], "t2": [trial("missing", score=_MISSING)]}
 
-    out = _scorer_report("judge", by_task, {}, seed=1)
+    out = _scorer_report(
+        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+    )
 
     assert out["mean"] == 1.0
     assert out["n"] == 1
@@ -474,3 +495,135 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
     assert counts["failure_rate"] == pytest.approx(0.25)
     # And the refusal is a rate against the plan it was measured over.
     assert counts["refusal_rate"] == pytest.approx(1 / 6)
+
+
+# ---- Sections: a scorer answers only for its own tasks.
+
+
+def test_review_repro_one_scorers_tasks_stay_out_of_anothers_numbers():
+    """A section used to iterate every task in the experiment.
+
+    So a task scored by `contains` landed in the `judge` section: its
+    errored trials added zeros to the judge's mean under the
+    failure-inclusive rule, and its completed trials added to the judge's
+    unscored coverage. Both for a scorer that was never meant to look at
+    it. The two-axes work could not see this because the crossing was not
+    between the axes, it was between the sections, and every axis rule
+    was being applied correctly to the wrong population.
+
+    Two tasks, one per scorer, and the judge task's trial errored. The
+    judge's mean must be that single zero and nothing else.
+    """
+    by_task = {
+        "judged": [trial("error", score=_MISSING, scorer="judge")],
+        "matched": [trial("error", score=_MISSING, scorer="contains")],
+    }
+    row_scored = {"judge": {"judged"}, "contains": {"matched"}}
+
+    judge = _scorer_report("judge", by_task, None, seed=1, row_scored=row_scored)
+    contains = _scorer_report("contains", by_task, None, seed=1, row_scored=row_scored)
+
+    # One zero each, not two. Before the fix both sections read n=2.
+    assert judge["n"] == 1
+    assert contains["n"] == 1
+    assert judge["coverage"]["scored"] + judge["coverage"]["unscored"] == 1
+    assert contains["coverage"]["scored"] + contains["coverage"]["unscored"] == 1
+
+
+def test_relabelling_a_task_moves_it_between_sections_and_changes_nothing_else():
+    """The file is authoritative for the scorers it mentions, so the same
+    rows reported against two different dataset labellings put the task in
+    a different section and leave every within-section number alone.
+
+    Same rows, twice. Only the file differs.
+    """
+    by_task = {
+        "t1": [trial("done", 1.0, scorer="contains")],
+        "t2": [trial("done", 0.0, scorer="contains")],
+    }
+    row_scored = {"contains": {"t1", "t2"}}
+    as_contains = {
+        "t1": {"scorer": {"kind": "contains"}},
+        "t2": {"scorer": {"kind": "contains"}},
+    }
+    # t2 relabelled: the file now says judge scores it, so it leaves the
+    # contains section even though its rows say contains.
+    relabelled = {
+        "t1": {"scorer": {"kind": "contains"}},
+        "t2": {"scorer": {"kind": "judge"}},
+    }
+
+    both = _scorer_report("contains", by_task, as_contains, 1, row_scored=row_scored)
+    one = _scorer_report("contains", by_task, relabelled, 1, row_scored=row_scored)
+
+    assert both["n"] == 2
+    assert both["mean"] == 0.5
+    # t2 is gone from this section, and t1's contribution is untouched.
+    assert one["n"] == 1
+    assert one["mean"] == 1.0
+
+
+def test_a_scorer_the_file_never_mentions_falls_back_to_its_rows():
+    """Human ratings are the case. No dataset declares `human`, so
+    reading the file's silence as "applies to nothing" would delete every
+    human mean from any report built with a dataset path: absence read as
+    denial, which is the mistake the threshold fallback exists to avoid.
+    """
+    by_task = {"t1": [trial("done", 4.0 / 5, scorer="human")]}
+    from_file = {"t1": {"scorer": {"kind": "contains"}}}
+
+    out = _scorer_report(
+        "human", by_task, from_file, seed=1, row_scored={"human": {"t1"}}
+    )
+
+    assert out["n"] == 1
+    assert out["mean"] == pytest.approx(0.8)
+
+
+# ---- Ranking: an ordering is a claim, and it names its metric.
+
+
+def section(scorer):
+    return {"scorer": scorer, "mean": 1.0, "interval": None}
+
+
+def test_a_single_scorer_needs_no_declaration_to_rank():
+    out = choose_metric(None, [{"scorers": [section("contains")]}])
+
+    assert out["metric"] == "contains"
+    assert "only scorer" in out["reason"]
+
+
+def test_review_repro_two_scorers_and_no_primary_publishes_no_ranking():
+    """The alphabetical accident, stated as a test.
+
+    The old rule ranked on per_scorer[0], the first of a sorted list, so
+    an experiment scored by `contains` and `judge` was ordered by
+    `contains` because c sorts before j. Nobody chose that, the report did
+    not say it, and adding a scorer named `accuracy` would have silently
+    reordered the leaderboard. A ranking is a claim that one model did
+    better, and it means nothing until somebody says better at what.
+    """
+    models = [{"scorers": [section("contains"), section("judge")]}]
+
+    out = choose_metric(None, models)
+
+    assert out["metric"] is None
+    assert out["available"] == ["contains", "judge"]
+    assert "better at what" in out["reason"]
+
+
+def test_a_declared_primary_wins_over_the_alphabet():
+    models = [{"scorers": [section("contains"), section("judge")]}]
+
+    out = choose_metric("judge", models)
+
+    assert out["metric"] == "judge"
+    assert "declared" in out["reason"]
+
+
+def test_nothing_scored_is_its_own_answer():
+    out = choose_metric(None, [{"scorers": []}])
+
+    assert out["metric"] is None
+    assert out["reason"] == "nothing has been scored"

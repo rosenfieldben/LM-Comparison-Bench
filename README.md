@@ -1017,6 +1017,37 @@ easiest to cross:
   scoring it zero would punish a model for an experiment that was halted,
   which is a fact about a budget.
 
+**A scorer answers only for the tasks that declared it.** Each scorer gets
+its own section, computed over its own tasks and no others. A section that
+iterated every task was dragging its neighbours' numbers around: a task
+scored by `contains` landed in the `judge` section, where its errored
+trials added zeros to the judge's mean under the failure-inclusive rule and
+its completed trials added to the judge's unscored coverage, all for a
+scorer never meant to look at it. Every axis rule was being applied
+correctly to the wrong population, which is why the two-axes work could not
+see it: the crossing was between the sections, not between the axes.
+
+The file is authoritative for any scorer it mentions, exactly as it is for
+thresholds; where it says nothing, the rows are the witness with the same
+floor limit. A scorer the file NEVER mentions falls to the rows even when a
+file was supplied, and `human` is why: no dataset declares it, so reading
+the file's silence as "applies to nothing" would delete every human mean
+from any report built with a dataset path.
+
+**A ranking is a claim, and it names its metric.** Ordering models says one
+did better, and that means nothing until somebody says better AT WHAT. The
+report ranks when `primary_metric` is declared, or when exactly one scorer
+exists and there is no choice to make. Otherwise it publishes every
+scorer's section in full and **no cross-scorer ranking**, and says why.
+
+The previous rule ranked on the first scorer alphabetically, so an
+experiment scored by `contains` and `judge` was ordered by `contains`
+because c sorts before j. Nobody chose that, the report did not say it, and
+adding a scorer named `accuracy` would have silently reordered the
+leaderboard. `primary_metric` is validated at creation against what the
+dataset can actually produce, plus `human`, since a person rating trials
+after the fact is the one scorer no file can declare.
+
 **Pass rate where a threshold was declared, score mean otherwise**, and
 the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
 says passed, usable verdicts, and eligible trials. A pass rate over three

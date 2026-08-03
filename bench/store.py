@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     repeats INTEGER NOT NULL,
     task_order_seed INTEGER,
     estimand_mode TEXT NOT NULL,
+    primary_metric TEXT,
     provider_pins_json TEXT,
     halt_on_refusal INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -139,7 +140,8 @@ CREATE TABLE IF NOT EXISTS results (
     cached_tokens INTEGER,
     provider TEXT,
     quantization TEXT,
-    native_finish_reason TEXT
+    native_finish_reason TEXT,
+    upstream_inference_cost_usd TEXT
 );
 """
 
@@ -218,6 +220,21 @@ MIGRATIONS = [
     # apart. None on an offline boot, where there were no bytes.
     ("groups", "budget", "TEXT"),
     ("runs", "catalog_digest", "TEXT"),
+    # Phase I.2. Both nullable and additive, like everything above.
+    #
+    # experiments.primary_metric is which scorer a ranking is computed
+    # on. NULL means none was declared, which is an answer rather than a
+    # gap: with more than one scorer the report then publishes sections
+    # and no cross-scorer ranking, because ordering models needs somebody
+    # to say better at what.
+    #
+    # results.upstream_inference_cost_usd is what the provider charged
+    # directly under BYOK, which is a different number from the credits
+    # the ceiling meters. TEXT rather than REAL because it arrives as a
+    # decimal string and a float conversion would round money on the way
+    # in; readers parse it themselves and the ceiling never reads it.
+    ("experiments", "primary_metric", "TEXT"),
+    ("results", "upstream_inference_cost_usd", "TEXT"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
     # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
@@ -1111,11 +1128,12 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
             """INSERT INTO experiments
                (name, created_at, dataset_name, dataset_digest, lineup_json,
                 budget, params_json, repeats, task_order_seed, estimand_mode,
-                provider_pins_json, halt_on_refusal, status, status_detail,
-                app_sha, catalog_digest, data_policy, tasks_total,
-                trials_total, trials_done, trials_refused, trials_failed)
+                primary_metric, provider_pins_json, halt_on_refusal, status,
+                status_detail, app_sha, catalog_digest, data_policy,
+                tasks_total, trials_total, trials_done, trials_refused,
+                trials_failed)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, 0, 0, 0)""",
+                       ?, ?, 0, 0, 0)""",
             (
                 spec["name"],
                 _now(),
@@ -1131,6 +1149,7 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
                 spec["repeats"],
                 spec.get("task_order_seed"),
                 spec["estimand_mode"],
+                spec.get("primary_metric"),
                 json.dumps(spec["provider_pins"], sort_keys=True)
                 if spec.get("provider_pins")
                 else None,

@@ -241,6 +241,22 @@
       " clusters, seed " +
       report.bootstrap.seed;
     el.append(estimand, detail);
+    // The ranking names its metric, or says there is none. A rank column
+    // with nothing saying what it ranks ON is the same failure as a
+    // number without its estimand, one level down: the reader supplies a
+    // meaning the report never claimed.
+    const ranking = document.createElement("span");
+    ranking.dataset.testid = "report-ranking";
+    ranking.className = "report-note";
+    ranking.textContent =
+      report.ranking.metric == null
+        ? "no ranking: " + report.ranking.reason
+        : "ranked on " +
+          report.ranking.metric +
+          " (" +
+          report.ranking.reason +
+          ")";
+    el.append(ranking);
     if (report.thresholds_source === "score_rows") {
       const note = document.createElement("span");
       note.dataset.testid = "report-threshold-note";
