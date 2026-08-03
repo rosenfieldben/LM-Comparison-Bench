@@ -5833,7 +5833,10 @@ def test_the_report_surfaces_the_self_judged_flag(client, tmp_path):
 
     scorer = report["models"][0]["scorers"][0]
     assert scorer["self_judged"] == 1
-    assert scorer["judge_models"] == ["model/alpha"]
+    # The judge is named ON the series rather than collected into a list
+    # beside it: one series, one instrument, and a reader never has to
+    # infer which produced a number from where it sits on the page.
+    assert scorer["judge_model"] == "model/alpha"
 
 
 @respx.mock
@@ -6608,3 +6611,87 @@ def test_the_report_names_the_metric_its_ranking_used(client, tmp_path):
     assert report["ranking"]["available"] == ["contains"]
     assert report["models"][0]["score"]["metric"] == "contains"
     assert report["models"][0]["rank"] is not None
+
+
+@respx.mock
+def test_review_repro_two_judges_appear_as_two_attributed_series(client, tmp_path):
+    """End to end, on the reviewer's shape: score once with each judge and
+    both verdicts survive, attributed, with no combined number anywhere.
+
+    Before this the report selected on the scorer alone, so the second
+    pass overwrote the first in every published figure and nothing said a
+    first judge had ever run.
+    """
+    verdicts = {"n": 0}
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] != JUDGE_MAX_TOKENS:
+            return httpx.Response(200, stream=alpha_stream())
+        verdicts["n"] += 1
+        content = (
+            '{"score": 0.9}' if body["model"] == "judge/strict" else '{"score": 0.1}'
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": f"g{verdicts['n']}",
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            },
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/strict")
+    score_experiment_to_completion(client, eid, path, judge_model="judge/lenient")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    series = {s["judge_model"]: s for s in report["models"][0]["scorers"]}
+    assert set(series) == {"judge/strict", "judge/lenient"}
+    assert series["judge/strict"]["mean"] == pytest.approx(0.9)
+    assert series["judge/lenient"]["mean"] == pytest.approx(0.1)
+    # No averaged number anywhere: 0.5 is a figure neither judge produced.
+    assert all(s["mean"] != pytest.approx(0.5) for s in series.values())
+    # And the ranking withholds rather than picking a judge.
+    assert report["ranking"]["metric"] is None
+    assert "averaging judges" in report["ranking"]["reason"]
+
+
+@respx.mock
+def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path):
+    """The ruling: one surfaced line, from flags the rows already carry.
+
+    A human-ranked report built on sighted ratings is a different claim
+    from one built blind, and the reader should not have to join tables.
+    """
+    eid, path = scored_experiment(client, tmp_path)
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
+        },
+    )
+    client.app.state.db.execute(
+        "UPDATE experiments SET primary_metric = 'human' WHERE id = ?", (eid,)
+    )
+    client.app.state.db.commit()
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["ranking"]["metric"] == "human"
+    assert report["ranking"]["ratings"] == len(ids)
+    assert report["ranking"]["blind_ratings"] == len(ids)

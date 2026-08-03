@@ -1074,6 +1074,33 @@ leaderboard. `primary_metric` is validated at creation against what the
 dataset can actually produce, plus `human`, since a person rating trials
 after the fact is the one scorer no file can declare.
 
+**A series is a (scorer, judge) pair, not a scorer.** Two judges grading
+the same trials are two instruments that disagree on purpose, so they get
+two rows with their means, intervals, pass rates and flags kept apart, and
+there is **no combined cross-judge number anywhere**: averaging a strict
+judge with a lenient one publishes a figure neither produced. Human ratings
+are their own series under `human`, and deterministic scorers carry no
+judge.
+
+Selection uses the full `(scorer, judge_model)` key. It used to filter on
+the scorer alone and take the last row, so two judges of one trial fought
+over a single slot and whichever ran second answered for both, with nothing
+on the page saying a first judge had ever run. The rule itself was already
+written and correct in `latest_per_key`; the report simply never called it,
+which is why "every helper that implements a key gets its call sites
+audited" is now a standing review lens.
+
+If the ranking metric resolves to more than one judge, the ranking is
+withheld and names them. It is the same question one level down: better
+according to whom.
+
+**A human-ranked report states its blind composition**, as `n blind of n
+ratings`, beside the metric. A ranking built on ratings made blind is a
+different claim from one built on ratings made while the rater could see
+which model wrote which answer, and the second is much the weaker. The
+flags are already on the rows; without the line a reader would have to join
+tables to learn which report they are holding.
+
 **Pass rate where a threshold was declared, score mean otherwise**, and
 the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
 says passed, usable verdicts, and eligible trials. A pass rate over three

@@ -32,6 +32,12 @@ import random
 import statistics
 from typing import Any
 
+# The latest-per-key rule lives in bench.scoring and this module is its
+# only consumer. Importing it rather than re-deriving "the last row" is
+# the whole point of J4: a correct helper with no call sites is a rule
+# nothing obeys.
+from bench.scoring import latest_per_key
+
 # The message the disconnect path writes, shared rather than duplicated.
 # A reader matching this literal on its own would be matching prose that
 # the writer is free to reword; importing the same constant the writer
@@ -161,9 +167,43 @@ OUTCOMES = ("done", "error", "refused", "stopped", "missing", "not_run")
 # they cannot drift into disagreeing about which trials they speak for.
 QUALITY_OUTCOMES = ("done", "error")
 
+# The one scorer no dataset can declare: a person decides to rate a trial
+# after the fact. Defined here because both the report and the creation
+# boundary need it and two spellings of one name is one too many.
+HUMAN_SCORER = "human"
 
-def scoring_state(scores: list[dict[str, Any]], scorer: str) -> str:
-    """Whether this trial has a usable number from this scorer.
+
+def latest_for(
+    scores: list[dict[str, Any]], scorer: str, judge_model: str | None
+) -> dict[str, Any] | None:
+    """The newest row for one FULL key, or None.
+
+    The key is (scorer, judge_model), both parts, and that is the point.
+    Selecting on the scorer alone made two judges of the same trial fight
+    over one slot: whichever row was written last answered for both, so a
+    report with a strict judge and a lenient one published whichever
+    happened to run second and attributed it to neither.
+
+    latest_per_key is where the rule lives, ordering by (created_at, id)
+    so a re-scoring pass in the same second still resolves the way the
+    writes actually happened. This function is the lookup on top of it,
+    and there is exactly one of it so no caller can quietly use half a
+    key again.
+    """
+    return next(
+        (
+            row
+            for row in latest_per_key(scores)
+            if row["scorer"] == scorer and row.get("judge_model") == judge_model
+        ),
+        None,
+    )
+
+
+def scoring_state(
+    scores: list[dict[str, Any]], scorer: str, judge_model: str | None
+) -> str:
+    """Whether this trial has a usable number from this scorer and judge.
 
     unscored means nobody has tried, which is a fact about the scoring
     pass and not about the model. scoring_failed means a pass tried and
@@ -173,11 +213,16 @@ def scoring_state(scores: list[dict[str, Any]], scorer: str) -> str:
     The distinction between the last two is the reason axis two exists.
     Both leave the trial without a score, and only one of them is a
     problem with the bench's own machinery.
+
+    judge_model is required rather than defaulted, deliberately. A
+    default would let a caller ask half the question and get a confident
+    answer about the wrong rows, which is the defect this workstream
+    exists to remove.
     """
-    rows = [r for r in scores if r["scorer"] == scorer]
-    if not rows:
+    latest = latest_for(scores, scorer, judge_model)
+    if latest is None:
         return "unscored"
-    return "scored" if rows[-1].get("score") is not None else "scoring_failed"
+    return "scored" if latest.get("score") is not None else "scoring_failed"
 
 
 def _percentile(values: list[float], fraction: float) -> float | None:
@@ -479,29 +524,80 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     a preference its author never expressed.
     """
     available = sorted({s["scorer"] for m in models for s in m["scorers"]})
-    if declared is not None:
-        return {
-            "metric": declared,
-            "reason": "declared as the experiment's primary metric",
-            "available": available,
-        }
-    if len(available) == 1:
-        return {
-            "metric": available[0],
-            "reason": "the only scorer in this experiment",
-            "available": available,
-        }
     if not available:
-        return {"metric": None, "reason": "nothing has been scored", "available": []}
-    return {
-        "metric": None,
-        "reason": (
+        return _ranking(None, "nothing has been scored", available, models)
+    if declared is not None:
+        metric = declared
+        reason = "declared as the experiment's primary metric"
+    elif len(available) == 1:
+        metric = available[0]
+        reason = "the only scorer in this experiment"
+    else:
+        return _ranking(
+            None,
             "more than one scorer and no primary_metric declared, so this "
             "report publishes each scorer's section and no cross-scorer "
-            "ranking: ordering models needs somebody to say better at what"
-        ),
+            "ranking: ordering models needs somebody to say better at what",
+            available,
+            models,
+        )
+    # A metric has to resolve to ONE series. Two judges under the chosen
+    # scorer is the same question one level down, "better according to
+    # whom", and averaging them would publish a number neither judge
+    # produced. So the ranking is withheld and names the judges rather
+    # than picking one, exactly as it withholds rather than picking a
+    # scorer alphabetically.
+    judges = sorted(
+        {
+            s["judge_model"]
+            for m in models
+            for s in m["scorers"]
+            if s["scorer"] == metric and s["judge_model"] is not None
+        }
+    )
+    if len(judges) > 1:
+        return _ranking(
+            None,
+            f"{metric} was scored by more than one judge ("
+            + ", ".join(judges)
+            + "), and averaging judges is a claim nobody made: declare "
+            "one judge's pass or read the sections",
+            available,
+            models,
+        )
+    return _ranking(metric, reason, available, models)
+
+
+def _ranking(
+    metric: str | None,
+    reason: str,
+    available: list[str],
+    models: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """The ranking block, with the composition a human metric needs.
+
+    A report ranked on human ratings that were made BLIND is a different
+    claim from one ranked on ratings made while the rater could see which
+    model wrote which answer, and the second is the weaker claim by a
+    wide margin. The rows already carry the flag; without this line a
+    reader would have to join tables to learn which report they are
+    holding, and almost nobody will.
+
+    Counted across every model, because the composition is a fact about
+    the ratings rather than about any one arm.
+    """
+    out: dict[str, Any] = {
+        "metric": metric,
+        "reason": reason,
         "available": available,
     }
+    if metric == HUMAN_SCORER:
+        sections = [
+            s for m in models for s in m["scorers"] if s["scorer"] == HUMAN_SCORER
+        ]
+        out["blind_ratings"] = sum(s["blind"] for s in sections)
+        out["ratings"] = sum(s["rated"] for s in sections)
+    return out
 
 
 def _model_report(
@@ -548,10 +644,22 @@ def _model_report(
     # failed trial scoring zero. That is the failure-inclusive rule: a
     # mean over only the trials that came back is a mean over survivors,
     # and the models that fail most would look best.
-    scorers = sorted({row["scorer"] for trial in flat for row in trial["scores"]})
+    # One section per SERIES, a (scorer, judge_model) pair. Sorted with
+    # the judgeless series first under each scorer, so a deterministic
+    # scorer and a human rating read before the judges that came later.
+    series = sorted(
+        {
+            (row["scorer"], row.get("judge_model"))
+            for trial in flat
+            for row in trial["scores"]
+        },
+        key=lambda pair: (pair[0], pair[1] or ""),
+    )
     per_scorer = [
-        _scorer_report(scorer, by_task, tasks_by_id, seed, row_declared, row_scored)
-        for scorer in scorers
+        _scorer_report(
+            scorer, judge, by_task, tasks_by_id, seed, row_declared, row_scored
+        )
+        for scorer, judge in series
     ]
 
     completed = [t["result"] for t in flat if t["outcome"] in COMPLETED]
@@ -716,13 +824,20 @@ def _eligible_tasks(
 
 def _scorer_report(
     scorer: str,
+    judge_model: str | None,
     by_task: dict[str, list[dict[str, Any]]],
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
     row_declared: dict[str, set[str]] | None = None,
     row_scored: dict[str, set[str]] | None = None,
 ) -> dict[str, Any]:
-    """One scorer's numbers for one model, with both axes reported.
+    """One SERIES' numbers for one model, with both axes reported.
+
+    A series is a (scorer, judge_model) pair, not a scorer. Two judges
+    grading the same trials are two measurements by two instruments that
+    disagree on purpose, and averaging them would publish a number
+    neither of them produced. Deterministic scorers and human ratings
+    carry no judge, so each is a single series under its own name.
 
     Computed over the tasks that DECLARED this scorer and no others; see
     applicable_tasks for why a section that iterated every task was
@@ -740,8 +855,7 @@ def _scorer_report(
     values_by_task: dict[str, list[float]] = {}
     scored = failed = unscored = 0
     passed = usable_verdicts = eligible = 0
-    blind_rows = self_judged_rows = 0
-    judge_models: set[str] = set()
+    blind_rows = self_judged_rows = rated = 0
     for task_id, trials in by_task.items():
         if task_id not in mine:
             # Another scorer's task. Not this section's business, on
@@ -776,9 +890,8 @@ def _scorer_report(
             # by this gate, and nowhere else.
             if trial["outcome"] not in QUALITY_OUTCOMES:
                 continue
-            rows = [r for r in trial["scores"] if r["scorer"] == scorer]
-            state = scoring_state(trial["scores"], scorer)
-            latest = rows[-1] if rows else None
+            state = scoring_state(trial["scores"], scorer, judge_model)
+            latest = latest_for(trial["scores"], scorer, judge_model)
             # Axis two, counted on its own.
             if state == "scored":
                 scored += 1
@@ -787,12 +900,11 @@ def _scorer_report(
             else:
                 unscored += 1
             if latest is not None:
+                rated += 1
                 if latest.get("blind"):
                     blind_rows += 1
                 if latest.get("self_judged"):
                     self_judged_rows += 1
-                if latest.get("judge_model"):
-                    judge_models.add(latest["judge_model"])
             # Inside the quality population there are exactly two rules,
             # and this is where the axes would be easiest to cross.
             #
@@ -826,6 +938,9 @@ def _scorer_report(
     total_states = scored + failed + unscored
     return {
         "scorer": scorer,
+        # Named on every series so a reader never has to infer which
+        # instrument produced a number from where it sits on the page.
+        "judge_model": judge_model,
         "mean": sum(flat) / len(flat) if flat else None,
         "n": len(flat),
         "interval": cluster_bootstrap(values_by_task, seed) if flat else None,
@@ -847,7 +962,10 @@ def _scorer_report(
         },
         "blind": blind_rows,
         "self_judged": self_judged_rows,
-        "judge_models": sorted(judge_models),
+        # How many trials this series actually put a row on, which is the
+        # denominator the blind count needs. "3 blind" means nothing
+        # until it says 3 of how many.
+        "rated": rated,
     }
 
 

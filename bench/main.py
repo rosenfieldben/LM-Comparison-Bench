@@ -43,7 +43,13 @@ from bench.models import (
     stream_model,
     strict_provider_preferences,
 )
-from bench.report import build_report, export_line, export_manifest, export_trial
+from bench.report import (
+    HUMAN_SCORER,
+    build_report,
+    export_line,
+    export_manifest,
+    export_trial,
+)
 from bench.scoring import judged_pass, score_response
 
 logger = logging.getLogger(__name__)
@@ -1949,13 +1955,6 @@ def read_dataset(path: str) -> dict[str, Any]:
         return parse_dataset(raw, name=Path(path).name)
     except DatasetError as exc:
         raise HTTPException(422, str(exc)) from None
-
-
-# The one scorer no dataset can declare. A person decides to rate a
-# trial after the fact, so `human` never appears in a file, and refusing
-# it as a primary metric would make the only numbers an actual human
-# produced the only ones a report may not be ordered by.
-HUMAN_SCORER = "human"
 
 
 def enforce_primary_metric(metric: str, dataset: dict[str, Any]) -> None:

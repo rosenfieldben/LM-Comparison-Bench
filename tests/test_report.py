@@ -84,35 +84,56 @@ def test_a_reworded_refusal_message_does_not_change_the_classification():
 # ---- Axis two: whether the bench could put a number on it.
 
 
-def score(scorer="judge", value=1.0):
-    return {"scorer": scorer, "score": value}
+_SEQ = {"n": 0}
+
+
+def score(scorer="judge", value=1.0, judge_model=None):
+    """One score row, carrying what latest_per_key orders by.
+
+    created_at and id are not decoration in a fixture: the rule resolves
+    ties by id precisely because a re-scoring pass inside one second
+    would otherwise leave the order to the query planner. A fixture that
+    omitted them would be testing a different function.
+    """
+    _SEQ["n"] += 1
+    return {
+        "scorer": scorer,
+        "score": value,
+        "judge_model": judge_model,
+        "created_at": "2026-08-03T00:00:00",
+        "id": _SEQ["n"],
+    }
 
 
 def test_an_untried_trial_is_unscored():
     """A fact about the scoring pass, not about the model."""
-    assert scoring_state([], "judge") == "unscored"
+    assert scoring_state([], "judge", None) == "unscored"
 
 
 def test_a_judge_that_returned_nothing_usable_is_scoring_failed():
     """The distinction axis two exists for. Both leave the trial without
     a number, and only one of them is a problem with the bench's own
     machinery rather than with the model."""
-    assert scoring_state([score(value=None)], "judge") == "scoring_failed"
+    assert scoring_state([score(value=None)], "judge", None) == "scoring_failed"
 
 
 def test_a_usable_verdict_is_scored():
-    assert scoring_state([score(value=0.5)], "judge") == "scored"
+    assert scoring_state([score(value=0.5)], "judge", None) == "scored"
 
 
 def test_the_latest_row_decides_the_state():
     """A re-scoring pass that fixed a failure means the trial is scored
     now, and the failed row stays as the audit trail rather than as the
     answer."""
-    assert scoring_state([score(value=None), score(value=1.0)], "judge") == "scored"
+    assert (
+        scoring_state([score(value=None), score(value=1.0)], "judge", None) == "scored"
+    )
 
 
 def test_another_scorers_rows_do_not_answer_for_this_one():
-    assert scoring_state([score(scorer="exact", value=1.0)], "judge") == "unscored"
+    assert (
+        scoring_state([score(scorer="exact", value=1.0)], "judge", None) == "unscored"
+    )
 
 
 # ---- Metrics: the count travels with the number.
@@ -348,8 +369,12 @@ def test_a_provider_nobody_recorded_is_not_a_provider():
 # ---- The crossing the two axes exist to prevent.
 
 
-def trial(outcome, score=None, scorer="judge", task="t1"):
-    scores = [] if score is _MISSING else [{"scorer": scorer, "score": score}]
+def trial(outcome, value=None, scorer="judge", task="t1", judge_model=None):
+    scores = (
+        []
+        if value is _MISSING
+        else [score(scorer=scorer, value=value, judge_model=judge_model)]
+    )
     return {"outcome": outcome, "result": {}, "scores": scores, "task_id": task}
 
 
@@ -381,11 +406,11 @@ def test_review_repro_an_unscored_trial_is_not_a_zero_in_the_mean():
     """
     by_task = {
         "t1": [trial("done", 1.0)],
-        "t2": [trial("done", score=_MISSING)],
+        "t2": [trial("done", value=_MISSING)],
     }
 
     out = _scorer_report(
-        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=1, row_scored=declared("t1", "t2")
     )
 
     # One usable score, so the mean is that score.
@@ -402,7 +427,7 @@ def test_a_judge_that_could_not_answer_is_not_a_zero_either():
     by_task = {"t1": [trial("done", 1.0)], "t2": [trial("done", None)]}
 
     out = _scorer_report(
-        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=1, row_scored=declared("t1", "t2")
     )
 
     assert out["mean"] == 1.0
@@ -414,10 +439,10 @@ def test_a_failed_trial_is_a_zero_because_that_is_axis_one():
     """The other direction, so the fix above cannot be read as excluding
     everything awkward. A trial that errored is a trial that failed the
     task, and it belongs in the denominator at zero."""
-    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("error", score=_MISSING)]}
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("error", value=_MISSING)]}
 
     out = _scorer_report(
-        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=1, row_scored=declared("t1", "t2")
     )
 
     assert out["mean"] == 0.5
@@ -433,10 +458,10 @@ def test_a_trial_that_never_ran_is_excluded_entirely():
     ever close, so the mean, the coverage counters and the eligible count
     all run over the same population.
     """
-    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("missing", score=_MISSING)]}
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("missing", value=_MISSING)]}
 
     out = _scorer_report(
-        "judge", by_task, None, seed=1, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=1, row_scored=declared("t1", "t2")
     )
 
     assert out["mean"] == 1.0
@@ -469,14 +494,14 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
     a missing trial never ran. The failure rate is 1/4, not 2/6.
     """
     by_task = {
-        "t1": [trial("done", 1.0), trial("error", score=_MISSING)],
+        "t1": [trial("done", 1.0), trial("error", value=_MISSING)],
         "t2": [
             trial("done", 1.0, task="t2"),
-            trial("stopped", score=_MISSING, task="t2"),
+            trial("stopped", value=_MISSING, task="t2"),
         ],
         "t3": [
-            trial("refused", score=_MISSING, task="t3"),
-            trial("missing", score=_MISSING, task="t3"),
+            trial("refused", value=_MISSING, task="t3"),
+            trial("missing", value=_MISSING, task="t3"),
         ],
     }
 
@@ -515,13 +540,15 @@ def test_review_repro_one_scorers_tasks_stay_out_of_anothers_numbers():
     judge's mean must be that single zero and nothing else.
     """
     by_task = {
-        "judged": [trial("error", score=_MISSING, scorer="judge")],
-        "matched": [trial("error", score=_MISSING, scorer="contains")],
+        "judged": [trial("error", value=_MISSING, scorer="judge")],
+        "matched": [trial("error", value=_MISSING, scorer="contains")],
     }
     row_scored = {"judge": {"judged"}, "contains": {"matched"}}
 
-    judge = _scorer_report("judge", by_task, None, seed=1, row_scored=row_scored)
-    contains = _scorer_report("contains", by_task, None, seed=1, row_scored=row_scored)
+    judge = _scorer_report("judge", None, by_task, None, seed=1, row_scored=row_scored)
+    contains = _scorer_report(
+        "contains", None, by_task, None, seed=1, row_scored=row_scored
+    )
 
     # One zero each, not two. Before the fix both sections read n=2.
     assert judge["n"] == 1
@@ -553,8 +580,12 @@ def test_relabelling_a_task_moves_it_between_sections_and_changes_nothing_else()
         "t2": {"scorer": {"kind": "judge"}},
     }
 
-    both = _scorer_report("contains", by_task, as_contains, 1, row_scored=row_scored)
-    one = _scorer_report("contains", by_task, relabelled, 1, row_scored=row_scored)
+    both = _scorer_report(
+        "contains", None, by_task, as_contains, 1, row_scored=row_scored
+    )
+    one = _scorer_report(
+        "contains", None, by_task, relabelled, 1, row_scored=row_scored
+    )
 
     assert both["n"] == 2
     assert both["mean"] == 0.5
@@ -573,7 +604,7 @@ def test_a_scorer_the_file_never_mentions_falls_back_to_its_rows():
     from_file = {"t1": {"scorer": {"kind": "contains"}}}
 
     out = _scorer_report(
-        "human", by_task, from_file, seed=1, row_scored={"human": {"t1"}}
+        "human", None, by_task, from_file, seed=1, row_scored={"human": {"t1"}}
     )
 
     assert out["n"] == 1
@@ -583,8 +614,17 @@ def test_a_scorer_the_file_never_mentions_falls_back_to_its_rows():
 # ---- Ranking: an ordering is a claim, and it names its metric.
 
 
-def section(scorer):
-    return {"scorer": scorer, "mean": 1.0, "interval": None}
+def section(scorer, judge_model=None, blind=0, rated=0):
+    """One series as choose_metric sees it: scorer, judge, and the flags
+    the human composition line is built from."""
+    return {
+        "scorer": scorer,
+        "judge_model": judge_model,
+        "mean": 1.0,
+        "interval": None,
+        "blind": blind,
+        "rated": rated,
+    }
 
 
 def test_a_single_scorer_needs_no_declaration_to_rank():
@@ -632,7 +672,7 @@ def test_nothing_scored_is_its_own_answer():
 # ---- The per-outcome matrix: every outcome's treatment, locked.
 
 
-def matrix_report(outcome, *, score=1.0, task="t2"):
+def matrix_report(outcome, *, value=1.0, task="t2"):
     """One clean 1.0 trial plus one trial with the outcome under test.
 
     Two tasks so the interval has something to resample, and so the
@@ -640,10 +680,10 @@ def matrix_report(outcome, *, score=1.0, task="t2"):
     """
     by_task = {
         "t1": [trial("done", 1.0)],
-        task: [trial(outcome, score=score)],
+        task: [trial(outcome, value=value)],
     }
     return _scorer_report(
-        "judge", by_task, None, seed=3, row_scored=declared("t1", task)
+        "judge", None, by_task, None, seed=3, row_scored=declared("t1", task)
     )
 
 
@@ -680,7 +720,7 @@ def test_the_outcome_matrix_locks_every_treatment(outcome, in_mean, mean, n, clu
     cluster count, and in both axes' counters, so the next outcome anyone
     adds has an empty row that fails until it is filled in deliberately.
     """
-    out = matrix_report(outcome, score=0.0 if outcome == "error" else 1.0)
+    out = matrix_report(outcome, value=0.0 if outcome == "error" else 1.0)
 
     assert out["mean"] == pytest.approx(mean)
     assert out["n"] == n
@@ -707,10 +747,10 @@ def test_review_repro_a_refusal_beside_a_perfect_score_does_not_halve_it():
     1.0 is the answer, with the refusal visible on axis one where it
     belongs. The report has both numbers and does not mix them.
     """
-    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("refused", score=_MISSING)]}
+    by_task = {"t1": [trial("done", 1.0)], "t2": [trial("refused", value=_MISSING)]}
 
     out = _scorer_report(
-        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=3, row_scored=declared("t1", "t2")
     )
 
     assert out["mean"] == 1.0
@@ -730,7 +770,7 @@ def test_a_score_row_on_a_stopped_trial_survives_and_stays_out_of_the_mean():
     }
 
     out = _scorer_report(
-        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2")
+        "judge", None, by_task, None, seed=3, row_scored=declared("t1", "t2")
     )
 
     assert out["mean"] == 1.0
@@ -750,13 +790,138 @@ def test_a_task_whose_every_trial_was_refused_leaves_the_bootstrap():
     """
     by_task = {
         "t1": [trial("done", 1.0), trial("done", 0.0)],
-        "t2": [trial("refused", score=_MISSING), trial("refused", score=_MISSING)],
+        "t2": [trial("refused", value=_MISSING), trial("refused", value=_MISSING)],
         "t3": [trial("done", 1.0), trial("done", 1.0)],
     }
 
     out = _scorer_report(
-        "judge", by_task, None, seed=3, row_scored=declared("t1", "t2", "t3")
+        "judge", None, by_task, None, seed=3, row_scored=declared("t1", "t2", "t3")
     )
 
     assert out["n"] == 4
     assert out["interval"]["n_clusters"] == 2
+
+
+# ---- The judge key, at its call site.
+
+
+def test_review_repro_two_judges_are_two_series_not_one_overwritten_row():
+    """The reviewer's shape: a strict judge and a lenient one.
+
+    latest_per_key has keyed on (scorer, judge_model) since I3 and the
+    report never called it. Selection was `rows[-1]` filtered on the
+    scorer alone, so the two judges fought over one slot and whichever
+    row happened to be written last answered for both. A report with
+    0.9 from one judge and 0.1 from the other published one number,
+    attributed to neither, and nothing on the page said a second judge
+    had ever run.
+
+    Both, attributed. Averaging them is not on the table: two judges
+    disagreeing is the measurement, and 0.5 is a number neither of them
+    produced.
+    """
+    by_task = {
+        "t1": [
+            {
+                "outcome": "done",
+                "result": {},
+                "task_id": "t1",
+                "scores": [
+                    score(value=0.9, judge_model="judge/strict"),
+                    score(value=0.1, judge_model="judge/lenient"),
+                ],
+            }
+        ]
+    }
+
+    strict = _scorer_report(
+        "judge", "judge/strict", by_task, None, seed=1, row_scored=declared("t1")
+    )
+    lenient = _scorer_report(
+        "judge", "judge/lenient", by_task, None, seed=1, row_scored=declared("t1")
+    )
+
+    assert strict["mean"] == pytest.approx(0.9)
+    assert lenient["mean"] == pytest.approx(0.1)
+    assert strict["judge_model"] == "judge/strict"
+    assert lenient["judge_model"] == "judge/lenient"
+    # Each series saw exactly its own row, so neither is reporting the
+    # other's verdict as coverage either.
+    assert strict["coverage"]["scored"] == 1
+    assert lenient["coverage"]["scored"] == 1
+
+
+def test_a_rescoring_pass_by_the_same_judge_still_takes_the_latest():
+    """The full key does not mean per-row: two rows from ONE judge are
+    still one series, and the newest wins by (created_at, id)."""
+    first = score(value=0.2, judge_model="judge/one")
+    second = score(value=0.8, judge_model="judge/one")
+
+    out = _scorer_report(
+        "judge",
+        "judge/one",
+        {
+            "t1": [
+                {
+                    "outcome": "done",
+                    "result": {},
+                    "task_id": "t1",
+                    "scores": [first, second],
+                }
+            ]
+        },
+        None,
+        seed=1,
+        row_scored=declared("t1"),
+    )
+
+    assert out["mean"] == pytest.approx(0.8)
+    assert out["n"] == 1
+
+
+def test_two_judges_under_the_chosen_metric_withhold_the_ranking():
+    """Same question one level down: better according to whom. Picking a
+    judge would be the alphabetical accident again, and averaging them
+    would publish a number neither judge produced."""
+    models = [
+        {
+            "scorers": [
+                section("judge", judge_model="judge/strict"),
+                section("judge", judge_model="judge/lenient"),
+            ]
+        }
+    ]
+
+    out = choose_metric("judge", models)
+
+    assert out["metric"] is None
+    assert "judge/lenient, judge/strict" in out["reason"]
+    assert "averaging judges is a claim nobody made" in out["reason"]
+
+
+def test_a_human_ranking_states_its_blind_composition():
+    """A report ranked on ratings made BLIND is a different claim from one
+    ranked on ratings made while the rater could see which model wrote
+    which answer, and the second is much the weaker. The rows carry the
+    flag; without this line a reader would have to join tables to learn
+    which report they are holding, and almost nobody will."""
+    models = [
+        {"scorers": [section("human", blind=2, rated=3)]},
+        {"scorers": [section("human", blind=1, rated=3)]},
+    ]
+
+    out = choose_metric(None, models)
+
+    assert out["metric"] == "human"
+    assert out["blind_ratings"] == 3
+    assert out["ratings"] == 6
+
+
+def test_a_non_human_ranking_carries_no_composition_line():
+    """It would be noise: only human rows carry the blind flag, so the
+    line would read 0 of 0 on every judged report and teach the reader to
+    ignore it."""
+    out = choose_metric(None, [{"scorers": [section("contains")]}])
+
+    assert out["metric"] == "contains"
+    assert "blind_ratings" not in out

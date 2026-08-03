@@ -248,6 +248,18 @@
     const ranking = document.createElement("span");
     ranking.dataset.testid = "report-ranking";
     ranking.className = "report-note";
+    // When the ranking is human, its blind composition rides with it. A
+    // report ranked on ratings made blind is a different claim from one
+    // ranked on sighted ratings, and the second is much the weaker; a
+    // reader should not have to join tables to learn which they hold.
+    const composition =
+      report.ranking.ratings === undefined
+        ? ""
+        : ", " +
+          report.ranking.blind_ratings +
+          " blind of " +
+          report.ranking.ratings +
+          " ratings";
     ranking.textContent =
       report.ranking.metric == null
         ? "no ranking: " + report.ranking.reason
@@ -255,7 +267,8 @@
           report.ranking.metric +
           " (" +
           report.ranking.reason +
-          ")";
+          ")" +
+          composition;
     el.append(ranking);
     if (report.thresholds_source === "score_rows") {
       const note = document.createElement("span");
