@@ -653,6 +653,25 @@ with no reference all fail at that point, naming the line, because
 discovering them after a run has paid for every trial is discovering them
 in the most expensive place available.
 
+**A regex cannot freeze the server.** The regex scorer runs its pattern in
+a single-use child process under a one-second deadline; expiry is recorded
+as a scoring failure (`regex exceeded deadline`) and never as a guessed
+verdict, because the bench does not know whether that pattern would have
+matched. Every other deterministic scorer stays in process, where a string
+comparison is linear in the subject and already bounded.
+
+The subject and pattern limits are necessary and were never sufficient,
+which the comment above them used to deny. Backtracking is exponential in
+the subject, so `(a+)+$` (six characters, well inside the 500-character
+pattern limit) against ten thousand characters runs effectively forever.
+Measured in process at small sizes it doubles every two characters: 0.03s
+at 18, 0.11s at 20, 0.44s at 22, 1.78s at 24. A process rather than a
+thread because `re` holds the GIL while it backtracks and only a process
+can be terminated; spawn rather than fork because forking an asyncio
+application copies whatever locks its threads happened to hold. The wait
+itself happens off the event loop, so the regex never runs in this thread
+or in this process.
+
 **Empty counts as missing** for a rubric or a comparing scorer's
 reference, and the empty case is the more dangerous of the two because it
 scores rather than failing: every string contains the empty string, so a

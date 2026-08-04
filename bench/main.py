@@ -2615,7 +2615,16 @@ async def score_one_result(
     spec = task["scorer"]
     kind = spec["kind"]
     if kind != "judge":
-        verdict = score_response(spec, task["reference"], result["response_text"])
+        # Off the loop thread. The deterministic scorers are string work
+        # that finishes in microseconds, but the regex one waits up to
+        # REGEX_DEADLINE_SECONDS on a child process, and blocking the
+        # loop for a second per pathological pattern would stall the
+        # progress stream and every browser run sharing this process.
+        # The regex never executes here in either sense: not in this
+        # thread, and not in this process.
+        verdict = await asyncio.to_thread(
+            score_response, spec, task["reference"], result["response_text"]
+        )
         store.add_score(
             app.state.db,
             result["id"],
