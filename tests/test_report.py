@@ -614,13 +614,13 @@ def test_a_scorer_the_file_never_mentions_falls_back_to_its_rows():
 # ---- Ranking: an ordering is a claim, and it names its metric.
 
 
-def section(scorer, judge_model=None, blind=0, rated=0):
+def section(scorer, judge_model=None, blind=0, rated=0, mean=1.0):
     """One series as choose_metric sees it: scorer, judge, and the flags
     the human composition line is built from."""
     return {
         "scorer": scorer,
         "judge_model": judge_model,
-        "mean": 1.0,
+        "mean": mean,
         "interval": None,
         "blind": blind,
         "rated": rated,
@@ -925,3 +925,35 @@ def test_a_non_human_ranking_carries_no_composition_line():
 
     assert out["metric"] == "contains"
     assert "blind_ratings" not in out
+
+
+def test_review_repro_the_ranking_resolves_to_a_series_not_a_scorer():
+    """Found by the call-site-keys lens, on the code this branch shipped.
+
+    choose_metric returned a scorer name and the caller took the first
+    section matching it. A scorer can carry a JUDGELESS series beside a
+    judged one: I3 records "no judge model was given for this scoring
+    pass" as a row under scorer `judge` with a NULL judge_model, so a
+    task scored once without a judge and once with one has two series and
+    exactly one real judge.
+
+    Judgeless sorts before judged, so the ranking named `judge` and then
+    ordered every model on the gap row's empty mean. A leaderboard on
+    None, labelled with a metric that had a real verdict sitting one row
+    below it.
+    """
+    models = [
+        {
+            "model": "m",
+            "scorers": [
+                section("judge", judge_model=None),
+                section("judge", judge_model="judge/one"),
+            ],
+        }
+    ]
+
+    out = choose_metric(None, models)
+
+    assert out["metric"] == "judge"
+    # The series, named. Before the fix nothing here said which.
+    assert out["judge_model"] == "judge/one"

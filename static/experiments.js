@@ -265,6 +265,9 @@
         ? "no ranking: " + report.ranking.reason
         : "ranked on " +
           report.ranking.metric +
+          (report.ranking.judge_model
+            ? " by " + report.ranking.judge_model
+            : "") +
           " (" +
           report.ranking.reason +
           ")" +

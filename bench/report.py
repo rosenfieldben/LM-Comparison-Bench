@@ -457,10 +457,23 @@ def build_report(
     ]
     ranking = choose_metric(experiment.get("primary_metric"), models)
     metric = ranking["metric"]
+    judge = ranking["judge_model"]
     for entry in models:
-        section = next((s for s in entry["scorers"] if s["scorer"] == metric), None)
+        # The FULL key. Matching on the scorer alone picked whichever
+        # series sorted first, which is the judgeless one, so a scorer
+        # carrying both a gap row and a real verdict ranked every model
+        # on the gap. See choose_metric.
+        section = next(
+            (
+                s
+                for s in entry["scorers"]
+                if s["scorer"] == metric and s["judge_model"] == judge
+            ),
+            None,
+        )
         entry["score"] = {
             "metric": metric,
+            "judge_model": judge,
             "mean": (section or {}).get("mean"),
             "interval": (section or {}).get("interval"),
         }
@@ -581,7 +594,7 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     """
     available = sorted({s["scorer"] for m in models for s in m["scorers"]})
     if not available:
-        return _ranking(None, "nothing has been scored", available, models)
+        return _ranking(None, None, "nothing has been scored", available, models)
     if declared is not None:
         metric = declared
         reason = "declared as the experiment's primary metric"
@@ -590,6 +603,7 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
         reason = "the only scorer in this experiment"
     else:
         return _ranking(
+            None,
             None,
             "more than one scorer and no primary_metric declared, so this "
             "report publishes each scorer's section and no cross-scorer "
@@ -614,6 +628,7 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     if len(judges) > 1:
         return _ranking(
             None,
+            None,
             f"{metric} was scored by more than one judge ("
             + ", ".join(judges)
             + "), and averaging judges is a claim nobody made: declare "
@@ -621,11 +636,20 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
             available,
             models,
         )
-    return _ranking(metric, reason, available, models)
+    # The SERIES, not just the scorer. A scorer can carry a judgeless
+    # series beside a judged one: I3 records "no judge model was given
+    # for this scoring pass" as a row under scorer `judge` with a NULL
+    # judge_model, so a task scored once without a judge and once with
+    # one has two series and exactly one real judge. Returning the scorer
+    # alone let the caller take whichever series came first, which sorts
+    # judgeless before judged, so the ranking named `judge` and ordered
+    # every model on the gap row's empty mean.
+    return _ranking(metric, judges[0] if judges else None, reason, available, models)
 
 
 def _ranking(
     metric: str | None,
+    judge_model: str | None,
     reason: str,
     available: list[str],
     models: list[dict[str, Any]],
@@ -644,6 +668,10 @@ def _ranking(
     """
     out: dict[str, Any] = {
         "metric": metric,
+        # Which series the ranking used, named beside the metric. A
+        # scorer is not a series, and a ranking that named only the
+        # scorer could not say which of two instruments produced it.
+        "judge_model": judge_model,
         "reason": reason,
         "available": available,
     }
