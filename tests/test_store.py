@@ -1621,3 +1621,142 @@ def test_the_store_stays_synchronous():
         "See the module docstring: one shared connection is safe only "
         "because nothing in this file can yield mid-statement."
     )
+
+
+# ---- Phase I.2: three more columns, proven against the era they land on.
+
+
+PRE_I2_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_i2_schema.sql").read_text()
+
+
+def test_migration_onto_pre_i2_database_is_additive_and_idempotent(tmp_path):
+    """The additive-only invariant, proven against the RIGHT era.
+
+    pre_i_schema.sql predates Phase I entirely, so it cannot say anything
+    about columns Phase I.2 adds on top of Phase I: a database that
+    already has the experiments table is the one an I.2 migration
+    actually meets, and it is the only one whose ALTERs are the ones
+    under test. This fixture is the SCHEMA string exactly as it stood at
+    baf9390, the tip of phase-i-evaluation-layer and the commit that
+    merged as PR #51, extracted rather than transcribed.
+
+    Three columns, all nullable and all additive:
+    experiments.primary_metric, experiments.quantizations_json and
+    results.upstream_inference_cost_usd. NULL on a legacy row is the
+    affirmative fact in each case. No primary metric was declared, so the
+    report publishes sections and no cross-scorer ranking. No
+    quantization filter narrowed the provider population. And the run
+    was not BYOK, which is a different fact from a BYOK run that cost
+    nothing, which is why zero degrades to NULL on the way in.
+    """
+    db_path = tmp_path / "pre_i2.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_I2_SCHEMA)
+    legacy.execute(
+        """INSERT INTO experiments
+           (id, name, created_at, dataset_name, dataset_digest, lineup_json,
+            budget, params_json, repeats, task_order_seed, estimand_mode,
+            provider_pins_json, halt_on_refusal, status, status_detail,
+            app_sha, catalog_digest, data_policy, tasks_total, trials_total,
+            trials_done, trials_refused, trials_failed)
+           VALUES (1, 'legacy sweep', '2026-02-01T00:00:00+00:00', 'd.jsonl',
+                   'deadbeef', '["legacy/a"]', 'standard', NULL, 2, 11,
+                   'routed_service', NULL, 1, 'done', NULL, 'abc1234', 'dd',
+                   'standard', 3, 6, 6, 0, 0)"""
+    )
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget, experiment_id, task_id,
+                               repeat_index, rotation_index)
+           VALUES (1, '2026-02-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', NULL, 'standard', 1, 't1', 0, 0)"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at,
+                             app_sha, catalog_snapshot_at, data_policy,
+                             catalog_digest)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-02-01T00:00:00+00:00',
+                   'abc1234', '2026-02-01T00:00:00+00:00', 'standard', 'dd')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position, billed_cost_usd, provider)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0, 3.1e-05, 'Together')"""
+    )
+    legacy.execute(
+        """INSERT INTO scores (result_id, scorer, score, passed, detail,
+                               judge_model, created_at)
+           VALUES (1, 'contains', 1.0, 1, NULL, NULL,
+                   '2026-02-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+    # The pre-state, asserted rather than assumed. Without this the test
+    # could pass against a fixture that already had the columns, which
+    # would prove nothing at all about the migration.
+    before = {
+        table: [r[1] for r in legacy.execute(f"PRAGMA table_info({table})")]
+        for table in ("experiments", "results")
+    }
+    assert "primary_metric" not in before["experiments"]
+    assert "quantizations_json" not in before["experiments"]
+    assert "upstream_inference_cost_usd" not in before["results"]
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        # The three columns exist on a database that never had them.
+        experiment_columns = [
+            r["name"] for r in conn.execute("PRAGMA table_info(experiments)")
+        ]
+        result_columns = [r["name"] for r in conn.execute("PRAGMA table_info(results)")]
+        assert "primary_metric" in experiment_columns
+        assert "quantizations_json" in experiment_columns
+        assert "upstream_inference_cost_usd" in result_columns
+
+        # And read NULL on the legacy rows, through the real readers
+        # rather than through raw SQL, because the decoded shape is what
+        # every caller actually sees.
+        experiment = store.get_experiment(conn, 1)
+        assert experiment is not None
+        assert experiment["primary_metric"] is None
+        assert experiment["quantizations"] is None
+        # Nothing else about the row moved.
+        assert experiment["lineup"] == ["legacy/a"]
+        assert experiment["estimand_mode"] == "routed_service"
+        assert experiment["task_order_seed"] == 11
+        assert experiment["halt_on_refusal"] is True
+        assert experiment["trials_total"] == 6
+
+        # A pre-I.2 row round trips through the real store unharmed.
+        run = store.get_run(conn, 1)
+        assert run is not None
+        result = run["results"][0]
+        assert result["response_text"] == "legacy text"
+        assert result["billed_cost_usd"] == 3.1e-05
+        assert result["provider"] == "Together"
+        assert result["upstream_inference_cost_usd"] is None
+        # The experiment's own readers still work over it.
+        assert [g["id"] for g in store.experiment_groups(conn, 1)] == [1]
+        assert store.scores_for_results(conn, [1])[1][0]["scorer"] == "contains"
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        # A second connect adds nothing and breaks nothing: each column
+        # appears exactly once, and the legacy row is untouched.
+        for table, column in (
+            ("experiments", "primary_metric"),
+            ("experiments", "quantizations_json"),
+            ("results", "upstream_inference_cost_usd"),
+        ):
+            names = [r["name"] for r in again.execute(f"PRAGMA table_info({table})")]
+            assert names.count(column) == 1, (table, column, names)
+        assert again.execute("SELECT count(*) c FROM experiments").fetchone()["c"] == 1
+        second = store.get_run(again, 1)
+        assert second is not None
+        assert second["results"][0]["response_text"] == "legacy text"
+    finally:
+        again.close()
