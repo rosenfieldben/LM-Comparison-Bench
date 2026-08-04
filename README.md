@@ -9,9 +9,18 @@ and every run lands in SQLite history for later replay.
 This is a comparison workbench: it puts models side by side under
 identical conditions and records what happened, with enough provenance
 to say later what an old run actually was. The evaluation layer on top
-of it, datasets, repeated trials and scoring, is in progress and not
-here yet, so treat a comparison as evidence to read rather than a
-benchmark result to cite.
+of it is here: datasets addressed by content, repeated randomized
+trials with rotated entry order, deterministic and rubric scoring,
+blind human rating, aggregates with their denominators and clustered
+intervals, and an export that seals a moment and can rebuild every
+number it publishes.
+
+What it still is not is a leaderboard. The statistical protocol a
+published comparison would need (paired estimates, multiplicity, power)
+is not here, and the report withholds a ranking rather than inventing
+one whenever nobody has said what "better" means. Read an experiment as
+evidence, with its intervals and its coverage counts, rather than as a
+result to quote out of context.
 
 ## Daily use
 
@@ -860,6 +869,36 @@ experiment and says so in `status_detail`; set it false to record
 refusals and keep going. Either way the conservation property holds
 across the whole experiment: every requested trial is accounted for as
 completed, failed, refused, or never attempted.
+
+**Blind rating is entered from the history list**, never from a
+comparison already on screen. The server opens the session, issues the
+shuffle, and returns the answers with no identity attached to any of
+them: no model, no provider, no cost, no timing. That ordering is the
+feature. A page that fetched the identified comparison and then hid the
+identities has already painted them, and "hidden" in a browser is a style
+rule anyone can undo plus a frame the rater may have seen.
+
+**The blind flag on a rating is the server's, not the client's.** It
+records whether an open session existed for that comparison when the
+ratings arrived, and the body's own claim is ignored. A page that
+revealed the identities and then posted `blind: true` would be testifying
+about its own past, which is the one witness a blind record cannot use.
+The reveal closes the session one way: a comparison whose answer key
+somebody has seen cannot be reopened blind, because a rating made after
+that is not a blind rating however the page is arranged.
+
+Nothing here is a secret from the operator, who owns the process and the
+database. The point is narrower and it is about evidence: a rating claims
+to have been made without knowing which model wrote which answer, and
+that claim is worth something only if the page could not have known
+either.
+
+Two limits remain and are stated rather than discovered. The bench cannot
+blind what a model wrote about itself, so an answer beginning "as an AI
+assistant made by X" identifies its author whatever the page does. And a
+rater who has already replayed a comparison sightedly knows its contents;
+the session records the conditions at rating time, not the contents of the
+rater's memory.
 
 **Progress survives disconnection**, and this is the one place in the
 bench where continuing after a client goes away is the point rather than

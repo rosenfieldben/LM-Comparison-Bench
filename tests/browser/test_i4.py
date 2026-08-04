@@ -456,3 +456,115 @@ def test_the_experiment_list_names_its_own_state(page, bench):
     expect(page.get_by_test_id("experiment-list")).to_have_attribute(
         "data-state", re.compile(r"ready|empty"), timeout=DONE_TIMEOUT
     )
+
+
+# ---- Phase I.2 J6: the blind session is opened by the server.
+
+
+def blind_view_markup(page):
+    """The blind view's own HTML, minus the answers themselves.
+
+    inner_html rather than inner_text, because the question here is what
+    the page RECEIVED rather than what it displayed: a hidden node still
+    means the mapping crossed the wire.
+
+    Scoped rather than whole-document for two reasons, both of which are
+    limits on the claim rather than conveniences. The history list names
+    the models of every comparison in a row title and always has, and a
+    SET of names is not an answer key. And the answer bodies are excluded
+    for the reason bench_chrome gives: the bench cannot blind what a
+    model wrote about itself, and this suite's stub answers "reply from
+    stub/fast", so including them would test the stub rather than the
+    bench.
+    """
+    return page.evaluate(
+        """() => {
+            const parts = [document.getElementById("run-controls").innerHTML];
+            for (const card of document.querySelectorAll(
+                '[data-testid="result-card"]'
+            )) {
+                const copy = card.cloneNode(true);
+                for (const body of copy.querySelectorAll(".card-body")) {
+                    body.remove();
+                }
+                parts.push(copy.innerHTML);
+            }
+            return parts.join(" ");
+        }"""
+    )
+
+
+def test_review_repro_the_blind_entry_never_paints_an_identity(
+    bench, open_history, bench_url
+):
+    """The claim the old path could not make.
+
+    Blind rating used to start from a comparison already on screen, so
+    the identities were painted and then hidden. Hidden in a browser is a
+    style rule anyone can undo, plus a frame the rater may have seen, and
+    the record still said blind. Entered from the list against a
+    server-issued session, the page never receives an identity at all.
+
+    Asserted on the DOCUMENT rather than on what is visible, which is the
+    opposite of the earlier blind tests and deliberately so: those ask
+    "could the rater see it", this asks "did the page ever have it".
+    """
+    page = bench(["stub/fast", "stub/slow"])
+    check_all_chips(page)
+    run_and_wait(page, "i6 blind entry", 2)
+
+    open_history()
+    page.get_by_test_id("history-rate-blind").first.click()
+    expect(page.get_by_test_id("rating-panel")).to_be_visible()
+
+    # The MARKUP of the blind view, not merely what is visible in it,
+    # which is the opposite of the earlier blind tests and deliberate:
+    # those ask "could the rater see it", this asks "did the page ever
+    # receive it". Scoped to the results area and the rating controls,
+    # because that is where a MAPPING would have to live. The history
+    # list names the models of every comparison in a row title and
+    # always has; a set of names is not an answer key, and the rater
+    # opened that panel themselves.
+    markup = blind_view_markup(page)
+    assert "stub/fast" not in markup
+    assert "stub/slow" not in markup
+    expect(cards(page)).to_have_count(2)
+    labels = page.get_by_test_id("rating-label")
+    assert sorted(labels.nth(i).inner_text() for i in range(2)) == ["A", "B"]
+
+    # And the answers are there: they are what is being rated. This is
+    # also the residual limit made visible, since this stub's answer
+    # names its own model and no arrangement of the page can fix that.
+    assert "reply from" in page.locator("#results").inner_text()
+
+
+def test_the_server_issued_session_reveals_only_after_the_save(
+    bench, open_history, bench_url
+):
+    """The identities arrive with the reveal, written onto the cards for
+    the first time, because there was never a hidden copy to un-hide."""
+    page = bench(["stub/fast", "stub/slow"])
+    check_all_chips(page)
+    run_and_wait(page, "i6 blind reveal", 2)
+    open_history()
+    page.get_by_test_id("history-rate-blind").first.click()
+    expect(page.get_by_test_id("rating-panel")).to_be_visible()
+
+    for i in range(2):
+        cards(page).nth(i).get_by_test_id("rating-4").click()
+    assert "stub/fast" not in blind_view_markup(page)
+
+    page.get_by_test_id("rating-submit").click()
+    expect(page.get_by_test_id("rating-msg")).to_contain_text("Identities revealed")
+
+    markup = blind_view_markup(page)
+    assert "stub/fast" in markup
+    assert "stub/slow" in markup
+
+    # The server recorded the blind, and it recorded it from its own
+    # session rather than from the page's word.
+    rows = page.request.get(bench_url + "/runs?limit=5").json()["runs"]
+    group_id = next(e["id"] for e in rows if e["type"] == "group")
+    group = page.request.get(bench_url + f"/groups/{group_id}").json()
+    ids = [r["id"] for run in group["runs"] for r in run["results"]]
+    assert ids

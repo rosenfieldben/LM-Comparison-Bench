@@ -30,6 +30,7 @@ import json
 import math
 import random
 import statistics
+from collections.abc import Mapping
 from typing import Any
 
 # The latest-per-key rule lives in bench.scoring and this module is its
@@ -376,19 +377,30 @@ def build_report(
     answer never touches a model's failure count.
     """
     lineup = experiment["lineup"]
-    # trials[model][task_id] = list of per-trial records, so the bootstrap
+    # An ARM is a lineup slot: (position, model). A lineup may list the
+    # same model twice, which is how anyone asks "how much does this vary
+    # run to run", and the two copies are two arms with two sets of paid
+    # trials. Keying any of this by model alone would merge them, and the
+    # merge would be silent.
+    arms = list(enumerate(lineup))
+    by_model: dict[str, list[int]] = {}
+    for position, model in arms:
+        by_model.setdefault(model, []).append(position)
+    # trials[arm][task_id] = list of per-trial records, so the bootstrap
     # can resample by task without a second pass over the rows.
-    trials: dict[str, dict[str, list[dict[str, Any]]]] = {m: {} for m in lineup}
+    trials: dict[tuple[int, str], dict[str, list[dict[str, Any]]]] = {
+        arm: {} for arm in arms
+    }
     for group in groups:
         task_id = group["task_id"]
-        seen: set[str] = set()
+        seen: set[tuple[int, str]] = set()
         for run in runs_by_group.get(group["id"], []):
             for result in run["results"]:
-                model = result["model"]
-                if model not in trials:
+                arm = _arm_of(result, trials, by_model)
+                if arm is None:
                     continue
-                seen.add(model)
-                trials[model].setdefault(task_id, []).append(
+                seen.add(arm)
+                trials[arm].setdefault(task_id, []).append(
                     {
                         "outcome": trial_outcome(result, run),
                         "result": result,
@@ -400,9 +412,9 @@ def build_report(
         # than skipped, because a halted experiment's un-run trials are
         # part of what was asked and leaving them out would quietly shrink
         # every denominator they belong to.
-        for model in lineup:
-            if model not in seen:
-                trials[model].setdefault(task_id, []).append(
+        for arm in arms:
+            if arm not in seen:
+                trials[arm].setdefault(task_id, []).append(
                     {
                         "outcome": "missing",
                         "result": None,
@@ -431,9 +443,17 @@ def build_report(
     row_scored = rows_scoring_tasks(trials)
     models = [
         _model_report(
-            model, by_task, tasks_by_id, seed, row_declared, not_run, row_scored
+            model,
+            position,
+            len(by_model.get(model, ())) > 1,
+            by_task,
+            tasks_by_id,
+            seed,
+            row_declared,
+            not_run,
+            row_scored,
         )
-        for model, by_task in trials.items()
+        for (position, model), by_task in trials.items()
     ]
     ranking = choose_metric(experiment.get("primary_metric"), models)
     metric = ranking["metric"]
@@ -448,12 +468,12 @@ def build_report(
     # A rank with no named metric is a claim about which model is better
     # with nothing behind it.
     ranks = (
-        min_ranks({m["model"]: m["score"]["mean"] for m in models})
+        min_ranks({m["label"]: m["score"]["mean"] for m in models})
         if metric is not None
-        else {m["model"]: None for m in models}
+        else {m["label"]: None for m in models}
     )
     for entry in models:
-        entry["rank"] = ranks[entry["model"]]
+        entry["rank"] = ranks[entry["label"]]
     return {
         "experiment_id": experiment["id"],
         "name": experiment["name"],
@@ -494,8 +514,44 @@ def build_report(
             # unit was resampled to know what the interval claims.
             "unit": "task",
         },
-        "models": sorted(models, key=lambda m: lineup.index(m["model"])),
+        # By position, which IS the declared order, rather than by a
+        # lookup of the model's name: with a duplicated model the lookup
+        # returns the same index for both arms and the sort silently
+        # depends on whatever order they arrived in.
+        # Judge spend on its own line, never folded into the models'
+        # totals. It is the bench's own instrument cost: money this tool
+        # spent measuring, not money any model under test was paid. A
+        # single "total cost" adding the two would answer neither "what
+        # did this comparison cost me" nor "what did these models cost".
+        "judge_cost": _judge_cost(scores_by_result),
+        "models": sorted(models, key=lambda m: m["position"]),
     }
+
+
+def _arm_of(
+    result: dict[str, Any],
+    trials: dict[tuple[int, str], Any],
+    by_model: dict[str, list[int]],
+) -> tuple[int, str] | None:
+    """Which lineup slot this row belongs to, or None if it belongs to none.
+
+    The recorded position decides, because that is what the runner wrote
+    and it is the only field that can tell two copies of one model apart.
+
+    The fallback exists for rows whose position predates the column or
+    was never set: if the model occupies exactly one slot there is no
+    ambiguity and using it recovers the row. If it occupies two, there is
+    no honest answer and the row is dropped rather than assigned to a
+    coin flip, which would put one arm's trial in the other's column.
+    """
+    model = result["model"]
+    position = result.get("position")
+    if isinstance(position, int) and (position, model) in trials:
+        return (position, model)
+    slots = by_model.get(model, [])
+    if position is None and len(slots) == 1:
+        return (slots[0], model)
+    return None
 
 
 def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[str, Any]:
@@ -602,6 +658,8 @@ def _ranking(
 
 def _model_report(
     model: str,
+    position: int,
+    duplicated: bool,
     by_task: dict[str, list[dict[str, Any]]],
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
@@ -663,8 +721,25 @@ def _model_report(
     ]
 
     completed = [t["result"] for t in flat if t["outcome"] in COMPLETED]
+    # Cost is over EVERY row that has one, not over the completed ones.
+    # A trial that streamed tokens and then broke was charged for those
+    # tokens, and a total that skipped it would under-report a real bill
+    # by exactly the amount the failures cost, which is the direction
+    # nobody checks. Latency and provider stay on completed trials,
+    # because a broken stream has no honest latency to report.
+    billable = [t["result"] for t in flat if t["result"] is not None]
     return {
         "model": model,
+        # The lineup slot, always. A reader with one arm per model never
+        # needs it and loses nothing by seeing it; a reader with two arms
+        # of one model cannot tell them apart without it.
+        "position": position,
+        # The name to print and to rank by. Identical to the model unless
+        # the lineup listed it more than once, in which case the two arms
+        # need names that differ or a leaderboard would show one row
+        # twice with different numbers and no way to say why.
+        "label": f"{model} #{position}" if duplicated else model,
+        "duplicate_arm": duplicated,
         "trials": {
             "planned": planned,
             "attempted": attempted,
@@ -684,7 +759,7 @@ def _model_report(
         "scorers": per_scorer,
         "latency_ms": summarize_metric([r.get("latency_ms") for r in completed]),
         "ttft_ms": summarize_metric([r.get("ttft_ms") for r in completed]),
-        "cost": _cost_totals(completed),
+        "cost": _cost_totals(billable),
         # The routed-service estimand made visible. Under dynamic routing
         # the provider is chosen per call, so it is the largest confound
         # in any comparison the bench draws; counting them is what turns
@@ -694,7 +769,7 @@ def _model_report(
 
 
 def rows_scoring_tasks(
-    trials_by_model: dict[str, dict[str, list[dict[str, Any]]]],
+    trials_by_arm: Mapping[Any, dict[str, list[dict[str, Any]]]],
 ) -> dict[str, set[str]]:
     """scorer -> task ids that have at least one row from that scorer.
 
@@ -708,7 +783,7 @@ def rows_scoring_tasks(
     smaller population than its neighbour for the same task.
     """
     scored: dict[str, set[str]] = {}
-    for by_task in trials_by_model.values():
+    for by_task in trials_by_arm.values():
         for task_id, trials in by_task.items():
             for trial in trials:
                 for row in trial["scores"]:
@@ -756,7 +831,7 @@ def applicable_tasks(
 
 
 def rows_declaring_thresholds(
-    trials_by_model: dict[str, dict[str, list[dict[str, Any]]]],
+    trials_by_arm: Mapping[Any, dict[str, list[dict[str, Any]]]],
 ) -> dict[str, set[str]]:
     """scorer -> task ids whose score rows witness a declared threshold.
 
@@ -790,7 +865,7 @@ def rows_declaring_thresholds(
     labels which of the two it used.
     """
     declared: dict[str, set[str]] = {}
-    for by_task in trials_by_model.values():
+    for by_task in trials_by_arm.values():
         for task_id, trials in by_task.items():
             for trial in trials:
                 for row in trial["scores"]:
@@ -975,6 +1050,11 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     The same rule the ceiling uses: what the platform charged beats what
     the catalog implies. Reporting the two counts beside the total is
     what keeps a total that is mostly estimate from reading like a bill.
+
+    Given every row that exists, including errored, stopped and refused
+    ones. A refusal carries no cost and contributes nothing; a trial that
+    streamed tokens before breaking carries a real charge, and leaving it
+    out would under-report the bill by exactly what the failures cost.
     """
     billed = [
         r["billed_cost_usd"] for r in results if r.get("billed_cost_usd") is not None
@@ -991,6 +1071,23 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
         "estimated_trials": len(estimated),
         "unpriced_trials": unpriced,
     }
+
+
+def _judge_cost(scores_by_result: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
+    """What the judging itself cost, over every score row that was billed.
+
+    Every row, not the latest per key: a re-scoring pass paid for its
+    call whether or not its verdict is the one the report now uses, and
+    superseded spend is still spend. That is the same rule the trial
+    totals follow, one level up.
+    """
+    charges = [
+        row["judge_billed_cost_usd"]
+        for rows in scores_by_result.values()
+        for row in rows
+        if row.get("judge_billed_cost_usd") is not None
+    ]
+    return {"total_usd": sum(charges), "billed_calls": len(charges)}
 
 
 def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:

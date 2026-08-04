@@ -505,7 +505,7 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
         ],
     }
 
-    out = _model_report("m", by_task, {}, seed=1)
+    out = _model_report("m", 0, False, by_task, {}, seed=1)
     counts = out["trials"]
 
     assert counts["planned"] == 6

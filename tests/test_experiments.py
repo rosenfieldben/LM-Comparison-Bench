@@ -140,12 +140,30 @@ def test_the_plan_is_task_major():
 def test_the_plan_carries_each_cells_entry_order():
     plan = plan_trials(tasks(1), ["a", "b", "c"], repeats=3, task_order_seed=None)
 
+    # Arms, not names: (position, model). The position is the model's
+    # slot in the DECLARED lineup and travels with it through the
+    # rotation, so a lineup listing one model twice keeps its two copies
+    # apart all the way to the report.
     assert [c["order"] for c in plan] == [
-        ["a", "b", "c"],
-        ["b", "c", "a"],
-        ["c", "a", "b"],
+        [(0, "a"), (1, "b"), (2, "c")],
+        [(1, "b"), (2, "c"), (0, "a")],
+        [(2, "c"), (0, "a"), (1, "b")],
     ]
     assert [c["rotation_index"] for c in plan] == [0, 1, 2]
+
+
+def test_review_repro_a_duplicated_model_keeps_two_distinct_arms():
+    """The same model twice is the natural way to ask how much a model
+    varies run to run, and it has to be the case that works.
+
+    The runner used to derive position with lineup.index(model), which
+    returns the FIRST match, so both copies were position 0: two paid
+    trials collapsed into one column with the second silently overwriting
+    the first in every per-position reader.
+    """
+    plan = plan_trials(tasks(1), ["a", "a"], repeats=1, task_order_seed=None)
+
+    assert plan[0]["order"] == [(0, "a"), (1, "a")]
 
 
 @given(
@@ -168,4 +186,4 @@ def test_the_plan_has_exactly_one_cell_per_task_repeat(
     assert sum(len(c["order"]) for c in plan) == n_tasks * repeats * n_models
     # Every cell asks every model exactly once, whatever the rotation.
     for cell in plan:
-        assert sorted(cell["order"]) == sorted(lineup)
+        assert sorted(cell["order"]) == sorted(enumerate(lineup))

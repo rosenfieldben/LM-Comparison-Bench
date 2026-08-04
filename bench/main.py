@@ -1,12 +1,14 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
 import logging
 import math
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -804,9 +806,69 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             "OpenRouter catalog fetch failed; cost display and model "
             "search are unavailable this session"
         )
+    # Blind sessions belong to this process and to the person in front of
+    # the page, so a new process starts with none. Cleared explicitly
+    # rather than relying on module import order, because the test client
+    # builds the app repeatedly in one interpreter and a session left
+    # behind would make a later comparison's ratings claim a blind that
+    # never happened.
+    BLIND_SESSIONS.clear()
+    # An experiment marked running in the database with no task behind it
+    # is a lie this process is now in a position to correct. The runner
+    # lives in memory, so a crash, a kill or a power cut leaves the row
+    # saying running forever: the progress endpoint waits on counters
+    # that will never move, and start refuses because the status is not
+    # "created". Both are worse than a terminal status that says what
+    # happened.
+    #
+    # Safe because one experiment runs at a time and this process has
+    # just started: nothing is running, so anything the row calls running
+    # belongs to a process that is gone.
+    for stale in store.list_experiments(app.state.db):
+        if stale["status"] == "running":
+            logger.warning(
+                "experiment %s was left running by a previous process; "
+                "marking interrupted",
+                stale["id"],
+            )
+            store.set_experiment_status(
+                app.state.db,
+                stale["id"],
+                "interrupted",
+                "the process running this experiment exited before it "
+                "finished; its completed trials are real and its "
+                "remaining trials never ran",
+            )
     yield
+    # The runner outlives the request that started it, deliberately, but
+    # it must not outlive the process. Without this the task is cancelled
+    # by interpreter teardown at an arbitrary await, which can be in the
+    # middle of a settlement: the money is spent and the row is not
+    # written. Asking it to stop between trials and then waiting is the
+    # same contract the stop endpoint offers.
+    await _shutdown_runner()
     await app.state.client.aclose()
     app.state.db.close()
+
+
+async def _shutdown_runner() -> None:
+    """Ask the runner to stop, then wait for it to actually be finished.
+
+    Two steps, and the second is the one that matters. Setting the stop
+    event alone would return while a trial is still in flight; cancelling
+    alone would cut it at an arbitrary await. Signal first so it can end
+    between trials, cancel second so a hung upstream call cannot hold
+    shutdown open forever, and await either way so the process does not
+    exit with a half-written row behind it.
+    """
+    state = getattr(app.state, "experiment_run", None) or {}
+    task = state.get("task")
+    if task is None or task.done():
+        return
+    state["stop"].set()
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await task
 
 
 # The three documentation routes are off. Nothing here consumes them: the
@@ -2111,6 +2173,23 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
             'estimand_mode to "underlying_model", which is the estimand '
             "that narrows the provider population on purpose.",
         )
+    if body.task_order_seed is not None:
+        # seed_for_repeat derives base + N, so the LAST repeat's seed is
+        # base + repeats - 1. Bounding only the base lets a legal base
+        # sit one repeat below the ceiling and hand the provider a seed
+        # past what survives a browser read-back, silently, on the last
+        # cell of a long run. Checked here where the arithmetic can be
+        # shown rather than at trial 300 where it cannot.
+        highest = body.task_order_seed + body.repeats - 1
+        if highest > MAX_SEED:
+            raise HTTPException(
+                422,
+                f"task_order_seed {body.task_order_seed} plus "
+                f"{body.repeats} repeats reaches {highest}, past the "
+                f"{MAX_SEED} limit: repeat N sends seed base + N, so the "
+                "last repeat is the one that would overflow. Lower the "
+                "seed or the repeat count.",
+            )
     if body.primary_metric is not None:
         enforce_primary_metric(body.primary_metric, dataset)
     if body.estimand_mode == "underlying_model":
@@ -2332,7 +2411,14 @@ async def run_experiment(experiment_id: int) -> None:
     except HTTPException as exc:
         # The file moved or became unreadable between creation and start.
         # Not a crash: the experiment records why it never ran.
+        #
+        # The singleton is released here as well as in the finally below,
+        # because this return happens BEFORE the try that owns it. Left
+        # set, one unreadable dataset wedged every later start with "an
+        # experiment is already running" naming an experiment that had
+        # already failed, until the process was restarted.
         store.set_experiment_status(db, experiment_id, "failed", str(exc.detail))
+        state["active"] = None
         return
     if dataset["digest"] != experiment["dataset_digest"]:
         # The bytes changed under it. Refusing is the whole point of
@@ -2385,17 +2471,26 @@ async def run_experiment(experiment_id: int) -> None:
                 },
             )
             halted = False
-            for model in cell["order"]:
+            for position, model in cell["order"]:
                 if state["stop"].is_set():
                     status, detail = "stopped", "stopped between trials"
                     halted = True
                     break
-                # Position is the model's place in the DECLARED lineup, not
-                # its place in this cell's rotated entry order. The rotation
-                # changes who asks first; it does not change which column a
-                # model occupies, and a report that mixed the two would
-                # attribute one model's results to another's slot.
-                position = lineup.index(model)
+                # Position is the model's place in the DECLARED lineup,
+                # not its place in this cell's rotated entry order. The
+                # rotation changes who asks first; it does not change
+                # which column a model occupies, and a report that mixed
+                # the two would attribute one model's results to
+                # another's slot.
+                #
+                # It arrives with the arm rather than being looked up by
+                # name. lineup.index(model) returns the FIRST match, so a
+                # lineup listing one model twice gave both copies
+                # position 0: two paid trials collapsed into one column,
+                # the second silently overwriting the first in every
+                # per-position reader. A duplicate lineup is the natural
+                # way to ask "how much does this model vary run to run",
+                # so it has to be the case that works.
                 # The entry checks, on the runner's own trial, exactly as a
                 # client's request gets them. Force a mismatch and this
                 # 409s the runner too, which is the point.
@@ -2483,6 +2578,7 @@ async def start_experiment(experiment_id: int, body: ExperimentStart) -> dict[st
     state["active"] = experiment_id
     state["stop"] = asyncio.Event()
     state["dataset_path"] = body.dataset_path
+    state["error"] = None
     # Held on app.state so the task is not garbage collected mid-run, and
     # so a stop can be issued against it. asyncio keeps only a weak
     # reference to a bare create_task.
@@ -2840,6 +2936,12 @@ async def get_run(run_id: int) -> dict[str, Any]:
 RATING_MIN = 1
 RATING_MAX = 5
 
+# Neutral names for the anonymized cards. Letters rather than numbers
+# because a rater reading "1" and "2" beside answers tends to read them
+# as a ranking somebody already made, and MAX_POSITION + 1 of them
+# because that is how many cards a comparison can hold.
+BLIND_LABELS = tuple(chr(ord("A") + i) for i in range(MAX_POSITION + 1))
+
 
 def normalized_rating(rating: int) -> float:
     """A 1-to-5 rating on the [0, 1] scale every score row uses."""
@@ -2863,12 +2965,13 @@ class RatingsSubmit(BaseModel):
     model_config = FORBID_UNKNOWN
 
     ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
-    # Whether the rater could see the identities while rating. Sent by the
-    # client because only the client knows what was on screen, and
-    # recorded either way rather than enforced: a rating entered after the
-    # reveal is still a rating, and refusing it would lose real data over
-    # a condition the record can simply state.
-    blind: bool
+    # Accepted and IGNORED. It stays on the model so an existing client
+    # is not rejected by extra="forbid" for sending what it always sent,
+    # and the server writes its own answer from the session instead. A
+    # page that revealed the identities and then claimed blind=true would
+    # be testifying about its own past, which is the one witness a blind
+    # record cannot use. See submit_ratings and blind_session_open.
+    blind: bool = False
 
 
 @app.post("/groups/{group_id}/ratings", status_code=201)
@@ -2880,6 +2983,16 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
     about a stale page: a tab holding a previous comparison's result ids
     would otherwise write ratings onto the wrong models silently, and a
     silent misattribution is the worst outcome this endpoint has.
+
+    THE BLIND FLAG IS THE SERVER'S, not the client's. It records whether
+    an open blind session existed for this group at the moment the
+    ratings arrived, and the body's own claim is ignored. A blind rating
+    is evidence about the conditions a person judged under, so the one
+    party that cannot be the witness is the page that was showing them
+    the answers: a tab that revealed identities and then posted
+    blind=true would be writing a claim about its own past that nothing
+    could check. The session is opened by the server, carries the
+    shuffle, and closes one way at reveal.
     """
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
@@ -2894,6 +3007,7 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
             "page may be showing an older comparison than the one it is "
             "rating; reload it.",
         )
+    blind = blind_session_open(group_id)
     written = 0
     for rating in body.ratings:
         store.add_score(
@@ -2908,11 +3022,11 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
                 # cutoff the rater never chose.
                 "passed": None,
                 "detail": _rating_detail(rating),
-                "blind": body.blind,
+                "blind": blind,
             },
         )
         written += 1
-    return {"group_id": group_id, "written": written, "blind": body.blind}
+    return {"group_id": group_id, "written": written, "blind": blind}
 
 
 def _rating_detail(rating: Rating) -> str:
@@ -2925,6 +3039,117 @@ def _rating_detail(rating: Rating) -> str:
     """
     base = f"{rating.rating} of {RATING_MAX}"
     return f"{base}, shown as {rating.label}" if rating.label else base
+
+
+# Blind sessions, in memory and per group. Not a table, deliberately: a
+# session is a fact about a person sitting in front of a page right now,
+# it expires with the process, and persisting it would create a second
+# record of blindness that could disagree with the score rows, which are
+# the only record that matters afterwards.
+#
+# One entry per group rather than a token, because the bench answers only
+# to loopback and the threat model is a stale tab rather than an
+# attacker: the question is "was a blind session open for this group when
+# these ratings arrived", and the group id answers it.
+BLIND_SESSIONS: dict[int, bool] = {}
+
+
+def blind_session_open(group_id: int) -> bool:
+    """Whether this group is being rated blind right now.
+
+    The server's own answer to the question the client is not a competent
+    witness for. Absent means no session was ever opened; False means one
+    was opened and then closed by a reveal, and both mean the same thing
+    to a rating arriving now.
+    """
+    return BLIND_SESSIONS.get(group_id, False)
+
+
+@app.post("/groups/{group_id}/blind", status_code=201)
+async def open_blind_session(group_id: int) -> dict[str, Any]:
+    """Open a blind session and hand back the anonymized comparison.
+
+    The shuffle is issued HERE, by the server, and the response carries
+    the answers with no identity attached to any of them: no model, no
+    provider, no cost, no timing. That ordering is the whole feature. A
+    client that fetched the identified comparison and then hid the
+    identities has already painted them, and "hidden" in a browser is a
+    style rule anyone can undo, plus a frame the rater may have seen.
+
+    Nothing here is a secret from the operator: they own the process and
+    the database. The point is narrower and it is about evidence. A
+    rating claims to have been made without knowing which model wrote
+    which answer, and the only way that claim can be worth anything is if
+    the page could not have known either.
+    """
+    ensure_rowid(group_id)
+    group = store.get_group(app.state.db, group_id)
+    if group is None:
+        raise HTTPException(404, "no such group")
+    results = [r for run in group["runs"] for r in run["results"]]
+    if not results:
+        raise HTTPException(
+            409,
+            f"comparison {group_id} has no results to rate: a blind "
+            "session over nothing would record nothing.",
+        )
+    if group_id in BLIND_SESSIONS and not BLIND_SESSIONS[group_id]:
+        # The close is ONE WAY, and this is where that is enforced. A
+        # session that could be reopened would let a rater look, close,
+        # reopen and rate, with the record still saying blind. Once
+        # somebody has seen the answer key for this comparison, no later
+        # rating of it can honestly claim not to have.
+        raise HTTPException(
+            409,
+            f"comparison {group_id} has already been revealed. A blind "
+            "session cannot be reopened: somebody has seen which model "
+            "wrote which answer, and a rating made after that is not a "
+            "blind rating however the page is arranged.",
+        )
+    order = list(range(len(results)))
+    random.shuffle(order)
+    BLIND_SESSIONS[group_id] = True
+    return {
+        "group_id": group_id,
+        "blind": True,
+        # Label, id and answer. Everything else a card normally carries
+        # is absent rather than nulled, because a null field is still a
+        # field a future edit could fill in by accident.
+        "cards": [
+            {
+                "label": BLIND_LABELS[slot],
+                "result_id": results[index]["id"],
+                "response_text": results[index].get("response_text"),
+                "error": results[index].get("error"),
+            }
+            for slot, index in enumerate(order)
+        ],
+    }
+
+
+@app.post("/groups/{group_id}/blind/reveal", status_code=200)
+async def close_blind_session(group_id: int) -> dict[str, Any]:
+    """Close the session, one way, and hand back the identities.
+
+    One way because a session that could be reopened would let a rater
+    look, close, reopen and rate, with the record still saying blind. The
+    close is what makes every later rating on this group honest about the
+    fact that somebody has now seen the answer key.
+    """
+    ensure_rowid(group_id)
+    group = store.get_group(app.state.db, group_id)
+    if group is None:
+        raise HTTPException(404, "no such group")
+    BLIND_SESSIONS[group_id] = False
+    return {
+        "group_id": group_id,
+        "blind": False,
+        "identities": [
+            {"result_id": r["id"], "model": r["model"], "position": r.get("position")}
+            for run in group["runs"]
+            for r in run["results"]
+        ],
+    }
 
 
 # ---- Phase I5: the report.
@@ -3021,6 +3246,51 @@ def _report_inputs(
     }
 
 
+def _export_lines(
+    experiment: dict[str, Any], experiment_id: int, thresholds: dict[str, Any] | None
+) -> list[dict[str, Any]]:
+    """Every line of the artifact, read inside one transaction.
+
+    The whole read sits in a `with conn` block so the export sees one
+    state of the database and not several. Without it a scoring pass
+    finishing between two group reads would land in the later lines and
+    not the earlier ones, producing an artifact that is internally
+    inconsistent and whose digest verifies perfectly, which is the worst
+    combination available.
+
+    The store's synchronous contract is what makes this a real snapshot
+    rather than a hopeful one: nothing here awaits, so no other task can
+    interleave a write between the first read and the last.
+    """
+    db = app.state.db
+    out: list[dict[str, Any]] = [export_manifest(experiment, REPORT_SEED, thresholds)]
+    with db:
+        for group in store.experiment_groups(db, experiment_id):
+            detail = store.get_group(db, group["id"])
+            if detail is None:
+                continue
+            rows = [
+                (run, result) for run in detail["runs"] for result in run["results"]
+            ]
+            # Position, then result id as the tiebreak. A row with no
+            # position sorts last rather than crashing the comparison,
+            # and the id keeps two rows at the same position in a stable
+            # order, which is what byte-identical exports need.
+            rows.sort(
+                key=lambda pair: (
+                    pair[1].get("position") is None,
+                    pair[1].get("position") or 0,
+                    pair[1]["id"],
+                )
+            )
+            score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
+            for run, result in rows:
+                out.append(
+                    export_trial(group, run, result, score_rows.get(result["id"], []))
+                )
+    return out
+
+
 def threshold_slice(tasks_by_id: dict[str, Any]) -> dict[str, Any]:
     """The smallest part of a dataset an aggregate cannot be re-derived
     without: which tasks declared a pass threshold, and what it was.
@@ -3097,39 +3367,29 @@ async def experiment_export(
         else threshold_slice(dataset_tasks(experiment, dataset_path))
     )
 
+    # EVERY ROW READ BEFORE THE FIRST BYTE GOES OUT, inside one
+    # transaction. The digest on the last line seals whatever the reader
+    # received, and reading lazily while streaming would let it seal an
+    # INTERVAL rather than a MOMENT: a scoring pass finishing mid-export
+    # would put its rows into the later lines and not the earlier ones,
+    # and the resulting artifact would be internally inconsistent while
+    # its digest verified perfectly. A citation that cannot be pinned to
+    # one state of the database is not a citation.
+    #
+    # Materializing is fine here, and bounded rather than hoped: an
+    # experiment cannot exceed MAX_TRIALS rows because create_experiment
+    # refuses one that would, so this holds at most 5000 trials with
+    # their prompts and responses. That is a large dict and a small
+    # fraction of what the same rows cost while being rendered into a
+    # report, which the same process already does on demand.
+    lines = _export_lines(experiment, experiment_id, thresholds)
+
     async def body() -> AsyncIterator[str]:
         digest = hashlib.sha256()
-
-        def emit(payload: dict[str, Any]) -> str:
+        for payload in lines:
             line = export_line(payload) + "\n"
             digest.update(line.encode("utf-8"))
-            return line
-
-        yield emit(export_manifest(experiment, REPORT_SEED, thresholds))
-        db = app.state.db
-        for group in store.experiment_groups(db, experiment_id):
-            detail = store.get_group(db, group["id"])
-            if detail is None:
-                continue
-            rows = [
-                (run, result) for run in detail["runs"] for result in run["results"]
-            ]
-            # Position, then result id as the tiebreak. A row with no
-            # position sorts last rather than crashing the comparison,
-            # and the id keeps two rows at the same position in a stable
-            # order, which is what byte-identical exports need.
-            rows.sort(
-                key=lambda pair: (
-                    pair[1].get("position") is None,
-                    pair[1].get("position") or 0,
-                    pair[1]["id"],
-                )
-            )
-            score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
-            for run, result in rows:
-                yield emit(
-                    export_trial(group, run, result, score_rows.get(result["id"], []))
-                )
+            yield line
         # Not folded into the digest, obviously: it is the digest.
         yield (
             export_line(

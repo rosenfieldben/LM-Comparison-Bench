@@ -10,6 +10,7 @@
 (function () {
   const resultsEl = document.getElementById("results");
   const runControlsEl = document.getElementById("run-controls");
+  const labelEl = document.getElementById("run-label");
 
   // Neutral, order-free labels. Letters rather than numbers because a
   // number reads as a rank, and a rater who thinks card 1 is the first
@@ -238,15 +239,57 @@
     // complete either way: the reveal is a courtesy to the rater, not
     // part of the measurement.
     if (!current()) return;
-    reveal();
+    const identities = session.serverIssued
+      ? await closeServerSession(groupId)
+      : null;
+    if (!current()) return;
+    reveal(identities);
   }
 
-  function reveal() {
+  async function closeServerSession(groupId) {
+    // The server's session closes one way, and the close is what makes
+    // every later rating of this comparison honest about the fact that
+    // somebody has now seen the answer key. Failing to close is not
+    // worth blocking the reveal over: the ratings are already saved, and
+    // the session expiring with the process fails closed.
+    try {
+      const resp = await fetch("/groups/" + groupId + "/blind/reveal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // The identities array, not the envelope around it. reveal() maps
+      // over what this returns, so handing back the whole payload threw
+      // inside an async function and left the panel stuck on "saving"
+      // with the ratings already saved: a silent half-finished state
+      // that only the browser test caught.
+      return (await resp.json()).identities;
+    } catch (err) {
+      console.error("blind reveal failed", err);
+      return null;
+    }
+  }
+
+  function reveal(identities) {
     // One way. Re-blinding after a reveal would produce a rating the
     // record calls blind that was made by someone who had already seen
     // the answer, which is worse than no blind rating at all.
     session.revealed = true;
-    for (const pair of session.cards) showIdentity(pair.card);
+    if (identities) {
+      // A server-issued session never painted an identity, so there is
+      // nothing to un-hide: the names arrive with the reveal and are
+      // written onto the cards for the first time here.
+      const byId = new Map(identities.map((i) => [i.result_id, i.model]));
+      for (const pair of session.cards) {
+        const name = document.createElement("div");
+        name.className = "card-header";
+        name.dataset.testid = "card-model";
+        name.textContent = byId.get(pair.resultId) || "";
+        pair.card.prepend(name);
+      }
+    }
+    for (const pair of session.cards) if (!identities) showIdentity(pair.card);
     for (const row of resultsEl.querySelectorAll(
       '[data-testid="rating-row"]',
     )) {
@@ -259,5 +302,60 @@
     session.submit.dataset.testid = "rating-submit-done";
   }
 
-  window.BenchRating = { start };
+  async function startBlind(groupId) {
+    // The server opens the session and issues the shuffle, and the
+    // payload it returns carries answers with NO identity attached: no
+    // model, no provider, no cost, no timing. Rendering from this and
+    // only this is what makes "the page could not have known either" a
+    // fact rather than a promise, because there is no identified paint
+    // to undo and nothing in the DOM to inspect.
+    window.BenchState.newViewEpoch();
+    resultsEl.replaceChildren();
+    runControlsEl.replaceChildren();
+    labelEl.textContent = "Blind rating: comparison #" + groupId;
+    let payload;
+    try {
+      const resp = await fetch("/groups/" + groupId + "/blind", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      payload = await resp.json();
+    } catch (err) {
+      // Same rule as every other load here: the failure is on the page
+      // and on the console, never only in a variable.
+      console.error("blind session failed to open", err);
+      labelEl.textContent = "could not open a blind session: " + err.message;
+      return;
+    }
+    const pairs = [];
+    for (const entry of payload.cards) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.dataset.testid = "result-card";
+      const body = document.createElement("div");
+      body.className = "card-body";
+      body.textContent = entry.response_text || entry.error || "";
+      card.append(body);
+      resultsEl.append(card);
+      pairs.push({ card: card, resultId: entry.result_id, label: entry.label });
+    }
+    session = {
+      groupId: groupId,
+      cards: pairs,
+      ratings: new Map(),
+      revealed: false,
+      epoch: window.BenchState.viewEpoch,
+      serverIssued: true,
+      submit: null,
+      count: null,
+      msg: null,
+    };
+    for (const pair of pairs) ratingRow(pair.card, pair.resultId, pair.label);
+    renderPanel();
+    updateSubmit();
+  }
+
+  window.BenchRating = { start, startBlind };
 })();

@@ -145,6 +145,33 @@
       row.addEventListener("click", () =>
         run.type === "group" ? showGroup(run.id) : showRun(run.id),
       );
+      // Blind rating starts HERE, from the list, and never from a
+      // comparison already on screen. Opening it after a replay means
+      // the identities were painted first, and "hidden" in a browser is
+      // a style rule anyone can undo plus a frame the rater may already
+      // have seen. From the list there is nothing to undo: the page
+      // never held the answer key.
+      //
+      // Offered on a comparison and not on a lone run, because the whole
+      // method is hiding which of SEVERAL answers came from which model.
+      if (run.type === "group" && run.models.length > 1) {
+        const pair = document.createElement("div");
+        pair.className = "hrow-pair";
+        const blind = document.createElement("button");
+        blind.type = "button";
+        blind.className = "tool";
+        blind.dataset.testid = "history-rate-blind";
+        blind.textContent = "rate blind";
+        blind.title =
+          "open this comparison with every identity withheld by the " +
+          "server, rate the answers, then reveal";
+        blind.addEventListener("click", () =>
+          window.BenchRating.startBlind(run.id),
+        );
+        pair.append(row, blind);
+        historyList.append(pair);
+        continue;
+      }
       historyList.append(row);
     }
     // A full page means there may be older entries beyond it; say so

@@ -5335,6 +5335,10 @@ def test_ratings_persist_as_human_scores_with_their_conditions(client):
     label the card wore. All three, because the normalized score alone is
     a number no rater ever saw and a blind nobody can audit."""
     group_id, ids = rated_group(client)
+    # The session is what makes the record's blind flag true; the body's
+    # own claim is ignored either way.
+    opened = client.post(f"/groups/{group_id}/blind", json={})
+    assert opened.status_code == 201, opened.text
 
     resp = client.post(
         f"/groups/{group_id}/ratings",
@@ -5851,6 +5855,7 @@ def test_human_ratings_appear_as_their_own_scorer_row_with_the_blind_flag(
     ).fetchone()["id"]
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    client.post(f"/groups/{group_id}/blind", json={})
     client.post(
         f"/groups/{group_id}/ratings",
         json={
@@ -6678,6 +6683,7 @@ def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path)
     ).fetchone()["id"]
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    client.post(f"/groups/{group_id}/blind", json={})
     client.post(
         f"/groups/{group_id}/ratings",
         json={
@@ -6695,3 +6701,252 @@ def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path)
     assert report["ranking"]["metric"] == "human"
     assert report["ranking"]["ratings"] == len(ids)
     assert report["ranking"]["blind_ratings"] == len(ids)
+
+
+# ---- Phase I.2 J6: the blind session is the server's.
+
+
+@respx.mock
+def test_review_repro_a_client_forged_blind_claim_persists_as_not_blind(client):
+    """The client is not a competent witness to its own blindness.
+
+    The flag used to be whatever the body said, on the reasoning that
+    only the client knows what was on screen. That is true and it is
+    exactly the problem: a page that revealed the identities and then
+    posted blind=true would be testifying about its own past, and nothing
+    could check it. A blind rating is evidence about the conditions a
+    person judged under, so the record has to come from the one party
+    that can be checked.
+    """
+    group_id, ids = rated_group(client)
+
+    # No session opened. The body insists anyway.
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 4}]},
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+@respx.mock
+def test_the_blind_payload_carries_no_identity_at_all(client):
+    """Anonymized BEFORE any identified paint, which is the whole feature.
+
+    A client that fetched the identified comparison and hid the
+    identities has already painted them, and "hidden" in a browser is a
+    style rule anyone can undo plus a frame the rater may have seen. The
+    server issues the shuffle and sends answers with nothing attached.
+    """
+    group_id, ids = rated_group(client)
+
+    payload = client.post(f"/groups/{group_id}/blind", json={}).json()
+
+    assert payload["blind"] is True
+    assert sorted(c["result_id"] for c in payload["cards"]) == sorted(ids)
+    assert sorted(c["label"] for c in payload["cards"]) == ["A", "B"]
+    body = json.dumps(payload)
+    for absent in ("model/alpha", "model/beta", "latency_ms", "cost_usd", "provider"):
+        assert absent not in body
+    # The answers themselves are there: they are what is being rated.
+    assert all("response_text" in c for c in payload["cards"])
+
+
+@respx.mock
+def test_the_reveal_closes_the_session_one_way(client):
+    """Once somebody has seen the answer key, no later rating of this
+    comparison can honestly claim not to have."""
+    group_id, ids = rated_group(client)
+    client.post(f"/groups/{group_id}/blind", json={})
+
+    revealed = client.post(f"/groups/{group_id}/blind/reveal", json={})
+    assert revealed.status_code == 200
+    assert {i["model"] for i in revealed.json()["identities"]} == {
+        "model/alpha",
+        "model/beta",
+    }
+
+    # Reopening is refused, and a rating after the reveal is recorded as
+    # what it is rather than refused: a sighted rating is still a rating.
+    assert client.post(f"/groups/{group_id}/blind", json={}).status_code == 409
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 4}]},
+    )
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+# ---- Phase I.2 J6: lifecycle, arms, seeds, cost.
+
+
+@respx.mock
+def test_review_repro_a_failed_start_does_not_wedge_later_starts(client, tmp_path):
+    """The singleton was claimed before the runner's try, and the dataset
+    read happens inside the runner. So one unreadable file left `active`
+    set forever: every later start answered "an experiment is already
+    running" and named an experiment that had already failed, until the
+    process was restarted.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    doomed = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    healthy = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    Path(path).unlink()
+
+    started = client.post(f"/experiments/{doomed}/start", json={"dataset_path": path})
+    assert started.status_code == 202
+    for _ in range(200):
+        if client.get(f"/experiments/{doomed}").json()["status"] != "running":
+            break
+        client.get("/models")
+    assert client.get(f"/experiments/{doomed}").json()["status"] == "failed"
+
+    # The next start is not blocked by the corpse of the first.
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    again = write_dataset(tmp_path, {"id": "t1", "prompt": "a"}, name="again.jsonl")
+    second = client.post(f"/experiments/{healthy}/start", json={"dataset_path": again})
+    assert second.status_code == 202, second.text
+
+
+@respx.mock
+def test_review_repro_a_duplicated_model_is_two_fully_reported_arms(client, tmp_path):
+    """Listing one model twice is how anyone asks how much it varies run
+    to run, so it has to be the case that works.
+
+    position came from lineup.index(model), which returns the FIRST
+    match, so both copies were position 0: two paid trials collapsed into
+    one column with the second silently overwriting the first in every
+    per-position reader. It also made the seed-determinism probe
+    meaningless, since the probe is exactly this shape.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/alpha"]),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+    assert len(report["models"]) == 2
+    assert [m["position"] for m in report["models"]] == [0, 1]
+    assert [m["label"] for m in report["models"]] == [
+        "model/alpha #0",
+        "model/alpha #1",
+    ]
+    # Both arms fully reported: each ran its own trial, neither is empty.
+    for arm in report["models"]:
+        assert arm["duplicate_arm"] is True
+        assert arm["trials"]["done"] == 1
+        assert arm["trials"]["planned"] == 1
+
+
+@respx.mock
+def test_a_seed_that_would_overflow_on_the_last_repeat_is_refused(client, tmp_path):
+    """seed_for_repeat derives base + N, so bounding only the base lets a
+    legal base sit one repeat below the ceiling and overflow silently on
+    the last cell of a long run."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, task_order_seed=main.MAX_SEED - 1, repeats=4),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "plus 4 repeats reaches" in detail
+    assert "last repeat is the one that would overflow" in detail
+
+
+@respx.mock
+def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
+    """A trial that streamed tokens and then broke was charged for those
+    tokens. The total was computed over completed trials only, so it
+    under-reported a real bill by exactly what the failures cost, which
+    is the direction nobody checks.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        frames = [
+            sse({"choices": [{"delta": {"content": "hi"}}]}),
+            sse(
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.25},
+                }
+            ),
+        ]
+        # The second trial is charged and then dies without [DONE].
+        if calls["n"] != 2:
+            frames.append(DONE_MARKER)
+        return httpx.Response(200, stream=ChunkStream(frames))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta"]),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+    totals = {m["model"]: m["cost"] for m in report["models"]}
+    # Both were billed a quarter, including the one that failed.
+    assert sum(c["total_usd"] for c in totals.values()) == pytest.approx(0.5)
+    assert sum(c["billed_trials"] for c in totals.values()) == 2
+    # And judge spend is its own line rather than folded in.
+    assert report["judge_cost"] == {"total_usd": 0, "billed_calls": 0}
+
+
+@respx.mock
+def test_review_repro_a_write_between_two_exports_changes_neither(client, tmp_path):
+    """The digest must seal a MOMENT, not an interval.
+
+    The export read lazily while streaming, so a scoring pass finishing
+    part way through would land in the later lines and not the earlier
+    ones. The artifact would be internally inconsistent and its digest
+    would verify perfectly, which is the worst combination available: a
+    citation that cannot be pinned to one state of the database is not a
+    citation.
+
+    Read fully, then streamed, inside one transaction. Proven by writing
+    between two exports of the same experiment and finding both
+    unchanged: the first cannot have seen the write because it finished
+    reading before it, and the second cannot have seen it because it
+    reads the same committed state the first did.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    first = read_export(client, eid)
+    # A write lands between the two reads, of exactly the kind a scoring
+    # pass produces.
+    result_id = client.app.state.db.execute(
+        """SELECT r.id FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY r.id LIMIT 1""",
+        (eid,),
+    ).fetchone()["id"]
+    store.add_score(
+        client.app.state.db,
+        result_id,
+        {"scorer": "human", "score": 1.0, "passed": None, "detail": "late"},
+    )
+    second = read_export(client, eid)
+
+    # The first artifact is fixed: nothing written after it can reach it.
+    assert b'"late"' not in first
+    # The second sees the write, wholly rather than partly, and is itself
+    # a consistent snapshot.
+    assert b'"late"' in second
+    assert read_export(client, eid) == second
