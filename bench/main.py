@@ -34,12 +34,14 @@ from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
     DATA_POLICY_PREFS,
+    QUANTIZATION_LEVELS,
     as_money,
     as_text,
     fetch_catalog,
     judge_response,
     keepalive_socket_options,
     missing_parameters,
+    normalized_provider_slug,
     provider_preferences,
     run_model,
     stream_model,
@@ -427,6 +429,13 @@ class ExperimentCreate(BaseModel):
     # allow_fallbacks false, so a pinned provider that cannot serve is a
     # recorded failure rather than a quiet reroute.
     provider_pins: dict[str, str] | None = None
+    # Strict mode only, and optional within it. Quantization varies by
+    # host and changes what the weights actually are, so two runs of the
+    # same model served at bf16 and at int4 are not measuring the same
+    # artifact. Validated against the documented levels at creation
+    # rather than sent unchecked, because a filter that matches nothing
+    # is, under allow_fallbacks false, a run that fails.
+    quantizations: list[str] | None = Field(default=None, min_length=1, max_length=12)
     halt_on_refusal: bool = True
 
 
@@ -485,6 +494,7 @@ class ExperimentDetail(BaseModel):
     estimand_mode: str
     primary_metric: str | None
     provider_pins: dict[str, Any] | None
+    quantizations: list[str] | None
     halt_on_refusal: bool
     status: str
     status_detail: str | None
@@ -2161,6 +2171,25 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
             f"{len(body.lineup)} models is {trials} paid calls, over the "
             f"{MAX_TRIALS} limit. Shorten the dataset or the lineup.",
         )
+    if body.quantizations and body.estimand_mode != "underlying_model":
+        raise HTTPException(
+            422,
+            "quantizations narrow which hosts may serve, which is the "
+            "underlying-model estimand's business and not the routed "
+            'service\'s. Set estimand_mode to "underlying_model", or '
+            "drop the filter.",
+        )
+    if body.quantizations:
+        unknown = sorted(set(body.quantizations) - set(QUANTIZATION_LEVELS))
+        if unknown:
+            raise HTTPException(
+                422,
+                f"quantizations {unknown} are not documented levels. "
+                f"OpenRouter accepts {', '.join(QUANTIZATION_LEVELS)}; a "
+                "level it does not recognize would filter to no provider "
+                "at all, and with allow_fallbacks false that is a run "
+                "that fails rather than one served by somebody else.",
+            )
     if body.provider_pins and body.estimand_mode != "underlying_model":
         # A pin under the routed-service estimand is a contradiction: the
         # whole point of that estimand is that routing is dynamic. Refusing
@@ -2208,7 +2237,19 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 "task_order_seed": body.task_order_seed,
                 "estimand_mode": body.estimand_mode,
                 "primary_metric": body.primary_metric,
-                "provider_pins": body.provider_pins,
+                # Normalized at the boundary so the recorded pin and the
+                # sent pin are one string. A report citing a pin is only
+                # worth reading if the pin it names is the pin that rode
+                # the payload.
+                "provider_pins": (
+                    {
+                        model: normalized_provider_slug(name)
+                        for model, name in body.provider_pins.items()
+                    }
+                    if body.provider_pins
+                    else None
+                ),
+                "quantizations": body.quantizations,
                 "halt_on_refusal": body.halt_on_refusal,
                 # The same provenance every run row carries, recorded once
                 # on the experiment because it is fixed for the whole of
@@ -2256,7 +2297,9 @@ def trial_provider_prefs(
     if experiment.get("estimand_mode") != "underlying_model":
         return base
     pins = experiment.get("provider_pins") or {}
-    return strict_provider_preferences(base, pins.get(model))
+    return strict_provider_preferences(
+        base, pins.get(model), experiment.get("quantizations")
+    )
 
 
 async def run_one_trial(
@@ -2965,12 +3008,17 @@ class RatingsSubmit(BaseModel):
     model_config = FORBID_UNKNOWN
 
     ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
-    # Accepted and IGNORED. It stays on the model so an existing client
-    # is not rejected by extra="forbid" for sending what it always sent,
-    # and the server writes its own answer from the session instead. A
-    # page that revealed the identities and then claimed blind=true would
-    # be testifying about its own past, which is the one witness a blind
+    # RECEIVED AND IGNORED. Nothing reads this field. The server writes
+    # its own answer from the blind session instead, because a page that
+    # revealed the identities and then claimed blind=true would be
+    # testifying about its own past, which is the one witness a blind
     # record cannot use. See submit_ratings and blind_session_open.
+    #
+    # It remains only so a client that has always sent it is not rejected
+    # by extra="forbid" for doing what it was told to do. Removing it is
+    # a breaking change to the request shape and is a NAMED DEFERRAL,
+    # waiting for a moment when breaking changes are being made
+    # deliberately rather than as a side effect of a correctness fix.
     blind: bool = False
 
 

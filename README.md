@@ -95,6 +95,18 @@ so the provider is chosen per request and can differ between two runs of
 the same model; naming it per run makes the largest confound in a
 comparison visible rather than assumed away.
 
+**The ceiling meters CREDITS.** OpenRouter's `usage.cost` is a charge in
+credits against the balance this process can spend, and that is the number
+the ceiling accumulates and refuses on. Under BYOK (bring your own key)
+there is a second number, `usage.cost_details.upstream_inference_cost`:
+what the upstream provider billed you directly. The bench records it in
+its own column beside the credit charge and **never meters it**, because a
+direct provider bill is not money OpenRouter can decline and a ceiling
+that pretended otherwise would be describing a control it does not have.
+Off BYOK the field is absent or zero and the column is NULL, which is the
+honest record of "this run was not BYOK"; a stored zero would be
+indistinguishable from a BYOK run that genuinely cost nothing.
+
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message
@@ -760,7 +772,8 @@ curl -X POST localhost:8000/experiments \
        "lineup": ["openai/gpt-4o-mini"],
        "budget": "standard",
        "estimand_mode": "underlying_model",
-       "provider_pins": {"openai/gpt-4o-mini": "OpenAI"},
+       "provider_pins": {"openai/gpt-4o-mini": "openai"},
+       "quantizations": ["fp8"],
        "params": {"temperature": 0}}'
 ```
 
@@ -768,10 +781,32 @@ It sends `require_parameters: true`, so a provider that would have
 silently ignored the temperature is ineligible instead. The routed-service
 path deliberately does not send it, because changing which providers are
 eligible silently changes what is being measured; here that change is the
-whole point. `provider_pins` is strict-mode only, and a pin travels as
+whole point.
+
+What that check can and cannot claim is worth stating. It verifies
+AGGREGATE `reasoning` support, not that a named effort tier means the same
+thing everywhere: the reasoning-tokens documentation says that "for models
+that only support `reasoning.max_tokens`, the effort level will be set
+based on the percentages above", so a provider advertising `reasoning` may
+be translating "high" into a token allocation rather than honouring the
+tier. Strict mode checks what it can check and claims exactly that.
+
+`provider_pins` is strict-mode only, normalized to the documented
+lowercase provider slugs at creation so the recorded pin and the sent pin
+are one string, and a pin travels as
 `order` **with `allow_fallbacks: false`**, never without it: an order that
 can be departed from is a preference, and a pinned run served by somebody
-else would record a constraint that did not hold. A pin naming a model
+else would record a constraint that did not hold.
+
+`quantizations` is the other strict-mode narrowing, and it is optional.
+Quantization varies by host and changes what the weights actually are, so
+two runs of "the same model" served at bf16 and at int4 are not measuring
+the same artifact. It rides the documented provider filter and its values
+are validated against the documented levels, because a level OpenRouter
+does not recognize filters to no provider at all and, under
+`allow_fallbacks: false`, that is a run that fails. **The throughput sort
+never stabilized quantization** and never claimed to: it biases routing
+toward serious hosts, which is a different property entirely. A pin naming a model
 outside the lineup is refused, since a declaration that cannot be honored
 should not be stored as though it will be.
 

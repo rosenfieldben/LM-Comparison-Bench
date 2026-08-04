@@ -266,9 +266,37 @@ _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 #   population; a pin that can be ignored narrows nothing.
 STRICT_PREFS: dict[str, Any] = {"require_parameters": True}
 
+# The documented quantization filter, and its documented values. Pinned
+# against https://openrouter.ai/docs/guides/routing/provider-selection,
+# read 2026-08-04: "quantizations string[] - List of quantization levels
+# to filter by (e.g. ["int4", "int8"])", with the levels listed as int4,
+# int8, fp4, mxfp4, nvfp4, fp6, fp8, mxfp8, fp16, bf16, fp32 and unknown.
+#
+# Strict mode's reason for wanting it: quantization varies by host and
+# changes what the weights actually are, so two runs of "the same model"
+# served at bf16 and at int4 are not measuring the same artifact. The
+# throughput sort the routed path uses biases toward serious hosts and
+# was never a quantization control; it does not pin one and never did.
+QUANTIZATION_LEVELS = (
+    "int4",
+    "int8",
+    "fp4",
+    "mxfp4",
+    "nvfp4",
+    "fp6",
+    "fp8",
+    "mxfp8",
+    "fp16",
+    "bf16",
+    "fp32",
+    "unknown",
+)
+
 
 def strict_provider_preferences(
-    base: Mapping[str, Any], pin: str | None = None
+    base: Mapping[str, Any],
+    pin: str | None = None,
+    quantizations: list[str] | None = None,
 ) -> dict[str, Any]:
     """The provider block for one strict-mode trial.
 
@@ -286,7 +314,29 @@ def strict_provider_preferences(
     if pin is not None:
         out["order"] = [pin]
         out["allow_fallbacks"] = False
+    if quantizations:
+        out["quantizations"] = list(quantizations)
     return out
+
+
+def normalized_provider_slug(name: str) -> str:
+    """A provider name as the documented field wants it.
+
+    order takes "provider slugs", and the documentation's own example is
+    ["anthropic", "openai"]: lowercase, and not the display names that
+    appear in a catalog or a report. A pin written "Together" is what a
+    person would naturally type after reading a provider column, and
+    sending it unchanged risks a filter that matches nothing, which under
+    allow_fallbacks false is a run that fails rather than a run served by
+    somebody else. Normalizing at the boundary means the recorded pin and
+    the sent pin are the same string, which is the property a report
+    citing a pin depends on.
+
+    Pinned against
+    https://openrouter.ai/docs/guides/routing/provider-selection, read
+    2026-08-04.
+    """
+    return name.strip().lower()
 
 
 # Which supported_parameters token each control needs. The check runs
@@ -294,6 +344,18 @@ def strict_provider_preferences(
 # effort maps to "reasoning": control_payload emits it as a reasoning
 # object, and "effort" is a key inside that object rather than a
 # parameter name OpenRouter publishes.
+#
+# effort maps to "reasoning" and the check therefore verifies AGGREGATE
+# reasoning support and nothing finer. That limit is real and is stated
+# rather than glossed: per
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# read 2026-08-04, "For models that only support reasoning.max_tokens,
+# the effort level will be set based on the percentages above", so a
+# provider advertising `reasoning` may be translating the requested
+# effort into a token allocation rather than honouring the named tier.
+# Strict mode can check that reasoning is supported at all; it cannot
+# check that "high" means the same thing everywhere, and it does not
+# claim to.
 #
 # max_tokens is here even though no control sets it, because every
 # payload this bench builds carries one. Under require_parameters a
@@ -584,16 +646,27 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     instead of reaching the spend accumulator, where NaN makes every
     ceiling comparison false and a negative subtracts from the total.
 
-    cost_details.upstream_inference_cost is deliberately not persisted. It
-    is the amount the upstream provider charged under bring-your-own-key,
-    and is absent or zero for the normal credits path this bench uses, so
-    a column for it would be null on every row this bench produces.
+    cost_details.upstream_inference_cost IS persisted, into its own
+    column, and it is a different number from cost. Pinned against
+    https://openrouter.ai/docs/use-cases/usage-accounting, read
+    2026-08-04: the usage object carries "cost" (in CREDITS) alongside
+    "cost_details": {"upstream_inference_cost": N}, and that second
+    figure "is only available for BYOK (Bring Your Own Key) requests.
+    For all other requests it will be 0 or null."
+
+    So on the ordinary credits path it is absent and the column is NULL,
+    which is the honest record of "this run was not BYOK". Under BYOK the
+    two diverge and only one of them is what the operator actually paid a
+    provider. The ceiling still meters credits and only credits: it is a
+    guard on the OpenRouter balance this process can spend, and a direct
+    provider bill is not money OpenRouter can decline.
     """
     if not isinstance(usage, dict):
         return
     result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
     result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
     result["billed_cost_usd"] = as_money(usage.get("cost"))
+    result["upstream_inference_cost_usd"] = _as_upstream_cost(usage.get("cost_details"))
     # Reasoning tokens are the reason the two-tier budget exists: they are
     # billed as completion tokens and consume max_tokens, but never appear
     # in the visible answer. Cached prompt tokens are the other direction,
@@ -664,6 +737,31 @@ def _settle_generation_id(
         )
 
 
+def _as_upstream_cost(source: Any) -> str | None:
+    """The BYOK provider charge, kept verbatim as text, or None.
+
+    TEXT rather than a float because nothing in this bench computes with
+    it: the ceiling meters credits, the report's totals are over credits,
+    and this number exists to be READ by an operator reconciling against
+    a provider invoice. Storing the received value as written keeps it
+    exactly comparable to that invoice; converting it to a float and back
+    would introduce a rounding this bench has no reason to perform.
+
+    Zero degrades to None deliberately. The documentation says the field
+    "will be 0 or null" for non-BYOK requests, so a stored 0 would be
+    indistinguishable from a BYOK run that genuinely cost nothing, and
+    the absence is the more honest record of "not a BYOK run".
+    """
+    if not isinstance(source, dict):
+        return None
+    value = source.get("upstream_inference_cost")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value) or value <= 0:
+        return None
+    return repr(value)
+
+
 def _as_label(value: object) -> str | None:
     """as_text with the empty string treated as absent.
 
@@ -705,6 +803,7 @@ async def run_model(
         "finish_reason": None,
         "request_json": None,
         "billed_cost_usd": None,
+        "upstream_inference_cost_usd": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -870,6 +969,7 @@ async def stream_model(
         "finish_reason": None,
         "request_json": None,
         "billed_cost_usd": None,
+        "upstream_inference_cost_usd": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -1073,6 +1173,7 @@ async def fetch_generation(
     record: dict[str, Any] = {
         "generation_id": generation_id,
         "billed_cost_usd": None,
+        "upstream_inference_cost_usd": None,
         "provider": None,
         "quantization": None,
         "native_finish_reason": None,
@@ -1105,6 +1206,12 @@ async def fetch_generation(
         return record
 
     record["billed_cost_usd"] = as_money(data.get("total_cost"))
+    # The generation endpoint names it at the TOP level rather than under
+    # cost_details, which the streaming usage object does not. Pinned
+    # against the Get a Generation reference, read 2026-08-04, whose
+    # example response carries "total_cost": 0.0015 beside
+    # "upstream_inference_cost": 0.0012 and "is_byok": false.
+    record["upstream_inference_cost_usd"] = _as_upstream_cost(data)
     record["provider"] = _as_label(data.get("provider_name"))
     record["quantization"] = _as_label(data.get("quantization"))
     record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))

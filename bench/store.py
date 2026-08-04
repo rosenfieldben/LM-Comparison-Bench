@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS experiments (
     task_order_seed INTEGER,
     estimand_mode TEXT NOT NULL,
     primary_metric TEXT,
+    quantizations_json TEXT,
     provider_pins_json TEXT,
     halt_on_refusal INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -234,6 +235,11 @@ MIGRATIONS = [
     # decimal string and a float conversion would round money on the way
     # in; readers parse it themselves and the ceiling never reads it.
     ("experiments", "primary_metric", "TEXT"),
+    # Strict mode's optional quantization filter, stored as a JSON array
+    # beside the pins for the same reason: it is part of the declaration
+    # of what the experiment IS, and a report citing a narrowed provider
+    # population has to be able to say how it was narrowed.
+    ("experiments", "quantizations_json", "TEXT"),
     ("results", "upstream_inference_cost_usd", "TEXT"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
@@ -683,8 +689,10 @@ def save_run(
                 completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                 generation_id, finish_reason, position, request_json,
                 billed_cost_usd, reasoning_tokens, cached_tokens,
-                provider, quantization, native_finish_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                provider, quantization, native_finish_reason,
+                upstream_inference_cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?)""",
             [
                 (
                     run_id,
@@ -710,6 +718,10 @@ def save_run(
                     r.get("provider"),
                     r.get("quantization"),
                     r.get("native_finish_reason"),
+                    # Verbatim as received, not through as_money: nothing
+                    # here computes with it and a float round trip would
+                    # round money on the way in. See _as_upstream_cost.
+                    as_text(r.get("upstream_inference_cost_usd")),
                 )
                 for r in results
             ],
@@ -878,6 +890,7 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
         "provider",
         "quantization",
         "native_finish_reason",
+        "upstream_inference_cost_usd",
     ):
         row[field] = as_text(row[field])
     # position orders the replay, so junk in it must not reorder history;
@@ -913,7 +926,8 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
                   billed_cost_usd, reasoning_tokens, cached_tokens,
-                  provider, quantization, native_finish_reason
+                  provider, quantization, native_finish_reason,
+                  upstream_inference_cost_usd
            FROM results WHERE run_id = ?
            ORDER BY COALESCE(position, id), id""",
         (run_id,),
@@ -1128,12 +1142,13 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
             """INSERT INTO experiments
                (name, created_at, dataset_name, dataset_digest, lineup_json,
                 budget, params_json, repeats, task_order_seed, estimand_mode,
-                primary_metric, provider_pins_json, halt_on_refusal, status,
+                primary_metric, quantizations_json, provider_pins_json,
+                halt_on_refusal, status,
                 status_detail, app_sha, catalog_digest, data_policy,
                 tasks_total, trials_total, trials_done, trials_refused,
                 trials_failed)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, 0, 0, 0)""",
+                       ?, ?, ?, 0, 0, 0)""",
             (
                 spec["name"],
                 _now(),
@@ -1150,6 +1165,9 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
                 spec.get("task_order_seed"),
                 spec["estimand_mode"],
                 spec.get("primary_metric"),
+                json.dumps(spec["quantizations"])
+                if spec.get("quantizations")
+                else None,
                 json.dumps(spec["provider_pins"], sort_keys=True)
                 if spec.get("provider_pins")
                 else None,
@@ -1179,6 +1197,8 @@ def _experiment_row(row: sqlite3.Row) -> dict[str, Any]:
     out["params"] = _decoded_params(out.pop("params_json")) or None
     pins = out.pop("provider_pins_json")
     out["provider_pins"] = _decoded_params(pins) or None
+    quant = out.pop("quantizations_json")
+    out["quantizations"] = json.loads(quant) if quant else None
     # Stored 0/1 because SQLite has no boolean; handed back as bool so no
     # reader has to remember which spelling this column uses.
     out["halt_on_refusal"] = bool(out["halt_on_refusal"])

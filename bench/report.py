@@ -1179,6 +1179,10 @@ def export_manifest(
         "repeats": experiment["repeats"],
         "task_order_seed": experiment["task_order_seed"],
         "provider_pins": experiment["provider_pins"],
+        # How the provider population was narrowed, if it was. A report
+        # citing a strict run has to be able to say what "strict" meant
+        # for that run.
+        "quantizations": experiment.get("quantizations"),
         "halt_on_refusal": experiment["halt_on_refusal"],
         "status": experiment["status"],
         "status_detail": experiment["status_detail"],

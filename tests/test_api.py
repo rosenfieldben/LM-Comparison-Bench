@@ -6518,7 +6518,9 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
     assert len(sent) == 1
     provider = sent[0]["provider"]
     assert provider["require_parameters"] is True
-    assert provider["order"] == ["Together"]
+    # Normalized to the documented lowercase slug on the way in, so the
+    # recorded pin and the sent pin are one string.
+    assert provider["order"] == ["together"]
     assert provider["allow_fallbacks"] is False
     # The privacy promise is written last and cannot be displaced by the
     # estimand: the boot policy's keys survive the merge.
@@ -6950,3 +6952,98 @@ def test_review_repro_a_write_between_two_exports_changes_neither(client, tmp_pa
     # a consistent snapshot.
     assert b'"late"' in second
     assert read_export(client, eid) == second
+
+
+# ---- Phase I.2 J7: contract truth, pinned at read time.
+
+
+@respx.mock
+def test_a_provider_pin_is_normalized_to_the_documented_slug(client, tmp_path):
+    """order takes provider SLUGS, lowercase, and the documentation's own
+    example is ["anthropic", "openai"]. A pin written "Together" is what a
+    person would type after reading a provider column, and sending it
+    unchanged risks a filter that matches nothing, which under
+    allow_fallbacks false is a run that fails rather than one served by
+    somebody else. Normalized at the boundary so the recorded pin and the
+    sent pin are one string.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            provider_pins={"model/alpha": "  Together  "},
+        ),
+    ).json()["id"]
+
+    assert client.get(f"/experiments/{eid}").json()["provider_pins"] == {
+        "model/alpha": "together"
+    }
+
+
+@respx.mock
+def test_quantization_pins_ride_the_documented_filter(client, tmp_path):
+    """Quantization varies by host and changes what the weights actually
+    are, so two runs of the same model served at bf16 and at int4 are not
+    measuring the same artifact. The throughput sort never controlled
+    this and never claimed to."""
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            quantizations=["fp8", "bf16"],
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert sent[0]["provider"]["quantizations"] == ["fp8", "bf16"]
+    assert sent[0]["provider"]["require_parameters"] is True
+
+
+@respx.mock
+def test_an_undocumented_quantization_level_is_refused(client, tmp_path):
+    """A level OpenRouter does not recognize filters to no provider at
+    all, and with allow_fallbacks false that is a run that fails."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            quantizations=["int3"],
+        ),
+    )
+
+    assert resp.status_code == 422
+    assert "not documented levels" in resp.json()["detail"]
+    assert "int4" in resp.json()["detail"]
+
+
+@respx.mock
+def test_quantization_pins_are_refused_under_the_routed_service_estimand(
+    client, tmp_path
+):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, quantizations=["fp8"])
+    )
+
+    assert resp.status_code == 422
+    assert "underlying-model estimand's business" in resp.json()["detail"]

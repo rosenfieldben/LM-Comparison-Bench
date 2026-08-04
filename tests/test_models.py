@@ -14,6 +14,7 @@ from bench.models import (
     fetch_catalog,
     judge_response,
     missing_parameters,
+    normalized_provider_slug,
     run_model,
     strict_provider_preferences,
 )
@@ -2000,3 +2001,67 @@ def test_a_pin_is_a_hard_restriction_and_never_a_preference():
     }
     assert "allow_fallbacks" not in unpinned
     assert "order" not in unpinned
+
+
+# ---- Phase I.2 J7: BYOK, captured but never metered.
+
+
+@respx.mock
+async def test_the_byok_upstream_charge_is_captured_beside_the_credit_cost(client):
+    """Two different numbers, and only one of them is what the operator
+    paid a provider directly.
+
+    Pinned against the usage-accounting page, read 2026-08-04: the usage
+    object carries "cost" in CREDITS alongside
+    "cost_details": {"upstream_inference_cost": N}, and that second
+    figure "is only available for BYOK (Bring Your Own Key) requests.
+    For all other requests it will be 0 or null."
+    """
+    body = json.loads(json.dumps(FIXTURE))
+    body["usage"] = {
+        "prompt_tokens": 10,
+        "completion_tokens": 20,
+        "cost": 0.95,
+        "cost_details": {"upstream_inference_cost": 19},
+    }
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    out = await run_model("hi", "a/b", client, max_tokens=100)
+
+    # The ceiling's number stays the credit charge.
+    assert out["billed_cost_usd"] == 0.95
+    # And the direct provider bill is beside it, verbatim as text.
+    assert out["upstream_inference_cost_usd"] == "19"
+
+
+@respx.mock
+async def test_a_non_byok_response_records_no_upstream_charge(client):
+    """The documentation says the field "will be 0 or null" off BYOK, so
+    a stored 0 would be indistinguishable from a BYOK run that genuinely
+    cost nothing. Absence is the more honest record."""
+    for details in (
+        {},
+        {"upstream_inference_cost": 0},
+        {"upstream_inference_cost": None},
+    ):
+        body = json.loads(json.dumps(FIXTURE))
+        body["usage"] = {"cost": 0.5, "cost_details": details}
+        respx.post(OPENROUTER_URL).respond(json=body)
+
+        out = await run_model("hi", "a/b", client, max_tokens=100)
+
+        assert out["billed_cost_usd"] == 0.5
+        assert out["upstream_inference_cost_usd"] is None
+
+
+def test_a_pin_normalizes_to_the_documented_lowercase_slug():
+    assert normalized_provider_slug("  Together  ") == "together"
+    assert normalized_provider_slug("DeepInfra") == "deepinfra"
+
+
+def test_quantizations_ride_the_documented_filter_and_only_when_asked():
+    pinned = strict_provider_preferences({"sort": "price"}, None, ["fp8"])
+    plain = strict_provider_preferences({"sort": "price"})
+
+    assert pinned["quantizations"] == ["fp8"]
+    assert "quantizations" not in plain
