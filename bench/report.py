@@ -391,23 +391,33 @@ def build_report(
     trials: dict[tuple[int, str], dict[str, list[dict[str, Any]]]] = {
         arm: {} for arm in arms
     }
+    # Models whose arms had to be reconstructed from row order somewhere
+    # in this experiment; see _cell_arms. Collected across cells because
+    # the caveat belongs to the arm on every page it appears on, not only
+    # to the cell that earned it.
+    reconstructed: set[str] = set()
     for group in groups:
         task_id = group["task_id"]
         seen: set[tuple[int, str]] = set()
-        for run in runs_by_group.get(group["id"], []):
-            for result in run["results"]:
-                arm = _arm_of(result, trials, by_model)
-                if arm is None:
-                    continue
-                seen.add(arm)
-                trials[arm].setdefault(task_id, []).append(
-                    {
-                        "outcome": trial_outcome(result, run),
-                        "result": result,
-                        "scores": scores_by_result.get(result["id"], []),
-                        "task_id": task_id,
-                    }
-                )
+        rows = [
+            (run, result)
+            for run in runs_by_group.get(group["id"], [])
+            for result in run["results"]
+        ]
+        assignment, ambiguous = _cell_arms(rows, by_model)
+        reconstructed |= ambiguous
+        for (run, result), arm in zip(rows, assignment, strict=True):
+            if arm is None:
+                continue
+            seen.add(arm)
+            trials[arm].setdefault(task_id, []).append(
+                {
+                    "outcome": trial_outcome(result, run),
+                    "result": result,
+                    "scores": scores_by_result.get(result["id"], []),
+                    "task_id": task_id,
+                }
+            )
         # Declared members with no row at all. Recorded as missing rather
         # than skipped, because a halted experiment's un-run trials are
         # part of what was asked and leaving them out would quietly shrink
@@ -448,6 +458,7 @@ def build_report(
             model,
             position,
             len(by_model.get(model, ())) > 1,
+            model in reconstructed,
             by_task,
             tasks_by_id,
             seed,
@@ -518,6 +529,10 @@ def build_report(
         # its threshold, and a reader comparing two reports has to know
         # which one had the file.
         "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
+        # The caveat, in the payload, as one sentence a page can print.
+        # None when nothing was reconstructed, so a reader who sees the
+        # key filled in knows it was earned rather than boilerplate.
+        "arm_caveat": LEGACY_ARM_CAVEAT if reconstructed else None,
         # The ranking always names the metric that produced it, or says
         # plainly that there is none. An unlabelled leaderboard is the
         # single easiest way to publish a claim nobody made.
@@ -544,30 +559,76 @@ def build_report(
     }
 
 
-def _arm_of(
-    result: dict[str, Any],
-    trials: dict[tuple[int, str], Any],
+LEGACY_ARM_CAVEAT = (
+    "some arms below were reconstructed from row order rather than read "
+    "from the record. Two or more rows in one cell claimed the same "
+    "lineup position, which every pre-I.2 run did for a duplicated model "
+    "because position came from lineup.index() and that returns the first "
+    "match. The trials themselves are real and their costs are real; "
+    "WHICH of the duplicated arms each one belongs to is a reconstruction, "
+    "so treat a difference between two arms of the same model in this "
+    "experiment as unproven"
+)
+
+
+def _cell_arms(
+    rows: list[tuple[dict[str, Any], dict[str, Any]]],
     by_model: dict[str, list[int]],
-) -> tuple[int, str] | None:
-    """Which lineup slot this row belongs to, or None if it belongs to none.
+) -> tuple[list[tuple[int, str] | None], set[str]]:
+    """One cell's rows mapped to lineup slots, plus the models it guessed.
 
-    The recorded position decides, because that is what the runner wrote
-    and it is the only field that can tell two copies of one model apart.
+    The recorded position decides whenever it can, because that is what
+    the runner wrote and it is the only field that can tell two copies of
+    one model apart. "Whenever it can" means every row of that model in
+    this cell carries a distinct position that the model actually
+    occupies.
 
-    The fallback exists for rows whose position predates the column or
-    was never set: if the model occupies exactly one slot there is no
-    ambiguity and using it recovers the row. If it occupies two, there is
-    no honest answer and the row is dropped rather than assigned to a
-    coin flip, which would put one arm's trial in the other's column.
+    IT CANNOT FOR LEGACY DUPLICATES, and the old rule made that much
+    worse than a missing label. Before I.2 the runner derived position
+    from lineup.index(model), which returns the FIRST match, so a lineup
+    listing one model twice wrote position 0 on both rows. Reading them
+    back, both mapped to arm 0 and arm 1 matched nothing, so the report
+    invented a MISSING trial for an arm that had in fact run and been
+    paid for, and handed arm 0 both charges. A phantom absence in one
+    column and a doubled bill in the other, from data that was complete.
+
+    So a collision falls back to ROW ORDER, which is the order the runner
+    wrote them in and therefore the order it ran them: recovery rather
+    than invention. It is still a guess about WHICH copy is which, and
+    that is what the caveat says. Rows beyond the available slots are
+    dropped, as they always were; slots beyond the available rows stay
+    empty and become the missing trial they genuinely are.
+
+    A model with ONE slot is never ambiguous, whatever its rows say,
+    because there is only one answer available. Recovering such a row
+    beats dropping it: dropping loses a paid trial from every denominator
+    it belongs to, which is the same class of defect one size smaller.
     """
-    model = result["model"]
-    position = result.get("position")
-    if isinstance(position, int) and (position, model) in trials:
-        return (position, model)
-    slots = by_model.get(model, [])
-    if position is None and len(slots) == 1:
-        return (slots[0], model)
-    return None
+    indices_by_model: dict[str, list[int]] = {}
+    for index, (_run, result) in enumerate(rows):
+        indices_by_model.setdefault(result["model"], []).append(index)
+    out: list[tuple[int, str] | None] = [None] * len(rows)
+    ambiguous: set[str] = set()
+    for model, indices in indices_by_model.items():
+        slots = by_model.get(model, [])
+        if not slots:
+            # A row for a model this lineup never declared. Not this
+            # experiment's, and not something to file under any arm.
+            continue
+        positions = [rows[index][1].get("position") for index in indices]
+        usable = [p for p in positions if isinstance(p, int) and p in slots]
+        if len(usable) == len(positions) == len(set(usable)):
+            # usable, not positions: same values in the same order in
+            # this branch, and the one of the two that is known to hold
+            # ints rather than whatever the column contained.
+            for index, position in zip(indices, usable, strict=True):
+                out[index] = (position, model)
+            continue
+        if len(slots) > 1:
+            ambiguous.add(model)
+        for index, slot in zip(indices, slots, strict=False):
+            out[index] = (slot, model)
+    return out, ambiguous
 
 
 def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[str, Any]:
@@ -776,6 +837,7 @@ def _model_report(
     model: str,
     position: int,
     duplicated: bool,
+    legacy_ambiguous: bool,
     by_task: dict[str, list[dict[str, Any]]],
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
@@ -849,6 +911,13 @@ def _model_report(
         # twice with different numbers and no way to say why.
         "label": f"{model} #{position}" if duplicated else model,
         "duplicate_arm": duplicated,
+        # Whether this arm's membership was reconstructed from row order
+        # rather than read off the rows. True only for a duplicated model
+        # whose legacy rows collided at one position; see _cell_arms and
+        # LEGACY_ARM_CAVEAT. Carried per arm rather than only as a
+        # report-level note, because a reader looking at one row of the
+        # table needs to know it about THAT row.
+        "legacy_ambiguous": legacy_ambiguous,
         "trials": {
             "planned": planned,
             "attempted": attempted,

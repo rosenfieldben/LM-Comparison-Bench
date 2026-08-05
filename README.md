@@ -1175,6 +1175,17 @@ judge with a lenient one publishes a figure neither produced. Human ratings
 are their own series under `human`, and deterministic scorers carry no
 judge.
 
+**A legacy duplicate never becomes a phantom.** Before I.2 the runner
+derived a result's position from `lineup.index(model)`, which returns the
+first match, so a lineup listing one model twice wrote position 0 on both
+rows. Read back under the arm rules, both mapped to arm 0 and arm 1 matched
+nothing: the report invented a **missing** trial for an arm that had run
+and been paid for, and handed arm 0 both charges. Such a cell is now
+reconstructed from row order, which is the order the runner ran them, and
+every arm of that model carries `legacy_ambiguous` with the report's
+`arm_caveat` saying that WHICH copy is which is a reconstruction. A cell
+whose rows recorded distinct positions is a record and carries no caveat.
+
 **Every arm appears in every series.** Series are discovered once across
 the whole experiment, so an arm the scoring pass never reached still gets
 its section, saying unscored on axis two and owing the series its

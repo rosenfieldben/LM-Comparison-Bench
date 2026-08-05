@@ -509,7 +509,7 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
     # No score rows anywhere, so the experiment has no series. Passed
     # explicitly rather than defaulted: series is the EXPERIMENT'S list
     # and an arm cannot derive it, which is the whole of I3.4.
-    out = _model_report("m", 0, False, by_task, {}, seed=1, series=[])
+    out = _model_report("m", 0, False, False, by_task, {}, seed=1, series=[])
     counts = out["trials"]
 
     assert counts["planned"] == 6
@@ -973,7 +973,7 @@ def test_review_repro_the_ranking_resolves_to_a_series_not_a_scorer():
 # ---- Phase I.3: a series nobody measured cannot order anything.
 
 
-def report_result(result_id, model, position, *, error=None):
+def report_result(result_id, model, position, *, error=None, cost=None):
     """One result row as the report reads it."""
     return {
         "id": result_id,
@@ -984,7 +984,7 @@ def report_result(result_id, model, position, *, error=None):
         "response_text": None if error else "hi",
         "latency_ms": 10.0,
         "ttft_ms": 5.0,
-        "cost_usd": None,
+        "cost_usd": cost,
         "billed_cost_usd": None,
         "provider": None,
     }
@@ -1167,3 +1167,81 @@ def test_review_repro_an_arm_the_scoring_pass_never_reached_still_has_a_section(
     # last, because "nobody scored it" is not a placing.
     assert out["ranking"]["judge_model"] == "j/one"
     assert {m["label"]: m["rank"] for m in out["models"]} == {"m/a": 1, "m/b": None}
+
+
+# ---- Phase I.3: legacy duplicate positions never synthesize arms.
+
+
+def test_review_repro_legacy_rows_at_one_position_do_not_invent_a_missing_arm():
+    """A pre-I.2 duplicate lineup wrote position 0 on BOTH rows, because
+    the runner derived position from lineup.index(model) and that returns
+    the first match.
+
+    Read back under the arm rules, both rows mapped to arm 0 and arm 1
+    matched nothing, so the report invented a MISSING trial for an arm
+    that had in fact run and been paid for, and handed arm 0 both
+    charges. A phantom absence in one column and a doubled bill in the
+    other, out of data that was complete. The experiment reads as half
+    broken and half twice as expensive, and neither is true.
+
+    Row order is the order the runner wrote them and therefore the order
+    it ran them, so it is recovery rather than invention. It is still a
+    guess about WHICH copy is which, which is what the caveat is for.
+    """
+    results = [
+        report_result(1, "m/a", 0, cost=0.25),
+        # The second copy's row, carrying the same position the first
+        # one did, exactly as every pre-I.2 duplicate run recorded it.
+        report_result(2, "m/a", 0, cost=0.75),
+    ]
+
+    out = one_cell_report(results, {})
+
+    arms = {m["label"]: m for m in out["models"]}
+    assert sorted(arms) == ["m/a #0", "m/a #1"]
+    # No phantom. Both arms ran, and neither is missing anything.
+    for arm in arms.values():
+        assert arm["trials"]["done"] == 1
+        assert arm["trials"]["missing"] == 0
+        assert arm["trials"]["planned"] == 1
+    # The costs land one per arm rather than both on the first.
+    assert arms["m/a #0"]["cost"]["total_usd"] == pytest.approx(0.25)
+    assert arms["m/a #1"]["cost"]["total_usd"] == pytest.approx(0.75)
+    # And the report says the membership was reconstructed, per arm and
+    # once at the top, rather than presenting a guess as a record.
+    assert [a["legacy_ambiguous"] for a in arms.values()] == [True, True]
+    assert "reconstructed from row order" in out["arm_caveat"]
+    assert "unproven" in out["arm_caveat"]
+
+
+def test_a_modern_duplicate_lineup_carries_no_caveat():
+    """The caveat has to be earned. Rows that recorded distinct positions
+    are a record, not a reconstruction, and a boilerplate caveat on every
+    duplicate lineup would train readers to ignore the one that means
+    something."""
+    results = [
+        report_result(1, "m/a", 0, cost=0.25),
+        report_result(2, "m/a", 1, cost=0.75),
+    ]
+
+    out = one_cell_report(results, {})
+
+    assert out["arm_caveat"] is None
+    assert [m["legacy_ambiguous"] for m in out["models"]] == [False, False]
+    assert [m["cost"]["total_usd"] for m in out["models"]] == [0.25, 0.75]
+
+
+def test_a_partly_run_duplicate_cell_still_reports_the_arm_that_missed():
+    """The boundary the reconstruction must not eat. One row at position
+    0 with two slots is what a halt mid-cell leaves, and it is
+    indistinguishable from a legacy row only if you ignore the position
+    it carries. The position is usable and distinct, so it is read, and
+    the arm that never ran stays missing."""
+    out = one_cell_report(
+        [report_result(1, "m/a", 0, cost=0.25)], {}, lineup=["m/a", "m/a"]
+    )
+
+    arms = {m["label"]: m["trials"] for m in out["models"]}
+    assert arms["m/a #0"]["done"] == 1
+    assert arms["m/a #1"]["missing"] == 1
+    assert out["arm_caveat"] is None
