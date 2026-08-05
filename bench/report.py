@@ -611,20 +611,29 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
             available,
             models,
         )
+    # RANKABLE series only, and everything below is computed over those.
+    # A series nobody measured cannot order anything; see rankable_series
+    # for what happened when one tried.
+    rankable = rankable_series(metric, models)
+    if not rankable:
+        return _ranking(
+            None,
+            None,
+            f"{metric} measured nothing on any arm: every value behind "
+            "its means is a failure-inclusive zero or absent entirely, "
+            "so an ordering would put the arms that failed above the "
+            "arms nobody scored. The sections are published in full; the "
+            "ranking waits for a scoring pass that produced a number",
+            available,
+            models,
+        )
     # A metric has to resolve to ONE series. Two judges under the chosen
     # scorer is the same question one level down, "better according to
     # whom", and averaging them would publish a number neither judge
     # produced. So the ranking is withheld and names the judges rather
     # than picking one, exactly as it withholds rather than picking a
     # scorer alphabetically.
-    judges = sorted(
-        {
-            s["judge_model"]
-            for m in models
-            for s in m["scorers"]
-            if s["scorer"] == metric and s["judge_model"] is not None
-        }
-    )
+    judges = sorted(judge for judge in rankable if judge is not None)
     if len(judges) > 1:
         return _ranking(
             None,
@@ -645,6 +654,41 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     # judgeless before judged, so the ranking named `judge` and ordered
     # every model on the gap row's empty mean.
     return _ranking(metric, judges[0] if judges else None, reason, available, models)
+
+
+def rankable_series(metric: str, models: list[dict[str, Any]]) -> set[str | None]:
+    """Which of this metric's series could order anything: judge_model set.
+
+    A SERIES IS RANKABLE ONLY IF SOMEBODY MEASURED IT. `measured` counts
+    the values in a section's mean that came from a score rather than
+    from the failure-inclusive rule, and a series where that is zero
+    across every arm has no measurement anywhere in it.
+
+    Its mean is not None, which is the trap. An arm whose trials all
+    errored gets a 0.0 per trial from the failure-inclusive rule, so its
+    mean is 0.0: a real number, the lowest one available, and the only
+    number in the series if its neighbours' trials went unscored and
+    reported None. min_ranks then ranks the arm that failed everything
+    FIRST, because it is the only arm with a value, and the report says
+    nothing to suggest that is what happened. Failing every trial came
+    first on the leaderboard.
+
+    The judgeless failure series is the same defect with a different
+    cause. A scoring pass run with no judge model records a row under
+    scorer `judge` with a NULL judge_model and a NULL score, so the
+    series exists, measures nothing, and is a candidate for exactly this.
+
+    Both are COVERAGE material, never ranking material. They belong on
+    the page (the sections publish in full, and the coverage counters are
+    where "nobody scored this" is supposed to be read) and they do not
+    belong in an ordering.
+    """
+    return {
+        s["judge_model"]
+        for m in models
+        for s in m["scorers"]
+        if s["scorer"] == metric and s.get("measured")
+    }
 
 
 def _ranking(
@@ -958,7 +1002,7 @@ def _scorer_report(
     values_by_task: dict[str, list[float]] = {}
     scored = failed = unscored = 0
     passed = usable_verdicts = eligible = 0
-    blind_rows = self_judged_rows = rated = 0
+    blind_rows = self_judged_rows = rated = measured = 0
     for task_id, trials in by_task.items():
         if task_id not in mine:
             # Another scorer's task. Not this section's business, on
@@ -1024,6 +1068,13 @@ def _scorer_report(
                 values_by_task.setdefault(task_id, []).append(0.0)
             elif value is not None:
                 values_by_task.setdefault(task_id, []).append(value)
+                # The value came from a SCORE rather than from the
+                # failure-inclusive rule. Counted because a mean of 0.0
+                # built entirely from failure zeros and a mean of 0.0
+                # somebody measured are the same number and different
+                # claims, and only the second one can order anything.
+                # See rankable_series.
+                measured += 1
             # The pass rate's population: tasks whose author declared a
             # threshold. A task without one contributes to the mean and
             # not to the rate, which is what "pass rate where a threshold
@@ -1046,6 +1097,12 @@ def _scorer_report(
         "judge_model": judge_model,
         "mean": sum(flat) / len(flat) if flat else None,
         "n": len(flat),
+        # How many of those n values are measurements rather than
+        # failure-inclusive zeros. n is the mean's denominator; this is
+        # how much of it anybody actually scored, and the difference is
+        # what tells "scored zero" from "never answered". Zero here means
+        # the series measured NOTHING, whatever its mean says.
+        "measured": measured,
         "interval": cluster_bootstrap(values_by_task, seed) if flat else None,
         # Axis two, reported as its own numbers rather than folded into
         # anything. scoring_failure_rate is also the measurement the

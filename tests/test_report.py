@@ -14,6 +14,7 @@ from bench.report import (
     _model_report,
     _provider_counts,
     _scorer_report,
+    build_report,
     choose_metric,
     cluster_bootstrap,
     min_ranks,
@@ -614,9 +615,15 @@ def test_a_scorer_the_file_never_mentions_falls_back_to_its_rows():
 # ---- Ranking: an ordering is a claim, and it names its metric.
 
 
-def section(scorer, judge_model=None, blind=0, rated=0, mean=1.0):
-    """One series as choose_metric sees it: scorer, judge, and the flags
-    the human composition line is built from."""
+def section(scorer, judge_model=None, blind=0, rated=0, mean=1.0, measured=1):
+    """One series as choose_metric sees it: scorer, judge, the flags the
+    human composition line is built from, and how much of the mean was
+    measured rather than filled in by the failure-inclusive rule.
+
+    measured defaults to 1, meaning "somebody scored this", because these
+    cases are about which metric a ranking resolves TO. measured=0 is the
+    unrankable series and it has its own cases below.
+    """
     return {
         "scorer": scorer,
         "judge_model": judge_model,
@@ -624,6 +631,7 @@ def section(scorer, judge_model=None, blind=0, rated=0, mean=1.0):
         "interval": None,
         "blind": blind,
         "rated": rated,
+        "measured": measured,
     }
 
 
@@ -957,3 +965,155 @@ def test_review_repro_the_ranking_resolves_to_a_series_not_a_scorer():
     assert out["metric"] == "judge"
     # The series, named. Before the fix nothing here said which.
     assert out["judge_model"] == "judge/one"
+
+
+# ---- Phase I.3: a series nobody measured cannot order anything.
+
+
+def report_result(result_id, model, position, *, error=None):
+    """One result row as the report reads it."""
+    return {
+        "id": result_id,
+        "model": model,
+        "position": position,
+        "error": error,
+        "request_json": '{"model": "m"}',
+        "response_text": None if error else "hi",
+        "latency_ms": 10.0,
+        "ttft_ms": 5.0,
+        "cost_usd": None,
+        "billed_cost_usd": None,
+        "provider": None,
+    }
+
+
+def one_cell_report(results, scores_by_result, **experiment):
+    """A one-task, one-repeat experiment over the given result rows.
+
+    build_report rather than _scorer_report, because the defects in this
+    section are about what the RANKING does with the sections, and a
+    section-level assertion cannot see a ranking.
+    """
+    spec = {
+        "id": 1,
+        "name": "n",
+        "lineup": [r["model"] for r in results],
+        "estimand_mode": "routed_service",
+        "dataset_name": "d.jsonl",
+        "dataset_digest": "ab" * 32,
+        "repeats": 1,
+        "status": "done",
+        "status_detail": None,
+        "tasks_total": 1,
+        "primary_metric": None,
+    }
+    spec.update(experiment)
+    return build_report(
+        spec,
+        [{"id": 10, "task_id": "t1", "repeat_index": 0, "rotation_index": 0}],
+        {10: [{"id": 100, "data_policy": "standard", "results": results}]},
+        scores_by_result,
+        None,
+        seed=3,
+    )
+
+
+def gap_row(**overrides):
+    """The row a scoring pass writes when it could not produce a number.
+
+    A judge pass run with no judge model records exactly this: scorer
+    `judge`, NULL judge_model, NULL score. It is a real row, so it makes
+    the task the scorer's business, and it measures nothing.
+    """
+    row = {
+        "scorer": "judge",
+        "judge_model": None,
+        "score": None,
+        "passed": None,
+        "detail": "no judge model was given for this scoring pass",
+        "blind": 0,
+        "self_judged": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "id": 1,
+    }
+    row.update(overrides)
+    return row
+
+
+def test_review_repro_a_failure_only_series_does_not_crown_the_arm_that_failed():
+    """The reviewer's shape, and it is worse than a missing ranking.
+
+    One arm answered and nobody scored it, so its mean is None. One arm
+    errored, so the failure-inclusive rule gave that trial a 0.0 and its
+    mean is 0.0: a real number, the lowest one available, and the only
+    number in the series. min_ranks ranks by value and skips None, so the
+    arm that failed every trial came FIRST on the leaderboard, and
+    nothing on the page said why.
+
+    The mean is not the lie. 0.0 is the correct failure-inclusive mean
+    for an arm that errored. The lie is the ORDERING built on top of it,
+    which claims a comparison was made when the only thing measured was
+    that one arm did not answer.
+    """
+    results = [
+        report_result(1, "m/a", 0),
+        report_result(2, "m/b", 1, error="HTTP 500 from OpenRouter"),
+    ]
+
+    out = one_cell_report(results, {1: [gap_row()], 2: [gap_row(id=2)]})
+
+    # Withheld, and the reason says which fact withheld it.
+    assert out["ranking"]["metric"] is None
+    assert "measured nothing on any arm" in out["ranking"]["reason"]
+    # Nobody is crowned. Not the errored arm, not anybody.
+    assert [m["rank"] for m in out["models"]] == [None, None]
+    # And the sections still publish in full: this is coverage material,
+    # which is a thing to READ, not a thing to delete.
+    sections = {m["label"]: m["scorers"][0] for m in out["models"]}
+    assert sections["m/a"]["mean"] is None
+    assert sections["m/b"]["mean"] == 0.0
+    assert sections["m/b"]["n"] == 1
+    # The counter the rule turns on: n is the mean's denominator, and
+    # none of it was measured.
+    assert [s["measured"] for s in sections.values()] == [0, 0]
+    assert sections["m/a"]["coverage"]["scoring_failed"] == 1
+
+
+def test_a_declared_primary_that_measured_nothing_is_withheld_by_name():
+    """Declaring the metric does not conjure a measurement. The
+    declaration answers "better at what"; it cannot answer "better by how
+    much" when the answer is that nobody looked."""
+    results = [
+        report_result(1, "m/a", 0),
+        report_result(2, "m/b", 1, error="HTTP 500 from OpenRouter"),
+    ]
+
+    out = one_cell_report(
+        results,
+        {1: [gap_row()], 2: [gap_row(id=2)]},
+        primary_metric="judge",
+    )
+
+    assert out["ranking"]["metric"] is None
+    assert "judge measured nothing on any arm" in out["ranking"]["reason"]
+    assert [m["rank"] for m in out["models"]] == [None, None]
+
+
+def test_one_measured_arm_is_enough_to_rank_the_series():
+    """The rule is per SERIES, not per arm. Once anybody has measured it,
+    an arm that failed everything ranks below them at 0.0, which is the
+    failure-inclusive rule doing exactly its job."""
+    results = [
+        report_result(1, "m/a", 0),
+        report_result(2, "m/b", 1, error="HTTP 500 from OpenRouter"),
+    ]
+
+    out = one_cell_report(
+        results,
+        {1: [gap_row(score=0.75, judge_model="j/one")], 2: [gap_row(id=2)]},
+    )
+
+    assert out["ranking"]["metric"] == "judge"
+    assert out["ranking"]["judge_model"] == "j/one"
+    ranks = {m["label"]: m["rank"] for m in out["models"]}
+    assert ranks == {"m/a": 1, "m/b": None}

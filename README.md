@@ -1187,6 +1187,21 @@ If the ranking metric resolves to more than one judge, the ranking is
 withheld and names them. It is the same question one level down: better
 according to whom.
 
+**A series nobody measured cannot order anything.** Every section carries
+`measured`: how many of the `n` values behind its mean came from a score
+rather than from the failure-inclusive rule. A series where that is zero
+across every arm ranks nothing, and the ranking is withheld saying so.
+
+The reason is that the mean is not None in that case, which is the trap.
+An arm whose trials all errored gets a 0.0 per trial from the
+failure-inclusive rule, so its mean is 0.0: a real number, the lowest
+available, and the only number in the series if its neighbours' trials
+went unscored and reported None. Ranks skip None and order by value, so
+the arm that failed every trial came FIRST. The same shape arrives from a
+scoring pass run with no judge model, which records a row under `judge`
+with a NULL judge_model and a NULL score. Both are coverage material,
+which is a thing to read, not a thing to rank.
+
 **A human-ranked report states its blind composition**, as `n blind of n
 ratings`, beside the metric. A ranking built on ratings made blind is a
 different claim from one built on ratings made while the rater could see
