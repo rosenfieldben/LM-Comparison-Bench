@@ -145,6 +145,33 @@
       row.addEventListener("click", () =>
         run.type === "group" ? showGroup(run.id) : showRun(run.id),
       );
+      // Blind rating starts HERE, from the list, and never from a
+      // comparison already on screen. Opening it after a replay means
+      // the identities were painted first, and "hidden" in a browser is
+      // a style rule anyone can undo plus a frame the rater may already
+      // have seen. From the list there is nothing to undo: the page
+      // never held the answer key.
+      //
+      // Offered on a comparison and not on a lone run, because the whole
+      // method is hiding which of SEVERAL answers came from which model.
+      if (run.type === "group" && run.models.length > 1) {
+        const pair = document.createElement("div");
+        pair.className = "hrow-pair";
+        const blind = document.createElement("button");
+        blind.type = "button";
+        blind.className = "tool";
+        blind.dataset.testid = "history-rate-blind";
+        blind.textContent = "rate blind";
+        blind.title =
+          "open this comparison with every identity withheld by the " +
+          "server, rate the answers, then reveal";
+        blind.addEventListener("click", () =>
+          window.BenchRating.startBlind(run.id),
+        );
+        pair.append(row, blind);
+        historyList.append(pair);
+        continue;
+      }
       historyList.append(row);
     }
     // A full page means there may be older entries beyond it; say so
@@ -245,16 +272,32 @@
     // Blind rating is offered on a comparison and not on a lone run: the
     // whole method is hiding which of SEVERAL answers came from which
     // model, and a single card has nothing to be blind between.
+    //
+    // The same server-issued session the history list opens, not a
+    // client-side hide of the cards already on screen. This control used
+    // to call a second path that concealed the painted identities with a
+    // style rule and posted blind: true; that path is gone. What it does
+    // now is replace this view with a fresh anonymized one the server
+    // built.
+    //
+    // The title says what the button cannot fix. Reaching it means the
+    // comparison was already replayed sightedly in this tab, and no
+    // arrangement of the page can un-know that. The record is honest
+    // about the conditions at RATING time, which is what it claims to
+    // be, and the list entry above is the way to rate one that was never
+    // replayed.
     if (source.kind === "group" && source.resultIds.length > 1) {
       const rate = document.createElement("button");
       rate.type = "button";
       rate.dataset.testid = "rate-blind";
       rate.textContent = "Rate blind";
       rate.title =
-        "hide identities, cost and timing, rate each answer, then reveal";
+        "open a fresh anonymized view of this comparison from the " +
+        "server. You have already seen these answers identified here; " +
+        "start from the history list to rate one you have not";
       rate.addEventListener("click", () => {
         rate.disabled = true;
-        window.BenchRating.start(source.id, source.resultIds);
+        window.BenchRating.startBlind(source.id);
       });
       row.append(rate);
     }

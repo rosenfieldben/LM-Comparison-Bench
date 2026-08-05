@@ -6,12 +6,17 @@ response into a number a conclusion rests on, so it has to be boring
 under everything a provider might return.
 """
 
+import time
+from pathlib import Path
+
 from hypothesis import given
 from hypothesis import strategies as st
 
+from bench import scoring
 from bench.models import parse_verdict
 from bench.scoring import (
     MAX_SUBJECT_CHARS,
+    REGEX_TIMEOUT_DETAIL,
     judged_pass,
     latest_per_key,
     score_response,
@@ -266,3 +271,130 @@ def test_a_scoring_failure_is_not_a_failed_answer():
     collapsing that into a fail would put the judge's own malfunctions
     into the model's pass rate."""
     assert judged_pass({"kind": "judge", "pass_threshold": 0.5}, None) is None
+
+
+# ---- Phase I.2 J5: a regex cannot freeze the server.
+
+
+def test_review_repro_a_catastrophic_pattern_times_out_instead_of_hanging():
+    """The reviewer's shape, and the comment above MAX_SUBJECT_CHARS was
+    wrong about it.
+
+    That comment claimed bounding the pattern and the subject bounded a
+    scorer's cost "without needing a timeout Python's re does not offer".
+    Backtracking is exponential in the SUBJECT, so `(a+)+$` (six
+    characters, well inside the loader's 500-character pattern limit)
+    against ten thousand characters runs effectively forever. Measured
+    in-process at small sizes it doubles every two characters: 0.03s at
+    18, 0.11s at 20, 0.44s at 22, 1.78s at 24. Ten thousand is not a
+    slow scoring pass, it is a hung server holding a database
+    connection.
+
+    The wall-clock assertion is the proof that the pattern never ran to
+    completion anywhere: at n=24 it already costs 1.78s, so a run that
+    returns in seconds for n=10000 can only have been terminated.
+    """
+    subject = "a" * 10_000 + "b"
+
+    start = time.perf_counter()
+    out = score_response({"kind": "regex", "pattern": r"(a+)+$"}, None, subject)
+    elapsed = time.perf_counter() - start
+
+    # A scoring failure, never a guessed verdict: the bench does not know
+    # whether that pattern would have matched.
+    assert out["score"] is None
+    assert out["passed"] is None
+    assert REGEX_TIMEOUT_DETAIL in out["detail"]
+    # Generous enough for interpreter startup on a loaded machine, and
+    # many orders of magnitude below what the match itself would cost.
+    assert elapsed < 15.0
+
+
+def test_an_ordinary_pattern_still_scores_normally():
+    """The scope control. Sending the work to a child must not change any
+    answer, only bound the time one answer may take."""
+    hit = score_response({"kind": "regex", "pattern": r"\d+"}, None, "answer 42")
+    miss = score_response({"kind": "regex", "pattern": r"\d+"}, None, "no digits")
+
+    assert (hit["score"], hit["passed"]) == (1.0, True)
+    assert (miss["score"], miss["passed"]) == (0.0, False)
+
+
+def test_the_other_deterministic_scorers_stay_in_process():
+    """Named as a test because it is a deliberate limit rather than an
+    oversight: a string comparison is linear in the subject and already
+    bounded by MAX_SUBJECT_CHARS, so paying interpreter startup for one
+    would be cost with no bound bought."""
+    source = (Path(scoring.__file__)).read_text(encoding="utf-8")
+    body = source.split("def score_response")[1]
+    before_regex = body.split('if kind == "regex"')[0]
+
+    assert "run_with_deadline" not in before_regex
+    assert body.count("run_with_deadline") == 1
+
+
+def test_review_repro_the_deadline_is_measured_on_the_monotonic_clock():
+    """The constant says "seconds", and until this commit nothing said
+    seconds OF WHAT. Three readings were available and they behave
+    differently under load, under an NTP step, and under a child that
+    sleeps: CPU time, system-clock wall time, and monotonic wall time.
+    Only the last one makes the number mean one thing.
+
+    Asserted against the mechanism rather than the docstring, because a
+    comment describing a clock nothing consults is precisely the defect
+    this project keeps finding. run_with_deadline does NO time
+    arithmetic of its own: it hands the deadline to
+    multiprocessing.Process.join and the clock comes from there. That
+    chain is join -> Popen.wait -> multiprocessing.connection.wait, and
+    the last of those computes `deadline = time.monotonic() + timeout`
+    and re-derives the remaining timeout from time.monotonic() on every
+    pass.
+
+    Walked here rather than trusted, so a CPython change that swapped
+    the clock fails this test instead of quietly changing what the
+    constant means.
+    """
+    import inspect
+    import multiprocessing.connection
+    import multiprocessing.popen_fork
+    import multiprocessing.popen_spawn_posix
+    from multiprocessing.process import BaseProcess
+
+    # The seam: nothing in this module computes a deadline itself. The
+    # docstring is stripped first, because it EXPLAINS the two clocks by
+    # name and a scan that counted that would be asserting on prose.
+    source = (Path(scoring.__file__)).read_text(encoding="utf-8")
+    function = source.split("def run_with_deadline")[1].split("\ndef ")[0]
+    code = function.split('"""')[2]
+    assert "worker.join(deadline)" in code
+    assert "time.time" not in code and "time.monotonic" not in code
+
+    # The chain, walked. spawn is the start method run_with_deadline
+    # asks for, and its Popen inherits the wait that carries the clock.
+    assert (
+        multiprocessing.popen_spawn_posix.Popen.wait
+        is multiprocessing.popen_fork.Popen.wait
+    )
+    assert "self._popen.wait(timeout)" in inspect.getsource(BaseProcess.join)
+    assert "wait([self.sentinel], timeout)" in inspect.getsource(
+        multiprocessing.popen_fork.Popen.wait
+    )
+    waiter = inspect.getsource(multiprocessing.connection.wait)
+    assert "deadline = time.monotonic() + timeout" in waiter
+    assert "timeout = deadline - time.monotonic()" in waiter
+
+
+def test_the_deadline_bounds_wall_time_not_cpu_time():
+    """A child that sleeps burns no CPU and must still be cut off, which
+    is the observable difference between the two readings. Measured with
+    time.monotonic, the same clock the deadline is kept on."""
+    start = time.monotonic()
+    kind, value = scoring.run_with_deadline(r"(a+)+$", "a" * 10_000 + "b", 1.0)
+    elapsed = time.monotonic() - start
+
+    assert (kind, value) == ("timeout", None)
+    # Above the deadline, because the parent waits the full second, and
+    # far below what the match itself would cost: at n=24 it is already
+    # 1.78s and the cost doubles every two characters.
+    assert elapsed >= 1.0
+    assert elapsed < 15.0

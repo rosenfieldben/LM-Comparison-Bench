@@ -640,6 +640,10 @@ def test_string_token_counts_yield_none_cost_not_500(client):
 
 @respx.mock
 async def test_client_disconnect_persists_partial_run(client):
+    """THE WINDOW: from the client vanishing mid-stream to the row being
+    written. The money is already spent at that point and the partial
+    answer is already in hand, so the disconnect must not be what
+    decides whether either is recorded."""
     # Drive the endpoint's generator directly and close it after one
     # delta: aclose() raises GeneratorExit at the yield, the same
     # mechanism a Starlette client disconnect triggers.
@@ -1037,6 +1041,12 @@ async def settle(condition, rounds=400):
 
 @respx.mock
 async def test_stream_upstream_concurrency_never_exceeds_cap(monkeypatch, tmp_path):
+    """THE WINDOW: the whole exchange, from acquiring the slot to the
+    last chunk of the body, not merely the request. A slot released at
+    the response headers would let a fifth stream start while four were
+    still reading, so the bound would hold on paper and not on the wire;
+    the tracker below counts inside the body's consumption for exactly
+    that reason."""
     gate = asyncio.Event()
     tracker = {"in_flight": 0, "max": 0, "started": 0}
 
@@ -4224,7 +4234,11 @@ def test_a_dataset_changed_since_creation_is_refused_rather_than_run(client, tmp
 
 @respx.mock
 def test_a_stop_halts_between_trials_and_leaves_an_honest_partial(client, tmp_path):
-    """A stopped experiment is a partial record, not a failed one, and it
+    """THE WINDOW: between two trials, which is the only place a stop may
+    land. Inside a trial is a different window with a different answer:
+    that trial has already spent its money and must persist.
+
+    A stopped experiment is a partial record, not a failed one, and it
     says which it is. The trials that ran are real and stay; the ones that
     did not are visible as the difference between done and total."""
     seen = {"n": 0}
@@ -4314,6 +4328,266 @@ def test_the_ceiling_halts_the_experiment_and_says_why(client, tmp_path, monkeyp
     # refused, or never attempted because the run halted.
     assert final["trials_done"] + final["trials_refused"] <= final["trials_total"]
     assert respx.calls.call_count == 1
+
+
+@respx.mock
+def test_review_repro_a_halted_plan_reports_everything_it_owed(client, tmp_path):
+    """Eight trials planned, two run. The report must say eight.
+
+    The plan was read off the groups that happened to exist, so halting
+    early SHRANK the reported plan to exactly what ran. Two of eight came
+    back and the report said two of two: the act of stopping erased the
+    evidence that anything was skipped, and a reader had nothing on the
+    page telling them six trials were owed. That is the worst direction
+    for this defect to point, because a truncated run reads as a complete
+    one and every rate on it looks trustworthy.
+
+    Four tasks, two models, one repeat: eight trials. The stop lands
+    after the first cell, so one cell of two models ran and three cells
+    never existed at all. Those three are not_run, which is a different
+    fact from missing: missing is a hole inside a cell that ran.
+    """
+    seen = {"n": 0}
+    eid_box = {}
+
+    async def route(request):
+        # Awaited on the runner's own loop, for the reason written out in
+        # test_a_stop_halts_between_trials_and_leaves_an_honest_partial: a
+        # nested synchronous client.post re-enters the test client's
+        # portal while its loop is mid-trial, which passes alone and fails
+        # in the full suite.
+        seen["n"] += 1
+        if seen["n"] == 2:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+        {"id": "t4", "prompt": "d"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+    assert final["status"] == "stopped"
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    # The plan is published as arithmetic, so the counters can be checked
+    # against it rather than trusted.
+    assert report["plan"] == {
+        "tasks": 4,
+        "repeats": 1,
+        "models": 2,
+        "cells": 4,
+        "trials": 8,
+        "cells_recorded": 1,
+    }
+    total_planned = sum(m["trials"]["planned"] for m in report["models"])
+    total_not_run = sum(m["trials"]["not_run"] for m in report["models"])
+    assert total_planned == 8
+    assert total_not_run == 6
+    for entry in report["models"]:
+        counts = entry["trials"]
+        assert counts["planned"] == 4
+        assert counts["not_run"] == 3
+        # Every outcome still partitions the plan, not the rows on disk.
+        assert sum(counts[k] for k in OUTCOMES) == counts["planned"]
+
+
+@respx.mock
+def test_review_repro_a_refused_trial_is_reported_as_refused_not_missing(
+    client, tmp_path
+):
+    """The refusal derivation was right and had nothing to read.
+
+    trial_outcome classifies an in-era error beside a NULL request_json as
+    "refused", structurally and deliberately. But the runner returned from
+    its refusal branch before persisting anything, so no such row ever
+    existed: the mechanism was complete and unreachable. A refused trial
+    therefore surfaced as `missing`, which says the cell ran and this
+    model left no row, when what happened is that the budget declined the
+    call. A budget fact was being reported as a gap in the record.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path, lineup=["model/alpha", "model/beta"], halt_on_refusal=False
+        ),
+    ).json()["id"]
+    # The first settlement closes the gate, so the second model in the
+    # same cell is refused. One cell, two models, one of each outcome.
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["trials_refused"] == 1
+    report = client.get(f"/experiments/{eid}/report").json()
+    outcomes = {m["model"]: m["trials"] for m in report["models"]}
+    assert outcomes["model/alpha"]["done"] == 1
+    assert outcomes["model/beta"]["refused"] == 1
+    # The point of the tombstone: not missing, and not silently absent.
+    assert outcomes["model/beta"]["missing"] == 0
+    assert outcomes["model/beta"]["not_run"] == 0
+    assert outcomes["model/beta"]["refusal_rate"] == 1.0
+    # And it is a row, so the export carries it and the artifact can be
+    # audited without the database.
+    lines = export_lines(client, eid)
+    refused = [x for x in lines if x["type"] == "trial" and x["model"] == "model/beta"]
+    assert len(refused) == 1
+    assert refused[0]["outcome"] == "refused"
+    assert refused[0]["request_json"] is None
+
+
+def assert_three_surfaces_agree(client, eid):
+    """Counters, report and export tell one story about one experiment.
+
+    Three surfaces, three different derivations of the same facts, and a
+    reader can reach any of them: the progress counters while it runs, the
+    report afterwards, the export forever. If they disagree, at least one
+    published number is wrong and nothing on the page says which, so the
+    agreement is the property worth asserting rather than any one of them
+    in isolation.
+    """
+    detail = client.get(f"/experiments/{eid}").json()
+    report = client.get(f"/experiments/{eid}/report").json()
+    lines = export_lines(client, eid)
+    trials = [x for x in lines if x["type"] == "trial"]
+
+    totals = {name: 0 for name in OUTCOMES}
+    for entry in report["models"]:
+        for name in OUTCOMES:
+            totals[name] += entry["trials"][name]
+
+    # Surface one against surface two. The counters count what the runner
+    # did; the report classifies what it left behind.
+    assert detail["trials_done"] == totals["done"]
+    assert detail["trials_refused"] == totals["refused"]
+    assert detail["trials_failed"] == totals["error"] + totals["stopped"]
+    # The plan is the same number on both, and it is the declared one.
+    assert detail["trials_total"] == sum(
+        m["trials"]["planned"] for m in report["models"]
+    )
+    assert detail["trials_total"] == report["plan"]["trials"]
+
+    # Surface three. Exactly the outcomes that produced a row appear as
+    # lines; the two absences produce none, which is what they are.
+    assert len(trials) == (
+        totals["done"] + totals["error"] + totals["refused"] + totals["stopped"]
+    )
+    by_outcome: dict[str, int] = {}
+    for trial in trials:
+        by_outcome[trial["outcome"]] = by_outcome.get(trial["outcome"], 0) + 1
+    for name in ("done", "error", "refused", "stopped"):
+        assert by_outcome.get(name, 0) == totals[name], name
+    # And the artifact alone can say how much never ran.
+    assert (
+        lines[0]["tasks_total"] * lines[0]["repeats"] * len(lines[0]["lineup"])
+        == detail["trials_total"]
+    )
+
+
+@respx.mock
+def test_review_repro_the_three_surfaces_agree_on_a_halted_run(client, tmp_path):
+    """A halt is where the surfaces used to diverge.
+
+    The counters knew the plan (trials_total is stored at creation), the
+    report read it off the groups, and the export could only be counted.
+    So a stopped experiment reported one plan to a watcher and a smaller
+    one to a reader, with the export unable to arbitrate. All three now
+    derive from the same declared arithmetic.
+    """
+    eid_box = {}
+    seen = {"n": 0}
+
+    async def route(request):
+        seen["n"] += 1
+        if seen["n"] == 2:
+            await main.stop_experiment(eid_box["id"])
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a"},
+        {"id": "t2", "prompt": "b"},
+        {"id": "t3", "prompt": "c"},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    eid_box["id"] = eid
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "stopped"
+    assert_three_surfaces_agree(client, eid)
+
+
+@respx.mock
+def test_the_three_surfaces_agree_when_refusals_do_not_halt(client, tmp_path):
+    """Continue mode, the other shape. Refusals now leave rows, so the
+    export gains lines a halted run never had, and the three surfaces have
+    to stay in step across that difference too."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 1,
+                                "completion_tokens": 1,
+                                "cost": 1.0,
+                            },
+                        }
+                    ),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, halt_on_refusal=False)
+    ).json()["id"]
+    client.app.state.spend_limit_usd = 0.5
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    # Everything after the first settlement is refused, and the run ran to
+    # the end of the plan rather than halting.
+    assert final["status"] == "done"
+    assert final["trials_refused"] == 3
+    assert_three_surfaces_agree(client, eid)
 
 
 @respx.mock
@@ -5075,11 +5349,16 @@ def test_ratings_persist_as_human_scores_with_their_conditions(client):
     label the card wore. All three, because the normalized score alone is
     a number no rater ever saw and a blind nobody can audit."""
     group_id, ids = rated_group(client)
+    # The session's TOKEN is what makes the record's blind flag true; the
+    # body's own claim is ignored either way.
+    opened = client.post(f"/groups/{group_id}/blind", json={})
+    assert opened.status_code == 201, opened.text
 
     resp = client.post(
         f"/groups/{group_id}/ratings",
         json={
             "blind": True,
+            "blind_token": opened.json()["token"],
             "ratings": [
                 {"result_id": ids[0], "rating": 5, "label": "B"},
                 {"result_id": ids[1], "rating": 1, "label": "A"},
@@ -5118,9 +5397,23 @@ def test_the_middle_of_the_scale_normalizes_to_the_middle(client):
 
 
 @respx.mock
-def test_a_rating_after_the_reveal_persists_as_not_blind(client):
-    """Honesty about conditions, not a prohibition. A sighted rating is
-    still a rating; what would be wrong is recording it as blind."""
+def test_a_rating_with_no_session_at_all_persists_as_not_blind(client):
+    """THE WINDOW: no blind session was ever opened on this comparison.
+    Not the window after a reveal, which is what this test was called
+    until the window-naming lens enumerated it.
+
+    Its body never opened a session and never revealed one, so the name
+    claimed an interval the test does not enter, and it passed with the
+    reveal endpoint mutated to close nothing at all. A proof of the
+    wrong window reading as coverage of the right one, which is the
+    exact failure the lens exists to catch. The post-reveal window is
+    covered by
+    test_review_repro_a_token_replayed_after_the_reveal_persists_as_not_blind.
+
+    What it does prove is worth keeping: honesty about conditions rather
+    than a prohibition. A sighted rating is still a rating; what would
+    be wrong is recording it as blind.
+    """
     group_id, ids = rated_group(client)
 
     client.post(
@@ -5283,18 +5576,17 @@ def test_the_two_axes_are_reported_separately(client, tmp_path):
     for entry in report["models"]:
         scorer = entry["scorers"][0]
         # Axis one: every trial accounted for by outcome.
-        counted = sum(
-            entry["trials"][k]
-            for k in ("done", "error", "refused", "stopped", "missing")
-        )
-        assert counted == entry["trials"]["planned"]
-        # Axis two: every trial that produced a result accounted for by
-        # scoring state. A trial that never ran is on neither axis, so
-        # the population is the plan less what never ran.
+        counts = entry["trials"]
+        counted = sum(counts[k] for k in OUTCOMES)
+        assert counted == counts["planned"]
+        # Axis two counts exactly the quality population: the trials a
+        # mean is willing to speak for, which is done plus error. A
+        # refusal, a stop, a missing row and an un-run cell are outside
+        # it, not gaps inside it, so they are not coverage either.
         coverage = scorer["coverage"]
         assert (
             coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
-            == entry["trials"]["planned"] - entry["trials"]["missing"]
+            == counts["done"] + counts["error"]
         )
         # The scoring-failure rate is its own number, which is also the
         # response_format revisit measurement.
@@ -5574,7 +5866,10 @@ def test_the_report_surfaces_the_self_judged_flag(client, tmp_path):
 
     scorer = report["models"][0]["scorers"][0]
     assert scorer["self_judged"] == 1
-    assert scorer["judge_models"] == ["model/alpha"]
+    # The judge is named ON the series rather than collected into a list
+    # beside it: one series, one instrument, and a reader never has to
+    # infer which produced a number from where it sits on the page.
+    assert scorer["judge_model"] == "model/alpha"
 
 
 @respx.mock
@@ -5589,10 +5884,11 @@ def test_human_ratings_appear_as_their_own_scorer_row_with_the_blind_flag(
     ).fetchone()["id"]
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    opened = client.post(f"/groups/{group_id}/blind", json={})
     client.post(
         f"/groups/{group_id}/ratings",
         json={
-            "blind": True,
+            "blind_token": opened.json()["token"],
             "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
         },
     )
@@ -5642,43 +5938,59 @@ def test_a_report_for_a_missing_experiment_404s(client):
 
 import hashlib
 
-from bench.report import build_report
+from bench.report import OUTCOMES, build_report
 
 
 @respx.mock
 def two_axes_experiment(client, tmp_path):
     """An experiment shaped so the two-axes bug would corrupt its numbers.
 
-    Two tasks, two models. The second upstream call errors, so one trial
-    is an axis-one failure. Only the first task carries a scorer, so the
-    completed trials of the second task are axis-two unscored. A mean
-    that confused the two would read differently from the correct one,
-    which is what makes this the right shape to re-derive from an export.
+    Two tasks, two models. Both models' second call errors, so two trials
+    are axis-one failures. Both tasks declare `contains`, and one model's
+    score rows on the second task are then deleted, so its trial there is
+    axis-two unscored: completed, meant to be scored, and not scored.
+
+    The deletion is how the gap is built, and the reason is J2. A task
+    that declares NO scorer is now outside every section, so it can no
+    longer serve as the axis-two half: it is not that scorer's business
+    at all. A real unscored trial is one on a task that DID declare the
+    scorer, which the other model's rows witness. That cross-model
+    witnessing is exactly the asymmetry applicable_tasks is built on, so
+    the fixture now exercises it rather than sitting beside it.
     """
     calls = {"n": 0}
 
     def route(request):
         calls["n"] += 1
+        # Call 2 is model/beta on `scored`. Task-major with rotation, so
+        # the second task's entry order is reversed: 3 is beta on `gap`
+        # and 4 is alpha on `gap`. Getting that backwards is easy and the
+        # numbers below depend on it, so it is written down.
         if calls["n"] == 2:
             return httpx.Response(500)
         return httpx.Response(200, stream=alpha_stream())
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
+    scorer = {"kind": "contains"}
     path = write_dataset(
         tmp_path,
-        {
-            "id": "scored",
-            "prompt": "a",
-            "reference": "Hello",
-            "scorer": {"kind": "contains"},
-        },
-        # No scorer at all, so its trials stay unscored: the axis-two
-        # half of the shape.
-        {"id": "unscored", "prompt": "b"},
+        {"id": "scored", "prompt": "a", "reference": "Hello", "scorer": scorer},
+        {"id": "gap", "prompt": "b", "reference": "Hello", "scorer": scorer},
     )
     eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
     run_experiment_to_completion(client, eid, path)
     score_experiment_to_completion(client, eid, path)
+    # model/alpha's verdict on `gap` removed: the trial completed and
+    # nobody scored it. model/beta's row on the same task survives, so
+    # the task is still witnessed as declaring `contains`.
+    client.app.state.db.execute(
+        """DELETE FROM scores WHERE result_id IN (
+               SELECT r.id FROM results r
+               JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id
+               WHERE g.task_id = 'gap' AND r.model = 'model/alpha')"""
+    )
+    client.app.state.db.commit()
     return eid, path
 
 
@@ -5753,6 +6065,10 @@ def rebuild_from_export(lines, tasks_by_id):
             "status": manifest["status"],
             "status_detail": manifest["status_detail"],
             "lineup": manifest["lineup"],
+            # The plan's arithmetic, which is what lets the artifact say
+            # how much never ran. Counting the trial lines can only say
+            # what did.
+            "tasks_total": manifest["tasks_total"],
         },
         groups,
         runs_by_group,
@@ -5919,26 +6235,26 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
     either would re-derive a different mean here while still matching on
     an experiment where everything succeeded.
 
-    The four rows the fixture actually produces, which is worth writing
-    down because an earlier description of this fixture named three
-    trials for model/beta when it has two:
+    The four rows the fixture actually produces, rewritten for J2: both
+    tasks now declare `contains`, because a task declaring no scorer is
+    outside every section and can no longer carry the axis-two half.
 
-        model/alpha  task=scored    done   contains=1.0
-        model/beta   task=scored    error  contains=0.0
-        model/alpha  task=unscored  done   (no score rows)
-        model/beta   task=unscored  done   (no score rows)
+        model/alpha  task=scored  done   contains=1.0
+        model/beta   task=scored  error  contains=0.0
+        model/beta   task=gap     done   contains=1.0
+        model/alpha  task=gap     done   (rows deleted: unscored)
 
     Both wrong directions, as numbers, so the claim that this fixture
     discriminates is checkable rather than asserted:
 
-        correct        alpha [1.0]      -> 1.0    beta [0.0]      -> 0.0
-        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 0.0] -> 0.0
-        B: drop failed alpha [1.0]      -> 1.0    beta []         -> None
+        correct        alpha [1.0]      -> 1.0    beta [0.0, 1.0] -> 0.5
+        A: unscored=0  alpha [1.0, 0.0] -> 0.5    beta [0.0, 1.0] -> 0.5
+        B: drop failed alpha [1.0]      -> 1.0    beta [1.0]      -> 1.0
 
     So each direction is caught by one model and not the other: A moves
-    model/alpha and leaves model/beta at 0.0, B empties model/beta and
-    leaves model/alpha at 1.0. The pair is load-bearing, and asserting
-    only one of the two means would let one direction through.
+    model/alpha off 1.0 and leaves model/beta at 0.5, B moves model/beta
+    off 0.5 and leaves model/alpha at 1.0. The pair is load-bearing, and
+    asserting only one of the two means would let one direction through.
 
     Re-derived by feeding the export's own rows back through the same
     pure function the report uses, which is what makes "self-sufficient"
@@ -5975,7 +6291,7 @@ def test_review_repro_the_export_alone_re_derives_a_two_axes_aggregate(
         for m in rebuilt["models"]
     }
     assert means["model/alpha"] == (1.0, 1)  # direction A would read 0.5
-    assert means["model/beta"] == (0.0, 1)  # direction B would read None
+    assert means["model/beta"] == (0.5, 2)  # direction B would read 1.0
 
     # And the export alone reproduces every model's mean and outcome
     # counts exactly.
@@ -6231,7 +6547,9 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
     assert len(sent) == 1
     provider = sent[0]["provider"]
     assert provider["require_parameters"] is True
-    assert provider["order"] == ["Together"]
+    # Normalized to the documented lowercase slug on the way in, so the
+    # recorded pin and the sent pin are one string.
+    assert provider["order"] == ["together"]
     assert provider["allow_fallbacks"] is False
     # The privacy promise is written last and cannot be displaced by the
     # estimand: the boot policy's keys survive the merge.
@@ -6268,3 +6586,1108 @@ def test_review_repro_the_routed_service_payload_is_unchanged_by_strict_mode(
     assert payload["provider"] == {"sort": "throughput"}
     assert "require_parameters" not in sent[0].decode()
     assert "allow_fallbacks" not in sent[0].decode()
+
+
+# ---- Phase I.2 J2: the primary metric.
+
+
+@respx.mock
+def test_a_primary_metric_must_name_something_the_dataset_produces(client, tmp_path):
+    """Checked at creation, where the dataset is open and the answer is
+    knowable. At report time the only available response is an empty
+    column, and a report that ranked every model on None would still call
+    itself a ranking."""
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "reference": "b", "scorer": {"kind": "contains"}},
+    )
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, primary_metric="judge")
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "not produced by this experiment" in detail
+    # Names what it would accept, including the one scorer no dataset can
+    # declare.
+    assert "contains, human" in detail
+
+
+@respx.mock
+def test_the_primary_metric_may_be_human_even_though_no_file_declares_it(
+    client, tmp_path
+):
+    """A person decides to rate a trial after the fact, so `human` never
+    appears in a dataset. Refusing it would make the only numbers an
+    actual human produced the only ones a report may not be ordered by."""
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "reference": "b", "scorer": {"kind": "contains"}},
+    )
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, primary_metric="human")
+    )
+
+    assert resp.status_code == 201
+    detail = client.get(f"/experiments/{resp.json()['id']}").json()
+    assert detail["primary_metric"] == "human"
+
+
+@respx.mock
+def test_the_report_names_the_metric_its_ranking_used(client, tmp_path):
+    """One scorer, so no declaration is needed and the report says which
+    one it used rather than leaving the rank column unexplained."""
+    eid, path = scored_experiment(client, tmp_path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["ranking"]["metric"] == "contains"
+    assert report["ranking"]["available"] == ["contains"]
+    assert report["models"][0]["score"]["metric"] == "contains"
+    assert report["models"][0]["rank"] is not None
+
+
+@respx.mock
+def test_review_repro_two_judges_appear_as_two_attributed_series(client, tmp_path):
+    """End to end, on the reviewer's shape: score once with each judge and
+    both verdicts survive, attributed, with no combined number anywhere.
+
+    Before this the report selected on the scorer alone, so the second
+    pass overwrote the first in every published figure and nothing said a
+    first judge had ever run.
+    """
+    verdicts = {"n": 0}
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["max_tokens"] != JUDGE_MAX_TOKENS:
+            return httpx.Response(200, stream=alpha_stream())
+        verdicts["n"] += 1
+        content = (
+            '{"score": 0.9}' if body["model"] == "judge/strict" else '{"score": 0.1}'
+        )
+        return httpx.Response(
+            200,
+            json={
+                "id": f"g{verdicts['n']}",
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+            },
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "g", "scorer": {"kind": "judge"}},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path, judge_model="judge/strict")
+    score_experiment_to_completion(client, eid, path, judge_model="judge/lenient")
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    series = {s["judge_model"]: s for s in report["models"][0]["scorers"]}
+    assert set(series) == {"judge/strict", "judge/lenient"}
+    assert series["judge/strict"]["mean"] == pytest.approx(0.9)
+    assert series["judge/lenient"]["mean"] == pytest.approx(0.1)
+    # No averaged number anywhere: 0.5 is a figure neither judge produced.
+    assert all(s["mean"] != pytest.approx(0.5) for s in series.values())
+    # And the ranking withholds rather than picking a judge.
+    assert report["ranking"]["metric"] is None
+    assert "averaging judges" in report["ranking"]["reason"]
+
+
+@respx.mock
+def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path):
+    """The ruling: one surfaced line, from flags the rows already carry.
+
+    A human-ranked report built on sighted ratings is a different claim
+    from one built blind, and the reader should not have to join tables.
+    """
+    eid, path = scored_experiment(client, tmp_path)
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    ids = [r["id"] for run in detail["runs"] for r in run["results"]]
+    opened = client.post(f"/groups/{group_id}/blind", json={})
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": opened.json()["token"],
+            "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
+        },
+    )
+    client.app.state.db.execute(
+        "UPDATE experiments SET primary_metric = 'human' WHERE id = ?", (eid,)
+    )
+    client.app.state.db.commit()
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["ranking"]["metric"] == "human"
+    assert report["ranking"]["ratings"] == len(ids)
+    assert report["ranking"]["blind_ratings"] == len(ids)
+
+
+# ---- Phase I.2 J6: the blind session is the server's.
+
+
+@respx.mock
+def test_review_repro_a_client_forged_blind_claim_persists_as_not_blind(client):
+    """THE WINDOW: a rating arriving with no blind session anywhere in
+    the process, and a body insisting it was blind anyway.
+
+    The client is not a competent witness to its own blindness.
+
+    The flag used to be whatever the body said, on the reasoning that
+    only the client knows what was on screen. That is true and it is
+    exactly the problem: a page that revealed the identities and then
+    posted blind=true would be testifying about its own past, and nothing
+    could check it. A blind rating is evidence about the conditions a
+    person judged under, so the record has to come from the one party
+    that can be checked.
+    """
+    group_id, ids = rated_group(client)
+
+    # No session opened. The body insists anyway.
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 4}]},
+    )
+
+    assert resp.status_code == 201
+    assert resp.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+@respx.mock
+def test_the_blind_payload_carries_no_identity_at_all(client):
+    """THE SURFACE: the server's response body, before any browser has
+    touched it. Not what a page renders, which is a later question with
+    its own tests; if an identity is in these bytes then the page has it
+    whatever it chooses to display.
+
+    Anonymized BEFORE any identified paint, which is the whole feature.
+
+    A client that fetched the identified comparison and hid the
+    identities has already painted them, and "hidden" in a browser is a
+    style rule anyone can undo plus a frame the rater may have seen. The
+    server issues the shuffle and sends answers with nothing attached.
+    """
+    group_id, ids = rated_group(client)
+
+    payload = client.post(f"/groups/{group_id}/blind", json={}).json()
+
+    assert payload["blind"] is True
+    assert sorted(c["result_id"] for c in payload["cards"]) == sorted(ids)
+    assert sorted(c["label"] for c in payload["cards"]) == ["A", "B"]
+    body = json.dumps(payload)
+    for absent in ("model/alpha", "model/beta", "latency_ms", "cost_usd", "provider"):
+        assert absent not in body
+    # The answers themselves are there: they are what is being rated.
+    assert all("response_text" in c for c in payload["cards"])
+
+
+@respx.mock
+def test_the_reveal_closes_the_session_one_way(client):
+    """Once somebody has seen the answer key, no later rating of this
+    comparison can honestly claim not to have."""
+    group_id, ids = rated_group(client)
+    token = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+
+    revealed = client.post(f"/groups/{group_id}/blind/reveal", json={})
+    assert revealed.status_code == 200
+    assert {i["model"] for i in revealed.json()["identities"]} == {
+        "model/alpha",
+        "model/beta",
+    }
+
+    # Reopening is refused, and a rating after the reveal is recorded as
+    # what it is rather than refused: a sighted rating is still a rating.
+    assert client.post(f"/groups/{group_id}/blind", json={}).status_code == 409
+    # CARRYING THE TOKEN, so blind = 0 is the close doing its job rather
+    # than a rating that had no credential to present. Without it this
+    # assertion passed for a reason unrelated to the reveal.
+    client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
+    )
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+# ---- Phase I.2 J6: lifecycle, arms, seeds, cost.
+
+
+@respx.mock
+def test_review_repro_a_failed_start_does_not_wedge_later_starts(client, tmp_path):
+    """The singleton was claimed before the runner's try, and the dataset
+    read happens inside the runner. So one unreadable file left `active`
+    set forever: every later start answered "an experiment is already
+    running" and named an experiment that had already failed, until the
+    process was restarted.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    doomed = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    healthy = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    Path(path).unlink()
+
+    started = client.post(f"/experiments/{doomed}/start", json={"dataset_path": path})
+    assert started.status_code == 202
+    for _ in range(200):
+        if client.get(f"/experiments/{doomed}").json()["status"] != "running":
+            break
+        client.get("/models")
+    assert client.get(f"/experiments/{doomed}").json()["status"] == "failed"
+
+    # The next start is not blocked by the corpse of the first.
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    again = write_dataset(tmp_path, {"id": "t1", "prompt": "a"}, name="again.jsonl")
+    second = client.post(f"/experiments/{healthy}/start", json={"dataset_path": again})
+    assert second.status_code == 202, second.text
+
+
+@respx.mock
+def test_review_repro_a_duplicated_model_is_two_fully_reported_arms(client, tmp_path):
+    """Listing one model twice is how anyone asks how much it varies run
+    to run, so it has to be the case that works.
+
+    position came from lineup.index(model), which returns the FIRST
+    match, so both copies were position 0: two paid trials collapsed into
+    one column with the second silently overwriting the first in every
+    per-position reader. It also made the seed-determinism probe
+    meaningless, since the probe is exactly this shape.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/alpha"]),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+    assert len(report["models"]) == 2
+    assert [m["position"] for m in report["models"]] == [0, 1]
+    assert [m["label"] for m in report["models"]] == [
+        "model/alpha #0",
+        "model/alpha #1",
+    ]
+    # Both arms fully reported: each ran its own trial, neither is empty.
+    for arm in report["models"]:
+        assert arm["duplicate_arm"] is True
+        assert arm["trials"]["done"] == 1
+        assert arm["trials"]["planned"] == 1
+
+
+@respx.mock
+def test_review_repro_a_sampling_seed_that_would_overflow_is_refused(client, tmp_path):
+    """seed_for_repeat derives base + N and the runner sends the result to
+    the provider, so a base one repeat below the ceiling overflows
+    silently on the last cell of a long run.
+
+    THE FIELD, which is the whole finding. This rule shipped guarding
+    task_order_seed, which never increments: plan_trials hands it to
+    ordered_tasks once, for the whole experiment. The rule was right, the
+    comment explaining it was right, and it was pointed at a value that
+    cannot overflow while the one that can went unguarded. A check on the
+    wrong field looks exactly like coverage.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, params={"seed": main.MAX_SEED - 1}, repeats=4),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "plus 4 repeats reaches" in detail
+    assert "last repeat is the one that would overflow" in detail
+
+
+@respx.mock
+def test_a_near_ceiling_shuffle_seed_is_accepted(client, tmp_path):
+    """The other direction, and the reason the check had to move rather
+    than be added. task_order_seed is used ONCE per experiment, so a value
+    one below the ceiling is a value one below the ceiling on every cell
+    of every repeat: refusing it refused a legal experiment for arithmetic
+    that never happens."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, task_order_seed=main.MAX_SEED - 1, repeats=4),
+    )
+
+    assert resp.status_code == 201, resp.text
+    assert (
+        client.get(f"/experiments/{resp.json()['id']}").json()["task_order_seed"]
+        == main.MAX_SEED - 1
+    )
+
+
+@respx.mock
+def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
+    """A trial that streamed tokens and then broke was charged for those
+    tokens. The total was computed over completed trials only, so it
+    under-reported a real bill by exactly what the failures cost, which
+    is the direction nobody checks.
+    """
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        frames = [
+            sse({"choices": [{"delta": {"content": "hi"}}]}),
+            sse(
+                {
+                    "choices": [],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.25},
+                }
+            ),
+        ]
+        # The second trial is charged and then dies without [DONE].
+        if calls["n"] != 2:
+            frames.append(DONE_MARKER)
+        return httpx.Response(200, stream=ChunkStream(frames))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta"]),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    report = client.get(f"/experiments/{eid}/report").json()
+    totals = {m["model"]: m["cost"] for m in report["models"]}
+    # Both were billed a quarter, including the one that failed.
+    assert sum(c["total_usd"] for c in totals.values()) == pytest.approx(0.5)
+    assert sum(c["billed_trials"] for c in totals.values()) == 2
+    # And judge spend is its own line rather than folded in.
+    assert report["judge_cost"] == {"total_usd": 0, "billed_calls": 0}
+
+
+@respx.mock
+def test_review_repro_a_write_between_two_exports_changes_neither(client, tmp_path):
+    """THE WINDOW: between two whole exports, from the last byte of the
+    first to the first byte of the second. That is a real window and it
+    is not the hard one; the window INSIDE an export is covered by
+    test_review_repro_a_write_landing_mid_export_reaches_neither_export,
+    which is where the isolation actually has to hold.
+
+    The digest must seal a MOMENT, not an interval.
+
+    The export read lazily while streaming, so a scoring pass finishing
+    part way through would land in the later lines and not the earlier
+    ones. The artifact would be internally inconsistent and its digest
+    would verify perfectly, which is the worst combination available: a
+    citation that cannot be pinned to one state of the database is not a
+    citation.
+
+    Read fully, then streamed, inside one transaction. Proven by writing
+    between two exports of the same experiment and finding both
+    unchanged: the first cannot have seen the write because it finished
+    reading before it, and the second cannot have seen it because it
+    reads the same committed state the first did.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    first = read_export(client, eid)
+    # A write lands between the two reads, of exactly the kind a scoring
+    # pass produces.
+    result_id = client.app.state.db.execute(
+        """SELECT r.id FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY r.id LIMIT 1""",
+        (eid,),
+    ).fetchone()["id"]
+    store.add_score(
+        client.app.state.db,
+        result_id,
+        {"scorer": "human", "score": 1.0, "passed": None, "detail": "late"},
+    )
+    second = read_export(client, eid)
+
+    # The first artifact is fixed: nothing written after it can reach it.
+    assert b'"late"' not in first
+    # The second sees the write, wholly rather than partly, and is itself
+    # a consistent snapshot.
+    assert b'"late"' in second
+    assert read_export(client, eid) == second
+
+
+# ---- Phase I.2 J7: contract truth, pinned at read time.
+
+
+@respx.mock
+def test_a_provider_pin_is_normalized_to_the_documented_slug(client, tmp_path):
+    """order takes provider SLUGS, lowercase, and the documentation's own
+    example is ["anthropic", "openai"]. A pin written "Together" is what a
+    person would type after reading a provider column, and sending it
+    unchanged risks a filter that matches nothing, which under
+    allow_fallbacks false is a run that fails rather than one served by
+    somebody else. Normalized at the boundary so the recorded pin and the
+    sent pin are one string.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            provider_pins={"model/alpha": "  Together  "},
+        ),
+    ).json()["id"]
+
+    assert client.get(f"/experiments/{eid}").json()["provider_pins"] == {
+        "model/alpha": "together"
+    }
+
+
+@respx.mock
+def test_quantization_pins_ride_the_documented_filter(client, tmp_path):
+    """Quantization varies by host and changes what the weights actually
+    are, so two runs of the same model served at bf16 and at int4 are not
+    measuring the same artifact. The throughput sort never controlled
+    this and never claimed to."""
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            quantizations=["fp8", "bf16"],
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert sent[0]["provider"]["quantizations"] == ["fp8", "bf16"]
+    assert sent[0]["provider"]["require_parameters"] is True
+
+
+@respx.mock
+def test_an_undocumented_quantization_level_is_refused(client, tmp_path):
+    """A level OpenRouter does not recognize filters to no provider at
+    all, and with allow_fallbacks false that is a run that fails."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha"],
+            estimand_mode="underlying_model",
+            quantizations=["int3"],
+        ),
+    )
+
+    assert resp.status_code == 422
+    assert "not documented levels" in resp.json()["detail"]
+    assert "int4" in resp.json()["detail"]
+
+
+@respx.mock
+def test_quantization_pins_are_refused_under_the_routed_service_estimand(
+    client, tmp_path
+):
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, quantizations=["fp8"])
+    )
+
+    assert resp.status_code == 422
+    assert "underlying-model estimand's business" in resp.json()["detail"]
+
+
+# ---- Phase I.3: the eleven counterexamples.
+
+
+def stale_experiment_db(tmp_path, status="running"):
+    """A database holding one experiment in the given status, then closed.
+
+    Written through store rather than by hand so the row is exactly what
+    a previous process would have left, including every column the
+    manifest discipline fills in at creation.
+    """
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    experiment_id = store.create_experiment(
+        conn,
+        {
+            "name": "left running",
+            "dataset_name": "d.jsonl",
+            "dataset_digest": "ab" * 32,
+            "lineup": ["model/alpha"],
+            "budget": "standard",
+            "params": None,
+            "repeats": 1,
+            "task_order_seed": None,
+            "estimand_mode": "routed_service",
+            "provider_pins": None,
+            "halt_on_refusal": True,
+            "app_sha": "abc1234",
+            "catalog_digest": "cd" * 32,
+            "data_policy": "standard",
+            "tasks_total": 1,
+            "trials_total": 1,
+        },
+    )
+    store.set_experiment_status(conn, experiment_id, status)
+    conn.close()
+    return db_path, experiment_id
+
+
+def boot_against(monkeypatch, db_path):
+    """A TestClient over an existing database file, catalog stubbed.
+
+    The `client` fixture always starts from an empty directory, which is
+    exactly the state that cannot exhibit a stale-row bug.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(db_path))
+
+    async def fake_fetch_catalog(_client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+def test_review_repro_a_stale_running_experiment_boots_as_interrupted(
+    monkeypatch, tmp_path
+):
+    """The status vocabulary is a tuple so its writers agree, and two of
+    them did not: the lifespan's stale-row sweep and the runner's
+    cancellation path both write "interrupted", which was never listed.
+
+    set_experiment_status asserts membership, so the sweep raised inside
+    the lifespan and the app would not boot at all. Any database holding
+    one row a previous process had left running was a database this
+    build could not open, and the sweep exists precisely because such
+    rows are the ordinary consequence of a crash.
+    """
+    db_path, experiment_id = stale_experiment_db(tmp_path)
+
+    with boot_against(monkeypatch, db_path) as booted:
+        row = booted.get(f"/experiments/{experiment_id}").json()
+
+    assert row["status"] == "interrupted"
+    assert "never ran" in row["status_detail"]
+    # And a terminal status is a status a reader may cite, so it has to
+    # be in the vocabulary the writers share rather than beside it.
+    assert "interrupted" in store.EXPERIMENT_STATUSES
+
+
+@respx.mock
+def test_review_repro_a_cancelled_runner_keeps_its_paid_row_and_says_interrupted(
+    client, tmp_path
+):
+    """THE WINDOW: from the cancel landing INSIDE the upstream exchange to
+    the experiment reaching a terminal status. Not the gap between
+    trials, where a cancel is harmless, and not the moment before the
+    request leaves, where there is nothing to lose. The window is the one
+    where the money is committed and the row is not yet written.
+
+    Landing the cancel there takes care. A cancel issued while the task
+    is running only sets a flag; it is delivered at the next real
+    suspension, and the mock transport does not suspend at all, so a
+    cancel from inside the respx route is absorbed and the run ends
+    normally. That version of this test passed against the broken code
+    for the wrong reason. The stream below cancels between two chunks and
+    then awaits, so the delivery point is inside aiter_lines with the
+    usage chunk still to come.
+
+    Two defects lived in that window.
+
+    The cancel propagated out of run_one_trial before the settlement and
+    before save_run, so the call was paid for and nothing recorded it:
+    the exact outcome the shutdown path's own docstring claimed to
+    prevent.
+
+    And CancelledError is a BaseException, so `except Exception` never
+    saw it and the finally wrote whatever `status` still held, which on
+    the ordinary path is "done". A run cut off by shutdown published
+    itself as a COMPLETED experiment, with every rate in its report
+    computed against a plan a reader had no reason to doubt.
+    """
+    fired = {"done": False}
+
+    class CancelMidStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse({"choices": [{"delta": {"content": "Hel"}}]})
+            if not fired["done"]:
+                fired["done"] = True
+                # What _shutdown_runner does, minus its await: awaiting
+                # the runner from inside the runner's own trial would
+                # deadlock on the task this stream runs underneath.
+                state = client.app.state.experiment_run
+                state["stop"].set()
+                state["task"].cancel()
+            # The real suspension. Everything above ran synchronously
+            # inside the task, so the cancel is only a pending flag until
+            # here; this is the instant it is delivered.
+            await asyncio.sleep(0)
+            yield sse({"choices": [{"delta": {"content": "lo"}}]})
+            yield sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+            yield sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            )
+            yield DONE_MARKER
+
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        return httpx.Response(200, stream=CancelMidStream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "interrupted"
+    assert "settled and persisted" in final["status_detail"]
+    # The trial that was in flight is real history: text, cost and all.
+    # Exactly one upstream call was made, and exactly one row records it.
+    assert calls["n"] == 1
+    rows = client.app.state.db.execute(
+        """SELECT r.response_text, r.cost_usd FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ?""",
+        (eid,),
+    ).fetchall()
+    assert [r["response_text"] for r in rows] == ["Hello"]
+    assert rows[0]["cost_usd"] == pytest.approx(2.9e-05)
+    report = client.get(f"/experiments/{eid}/report").json()
+    assert report["models"][0]["cost"]["total_usd"] == pytest.approx(2.9e-05)
+    # Conservation across the cancel: every persisted row is counted
+    # exactly once, and the gap to the total is what never ran.
+    assert final["trials_done"] + final["trials_failed"] + final[
+        "trials_refused"
+    ] == len(rows)
+    assert final["trials_done"] == 1
+    assert final["trials_total"] == 2
+
+
+@respx.mock
+def test_review_repro_a_second_tabs_sighted_rating_persists_as_not_blind(client):
+    """THE WINDOW: from one tab opening a blind session to another tab,
+    on the same comparison, posting ratings while that session is still
+    open and unrevealed. Nothing before the open and nothing after the
+    reveal; the whole defect lived in the interval where a session
+    existed and the second tab had nothing to do with it.
+
+    The flag was a per-group boolean, so it answered "is a blind session
+    open for this group". That is TRUE FOR EVERY TAB the moment any one
+    of them opens one. A second window replaying the same comparison the
+    ordinary way, with every model name, provider and cost on screen,
+    posted its ratings into somebody else's blind and they persisted
+    blind = 1. Nothing about those ratings was blind and nothing in the
+    record said otherwise, which is the same defect as a client-forged
+    claim arriving by a longer route.
+
+    One click apart in a real browser: open the list, rate blind in one
+    tab, replay the comparison in another.
+    """
+    group_id, ids = rated_group(client)
+    blind_tab = client.post(f"/groups/{group_id}/blind", json={})
+    assert blind_tab.status_code == 201, blind_tab.text
+
+    # The second tab. It never opened a session, so it holds no token,
+    # and it is looking at the identified comparison.
+    sighted = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"ratings": [{"result_id": ids[0], "rating": 5}]},
+    )
+
+    assert sighted.status_code == 201
+    assert sighted.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+    # And the tab that DID open the session is unaffected: its token
+    # still works, so the fix is a narrowing rather than a blanket no.
+    blind = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": blind_tab.json()["token"],
+            "ratings": [{"result_id": ids[1], "rating": 5}],
+        },
+    )
+    assert blind.json()["blind"] is True
+
+
+@respx.mock
+def test_review_repro_a_token_replayed_after_the_reveal_persists_as_not_blind(client):
+    """THE WINDOW: from the reveal to any later rating bearing a token
+    issued before it. The close is one way, and a token is only worth
+    what the session behind it is worth.
+
+    A rater who reveals, sees which model wrote which answer, and then
+    re-posts with the token their page is still holding is not making a
+    blind rating however the request is shaped. The token has to die with
+    its session or it becomes a bearer credential for a claim that has
+    stopped being true.
+    """
+    group_id, ids = rated_group(client)
+    token = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+    # Blind while the session is open.
+    before = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
+    )
+    assert before.json()["blind"] is True
+
+    revealed = client.post(f"/groups/{group_id}/blind/reveal", json={})
+    assert revealed.status_code == 200
+    after = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[1], "rating": 4}],
+        },
+    )
+
+    assert after.status_code == 201
+    assert after.json()["blind"] is False
+    rows = store.scores_for_results(client.app.state.db, ids)
+    assert rows[ids[0]][0]["blind"] == 1
+    assert rows[ids[1]][0]["blind"] == 0
+    # And the session cannot be reopened to launder the same token.
+    assert client.post(f"/groups/{group_id}/blind", json={}).status_code == 409
+
+
+@respx.mock
+def test_an_invented_blind_token_persists_as_not_blind(client):
+    """THE WINDOW: no session on this comparison, and a token presented
+    anyway. The forged-boolean case one level along, now that the claim
+    is a credential rather than a flag.
+
+    No session was ever opened, so nothing issued this. The bench
+    answers only to loopback and the threat model is a stale tab rather
+    than an attacker, but a token nobody issued must fail for the same
+    reason a forged boolean did: the server is the witness."""
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "blind_token": "not-a-token-anybody-issued",
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
+    )
+
+    assert resp.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+@respx.mock
+def test_two_blind_sessions_on_one_comparison_do_not_invalidate_each_other(client):
+    """THE WINDOW: two sessions open on one comparison at the same time,
+    then the interval after a single reveal closes both.
+
+    Two people rating the same comparison on one machine are both
+    legitimately blind, and neither opening should silence the other. A
+    single stored token would have made the second open revoke the
+    first, turning a real blind rating into a sighted one for no reason
+    anybody could see."""
+    group_id, ids = rated_group(client)
+    first = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+    second = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+
+    assert first != second
+    for token, result_id in ((first, ids[0]), (second, ids[1])):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={
+                "blind_token": token,
+                "ratings": [{"result_id": result_id, "rating": 4}],
+            },
+        )
+        assert resp.json()["blind"] is True
+    # And one reveal closes both, because the answer key is out.
+    client.post(f"/groups/{group_id}/blind/reveal", json={})
+    for token in (first, second):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={
+                "blind_token": token,
+                "ratings": [{"result_id": ids[0], "rating": 4}],
+            },
+        )
+        assert resp.json()["blind"] is False
+
+
+@respx.mock
+def test_review_repro_a_write_landing_mid_export_reaches_neither_export(
+    client, tmp_path, monkeypatch
+):
+    """THE WINDOW: between two of the export's OWN internal queries, from
+    its first group read to its last score read. Not the gap between two
+    exports, which the I.2 tombstone already covered and which any
+    sequential read would pass; the window where the export is holding a
+    partly-assembled artifact.
+
+    A digest over lines that straddle two states of the database verifies
+    perfectly while describing a moment that never existed. That is the
+    worst combination available, and the previous proof could not see it:
+    it wrote between the exports, so both reads were already whole.
+
+    The write comes from a SECOND CONNECTION, which is the only shape
+    that can reach this window and is a real one: `python -m
+    bench.reconcile --apply` against a live bench is a second connection
+    by design, and is the reason connect() turns WAL on. A write on the
+    export's own connection would join its transaction and be visible to
+    it, which proves nothing about isolation.
+
+    Two exports, each with its own write injected mid-read, and neither
+    sees the write injected into it. The second DOES see the first's,
+    which is the other half: the snapshot is a snapshot, not a stale
+    cache.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+    result_id = client.app.state.db.execute(
+        """SELECT r.id FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY r.id LIMIT 1""",
+        (eid,),
+    ).fetchone()["id"]
+    writer = store.connect(str(tmp_path / "bench.db"))
+    real_scores_for_results = store.scores_for_results
+    pending = {"marker": None}
+
+    def hooked(conn, ids):
+        # Fires once per export, after the first group's rows have been
+        # read and before the rest: precisely inside the window.
+        if pending["marker"] is not None:
+            marker, pending["marker"] = pending["marker"], None
+            store.add_score(
+                writer,
+                result_id,
+                {"scorer": "human", "score": 1.0, "passed": None, "detail": marker},
+            )
+        return real_scores_for_results(conn, ids)
+
+    monkeypatch.setattr(store, "scores_for_results", hooked)
+
+    pending["marker"] = "first-injection"
+    first = read_export(client, eid)
+    pending["marker"] = "second-injection"
+    second = read_export(client, eid)
+
+    # Neither export contains the write that landed inside it.
+    assert b"first-injection" not in first
+    assert b"second-injection" not in second
+    # The second sees the first's write, wholly: a snapshot, not a stale
+    # read. That is also what makes the absence above meaningful, since a
+    # export that never saw either write would pass the first two
+    # assertions for the wrong reason.
+    assert b"first-injection" in second
+    # And a third export, with nothing injected, sees both.
+    third = read_export(client, eid)
+    assert b"first-injection" in third
+    assert b"second-injection" in third
+    writer.close()
+
+
+@respx.mock
+def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
+    client, tmp_path
+):
+    """End to end for a number that was being ingested and then lost.
+
+    usage.cost_details.upstream_inference_cost is parsed at the wire and
+    stored, and from there it reached nothing: not the served result, not
+    the export, not the report. An artifact carrying two of OpenRouter's
+    three money figures cannot be reconciled against the provider invoice
+    the run was actually paid on, which is the only use this figure has.
+
+    Never summed into the total. That total is what OpenRouter charged in
+    credits and is what the spend ceiling meters; this is what a provider
+    billed directly on a bring-your-own-key run, which OpenRouter cannot
+    decline. One number covering both would be a figure nobody is owed.
+    """
+
+    def route(request):
+        frames = [
+            sse({"choices": [{"delta": {"content": "hi"}}]}),
+            sse(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cost": 0.25,
+                        "cost_details": {"upstream_inference_cost": 0.0042},
+                    },
+                }
+            ),
+            DONE_MARKER,
+        ]
+        return httpx.Response(200, stream=ChunkStream(frames))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    # The stored row, served as the string it arrived as.
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    served = detail["runs"][0]["results"][0]
+    assert served["upstream_inference_cost_usd"] == "0.0042"
+
+    # The export line.
+    lines = [json.loads(raw) for raw in read_export(client, eid).splitlines()]
+    trial = next(line for line in lines if line["type"] == "trial")
+    assert trial["upstream_inference_cost_usd"] == "0.0042"
+    assert trial["billed_cost_usd"] == 0.25
+
+    # The report's cost section, beside the total and not inside it.
+    cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
+    assert cost["total_usd"] == pytest.approx(0.25)
+    assert cost["upstream"] == {"trials": 1, "values": ["0.0042"]}
+
+
+@respx.mock
+def test_a_report_with_no_byok_run_carries_no_upstream_line(client, tmp_path):
+    """Present only when it was earned. A key that is always there is a
+    key nobody reads, and this one is a claim that real money moved
+    somewhere the bench cannot see."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert (
+        client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]["upstream"]
+        is None
+    )
+
+
+@respx.mock
+def test_review_repro_a_failed_digest_check_does_not_wedge_later_starts(
+    client, tmp_path
+):
+    """The singleton was released on the unreadable-dataset path and not
+    on the digest-mismatch one, because each pre-run exit sat above the
+    try that owns the release and carried its own copy of it.
+
+    So one dataset edited between creation and start left `active` set
+    forever: every later start answered "an experiment is already
+    running" and named an experiment that had already failed, until the
+    process was restarted. A cleanup duplicated per exit is a cleanup
+    that will be forgotten on the next exit somebody adds, and this is
+    the exit where it was.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "original"})
+    doomed = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    healthy = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    # The bytes change under the first experiment, which is exactly what
+    # the recorded digest exists to catch.
+    Path(path).write_text('{"id": "t1", "prompt": "edited"}\n', encoding="utf-8")
+
+    final = run_experiment_to_completion(client, doomed, path)
+    assert final["status"] == "failed"
+    assert "dataset changed since this experiment was created" in final["status_detail"]
+
+    # The next start is not blocked by the corpse of the first.
+    again = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "edited"}, name="again.jsonl"
+    )
+    second = client.post(f"/experiments/{healthy}/start", json={"dataset_path": again})
+    assert second.status_code == 202, second.text
+
+
+def test_review_repro_blind_labels_past_z_continue_aa_not_punctuation(client):
+    """chr(ord("A") + slot) was fine to Z and nonsense after it.
+
+    Slot 26 is "[", then a backslash, "]", "^", "_", "`" and the
+    lowercase letters. A comparison of 27 answers labelled its cards with
+    punctuation, and the label is recorded in the score row's detail
+    ("4 of 5, shown as ^"), so the audit trail that makes a blind rating
+    checkable became unreadable at exactly the width where checking it
+    matters most.
+    """
+    assert main.BLIND_LABELS[:3] == ("A", "B", "C")
+    assert main.BLIND_LABELS[25] == "Z"
+    # The boundary, and the reason the carry subtracts one: there is no
+    # zero digit, so the sequence after Z is AA rather than BA.
+    assert main.BLIND_LABELS[26] == "AA"
+    assert main.BLIND_LABELS[27] == "AB"
+    assert main.BLIND_LABELS[51] == "AZ"
+    assert main.BLIND_LABELS[52] == "BA"
+    # Every label a comparison can carry is letters and nothing else.
+    assert all(label.isalpha() and label.isupper() for label in main.BLIND_LABELS)
+    assert len(set(main.BLIND_LABELS)) == len(main.BLIND_LABELS)
+
+
+@respx.mock
+def test_a_twenty_seven_answer_comparison_gets_letters_for_every_card(client):
+    """Through the endpoint, at the width where the old rule broke."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    for index in range(27):
+        stream_events(
+            client,
+            {"prompt": "wide", "model": f"model/m{index}", "group_id": group_id},
+        )
+
+    cards = client.post(f"/groups/{group_id}/blind", json={}).json()["cards"]
+
+    labels = sorted(card["label"] for card in cards)
+    assert len(labels) == 27
+    assert labels[-1] == "Z" and "AA" in labels
+    assert all(label.isalpha() for label in labels)

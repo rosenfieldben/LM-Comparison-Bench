@@ -13,7 +13,12 @@ ASK the same things in the same order.
 """
 
 import random
-from typing import Any
+from typing import Any, TypeVar
+
+# rotate works on whatever the lineup is made of. It rotates model names
+# in the tests and (position, model) arms in the plan, and it must not
+# quietly become two functions that could disagree about the offset.
+T = TypeVar("T")
 
 
 def ordered_tasks(
@@ -61,7 +66,7 @@ def rotation_for(lineup_size: int, task_index: int, repeat_index: int) -> int:
     return (task_index + repeat_index) % lineup_size
 
 
-def rotate(lineup: list[str], rotation: int) -> list[str]:
+def rotate(lineup: list[T], rotation: int) -> list[T]:
     """The lineup in this cell's entry order.
 
     Rotation, not shuffle: the relative order is preserved and only the
@@ -123,7 +128,12 @@ def plan_trials(
                     "task_index": task_index,
                     "repeat_index": repeat_index,
                     "rotation_index": rotation,
-                    "order": rotate(lineup, rotation),
+                    # ARMS, not model names: (position, model) pairs, so a
+                    # lineup that lists the same model twice runs it twice
+                    # and the two stay distinguishable all the way to the
+                    # report. Deriving position from the name later cannot
+                    # do that, because both copies have the same name.
+                    "order": rotate(list(enumerate(lineup)), rotation),
                 }
             )
     return out

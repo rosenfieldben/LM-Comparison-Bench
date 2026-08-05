@@ -213,7 +213,17 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
         # Empty counts as absent here, unlike the optional fields above.
         # A blank rubric is not a rubric, and the difference between
         # omitting the key and writing "" is a typo away.
-        if scorer and scorer["kind"] == JUDGE_SCORER and not task["rubric"]:
+        # Normalized first, then tested, so a reference of "   " is
+        # refused exactly like "". Whitespace is not a value a scorer can
+        # compare against: `contains` normalizes both sides and would end
+        # up asking whether the response contains the empty string, which
+        # every response does. Same trap as the empty case, wearing a
+        # disguise that looks deliberate in a file.
+        if (
+            scorer
+            and scorer["kind"] == JUDGE_SCORER
+            and not (task["rubric"] or "").strip()
+        ):
             _fail(line_no, "scorer kind judge requires a non-empty rubric")
         # The reference-comparing scorers have the same problem in the
         # other direction, and an empty reference is worse than a missing
@@ -224,7 +234,7 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
         if (
             scorer
             and scorer["kind"] in ("exact", "normalized_exact", "contains")
-            and not task["reference"]
+            and not (task["reference"] or "").strip()
         ):
             _fail(
                 line_no,

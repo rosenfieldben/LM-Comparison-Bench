@@ -1,20 +1,25 @@
-// Blind human rating on a replayed comparison. Exposed on window.BenchRating.
+// Blind human rating. Exposed on window.BenchRating.
 //
 // The point of blinding is that a rater who can see which model wrote an
-// answer is not rating the answer. So this hides identity, provider, cost
-// and timing, gives each card a neutral label in a shuffled order, and
-// reveals only after every card has been rated and the ratings are
-// already saved. Revealing before the save would let a rater see the
-// answer and then change their mind, which is the same defect wearing a
-// different hat.
+// answer is not rating the answer. ONE PATH, and it starts at the server:
+// the anonymized view is built from a payload that carries answers and
+// nothing else, under a session token the server issued, and identities
+// arrive for the first time at the reveal, after the ratings are already
+// saved. Revealing before the save would let a rater see the answer and
+// then change their mind, which is the same defect wearing a hat.
+//
+// There used to be a second path that fetched the identified comparison
+// and then hid the identities with a style rule, sending blind: true
+// with the ratings. Both halves of that were wrong. Hidden in a browser
+// is a rule anyone can undo plus a frame the rater may already have
+// seen, and a page that painted the answer key is the one witness that
+// cannot testify about its own blindness. It is gone rather than
+// deprecated, because a path nobody should use is a path nobody should
+// be able to reach.
 (function () {
   const resultsEl = document.getElementById("results");
   const runControlsEl = document.getElementById("run-controls");
-
-  // Neutral, order-free labels. Letters rather than numbers because a
-  // number reads as a rank, and a rater who thinks card 1 is the first
-  // one is already being nudged.
-  const LABELS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const labelEl = document.getElementById("run-label");
 
   // The rating scale, and it must equal RATING_MIN and RATING_MAX in
   // bench/main.py. The server validates the range it receives, so a
@@ -46,57 +51,6 @@
       return null;
     }
     return session;
-  }
-
-  function shuffled(items) {
-    // Fisher-Yates over a copy. crypto.getRandomValues rather than
-    // Math.random is deliberate overkill in one respect and not in
-    // another: it costs nothing here, and it removes any question about
-    // whether a weak generator could correlate label order with lineup
-    // order across sessions.
-    const out = items.slice();
-    const draws = new Uint32Array(out.length);
-    crypto.getRandomValues(draws);
-    for (let i = out.length - 1; i > 0; i--) {
-      const j = draws[i] % (i + 1);
-      [out[i], out[j]] = [out[j], out[i]];
-    }
-    return out;
-  }
-
-  // Everything on a card that could identify the model behind it. Hidden
-  // as a set rather than one by one at each call site, so a card that
-  // grows a new identifying field later is a change in one place.
-  //
-  // Cost and timing are here for the same reason as the name: a rater who
-  // knows one answer cost ten times another, or took four seconds longer,
-  // can often guess which model it was, and a guess is not a blind.
-  const CONCEALED = [
-    '[data-testid="card-model"]',
-    '[data-testid="card-provider"]',
-    ".metrics",
-  ];
-
-  function hideIdentity(card) {
-    for (const selector of CONCEALED) {
-      const el = card.querySelector(selector);
-      if (!el) continue;
-      // The state before the blind, so the reveal restores rather than
-      // unhides. The provider caption starts hidden when no provider was
-      // recorded, and a reveal that simply cleared hidden would show an
-      // empty caption on exactly the rows that have nothing to say.
-      el.dataset.blindWasHidden = el.hidden ? "1" : "0";
-      el.hidden = true;
-    }
-  }
-
-  function showIdentity(card) {
-    for (const selector of CONCEALED) {
-      const el = card.querySelector(selector);
-      if (!el) continue;
-      el.hidden = el.dataset.blindWasHidden === "1";
-      delete el.dataset.blindWasHidden;
-    }
   }
 
   function ratingRow(card, resultId, label) {
@@ -139,45 +93,6 @@
     session.count.textContent = done + " of " + total + " rated";
   }
 
-  // Cards, paired with the result ids they show. Read from the DOM rather
-  // than passed in, because the DOM is what the rater is actually looking
-  // at: a list handed in could drift from the cards on screen, and then
-  // the rating-to-result mapping would be wrong in exactly the way
-  // nothing on screen would reveal.
-  function cardsOnScreen(resultIds) {
-    const cards = Array.from(
-      resultsEl.querySelectorAll('[data-testid="result-card"]'),
-    );
-    return cards.map((card, index) => ({ card, resultId: resultIds[index] }));
-  }
-
-  function start(groupId, resultIds) {
-    if (current()) return;
-    const pairs = cardsOnScreen(resultIds);
-    if (pairs.length === 0) return;
-    // Labels are assigned in shuffled order, so label order carries no
-    // information about lineup order. The cards stay where they are:
-    // moving them would also work, but it would make the reveal jump the
-    // page around, and the labels alone are enough.
-    const labels = shuffled(LABELS.slice(0, pairs.length).split(""));
-    session = {
-      groupId: groupId,
-      cards: pairs,
-      ratings: new Map(),
-      revealed: false,
-      epoch: window.BenchState.viewEpoch,
-      submit: null,
-      count: null,
-      msg: null,
-    };
-    for (const [index, pair] of pairs.entries()) {
-      hideIdentity(pair.card);
-      ratingRow(pair.card, pair.resultId, labels[index]);
-    }
-    renderPanel();
-    updateSubmit();
-  }
-
   function renderPanel() {
     const panel = document.createElement("div");
     panel.className = "rating-panel";
@@ -206,8 +121,12 @@
     if (!current() || session.revealed) return;
     session.submit.disabled = true;
     session.msg.textContent = "saving";
+    // The TOKEN, and no claim. The server decides whether these ratings
+    // are blind by whether this token names a session it still has open;
+    // a flag saying "trust me, I was blind" is the one thing a page
+    // cannot honestly send about its own past.
     const payload = {
-      blind: true,
+      blind_token: session.token,
       ratings: Array.from(session.ratings, ([resultId, entry]) => ({
         result_id: resultId,
         rating: entry.rating,
@@ -238,15 +157,56 @@
     // complete either way: the reveal is a courtesy to the rater, not
     // part of the measurement.
     if (!current()) return;
-    reveal();
+    const identities = await closeServerSession(groupId);
+    if (!current()) return;
+    reveal(identities);
   }
 
-  function reveal() {
+  async function closeServerSession(groupId) {
+    // The server's session closes one way, and the close is what makes
+    // every later rating of this comparison honest about the fact that
+    // somebody has now seen the answer key. Failing to close is not
+    // worth blocking the reveal over: the ratings are already saved, and
+    // the session expiring with the process fails closed.
+    try {
+      const resp = await fetch("/groups/" + groupId + "/blind/reveal", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      // The identities array, not the envelope around it. reveal() maps
+      // over what this returns, so handing back the whole payload threw
+      // inside an async function and left the panel stuck on "saving"
+      // with the ratings already saved: a silent half-finished state
+      // that only the browser test caught.
+      return (await resp.json()).identities;
+    } catch (err) {
+      console.error("blind reveal failed", err);
+      return null;
+    }
+  }
+
+  function reveal(identities) {
     // One way. Re-blinding after a reveal would produce a rating the
     // record calls blind that was made by someone who had already seen
     // the answer, which is worse than no blind rating at all.
     session.revealed = true;
-    for (const pair of session.cards) showIdentity(pair.card);
+    // WRITTEN FOR THE FIRST TIME, never un-hidden. The blind view was
+    // built from a payload that carried no identity at all, so there is
+    // no concealed copy in the DOM to restore; if the close failed there
+    // is simply nothing to paint, and the ratings are already saved
+    // either way.
+    if (identities) {
+      const byId = new Map(identities.map((i) => [i.result_id, i.model]));
+      for (const pair of session.cards) {
+        const name = document.createElement("div");
+        name.className = "card-header";
+        name.dataset.testid = "card-model";
+        name.textContent = byId.get(pair.resultId) || "";
+        pair.card.prepend(name);
+      }
+    }
     for (const row of resultsEl.querySelectorAll(
       '[data-testid="rating-row"]',
     )) {
@@ -259,5 +219,64 @@
     session.submit.dataset.testid = "rating-submit-done";
   }
 
-  window.BenchRating = { start };
+  async function startBlind(groupId) {
+    // The server opens the session and issues the shuffle, and the
+    // payload it returns carries answers with NO identity attached: no
+    // model, no provider, no cost, no timing. Rendering from this and
+    // only this is what makes "the page could not have known either" a
+    // fact rather than a promise, because there is no identified paint
+    // to undo and nothing in the DOM to inspect.
+    window.BenchState.newViewEpoch();
+    resultsEl.replaceChildren();
+    runControlsEl.replaceChildren();
+    labelEl.textContent = "Blind rating: comparison #" + groupId;
+    let payload;
+    try {
+      const resp = await fetch("/groups/" + groupId + "/blind", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
+      payload = await resp.json();
+    } catch (err) {
+      // Same rule as every other load here: the failure is on the page
+      // and on the console, never only in a variable.
+      console.error("blind session failed to open", err);
+      labelEl.textContent = "could not open a blind session: " + err.message;
+      return;
+    }
+    const pairs = [];
+    for (const entry of payload.cards) {
+      const card = document.createElement("div");
+      card.className = "card";
+      card.dataset.testid = "result-card";
+      const body = document.createElement("div");
+      body.className = "card-body";
+      body.textContent = entry.response_text || entry.error || "";
+      card.append(body);
+      resultsEl.append(card);
+      pairs.push({ card: card, resultId: entry.result_id, label: entry.label });
+    }
+    session = {
+      groupId: groupId,
+      cards: pairs,
+      ratings: new Map(),
+      revealed: false,
+      epoch: window.BenchState.viewEpoch,
+      // The server's proof that THIS page was handed an anonymized view.
+      // Held only here, for as long as this view lasts: it is the whole
+      // of what makes a rating from this tab blind, and a second tab
+      // showing the identified comparison has no way to obtain it.
+      token: payload.token,
+      submit: null,
+      count: null,
+      msg: null,
+    };
+    for (const pair of pairs) ratingRow(pair.card, pair.resultId, pair.label);
+    renderPanel();
+    updateSubmit();
+  }
+
+  window.BenchRating = { startBlind };
 })();

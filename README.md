@@ -9,9 +9,18 @@ and every run lands in SQLite history for later replay.
 This is a comparison workbench: it puts models side by side under
 identical conditions and records what happened, with enough provenance
 to say later what an old run actually was. The evaluation layer on top
-of it, datasets, repeated trials and scoring, is in progress and not
-here yet, so treat a comparison as evidence to read rather than a
-benchmark result to cite.
+of it is here: datasets addressed by content, repeated randomized
+trials with rotated entry order, deterministic and rubric scoring,
+blind human rating, aggregates with their denominators and clustered
+intervals, and an export that seals a moment and can rebuild every
+number it publishes.
+
+What it still is not is a leaderboard. The statistical protocol a
+published comparison would need (paired estimates, multiplicity, power)
+is not here, and the report withholds a ranking rather than inventing
+one whenever nobody has said what "better" means. Read an experiment as
+evidence, with its intervals and its coverage counts, rather than as a
+result to quote out of context.
 
 ## Daily use
 
@@ -85,6 +94,34 @@ the answer) and the provider that served it. Routing is by throughput,
 so the provider is chosen per request and can differ between two runs of
 the same model; naming it per run makes the largest confound in a
 comparison visible rather than assumed away.
+
+**The ceiling meters CREDITS.** OpenRouter's `usage.cost` is a charge in
+credits against the balance this process can spend, and that is the number
+the ceiling accumulates and refuses on. Under BYOK (bring your own key)
+there is a second number, `usage.cost_details.upstream_inference_cost`:
+what the upstream provider billed you directly. The bench records it in
+its own column beside the credit charge and **never meters it**, because a
+direct provider bill is not money OpenRouter can decline and a ceiling
+that pretended otherwise would be describing a control it does not have.
+Off BYOK the field is absent or zero and the column is NULL, which is the
+honest record of "this run was not BYOK"; a stored zero would be
+indistinguishable from a BYOK run that genuinely cost nothing.
+
+It travels the whole way: served on the result, written by the reconcile
+pass from the generation record, carried on the export's trial lines, and
+shown in the report's cost section as its own figure. **Never summed into
+any total**, and stored, served and exported as the string it arrived as,
+because nothing computes with it. Its use is matching a provider's own
+invoice line, and a float would reformat the number being matched.
+
+The reconcile pass writes it on every row it reaches, and its work list
+does **not** select on it being absent. NULL is the affirmative "not
+BYOK", and there is no column for "asked, and the answer was no", so a
+clause on it would park every ordinary row on the list forever and the
+pass would never converge. The narrow case that leaves unreached is a
+BYOK run whose usage object arrived with `cost` and without
+`cost_details`, leaving the row otherwise complete; that gap is real and
+smaller than a work list that never empties.
 
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
@@ -653,6 +690,36 @@ with no reference all fail at that point, naming the line, because
 discovering them after a run has paid for every trial is discovering them
 in the most expensive place available.
 
+**A regex cannot freeze the server.** The regex scorer runs its pattern in
+a single-use child process under a one-second deadline; expiry is recorded
+as a scoring failure (`regex exceeded deadline`) and never as a guessed
+verdict, because the bench does not know whether that pattern would have
+matched. Every other deterministic scorer stays in process, where a string
+comparison is linear in the subject and already bounded.
+
+That second is **wall time on the monotonic clock**, and the distinction
+is what keeps the number meaning one thing. It is not CPU time, so a busy
+machine gives the pattern less work per second and the same second of
+grace; it is not system-clock wall time, so an NTP step during a scoring
+pass cannot shorten or extend it. The bench does no time arithmetic of its
+own here: the value goes to `Process.join`, and the clock comes from
+`multiprocessing.connection.wait`, which keeps its deadline on
+`time.monotonic`. The test walks that chain rather than trusting it, so a
+CPython change that swapped the clock fails a test instead of quietly
+changing what the constant means.
+
+The subject and pattern limits are necessary and were never sufficient,
+which the comment above them used to deny. Backtracking is exponential in
+the subject, so `(a+)+$` (six characters, well inside the 500-character
+pattern limit) against ten thousand characters runs effectively forever.
+Measured in process at small sizes it doubles every two characters: 0.03s
+at 18, 0.11s at 20, 0.44s at 22, 1.78s at 24. A process rather than a
+thread because `re` holds the GIL while it backtracks and only a process
+can be terminated; spawn rather than fork because forking an asyncio
+application copies whatever locks its threads happened to hold. The wait
+itself happens off the event loop, so the regex never runs in this thread
+or in this process.
+
 **Empty counts as missing** for a rubric or a comparing scorer's
 reference, and the empty case is the more dangerous of the two because it
 scores rather than failing: every string contains the empty string, so a
@@ -732,7 +799,8 @@ curl -X POST localhost:8000/experiments \
        "lineup": ["openai/gpt-4o-mini"],
        "budget": "standard",
        "estimand_mode": "underlying_model",
-       "provider_pins": {"openai/gpt-4o-mini": "OpenAI"},
+       "provider_pins": {"openai/gpt-4o-mini": "openai"},
+       "quantizations": ["fp8"],
        "params": {"temperature": 0}}'
 ```
 
@@ -740,10 +808,32 @@ It sends `require_parameters: true`, so a provider that would have
 silently ignored the temperature is ineligible instead. The routed-service
 path deliberately does not send it, because changing which providers are
 eligible silently changes what is being measured; here that change is the
-whole point. `provider_pins` is strict-mode only, and a pin travels as
+whole point.
+
+What that check can and cannot claim is worth stating. It verifies
+AGGREGATE `reasoning` support, not that a named effort tier means the same
+thing everywhere: the reasoning-tokens documentation says that "for models
+that only support `reasoning.max_tokens`, the effort level will be set
+based on the percentages above", so a provider advertising `reasoning` may
+be translating "high" into a token allocation rather than honouring the
+tier. Strict mode checks what it can check and claims exactly that.
+
+`provider_pins` is strict-mode only, normalized to the documented
+lowercase provider slugs at creation so the recorded pin and the sent pin
+are one string, and a pin travels as
 `order` **with `allow_fallbacks: false`**, never without it: an order that
 can be departed from is a preference, and a pinned run served by somebody
-else would record a constraint that did not hold. A pin naming a model
+else would record a constraint that did not hold.
+
+`quantizations` is the other strict-mode narrowing, and it is optional.
+Quantization varies by host and changes what the weights actually are, so
+two runs of "the same model" served at bf16 and at int4 are not measuring
+the same artifact. It rides the documented provider filter and its values
+are validated against the documented levels, because a level OpenRouter
+does not recognize filters to no provider at all and, under
+`allow_fallbacks: false`, that is a run that fails. **The throughput sort
+never stabilized quantization** and never claimed to: it biases routing
+toward serious hosts, which is a different property entirely. A pin naming a model
 outside the lineup is refused, since a declaration that cannot be honored
 should not be stored as though it will be.
 
@@ -831,6 +921,15 @@ arbitrary but reproducible subset of the dataset instead of a privileged
 one. If you expect to hit the ceiling, or you are running a dataset you
 did not write, set the seed.
 
+**Two seeds, and only one of them increments.** `task_order_seed` is used
+once per experiment, so it is bounded against the safe-integer limit and
+nothing further. `params.seed` is the SAMPLING seed, and repeat N sends
+`base + N`, so an experiment is refused at creation when
+`seed + repeats - 1` would pass that limit, with the arithmetic shown.
+The rule shipped guarding the wrong one of the two: it protected a value
+that cannot overflow and left the one that can unguarded, which is a
+check that looks exactly like coverage.
+
 **Interruption is honest.** A stop halts between trials, never inside
 one: a trial that reached upstream has already spent its money, and
 abandoning it would throw away a result you paid for. The experiment ends
@@ -841,6 +940,50 @@ experiment and says so in `status_detail`; set it false to record
 refusals and keep going. Either way the conservation property holds
 across the whole experiment: every requested trial is accounted for as
 completed, failed, refused, or never attempted.
+
+**Blind rating is entered from the history list**, never from a
+comparison already on screen. The server opens the session, issues the
+shuffle, and returns the answers with no identity attached to any of
+them: no model, no provider, no cost, no timing. That ordering is the
+feature. A page that fetched the identified comparison and then hid the
+identities has already painted them, and "hidden" in a browser is a style
+rule anyone can undo plus a frame the rater may have seen.
+
+**The blind flag on a rating is the server's, not the client's, and it is
+decided by a token.** Opening a blind session issues one; a rating is
+recorded blind only when it arrives bearing the token of a session the
+server still has open. A page that revealed the identities and then posted
+`blind: true` would be testifying about its own past, which is the one
+witness a blind record cannot use.
+
+A per-group boolean was not enough. It answered "is a blind session open
+for this comparison", which is true for **every tab** the moment any one
+of them opens one, so a second window replaying that comparison sighted
+posted its ratings into somebody else's blind and they persisted
+`blind = 1`. The token answers the question that was meant: did **these
+ratings** come from a blind session. A missing token, an invented one, or
+one issued before the reveal all persist `blind = 0`. Several sessions may
+be open on one comparison at once, because two people rating it are both
+legitimately blind; one reveal closes all of them, because the answer key
+is out.
+
+**What the flag attests is the path the rating took**, and stating that is
+the point rather than a hedge. It says these ratings came from a view the
+server built without identities, on a session it issued and had not yet
+closed. It cannot attest what the person in the chair arranged to see by
+other means: this is a localhost tool, the operator owns the process, the
+database and the browser, and they can keep the export open in one window
+and the blind view in another. The claim is narrower than "this person did
+not know". It is "the bench did not tell them", which is the only party
+the bench can speak for. What the boolean got wrong was different in kind:
+it attested a path the ratings had not taken at all.
+
+Two further limits are stated rather than discovered. The bench cannot
+blind what a model wrote about itself, so an answer beginning "as an AI
+assistant made by X" identifies its author whatever the page does. And a
+rater who has already replayed a comparison sightedly knows its contents;
+the session records the conditions at rating time, not the contents of the
+rater's memory.
 
 **Progress survives disconnection**, and this is the one place in the
 bench where continuing after a client goes away is the point rather than
@@ -948,24 +1091,58 @@ does there is no way to tell which is wrong.
 **The report keeps two axes apart, everywhere.**
 
 *Axis one, trial outcomes:* `done`, `error`, `refused`, `stopped`,
-`missing`. This is what happened when the bench asked a model to do a
-task, and it is where a model's failure rate comes from. Outcomes are
-derived at read time from fields that were already recorded for their own
-reasons, so the vocabulary can change without a migration and no old row
-carries a label that predates the rules. A declared member that never ran
-counts as `missing` rather than vanishing.
+`missing`, `not_run`. This is what happened when the bench asked a model
+to do a task, and it is where a model's failure rate comes from. Outcomes
+are derived at read time from fields that were already recorded for their
+own reasons, so the vocabulary can change without a migration and no old
+row carries a label that predates the rules.
 
-Two denominators go with those outcomes, and the difference between them
-matters enough that both are published. `planned` is every trial the plan
-called for. `attempted` is the subset where a request actually reached a
-provider: `done`, `error`, `stopped`. A `refused` trial was declined by
-the spend ceiling before the call went out and a `missing` trial never
-ran, so neither is an attempt. **`failure_rate` is `error / attempted`**
-and nothing else: a stop is the operator's decision, a refusal is the
-ceiling's, and a missing trial is the experiment's, so counting any of
-them would let a halted run read as a bad model. `refusal_rate` is
-`refused / planned`, because a refusal is a fact about the budget against
-the plan.
+**Two absences, and they are different facts.** `missing` means the cell
+exists (the group was created, other models in the lineup have rows in it)
+and this model left none: a hole in a cell that ran. `not_run` means the
+cell was never created at all, because the runner halted or was stopped
+before reaching it: a plan abandoned. Folding the two together would hide
+a halt inside a gap.
+
+**The plan comes from the plan, not from the rows.** `planned` is
+`tasks x repeats` per model, read off the experiment's own recorded counts
+rather than off the groups that happen to exist. That is not a detail:
+deriving it from rows is what makes a halt invisible, because eight trials
+stopped after two would report a plan of two and nothing on the page would
+say six were owed. The report publishes the arithmetic as its own `plan`
+block so the counters can be checked against it instead of trusted, and
+the export manifest carries `tasks_total` so `not_run` is derivable from
+the artifact alone.
+
+**A refusal is a row.** When the spend ceiling declines a trial the runner
+persists a result carrying the refusal error beside a NULL `request_json`,
+which is exactly the pair the era-gated derivation reads as `refused`. The
+derivation was always there and had nothing to read: the runner returned
+before writing anything, so a refused trial surfaced as `missing` and a
+budget fact was published as a gap in the record.
+
+`attempted` is the subset that ran to a **model-attributable end**:
+`done` and `error`. A refused trial was declined before the call went
+out, a missing trial left no row, and a not-run trial has no cell, so
+none of the three is an attempt. Neither is a **stopped** one: it was cut
+off part way through by an operator or a disconnect, so nobody knows
+whether it would have succeeded, and counting it made the published
+failure rate depend on when somebody pressed stop. Stop a run early and
+the rate falls, with nothing on the page connecting the two.
+
+That set is `QUALITY_OUTCOMES`, which is not a coincidence: the trials a
+quality number may be computed from and the trials a failure rate may be
+computed over are the same trials, because both questions are "what did
+the model do". **`failure_rate` is `error / attempted`** and nothing else.
+`refusal_rate` is `refused / planned`, because a refusal is a fact about
+the budget against the plan.
+
+**Three surfaces agree, and that is asserted.** The progress counters, the
+report's outcome counts and the export's lines are three derivations of the
+same facts, reachable at three different times. If they disagree at least
+one published number is wrong and nothing says which, so the agreement is
+tested directly, over a halted run and over a continue-mode run where
+refusals leave rows the halted one never had.
 
 *Axis two, scoring coverage:* `scored`, `scoring_failed`, `unscored`.
 This is what happened when the bench tried to put a number on a trial. A
@@ -974,20 +1151,138 @@ here and only here. A trial that never ran is on neither axis: it has no
 response to score, so calling it `unscored` would report a gap in
 coverage nobody could ever close.
 
-The two never mix, and the rule for the score mean is where they would be
-easiest to cross:
+**One gate decides which trials a quality number may speak for**, and the
+mean, the interval's clusters, the pass rate's denominator and both
+coverage counters all sit behind it, so they cannot drift into disagreeing
+about their population.
 
-- A trial that **failed** contributes zero. That is the
-  failure-inclusive rule: an errored trial is a trial that failed the
-  task, and averaging over survivors would flatter the models that fail
-  most.
-- A trial that **succeeded but has no usable score** contributes nothing.
-  Its absence belongs to axis two. Scoring it zero would put the judge's
-  malfunction into the model's mean, where it is indistinguishable from a
-  bad answer.
-- A trial that **never ran** contributes nothing. It is an absence, and
-  scoring it zero would punish a model for an experiment that was halted,
-  which is a fact about a budget.
+In: `done` and `error`. A completed trial is evidence about quality; an
+errored one is a trial that failed the task, and dropping it would average
+over survivors and flatter the models that fail most.
+
+Out: `refused`, `stopped`, `missing`, `not_run`. Each for its own reason,
+and none of them about the model. A refusal is the spend ceiling declining
+to buy the answer, a stop is the operator ending the run, and the two
+absences are the experiment's. Scoring any of them zero publishes a budget,
+an operator or an abandoned plan as capability. Counting them as `unscored`
+would be no better: that reports a coverage gap nobody could ever close.
+
+This is what the previous rule got wrong, and the shape of the mistake is
+worth keeping. The two-axes design was specified precisely for `error` and
+for unscored trials, and the tests pinned exactly those two; `refused` and
+`stopped` were left to inference and fell through the failure-inclusive
+branch. One perfect answer beside one refused trial published **0.5**: the
+model looked half as good because the operator ran out of money. The rules
+were right and the coverage of the rules was not, so the treatment of every
+outcome is now a matrix test with a row per outcome, and the next outcome
+anyone adds gets an empty row that fails until it is filled in deliberately.
+
+Inside the population there are exactly two rules. An errored trial
+contributes zero. A completed trial with no usable score contributes
+nothing, because its absence belongs to axis two and scoring it zero would
+put the judge's malfunction into the model's mean.
+
+**A score row on a stopped trial is neither deleted nor obeyed.** It stays
+in the database and in the export as the audit trail of what the scoring
+pass did, and it never reaches a published number.
+
+**A task the exclusions hollow out leaves the bootstrap.** If every trial
+of a task was refused, stopped or never run, it contributes no cluster
+rather than an empty one, and the interval's stated `n_clusters` says so.
+An interval claiming twenty tasks when six are empty is false precision
+arriving by the back door, which is the thing this layer exists to stop.
+
+**A scorer answers only for the tasks that declared it.** Each scorer gets
+its own section, computed over its own tasks and no others. A section that
+iterated every task was dragging its neighbours' numbers around: a task
+scored by `contains` landed in the `judge` section, where its errored
+trials added zeros to the judge's mean under the failure-inclusive rule and
+its completed trials added to the judge's unscored coverage, all for a
+scorer never meant to look at it. Every axis rule was being applied
+correctly to the wrong population, which is why the two-axes work could not
+see it: the crossing was between the sections, not between the axes.
+
+The file is authoritative for any scorer it mentions, exactly as it is for
+thresholds; where it says nothing, the rows are the witness with the same
+floor limit. A scorer the file NEVER mentions falls to the rows even when a
+file was supplied, and `human` is why: no dataset declares it, so reading
+the file's silence as "applies to nothing" would delete every human mean
+from any report built with a dataset path.
+
+**A ranking is a claim, and it names its metric.** Ordering models says one
+did better, and that means nothing until somebody says better AT WHAT. The
+report ranks when `primary_metric` is declared, or when exactly one scorer
+exists and there is no choice to make. Otherwise it publishes every
+scorer's section in full and **no cross-scorer ranking**, and says why.
+
+The previous rule ranked on the first scorer alphabetically, so an
+experiment scored by `contains` and `judge` was ordered by `contains`
+because c sorts before j. Nobody chose that, the report did not say it, and
+adding a scorer named `accuracy` would have silently reordered the
+leaderboard. `primary_metric` is validated at creation against what the
+dataset can actually produce, plus `human`, since a person rating trials
+after the fact is the one scorer no file can declare.
+
+**A series is a (scorer, judge) pair, not a scorer.** Two judges grading
+the same trials are two instruments that disagree on purpose, so they get
+two rows with their means, intervals, pass rates and flags kept apart, and
+there is **no combined cross-judge number anywhere**: averaging a strict
+judge with a lenient one publishes a figure neither produced. Human ratings
+are their own series under `human`, and deterministic scorers carry no
+judge.
+
+**A legacy duplicate never becomes a phantom.** Before I.2 the runner
+derived a result's position from `lineup.index(model)`, which returns the
+first match, so a lineup listing one model twice wrote position 0 on both
+rows. Read back under the arm rules, both mapped to arm 0 and arm 1 matched
+nothing: the report invented a **missing** trial for an arm that had run
+and been paid for, and handed arm 0 both charges. Such a cell is now
+reconstructed from row order, which is the order the runner ran them, and
+every arm of that model carries `legacy_ambiguous` with the report's
+`arm_caveat` saying that WHICH copy is which is a reconstruction. A cell
+whose rows recorded distinct positions is a record and carries no caveat.
+
+**Every arm appears in every series.** Series are discovered once across
+the whole experiment, so an arm the scoring pass never reached still gets
+its section, saying unscored on axis two and owing the series its
+failure-inclusive zeros on axis one. Discovered per arm, from that arm's
+own rows, such an arm vanished from the scorer table entirely, and absence
+on a page reads as "nothing to say" rather than as "nobody looked". Which
+tasks a section covers is still decided by the scorer that declared them.
+
+Selection uses the full `(scorer, judge_model)` key. It used to filter on
+the scorer alone and take the last row, so two judges of one trial fought
+over a single slot and whichever ran second answered for both, with nothing
+on the page saying a first judge had ever run. The rule itself was already
+written and correct in `latest_per_key`; the report simply never called it,
+which is why "every helper that implements a key gets its call sites
+audited" is now a standing review lens.
+
+If the ranking metric resolves to more than one judge, the ranking is
+withheld and names them. It is the same question one level down: better
+according to whom.
+
+**A series nobody measured cannot order anything.** Every section carries
+`measured`: how many of the `n` values behind its mean came from a score
+rather than from the failure-inclusive rule. A series where that is zero
+across every arm ranks nothing, and the ranking is withheld saying so.
+
+The reason is that the mean is not None in that case, which is the trap.
+An arm whose trials all errored gets a 0.0 per trial from the
+failure-inclusive rule, so its mean is 0.0: a real number, the lowest
+available, and the only number in the series if its neighbours' trials
+went unscored and reported None. Ranks skip None and order by value, so
+the arm that failed every trial came FIRST. The same shape arrives from a
+scoring pass run with no judge model, which records a row under `judge`
+with a NULL judge_model and a NULL score. Both are coverage material,
+which is a thing to read, not a thing to rank.
+
+**A human-ranked report states its blind composition**, as `n blind of n
+ratings`, beside the metric. A ranking built on ratings made blind is a
+different claim from one built on ratings made while the rater could see
+which model wrote which answer, and the second is much the weaker. The
+flags are already on the rows; without the line a reader would have to join
+tables to learn which report they are holding.
 
 **Pass rate where a threshold was declared, score mean otherwise**, and
 the rate never appears without its coverage: `0.80 (4/5 of 12 eligible)`
@@ -1075,6 +1370,25 @@ both cost figures, the serving provider, and every score row attached.
 The last line is a sha256 over the preceding bytes, so a citation can
 name the artifact it cites and anyone can check the name.
 
+**The digest seals a moment, not an interval.** Every row is read inside
+one explicit read transaction, opened before the first query and closed
+after the last, so a write committed anywhere inside that window appears
+in none of the lines rather than in the later ones. An artifact that
+straddled two states of the database would verify its own digest
+perfectly while describing a moment that never existed, which is the
+worst combination available.
+
+This needs a real `BEGIN`. A `with conn:` block does not provide one: the
+sqlite3 connection context manager commits or rolls back at exit and
+never begins, and the module starts a transaction implicitly before a
+write and not before a read, so a block of pure `SELECT`s runs each of
+them in its own autocommit transaction. It reads as the guarantee and
+gives none of it. The writer this defends against is another
+**connection**, not another task: the store's synchronous contract
+already rules out an interleaving on the export's own connection, but
+`python -m bench.reconcile --apply` against a live bench is a second
+connection by design, and is the reason `connect()` turns WAL on.
+
 **Two exports of the same experiment are byte-identical.** Line order is
 task, then repeat, then position; key order within a line is sorted.
 Both rules are needed, and neither alone is enough: an artifact whose
@@ -1128,21 +1442,40 @@ which makes it the most sensitive thing the bench will hand you.
 
 ## Blind human rating
 
-Replay a comparison and press "Rate blind". Every card's model id,
-provider, cost and timing is hidden, each card is given a neutral letter
-in a shuffled order, and you rate the answers 1 to 5. Only when every
-card is rated and the ratings are saved do the identities come back.
+Press **rate blind** on a comparison in the History list. The server opens
+a session, shuffles the answers, and hands back a view carrying answers
+and neutral letters with nothing else attached: no model, no provider, no
+cost, no timing. You rate 1 to 5, and the identities arrive only after
+every card is rated and the ratings are saved.
 
-Cost and timing are hidden along with the name, because a rater who knows
+**One path, and it starts at the server.** There used to be a second one,
+reached from a replayed comparison, that fetched the identified cards and
+then hid the identities with a style rule while posting `blind: true`.
+Both halves of that were wrong: hidden in a browser is a rule anyone can
+undo plus a frame the rater may already have seen, and a page that painted
+the answer key is the one witness that cannot testify about its own
+blindness. It is gone rather than deprecated, because a path nobody should
+use is a path nobody should be able to reach. The **Rate blind** button on
+a replayed comparison remains and now opens the same server session,
+replacing the view with a fresh anonymized one; its tooltip says what it
+cannot fix, which is that you have already seen those answers identified.
+
+Cost and timing are absent along with the name, because a rater who knows
 one answer cost ten times another can often guess which model it was, and
 a guess is not a blind. The reveal happens after the save, not before: a
 rater who saw the identities and then changed their mind would be
 producing a sighted rating the record calls blind. If the save fails,
-nothing is revealed and you can retry.
+nothing is revealed and you can retry. The revealed view shows the model
+names and not the metrics, because the blind view renders a minimal card
+rather than reusing the normal renderer; the numbers are one ordinary
+replay away.
 
 Ratings persist as `scores` rows with `scorer = "human"` and `blind = 1`,
 the normalized score in `score` and the point you actually clicked in
-`detail` ("4 of 5, shown as B"). The label is recorded so the
+`detail` ("4 of 5, shown as B"). Labels run A to Z and then AA, AB, like
+spreadsheet columns, so a comparison wider than 26 answers is still
+labelled in letters rather than in the punctuation that follows Z in
+ASCII. The label is recorded so the
 rating-to-model mapping is auditable after the reveal. Ratings entered on
 a normal replay, without blind mode, persist with `blind = 0`: a sighted
 rating is still a rating, and what would be wrong is recording it as

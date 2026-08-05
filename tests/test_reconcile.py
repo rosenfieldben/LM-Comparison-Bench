@@ -4,6 +4,25 @@ The whole script runs in-process: store.connect against a temp file and a
 stubbed generation endpoint through respx, injected the way the endpoints
 inject their client. No subprocess and no network, so the assertions are
 about what the pass writes, not about how it was launched.
+
+EVERY CLIENT HERE IS BUILT trust_env=False, and it is load-bearing rather
+than tidy. respx intercepts at the transport, which is a layer BELOW the
+one that reads proxy environment variables: with trust_env on, httpx
+resolves the ambient proxy while CONSTRUCTING the client, and a socks
+proxy without the socksio package raises ImportError there. The client
+never exists, so respx never gets a request to intercept, and a test that
+touches no network fails because of the network anyway.
+
+That is not hypothetical. Two tests were added with a bare
+httpx.AsyncClient() and passed everywhere except under the poisoned-proxy
+hermeticity run, where they were the only two failures in the suite:
+
+  ImportError: Using SOCKS proxy, but the 'socksio' package is not
+  installed. Make sure to install httpx using `pip install httpx[socks]`.
+
+The convention was invisible, which is why it was missed: fifteen call
+sites carried the flag and nothing said why. It is said here once rather
+than fifteen times.
 """
 
 import io
@@ -448,3 +467,56 @@ async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
     )
 
     assert store.results_awaiting_reconciliation(conn) == []
+
+
+@respx.mock
+async def test_review_repro_the_byok_figure_is_written_rather_than_fetched_and_dropped(
+    conn,
+):
+    """fetch_generation has parsed upstream_inference_cost since I.2 and
+    nothing wrote it.
+
+    The column existed, the migration shipped, the parser had tests, and
+    RECONCILABLE_COLUMNS is what decides whether any of that reaches a
+    row: every pass fetched the figure and threw it away. A value parsed
+    on the wire and dropped before the write is a helper with no call
+    site wearing a different hat, which is the lens this phase keeps
+    finding things with.
+
+    Verbatim, as the string it arrived as. Nothing computes with it: the
+    ceiling meters the OpenRouter balance and a direct provider bill is
+    not money OpenRouter can decline, so the figure exists to be matched
+    against that provider's own invoice line and a float would reformat
+    the number being matched.
+    """
+    respx.get(GENERATION_URL).respond(
+        json=audit_body("gen-byok", upstream_inference_cost=0.0042, is_byok=True)
+    )
+    run_id = seed(conn, [completed_result("model/a", "gen-byok")])
+
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
+
+    row = row_of(conn, run_id)
+    assert row["upstream_inference_cost_usd"] == "0.0042"
+    # And it is not the charge OpenRouter made, which is a different bill
+    # in a different place.
+    assert row["billed_cost_usd"] == 0.0015
+
+
+@respx.mock
+async def test_an_unreported_byok_figure_does_not_erase_one_captured_in_band(conn):
+    """COALESCE like the text columns, not the money CASE. Absence on the
+    generation record means "not reported", never "known to be nothing",
+    and there is no poisoned-value case to clear because nothing computes
+    with it."""
+    respx.get(GENERATION_URL).respond(json=audit_body("gen-a"))
+    run_id = seed(
+        conn,
+        [completed_result("model/a", "gen-a", upstream_inference_cost_usd="0.99")],
+    )
+
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
+
+    assert row_of(conn, run_id)["upstream_inference_cost_usd"] == "0.99"

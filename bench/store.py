@@ -29,12 +29,14 @@ WAL mode and the busy timeout, both set in connect(). This contract is
 about the one process that holds this connection.
 """
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import stat
 import urllib.parse
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -68,6 +70,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     repeats INTEGER NOT NULL,
     task_order_seed INTEGER,
     estimand_mode TEXT NOT NULL,
+    primary_metric TEXT,
+    quantizations_json TEXT,
     provider_pins_json TEXT,
     halt_on_refusal INTEGER NOT NULL,
     status TEXT NOT NULL,
@@ -139,7 +143,8 @@ CREATE TABLE IF NOT EXISTS results (
     cached_tokens INTEGER,
     provider TEXT,
     quantization TEXT,
-    native_finish_reason TEXT
+    native_finish_reason TEXT,
+    upstream_inference_cost_usd TEXT
 );
 """
 
@@ -218,6 +223,26 @@ MIGRATIONS = [
     # apart. None on an offline boot, where there were no bytes.
     ("groups", "budget", "TEXT"),
     ("runs", "catalog_digest", "TEXT"),
+    # Phase I.2. Both nullable and additive, like everything above.
+    #
+    # experiments.primary_metric is which scorer a ranking is computed
+    # on. NULL means none was declared, which is an answer rather than a
+    # gap: with more than one scorer the report then publishes sections
+    # and no cross-scorer ranking, because ordering models needs somebody
+    # to say better at what.
+    #
+    # results.upstream_inference_cost_usd is what the provider charged
+    # directly under BYOK, which is a different number from the credits
+    # the ceiling meters. TEXT rather than REAL because it arrives as a
+    # decimal string and a float conversion would round money on the way
+    # in; readers parse it themselves and the ceiling never reads it.
+    ("experiments", "primary_metric", "TEXT"),
+    # Strict mode's optional quantization filter, stored as a JSON array
+    # beside the pins for the same reason: it is part of the declaration
+    # of what the experiment IS, and a report citing a narrowed provider
+    # population has to be able to say how it was narrowed.
+    ("experiments", "quantizations_json", "TEXT"),
+    ("results", "upstream_inference_cost_usd", "TEXT"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
     # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
@@ -363,6 +388,68 @@ def connect(path: str) -> sqlite3.Connection:
     conn.executescript(INDEXES)
     conn.commit()
     return conn
+
+
+@contextlib.contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """One consistent view of the database for the whole block.
+
+    `with conn` DOES NOT DO THIS and that is the trap it replaces. The
+    sqlite3 connection context manager commits or rolls back at exit; it
+    does not issue a BEGIN. Under the default isolation level the module
+    starts a transaction implicitly before INSERT, UPDATE, DELETE and
+    REPLACE and NOT before SELECT, so a block containing only reads runs
+    every one of them in its own autocommit transaction. `with conn`
+    around a pure read is therefore a no-op wearing the costume of a
+    snapshot, which is worse than nothing: it reads as the guarantee and
+    provides none of it.
+
+    BEGIN is deferred, so the read lock is taken at the first SELECT and
+    held to the end of the block. In WAL mode that pins one version of
+    the database for every statement inside, which is what makes a
+    digest over the result seal a MOMENT rather than an interval.
+
+    The writer this defends against is another CONNECTION, not another
+    task. Nothing inside awaits, so the store's synchronous contract
+    already rules out an interleaving on this connection. What it cannot
+    rule out is `python -m bench.reconcile --apply` against a live bench,
+    which is a second connection by design and is the reason this file
+    turns WAL on at all.
+
+    rollback rather than commit, because nothing was written and rollback
+    is the honest close for a read. It also cannot fail on a busy
+    database the way a commit can.
+
+    THE SNAPSHOT IS ONLY AS GOOD AS WHAT RUNS INSIDE IT, and that is why
+    the exit checks rather than assumes. Every write helper in this
+    module uses `with conn`, and the sqlite3 connection context manager
+    COMMITS at exit: one of them called inside this block ends the
+    transaction early and every read after it sees a different state of
+    the database. Nothing fails, nothing logs, and the artifact built
+    from those reads straddles two moments while its digest verifies
+    perfectly, which is the exact defect this function exists to prevent
+    arriving through the front door instead.
+
+    No caller does that today. That is a fact about today's callers and
+    not a property of anything, so it is asserted rather than trusted:
+    a silent loss of isolation becomes a loud one.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+        held = conn.in_transaction
+    finally:
+        conn.rollback()
+    if not held:
+        raise RuntimeError(
+            "the read snapshot was committed from inside its own block, so "
+            "the reads after that point saw a different state of the "
+            "database than the reads before it. Something in the block "
+            "called a store function that opens `with conn`, which commits "
+            "at exit. A snapshot that ends early is worse than no snapshot: "
+            "it produces an artifact that straddles two moments and a "
+            "digest over it that verifies."
+        )
 
 
 def _now() -> str:
@@ -666,8 +753,10 @@ def save_run(
                 completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                 generation_id, finish_reason, position, request_json,
                 billed_cost_usd, reasoning_tokens, cached_tokens,
-                provider, quantization, native_finish_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                provider, quantization, native_finish_reason,
+                upstream_inference_cost_usd)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                       ?)""",
             [
                 (
                     run_id,
@@ -693,6 +782,10 @@ def save_run(
                     r.get("provider"),
                     r.get("quantization"),
                     r.get("native_finish_reason"),
+                    # Verbatim as received, not through as_money: nothing
+                    # here computes with it and a float round trip would
+                    # round money on the way in. See _as_upstream_cost.
+                    as_text(r.get("upstream_inference_cost_usd")),
                 )
                 for r in results
             ],
@@ -861,6 +954,7 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
         "provider",
         "quantization",
         "native_finish_reason",
+        "upstream_inference_cost_usd",
     ):
         row[field] = as_text(row[field])
     # position orders the replay, so junk in it must not reorder history;
@@ -896,7 +990,8 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
                   billed_cost_usd, reasoning_tokens, cached_tokens,
-                  provider, quantization, native_finish_reason
+                  provider, quantization, native_finish_reason,
+                  upstream_inference_cost_usd
            FROM results WHERE run_id = ?
            ORDER BY COALESCE(position, id), id""",
         (run_id,),
@@ -985,6 +1080,28 @@ def results_awaiting_reconciliation(
     models.fetch_generation), so keying on it would park every row in this
     list forever waiting for a field that may never be sent.
 
+    `upstream_inference_cost_usd` DELIBERATELY DOES NOT JOIN THE
+    PREDICATE, for the same reason `quantization` does not, and the
+    arithmetic is worth writing down because the instinct is the other
+    way. The endpoint does report the figure, beside `is_byok`. But it
+    "is only available for BYOK (Bring Your Own Key) requests. For all
+    other requests it will be 0 or null", and NULL in that column is the
+    affirmative fact "this run was not BYOK". There is no column for
+    "asked, and the answer was no", so a clause on it would park EVERY
+    ordinary row on this list forever: the pass would never converge, and
+    `python -m bench.reconcile` would report work to do on a database
+    with nothing left to fill. A work list that never empties is a work
+    list nobody reads.
+
+    What the pass does instead is write the figure on every row it
+    reaches for one of the reasons above, which is every row whose
+    billing story is incomplete, and that is where a missing BYOK figure
+    actually lives: a stream that ended without a usage object carries
+    neither a charge nor cost_details. The narrow case this does not
+    reach is a BYOK run whose usage arrived with `cost` and without
+    `cost_details`, leaving the row otherwise complete. That gap is real
+    and it is smaller than a list that never empties.
+
     A row the endpoint genuinely cannot fill stays listed across passes.
     That is the honest state (the gap is real and still open), it costs one
     lookup per pass, and it ends on its own when the generation record
@@ -1020,6 +1137,11 @@ RECONCILABLE_COLUMNS = (
     "provider",
     "quantization",
     "native_finish_reason",
+    # The BYOK figure. fetch_generation has parsed it since I.2 and this
+    # list is what decides whether anybody writes it; without the entry
+    # the value was fetched on every pass and thrown away, which is a
+    # helper with no call site wearing a different hat.
+    "upstream_inference_cost_usd",
 )
 
 
@@ -1057,7 +1179,10 @@ def apply_reconciliation(
                    END,
                    provider = COALESCE(?, provider),
                    quantization = COALESCE(?, quantization),
-                   native_finish_reason = COALESCE(?, native_finish_reason)
+                   native_finish_reason = COALESCE(?, native_finish_reason),
+                   upstream_inference_cost_usd = COALESCE(
+                       ?, upstream_inference_cost_usd
+                   )
                WHERE id = ?""",
             (
                 record["billed_cost_usd"],
@@ -1065,6 +1190,13 @@ def apply_reconciliation(
                 record["provider"],
                 record["quantization"],
                 record["native_finish_reason"],
+                # COALESCE like the text columns, not the money CASE. It
+                # is TEXT recorded verbatim for reconciliation against a
+                # provider invoice, and an unreported figure means "not
+                # reported" rather than "known to be nothing": there is
+                # no poisoned-value case to clear, because nothing
+                # computes with it.
+                record["upstream_inference_cost_usd"],
                 result_id,
             ),
         )
@@ -1082,12 +1214,26 @@ def apply_reconciliation(
 # and not a placeholder: the manifest is written complete before any
 # trial, so an experiment that never starts still has a full record of
 # what it was going to be.
+# "interrupted" is what a run becomes when the PROCESS ended rather than
+# the run: a crash, a kill, or a shutdown that cancelled the runner
+# mid-trial. It is terminal like the rest, and it is not "failed" or
+# "stopped", because neither of those is true: nothing about the
+# experiment went wrong and no operator asked it to end. The completed
+# trials are real and the remaining ones never ran.
+#
+# It was written by two callers (the lifespan's stale-row sweep and the
+# runner's cancellation path) before it was ever listed here, and
+# set_experiment_status asserts membership: the sweep raised at startup,
+# so a database holding one stale running row made the app unbootable.
+# That is the whole argument for keeping the vocabulary in one tuple and
+# the whole way this tuple failed to be one.
 EXPERIMENT_STATUSES = (
     "created",
     "running",
     "done",
     "stopped",
     "halted_on_refusal",
+    "interrupted",
     "failed",
 )
 
@@ -1111,11 +1257,13 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
             """INSERT INTO experiments
                (name, created_at, dataset_name, dataset_digest, lineup_json,
                 budget, params_json, repeats, task_order_seed, estimand_mode,
-                provider_pins_json, halt_on_refusal, status, status_detail,
-                app_sha, catalog_digest, data_policy, tasks_total,
-                trials_total, trials_done, trials_refused, trials_failed)
+                primary_metric, quantizations_json, provider_pins_json,
+                halt_on_refusal, status,
+                status_detail, app_sha, catalog_digest, data_policy,
+                tasks_total, trials_total, trials_done, trials_refused,
+                trials_failed)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, 0, 0, 0)""",
+                       ?, ?, ?, 0, 0, 0)""",
             (
                 spec["name"],
                 _now(),
@@ -1131,6 +1279,10 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
                 spec["repeats"],
                 spec.get("task_order_seed"),
                 spec["estimand_mode"],
+                spec.get("primary_metric"),
+                json.dumps(spec["quantizations"])
+                if spec.get("quantizations")
+                else None,
                 json.dumps(spec["provider_pins"], sort_keys=True)
                 if spec.get("provider_pins")
                 else None,
@@ -1160,6 +1312,8 @@ def _experiment_row(row: sqlite3.Row) -> dict[str, Any]:
     out["params"] = _decoded_params(out.pop("params_json")) or None
     pins = out.pop("provider_pins_json")
     out["provider_pins"] = _decoded_params(pins) or None
+    quant = out.pop("quantizations_json")
+    out["quantizations"] = json.loads(quant) if quant else None
     # Stored 0/1 because SQLite has no boolean; handed back as bool so no
     # reader has to remember which spelling this column uses.
     out["halt_on_refusal"] = bool(out["halt_on_refusal"])
