@@ -7476,3 +7476,88 @@ def test_review_repro_a_write_landing_mid_export_reaches_neither_export(
     assert b"first-injection" in third
     assert b"second-injection" in third
     writer.close()
+
+
+@respx.mock
+def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
+    client, tmp_path
+):
+    """End to end for a number that was being ingested and then lost.
+
+    usage.cost_details.upstream_inference_cost is parsed at the wire and
+    stored, and from there it reached nothing: not the served result, not
+    the export, not the report. An artifact carrying two of OpenRouter's
+    three money figures cannot be reconciled against the provider invoice
+    the run was actually paid on, which is the only use this figure has.
+
+    Never summed into the total. That total is what OpenRouter charged in
+    credits and is what the spend ceiling meters; this is what a provider
+    billed directly on a bring-your-own-key run, which OpenRouter cannot
+    decline. One number covering both would be a figure nobody is owed.
+    """
+
+    def route(request):
+        frames = [
+            sse({"choices": [{"delta": {"content": "hi"}}]}),
+            sse(
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 1,
+                        "cost": 0.25,
+                        "cost_details": {"upstream_inference_cost": 0.0042},
+                    },
+                }
+            ),
+            DONE_MARKER,
+        ]
+        return httpx.Response(200, stream=ChunkStream(frames))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    # The stored row, served as the string it arrived as.
+    group_id = client.app.state.db.execute(
+        "SELECT id FROM groups WHERE experiment_id = ? ORDER BY id LIMIT 1", (eid,)
+    ).fetchone()["id"]
+    detail = client.get(f"/groups/{group_id}").json()
+    served = detail["runs"][0]["results"][0]
+    assert served["upstream_inference_cost_usd"] == "0.0042"
+
+    # The export line.
+    lines = [json.loads(raw) for raw in read_export(client, eid).splitlines()]
+    trial = next(line for line in lines if line["type"] == "trial")
+    assert trial["upstream_inference_cost_usd"] == "0.0042"
+    assert trial["billed_cost_usd"] == 0.25
+
+    # The report's cost section, beside the total and not inside it.
+    cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
+    assert cost["total_usd"] == pytest.approx(0.25)
+    assert cost["upstream"] == {"trials": 1, "values": ["0.0042"]}
+
+
+@respx.mock
+def test_a_report_with_no_byok_run_carries_no_upstream_line(client, tmp_path):
+    """Present only when it was earned. A key that is always there is a
+    key nobody reads, and this one is a claim that real money moved
+    somewhere the bench cannot see."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert (
+        client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]["upstream"]
+        is None
+    )

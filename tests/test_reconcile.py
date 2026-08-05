@@ -448,3 +448,56 @@ async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
     )
 
     assert store.results_awaiting_reconciliation(conn) == []
+
+
+@respx.mock
+async def test_review_repro_the_byok_figure_is_written_rather_than_fetched_and_dropped(
+    conn,
+):
+    """fetch_generation has parsed upstream_inference_cost since I.2 and
+    nothing wrote it.
+
+    The column existed, the migration shipped, the parser had tests, and
+    RECONCILABLE_COLUMNS is what decides whether any of that reaches a
+    row: every pass fetched the figure and threw it away. A value parsed
+    on the wire and dropped before the write is a helper with no call
+    site wearing a different hat, which is the lens this phase keeps
+    finding things with.
+
+    Verbatim, as the string it arrived as. Nothing computes with it: the
+    ceiling meters the OpenRouter balance and a direct provider bill is
+    not money OpenRouter can decline, so the figure exists to be matched
+    against that provider's own invoice line and a float would reformat
+    the number being matched.
+    """
+    respx.get(GENERATION_URL).respond(
+        json=audit_body("gen-byok", upstream_inference_cost=0.0042, is_byok=True)
+    )
+    run_id = seed(conn, [completed_result("model/a", "gen-byok")])
+
+    async with httpx.AsyncClient() as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
+
+    row = row_of(conn, run_id)
+    assert row["upstream_inference_cost_usd"] == "0.0042"
+    # And it is not the charge OpenRouter made, which is a different bill
+    # in a different place.
+    assert row["billed_cost_usd"] == 0.0015
+
+
+@respx.mock
+async def test_an_unreported_byok_figure_does_not_erase_one_captured_in_band(conn):
+    """COALESCE like the text columns, not the money CASE. Absence on the
+    generation record means "not reported", never "known to be nothing",
+    and there is no poisoned-value case to clear because nothing computes
+    with it."""
+    respx.get(GENERATION_URL).respond(json=audit_body("gen-a"))
+    run_id = seed(
+        conn,
+        [completed_result("model/a", "gen-a", upstream_inference_cost_usd="0.99")],
+    )
+
+    async with httpx.AsyncClient() as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
+
+    assert row_of(conn, run_id)["upstream_inference_cost_usd"] == "0.99"

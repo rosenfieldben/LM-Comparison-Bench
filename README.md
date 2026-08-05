@@ -107,6 +107,22 @@ Off BYOK the field is absent or zero and the column is NULL, which is the
 honest record of "this run was not BYOK"; a stored zero would be
 indistinguishable from a BYOK run that genuinely cost nothing.
 
+It travels the whole way: served on the result, written by the reconcile
+pass from the generation record, carried on the export's trial lines, and
+shown in the report's cost section as its own figure. **Never summed into
+any total**, and stored, served and exported as the string it arrived as,
+because nothing computes with it. Its use is matching a provider's own
+invoice line, and a float would reformat the number being matched.
+
+The reconcile pass writes it on every row it reaches, and its work list
+does **not** select on it being absent. NULL is the affirmative "not
+BYOK", and there is no column for "asked, and the answer was no", so a
+clause on it would park every ordinary row on the list forever and the
+pass would never converge. The narrow case that leaves unreached is a
+BYOK run whose usage object arrived with `cost` and without
+`cost_details`, leaving the row otherwise complete; that gap is real and
+smaller than a work list that never empties.
+
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message

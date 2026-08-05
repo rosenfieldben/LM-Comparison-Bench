@@ -1055,6 +1055,28 @@ def results_awaiting_reconciliation(
     models.fetch_generation), so keying on it would park every row in this
     list forever waiting for a field that may never be sent.
 
+    `upstream_inference_cost_usd` DELIBERATELY DOES NOT JOIN THE
+    PREDICATE, for the same reason `quantization` does not, and the
+    arithmetic is worth writing down because the instinct is the other
+    way. The endpoint does report the figure, beside `is_byok`. But it
+    "is only available for BYOK (Bring Your Own Key) requests. For all
+    other requests it will be 0 or null", and NULL in that column is the
+    affirmative fact "this run was not BYOK". There is no column for
+    "asked, and the answer was no", so a clause on it would park EVERY
+    ordinary row on this list forever: the pass would never converge, and
+    `python -m bench.reconcile` would report work to do on a database
+    with nothing left to fill. A work list that never empties is a work
+    list nobody reads.
+
+    What the pass does instead is write the figure on every row it
+    reaches for one of the reasons above, which is every row whose
+    billing story is incomplete, and that is where a missing BYOK figure
+    actually lives: a stream that ended without a usage object carries
+    neither a charge nor cost_details. The narrow case this does not
+    reach is a BYOK run whose usage arrived with `cost` and without
+    `cost_details`, leaving the row otherwise complete. That gap is real
+    and it is smaller than a list that never empties.
+
     A row the endpoint genuinely cannot fill stays listed across passes.
     That is the honest state (the gap is real and still open), it costs one
     lookup per pass, and it ends on its own when the generation record
@@ -1090,6 +1112,11 @@ RECONCILABLE_COLUMNS = (
     "provider",
     "quantization",
     "native_finish_reason",
+    # The BYOK figure. fetch_generation has parsed it since I.2 and this
+    # list is what decides whether anybody writes it; without the entry
+    # the value was fetched on every pass and thrown away, which is a
+    # helper with no call site wearing a different hat.
+    "upstream_inference_cost_usd",
 )
 
 
@@ -1127,7 +1154,10 @@ def apply_reconciliation(
                    END,
                    provider = COALESCE(?, provider),
                    quantization = COALESCE(?, quantization),
-                   native_finish_reason = COALESCE(?, native_finish_reason)
+                   native_finish_reason = COALESCE(?, native_finish_reason),
+                   upstream_inference_cost_usd = COALESCE(
+                       ?, upstream_inference_cost_usd
+                   )
                WHERE id = ?""",
             (
                 record["billed_cost_usd"],
@@ -1135,6 +1165,13 @@ def apply_reconciliation(
                 record["provider"],
                 record["quantization"],
                 record["native_finish_reason"],
+                # COALESCE like the text columns, not the money CASE. It
+                # is TEXT recorded verbatim for reconciliation against a
+                # provider invoice, and an unreported figure means "not
+                # reported" rather than "known to be nothing": there is
+                # no poisoned-value case to clear, because nothing
+                # computes with it.
+                record["upstream_inference_cost_usd"],
                 result_id,
             ),
         )

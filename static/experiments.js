@@ -230,7 +230,21 @@
             c.estimated_trials +
             " estimated, " +
             c.unpriced_trials +
-            " unpriced)",
+            " unpriced)" +
+            // Beside the total and never added to it. That total is what
+            // OpenRouter charged in credits; this is what a provider
+            // billed directly on a BYOK run, which is a different bill
+            // in a different place, and one number covering both would
+            // be a figure nobody is owed. Absent entirely when no run
+            // was BYOK.
+            (c.upstream
+              ? ", plus " +
+                c.upstream.trials +
+                " upstream BYOK charge" +
+                (c.upstream.trials === 1 ? "" : "s") +
+                " billed direct"
+              : ""),
+          "report-cost",
         ),
         cell(
           num(entry.latency_ms.median, 0) +

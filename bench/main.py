@@ -247,6 +247,15 @@ class ModelResult(BaseModel):
     provider: str | None = None
     quantization: str | None = None
     native_finish_reason: str | None = None
+    # What the upstream provider billed directly, present only on BYOK
+    # runs. A STRING, and the type is the point: it is stored and served
+    # verbatim because nothing computes with it. It exists to be
+    # reconciled against a provider's own invoice, and a float would
+    # silently reformat the number that invoice has to be matched
+    # against. It is never metered, because the ceiling guards the
+    # OpenRouter balance this process can spend and a direct provider
+    # bill is not money OpenRouter can decline.
+    upstream_inference_cost_usd: str | None = None
 
 
 class StreamCompareRequest(BaseModel):

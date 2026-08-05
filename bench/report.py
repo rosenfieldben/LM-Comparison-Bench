@@ -1256,11 +1256,30 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
         if r.get("billed_cost_usd") is None and r.get("cost_usd") is not None
     ]
     unpriced = len(results) - len(billed) - len(estimated)
+    # The BYOK figures, verbatim and NEVER SUMMED. total_usd above is what
+    # OpenRouter charged, in credits, and it is the number the spend
+    # ceiling meters. This is what an upstream provider billed directly on
+    # a bring-your-own-key run, which is a different bill in a different
+    # place that OpenRouter cannot decline; adding the two would produce a
+    # figure nobody is owed. Kept as the strings that were stored, because
+    # the whole use for them is matching a provider's own invoice line and
+    # a float would reformat the number being matched.
+    upstream = [
+        r["upstream_inference_cost_usd"]
+        for r in results
+        if r.get("upstream_inference_cost_usd") is not None
+    ]
     return {
         "total_usd": sum(billed) + sum(estimated),
         "billed_trials": len(billed),
         "estimated_trials": len(estimated),
         "unpriced_trials": unpriced,
+        # None rather than an empty block when no run was BYOK, so the
+        # key being filled in means something happened rather than that
+        # the report always says this.
+        "upstream": (
+            {"trials": len(upstream), "values": upstream} if upstream else None
+        ),
     }
 
 
@@ -1441,6 +1460,11 @@ def export_trial(
         "max_tokens": result.get("max_tokens"),
         "cost_usd": result.get("cost_usd"),
         "billed_cost_usd": result.get("billed_cost_usd"),
+        # The BYOK figure, verbatim. An export that carried the two
+        # OpenRouter numbers and dropped the third would leave a reader
+        # holding a citable artifact that cannot be reconciled against
+        # the provider invoice the run was actually paid on.
+        "upstream_inference_cost_usd": result.get("upstream_inference_cost_usd"),
         "app_sha": run.get("app_sha"),
         "catalog_digest": run.get("catalog_digest"),
         "data_policy": run.get("data_policy"),
