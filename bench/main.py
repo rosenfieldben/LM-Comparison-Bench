@@ -2509,45 +2509,49 @@ async def run_experiment(experiment_id: int) -> None:
     state = app.state.experiment_run
     lineup = experiment["lineup"]
     controls_base = experiment["params"] or {}
-    try:
-        dataset = read_dataset(state["dataset_path"])
-    except HTTPException as exc:
-        # The file moved or became unreadable between creation and start.
-        # Not a crash: the experiment records why it never ran.
-        #
-        # The singleton is released here as well as in the finally below,
-        # because this return happens BEFORE the try that owns it. Left
-        # set, one unreadable dataset wedged every later start with "an
-        # experiment is already running" naming an experiment that had
-        # already failed, until the process was restarted.
-        store.set_experiment_status(db, experiment_id, "failed", str(exc.detail))
-        state["active"] = None
-        return
-    if dataset["digest"] != experiment["dataset_digest"]:
-        # The bytes changed under it. Refusing is the whole point of
-        # recording a content digest: running anyway would produce a
-        # record citing one dataset and containing another, which is the
-        # single most misleading artifact this phase could emit.
-        store.set_experiment_status(
-            db,
-            experiment_id,
-            "failed",
-            f"dataset changed since this experiment was created: recorded "
-            f"{experiment['dataset_digest'][:12]}, file is "
-            f"{dataset['digest'][:12]}",
-        )
-        return
-    store.set_experiment_status(db, experiment_id, "running")
-    plan = plan_trials(
-        dataset["tasks"], lineup, experiment["repeats"], experiment["task_order_seed"]
-    )
     status, detail = "done", None
     # Set by the cancellation handler around each trial, and read once
     # that trial has been counted. Declared out here rather than per cell
     # because it is a fact about the process rather than about a trial:
     # once it is true the run is over.
     interrupted = False
+    # EVERY exit through the one finally, including the two that happen
+    # before a single trial runs. They used to sit above the try, so each
+    # needed its own copy of the release and its own status write, and
+    # the digest branch was written without either: one changed dataset
+    # left `active` set, and every later start answered "an experiment is
+    # already running" naming an experiment that had already failed,
+    # until the process was restarted. A cleanup duplicated per exit is a
+    # cleanup that will be forgotten on the next exit somebody adds.
     try:
+        try:
+            dataset = read_dataset(state["dataset_path"])
+        except HTTPException as exc:
+            # The file moved or became unreadable between creation and
+            # start. Not a crash: the experiment records why it never ran.
+            status, detail = "failed", str(exc.detail)
+            return
+        if dataset["digest"] != experiment["dataset_digest"]:
+            # The bytes changed under it. Refusing is the whole point of
+            # recording a content digest: running anyway would produce a
+            # record citing one dataset and containing another, which is
+            # the single most misleading artifact this phase could emit.
+            status, detail = (
+                "failed",
+                (
+                    f"dataset changed since this experiment was created: "
+                    f"recorded {experiment['dataset_digest'][:12]}, file is "
+                    f"{dataset['digest'][:12]}"
+                ),
+            )
+            return
+        store.set_experiment_status(db, experiment_id, "running")
+        plan = plan_trials(
+            dataset["tasks"],
+            lineup,
+            experiment["repeats"],
+            experiment["task_order_seed"],
+        )
         for cell in plan:
             if state["stop"].is_set():
                 status, detail = "stopped", "stopped between trials"
@@ -3092,11 +3096,35 @@ async def get_run(run_id: int) -> dict[str, Any]:
 RATING_MIN = 1
 RATING_MAX = 5
 
+
+def blind_label(slot: int) -> str:
+    """Spreadsheet-style column names: A to Z, then AA, AB, and on.
+
+    chr(ord("A") + slot) was fine to Z and nonsense after it: slot 26 is
+    "[", then a backslash, "]", "^", "_", "`" and the lowercase letters.
+    A comparison of 27 answers labelled its cards with punctuation, and
+    since the label is recorded in the score row's detail ("4 of 5, shown
+    as ^"), the audit trail that makes a blind rating checkable became
+    unreadable at exactly the width where checking it matters most.
+
+    Bijective base 26, which is why the loop subtracts one before
+    carrying: there is no zero digit here, so the sequence after Z is AA
+    rather than BA, exactly as a spreadsheet's columns run.
+    """
+    name = ""
+    while True:
+        slot, remainder = divmod(slot, 26)
+        name = chr(ord("A") + remainder) + name
+        if slot == 0:
+            return name
+        slot -= 1
+
+
 # Neutral names for the anonymized cards. Letters rather than numbers
 # because a rater reading "1" and "2" beside answers tends to read them
 # as a ranking somebody already made, and MAX_POSITION + 1 of them
 # because that is how many cards a comparison can hold.
-BLIND_LABELS = tuple(chr(ord("A") + i) for i in range(MAX_POSITION + 1))
+BLIND_LABELS = tuple(blind_label(i) for i in range(MAX_POSITION + 1))
 
 
 def normalized_rating(rating: int) -> float:

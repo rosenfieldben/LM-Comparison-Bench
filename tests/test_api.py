@@ -7561,3 +7561,84 @@ def test_a_report_with_no_byok_run_carries_no_upstream_line(client, tmp_path):
         client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]["upstream"]
         is None
     )
+
+
+@respx.mock
+def test_review_repro_a_failed_digest_check_does_not_wedge_later_starts(
+    client, tmp_path
+):
+    """The singleton was released on the unreadable-dataset path and not
+    on the digest-mismatch one, because each pre-run exit sat above the
+    try that owns the release and carried its own copy of it.
+
+    So one dataset edited between creation and start left `active` set
+    forever: every later start answered "an experiment is already
+    running" and named an experiment that had already failed, until the
+    process was restarted. A cleanup duplicated per exit is a cleanup
+    that will be forgotten on the next exit somebody adds, and this is
+    the exit where it was.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "original"})
+    doomed = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    healthy = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    # The bytes change under the first experiment, which is exactly what
+    # the recorded digest exists to catch.
+    Path(path).write_text('{"id": "t1", "prompt": "edited"}\n', encoding="utf-8")
+
+    final = run_experiment_to_completion(client, doomed, path)
+    assert final["status"] == "failed"
+    assert "dataset changed since this experiment was created" in final["status_detail"]
+
+    # The next start is not blocked by the corpse of the first.
+    again = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "edited"}, name="again.jsonl"
+    )
+    second = client.post(f"/experiments/{healthy}/start", json={"dataset_path": again})
+    assert second.status_code == 202, second.text
+
+
+def test_review_repro_blind_labels_past_z_continue_aa_not_punctuation(client):
+    """chr(ord("A") + slot) was fine to Z and nonsense after it.
+
+    Slot 26 is "[", then a backslash, "]", "^", "_", "`" and the
+    lowercase letters. A comparison of 27 answers labelled its cards with
+    punctuation, and the label is recorded in the score row's detail
+    ("4 of 5, shown as ^"), so the audit trail that makes a blind rating
+    checkable became unreadable at exactly the width where checking it
+    matters most.
+    """
+    assert main.BLIND_LABELS[:3] == ("A", "B", "C")
+    assert main.BLIND_LABELS[25] == "Z"
+    # The boundary, and the reason the carry subtracts one: there is no
+    # zero digit, so the sequence after Z is AA rather than BA.
+    assert main.BLIND_LABELS[26] == "AA"
+    assert main.BLIND_LABELS[27] == "AB"
+    assert main.BLIND_LABELS[51] == "AZ"
+    assert main.BLIND_LABELS[52] == "BA"
+    # Every label a comparison can carry is letters and nothing else.
+    assert all(label.isalpha() and label.isupper() for label in main.BLIND_LABELS)
+    assert len(set(main.BLIND_LABELS)) == len(main.BLIND_LABELS)
+
+
+@respx.mock
+def test_a_twenty_seven_answer_comparison_gets_letters_for_every_card(client):
+    """Through the endpoint, at the width where the old rule broke."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    group_id = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    for index in range(27):
+        stream_events(
+            client,
+            {"prompt": "wide", "model": f"model/m{index}", "group_id": group_id},
+        )
+
+    cards = client.post(f"/groups/{group_id}/blind", json={}).json()["cards"]
+
+    labels = sorted(card["label"] for card in cards)
+    assert len(labels) == 27
+    assert labels[-1] == "Z" and "AA" in labels
+    assert all(label.isalpha() for label in labels)

@@ -1455,7 +1455,10 @@ replay away.
 
 Ratings persist as `scores` rows with `scorer = "human"` and `blind = 1`,
 the normalized score in `score` and the point you actually clicked in
-`detail` ("4 of 5, shown as B"). The label is recorded so the
+`detail` ("4 of 5, shown as B"). Labels run A to Z and then AA, AB, like
+spreadsheet columns, so a comparison wider than 26 answers is still
+labelled in letters rather than in the punctuation that follows Z in
+ASCII. The label is recorded so the
 rating-to-model mapping is auditable after the reveal. Ratings entered on
 a normal replay, without blind mode, persist with `blind = 0`: a sighted
 rating is still a rating, and what would be wrong is recording it as
