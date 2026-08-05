@@ -419,12 +419,37 @@ def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
     rollback rather than commit, because nothing was written and rollback
     is the honest close for a read. It also cannot fail on a busy
     database the way a commit can.
+
+    THE SNAPSHOT IS ONLY AS GOOD AS WHAT RUNS INSIDE IT, and that is why
+    the exit checks rather than assumes. Every write helper in this
+    module uses `with conn`, and the sqlite3 connection context manager
+    COMMITS at exit: one of them called inside this block ends the
+    transaction early and every read after it sees a different state of
+    the database. Nothing fails, nothing logs, and the artifact built
+    from those reads straddles two moments while its digest verifies
+    perfectly, which is the exact defect this function exists to prevent
+    arriving through the front door instead.
+
+    No caller does that today. That is a fact about today's callers and
+    not a property of anything, so it is asserted rather than trusted:
+    a silent loss of isolation becomes a loud one.
     """
     conn.execute("BEGIN")
     try:
         yield
+        held = conn.in_transaction
     finally:
         conn.rollback()
+    if not held:
+        raise RuntimeError(
+            "the read snapshot was committed from inside its own block, so "
+            "the reads after that point saw a different state of the "
+            "database than the reads before it. Something in the block "
+            "called a store function that opens `with conn`, which commits "
+            "at exit. A snapshot that ends early is worse than no snapshot: "
+            "it produces an artifact that straddles two moments and a "
+            "digest over it that verifies."
+        )
 
 
 def _now() -> str:

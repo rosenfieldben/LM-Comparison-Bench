@@ -45,6 +45,10 @@ def test_duplicate_prompt_name_raises(db):
 
 
 def test_save_run_is_atomic(db):
+    """THE WINDOW: from the run INSERT to the last result INSERT. A
+    failure anywhere inside it must leave neither behind, because a run
+    row with a partial set of results is a comparison that silently lost
+    a model, which is worse than a comparison that failed."""
     # model NULL violates NOT NULL mid-batch; the run row inserted in the
     # same transaction must roll back with it.
     bad_batch = [make_result(), make_result(model=None)]
@@ -1760,3 +1764,58 @@ def test_migration_onto_pre_i2_database_is_additive_and_idempotent(tmp_path):
         assert second["results"][0]["response_text"] == "legacy text"
     finally:
         again.close()
+
+
+def test_review_repro_a_write_inside_the_read_snapshot_is_caught(db):
+    """THE WINDOW: from read_snapshot's BEGIN to its exit. Anything
+    inside it that ends the transaction early splits the block into two
+    snapshots, and the reads after the split see a different state of
+    the database than the reads before it.
+
+    The closing review found this in the branch's own code. Every write
+    helper in this module uses `with conn`, and the sqlite3 connection
+    context manager COMMITS at exit, so one of them called inside the
+    block ends the snapshot. Nothing fails and nothing logs: the export
+    built from those reads straddles two moments and its digest verifies
+    perfectly, which is the exact defect read_snapshot exists to
+    prevent, arriving through the front door instead.
+
+    No caller does this today. That is a fact about today's callers
+    rather than a property of anything, and an invariant that holds by
+    accident of what the callees currently do is the shape this whole
+    phase keeps finding, so it is asserted rather than trusted.
+    """
+    with pytest.raises(RuntimeError) as caught:
+        with store.read_snapshot(db):
+            # A real write helper, chosen because it is the ordinary way
+            # this would happen: somebody adds a convenience call inside
+            # a read block and nothing tells them.
+            store.save_prompt(db, "inside", "the snapshot")
+
+    assert "committed from inside its own block" in str(caught.value)
+    # The write itself is not undone, which is the honest outcome: it
+    # committed, and pretending otherwise would be a second lie on top
+    # of the first. What must not happen is the export believing it read
+    # one state of the database.
+    assert [p["name"] for p in store.list_prompts(db)] == ["inside"]
+
+
+def test_a_read_only_snapshot_block_completes_normally(db):
+    """The scope control. The guard must fire on a lost snapshot and on
+    nothing else, or the export stops working and the fix reads as the
+    bug."""
+    store.save_prompt(db, "before", "written outside the block")
+
+    with store.read_snapshot(db):
+        names = [p["name"] for p in store.list_prompts(db)]
+
+    assert names == ["before"]
+
+
+def test_an_exception_inside_the_snapshot_propagates_unchanged(db):
+    """The guard must not mask what actually went wrong. A failure inside
+    the block is the interesting exception; replacing it with a
+    complaint about the transaction would bury it."""
+    with pytest.raises(ValueError, match="the real problem"):
+        with store.read_snapshot(db):
+            raise ValueError("the real problem")

@@ -640,6 +640,10 @@ def test_string_token_counts_yield_none_cost_not_500(client):
 
 @respx.mock
 async def test_client_disconnect_persists_partial_run(client):
+    """THE WINDOW: from the client vanishing mid-stream to the row being
+    written. The money is already spent at that point and the partial
+    answer is already in hand, so the disconnect must not be what
+    decides whether either is recorded."""
     # Drive the endpoint's generator directly and close it after one
     # delta: aclose() raises GeneratorExit at the yield, the same
     # mechanism a Starlette client disconnect triggers.
@@ -1037,6 +1041,12 @@ async def settle(condition, rounds=400):
 
 @respx.mock
 async def test_stream_upstream_concurrency_never_exceeds_cap(monkeypatch, tmp_path):
+    """THE WINDOW: the whole exchange, from acquiring the slot to the
+    last chunk of the body, not merely the request. A slot released at
+    the response headers would let a fifth stream start while four were
+    still reading, so the bound would hold on paper and not on the wire;
+    the tracker below counts inside the body's consumption for exactly
+    that reason."""
     gate = asyncio.Event()
     tracker = {"in_flight": 0, "max": 0, "started": 0}
 
@@ -4224,7 +4234,11 @@ def test_a_dataset_changed_since_creation_is_refused_rather_than_run(client, tmp
 
 @respx.mock
 def test_a_stop_halts_between_trials_and_leaves_an_honest_partial(client, tmp_path):
-    """A stopped experiment is a partial record, not a failed one, and it
+    """THE WINDOW: between two trials, which is the only place a stop may
+    land. Inside a trial is a different window with a different answer:
+    that trial has already spent its money and must persist.
+
+    A stopped experiment is a partial record, not a failed one, and it
     says which it is. The trials that ran are real and stay; the ones that
     did not are visible as the difference between done and total."""
     seen = {"n": 0}
@@ -5383,9 +5397,23 @@ def test_the_middle_of_the_scale_normalizes_to_the_middle(client):
 
 
 @respx.mock
-def test_a_rating_after_the_reveal_persists_as_not_blind(client):
-    """Honesty about conditions, not a prohibition. A sighted rating is
-    still a rating; what would be wrong is recording it as blind."""
+def test_a_rating_with_no_session_at_all_persists_as_not_blind(client):
+    """THE WINDOW: no blind session was ever opened on this comparison.
+    Not the window after a reveal, which is what this test was called
+    until the window-naming lens enumerated it.
+
+    Its body never opened a session and never revealed one, so the name
+    claimed an interval the test does not enter, and it passed with the
+    reveal endpoint mutated to close nothing at all. A proof of the
+    wrong window reading as coverage of the right one, which is the
+    exact failure the lens exists to catch. The post-reveal window is
+    covered by
+    test_review_repro_a_token_replayed_after_the_reveal_persists_as_not_blind.
+
+    What it does prove is worth keeping: honesty about conditions rather
+    than a prohibition. A sighted rating is still a rating; what would
+    be wrong is recording it as blind.
+    """
     group_id, ids = rated_group(client)
 
     client.post(
@@ -6711,7 +6739,10 @@ def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path)
 
 @respx.mock
 def test_review_repro_a_client_forged_blind_claim_persists_as_not_blind(client):
-    """The client is not a competent witness to its own blindness.
+    """THE WINDOW: a rating arriving with no blind session anywhere in
+    the process, and a body insisting it was blind anyway.
+
+    The client is not a competent witness to its own blindness.
 
     The flag used to be whatever the body said, on the reasoning that
     only the client knows what was on screen. That is true and it is
@@ -6736,7 +6767,12 @@ def test_review_repro_a_client_forged_blind_claim_persists_as_not_blind(client):
 
 @respx.mock
 def test_the_blind_payload_carries_no_identity_at_all(client):
-    """Anonymized BEFORE any identified paint, which is the whole feature.
+    """THE SURFACE: the server's response body, before any browser has
+    touched it. Not what a page renders, which is a later question with
+    its own tests; if an identity is in these bytes then the page has it
+    whatever it chooses to display.
+
+    Anonymized BEFORE any identified paint, which is the whole feature.
 
     A client that fetched the identified comparison and hid the
     identities has already painted them, and "hidden" in a browser is a
@@ -6762,7 +6798,7 @@ def test_the_reveal_closes_the_session_one_way(client):
     """Once somebody has seen the answer key, no later rating of this
     comparison can honestly claim not to have."""
     group_id, ids = rated_group(client)
-    client.post(f"/groups/{group_id}/blind", json={})
+    token = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
 
     revealed = client.post(f"/groups/{group_id}/blind/reveal", json={})
     assert revealed.status_code == 200
@@ -6774,9 +6810,15 @@ def test_the_reveal_closes_the_session_one_way(client):
     # Reopening is refused, and a rating after the reveal is recorded as
     # what it is rather than refused: a sighted rating is still a rating.
     assert client.post(f"/groups/{group_id}/blind", json={}).status_code == 409
+    # CARRYING THE TOKEN, so blind = 0 is the close doing its job rather
+    # than a rating that had no credential to present. Without it this
+    # assertion passed for a reason unrelated to the reveal.
     client.post(
         f"/groups/{group_id}/ratings",
-        json={"blind": True, "ratings": [{"result_id": ids[0], "rating": 4}]},
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
     )
     assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
 
@@ -7352,7 +7394,11 @@ def test_review_repro_a_token_replayed_after_the_reveal_persists_as_not_blind(cl
 
 @respx.mock
 def test_an_invented_blind_token_persists_as_not_blind(client):
-    """No session was ever opened, so nothing issued this. The bench
+    """THE WINDOW: no session on this comparison, and a token presented
+    anyway. The forged-boolean case one level along, now that the claim
+    is a credential rather than a flag.
+
+    No session was ever opened, so nothing issued this. The bench
     answers only to loopback and the threat model is a stale tab rather
     than an attacker, but a token nobody issued must fail for the same
     reason a forged boolean did: the server is the witness."""
@@ -7373,7 +7419,10 @@ def test_an_invented_blind_token_persists_as_not_blind(client):
 
 @respx.mock
 def test_two_blind_sessions_on_one_comparison_do_not_invalidate_each_other(client):
-    """Two people rating the same comparison on one machine are both
+    """THE WINDOW: two sessions open on one comparison at the same time,
+    then the interval after a single reveal closes both.
+
+    Two people rating the same comparison on one machine are both
     legitimately blind, and neither opening should silence the other. A
     single stored token would have made the second open revoke the
     first, turning a real blind rating into a sighted one for no reason

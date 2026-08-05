@@ -95,7 +95,15 @@ def start_blind(bench, open_history, prompt="i4 blind rating"):
 def test_blind_rating_hides_every_identity_until_the_ratings_are_saved(
     bench, open_history
 ):
-    """The measurement is the whole point: a rater who can see which model
+    """THE SURFACE: what the rater can SEE, which is bench_chrome, the
+    rendered text of everything the bench puts on a card minus the answer
+    body. Deliberately not the markup: that is a different and stronger
+    question, asked by
+    test_review_repro_the_blind_entry_never_paints_an_identity, and the
+    two together are what separate "could the rater see it" from "did the
+    page ever receive it".
+
+    The measurement is the whole point: a rater who can see which model
     wrote an answer is not rating the answer. Identity, provider, cost and
     timing all go, because a rater who knows one answer cost ten times
     another can often guess which model it was, and a guess is not a
@@ -143,7 +151,12 @@ def test_submit_stays_disabled_until_every_card_is_rated(bench, open_history):
 def test_the_reveal_happens_only_after_the_save_and_maps_correctly(
     bench, bench_url, open_history
 ):
-    """Reveal after persistence, not before. A rater who saw the answer
+    """THE WINDOW: from the submit click to the reveal, which must
+    contain the save. A rater who saw the answer inside that window and
+    then changed their mind would produce a sighted rating the record
+    calls blind.
+
+    Reveal after persistence, not before. A rater who saw the answer
     and then changed their mind would be producing a sighted rating the
     record calls blind.
 
@@ -220,7 +233,9 @@ def test_the_reveal_happens_only_after_the_save_and_maps_correctly(
 
 
 def test_a_rated_card_cannot_be_rated_again_after_the_reveal(bench, open_history):
-    """The reveal is one way. Re-blinding after it would produce a rating
+    """THE WINDOW: after the reveal, on the page that performed it.
+
+    The reveal is one way. Re-blinding after it would produce a rating
     the record calls blind that was made by someone who had already seen
     the answer, which is worse than no blind rating at all."""
     page = start_blind(bench, open_history)
@@ -238,7 +253,10 @@ def test_a_rated_card_cannot_be_rated_again_after_the_reveal(bench, open_history
 
 
 def test_a_failed_save_does_not_reveal(bench, open_history):
-    """A rater who saw the identities after a failed save would have to
+    """THE WINDOW: a save that failed, from the error to whatever the
+    page does next. Nothing may be revealed inside it.
+
+    A rater who saw the identities after a failed save would have to
     re-rate with the answer in front of them, and that second rating would
     not be blind however it was labelled."""
     page = start_blind(bench, open_history)
@@ -557,8 +575,10 @@ def test_review_repro_the_blind_entry_never_paints_an_identity(
 def test_the_server_issued_session_reveals_only_after_the_save(
     bench, open_history, bench_url
 ):
-    """The identities arrive with the reveal, written onto the cards for
-    the first time, because there was never a hidden copy to un-hide."""
+    """THE WINDOW: from the last rating click to the reveal, over a
+    server-issued session. The identities arrive with the reveal, written
+    onto the cards for the first time, because there was never a hidden
+    copy to un-hide."""
     page = bench(["stub/fast", "stub/slow"])
     check_all_chips(page)
     run_and_wait(page, "i6 blind reveal", 2)
