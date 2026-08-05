@@ -331,3 +331,70 @@ def test_the_other_deterministic_scorers_stay_in_process():
 
     assert "run_with_deadline" not in before_regex
     assert body.count("run_with_deadline") == 1
+
+
+def test_review_repro_the_deadline_is_measured_on_the_monotonic_clock():
+    """The constant says "seconds", and until this commit nothing said
+    seconds OF WHAT. Three readings were available and they behave
+    differently under load, under an NTP step, and under a child that
+    sleeps: CPU time, system-clock wall time, and monotonic wall time.
+    Only the last one makes the number mean one thing.
+
+    Asserted against the mechanism rather than the docstring, because a
+    comment describing a clock nothing consults is precisely the defect
+    this project keeps finding. run_with_deadline does NO time
+    arithmetic of its own: it hands the deadline to
+    multiprocessing.Process.join and the clock comes from there. That
+    chain is join -> Popen.wait -> multiprocessing.connection.wait, and
+    the last of those computes `deadline = time.monotonic() + timeout`
+    and re-derives the remaining timeout from time.monotonic() on every
+    pass.
+
+    Walked here rather than trusted, so a CPython change that swapped
+    the clock fails this test instead of quietly changing what the
+    constant means.
+    """
+    import inspect
+    import multiprocessing.connection
+    import multiprocessing.popen_fork
+    import multiprocessing.popen_spawn_posix
+    from multiprocessing.process import BaseProcess
+
+    # The seam: nothing in this module computes a deadline itself. The
+    # docstring is stripped first, because it EXPLAINS the two clocks by
+    # name and a scan that counted that would be asserting on prose.
+    source = (Path(scoring.__file__)).read_text(encoding="utf-8")
+    function = source.split("def run_with_deadline")[1].split("\ndef ")[0]
+    code = function.split('"""')[2]
+    assert "worker.join(deadline)" in code
+    assert "time.time" not in code and "time.monotonic" not in code
+
+    # The chain, walked. spawn is the start method run_with_deadline
+    # asks for, and its Popen inherits the wait that carries the clock.
+    assert (
+        multiprocessing.popen_spawn_posix.Popen.wait
+        is multiprocessing.popen_fork.Popen.wait
+    )
+    assert "self._popen.wait(timeout)" in inspect.getsource(BaseProcess.join)
+    assert "wait([self.sentinel], timeout)" in inspect.getsource(
+        multiprocessing.popen_fork.Popen.wait
+    )
+    waiter = inspect.getsource(multiprocessing.connection.wait)
+    assert "deadline = time.monotonic() + timeout" in waiter
+    assert "timeout = deadline - time.monotonic()" in waiter
+
+
+def test_the_deadline_bounds_wall_time_not_cpu_time():
+    """A child that sleeps burns no CPU and must still be cut off, which
+    is the observable difference between the two readings. Measured with
+    time.monotonic, the same clock the deadline is kept on."""
+    start = time.monotonic()
+    kind, value = scoring.run_with_deadline(r"(a+)+$", "a" * 10_000 + "b", 1.0)
+    elapsed = time.monotonic() - start
+
+    assert (kind, value) == ("timeout", None)
+    # Above the deadline, because the parent waits the full second, and
+    # far below what the match itself would cost: at n=24 it is already
+    # 1.78s and the cost doubles every two characters.
+    assert elapsed >= 1.0
+    assert elapsed < 15.0

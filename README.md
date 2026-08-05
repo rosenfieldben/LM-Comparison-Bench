@@ -697,6 +697,17 @@ verdict, because the bench does not know whether that pattern would have
 matched. Every other deterministic scorer stays in process, where a string
 comparison is linear in the subject and already bounded.
 
+That second is **wall time on the monotonic clock**, and the distinction
+is what keeps the number meaning one thing. It is not CPU time, so a busy
+machine gives the pattern less work per second and the same second of
+grace; it is not system-clock wall time, so an NTP step during a scoring
+pass cannot shorten or extend it. The bench does no time arithmetic of its
+own here: the value goes to `Process.join`, and the clock comes from
+`multiprocessing.connection.wait`, which keeps its deadline on
+`time.monotonic`. The test walks that chain rather than trusting it, so a
+CPython change that swapped the clock fails a test instead of quietly
+changing what the constant means.
+
 The subject and pattern limits are necessary and were never sufficient,
 which the comment above them used to deny. Backtracking is exponential in
 the subject, so `(a+)+$` (six characters, well inside the 500-character

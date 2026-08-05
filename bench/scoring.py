@@ -41,6 +41,23 @@ MAX_SUBJECT_CHARS = 200_000
 
 # How long one pattern may run before the bench stops waiting for it.
 #
+# SECONDS OF WALL TIME ON THE MONOTONIC CLOCK, which is the property that
+# keeps this number meaning one thing. The value reaches
+# multiprocessing.Process.join, which is Popen.wait, which is
+# multiprocessing.connection.wait, and that function's body is
+# `deadline = time.monotonic() + timeout` with the remaining timeout
+# re-derived from time.monotonic() on every pass. Verified against the
+# CPython 3.11 source in this environment, and asserted by
+# tests/test_scoring.py rather than assumed.
+#
+# Three things it therefore is NOT. It is not CPU time, so a machine
+# running twenty other things gives the pattern less work per second and
+# the same second of grace. It is not wall time on the system clock, so
+# an NTP step or a manual clock change during a scoring pass cannot
+# shorten or extend it. And it is not a budget the child can spend
+# differently: the parent measures it from outside, which is the whole
+# reason the pattern runs in a child at all.
+#
 # A second is enormous for a regex over at most 200k characters: every
 # pattern anyone would deliberately write finishes in single-digit
 # milliseconds, so this never fires on honest input and no user tuning
@@ -101,6 +118,12 @@ def run_with_deadline(
     general: the classic deadlock is a child blocked writing a payload
     bigger than the pipe buffer while the parent waits for it to exit.
     This payload is a two-item tuple holding a bool.
+
+    join is also WHERE THE CLOCK COMES FROM, and this function does no
+    time arithmetic of its own for that reason. Anything computed here
+    from time.time() would move under an NTP step; join reaches
+    multiprocessing.connection.wait, which derives its remaining timeout
+    from time.monotonic() on every pass. See REGEX_DEADLINE_SECONDS.
     """
     context = multiprocessing.get_context("spawn")
     receiver, sender = context.Pipe(duplex=False)
