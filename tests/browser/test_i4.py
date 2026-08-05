@@ -568,3 +568,164 @@ def test_the_server_issued_session_reveals_only_after_the_save(
     group = page.request.get(bench_url + f"/groups/{group_id}").json()
     ids = [r["id"] for run in group["runs"] for r in run["results"]]
     assert ids
+
+
+# ---- Phase I.3: the report view renders what the report now says.
+
+
+def run_experiment_for_report(page, bench_url, tmp_path, name, lineup, task):
+    """One experiment over one task, run to a terminal state.
+
+    Takes the lineup and the task so the report-view cases can differ in
+    the SHAPE they exercise (a duplicated arm, a judged rubric) rather
+    than in how they got there.
+    """
+    dataset = tmp_path / f"{name.replace(' ', '-')}.jsonl"
+    dataset.write_text(json.dumps(task) + "\n", encoding="utf-8")
+    created = page.request.post(
+        bench_url + "/experiments",
+        data={
+            "name": name,
+            "dataset_path": str(dataset),
+            "lineup": lineup,
+            "budget": "standard",
+        },
+    )
+    assert created.ok, created.text()
+    eid = created.json()["id"]
+    started = page.request.post(
+        bench_url + f"/experiments/{eid}/start", data={"dataset_path": str(dataset)}
+    )
+    assert started.ok, started.text()
+    for _ in range(200):
+        detail = page.request.get(bench_url + f"/experiments/{eid}").json()
+        if detail["status"] not in ("created", "running"):
+            break
+        page.wait_for_timeout(50)
+    assert detail["status"] == "done", detail
+    return eid, dataset
+
+
+def score_and_wait(page, bench_url, eid, dataset, judge_model, expected_series):
+    """Run one scoring pass and wait until the report shows its series.
+
+    The report is the wait condition because scoring has no progress
+    endpoint, and the report is also what the test is about: waiting on
+    the thing under assertion cannot pass on a stale read.
+    """
+    started = page.request.post(
+        bench_url + f"/experiments/{eid}/score",
+        data={"dataset_path": str(dataset), "judge_model": judge_model},
+    )
+    assert started.ok, started.text()
+    for _ in range(200):
+        report = page.request.get(bench_url + f"/experiments/{eid}/report").json()
+        seen = {s["judge_model"] for m in report["models"] for s in m["scorers"]}
+        if len(seen) >= expected_series:
+            return report
+        page.wait_for_timeout(50)
+    raise AssertionError(f"scoring never produced {expected_series} series: {seen}")
+
+
+def column_texts(page, table, testid, expected):
+    """One column of one report table, after waiting for it to fill.
+
+    expect() first, because .count() does not retry: reading the DOM the
+    instant after BenchReport.show() is dispatched is a read of the page
+    before the fetch resolves, and an empty list would then pass any
+    assertion phrased as "does not contain".
+    """
+    cells = page.get_by_test_id(table).get_by_test_id(testid)
+    expect(cells).to_have_count(expected)
+    return [cells.nth(i).inner_text() for i in range(expected)]
+
+
+def test_review_repro_a_duplicate_arm_is_two_rows_a_reader_can_tell_apart(
+    page, bench, bench_url, tmp_path
+):
+    """Listing one model twice is how anyone asks how much it varies run
+    to run, so the two arms have to be tellable apart on the page.
+
+    The report computes exactly that name and calls it `label`. The view
+    printed `model` instead, so a duplicated lineup rendered the SAME
+    NAME on two rows carrying different numbers, in all three tables,
+    with nothing on screen to say which arm was which. A reader looking
+    at the answer to the variation question could not read it.
+    """
+    eid, _dataset = run_experiment_for_report(
+        page,
+        bench_url,
+        tmp_path,
+        "i3 duplicate arm",
+        ["stub/fast", "stub/fast"],
+        {"id": "t1", "prompt": "hi"},
+    )
+
+    bench(["stub/fast"])
+    page.evaluate("(id) => window.BenchReport.show(id)", eid)
+    expect(page.get_by_test_id("report-panel")).to_be_visible()
+
+    assert column_texts(page, "report-outcomes", "report-model", 2) == [
+        "stub/fast #0",
+        "stub/fast #1",
+    ]
+    # Every table, not only the first: the same field was printed in all
+    # three, so fixing one would leave two.
+    assert column_texts(page, "report-providers", "report-model", 2) == [
+        "stub/fast #0",
+        "stub/fast #1",
+    ]
+    # These rows recorded distinct positions, so nothing was
+    # reconstructed. The arm caveat has to be EARNED: a hedge on every
+    # duplicate lineup would train readers to ignore the one that means
+    # something.
+    expect(page.get_by_test_id("report-arm-caveat")).to_have_count(0)
+
+
+def test_review_repro_two_judges_render_as_two_rows_that_name_their_judge(
+    page, bench, bench_url, tmp_path
+):
+    """A series is a (scorer, judge) pair, and the page showed only the
+    scorer.
+
+    Two judges of one trial therefore rendered as two rows reading
+    "judge", with different means and no column saying why. That looks
+    like a bug in the bench rather than like the disagreement it is, and
+    a reader has no way to attribute either number.
+
+    The stub scores by JUDGE, 0.9 from stub/fast and 0.4 from stub/slow,
+    so a view that merged the series could not produce this table.
+    """
+    eid, dataset = run_experiment_for_report(
+        page,
+        bench_url,
+        tmp_path,
+        "i3 two judges",
+        ["stub/fast"],
+        # The rubric is a task field rather than a scorer field; a judge
+        # scorer without one is refused at load, because the rubric IS
+        # the scorer.
+        {
+            "id": "t1",
+            "prompt": "hi",
+            "rubric": "score 1 if the response is a reply",
+            "scorer": {"kind": "judge"},
+        },
+    )
+    score_and_wait(page, bench_url, eid, dataset, "stub/fast", 1)
+    score_and_wait(page, bench_url, eid, dataset, "stub/slow", 2)
+
+    bench(["stub/fast"])
+    page.evaluate("(id) => window.BenchReport.show(id)", eid)
+    expect(page.get_by_test_id("report-panel")).to_be_visible()
+
+    rows = page.get_by_test_id("report-score-row")
+    expect(rows).to_have_count(2)
+    assert sorted(column_texts(page, "report-scores", "report-judge", 2)) == [
+        "stub/fast",
+        "stub/slow",
+    ]
+    # Two attributed means, kept apart. No combined number anywhere.
+    means = [rows.nth(i).inner_text() for i in range(2)]
+    assert any("0.90" in text for text in means)
+    assert any("0.40" in text for text in means)

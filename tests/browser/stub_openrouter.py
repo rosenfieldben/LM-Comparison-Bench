@@ -94,6 +94,11 @@ RECONCILED_QUANTIZATION = "fp8"
 # Deltas that must render as literal text everywhere, never as markup.
 HTML_DELTAS = ["<img src=x onerror=alert(1)>", " and ", "<b>bold?</b>"]
 
+# What each judge model scores a response, keyed by the JUDGE and not by
+# the model under test. Two judges that agreed could not distinguish a
+# report which keeps series apart from one that merges them.
+JUDGE_SCORES = {"stub/fast": 0.9, "stub/slow": 0.4}
+
 
 def sse(obj) -> bytes:
     return f"data: {json.dumps(obj)}\n\n".encode()
@@ -330,6 +335,49 @@ def build_app() -> Starlette:
             headers=headers,
         )
 
+    def is_judge_request(payload) -> bool:
+        """Whether this completion is a judge call rather than a trial.
+
+        Matched on a phrase from the judge's system prompt, spelled out
+        here rather than imported from bench.models for the same reason
+        the generation-id header is: this file stands in for the external
+        contract, and importing the app's own constant would make a
+        change to that prompt invisible on both sides at once.
+        """
+        messages = payload.get("messages") or []
+        first = messages[0].get("content", "") if messages else ""
+        return "grading one response against a rubric" in first
+
+    def judge_body(model: str, headers: dict) -> Response:
+        """A verdict in the shape parse_verdict accepts.
+
+        The score depends on the JUDGE, so two judges of the same trial
+        disagree. That disagreement is the whole reason a series is a
+        (scorer, judge) pair rather than a scorer, and a stub where both
+        judges returned the same number could not tell a report that
+        keeps them apart from one that merges them.
+        """
+        score = JUDGE_SCORES.get(model, 0.5)
+        return JSONResponse(
+            {
+                "id": f"gen-judge-{model.split('/')[-1]}",
+                "provider": PROVIDER,
+                "choices": [
+                    {
+                        "message": {
+                            "role": "assistant",
+                            "content": json.dumps(
+                                {"score": score, "reason": f"graded by {model}"}
+                            ),
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": USAGE,
+            },
+            headers=headers,
+        )
+
     async def completions(request):
         payload = await request.json()
         state["requests"].append(payload)
@@ -340,6 +388,8 @@ def build_app() -> Starlette:
         # stopped mid-stream would have nothing to persist, which is the
         # exact case the header exists to cover.
         headers = {GENERATION_ID_HEADER: f"gen-hdr-{model.split('/')[-1]}"}
+        if is_judge_request(payload):
+            return judge_body(model, headers)
         if payload.get("stream"):
             return StreamingResponse(
                 personality_stream(model),

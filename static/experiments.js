@@ -10,9 +10,19 @@
 (function () {
   const panel = document.getElementById("report-panel");
 
-  function cell(text, className) {
+  function cell(text, name) {
     const td = document.createElement("td");
-    if (className) td.className = className;
+    if (name) {
+      // ONE name, used as both the style hook and the test hook. The
+      // frontend stability contract selects on data-testid and volt.css
+      // targets the class, and a column that carried only the class
+      // forced tests to select on styling, which is the coupling the
+      // contract exists to prevent. Stamped together here so a renamed
+      // column cannot leave the stylesheet and the suite pointing at two
+      // different things.
+      td.className = name;
+      td.dataset.testid = name;
+    }
     td.textContent = text;
     return td;
   }
@@ -73,7 +83,12 @@
       // failure rate is over the second, so it ships with its counts for
       // the same reason the pass rate does.
       tr.append(
-        cell(entry.model, "report-model"),
+        // The LABEL, not the model. They are the same string unless the
+        // lineup listed the model twice, and in that case the model name
+        // shows the same row twice with different numbers and no way to
+        // tell which arm is which. The report already computed the
+        // distinguishing name; printing the other field threw it away.
+        cell(entry.label, "report-model"),
         cell(entry.rank == null ? "—" : String(entry.rank)),
         cell(String(t.planned)),
         cell(String(t.attempted)),
@@ -112,6 +127,11 @@
       head([
         "model",
         "scorer",
+        // The judge is half the series key. Without it two judges of one
+        // scorer render as two identical-looking rows with different
+        // numbers, which reads as a bug in the bench rather than as the
+        // disagreement it is.
+        "judge",
         "mean",
         "95% interval",
         "n",
@@ -148,11 +168,24 @@
           flags.push("self-judged " + scorer.self_judged);
         if (scorer.blind > 0) flags.push("blind " + scorer.blind);
         tr.append(
-          cell(entry.model, "report-model"),
+          cell(entry.label, "report-model"),
           cell(scorer.scorer),
+          // Empty rather than a stand-in name: a deterministic scorer and
+          // a human rating have no judge, and inventing one would make
+          // three different things look like one.
+          cell(scorer.judge_model || "—", "report-judge"),
           cell(num(scorer.mean)),
           cell(interval(scorer.interval)),
-          cell(String(scorer.n)),
+          // How much of the mean anybody actually measured. n is the
+          // denominator; the rest of it is failure-inclusive zeros, and
+          // a 0.00 mean over zero measurements means the arm never
+          // answered rather than that it answered badly.
+          cell(
+            scorer.n === scorer.measured
+              ? String(scorer.n)
+              : scorer.n + " (" + scorer.measured + " measured)",
+            "report-n",
+          ),
           cell(passText, "report-pass"),
           cell(cov.scored + " scored, " + cov.unscored + " unscored"),
           cell(
@@ -183,7 +216,7 @@
       const tr = document.createElement("tr");
       tr.dataset.testid = "report-provider-row";
       tr.append(
-        cell(entry.model, "report-model"),
+        cell(entry.label, "report-model"),
         // Empty rather than a guess: under dynamic routing the provider
         // is chosen per call, and a run whose host nobody recorded has
         // no host to name.
@@ -273,6 +306,17 @@
           ")" +
           composition;
     el.append(ranking);
+    if (report.arm_caveat) {
+      // Present only when it was earned, so a reader who sees it knows
+      // something specific happened rather than that the bench hedges by
+      // habit. A caveat that lived only in the payload would be a caveat
+      // nobody reads, which is the same as not having one.
+      const arms = document.createElement("span");
+      arms.dataset.testid = "report-arm-caveat";
+      arms.className = "report-note";
+      arms.textContent = report.arm_caveat;
+      el.append(arms);
+    }
     if (report.thresholds_source === "score_rows") {
       const note = document.createElement("span");
       note.dataset.testid = "report-threshold-note";
