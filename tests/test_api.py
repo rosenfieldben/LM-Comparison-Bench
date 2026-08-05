@@ -6851,10 +6851,38 @@ def test_review_repro_a_duplicated_model_is_two_fully_reported_arms(client, tmp_
 
 
 @respx.mock
-def test_a_seed_that_would_overflow_on_the_last_repeat_is_refused(client, tmp_path):
-    """seed_for_repeat derives base + N, so bounding only the base lets a
-    legal base sit one repeat below the ceiling and overflow silently on
-    the last cell of a long run."""
+def test_review_repro_a_sampling_seed_that_would_overflow_is_refused(client, tmp_path):
+    """seed_for_repeat derives base + N and the runner sends the result to
+    the provider, so a base one repeat below the ceiling overflows
+    silently on the last cell of a long run.
+
+    THE FIELD, which is the whole finding. This rule shipped guarding
+    task_order_seed, which never increments: plan_trials hands it to
+    ordered_tasks once, for the whole experiment. The rule was right, the
+    comment explaining it was right, and it was pointed at a value that
+    cannot overflow while the one that can went unguarded. A check on the
+    wrong field looks exactly like coverage.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, params={"seed": main.MAX_SEED - 1}, repeats=4),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "plus 4 repeats reaches" in detail
+    assert "last repeat is the one that would overflow" in detail
+
+
+@respx.mock
+def test_a_near_ceiling_shuffle_seed_is_accepted(client, tmp_path):
+    """The other direction, and the reason the check had to move rather
+    than be added. task_order_seed is used ONCE per experiment, so a value
+    one below the ceiling is a value one below the ceiling on every cell
+    of every repeat: refusing it refused a legal experiment for arithmetic
+    that never happens."""
     path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
 
     resp = client.post(
@@ -6862,10 +6890,11 @@ def test_a_seed_that_would_overflow_on_the_last_repeat_is_refused(client, tmp_pa
         json=experiment_body(path, task_order_seed=main.MAX_SEED - 1, repeats=4),
     )
 
-    assert resp.status_code == 422
-    detail = resp.json()["detail"]
-    assert "plus 4 repeats reaches" in detail
-    assert "last repeat is the one that would overflow" in detail
+    assert resp.status_code == 201, resp.text
+    assert (
+        client.get(f"/experiments/{resp.json()['id']}").json()["task_order_seed"]
+        == main.MAX_SEED - 1
+    )
 
 
 @respx.mock

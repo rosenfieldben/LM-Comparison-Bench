@@ -894,6 +894,15 @@ arbitrary but reproducible subset of the dataset instead of a privileged
 one. If you expect to hit the ceiling, or you are running a dataset you
 did not write, set the seed.
 
+**Two seeds, and only one of them increments.** `task_order_seed` is used
+once per experiment, so it is bounded against the safe-integer limit and
+nothing further. `params.seed` is the SAMPLING seed, and repeat N sends
+`base + N`, so an experiment is refused at creation when
+`seed + repeats - 1` would pass that limit, with the arithmetic shown.
+The rule shipped guarding the wrong one of the two: it protected a value
+that cannot overflow and left the one that can unguarded, which is a
+check that looks exactly like coverage.
+
 **Interruption is honest.** A stop halts between trials, never inside
 one: a trial that reached upstream has already spent its money, and
 abandoning it would throw away a result you paid for. The experiment ends

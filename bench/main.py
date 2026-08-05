@@ -166,6 +166,12 @@ class ExperimentParams(BaseModel):
     # is now JS's safe-integer range exactly (MIN_SAFE_INTEGER is
     # -MAX_SAFE_INTEGER), because the limit that matters is what survives
     # being read back in a browser. See MAX_SEED.
+    #
+    # THIS IS THE SEED THAT INCREMENTS. An experiment's repeat N sends
+    # base + N (see bench.experiments.seed_for_repeat), so this bound is
+    # necessary and not sufficient there, and create_experiment carries
+    # the arithmetic. A one-off /compare sends it unchanged, which is why
+    # the field's own bound stays the simple one.
     seed: int | None = Field(default=None, ge=-MAX_SEED, le=MAX_SEED)
     # Three named tiers of the seven OpenRouter documents. A comparison
     # holds one effort across models, and the widest set invites a
@@ -418,6 +424,14 @@ class ExperimentCreate(BaseModel):
     # absent means file order. Either way the order is reproducible, which
     # is the only property that matters: a hidden shuffle would make an
     # experiment unrepeatable by anyone including its author.
+    #
+    # Bounded against MAX_SEED and nothing further, because this seed
+    # NEVER INCREMENTS: plan_trials hands it to ordered_tasks once, for
+    # the whole experiment, so a value one below the ceiling is a value
+    # one below the ceiling on every cell of every repeat. The
+    # base-plus-repeats rule belongs to params.seed, which is the seed
+    # seed_for_repeat derives from, and it lives at that field's
+    # validation in create_experiment.
     task_order_seed: int | None = Field(default=None, ge=0, le=MAX_SEED)
     estimand_mode: Literal["routed_service", "underlying_model"] = "routed_service"
     # Which scorer a ranking is computed on. Absent means none declared,
@@ -2214,22 +2228,31 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
             'estimand_mode to "underlying_model", which is the estimand '
             "that narrows the provider population on purpose.",
         )
-    if body.task_order_seed is not None:
-        # seed_for_repeat derives base + N, so the LAST repeat's seed is
-        # base + repeats - 1. Bounding only the base lets a legal base
-        # sit one repeat below the ceiling and hand the provider a seed
-        # past what survives a browser read-back, silently, on the last
-        # cell of a long run. Checked here where the arithmetic can be
-        # shown rather than at trial 300 where it cannot.
-        highest = body.task_order_seed + body.repeats - 1
+    sampling_seed = (controls or {}).get("seed")
+    if sampling_seed is not None:
+        # THE SEED THAT INCREMENTS, which is params.seed and is not
+        # task_order_seed. seed_for_repeat derives base + N and the
+        # runner sends the result to the provider, so the LAST repeat's
+        # seed is base + repeats - 1: bounding only the base lets a legal
+        # base sit one repeat below the ceiling and hand the provider a
+        # value past what survives a browser read-back, silently, on the
+        # last cell of a long run. Checked here where the arithmetic can
+        # be shown rather than at trial 300 where it cannot.
+        #
+        # This check used to sit on task_order_seed, which never
+        # increments: plan_trials calls ordered_tasks with it once, for
+        # the whole experiment. So the rule was correct, its explanation
+        # was correct, and it was pointed at the wrong field. It guarded
+        # a value that cannot overflow and left the one that can
+        # unguarded, which is a defect that looks exactly like coverage.
+        highest = sampling_seed + body.repeats - 1
         if highest > MAX_SEED:
             raise HTTPException(
                 422,
-                f"task_order_seed {body.task_order_seed} plus "
-                f"{body.repeats} repeats reaches {highest}, past the "
-                f"{MAX_SEED} limit: repeat N sends seed base + N, so the "
-                "last repeat is the one that would overflow. Lower the "
-                "seed or the repeat count.",
+                f"seed {sampling_seed} plus {body.repeats} repeats "
+                f"reaches {highest}, past the {MAX_SEED} limit: repeat N "
+                "sends seed base + N, so the last repeat is the one that "
+                "would overflow. Lower the seed or the repeat count.",
             )
     if body.primary_metric is not None:
         enforce_primary_metric(body.primary_metric, dataset)
