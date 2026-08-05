@@ -1328,6 +1328,25 @@ both cost figures, the serving provider, and every score row attached.
 The last line is a sha256 over the preceding bytes, so a citation can
 name the artifact it cites and anyone can check the name.
 
+**The digest seals a moment, not an interval.** Every row is read inside
+one explicit read transaction, opened before the first query and closed
+after the last, so a write committed anywhere inside that window appears
+in none of the lines rather than in the later ones. An artifact that
+straddled two states of the database would verify its own digest
+perfectly while describing a moment that never existed, which is the
+worst combination available.
+
+This needs a real `BEGIN`. A `with conn:` block does not provide one: the
+sqlite3 connection context manager commits or rolls back at exit and
+never begins, and the module starts a transaction implicitly before a
+write and not before a read, so a block of pure `SELECT`s runs each of
+them in its own autocommit transaction. It reads as the guarantee and
+gives none of it. The writer this defends against is another
+**connection**, not another task: the store's synchronous contract
+already rules out an interleaving on the export's own connection, but
+`python -m bench.reconcile --apply` against a live bench is a second
+connection by design, and is the reason `connect()` turns WAL on.
+
 **Two exports of the same experiment are byte-identical.** Line order is
 task, then repeat, then position; key order within a line is sorted.
 Both rules are needed, and neither alone is enough: an artifact whose

@@ -3451,22 +3451,32 @@ def _report_inputs(
 def _export_lines(
     experiment: dict[str, Any], experiment_id: int, thresholds: dict[str, Any] | None
 ) -> list[dict[str, Any]]:
-    """Every line of the artifact, read inside one transaction.
+    """Every line of the artifact, read inside one explicit transaction.
 
-    The whole read sits in a `with conn` block so the export sees one
-    state of the database and not several. Without it a scoring pass
-    finishing between two group reads would land in the later lines and
-    not the earlier ones, producing an artifact that is internally
-    inconsistent and whose digest verifies perfectly, which is the worst
-    combination available.
+    THE WINDOW THIS SEALS: from the first group read to the last score
+    read. A write committed anywhere inside it must appear in none of
+    these lines, not in the later ones, because a digest over an artifact
+    that straddles two states of the database verifies perfectly while
+    describing a moment that never existed.
 
-    The store's synchronous contract is what makes this a real snapshot
-    rather than a hopeful one: nothing here awaits, so no other task can
-    interleave a write between the first read and the last.
+    It used to be a `with db` block, which does not do this. The sqlite3
+    connection context manager commits or rolls back at exit and never
+    issues a BEGIN, and the module starts a transaction implicitly before
+    a write and not before a read, so a block of pure SELECTs ran every
+    one of them in its own autocommit transaction. The block read as the
+    guarantee and provided none of it. store.read_snapshot issues the
+    BEGIN.
+
+    Two DIFFERENT protections, and conflating them is what hid this. The
+    store's synchronous contract rules out another TASK interleaving on
+    this connection, and it did that correctly the whole time. It says
+    nothing about another CONNECTION, and `python -m bench.reconcile
+    --apply` against a live bench is exactly that, by design: it is the
+    reason connect() turns WAL on.
     """
     db = app.state.db
     out: list[dict[str, Any]] = [export_manifest(experiment, REPORT_SEED, thresholds)]
-    with db:
+    with store.read_snapshot(db):
         for group in store.experiment_groups(db, experiment_id):
             detail = store.get_group(db, group["id"])
             if detail is None:

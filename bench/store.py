@@ -29,12 +29,14 @@ WAL mode and the busy timeout, both set in connect(). This contract is
 about the one process that holds this connection.
 """
 
+import contextlib
 import json
 import logging
 import os
 import sqlite3
 import stat
 import urllib.parse
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from typing import Any
 
@@ -386,6 +388,43 @@ def connect(path: str) -> sqlite3.Connection:
     conn.executescript(INDEXES)
     conn.commit()
     return conn
+
+
+@contextlib.contextmanager
+def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
+    """One consistent view of the database for the whole block.
+
+    `with conn` DOES NOT DO THIS and that is the trap it replaces. The
+    sqlite3 connection context manager commits or rolls back at exit; it
+    does not issue a BEGIN. Under the default isolation level the module
+    starts a transaction implicitly before INSERT, UPDATE, DELETE and
+    REPLACE and NOT before SELECT, so a block containing only reads runs
+    every one of them in its own autocommit transaction. `with conn`
+    around a pure read is therefore a no-op wearing the costume of a
+    snapshot, which is worse than nothing: it reads as the guarantee and
+    provides none of it.
+
+    BEGIN is deferred, so the read lock is taken at the first SELECT and
+    held to the end of the block. In WAL mode that pins one version of
+    the database for every statement inside, which is what makes a
+    digest over the result seal a MOMENT rather than an interval.
+
+    The writer this defends against is another CONNECTION, not another
+    task. Nothing inside awaits, so the store's synchronous contract
+    already rules out an interleaving on this connection. What it cannot
+    rule out is `python -m bench.reconcile --apply` against a live bench,
+    which is a second connection by design and is the reason this file
+    turns WAL on at all.
+
+    rollback rather than commit, because nothing was written and rollback
+    is the honest close for a read. It also cannot fail on a busy
+    database the way a commit can.
+    """
+    conn.execute("BEGIN")
+    try:
+        yield
+    finally:
+        conn.rollback()
 
 
 def _now() -> str:

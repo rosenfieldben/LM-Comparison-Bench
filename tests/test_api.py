@@ -6913,7 +6913,13 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
 
 @respx.mock
 def test_review_repro_a_write_between_two_exports_changes_neither(client, tmp_path):
-    """The digest must seal a MOMENT, not an interval.
+    """THE WINDOW: between two whole exports, from the last byte of the
+    first to the first byte of the second. That is a real window and it
+    is not the hard one; the window INSIDE an export is covered by
+    test_review_repro_a_write_landing_mid_export_reaches_neither_export,
+    which is where the isolation actually has to hold.
+
+    The digest must seal a MOMENT, not an interval.
 
     The export read lazily while streaming, so a scoring pass finishing
     part way through would land in the later lines and not the earlier
@@ -7368,3 +7374,76 @@ def test_two_blind_sessions_on_one_comparison_do_not_invalidate_each_other(clien
             },
         )
         assert resp.json()["blind"] is False
+
+
+@respx.mock
+def test_review_repro_a_write_landing_mid_export_reaches_neither_export(
+    client, tmp_path, monkeypatch
+):
+    """THE WINDOW: between two of the export's OWN internal queries, from
+    its first group read to its last score read. Not the gap between two
+    exports, which the I.2 tombstone already covered and which any
+    sequential read would pass; the window where the export is holding a
+    partly-assembled artifact.
+
+    A digest over lines that straddle two states of the database verifies
+    perfectly while describing a moment that never existed. That is the
+    worst combination available, and the previous proof could not see it:
+    it wrote between the exports, so both reads were already whole.
+
+    The write comes from a SECOND CONNECTION, which is the only shape
+    that can reach this window and is a real one: `python -m
+    bench.reconcile --apply` against a live bench is a second connection
+    by design, and is the reason connect() turns WAL on. A write on the
+    export's own connection would join its transaction and be visible to
+    it, which proves nothing about isolation.
+
+    Two exports, each with its own write injected mid-read, and neither
+    sees the write injected into it. The second DOES see the first's,
+    which is the other half: the snapshot is a snapshot, not a stale
+    cache.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+    result_id = client.app.state.db.execute(
+        """SELECT r.id FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ? ORDER BY r.id LIMIT 1""",
+        (eid,),
+    ).fetchone()["id"]
+    writer = store.connect(str(tmp_path / "bench.db"))
+    real_scores_for_results = store.scores_for_results
+    pending = {"marker": None}
+
+    def hooked(conn, ids):
+        # Fires once per export, after the first group's rows have been
+        # read and before the rest: precisely inside the window.
+        if pending["marker"] is not None:
+            marker, pending["marker"] = pending["marker"], None
+            store.add_score(
+                writer,
+                result_id,
+                {"scorer": "human", "score": 1.0, "passed": None, "detail": marker},
+            )
+        return real_scores_for_results(conn, ids)
+
+    monkeypatch.setattr(store, "scores_for_results", hooked)
+
+    pending["marker"] = "first-injection"
+    first = read_export(client, eid)
+    pending["marker"] = "second-injection"
+    second = read_export(client, eid)
+
+    # Neither export contains the write that landed inside it.
+    assert b"first-injection" not in first
+    assert b"second-injection" not in second
+    # The second sees the first's write, wholly: a snapshot, not a stale
+    # read. That is also what makes the absence above meaningful, since a
+    # export that never saw either write would pass the first two
+    # assertions for the wrong reason.
+    assert b"first-injection" in second
+    # And a third export, with nothing injected, sees both.
+    third = read_export(client, eid)
+    assert b"first-injection" in third
+    assert b"second-injection" in third
+    writer.close()
