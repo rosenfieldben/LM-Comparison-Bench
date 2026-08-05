@@ -857,6 +857,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # written. Asking it to stop between trials and then waiting is the
     # same contract the stop endpoint offers.
     await _shutdown_runner()
+    # After the runner, not before. The client is what the in-flight
+    # trial is streaming through, so closing it first would break the
+    # exchange this line just finished waiting for.
     await app.state.client.aclose()
     app.state.db.close()
 
@@ -864,12 +867,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 async def _shutdown_runner() -> None:
     """Ask the runner to stop, then wait for it to actually be finished.
 
-    Two steps, and the second is the one that matters. Setting the stop
-    event alone would return while a trial is still in flight; cancelling
-    alone would cut it at an arbitrary await. Signal first so it can end
-    between trials, cancel second so a hung upstream call cannot hold
-    shutdown open forever, and await either way so the process does not
-    exit with a half-written row behind it.
+    Three steps and they are not interchangeable. The stop event alone
+    would return while a trial is still in flight. The cancel is what
+    ends the run rather than merely asking, and run_experiment shields
+    the trial it is on, so the cancel lands between the trial and the
+    next one instead of inside the upstream exchange.
+
+    THE AWAIT IS THE POINT. Without it this function returns while the
+    runner is still settling: the process exits, the money is spent and
+    the row is not written. What it costs is a bounded wait for ONE
+    trial, never for the rest of the plan, because the cancellation
+    breaks the loop as soon as that trial is counted. A trial whose
+    upstream keeps trickling chunks can make that wait long; losing a
+    paid row is worse, and that is the trade this makes on purpose.
     """
     state = getattr(app.state, "experiment_run", None) or {}
     task = state.get("task")
@@ -2426,6 +2436,22 @@ async def run_one_trial(
     return result
 
 
+# What a run says when the PROCESS ended rather than the run. Written by
+# the two cancellation handlers in run_experiment; the lifespan's
+# stale-row sweep says its own thing, because "a previous process left
+# this row behind" and "this process is shutting down now" are different
+# facts and the second one knows more.
+#
+# Not "stopped" and not "failed". Nobody asked this experiment to end and
+# nothing about it went wrong: its completed trials are real, its
+# in-flight trial was paid for and persisted, and the rest never ran.
+INTERRUPTED_BY_SHUTDOWN = (
+    "this process shut down while the experiment was running; the trial "
+    "in flight was settled and persisted before the runner finished, and "
+    "the remaining trials never ran"
+)
+
+
 async def run_experiment(experiment_id: int) -> None:
     """Walk every cell of an experiment, one trial at a time.
 
@@ -2482,6 +2508,11 @@ async def run_experiment(experiment_id: int) -> None:
         dataset["tasks"], lineup, experiment["repeats"], experiment["task_order_seed"]
     )
     status, detail = "done", None
+    # Set by the cancellation handler around each trial, and read once
+    # that trial has been counted. Declared out here rather than per cell
+    # because it is a fact about the process rather than about a trial:
+    # once it is true the run is over.
+    interrupted = False
     try:
         for cell in plan:
             if state["stop"].is_set():
@@ -2545,9 +2576,27 @@ async def run_experiment(experiment_id: int) -> None:
                     model=model,
                     position=position,
                 )
-                result = await run_one_trial(
-                    experiment, task, model, position, group_id, controls
+                # SHIELDED, then awaited again. Shutdown cancels this
+                # task, and without the shield the CancelledError landed
+                # at whatever await run_one_trial was suspended on, which
+                # is the upstream stream: the call was paid for and
+                # neither the settlement nor the row ever happened. The
+                # money moved and nothing recorded it, which is the exact
+                # outcome _shutdown_runner's docstring claims to prevent.
+                #
+                # The shield lets the trial finish on its own while the
+                # cancellation is delivered here; re-awaiting it collects
+                # the result once its settlement and its save_run have
+                # run. Bounded by the upstream timeout the client already
+                # carries, so this cannot hold shutdown open forever.
+                trial = asyncio.ensure_future(
+                    run_one_trial(experiment, task, model, position, group_id, controls)
                 )
+                try:
+                    result = await asyncio.shield(trial)
+                except asyncio.CancelledError:
+                    result = await trial
+                    interrupted = True
                 refused = bool(result.get("spend_refused"))
                 failed = not refused and result.get("error") is not None
                 # Three disjoint buckets, which is what the conservation
@@ -2564,6 +2613,21 @@ async def run_experiment(experiment_id: int) -> None:
                     refused=1 if refused else 0,
                     failed=1 if failed else 0,
                 )
+                if interrupted:
+                    # After the counters, deliberately. The trial finished
+                    # and was persisted, so conservation has to hold over
+                    # it exactly as it does over every other outcome; a
+                    # break that skipped the bump would leave a row in the
+                    # database that no counter had ever seen.
+                    #
+                    # Ahead of the refusal branch because the process
+                    # ending outranks anything about this experiment. A
+                    # run cut short by shutdown is not halted_on_refusal
+                    # even if its last trial was refused: the reason it
+                    # stopped is that the process went away.
+                    status, detail = "interrupted", INTERRUPTED_BY_SHUTDOWN
+                    halted = True
+                    break
                 if refused and experiment["halt_on_refusal"]:
                     # The default. A ceiling refusal means the money ran
                     # out, and continuing would produce a record whose
@@ -2582,6 +2646,21 @@ async def run_experiment(experiment_id: int) -> None:
                     break
             if halted:
                 break
+    except asyncio.CancelledError:
+        # A cancel that landed somewhere other than the shielded trial.
+        # CancelledError is a BaseException, so `except Exception` never
+        # saw it and the finally below wrote whatever `status` still held,
+        # which on the ordinary path is "done": a run cut off by shutdown
+        # published itself as a completed experiment. Every rate in its
+        # report was then computed against a plan the reader had no reason
+        # to doubt, and nothing anywhere said the process had gone away.
+        #
+        # Re-raised, because the caller asked this task to end and a
+        # coroutine that swallows its own cancellation is lying to the
+        # scheduler as well. The finally runs first, so the honest status
+        # is written either way.
+        status, detail = "interrupted", INTERRUPTED_BY_SHUTDOWN
+        raise
     except Exception as exc:
         logger.exception("experiment %s failed", experiment_id)
         status, detail = "failed", f"{type(exc).__name__}: {exc}"

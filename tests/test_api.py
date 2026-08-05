@@ -7126,3 +7126,100 @@ def test_review_repro_a_stale_running_experiment_boots_as_interrupted(
     # And a terminal status is a status a reader may cite, so it has to
     # be in the vocabulary the writers share rather than beside it.
     assert "interrupted" in store.EXPERIMENT_STATUSES
+
+
+@respx.mock
+def test_review_repro_a_cancelled_runner_keeps_its_paid_row_and_says_interrupted(
+    client, tmp_path
+):
+    """THE WINDOW: from the cancel landing INSIDE the upstream exchange to
+    the experiment reaching a terminal status. Not the gap between
+    trials, where a cancel is harmless, and not the moment before the
+    request leaves, where there is nothing to lose. The window is the one
+    where the money is committed and the row is not yet written.
+
+    Landing the cancel there takes care. A cancel issued while the task
+    is running only sets a flag; it is delivered at the next real
+    suspension, and the mock transport does not suspend at all, so a
+    cancel from inside the respx route is absorbed and the run ends
+    normally. That version of this test passed against the broken code
+    for the wrong reason. The stream below cancels between two chunks and
+    then awaits, so the delivery point is inside aiter_lines with the
+    usage chunk still to come.
+
+    Two defects lived in that window.
+
+    The cancel propagated out of run_one_trial before the settlement and
+    before save_run, so the call was paid for and nothing recorded it:
+    the exact outcome the shutdown path's own docstring claimed to
+    prevent.
+
+    And CancelledError is a BaseException, so `except Exception` never
+    saw it and the finally wrote whatever `status` still held, which on
+    the ordinary path is "done". A run cut off by shutdown published
+    itself as a COMPLETED experiment, with every rate in its report
+    computed against a plan a reader had no reason to doubt.
+    """
+    fired = {"done": False}
+
+    class CancelMidStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield sse({"choices": [{"delta": {"content": "Hel"}}]})
+            if not fired["done"]:
+                fired["done"] = True
+                # What _shutdown_runner does, minus its await: awaiting
+                # the runner from inside the runner's own trial would
+                # deadlock on the task this stream runs underneath.
+                state = client.app.state.experiment_run
+                state["stop"].set()
+                state["task"].cancel()
+            # The real suspension. Everything above ran synchronously
+            # inside the task, so the cancel is only a pending flag until
+            # here; this is the instant it is delivered.
+            await asyncio.sleep(0)
+            yield sse({"choices": [{"delta": {"content": "lo"}}]})
+            yield sse({"choices": [{"delta": {}, "finish_reason": "stop"}]})
+            yield sse(
+                {"choices": [], "usage": {"prompt_tokens": 13, "completion_tokens": 8}}
+            )
+            yield DONE_MARKER
+
+    calls = {"n": 0}
+
+    def route(request):
+        calls["n"] += 1
+        return httpx.Response(200, stream=CancelMidStream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "interrupted"
+    assert "settled and persisted" in final["status_detail"]
+    # The trial that was in flight is real history: text, cost and all.
+    # Exactly one upstream call was made, and exactly one row records it.
+    assert calls["n"] == 1
+    rows = client.app.state.db.execute(
+        """SELECT r.response_text, r.cost_usd FROM results r
+           JOIN runs ru ON ru.id = r.run_id
+           JOIN groups g ON g.id = ru.group_id
+           WHERE g.experiment_id = ?""",
+        (eid,),
+    ).fetchall()
+    assert [r["response_text"] for r in rows] == ["Hello"]
+    assert rows[0]["cost_usd"] == pytest.approx(2.9e-05)
+    report = client.get(f"/experiments/{eid}/report").json()
+    assert report["models"][0]["cost"]["total_usd"] == pytest.approx(2.9e-05)
+    # Conservation across the cancel: every persisted row is counted
+    # exactly once, and the gap to the total is what never ran.
+    assert final["trials_done"] + final["trials_failed"] + final[
+        "trials_refused"
+    ] == len(rows)
+    assert final["trials_done"] == 1
+    assert final["trials_total"] == 2
