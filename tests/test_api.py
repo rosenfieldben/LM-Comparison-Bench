@@ -7047,3 +7047,82 @@ def test_quantization_pins_are_refused_under_the_routed_service_estimand(
 
     assert resp.status_code == 422
     assert "underlying-model estimand's business" in resp.json()["detail"]
+
+
+# ---- Phase I.3: the eleven counterexamples.
+
+
+def stale_experiment_db(tmp_path, status="running"):
+    """A database holding one experiment in the given status, then closed.
+
+    Written through store rather than by hand so the row is exactly what
+    a previous process would have left, including every column the
+    manifest discipline fills in at creation.
+    """
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    experiment_id = store.create_experiment(
+        conn,
+        {
+            "name": "left running",
+            "dataset_name": "d.jsonl",
+            "dataset_digest": "ab" * 32,
+            "lineup": ["model/alpha"],
+            "budget": "standard",
+            "params": None,
+            "repeats": 1,
+            "task_order_seed": None,
+            "estimand_mode": "routed_service",
+            "provider_pins": None,
+            "halt_on_refusal": True,
+            "app_sha": "abc1234",
+            "catalog_digest": "cd" * 32,
+            "data_policy": "standard",
+            "tasks_total": 1,
+            "trials_total": 1,
+        },
+    )
+    store.set_experiment_status(conn, experiment_id, status)
+    conn.close()
+    return db_path, experiment_id
+
+
+def boot_against(monkeypatch, db_path):
+    """A TestClient over an existing database file, catalog stubbed.
+
+    The `client` fixture always starts from an empty directory, which is
+    exactly the state that cannot exhibit a stale-row bug.
+    """
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(db_path))
+
+    async def fake_fetch_catalog(_client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    return TestClient(app, base_url="http://localhost")
+
+
+def test_review_repro_a_stale_running_experiment_boots_as_interrupted(
+    monkeypatch, tmp_path
+):
+    """The status vocabulary is a tuple so its writers agree, and two of
+    them did not: the lifespan's stale-row sweep and the runner's
+    cancellation path both write "interrupted", which was never listed.
+
+    set_experiment_status asserts membership, so the sweep raised inside
+    the lifespan and the app would not boot at all. Any database holding
+    one row a previous process had left running was a database this
+    build could not open, and the sweep exists precisely because such
+    rows are the ordinary consequence of a crash.
+    """
+    db_path, experiment_id = stale_experiment_db(tmp_path)
+
+    with boot_against(monkeypatch, db_path) as booted:
+        row = booted.get(f"/experiments/{experiment_id}").json()
+
+    assert row["status"] == "interrupted"
+    assert "never ran" in row["status_detail"]
+    # And a terminal status is a status a reader may cite, so it has to
+    # be in the vocabulary the writers share rather than beside it.
+    assert "interrupted" in store.EXPERIMENT_STATUSES

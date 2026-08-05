@@ -1113,12 +1113,26 @@ def apply_reconciliation(
 # and not a placeholder: the manifest is written complete before any
 # trial, so an experiment that never starts still has a full record of
 # what it was going to be.
+# "interrupted" is what a run becomes when the PROCESS ended rather than
+# the run: a crash, a kill, or a shutdown that cancelled the runner
+# mid-trial. It is terminal like the rest, and it is not "failed" or
+# "stopped", because neither of those is true: nothing about the
+# experiment went wrong and no operator asked it to end. The completed
+# trials are real and the remaining ones never ran.
+#
+# It was written by two callers (the lifespan's stale-row sweep and the
+# runner's cancellation path) before it was ever listed here, and
+# set_experiment_status asserts membership: the sweep raised at startup,
+# so a database holding one stale running row made the app unbootable.
+# That is the whole argument for keeping the vocabulary in one tuple and
+# the whole way this tuple failed to be one.
 EXPERIMENT_STATUSES = (
     "created",
     "running",
     "done",
     "stopped",
     "halted_on_refusal",
+    "interrupted",
     "failed",
 )
 
