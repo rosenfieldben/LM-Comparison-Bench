@@ -5335,8 +5335,8 @@ def test_ratings_persist_as_human_scores_with_their_conditions(client):
     label the card wore. All three, because the normalized score alone is
     a number no rater ever saw and a blind nobody can audit."""
     group_id, ids = rated_group(client)
-    # The session is what makes the record's blind flag true; the body's
-    # own claim is ignored either way.
+    # The session's TOKEN is what makes the record's blind flag true; the
+    # body's own claim is ignored either way.
     opened = client.post(f"/groups/{group_id}/blind", json={})
     assert opened.status_code == 201, opened.text
 
@@ -5344,6 +5344,7 @@ def test_ratings_persist_as_human_scores_with_their_conditions(client):
         f"/groups/{group_id}/ratings",
         json={
             "blind": True,
+            "blind_token": opened.json()["token"],
             "ratings": [
                 {"result_id": ids[0], "rating": 5, "label": "B"},
                 {"result_id": ids[1], "rating": 1, "label": "A"},
@@ -5855,11 +5856,11 @@ def test_human_ratings_appear_as_their_own_scorer_row_with_the_blind_flag(
     ).fetchone()["id"]
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
-    client.post(f"/groups/{group_id}/blind", json={})
+    opened = client.post(f"/groups/{group_id}/blind", json={})
     client.post(
         f"/groups/{group_id}/ratings",
         json={
-            "blind": True,
+            "blind_token": opened.json()["token"],
             "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
         },
     )
@@ -6685,11 +6686,11 @@ def test_a_human_ranked_report_states_how_much_of_it_was_blind(client, tmp_path)
     ).fetchone()["id"]
     detail = client.get(f"/groups/{group_id}").json()
     ids = [r["id"] for run in detail["runs"] for r in run["results"]]
-    client.post(f"/groups/{group_id}/blind", json={})
+    opened = client.post(f"/groups/{group_id}/blind", json={})
     client.post(
         f"/groups/{group_id}/ratings",
         json={
-            "blind": True,
+            "blind_token": opened.json()["token"],
             "ratings": [{"result_id": i, "rating": 4, "label": "A"} for i in ids],
         },
     )
@@ -7223,3 +7224,147 @@ def test_review_repro_a_cancelled_runner_keeps_its_paid_row_and_says_interrupted
     ] == len(rows)
     assert final["trials_done"] == 1
     assert final["trials_total"] == 2
+
+
+@respx.mock
+def test_review_repro_a_second_tabs_sighted_rating_persists_as_not_blind(client):
+    """THE WINDOW: from one tab opening a blind session to another tab,
+    on the same comparison, posting ratings while that session is still
+    open and unrevealed. Nothing before the open and nothing after the
+    reveal; the whole defect lived in the interval where a session
+    existed and the second tab had nothing to do with it.
+
+    The flag was a per-group boolean, so it answered "is a blind session
+    open for this group". That is TRUE FOR EVERY TAB the moment any one
+    of them opens one. A second window replaying the same comparison the
+    ordinary way, with every model name, provider and cost on screen,
+    posted its ratings into somebody else's blind and they persisted
+    blind = 1. Nothing about those ratings was blind and nothing in the
+    record said otherwise, which is the same defect as a client-forged
+    claim arriving by a longer route.
+
+    One click apart in a real browser: open the list, rate blind in one
+    tab, replay the comparison in another.
+    """
+    group_id, ids = rated_group(client)
+    blind_tab = client.post(f"/groups/{group_id}/blind", json={})
+    assert blind_tab.status_code == 201, blind_tab.text
+
+    # The second tab. It never opened a session, so it holds no token,
+    # and it is looking at the identified comparison.
+    sighted = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"ratings": [{"result_id": ids[0], "rating": 5}]},
+    )
+
+    assert sighted.status_code == 201
+    assert sighted.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+    # And the tab that DID open the session is unaffected: its token
+    # still works, so the fix is a narrowing rather than a blanket no.
+    blind = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": blind_tab.json()["token"],
+            "ratings": [{"result_id": ids[1], "rating": 5}],
+        },
+    )
+    assert blind.json()["blind"] is True
+
+
+@respx.mock
+def test_review_repro_a_token_replayed_after_the_reveal_persists_as_not_blind(client):
+    """THE WINDOW: from the reveal to any later rating bearing a token
+    issued before it. The close is one way, and a token is only worth
+    what the session behind it is worth.
+
+    A rater who reveals, sees which model wrote which answer, and then
+    re-posts with the token their page is still holding is not making a
+    blind rating however the request is shaped. The token has to die with
+    its session or it becomes a bearer credential for a claim that has
+    stopped being true.
+    """
+    group_id, ids = rated_group(client)
+    token = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+    # Blind while the session is open.
+    before = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
+    )
+    assert before.json()["blind"] is True
+
+    revealed = client.post(f"/groups/{group_id}/blind/reveal", json={})
+    assert revealed.status_code == 200
+    after = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind_token": token,
+            "ratings": [{"result_id": ids[1], "rating": 4}],
+        },
+    )
+
+    assert after.status_code == 201
+    assert after.json()["blind"] is False
+    rows = store.scores_for_results(client.app.state.db, ids)
+    assert rows[ids[0]][0]["blind"] == 1
+    assert rows[ids[1]][0]["blind"] == 0
+    # And the session cannot be reopened to launder the same token.
+    assert client.post(f"/groups/{group_id}/blind", json={}).status_code == 409
+
+
+@respx.mock
+def test_an_invented_blind_token_persists_as_not_blind(client):
+    """No session was ever opened, so nothing issued this. The bench
+    answers only to loopback and the threat model is a stale tab rather
+    than an attacker, but a token nobody issued must fail for the same
+    reason a forged boolean did: the server is the witness."""
+    group_id, ids = rated_group(client)
+
+    resp = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "blind": True,
+            "blind_token": "not-a-token-anybody-issued",
+            "ratings": [{"result_id": ids[0], "rating": 4}],
+        },
+    )
+
+    assert resp.json()["blind"] is False
+    assert store.scores_for_results(client.app.state.db, ids)[ids[0]][0]["blind"] == 0
+
+
+@respx.mock
+def test_two_blind_sessions_on_one_comparison_do_not_invalidate_each_other(client):
+    """Two people rating the same comparison on one machine are both
+    legitimately blind, and neither opening should silence the other. A
+    single stored token would have made the second open revoke the
+    first, turning a real blind rating into a sighted one for no reason
+    anybody could see."""
+    group_id, ids = rated_group(client)
+    first = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+    second = client.post(f"/groups/{group_id}/blind", json={}).json()["token"]
+
+    assert first != second
+    for token, result_id in ((first, ids[0]), (second, ids[1])):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={
+                "blind_token": token,
+                "ratings": [{"result_id": result_id, "rating": 4}],
+            },
+        )
+        assert resp.json()["blind"] is True
+    # And one reveal closes both, because the answer key is out.
+    client.post(f"/groups/{group_id}/blind/reveal", json={})
+    for token in (first, second):
+        resp = client.post(
+            f"/groups/{group_id}/ratings",
+            json={
+                "blind_token": token,
+                "ratings": [{"result_id": ids[0], "rating": 4}],
+            },
+        )
+        assert resp.json()["blind"] is False

@@ -913,22 +913,36 @@ feature. A page that fetched the identified comparison and then hid the
 identities has already painted them, and "hidden" in a browser is a style
 rule anyone can undo plus a frame the rater may have seen.
 
-**The blind flag on a rating is the server's, not the client's.** It
-records whether an open session existed for that comparison when the
-ratings arrived, and the body's own claim is ignored. A page that
-revealed the identities and then posted `blind: true` would be testifying
-about its own past, which is the one witness a blind record cannot use.
-The reveal closes the session one way: a comparison whose answer key
-somebody has seen cannot be reopened blind, because a rating made after
-that is not a blind rating however the page is arranged.
+**The blind flag on a rating is the server's, not the client's, and it is
+decided by a token.** Opening a blind session issues one; a rating is
+recorded blind only when it arrives bearing the token of a session the
+server still has open. A page that revealed the identities and then posted
+`blind: true` would be testifying about its own past, which is the one
+witness a blind record cannot use.
 
-Nothing here is a secret from the operator, who owns the process and the
-database. The point is narrower and it is about evidence: a rating claims
-to have been made without knowing which model wrote which answer, and
-that claim is worth something only if the page could not have known
-either.
+A per-group boolean was not enough. It answered "is a blind session open
+for this comparison", which is true for **every tab** the moment any one
+of them opens one, so a second window replaying that comparison sighted
+posted its ratings into somebody else's blind and they persisted
+`blind = 1`. The token answers the question that was meant: did **these
+ratings** come from a blind session. A missing token, an invented one, or
+one issued before the reveal all persist `blind = 0`. Several sessions may
+be open on one comparison at once, because two people rating it are both
+legitimately blind; one reveal closes all of them, because the answer key
+is out.
 
-Two limits remain and are stated rather than discovered. The bench cannot
+**What the flag attests is the path the rating took**, and stating that is
+the point rather than a hedge. It says these ratings came from a view the
+server built without identities, on a session it issued and had not yet
+closed. It cannot attest what the person in the chair arranged to see by
+other means: this is a localhost tool, the operator owns the process, the
+database and the browser, and they can keep the export open in one window
+and the blind view in another. The claim is narrower than "this person did
+not know". It is "the bench did not tell them", which is the only party
+the bench can speak for. What the boolean got wrong was different in kind:
+it attested a path the ratings had not taken at all.
+
+Two further limits are stated rather than discovered. The bench cannot
 blind what a model wrote about itself, so an answer beginning "as an AI
 assistant made by X" identifies its author whatever the page does. And a
 rater who has already replayed a comparison sightedly knows its contents;

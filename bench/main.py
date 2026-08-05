@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -10,6 +11,7 @@ import math
 import os
 import random
 import re
+import secrets
 import sqlite3
 import subprocess
 import time
@@ -3087,15 +3089,26 @@ class RatingsSubmit(BaseModel):
     model_config = FORBID_UNKNOWN
 
     ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
-    # RECEIVED AND IGNORED. Nothing reads this field. The server writes
-    # its own answer from the blind session instead, because a page that
-    # revealed the identities and then claimed blind=true would be
-    # testifying about its own past, which is the one witness a blind
-    # record cannot use. See submit_ratings and blind_session_open.
+    # The token the server issued when it opened a blind session, echoed
+    # back. This is the ONLY thing that can make a rating blind; see
+    # blind_token_valid for why a boolean could not.
     #
-    # It remains only so a client that has always sent it is not rejected
-    # by extra="forbid" for doing what it was told to do. Removing it is
-    # a breaking change to the request shape and is a NAMED DEFERRAL,
+    # Absent is the ordinary case and it is not an error: a sighted
+    # rating is a real rating, it simply persists blind = 0. Bounded
+    # because it is a string from a request and every string from a
+    # request is bounded.
+    blind_token: str | None = Field(default=None, max_length=200)
+    # RECEIVED AND IGNORED. Nothing reads this field. The server writes
+    # its own answer from the blind session's token instead, because a
+    # page that revealed the identities and then claimed blind=true would
+    # be testifying about its own past, which is the one witness a blind
+    # record cannot use. See submit_ratings and blind_token_valid.
+    #
+    # No client in this repository sends it any more, as of the commit
+    # that removed the legacy rate-blind path. It remains only so a
+    # third-party script that has always sent it is not rejected by
+    # extra="forbid" for doing what it was told to do. Removing it is a
+    # breaking change to the request shape and is a NAMED DEFERRAL,
     # waiting for a moment when breaking changes are being made
     # deliberately rather than as a side effect of a correctness fix.
     blind: bool = False
@@ -3111,15 +3124,20 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
     would otherwise write ratings onto the wrong models silently, and a
     silent misattribution is the worst outcome this endpoint has.
 
-    THE BLIND FLAG IS THE SERVER'S, not the client's. It records whether
-    an open blind session existed for this group at the moment the
-    ratings arrived, and the body's own claim is ignored. A blind rating
-    is evidence about the conditions a person judged under, so the one
-    party that cannot be the witness is the page that was showing them
-    the answers: a tab that revealed identities and then posted
-    blind=true would be writing a claim about its own past that nothing
-    could check. The session is opened by the server, carries the
-    shuffle, and closes one way at reveal.
+    THE BLIND FLAG IS THE SERVER'S, not the client's, and it is decided
+    by the TOKEN these ratings carry rather than by anything the body
+    claims. A blind rating is evidence about the conditions a person
+    judged under, so the one party that cannot be the witness is the page
+    that was showing them the answers.
+
+    A per-group boolean was not enough, and the gap was reachable in one
+    click. It answered "is a blind session open for this group", which is
+    true for EVERY tab the moment any one of them opens one: a second tab
+    replaying the same comparison sighted, with every model name on
+    screen, posted its ratings into a blind that a different window had
+    opened, and they persisted blind = 1. The token answers the question
+    that was actually meant, "did THESE ratings come from a blind
+    session", and only the tab the server handed it to can answer yes.
     """
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
@@ -3134,7 +3152,7 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
             "page may be showing an older comparison than the one it is "
             "rating; reload it.",
         )
-    blind = blind_session_open(group_id)
+    blind = blind_token_valid(group_id, body.blind_token)
     written = 0
     for rating in body.ratings:
         store.add_score(
@@ -3172,24 +3190,46 @@ def _rating_detail(rating: Rating) -> str:
 # session is a fact about a person sitting in front of a page right now,
 # it expires with the process, and persisting it would create a second
 # record of blindness that could disagree with the score rows, which are
-# the only record that matters afterwards.
+# the only record that matters afterwards. A restart fails closed.
 #
-# One entry per group rather than a token, because the bench answers only
-# to loopback and the threat model is a stale tab rather than an
-# attacker: the question is "was a blind session open for this group when
-# these ratings arrived", and the group id answers it.
-BLIND_SESSIONS: dict[int, bool] = {}
+# Three states, and the None is load-bearing:
+#   absent  no session was ever opened for this group
+#   set     the tokens of every session currently open on it
+#   None    a reveal happened; the close is one way and this is the mark
+#
+# A SET rather than one token, because two people rating the same
+# comparison on one machine are both legitimately blind and neither
+# should invalidate the other. A reveal closes all of them at once, which
+# is correct: once anybody has seen the answer key for this comparison,
+# no rating of it made afterwards is blind however the page is arranged.
+BLIND_SESSIONS: dict[int, set[str] | None] = {}
 
 
-def blind_session_open(group_id: int) -> bool:
-    """Whether this group is being rated blind right now.
+def blind_token_valid(group_id: int, token: str | None) -> bool:
+    """Whether these ratings came from an open, unrevealed blind session.
 
-    The server's own answer to the question the client is not a competent
-    witness for. Absent means no session was ever opened; False means one
-    was opened and then closed by a reveal, and both mean the same thing
-    to a rating arriving now.
+    A TOKEN AND NOT A BOOLEAN, and the difference is the whole of this
+    fix. A per-group boolean answered "is a blind session open for this
+    group", which is true for every tab in the browser the moment any one
+    of them opens one. A second tab replaying the same comparison
+    sighted, model names and costs on screen, posted its ratings into
+    somebody else's blind and they persisted blind = 1. Nothing about
+    that rating was blind and nothing in the record said so.
+
+    Four ways to arrive without one, all the same answer. No token: a
+    sighted rating, which is a real rating that is simply not blind. A
+    token for a session that was never opened, or one invented: nothing
+    issued it. A token after the reveal: somebody has seen the answer
+    key. Compared with compare_digest because a token comparison is a
+    token comparison, not because the threat model here is timing.
     """
-    return BLIND_SESSIONS.get(group_id, False)
+    if token is None:
+        return False
+    issued = BLIND_SESSIONS.get(group_id)
+    if not issued:
+        # Absent, revealed (None), or open with nothing outstanding.
+        return False
+    return any(hmac.compare_digest(known, token) for known in issued)
 
 
 @app.post("/groups/{group_id}/blind", status_code=201)
@@ -3203,11 +3243,24 @@ async def open_blind_session(group_id: int) -> dict[str, Any]:
     identities has already painted them, and "hidden" in a browser is a
     style rule anyone can undo, plus a frame the rater may have seen.
 
-    Nothing here is a secret from the operator: they own the process and
-    the database. The point is narrower and it is about evidence. A
-    rating claims to have been made without knowing which model wrote
-    which answer, and the only way that claim can be worth anything is if
-    the page could not have known either.
+    The response carries a TOKEN, and a rating is recorded blind only if
+    it comes back bearing one. See blind_token_valid.
+
+    THE HONEST RESIDUAL, stated here because this is where the feature
+    lives and a limit documented somewhere else is a limit nobody reads.
+    What the flag attests is THE PATH THE RATING TOOK: it says these
+    ratings came from a view the server built without identities, on a
+    session it issued and had not yet closed. It does not and cannot
+    attest what the person in the chair arranged to see by other means.
+    This is a localhost tool and the operator owns the process, the
+    database and the browser; they can open the export in one window and
+    the blind view in another, and no server-side rule can see that.
+
+    That is a real limit and it is not a defect, because the claim being
+    made is narrower than "this person did not know". It is "the bench
+    did not tell them", and the bench is the only party it can speak for.
+    What the boolean got wrong was different in kind: it attested a path
+    the ratings had not taken at all.
     """
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
@@ -3220,12 +3273,17 @@ async def open_blind_session(group_id: int) -> dict[str, Any]:
             f"comparison {group_id} has no results to rate: a blind "
             "session over nothing would record nothing.",
         )
-    if group_id in BLIND_SESSIONS and not BLIND_SESSIONS[group_id]:
+    if BLIND_SESSIONS.get(group_id, ()) is None:
         # The close is ONE WAY, and this is where that is enforced. A
         # session that could be reopened would let a rater look, close,
         # reopen and rate, with the record still saying blind. Once
         # somebody has seen the answer key for this comparison, no later
         # rating of it can honestly claim not to have.
+        #
+        # None is the revealed mark and the default is an empty tuple
+        # rather than None, so "never opened" and "revealed" stay
+        # distinguishable: a get() defaulting to None would refuse the
+        # first open every group ever gets.
         raise HTTPException(
             409,
             f"comparison {group_id} has already been revealed. A blind "
@@ -3235,10 +3293,20 @@ async def open_blind_session(group_id: int) -> dict[str, Any]:
         )
     order = list(range(len(results)))
     random.shuffle(order)
-    BLIND_SESSIONS[group_id] = True
+    # secrets rather than random: the shuffle above may be predictable
+    # without consequence (the labels carry no information either way),
+    # while a guessable token would let a page claim a blindness the
+    # server never granted it, which is the whole thing this defends.
+    token = secrets.token_urlsafe(32)
+    open_tokens = BLIND_SESSIONS.get(group_id) or set()
+    open_tokens.add(token)
+    BLIND_SESSIONS[group_id] = open_tokens
     return {
         "group_id": group_id,
         "blind": True,
+        # The only thing that can make a later rating blind. Held by the
+        # tab that opened this session and by nothing else.
+        "token": token,
         # Label, id and answer. Everything else a card normally carries
         # is absent rather than nulled, because a null field is still a
         # field a future edit could fill in by accident.
@@ -3262,12 +3330,19 @@ async def close_blind_session(group_id: int) -> dict[str, Any]:
     look, close, reopen and rate, with the record still saying blind. The
     close is what makes every later rating on this group honest about the
     fact that somebody has now seen the answer key.
+
+    EVERY open token on this group dies here, not only the caller's, and
+    no token is required to do it. Both follow from what a reveal means:
+    the answer key for this comparison is now out, and which tab asked
+    for it changes nothing about that. A rating replaying a token issued
+    before the reveal persists 0, which is the second half of the rule
+    the token exists to enforce.
     """
     ensure_rowid(group_id)
     group = store.get_group(app.state.db, group_id)
     if group is None:
         raise HTTPException(404, "no such group")
-    BLIND_SESSIONS[group_id] = False
+    BLIND_SESSIONS[group_id] = None
     return {
         "group_id": group_id,
         "blind": False,

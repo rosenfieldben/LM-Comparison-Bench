@@ -207,8 +207,12 @@
     if (!current() || session.revealed) return;
     session.submit.disabled = true;
     session.msg.textContent = "saving";
+    // The TOKEN, and no claim. The server decides whether these ratings
+    // are blind by whether this token names a session it still has open;
+    // a flag saying "trust me, I was blind" is the one thing a page
+    // cannot honestly send about its own past.
     const payload = {
-      blind: true,
+      blind_token: session.token,
       ratings: Array.from(session.ratings, ([resultId, entry]) => ({
         result_id: resultId,
         rating: entry.rating,
@@ -348,6 +352,11 @@
       revealed: false,
       epoch: window.BenchState.viewEpoch,
       serverIssued: true,
+      // The server's proof that THIS page was handed an anonymized view.
+      // Held only here, for as long as this view lasts: it is the whole
+      // of what makes a rating from this tab blind, and a second tab
+      // showing the identified comparison has no way to obtain it.
+      token: payload.token,
       submit: null,
       count: null,
       msg: null,

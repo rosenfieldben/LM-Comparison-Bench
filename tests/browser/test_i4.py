@@ -182,7 +182,14 @@ def test_the_reveal_happens_only_after_the_save_and_maps_correctly(
     # wore and the rating clicked under it.
     assert len(posted) == 1
     payload = json.loads(posted[0])
-    assert payload["blind"] is True
+    # NO CLAIM. The page used to post blind: true, which is the one thing
+    # it cannot honestly say about its own past. This path is the legacy
+    # client-side blind and it holds no server token, so what it sends is
+    # nothing at all and the record says blind = 0, correctly: no session
+    # was ever issued for it. The next commit removes the path; the token
+    # assertion arrives with it.
+    assert "blind" not in payload
+    assert payload.get("blind_token") is None
     sent = {r["label"]: r for r in payload["ratings"]}
     assert sent["A"]["rating"] == 5
     assert sent["B"]["rating"] == 1
