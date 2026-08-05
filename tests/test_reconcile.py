@@ -4,6 +4,25 @@ The whole script runs in-process: store.connect against a temp file and a
 stubbed generation endpoint through respx, injected the way the endpoints
 inject their client. No subprocess and no network, so the assertions are
 about what the pass writes, not about how it was launched.
+
+EVERY CLIENT HERE IS BUILT trust_env=False, and it is load-bearing rather
+than tidy. respx intercepts at the transport, which is a layer BELOW the
+one that reads proxy environment variables: with trust_env on, httpx
+resolves the ambient proxy while CONSTRUCTING the client, and a socks
+proxy without the socksio package raises ImportError there. The client
+never exists, so respx never gets a request to intercept, and a test that
+touches no network fails because of the network anyway.
+
+That is not hypothetical. Two tests were added with a bare
+httpx.AsyncClient() and passed everywhere except under the poisoned-proxy
+hermeticity run, where they were the only two failures in the suite:
+
+  ImportError: Using SOCKS proxy, but the 'socksio' package is not
+  installed. Make sure to install httpx using `pip install httpx[socks]`.
+
+The convention was invisible, which is why it was missed: fifteen call
+sites carried the flag and nothing said why. It is said here once rather
+than fifteen times.
 """
 
 import io
@@ -475,7 +494,7 @@ async def test_review_repro_the_byok_figure_is_written_rather_than_fetched_and_d
     )
     run_id = seed(conn, [completed_result("model/a", "gen-byok")])
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
 
     row = row_of(conn, run_id)
@@ -497,7 +516,7 @@ async def test_an_unreported_byok_figure_does_not_erase_one_captured_in_band(con
         [completed_result("model/a", "gen-a", upstream_inference_cost_usd="0.99")],
     )
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(trust_env=False) as client:
         await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
 
     assert row_of(conn, run_id)["upstream_inference_cost_usd"] == "0.99"
