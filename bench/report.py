@@ -869,13 +869,28 @@ def _model_report(
     # stopped after two would have reported a plan of two, with nothing
     # anywhere saying six were owed.
     #
-    # ATTEMPTED is the subset where a request actually reached a
-    # provider: done, error, stopped. A refused trial was declined by the
-    # spend ceiling before the call went out; a missing trial has a cell
-    # but no row; a not_run trial has no cell at all. None of the three
-    # is an attempt by anybody's reading of the word.
+    # ATTEMPTED is the subset that ran to a MODEL-ATTRIBUTABLE end: the
+    # model answered, or the model failed to. It is the failure rate's
+    # denominator and it must contain only trials whose outcome is a fact
+    # about the model.
+    #
+    # `stopped` is not one of those and used to be counted here. A
+    # stopped trial was cut off by an operator or a client disconnect
+    # part way through, so nobody knows whether it would have succeeded;
+    # putting it in the denominator makes the published failure rate
+    # depend on WHEN SOMEBODY PRESSED STOP. Stop a run early and the rate
+    # falls, with nothing on the page connecting the two.
+    #
+    # A refused trial was declined by the spend ceiling before the call
+    # went out; a missing trial has a cell but no row; a not_run trial
+    # has no cell at all. None of those is an attempt either.
+    #
+    # This set is QUALITY_OUTCOMES, which is not a coincidence and is
+    # worth stating: the trials a quality number may be computed from and
+    # the trials a failure rate may be computed over are the same trials,
+    # because both questions are "what did the model do".
     planned = len(flat) + not_run
-    attempted = outcomes["done"] + outcomes["error"] + outcomes["stopped"]
+    attempted = sum(outcomes[name] for name in QUALITY_OUTCOMES)
 
     # Score means over EVERY trial the model was asked to do, with a
     # failed trial scoring zero. That is the failure-inclusive rule: a

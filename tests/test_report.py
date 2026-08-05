@@ -491,8 +491,10 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
     which is exactly what the two-axes work was for, one axis over.
 
     Six trials: two done, one error, one stopped, one refused, one never
-    run. Attempted is four, because a refusal never left the process and
-    a missing trial never ran. The failure rate is 1/4, not 2/6.
+    run. Attempted is THREE: a refusal never left the process, a missing
+    trial never ran, and a stopped trial was cut off part way through so
+    nobody knows what it would have done. The failure rate is 1/3, not
+    2/6 and not 1/4.
     """
     by_task = {
         "t1": [trial("done", 1.0), trial("error", value=_MISSING)],
@@ -513,15 +515,15 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
     counts = out["trials"]
 
     assert counts["planned"] == 6
-    assert counts["attempted"] == 4
+    assert counts["attempted"] == 3
     # The outcome counters still partition the plan, not the attempts.
     assert (
         sum(counts[k] for k in ("done", "error", "refused", "stopped", "missing")) == 6
     )
-    # One error over four attempts. The old rule read (1 error + 1
-    # missing) / 6 planned = 0.333, which is neither a rate the label
-    # describes nor a number about the model.
-    assert counts["failure_rate"] == pytest.approx(0.25)
+    # One error over three attempts. The first rule read (1 error + 1
+    # missing) / 6 planned = 0.333; the second still counted the stopped
+    # trial and read 0.25. Neither is a number about the model.
+    assert counts["failure_rate"] == pytest.approx(1 / 3)
     # And the refusal is a rate against the plan it was measured over.
     assert counts["refusal_rate"] == pytest.approx(1 / 6)
 
@@ -698,25 +700,61 @@ def matrix_report(outcome, *, value=1.0, task="t2"):
     )
 
 
+def matrix_trials(outcome):
+    """The same shape read as AXIS ONE: one clean trial plus one under
+    test, as _model_report counts it.
+
+    not_run takes the other branch by necessity. It has no per-trial
+    record by definition, because the runner never created the cell; it
+    arrives as the plan's arithmetic, so the fixture passes it as one
+    rather than fabricating a row for it.
+    """
+    if outcome == "not_run":
+        return _model_report(
+            "m",
+            0,
+            False,
+            False,
+            {"t1": [trial("done", 1.0)]},
+            {},
+            seed=3,
+            series=[],
+            not_run=1,
+        )["trials"]
+    by_task = {
+        "t1": [trial("done", 1.0)],
+        "t2": [trial(outcome, value=_MISSING, task="t2")],
+    }
+    return _model_report("m", 0, False, False, by_task, {}, seed=3, series=[])["trials"]
+
+
 @pytest.mark.parametrize(
-    ("outcome", "in_mean", "mean", "n", "clusters"),
+    ("outcome", "in_mean", "mean", "n", "clusters", "attempted"),
     [
-        # The model answered. Its score is the evidence.
-        ("done", True, 1.0, 2, 2),
+        # The model answered. Its score is the evidence, and it is an
+        # attempt.
+        ("done", True, 1.0, 2, 2, 2),
         # The model failed the task. Zero, and the denominator keeps it:
         # a mean over survivors would flatter the models that fail most.
-        ("error", True, 0.5, 2, 2),
-        # The spend ceiling declined to buy the answer. Not the model.
-        ("refused", False, 1.0, 1, 1),
-        # The operator ended the run. Not the model.
-        ("stopped", False, 1.0, 1, 1),
+        # An attempt, and the one the failure rate is counting.
+        ("error", True, 0.5, 2, 2, 2),
+        # The spend ceiling declined to buy the answer. Not the model,
+        # and not an attempt: nothing left the process.
+        ("refused", False, 1.0, 1, 1, 1),
+        # The operator ended the run part way through. Not the model, and
+        # NOT AN ATTEMPT: nobody knows what it would have done, so
+        # counting it would make the failure rate depend on when
+        # somebody pressed stop.
+        ("stopped", False, 1.0, 1, 1, 1),
         # A cell that ran, with no row from this model.
-        ("missing", False, 1.0, 1, 1),
+        ("missing", False, 1.0, 1, 1, 1),
         # No cell at all: the plan was abandoned before it.
-        ("not_run", False, 1.0, 1, 1),
+        ("not_run", False, 1.0, 1, 1, 1),
     ],
 )
-def test_the_outcome_matrix_locks_every_treatment(outcome, in_mean, mean, n, clusters):
+def test_the_outcome_matrix_locks_every_treatment(
+    outcome, in_mean, mean, n, clusters, attempted
+):
     """One row per axis-one outcome, and the whole point is that this is a
     MATRIX rather than four hand-picked cases.
 
@@ -744,6 +782,15 @@ def test_the_outcome_matrix_locks_every_treatment(outcome, in_mean, mean, n, clu
     coverage = out["coverage"]
     states = coverage["scored"] + coverage["scoring_failed"] + coverage["unscored"]
     assert states == (2 if in_mean else 1)
+
+    # AXIS ONE, in the same matrix, because "which trials may a number be
+    # computed over" is one question with one answer and two counters
+    # reading it. attempted is the failure rate's denominator and it is
+    # exactly the trials the mean was willing to speak for.
+    counts = matrix_trials(outcome)
+    assert counts["planned"] == 2
+    assert counts["attempted"] == attempted
+    assert attempted == (2 if in_mean else 1)
 
 
 def test_review_repro_a_refusal_beside_a_perfect_score_does_not_halve_it():

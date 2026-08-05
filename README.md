@@ -1110,15 +1110,21 @@ derivation was always there and had nothing to read: the runner returned
 before writing anything, so a refused trial surfaced as `missing` and a
 budget fact was published as a gap in the record.
 
-`attempted` is the subset where a request actually reached a provider:
-`done`, `error`, `stopped`. A refused trial was declined before the call
-went out, a missing trial left no row, a not-run trial has no cell, so
-none of the three is an attempt. **`failure_rate` is `error / attempted`**
-and nothing else: a stop is the operator's decision, a refusal is the
-ceiling's, and the two absences are the experiment's, so counting any of
-them would let a halted run read as a bad model. `refusal_rate` is
-`refused / planned`, because a refusal is a fact about the budget against
-the plan.
+`attempted` is the subset that ran to a **model-attributable end**:
+`done` and `error`. A refused trial was declined before the call went
+out, a missing trial left no row, and a not-run trial has no cell, so
+none of the three is an attempt. Neither is a **stopped** one: it was cut
+off part way through by an operator or a disconnect, so nobody knows
+whether it would have succeeded, and counting it made the published
+failure rate depend on when somebody pressed stop. Stop a run early and
+the rate falls, with nothing on the page connecting the two.
+
+That set is `QUALITY_OUTCOMES`, which is not a coincidence: the trials a
+quality number may be computed from and the trials a failure rate may be
+computed over are the same trials, because both questions are "what did
+the model do". **`failure_rate` is `error / attempted`** and nothing else.
+`refusal_rate` is `refused / planned`, because a refusal is a fact about
+the budget against the plan.
 
 **Three surfaces agree, and that is asserted.** The progress counters, the
 report's outcome counts and the export's lines are three derivations of the
