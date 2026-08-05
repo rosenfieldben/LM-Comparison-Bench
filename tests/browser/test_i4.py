@@ -111,8 +111,13 @@ def test_blind_rating_hides_every_identity_until_the_ratings_are_saved(
     expect(labels).to_have_count(2)
     assert sorted(labels.nth(i).inner_text() for i in range(2)) == ["A", "B"]
     for i in range(2):
-        expect(cards(page).nth(i).locator(".metrics")).to_be_hidden()
-        expect(cards(page).nth(i).get_by_test_id("card-model")).to_be_hidden()
+        # ABSENT, not hidden. The old path painted these and then set
+        # hidden on them, so "is it hidden" was the strongest question
+        # available; the server-issued view never receives them, so the
+        # count is the honest assertion and to_be_hidden would now pass
+        # vacuously on an element that does not exist.
+        expect(cards(page).nth(i).locator(".metrics")).to_have_count(0)
+        expect(cards(page).nth(i).get_by_test_id("card-model")).to_have_count(0)
     # The answers themselves stay visible; they are what is being rated.
     assert "reply from" in page.locator("#results").inner_text()
 
@@ -171,25 +176,29 @@ def test_the_reveal_happens_only_after_the_save_and_maps_correctly(
     page.get_by_test_id("rating-submit").click()
     expect(page.get_by_test_id("rating-msg")).to_contain_text("Identities revealed")
 
-    # Identities are back, and the metrics with them.
+    # Identities ARRIVE. Not "come back": this view never had them, so
+    # the reveal writes them onto the cards for the first time.
     text_after = bench_chrome(page)
     assert "stub/fast" in text_after
     assert "stub/slow" in text_after
     for i in range(2):
-        expect(cards(page).nth(i).locator(".metrics")).to_be_visible()
+        expect(cards(page).nth(i).get_by_test_id("card-model")).to_be_visible()
+        # Cost and timing stay off, by design and not by omission. The
+        # blind view renders a minimal card rather than reusing the
+        # normal renderer, so there is no metrics block to restore; the
+        # numbers are a click away in the ordinary replay.
+        expect(cards(page).nth(i).locator(".metrics")).to_have_count(0)
 
     # What was sent: one entry per card, each carrying the label the card
     # wore and the rating clicked under it.
     assert len(posted) == 1
     payload = json.loads(posted[0])
-    # NO CLAIM. The page used to post blind: true, which is the one thing
-    # it cannot honestly say about its own past. This path is the legacy
-    # client-side blind and it holds no server token, so what it sends is
-    # nothing at all and the record says blind = 0, correctly: no session
-    # was ever issued for it. The next commit removes the path; the token
-    # assertion arrives with it.
+    # A TOKEN AND NO CLAIM. The page used to post blind: true, which is
+    # the one thing it cannot honestly say about its own past. It now
+    # sends only the token the server handed it when it opened the
+    # session, and the server decides.
     assert "blind" not in payload
-    assert payload.get("blind_token") is None
+    assert payload["blind_token"]
     sent = {r["label"]: r for r in payload["ratings"]}
     assert sent["A"]["rating"] == 5
     assert sent["B"]["rating"] == 1
@@ -736,3 +745,85 @@ def test_review_repro_two_judges_render_as_two_rows_that_name_their_judge(
     means = [rows.nth(i).inner_text() for i in range(2)]
     assert any("0.90" in text for text in means)
     assert any("0.40" in text for text in means)
+
+
+def test_review_repro_the_legacy_rate_blind_path_is_gone(bench, open_history, page):
+    """The second path removed rather than deprecated.
+
+    It fetched the identified comparison, hid the identities with a style
+    rule, and posted blind: true with the ratings. Both halves were
+    wrong. Hidden in a browser is a rule anyone can undo plus a frame the
+    rater may already have seen, and a page that painted the answer key
+    is the one witness that cannot testify about its own blindness.
+
+    Asserted three ways, because "removed" has to mean unreachable
+    rather than merely unused. The entry point is not on window. The
+    source carries none of the machinery that path needed. And the
+    control that used to call it now produces a session the server
+    vouches for.
+    """
+    start_blind(bench, open_history, prompt="i3 legacy path gone")
+
+    # No entry point. A module that still exported it would leave the
+    # path one console line away.
+    assert page.evaluate("() => Object.keys(window.BenchRating)") == ["startBlind"]
+
+    # No machinery. These existed only to paint identities and then
+    # conceal them, which is the thing that must not be possible.
+    source = (STATIC / "rating.js").read_text(encoding="utf-8")
+    # Comments stripped first. The module's own header describes the path
+    # it removed, and a scan that counted that would be asserting on
+    # prose rather than on code.
+    code = "\n".join(
+        line for line in source.splitlines() if not line.strip().startswith("//")
+    )
+    for gone in ("hideIdentity", "showIdentity", "CONCEALED", "cardsOnScreen"):
+        assert gone not in code, gone
+    # And no client-side blindness claim anywhere in the flow.
+    assert "blind: true" not in code
+    assert "blind_token" in code
+
+
+def test_the_rewired_control_opens_a_server_vouched_session(
+    bench, bench_url, open_history
+):
+    """The control kept its place and changed what it does. It now asks
+    the server for an anonymized view, and the rating that follows is
+    blind because the SERVER says a session was open, not because the
+    page claimed one."""
+    page = bench(["stub/fast", "stub/slow"])
+    check_all_chips(page)
+    run_and_wait(page, "i3 rewired control", 2)
+    replay(page, open_history, "i3 rewired control")
+    opened = []
+    page.on(
+        "request",
+        lambda request: (
+            opened.append(request.url)
+            if request.url.endswith("/blind") and request.method == "POST"
+            else None
+        ),
+    )
+
+    page.get_by_test_id("rate-blind").click()
+    expect(page.get_by_test_id("rating-panel")).to_be_visible()
+
+    # It asked the SERVER for the view. The old path asked nobody.
+    assert len(opened) == 1, opened
+    for i in range(2):
+        cards(page).nth(i).get_by_test_id("rating-4").click()
+    page.get_by_test_id("rating-submit").click()
+    expect(page.get_by_test_id("rating-msg")).to_contain_text("Identities revealed")
+
+    # A real server session existed and was closed one way, which is the
+    # server vouching for it: a comparison whose answer key is out cannot
+    # be reopened blind, and only a session that was genuinely opened can
+    # be in that state.
+    group_id = next(
+        e["id"]
+        for e in page.request.get(bench_url + "/runs?limit=5").json()["runs"]
+        if e["type"] == "group"
+    )
+    reopened = page.request.post(bench_url + f"/groups/{group_id}/blind", data={})
+    assert reopened.status == 409, reopened.text()
+    assert "already been revealed" in reopened.text()

@@ -1381,17 +1381,33 @@ which makes it the most sensitive thing the bench will hand you.
 
 ## Blind human rating
 
-Replay a comparison and press "Rate blind". Every card's model id,
-provider, cost and timing is hidden, each card is given a neutral letter
-in a shuffled order, and you rate the answers 1 to 5. Only when every
-card is rated and the ratings are saved do the identities come back.
+Press **rate blind** on a comparison in the History list. The server opens
+a session, shuffles the answers, and hands back a view carrying answers
+and neutral letters with nothing else attached: no model, no provider, no
+cost, no timing. You rate 1 to 5, and the identities arrive only after
+every card is rated and the ratings are saved.
 
-Cost and timing are hidden along with the name, because a rater who knows
+**One path, and it starts at the server.** There used to be a second one,
+reached from a replayed comparison, that fetched the identified cards and
+then hid the identities with a style rule while posting `blind: true`.
+Both halves of that were wrong: hidden in a browser is a rule anyone can
+undo plus a frame the rater may already have seen, and a page that painted
+the answer key is the one witness that cannot testify about its own
+blindness. It is gone rather than deprecated, because a path nobody should
+use is a path nobody should be able to reach. The **Rate blind** button on
+a replayed comparison remains and now opens the same server session,
+replacing the view with a fresh anonymized one; its tooltip says what it
+cannot fix, which is that you have already seen those answers identified.
+
+Cost and timing are absent along with the name, because a rater who knows
 one answer cost ten times another can often guess which model it was, and
 a guess is not a blind. The reveal happens after the save, not before: a
 rater who saw the identities and then changed their mind would be
 producing a sighted rating the record calls blind. If the save fails,
-nothing is revealed and you can retry.
+nothing is revealed and you can retry. The revealed view shows the model
+names and not the metrics, because the blind view renders a minimal card
+rather than reusing the normal renderer; the numbers are one ordinary
+replay away.
 
 Ratings persist as `scores` rows with `scorer = "human"` and `blind = 1`,
 the normalized score in `score` and the point you actually clicked in
