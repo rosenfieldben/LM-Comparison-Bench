@@ -1175,6 +1175,14 @@ judge with a lenient one publishes a figure neither produced. Human ratings
 are their own series under `human`, and deterministic scorers carry no
 judge.
 
+**Every arm appears in every series.** Series are discovered once across
+the whole experiment, so an arm the scoring pass never reached still gets
+its section, saying unscored on axis two and owing the series its
+failure-inclusive zeros on axis one. Discovered per arm, from that arm's
+own rows, such an arm vanished from the scorer table entirely, and absence
+on a page reads as "nothing to say" rather than as "nobody looked". Which
+tasks a section covers is still decided by the scorer that declared them.
+
 Selection uses the full `(scorer, judge_model)` key. It used to filter on
 the scorer alone and take the last row, so two judges of one trial fought
 over a single slot and whichever ran second answered for both, with nothing

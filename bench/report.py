@@ -441,6 +441,8 @@ def build_report(
     # already in memory and the two witnesses can be compared in a test.
     row_declared = rows_declaring_thresholds(trials)
     row_scored = rows_scoring_tasks(trials)
+    # Discovered ONCE, over the whole experiment; see experiment_series.
+    series = experiment_series(trials)
     models = [
         _model_report(
             model,
@@ -449,6 +451,7 @@ def build_report(
             by_task,
             tasks_by_id,
             seed,
+            series,
             row_declared,
             not_run,
             row_scored,
@@ -728,6 +731,47 @@ def _ranking(
     return out
 
 
+def experiment_series(
+    trials_by_arm: Mapping[Any, dict[str, list[dict[str, Any]]]],
+) -> list[tuple[str, str | None]]:
+    """Every (scorer, judge_model) pair anywhere in the experiment.
+
+    DISCOVERED AT EXPERIMENT LEVEL, and that is the whole point. Derived
+    per arm, from that arm's own score rows, an arm with no rows got no
+    sections at all: it vanished from the scorer table entirely. Not with
+    a zero, not with an unscored count, gone.
+
+    That is the worst way to report a gap, because absence on a page
+    reads as "nothing to say" rather than as "nobody looked". A scoring
+    pass that ran out of budget partway through the lineup, or was
+    stopped, leaves exactly this shape, and the arm it never reached is
+    the one a reader most needs to see labelled. Its errored trials also
+    owe the series their failure-inclusive zeros, and those disappeared
+    with it, so the neighbours' means were being compared against a
+    population the missing arm was silently excused from.
+
+    A section for a series this arm has no rows in is not an invention:
+    the tasks are real, the trials are real, and what the section reports
+    is that they are unscored. WHICH tasks it covers is still decided by
+    applicable_tasks, so a scorer still answers only for the tasks that
+    declared it.
+
+    Sorted with the judgeless series first under each scorer, so a
+    deterministic scorer and a human rating read before the judges that
+    came later.
+    """
+    return sorted(
+        {
+            (row["scorer"], row.get("judge_model"))
+            for by_task in trials_by_arm.values()
+            for trials in by_task.values()
+            for trial in trials
+            for row in trial["scores"]
+        },
+        key=lambda pair: (pair[0], pair[1] or ""),
+    )
+
+
 def _model_report(
     model: str,
     position: int,
@@ -735,6 +779,7 @@ def _model_report(
     by_task: dict[str, list[dict[str, Any]]],
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
+    series: list[tuple[str, str | None]],
     row_declared: dict[str, set[str]] | None = None,
     not_run: int = 0,
     row_scored: dict[str, set[str]] | None = None,
@@ -774,17 +819,9 @@ def _model_report(
     # failed trial scoring zero. That is the failure-inclusive rule: a
     # mean over only the trials that came back is a mean over survivors,
     # and the models that fail most would look best.
-    # One section per SERIES, a (scorer, judge_model) pair. Sorted with
-    # the judgeless series first under each scorer, so a deterministic
-    # scorer and a human rating read before the judges that came later.
-    series = sorted(
-        {
-            (row["scorer"], row.get("judge_model"))
-            for trial in flat
-            for row in trial["scores"]
-        },
-        key=lambda pair: (pair[0], pair[1] or ""),
-    )
+    # One section per SERIES, a (scorer, judge_model) pair, and the list
+    # is the EXPERIMENT'S rather than this arm's: see experiment_series
+    # for what an arm with no rows of its own used to do to the page.
     per_scorer = [
         _scorer_report(
             scorer, judge, by_task, tasks_by_id, seed, row_declared, row_scored

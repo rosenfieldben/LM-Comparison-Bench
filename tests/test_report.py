@@ -506,7 +506,10 @@ def test_review_repro_a_trial_nobody_ran_is_not_an_attempt():
         ],
     }
 
-    out = _model_report("m", 0, False, by_task, {}, seed=1)
+    # No score rows anywhere, so the experiment has no series. Passed
+    # explicitly rather than defaulted: series is the EXPERIMENT'S list
+    # and an arm cannot derive it, which is the whole of I3.4.
+    out = _model_report("m", 0, False, by_task, {}, seed=1, series=[])
     counts = out["trials"]
 
     assert counts["planned"] == 6
@@ -1102,7 +1105,13 @@ def test_a_declared_primary_that_measured_nothing_is_withheld_by_name():
 def test_one_measured_arm_is_enough_to_rank_the_series():
     """The rule is per SERIES, not per arm. Once anybody has measured it,
     an arm that failed everything ranks below them at 0.0, which is the
-    failure-inclusive rule doing exactly its job."""
+    failure-inclusive rule doing exactly its job.
+
+    m/b has no row under (judge, j/one) at all: its only row is the
+    judgeless gap. It ranks second anyway, because series discovery is at
+    experiment level and its errored trial owes that series a zero. See
+    experiment_series for what its absence used to do instead.
+    """
     results = [
         report_result(1, "m/a", 0),
         report_result(2, "m/b", 1, error="HTTP 500 from OpenRouter"),
@@ -1116,4 +1125,45 @@ def test_one_measured_arm_is_enough_to_rank_the_series():
     assert out["ranking"]["metric"] == "judge"
     assert out["ranking"]["judge_model"] == "j/one"
     ranks = {m["label"]: m["rank"] for m in out["models"]}
-    assert ranks == {"m/a": 1, "m/b": None}
+    assert ranks == {"m/a": 1, "m/b": 2}
+
+
+def test_review_repro_an_arm_the_scoring_pass_never_reached_still_has_a_section():
+    """Series discovery is the EXPERIMENT'S, not the arm's.
+
+    A scoring pass that runs out of budget partway through the lineup,
+    or is stopped, leaves one arm with no score rows at all. Derived per
+    arm, from that arm's own rows, that arm got no sections: it vanished
+    from the scorer table entirely. Not a zero, not an unscored count,
+    gone.
+
+    That is the worst available way to report a gap, because absence on a
+    page reads as "nothing to say" rather than as "nobody looked", and
+    the arm nobody reached is exactly the one a reader needs labelled.
+
+    Its section is not an invention. The tasks are real and the trials
+    are real; what the section reports is that they are unscored, which
+    is a fact the report already knows and was throwing away.
+    """
+    results = [report_result(1, "m/a", 0), report_result(2, "m/b", 1)]
+
+    # Only m/a was scored. The pass never reached m/b.
+    out = one_cell_report(results, {1: [gap_row(score=0.75, judge_model="j/one")]})
+
+    sections = {m["label"]: m["scorers"] for m in out["models"]}
+    assert [(s["scorer"], s["judge_model"]) for s in sections["m/b"]] == [
+        ("judge", "j/one")
+    ]
+    unreached = sections["m/b"][0]
+    # It says unscored, which is axis two, and it says nothing at all on
+    # axis one's behalf: no mean, no invented zero.
+    assert unreached["coverage"]["unscored"] == 1
+    assert unreached["coverage"]["scored"] == 0
+    assert unreached["mean"] is None
+    assert unreached["n"] == 0
+    assert unreached["measured"] == 0
+    # The ranking is unaffected: one measured arm makes the series
+    # rankable, and an arm with no measurement is unranked rather than
+    # last, because "nobody scored it" is not a placing.
+    assert out["ranking"]["judge_model"] == "j/one"
+    assert {m["label"]: m["rank"] for m in out["models"]} == {"m/a": 1, "m/b": None}
