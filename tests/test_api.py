@@ -84,6 +84,22 @@ TEST_CATALOG = {
             # Text only: the model a native comparison must refuse.
             "input_modalities": ["text"],
         },
+        {
+            # A SECOND image-capable model, and it exists for exactly one
+            # reason: the fairness law in native mode is a claim about
+            # what DIFFERENT models received, and one vision model can
+            # only ever prove a payload is identical to itself. Named
+            # apart from model/alpha so a test asserting agreement is
+            # asserting it across two entries.
+            "id": "model/vision",
+            "name": "Vision",
+            "context_length": 8192,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+            "max_completion_tokens": None,
+            "supported_parameters": ["max_tokens"],
+            "input_modalities": ["image", "text"],
+        },
     ],
     "prices": TEST_PRICES,
 }
@@ -9213,3 +9229,352 @@ def test_the_report_keeps_documents_in_first_appearance_order():
         "aaa",
         "bbb",
     ]
+
+
+# ---- Phase K closing review. Findings and their tombstones.
+
+
+@respx.mock
+def test_review_repro_an_ungrouped_inline_member_refuses_an_image(client):
+    """WINDOW: POST /compare/stream with group_id null and mode inline,
+    at entry and before any upstream request.
+
+    THE TWIN OF THE NATIVE BYPASS, found by the closing review's fairness
+    walk after K4 fixed only one half of it. enforce_inline_mode ran at
+    group creation and nowhere else, and enforce_group_experiment returns
+    immediately when group_id is None, so an image declared inline slipped
+    past. The browser degrades to ungrouped runs when the group POST
+    fails, and this refusal IS a failing group POST, so the refusal
+    turned itself into the send it had just refused.
+
+    What actually went out, measured on the wire before the fix, is the
+    exact failure enforce_inline_mode's docstring describes:
+
+        ----- attachment 1 of 1: shot.png -----
+
+        ----- end attachment 1 of 1 -----
+
+    Every model told a document was attached and shown none of it, which
+    is worse than an error: the answers come back, they look like
+    answers, and nothing on the card says the models were reading an
+    empty block.
+
+    The call count is asserted because "refused" and "refused before
+    spending" are different claims and only the second is the
+    invariant."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "what is this",
+            "model": "model/alpha",
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "inline",
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "'shot.png' is an image" in detail
+    assert "Use native mode" in detail
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_review_repro_an_ungrouped_inline_batch_refuses_an_image(client):
+    """WINDOW: POST /compare, group_id null, mode inline, at entry.
+
+    The batch endpoint has its own door, so it needs its own proof: a
+    fix applied to one endpoint and not the other is how this class of
+    bypass keeps coming back."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "what is this",
+            "models": ["model/alpha", "model/beta"],
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "inline",
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "'shot.png' is an image" in resp.json()["detail"]
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_an_ungrouped_inline_member_with_a_real_document_still_runs(client):
+    """The mirror, so the two refusals above are checks rather than a
+    blanket ban on ungrouped attached runs.
+
+    WINDOW: the same endpoint and shape, with a text document."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "contract.txt", b"forty two days").json()["digest"]
+
+    resp = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "summarize",
+            "model": "model/alpha",
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "inline",
+        },
+    )
+
+    assert resp.status_code == 200
+
+
+@respx.mock
+def test_review_repro_streamed_members_send_byte_identical_composed_content(client):
+    """THE FAIRNESS LAW ON THE PATH THE BROWSER ACTUALLY USES.
+
+    WINDOW: the three POST /compare/stream requests that one comparison
+    of three models issues, captured at the respx transport, compared
+    against each other.
+
+    A DIFFERENT ARGUMENT FROM THE BATCH ENDPOINT'S, which is why it
+    needs its own proof rather than inheriting one. /compare composes
+    once and hands the same string to every member, so identical content
+    is structural. /compare/stream is one request per model and each one
+    composes for itself, so what makes them agree is that composition is
+    pure over inputs the group has already pinned: prompt, digest list
+    and mode are fixed on the group row and a member that disagrees is
+    refused, and the extraction is READ rather than recomputed.
+
+    The existing batch tombstone proves nothing about this window. It
+    asserts a property of a code path the browser never takes, so a
+    regression here (a per-member re-extraction, an order that came from
+    the query instead of the declaration) would pass it untouched. That
+    is the wrong-window failure exactly, and this is the proof that
+    closes it."""
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(
+            200, json=response_for(payload["model"], "reply from " + payload["model"])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    lineup = ["model/alpha", "model/beta", "model/gamma"]
+    group_id, digest = attached_group(client, "summarize the attachment", models=lineup)
+
+    for model in lineup:
+        resp = client.post(
+            "/compare/stream",
+            json={
+                "prompt": "summarize the attachment",
+                "model": model,
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert len(sent) == 3
+    # One distinct value, not pairwise equality: a third member drifting
+    # cannot hide behind a comparison of the first two.
+    contents = {json.dumps(payload["messages"], sort_keys=True) for payload in sent}
+    assert len(contents) == 1, contents
+    # And it is not identical for the trivial reason that nothing arrived.
+    assert "the contract says forty two" in sent[0]["messages"][-1]["content"]
+    assert {payload["model"] for payload in sent} == set(lineup)
+
+
+@respx.mock
+def test_review_repro_native_members_send_byte_identical_content_parts(client):
+    """THE FAIRNESS LAW IN NATIVE MODE, which had no proof at all.
+
+    WINDOW: the three POST /compare/stream requests of one native
+    comparison over three image-capable models, compared at the
+    transport.
+
+    Native builds a LIST OF CONTENT PARTS rather than a string, through
+    a different composer, reading the stored BLOB and base64-encoding it
+    per request. Every one of those steps is a place the bytes could come
+    out different for one model, and none of them is exercised by either
+    inline proof. A mode whose whole claim is "every model saw this exact
+    image" needs the claim checked on the wire."""
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(
+            200, json=response_for(payload["model"], "reply from " + payload["model"])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    # The two image-capable models in the catalog. Two and not three,
+    # because native mode refuses a model the catalog cannot vouch for
+    # and that refusal is correct: the lineup here is every model this
+    # comparison is allowed to have.
+    lineup = ["model/alpha", "model/vision"]
+    created, digest = native_group(client, models=lineup)
+    assert created.status_code == 201, created.json()
+    group_id = created.json()["id"]
+
+    for model in lineup:
+        resp = client.post(
+            "/compare/stream",
+            json={
+                "prompt": "what is in this image",
+                "model": model,
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+                "attachments_mode": "native",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert len(sent) == 2
+    contents = {json.dumps(payload["messages"], sort_keys=True) for payload in sent}
+    assert len(contents) == 1, contents
+    # The image really is in there, as the documented data URL, so this
+    # is not two identical payloads that both dropped it.
+    parts = sent[0]["messages"][-1]["content"]
+    assert parts[0]["type"] == "text"
+    assert parts[1]["image_url"]["url"] == (
+        "data:image/png;base64," + base64.b64encode(PNG_BYTES).decode("ascii")
+    )
+    assert {payload["model"] for payload in sent} == set(lineup)
+
+
+@respx.mock
+def test_review_repro_no_reader_serves_a_documents_bytes_or_text(client):
+    """THE NO-CONTENT-LEAK WALK, as one test over every payload a client
+    can obtain about a comparison that ran over a document.
+
+    WINDOW: four responses from one attached comparison, GET
+    /attachments/{digest}, GET /runs, GET /groups/{id} and the
+    experiment export, scanned whole.
+
+    ONE TEST RATHER THAN FOUR ASSERTIONS SPREAD AROUND, because the
+    property is "no reader anywhere serves it" and that is a claim about
+    the set. Each payload is built by different code, and a scan that
+    covered three of them would read as coverage.
+
+    Both quantities are scanned. The BYTES are the obvious one. The
+    EXTRACTED TEXT is the one that would slip: it is a legitimate column
+    on the row every metadata reader selects, so serving it is a
+    one-word mistake rather than a deliberate act, and it is the whole
+    document in plain text."""
+    body = b"the contract says the delivery window is forty two days"
+    digest = upload(client, "contract.txt", body).json()["digest"]
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize it",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    ).json()["id"]
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    client.post(
+        "/compare",
+        json={
+            "prompt": "summarize it",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    payloads = {
+        "attachment metadata": client.get(f"/attachments/{digest}").text,
+        "history list": client.get("/runs").text,
+        "group detail": client.get(f"/groups/{group_id}").text,
+        "run detail": client.get(f"/runs/{group_id}").text,
+    }
+
+    text = body.decode()
+    for where, served in payloads.items():
+        # The extracted text, which for a .txt file IS the document.
+        assert text not in served, where
+        # And the column names, so a future reader that added the field
+        # back is caught even if this fixture's document changed.
+        assert "extracted_text" not in served, where
+        assert '"content"' not in served, where
+    # The digest and the size ARE served, which is what makes the
+    # absences above meaningful rather than a sign nothing was attached.
+    assert digest in payloads["group detail"]
+    assert str(len(body)) in payloads["attachment metadata"]
+
+
+def test_review_repro_the_upload_refuses_every_cors_simple_content_type(client):
+    """THE JSON-ONLY INVARIANT, re-probed at the upload endpoint across
+    ALL THREE of the content types that make a POST a CORS "simple"
+    request, plus the bodyless case.
+
+    WINDOW: the LocalOnlyGuard middleware, which runs before routing, so
+    the assertion that nothing was stored is a claim about the whole
+    request and not only about the handler.
+
+    Three types and not one, because the invariant is "no simple POST
+    gets through" and multipart alone is a proof about the type this
+    endpoint most invites rather than about the rule. text/plain is the
+    one a hostile page reaches for when multipart is blocked, and it can
+    carry a perfectly valid JSON body."""
+    before = client.app.state.db.execute(
+        "SELECT COUNT(*) c FROM attachments"
+    ).fetchone()
+    valid = json.dumps({"filename": "x.txt", "content_base64": b64(b"hi")})
+    simple = {
+        "multipart/form-data; boundary=x": b"--x--",
+        "text/plain;charset=UTF-8": valid.encode(),
+        "application/x-www-form-urlencoded": b"filename=x.txt",
+    }
+
+    for content_type, payload in simple.items():
+        resp = client.post(
+            "/attachments", content=payload, headers={"Content-Type": content_type}
+        )
+        assert resp.status_code == 415, content_type
+        assert resp.json()["detail"] == "POST bodies must be application/json"
+    # A bodyless POST too: the old exemption for those was a reproduced
+    # hole, and this endpoint must not reopen it.
+    assert client.post("/attachments").status_code == 415
+
+    after = client.app.state.db.execute("SELECT COUNT(*) c FROM attachments").fetchone()
+    # Refused BEFORE the body was read, so a blocked upload leaves no row
+    # behind. A 415 that had already stored the document would be a
+    # refusal in name only.
+    assert after["c"] == before["c"]
+
+
+def test_the_upload_still_accepts_json_with_a_charset(client):
+    """The mirror of the walk above, and the reason the guard tests
+    startswith rather than equality: a browser is entitled to send
+    application/json;charset=utf-8, and refusing it would break the
+    ordinary case in the name of the hostile one."""
+    resp = client.post(
+        "/attachments",
+        content=json.dumps({"filename": "x.txt", "content_base64": b64(b"hi")}),
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )
+
+    assert resp.status_code == 201
