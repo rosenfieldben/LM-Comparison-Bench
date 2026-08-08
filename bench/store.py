@@ -109,7 +109,9 @@ CREATE TABLE IF NOT EXISTS groups (
     experiment_id INTEGER NULL REFERENCES experiments(id),
     task_id TEXT,
     repeat_index INTEGER,
-    rotation_index INTEGER
+    rotation_index INTEGER,
+    attachments_json TEXT,
+    attachments_mode TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -295,6 +297,11 @@ MIGRATIONS = [
     # different fact. Nothing writes "[]" for the same reason params_json
     # never stores "{}": absence gets exactly one spelling.
     ("groups", "attachments_json", "TEXT"),
+    # How those documents reach the models: "inline" or "native". NULL
+    # when the group declared no attachment at all, which is the same
+    # absence attachments_json records and is stored the same way, so a
+    # reader never has to reconcile a mode against no documents.
+    ("groups", "attachments_mode", "TEXT"),
 ]
 
 
@@ -523,6 +530,7 @@ def create_group(
     budget: str | None = None,
     experiment: dict[str, Any] | None = None,
     attachments: list[str] | None = None,
+    attachments_mode: str | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -567,8 +575,8 @@ def create_group(
             "INSERT INTO groups"
             " (created_at, prompt_text, models_json, params_json, budget,"
             "  experiment_id, task_id, repeat_index, rotation_index,"
-            "  attachments_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  attachments_json, attachments_mode)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
@@ -580,6 +588,7 @@ def create_group(
                 place.get("repeat_index"),
                 place.get("rotation_index"),
                 json.dumps(attachments) if attachments else None,
+                attachments_mode if attachments else None,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
@@ -675,6 +684,25 @@ def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | No
     return dict(row) if row is not None else None
 
 
+def attachment_content(conn: sqlite3.Connection, digest: str) -> bytes | None:
+    """The stored bytes for one attachment. The ONLY reader that returns them.
+
+    Every other reader here omits the BLOB deliberately, and this one is
+    the single exception, so the exception is one function a reviewer can
+    find rather than a column list to audit.
+
+    It exists for native mode alone: an image sent as a content part has
+    to reach the payload as base64, so the bytes must leave the database
+    for exactly that one purpose. Nothing serves them to a client, no
+    endpoint returns them, and the inline path never calls this at all,
+    because inline sends extracted text and has no use for the original.
+    """
+    row = conn.execute(
+        "SELECT content FROM attachments WHERE digest = ?", (digest,)
+    ).fetchone()
+    return bytes(row["content"]) if row is not None else None
+
+
 def attachments_for(
     conn: sqlite3.Connection, digests: list[str]
 ) -> dict[str, dict[str, Any]]:
@@ -719,6 +747,22 @@ def group_attachments(conn: sqlite3.Connection, group_id: int) -> list[str] | No
     decoded = json.loads(row["attachments_json"])
     assert isinstance(decoded, list)
     return [str(digest) for digest in decoded]
+
+
+def group_attachments_mode(conn: sqlite3.Connection, group_id: int) -> str | None:
+    """How this group's documents reach its models, or None for none.
+
+    None means the group declared no attachment, whether because it
+    predates the feature or because it simply has none. The two collapse
+    here on purpose and it costs nothing: a mode is a statement about
+    documents, and with no documents there is nothing for it to be a
+    statement about, which is why the boundary refuses a mode declared
+    without one.
+    """
+    row = conn.execute(
+        "SELECT attachments_mode FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    return str(row["attachments_mode"]) if row and row["attachments_mode"] else None
 
 
 def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:

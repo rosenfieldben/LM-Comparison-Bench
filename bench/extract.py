@@ -104,6 +104,21 @@ ATTACHMENT_INTRO = (
 # compose for why the record is not the wire bytes.
 ATTACHMENT_PLACEHOLDER = "<<attachment content: sha256 {digest}, {chars} characters>>"
 
+# The same job for a native image part, and a SEPARATE constant rather
+# than the one above because the two placeholders describe different
+# quantities and a shared one would have to lie about one of them. An
+# inline document is stood in for by its character count, which is what
+# the model would have read; an image is stood in for by its byte count,
+# which is not a character count and must not be labelled as one.
+#
+# The media type is spelled out because it is part of the wire bytes
+# rather than of the stored content: the data URL is
+# data:{media_type};base64,{...}, so digest plus stored bytes plus this
+# line reconstructs the part exactly, with nothing inferred.
+NATIVE_PLACEHOLDER = (
+    "<<attachment content: sha256 {digest}, {size} bytes, {media_type}>>"
+)
+
 
 class ExtractionError(RuntimeError):
     """A document the bench will not read.
@@ -274,8 +289,9 @@ def extract(filename: str, content: bytes) -> dict[str, str]:
     if reader is None:
         raise ExtractionError(
             f"{filename!r} is a {suffix or 'suffixless'} file, and the "
-            f"bench reads {', '.join(SUPPORTED_SUFFIXES)}. Convert it, or "
-            "paste its text into the prompt."
+            f"bench reads {', '.join(SUPPORTED_SUFFIXES)} as documents and "
+            f"{', '.join(sorted(NATIVE_IMAGE_TYPES))} as images for native "
+            "mode. Convert it, or paste its text into the prompt."
         )
     read, extractor = reader
     text = read(content).strip()
@@ -392,3 +408,118 @@ def enforce_composed_size(composed: str) -> None:
             "would truncate this at different points, which is not one "
             "comparison. Attach a shorter document or a single section."
         )
+
+
+# The two attachment modes, and what each one measures.
+#
+# INLINE is the default and the default estimand. The bench extracts the
+# text and composes it identically for every model, so what is compared
+# is how each model handles THE BENCH'S READING of the document. Every
+# model can participate, and they are all held to the same reading, good
+# or bad.
+#
+# NATIVE hands the file to the provider as a content part and lets the
+# model see it directly. That measures something different and often
+# more interesting (layout, tables, handwriting) and it CHANGES WHICH
+# MODELS CAN PARTICIPATE, because a text-only model cannot take an image
+# at all. That is strict mode's argument in a new costume: an opt-in
+# that narrows the population in exchange for a sharper question, so it
+# is declared, recorded on the manifest, and capability-checked at
+# creation rather than discovered at the first paid call.
+ATTACHMENT_MODES = ("inline", "native")
+
+# What native mode can send, by suffix, with the data-URL media type
+# each one needs.
+#
+# Pinned against OpenRouter's image-understanding guide at
+# https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+# read 2026-08-08, which states: "Supported image content types are:
+# image/png image/jpeg image/webp image/gif", and shows the base64 form
+# as data:image/jpeg;base64,{base64_image} inside an image_url part.
+#
+# GIF IS DOCUMENTED AND DELIBERATELY NOT TAKEN. An animated GIF is a
+# sequence of frames and what a provider does with the frames it is not
+# shown is undefined and varies, so a comparison over one would not be a
+# comparison over the same input. The three still formats are the ones
+# where "every model saw this image" is a claim the bench can make.
+NATIVE_IMAGE_TYPES = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+}
+
+# The modality string a model must accept for native image parts.
+# Pinned against the live listing at https://openrouter.ai/api/v1/models
+# read 2026-08-08, where architecture.input_modalities is an array of
+# strings and a vision model carries "image" among them.
+IMAGE_MODALITY = "image"
+
+
+def native_media_type(filename: str) -> str | None:
+    """The data-URL media type for a native image, or None if not one."""
+    return NATIVE_IMAGE_TYPES.get(suffix_of(filename))
+
+
+def ingest(filename: str, content: bytes) -> dict[str, Any]:
+    """What the bench stores for one uploaded file.
+
+    TWO KINDS, and the split is what the modes rest on. A DOCUMENT is
+    read now and its text is what every model will see; an IMAGE is
+    stored as bytes and read by nothing here, because native mode hands
+    it to the provider and the model does the reading.
+
+    An image therefore carries no extracted text and says so with an
+    extractor of "none": not a parser that produced nothing, which is
+    what a scanned PDF is, but no parser at all. Keeping those two
+    distinguishable matters, because the first is a refusal and the
+    second is the ordinary native case.
+
+    The kind decides which mode may use the file, checked at the
+    declaration rather than here: this function stores, and the
+    boundary refuses.
+    """
+    if native_media_type(filename) is not None:
+        return {
+            "text": "",
+            "extractor": "none",
+            "extractor_version": "0",
+            "kind": "image",
+        }
+    return {**extract(filename, content), "kind": "document"}
+
+
+def compose_native(
+    prompt: str, documents: list[dict[str, Any]], *, redacted: bool
+) -> list[dict[str, Any]]:
+    """The user message as content parts: the text, then the images.
+
+    Pinned against OpenRouter's image-understanding guide at
+    https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+    read 2026-08-08. The documented shape is a content array of
+    {"type": "text", "text": ...} and
+    {"type": "image_url", "image_url": {"url": data_url}} where the
+    base64 form is data:image/jpeg;base64,{base64_image}.
+
+    TEXT FIRST, and that is the documentation's own instruction rather
+    than a preference: "Due to how the content is parsed, we recommend
+    sending the text prompt first, then the images."
+
+    redacted follows compose's rule and for the same reason: the record
+    keeps the structure and a digest reference where the base64 sat, so
+    the payload is reconstructible from the record plus the stored bytes
+    without every result row carrying a copy of the image.
+    """
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for document in documents:
+        url = (
+            NATIVE_PLACEHOLDER.format(
+                digest=document["digest"],
+                size=document["byte_size"],
+                media_type=document["media_type"],
+            )
+            if redacted
+            else document["data_url"]
+        )
+        parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts

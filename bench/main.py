@@ -35,11 +35,14 @@ from bench import store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
 from bench.extract import (
+    IMAGE_MODALITY,
     CompositionError,
     ExtractionError,
     compose,
+    compose_native,
     enforce_composed_size,
-    extract,
+    ingest,
+    native_media_type,
     suffix_of,
 )
 from bench.models import (
@@ -279,6 +282,11 @@ class CompareRequest(BaseModel):
     attachments: list[str] | None = Field(
         default=None, min_length=1, max_length=MAX_ATTACHMENTS
     )
+    # The mode this member believes the comparison runs under. Checked
+    # against the group's declaration like the digests themselves: a
+    # member that thought it was sending inline text while the group
+    # declared native would be running a different experiment.
+    attachments_mode: Literal["inline", "native"] = "inline"
 
 
 class ModelResult(BaseModel):
@@ -366,6 +374,11 @@ class StreamCompareRequest(BaseModel):
     attachments: list[str] | None = Field(
         default=None, min_length=1, max_length=MAX_ATTACHMENTS
     )
+    # The mode this member believes the comparison runs under. Checked
+    # against the group's declaration like the digests themselves: a
+    # member that thought it was sending inline text while the group
+    # declared native would be running a different experiment.
+    attachments_mode: Literal["inline", "native"] = "inline"
 
 
 class CompareResponse(BaseModel):
@@ -519,6 +532,17 @@ class GroupCreate(BaseModel):
     attachments: list[str] | None = Field(
         default=None, min_length=1, max_length=MAX_ATTACHMENTS
     )
+    # How the documents reach the models, and it is part of the
+    # declaration because it decides WHAT IS BEING MEASURED.
+    #
+    # inline is the default and the default estimand: the bench extracts
+    # the text and composes it identically for everyone, so every model
+    # is held to the bench's own reading. native hands the file to the
+    # provider as a content part, which measures something sharper and
+    # narrows the population to models that accept that modality. That
+    # is strict mode's argument in a new costume, so it is declared,
+    # recorded, and capability-checked at creation.
+    attachments_mode: Literal["inline", "native"] = "inline"
 
 
 class GroupCreated(BaseModel):
@@ -1712,8 +1736,177 @@ def enforce_composed(prompt: str, digests: list[str]) -> str:
     return composed
 
 
+def enforce_inline_mode(digests: list[str]) -> None:
+    """Inline mode's one refusal: an image has no text to compose.
+
+    The mirror of native mode's, and it needs saying for the same
+    reason. An image stored for native mode carries an empty extraction
+    by construction, so composing it inline would put an empty delimited
+    block into the prompt: every model told a document was attached and
+    shown none of it. The remedy is named, because switching mode is a
+    one-word fix.
+    """
+    wrong = [
+        d["filename"]
+        for d in enforce_attachments_exist(digests)
+        if native_media_type(d["filename"]) is not None
+    ]
+    if wrong:
+        raise HTTPException(
+            422,
+            f"{', '.join(repr(name) for name in wrong)} is an image, and "
+            "inline mode sends extracted text, which an image has none "
+            "of. Use native mode, which hands the image to the model "
+            "itself and checks that every model in the lineup accepts "
+            "one.",
+        )
+
+
+def enforce_native_mode(digests: list[str], lineup: list[str] | None) -> None:
+    """Everything native mode must be able to promise, at creation.
+
+    THE SAME ARGUMENT STRICT MODE MAKES, one modality over. Native mode
+    claims every model in this comparison saw the file itself, and every
+    way that claim could turn out to be about something else is a
+    refusal here rather than at the first paid call.
+
+    A NON-IMAGE UNDER NATIVE has no shape to send. The bench composes
+    image_url parts and nothing else, so a PDF declared native would
+    either be dropped or turned back into text without saying so, and
+    either way the record would claim a mode that did not happen. The
+    remedy is named, because "use inline mode" is a one-word fix the
+    person can act on.
+
+    A MODEL THAT DOES NOT ACCEPT IMAGES cannot participate. Without a
+    catalog there is nothing to check against, so the check is
+    unavailable and the comparison cannot be created: skipping it
+    silently on an offline boot would produce rows labelled native whose
+    capability check never ran, which is a native mode that isn't. A
+    model the catalog does not list, or lists without input_modalities,
+    is the same problem one model down. Absence of evidence is not
+    support.
+    """
+    documents = enforce_attachments_exist(digests)
+    wrong = [
+        d["filename"] for d in documents if native_media_type(d["filename"]) is None
+    ]
+    if wrong:
+        raise HTTPException(
+            422,
+            f"native mode sends images as content parts, and "
+            f"{', '.join(repr(name) for name in wrong)} is not one. Use "
+            "inline mode, which extracts the text and gives every model "
+            "the same reading of it.",
+        )
+    if not lineup:
+        return
+    catalog = getattr(app.state, "catalog", None) or {}
+    if not catalog.get("fetched"):
+        raise HTTPException(
+            422,
+            "native attachments check every model against the model "
+            "catalog, and this boot has no catalog: the snapshot could "
+            "not be fetched at startup. Restart with OpenRouter "
+            "reachable, or use inline mode, which makes no capability "
+            "claim. Creating it without the check would label the rows "
+            "with a guarantee nothing verified.",
+        )
+    by_id = {m["id"]: m for m in catalog.get("models", [])}
+    for model in lineup:
+        entry = by_id.get(model)
+        if entry is None:
+            raise HTTPException(
+                422,
+                f"native attachments need the catalog's input modalities "
+                f"for {model}, and the catalog does not list it. Absence "
+                "of evidence is not support: use inline mode, or drop the "
+                "model.",
+            )
+        modalities = entry.get("input_modalities")
+        if modalities is None:
+            raise HTTPException(
+                422,
+                f"the catalog lists {model} without input modalities, so "
+                f"whether it accepts {IMAGE_MODALITY} input cannot be "
+                "checked. Absence of evidence is not support: use inline "
+                "mode, or drop the model.",
+            )
+        if IMAGE_MODALITY not in modalities:
+            raise HTTPException(
+                422,
+                f"{model} does not accept {IMAGE_MODALITY} input "
+                f"(the catalog lists {', '.join(modalities) or 'nothing'}), "
+                "so it cannot take a native attachment. Drop the model, or "
+                "use inline mode, which extracts the text and gives every "
+                "model the same reading of it.",
+            )
+
+
+def native_documents(digests: list[str]) -> list[dict[str, Any]]:
+    """The declared images with their data URLs, in declared order.
+
+    The one place attachment bytes leave the database, and they leave it
+    to become base64 in a payload and nothing else; see
+    store.attachment_content.
+    """
+    documents = enforce_attachments_exist(digests)
+    out = []
+    for document in documents:
+        content = store.attachment_content(app.state.db, document["digest"])
+        assert content is not None, document["digest"]
+        media = native_media_type(document["filename"])
+        assert media is not None, document["filename"]
+        out.append(
+            {
+                **document,
+                # Carried alongside the URL rather than re-derived by the
+                # composer, because the recorded placeholder names it and
+                # the two must be the same string: a record that said a
+                # different media type than the wire carried would make
+                # the payload unreconstructible while looking exact.
+                "media_type": media,
+                "data_url": (
+                    f"data:{media};base64,{base64.b64encode(content).decode('ascii')}"
+                ),
+            }
+        )
+    return out
+
+
+def composed_for(prompt: str, digests: list[str] | None, mode: str) -> tuple[Any, Any]:
+    """The user content to send and the user content to record.
+
+    ONE FUNCTION FOR BOTH MODES AND BOTH ENDPOINTS, because the fairness
+    law and rule two are the same law in each: composed once per
+    comparison, recorded by reference. Four call sites building this
+    themselves would be four chances for one of them to compose per
+    model or to record the content.
+
+    Returns (None-free) plain strings in inline mode and content-part
+    lists in native mode, which is the shape difference the payload
+    itself has. With nothing attached it returns the prompt and None, so
+    rule one holds: the payload is what it was before this phase and
+    request_json is recorded from what was sent.
+    """
+    if not digests:
+        return prompt, None
+    if mode == "native":
+        documents = native_documents(digests)
+        return (
+            compose_native(prompt, documents, redacted=False),
+            compose_native(prompt, documents, redacted=True),
+        )
+    return (
+        enforce_composed(prompt, digests),
+        compose(prompt, enforce_attachments_exist(digests), redacted=True),
+    )
+
+
 def _attachments_conflict(
-    declared: list[str] | None, requested: list[str] | None
+    declared: list[str] | None,
+    requested: list[str] | None,
+    declared_mode: str | None = None,
+    requested_mode: str = "inline",
 ) -> str | None:
     """Why this member's attachments do not match the group's, or None.
 
@@ -1747,6 +1940,18 @@ def _attachments_conflict(
             f"({len(declared)} declared, {len(wanted)} sent); a group holds "
             "one set of documents, in one order, across its runs"
         )
+    # The MODE is half the declaration, because it decides what is being
+    # measured. A member that thought it was sending inline text while
+    # the group declared native would be running a different experiment
+    # against the same digests, and the record would name only one of
+    # them.
+    if (declared_mode or "inline") != requested_mode:
+        return (
+            f"this comparison declared attachments_mode "
+            f"{declared_mode or 'inline'!r} and this member sent "
+            f"{requested_mode!r}; the mode decides what is being measured, "
+            "so a group holds one across its runs"
+        )
     return None
 
 
@@ -1759,6 +1964,7 @@ def enforce_group_experiment(
     position: int | None = None,
     models: list[str] | None = None,
     attachments: list[str] | None = None,
+    attachments_mode: str = "inline",
 ) -> None:
     """Reject a run whose group already holds a different experiment.
 
@@ -1809,7 +2015,10 @@ def enforce_group_experiment(
     # and before any upstream call, so a mismatch spends nothing. See
     # _attachments_conflict for what the two NULLs decide here.
     mismatch = _attachments_conflict(
-        store.group_attachments(app.state.db, group_id), attachments
+        store.group_attachments(app.state.db, group_id),
+        attachments,
+        store.group_attachments_mode(app.state.db, group_id),
+        attachments_mode,
     )
     if mismatch is not None:
         raise HTTPException(409, mismatch)
@@ -1927,6 +2136,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         request.budget,
         models=request.models,
         attachments=request.attachments,
+        attachments_mode=request.attachments_mode,
     )
     # COMPOSED ONCE, for the whole batch. Every member below sends this
     # same string, so identical composed content across models is a
@@ -1934,19 +2144,8 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # holds when nothing is attached: compose returns the prompt
     # unchanged and record_prompt stays None, so the payload is byte for
     # byte what it was before this phase.
-    composed = (
-        enforce_composed(request.prompt, request.attachments)
-        if request.attachments
-        else request.prompt
-    )
-    recorded = (
-        compose(
-            request.prompt,
-            enforce_attachments_exist(request.attachments),
-            redacted=True,
-        )
-        if request.attachments
-        else None
+    composed, recorded = composed_for(
+        request.prompt, request.attachments, request.attachments_mode
     )
 
     async def limited(model: str) -> dict[str, Any]:
@@ -2062,24 +2261,14 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         model=request.model,
         position=request.position,
         attachments=request.attachments,
+        attachments_mode=request.attachments_mode,
     )
     # Composed at ENTRY, outside the generator, so a composition refusal
     # is a 422 with nothing written rather than an error raised after
     # the response has already begun. Same reasoning as the export's
     # dataset check.
-    composed = (
-        enforce_composed(request.prompt, request.attachments)
-        if request.attachments
-        else request.prompt
-    )
-    recorded = (
-        compose(
-            request.prompt,
-            enforce_attachments_exist(request.attachments),
-            redacted=True,
-        )
-        if request.attachments
-        else None
+    composed, recorded = composed_for(
+        request.prompt, request.attachments, request.attachments_mode
     )
     max_tokens = effective_budget(request.budget, request.model)
 
@@ -2293,11 +2482,25 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
     # with a document missing from it, which is the failure this whole
     # layer exists to make impossible.
     if body.attachments:
-        enforce_attachments_exist(body.attachments)
-        # Composed once at declaration, against the longest prompt this
-        # group can hold, so the ceiling is a refusal at creation rather
-        # than a surprise on the first paid member.
-        enforce_composed(body.prompt or "", body.attachments)
+        if body.attachments_mode == "native":
+            # Every promise native mode makes, checked here rather than
+            # at the first paid call: the files must be images and every
+            # declared model must accept them.
+            enforce_native_mode(body.attachments, body.models)
+        else:
+            enforce_inline_mode(body.attachments)
+            # Composed once at declaration, against the longest prompt
+            # this group can hold, so the ceiling is a refusal at
+            # creation rather than a surprise on the first paid member.
+            enforce_composed(body.prompt or "", body.attachments)
+    elif body.attachments_mode != "inline":
+        raise HTTPException(
+            422,
+            "attachments_mode was declared without any attachment. A mode "
+            "is a statement about how documents reach the models, and "
+            "there are none, so the declaration would record a fact about "
+            "nothing.",
+        )
     return {
         "id": store.create_group(
             app.state.db,
@@ -2306,6 +2509,7 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             request_controls(body.params) or None,
             body.budget,
             attachments=body.attachments,
+            attachments_mode=body.attachments_mode if body.attachments else None,
         )
     }
 
@@ -3408,7 +3612,7 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
             422, f"{body.filename!r} is empty, so there is nothing to attach."
         )
     try:
-        extracted = extract(body.filename, content)
+        extracted = ingest(body.filename, content)
     except ExtractionError as exc:
         # The extractor's messages are written to be shown, which is
         # what ExtractionError means; passing the text straight through
@@ -3419,7 +3623,8 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
         {
             "digest": hashlib.sha256(content).hexdigest(),
             "filename": body.filename,
-            "mime": ATTACHMENT_MIMES.get(
+            "mime": native_media_type(body.filename)
+            or ATTACHMENT_MIMES.get(
                 suffix_of(body.filename), "application/octet-stream"
             ),
             "byte_size": len(content),

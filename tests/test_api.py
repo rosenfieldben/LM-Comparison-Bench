@@ -1,3 +1,4 @@
+import base64
 import json
 import math
 import re
@@ -48,6 +49,9 @@ TEST_CATALOG = {
                 "temperature",
                 "top_p",
             ],
+            # Accepts native image parts, so it is the model native mode
+            # can run on. Its neighbours below deliberately cannot.
+            "input_modalities": ["image", "text"],
         },
         {
             "id": "model/bare",
@@ -60,6 +64,10 @@ TEST_CATALOG = {
             # mode treats as "cannot check" rather than "supports
             # everything".
             "supported_parameters": None,
+            # The catalog says nothing about its modalities either, which
+            # native mode treats as "cannot check" rather than "accepts
+            # everything", exactly as strict mode treats the parameters.
+            "input_modalities": None,
         },
         # Publishes a completion cap below the extended budget, so the
         # per-model clamp has something to bite on.
@@ -73,6 +81,8 @@ TEST_CATALOG = {
             # Takes a budget and nothing else, so a temperature makes it
             # ineligible under require_parameters.
             "supported_parameters": ["max_tokens"],
+            # Text only: the model a native comparison must refuse.
+            "input_modalities": ["text"],
         },
     ],
     "prices": TEST_PRICES,
@@ -7698,9 +7708,7 @@ def test_a_twenty_seven_answer_comparison_gets_letters_for_every_card(client):
 
 
 def b64(content: bytes) -> str:
-    import base64 as _base64
-
-    return _base64.b64encode(content).decode("ascii")
+    return base64.b64encode(content).decode("ascii")
 
 
 def upload(client, filename, content):
@@ -8295,3 +8303,350 @@ def test_more_attachments_than_the_cap_are_refused_at_the_boundary(client):
     )
 
     assert resp.status_code == 422
+
+
+# ---- Phase K3: native image parts, capability-checked.
+
+
+PNG_BYTES = base64.b64decode(
+    # A 1x1 transparent PNG, the smallest real one.
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk"
+    "YPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=="
+)
+
+
+def native_group(client, prompt="what is in this image", models=None, name="shot.png"):
+    digest = upload(client, name, PNG_BYTES).json()["digest"]
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": prompt,
+            "models": models or ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+    return resp, digest
+
+
+def test_an_image_uploads_with_no_extraction_and_says_so(client):
+    """An image carries no extracted text and records extractor "none":
+    not a parser that produced nothing, which is what a scanned PDF is,
+    but no parser at all. Keeping the two distinguishable matters,
+    because the first is a refusal and the second is the ordinary native
+    case."""
+    body = upload(client, "shot.png", PNG_BYTES).json()
+
+    assert body["mime"] == "image/png"
+    assert body["extracted_chars"] == 0
+    assert body["extractor"] == "none"
+    assert body["extractor_version"] == "0"
+
+
+@respx.mock
+def test_review_repro_native_mode_sends_the_documented_content_part_shape(client):
+    """THE PINNED SHAPE, asserted on the wire.
+
+    OpenRouter's image-understanding guide, read 2026-08-08 at
+    https://openrouter.ai/docs/guides/overview/multimodal/image-understanding
+    documents a content array of {"type": "text", ...} and
+    {"type": "image_url", "image_url": {"url": data_url}} with the
+    base64 form data:image/jpeg;base64,{base64_image}, and says: "Due to
+    how the content is parsed, we recommend sending the text prompt
+    first, then the images."
+
+    Asserted against the payload rather than against the composer,
+    because a shape that is right in a unit test and wrong on the wire
+    is the failure this pin exists to prevent.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, json=response_for("model/alpha", "a pixel")),
+        )[1]
+    )
+    created, digest = native_group(client)
+    assert created.status_code == 201, created.text
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha"],
+            "group_id": created.json()["id"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    content = sent[0]["messages"][-1]["content"]
+    assert content[0] == {"type": "text", "text": "what is in this image"}
+    assert content[1]["type"] == "image_url"
+    url = content[1]["image_url"]["url"]
+    assert url.startswith("data:image/png;base64,")
+    # The bytes on the wire are the bytes that were uploaded.
+    assert base64.b64decode(url.split(",", 1)[1]) == PNG_BYTES
+    # Text first, which is the documentation's own instruction.
+    assert content[0]["type"] == "text"
+
+
+@respx.mock
+def test_review_repro_a_non_image_under_native_refuses_and_names_the_remedy(client):
+    """Native mode composes image_url parts and nothing else, so a PDF
+    declared native would be dropped or quietly turned back into text,
+    and either way the record would claim a mode that did not happen.
+
+    The remedy is named because it is a one-word fix the person can act
+    on, which is the difference between a refusal and a dead end."""
+    digest = upload(client, "contract.txt", b"a text document").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "read this",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "'contract.txt' is not one" in detail
+    assert "Use inline mode" in detail
+    assert respx.calls.call_count == 0
+
+
+def test_an_image_under_inline_refuses_and_names_the_remedy(client):
+    """The mirror. An image stored for native mode carries an empty
+    extraction by construction, so composing it inline would put an
+    empty delimited block into the prompt: every model told a document
+    was attached and shown none of it."""
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "'shot.png' is an image" in detail
+    assert "Use native mode" in detail
+
+
+def test_review_repro_a_model_without_image_input_is_refused_by_name(client):
+    """STRICT MODE'S LANGUAGE, one modality over. Native mode claims
+    every model in the comparison saw the file itself, and a text-only
+    model cannot, so the comparison is refused at creation rather than
+    failing at the first paid call.
+
+    The 422 names the model and the modality, because "not supported" on
+    its own leaves the person to work out which of five models it means.
+    """
+    created, _digest = native_group(client, models=["model/alpha", "model/capped"])
+
+    assert created.status_code == 422
+    detail = created.json()["detail"]
+    assert "model/capped does not accept image input" in detail
+    assert "the catalog lists text" in detail
+    assert "use inline mode" in detail
+
+
+def test_a_model_the_catalog_does_not_list_is_refused_as_unverifiable(client):
+    """Absence of evidence is not support, which is the sentence strict
+    mode already uses one field over."""
+    created, _digest = native_group(client, models=["model/unlisted"])
+
+    assert created.status_code == 422
+    assert "the catalog does not list it" in created.json()["detail"]
+
+
+def test_a_model_listed_without_modalities_is_refused_as_unverifiable(client):
+    """The catalog lists model/bare with input_modalities None, which is
+    "cannot check" rather than "accepts everything"."""
+    created, _digest = native_group(client, models=["model/bare"])
+
+    assert created.status_code == 422
+    detail = created.json()["detail"]
+    assert "without input modalities" in detail
+    assert "Absence of evidence is not support" in detail
+
+
+def test_native_mode_on_an_offline_boot_is_refused_rather_than_unchecked(
+    monkeypatch, tmp_path
+):
+    """A native comparison created with no catalog would carry rows
+    labelled native whose capability check never ran, which is a native
+    mode that isn't. A label nobody verified is worse than no label,
+    because a reader cannot tell the two apart afterwards."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+
+    async def offline(_client):
+        return {"fetched": False, "digest": None, "models": [], "prices": {}}
+
+    monkeypatch.setattr("bench.main.fetch_catalog", offline)
+    with TestClient(app, base_url="http://localhost") as offline_client:
+        digest = offline_client.post(
+            "/attachments",
+            json={"filename": "shot.png", "content_base64": b64(PNG_BYTES)},
+        ).json()["digest"]
+
+        resp = offline_client.post(
+            "/groups",
+            json={
+                "prompt": "describe",
+                "models": ["model/alpha"],
+                "budget": "standard",
+                "attachments": [digest],
+                "attachments_mode": "native",
+            },
+        )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "this boot has no catalog" in detail
+    assert "guarantee nothing verified" in detail
+
+
+@respx.mock
+def test_review_repro_the_native_record_carries_a_digest_not_the_base64(client):
+    """Rule two's resolution applied to native parts. The wire carries
+    the image; the record carries a reference to it and the byte count,
+    so a result row is not a second copy of every image ever sent."""
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, json=response_for("model/alpha", "ok")),
+        )[1]
+    )
+    created, digest = native_group(client)
+
+    client.post(
+        "/compare",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha"],
+            "group_id": created.json()["id"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    encoded = base64.b64encode(PNG_BYTES).decode("ascii")
+    assert encoded in json.dumps(sent[0])
+    row = client.app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert encoded not in row["request_json"]
+    assert f"sha256 {digest}" in row["request_json"]
+    # The structure survives, so the record still says an image part was
+    # sent and where in the message it sat.
+    recorded = json.loads(row["request_json"])["messages"][-1]["content"]
+    assert recorded[0]["type"] == "text"
+    assert recorded[1]["type"] == "image_url"
+    # The reference states the true quantity and the media type, which
+    # is the whole of what reconstruction needs beyond the stored bytes.
+    # An image's size is a BYTE count; labelling it "characters" the way
+    # the inline placeholder does would be a record that reads exact and
+    # is false, so native carries its own placeholder.
+    stand_in = recorded[1]["image_url"]["url"]
+    assert stand_in == (
+        f"<<attachment content: sha256 {digest}, {len(PNG_BYTES)} bytes, image/png>>"
+    )
+    rebuilt = f"data:image/png;base64,{encoded}"
+    assert json.dumps(sent[0]["messages"][-1]["content"][1]["image_url"]["url"]) == (
+        json.dumps(rebuilt)
+    )
+
+
+@respx.mock
+def test_a_member_sending_the_other_mode_is_refused(client):
+    """The mode is half the declaration, because it decides what is being
+    measured. A member that thought it was sending inline text while the
+    group declared native would be running a different experiment
+    against the same digests, and the record would name only one."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, json=response_for("m", "hi"))
+    )
+    created, digest = native_group(client)
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha"],
+            "group_id": created.json()["id"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 409
+    assert "declared attachments_mode 'native'" in resp.json()["detail"]
+    assert respx.calls.call_count == 0
+
+
+def test_a_mode_declared_without_attachments_is_refused(client):
+    """A mode is a statement about how documents reach the models. With
+    none, the declaration would record a fact about nothing."""
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "without any attachment" in resp.json()["detail"]
+
+
+@respx.mock
+def test_review_repro_rule_one_holds_across_both_modes(client):
+    """RULE ONE, against the captured fixture. A comparison that declares
+    no attachment sends the payload it always did, in either mode's
+    presence in the codebase: no content parts, no wrapper, no preamble.
+
+    Captured as a whole payload rather than as a field, because the
+    claim is that NOTHING changed, and a field-by-field assertion only
+    covers the fields somebody thought to list.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, json=response_for("model/alpha", "ok")),
+        )[1]
+    )
+
+    client.post(
+        "/compare",
+        json={
+            "prompt": "plain question",
+            "models": ["model/alpha"],
+            "budget": "standard",
+        },
+    )
+
+    assert sent[0] == {
+        "model": "model/alpha",
+        "messages": [{"role": "user", "content": "plain question"}],
+        "max_tokens": 16384,
+        "provider": {"sort": "throughput"},
+    }

@@ -535,7 +535,33 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             # lines, because a wrapped URL is a URL nobody can click:
             # https://openrouter.ai/docs/api-reference/list-available-models
             "supported_parameters": None,
+            # Which kinds of input this model accepts, which is what the
+            # native attachment mode checks against. None means the
+            # catalog did not say, treated as "cannot check" rather than
+            # "accepts everything", exactly as supported_parameters is.
+            #
+            # Pinned against the live model listing at
+            # https://openrouter.ai/api/v1/models read 2026-08-08, where
+            # every one of the 400 entries carries
+            # architecture.input_modalities as an array of strings, for
+            # example ["text", "image", "video", "file", "audio"] on a
+            # multimodal model and ["text"] on a text-only one. The same
+            # field appears in the documented response shape at
+            # https://openrouter.ai/docs/guides/overview/multimodal/image-generation
+            "input_modalities": None,
         }
+        architecture = entry.get("architecture")
+        if isinstance(architecture, dict):
+            modalities = architecture.get("input_modalities")
+            if isinstance(modalities, list):
+                # Strings only, same degrade-in-place rule as
+                # supported_parameters: one malformed element must not
+                # cost the whole entry. An empty list stays a list,
+                # because "this model accepts nothing" is a real if
+                # improbable answer and is not the same as unknown.
+                model["input_modalities"] = sorted(
+                    {x for x in modalities if isinstance(x, str)}
+                )
         supported = entry.get("supported_parameters")
         if isinstance(supported, list):
             # Strings only, so one malformed element degrades itself
