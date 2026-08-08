@@ -52,6 +52,13 @@
     // the composer, so a rerun issued minutes later replays the experiment
     // it belongs to and not whatever the panel happens to hold by then.
     controls,
+    // The attachment declaration, already in body shape and empty when
+    // there is none. Passed in for the same reason the controls are, and
+    // the reason is sharper here: the server refuses a member whose
+    // documents disagree with its group's, so a rerun that re-read the
+    // composer would 422 the moment somebody detached a file between the
+    // original run and the retry.
+    documents,
   ) {
     // Superseded before it started: spend no money for a dead view.
     if (epoch !== BenchState.viewEpoch) return;
@@ -185,6 +192,7 @@
                     budget,
                     position,
                     controls,
+                    documents,
                   }
                 : null,
             // A user Stop renders as an honest stopped state, not done or
@@ -320,6 +328,13 @@
           // checked against it. Omitted entirely when nothing was set, which
           // is what keeps a blank run's body what it always was.
           ...(hasControls(controls) ? { params: controls } : {}),
+          // The documents this member brings, which the server checks
+          // against the group's declaration before composing anything: a
+          // member that disagrees with its group is refused rather than
+          // quietly sending a different prompt to one model. Spread from
+          // one object so an unattached comparison's body carries no
+          // attachment keys at all, which is rule one.
+          ...documents,
           // Which column this run occupies, so a replay can rebuild the
           // layout from the rows instead of from the current chip order,
           // which drifts as the lineup is edited. A rerun re-sends the
@@ -430,6 +445,12 @@
     // the panel per model would let an edit mid-batch split the group and
     // trip the server's own one-experiment check.
     const controls = BenchControls.experimentParams();
+    // Read once for the whole batch, exactly like the controls above and
+    // for the same reason: one comparison is one experiment, so every
+    // request in it has to carry the same declaration. Re-reading the
+    // control per model would let a mid-batch detach split the group and
+    // trip the server's own entry check.
+    const documents = BenchAttach.declared();
     const epoch = BenchState.newViewEpoch();
     // Reserve the in-flight registry synchronously, before the /groups
     // await below, so the Run button is disabled for the whole batch
@@ -495,6 +516,13 @@
           // checked against rather than a claim assembled after the money
           // moved.
           ...(hasControls(controls) ? { params: controls } : {}),
+          // The documents, declared here with everything else the group
+          // fixes before its first call. This is where the composed size
+          // and, in native mode, every model's image capability are
+          // checked, so a comparison that cannot be run fairly is refused
+          // before any money moves. Empty spread when nothing is
+          // attached, which is rule one.
+          ...documents,
         }),
         signal: groupController.signal,
       });
@@ -528,6 +556,7 @@
             epoch,
             i,
             controls,
+            documents,
           ),
         ),
       );

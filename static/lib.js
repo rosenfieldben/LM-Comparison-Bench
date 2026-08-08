@@ -41,6 +41,56 @@
     return Number(v.toPrecision(2)).toString();
   }
 
+  // ---- Attachment chip formatting. Pure, so the chip the composer
+  // ---- draws and the chip a history row draws cannot drift: an
+  // ---- attachment shown one way before a run and another way after it
+  // ---- would make the record look like a different document.
+
+  // Binary units, because the upload limit is stated in MiB and a chip
+  // that said "8.4 MB" beside a refusal quoting 8 MiB would read as a
+  // contradiction. KiB at 1024 and not 1000 for the same reason.
+  function fmtBytes(n) {
+    if (!Number.isFinite(n) || n < 0) return "";
+    if (n < 1024) return n + " B";
+    const units = ["KiB", "MiB", "GiB"];
+    let value = n / 1024;
+    let unit = 0;
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024;
+      unit += 1;
+    }
+    // One decimal below ten, none above: "9.4 KiB" and "512 KiB" both
+    // read at a glance, and "512.3 KiB" is three digits of noise.
+    return (
+      (value < 10 ? value.toFixed(1) : Math.round(value)) + " " + units[unit]
+    );
+  }
+
+  // The first seven hex characters, git's length and for git's reason:
+  // long enough to be unambiguous by eye across the handful of documents
+  // one bench holds, short enough to sit in a chip. NEVER used to look
+  // anything up: every request carries the full digest, because a
+  // prefix that collided would attach the wrong document.
+  function shortDigest(digest) {
+    return typeof digest === "string" ? digest.slice(0, 7) : "";
+  }
+
+  // Characters over four, the oldest rough tokenizer there is, and it is
+  // labeled approximate everywhere it is shown for exactly that reason.
+  //
+  // The bench does NOT tokenize. Every model in a comparison runs its
+  // own tokenizer and they disagree with each other, so any single
+  // number here is wrong for at least some of them; what this is for is
+  // the order of magnitude, the difference between "this fits" and "this
+  // is a novel". Shipping a real tokenizer would be a dependency that
+  // bought a precise answer to a question nobody asked, and worse, would
+  // make the estimate look authoritative when it can only ever describe
+  // one model's view.
+  function approxTokens(chars) {
+    if (!Number.isFinite(chars) || chars < 0) return 0;
+    return Math.ceil(chars / 4);
+  }
+
   function niceScale(maxTtft) {
     // Smallest 100·2^k at or above the slowest known TTFT, so bars keep
     // honest proportions and the scale label stays a round number.
@@ -183,6 +233,9 @@
     fmtCost,
     fmtBilled,
     fmtEstimate,
+    fmtBytes,
+    shortDigest,
+    approxTokens,
     niceScale,
     minRanks,
     tokenizeDiff,

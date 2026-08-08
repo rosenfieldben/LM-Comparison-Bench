@@ -56,9 +56,27 @@ CATALOG = {
             # than showing nothing.
             ("stub/nancost", {}),
             ("stub/negcost", {}),
+            # The one model in this catalog that accepts images, so the
+            # native-attachment path has something it can legally run
+            # against. Its siblings above carry TEXT_ONLY below, which is
+            # what makes a native comparison over them a refusal naming
+            # the modality rather than an unverifiable-model refusal:
+            # the two are different messages and the suite checks the
+            # first, so the catalog has to be able to produce it.
+            (
+                "stub/vision",
+                {"architecture": {"input_modalities": ["text", "image"]}},
+            ),
         ]
     ]
 }
+
+# Every model that is not stub/vision declares text and only text. Added
+# after the comprehension rather than inside it because it applies to all
+# but one entry, and a per-entry repetition of the same dict is the kind
+# of thing that drifts in one place.
+for _entry in CATALOG["data"]:
+    _entry.setdefault("architecture", {"input_modalities": ["text"]})
 
 # The billed figure is deliberately NOT 2.9e-5: it has to be
 # distinguishable from the catalog estimate above, or a test asserting the

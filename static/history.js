@@ -140,7 +140,17 @@
         chip.title = badge.title;
         badges.append(chip);
       }
-      row.append(time, text, badges, count);
+      // A comparison that was run over a document reads very differently
+      // from one that was not, so the row says so without being opened.
+      // Names, because this is the sighted list: the blind view is the
+      // one place identities and document names are withheld, and it is
+      // built from a different payload entirely.
+      const docs = document.createElement("span");
+      docs.className = "hdocs";
+      for (const ref of run.attachments || []) {
+        docs.append(attachmentChip(ref, run.attachments_mode, "history"));
+      }
+      row.append(time, text, badges, docs, count);
       row.title = run.models.join(", ");
       row.addEventListener("click", () =>
         run.type === "group" ? showGroup(run.id) : showRun(run.id),
@@ -184,6 +194,39 @@
     applyHistoryFilter();
   }
 
+  // One document, as a chip, in the one shape both the history row and
+  // the replay banner use. Shared rather than written twice because the
+  // two must agree: a document shown one way in the list and another way
+  // after the click would read as two different documents.
+  //
+  // A ref whose row is gone carries only a digest (see AttachmentRef);
+  // it renders as such rather than being skipped, so a comparison that
+  // declared three documents never reads as having declared two.
+  function attachmentChip(ref, mode, where) {
+    const { fmtBytes, shortDigest } = window.BenchLib;
+    const chip = document.createElement("span");
+    chip.className = "attach-chip ref";
+    chip.dataset.testid = where + "-attachment";
+    const missing = ref.filename === null || ref.filename === undefined;
+    // textContent throughout: a filename is user text.
+    chip.textContent = missing ? "(no longer stored)" : ref.filename;
+    if (missing) chip.classList.add("attach-missing");
+    const bits = [];
+    if (!missing && Number.isFinite(ref.byte_size)) {
+      bits.push(fmtBytes(ref.byte_size));
+    }
+    bits.push("sha256 " + shortDigest(ref.digest));
+    if (mode) bits.push(mode);
+    // The extractor and its version, because a pypdf upgrade changes the
+    // text a model read and a replay that could not say which parser
+    // produced it would be a replay of a prompt nobody can reconstruct.
+    if (!missing && ref.extractor && ref.extractor !== "none") {
+      bits.push("read by " + ref.extractor + " " + ref.extractor_version);
+    }
+    chip.title = bits.join("\n");
+    return chip;
+  }
+
   // Whether routing is recoverable from this source. A group stores its
   // declared controls, so reuse restores them exactly. An ungrouped run has
   // no stored set at all; its controls are derived from its recorded
@@ -197,8 +240,18 @@
   // truth defect as any other default rendered as a choice. What is not
   // acceptable is being quiet about it, so the button says so before the
   // click and the composer says so after.
+  // Attachments join routing in the same sentence and for the same
+  // reason, which is worth stating rather than quietly widening: an
+  // ungrouped run has no declaration at all, so there is no digest list
+  // to restore. The digests DO survive inside its recorded payload, in
+  // the placeholder that stands where the content sat, and this
+  // deliberately does not go and parse them out: that would promote a
+  // record format into a data format, which is the same mistake reading
+  // controls back off their badges would be. The declaration is the data
+  // path, and an ungrouped run does not have one.
   const UNGROUPED_ROUTING_NOTE =
-    "routing is not restored: an ungrouped run does not record it";
+    "routing is not restored, and neither are attachments: an ungrouped " +
+    "run records no declaration";
 
   // The controls a replayed comparison ran under, badges plus the system
   // prompt in full. The badge alone says only that a system prompt existed,
@@ -210,6 +263,28 @@
   // would attribute one comparison's experiment to another.
   function renderRunControls(params, source) {
     runControlsEl.replaceChildren();
+    // The documents this comparison ran over, above the controls,
+    // because they changed what every model READ and the controls only
+    // changed how each one answered. Drawn from the source's stored
+    // declaration and never from the composer's current staging, which
+    // is a different comparison's documents.
+    const refs = source?.attachments || [];
+    if (refs.length > 0) {
+      const strip = document.createElement("div");
+      strip.className = "attach-strip";
+      strip.dataset.testid = "run-attachments";
+      const label = document.createElement("span");
+      label.className = "attach-strip-label";
+      label.textContent =
+        source.attachmentsMode === "native"
+          ? "documents (native: the models saw the images)"
+          : "documents (inline: the bench extracted the text)";
+      strip.append(label);
+      for (const ref of refs) {
+        strip.append(attachmentChip(ref, source.attachmentsMode, "run"));
+      }
+      runControlsEl.append(strip);
+    }
     const badges = window.BenchLib.controlBadges(params);
     if (badges.length > 0) {
       const strip = document.createElement("div");
@@ -463,6 +538,11 @@
         group.prompt ??
         (group.runs.length > 0 ? group.runs[0].prompt_text : ""),
       params: group.params,
+      // Part of the experiment, so reuse carries it forward with the
+      // prompt and the controls. Always a list from the API, empty on
+      // every group that declared none.
+      attachments: group.attachments || [],
+      attachmentsMode: group.attachments_mode || null,
     });
     // Cards in the order the comparison actually had. Runs persist in
     // completion order, so run order alone would shuffle cards between
@@ -538,6 +618,14 @@
       id: run.id,
       prompt: run.prompt_text,
       params: run.params,
+      // Empty by construction, not by omission: an ungrouped run has no
+      // declaration to read, and its recorded payload holds a digest
+      // REFERENCE rather than the digest list a chip would need. Reuse
+      // from a lone run therefore drops attachments the same way it
+      // drops routing, and the note below already tells the user that a
+      // lone run is a lossy source.
+      attachments: [],
+      attachmentsMode: null,
     });
     for (const result of run.results) {
       BenchRender.fillColumn(

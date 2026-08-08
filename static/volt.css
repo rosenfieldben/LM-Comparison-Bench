@@ -817,6 +817,96 @@
   color: var(--text-faint);
   white-space: nowrap;
 }
+/* ---- Attached documents. The composer's staging area, and the same
+   chip reused on history rows and the replay banner, so a document looks
+   the same before a comparison and after it. */
+#attach-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px 0;
+  flex-wrap: wrap;
+}
+#attach-label { margin-right: 4px; }
+#attachments { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+#attach-actions { display: flex; gap: 6px; margin-left: auto; align-items: center; }
+/* The native file input is replaced by its own label, which is the only
+   way to style a file picker without script. The input stays in the DOM
+   and focusable rather than display:none, so the control is reachable by
+   keyboard; the label is its visible surface. */
+#attach-input {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+.attach-btn {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 0 13px;
+  border-radius: 4px;
+  border: 1px dashed var(--accent-dash-border);
+  color: var(--accent-label);
+  background: none;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.attach-btn:hover { background: var(--accent-tint); }
+#attach-input:focus-visible + .sel-wrap,
+#attach-row:has(#attach-input:focus-visible) .attach-btn {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+#attach-mode { font-size: 11px; }
+#attach-msg { font-size: 11px; color: var(--warn, var(--text-faint)); flex-basis: 100%; }
+#attach-note { font-size: 10.5px; color: var(--text-faint); flex-basis: 100%; }
+.attach-note-line { margin-top: 2px; }
+.attach-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 0 2px 0 11px;
+  border: 1px solid var(--border-chip);
+  border-radius: 4px;
+  background: var(--bg-chip);
+  font-size: 11.5px;
+  color: var(--text-body);
+}
+.attach-name { color: var(--text-body); }
+.attach-meta { color: var(--text-faint); font-size: 10.5px; }
+/* A declared document the bench can no longer resolve. Loud on purpose:
+   it blocks the run, so it must not read as decoration. */
+.attach-chip.attach-missing {
+  border-color: var(--err);
+  color: var(--err-text);
+}
+.attach-chip.attach-missing .attach-name { color: var(--err-text); }
+.chip-x {
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: none;
+  background: none;
+  border-radius: 4px;
+  color: var(--text-faint);
+  font-size: 13px;
+}
+.chip-x:hover:not(:disabled) { color: var(--err); border: none; background: none; }
+/* The read-only form: a history row's chip and the replay banner's, with
+   no remove button and no padding for one. */
+.attach-chip.ref {
+  min-height: 20px;
+  padding: 0 6px;
+  font-size: 10px;
+  color: var(--text-faint);
+  white-space: nowrap;
+}
+.hdocs, .attach-strip { display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.attach-strip-label { font-size: 11px; color: var(--text-faint); margin-right: 4px; }
+
 #run-controls { display: grid; gap: 4px; }
 /* pre-wrap because a system prompt's line breaks are part of it, and a
    prompt that reads differently here than it did on the wire would be a

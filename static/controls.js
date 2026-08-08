@@ -166,6 +166,13 @@
     BS.selectedPromptId = null;
     savedSelect.value = "";
     setExperimentParams(source.params);
+    // The documents come with it, and they are part of the experiment in
+    // the same way the controls are: the prompt the models actually read
+    // was the composition of this text WITH these documents, so reusing
+    // the text alone would reproduce a different comparison under the
+    // old label. Cleared when the source declared none, for the same
+    // reason setExperimentParams clears an unset control.
+    window.BenchAttach.setFrom(source.attachments, source.attachmentsMode);
     autosizePrompt();
     updateRunState();
   }
@@ -414,11 +421,18 @@
     // Summary first, because the disable below reads its validity check and
     // the panel may be collapsed over the offending input.
     renderControlsSummary();
+    // The attached documents can block a run too, and the Run button has
+    // exactly ONE owner: a second place that disabled it would be a
+    // second place that could forget to re-enable it. See
+    // BenchAttach.blockingReason for the two cases.
+    const attachBlock = window.BenchAttach.blockingReason();
     runBtn.disabled =
       BS.inflightRuns > 0 ||
       promptEl.value.trim() === "" ||
       checked === 0 ||
+      attachBlock !== null ||
       invalidControls().length > 0;
+    runBtn.title = attachBlock === null ? "" : "cannot run: " + attachBlock;
     // Stop is live exactly while runs are: it acts on the in-flight
     // controllers and has nothing to do when the count is zero.
     stopBtn.disabled = BS.inflightRuns === 0;
@@ -440,6 +454,13 @@
     // undefined, which setDataPolicy treats as standard: a badge is a claim
     // about where prompts go, and a failed fetch is not evidence for one.
     BS.setDataPolicy(catalog.data_policy);
+    // The attach control states the policy in words, and it painted its
+    // first note before this fetch resolved: the deck is drawn
+    // synchronously at boot and the catalog arrives a round trip later.
+    // Without this repaint a zero-retention session read "Session
+    // routing: default" at the one control that sends a document out,
+    // which is the worst possible place to be a round trip stale.
+    window.BenchAttach.refresh();
     // Pricing just arrived (or didn't): refresh the run estimate.
     updateRunState();
   }

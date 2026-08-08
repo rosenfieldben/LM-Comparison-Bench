@@ -1088,14 +1088,35 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
         request_by_run.setdefault(row["run_id"], row["request_json"])
     group_created: dict[int, str] = {}
     group_controls: dict[int, dict[str, Any]] = {}
+    # The documents each selected group declared, digests only and read in
+    # the same pass as its controls rather than one query per row: a page
+    # of a hundred comparisons must stay one query, which is the rule the
+    # rest of this function already follows.
+    group_docs: dict[int, list[str] | None] = {}
+    group_doc_mode: dict[int, str | None] = {}
     if group_ids:
         for row in conn.execute(
-            f"SELECT id, created_at, params_json FROM groups"
-            f" WHERE id IN ({marks(group_ids)})",
+            f"SELECT id, created_at, params_json, attachments_json, attachments_mode"
+            f" FROM groups WHERE id IN ({marks(group_ids)})",
             group_ids,
         ):
             group_created[row["id"]] = row["created_at"]
             group_controls[row["id"]] = _decoded_params(row["params_json"])
+            # Decoded through the same repair-on-read discipline
+            # group_attachments uses, and NOT by calling it: that would be
+            # one query per group, which is the N+1 this pass exists to
+            # avoid. The two must agree, so the shape check is the same.
+            raw_docs = row["attachments_json"]
+            docs: list[str] | None = None
+            if isinstance(raw_docs, str):
+                try:
+                    decoded_docs = json.loads(raw_docs)
+                except (TypeError, ValueError):
+                    decoded_docs = None
+                if isinstance(decoded_docs, list):
+                    docs = [str(d) for d in decoded_docs]
+            group_docs[row["id"]] = docs
+            group_doc_mode[row["id"]] = as_text(row["attachments_mode"])
 
     runs_by_id = {r["id"]: r for r in run_rows}
     members: dict[int, list[dict[str, Any]]] = {}
@@ -1138,6 +1159,14 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
                     # holds what was declared before any call, so a group
                     # can show a routing badge where a lone run cannot.
                     "params": group_controls.get(key) or None,
+                    # Declared documents, digests in declaration order.
+                    # None for a pre-K group, the same two NULLs
+                    # group_attachments documents; a list entry is never
+                    # emitted for a lone run because an ungrouped run has
+                    # no declaration to read and its payload records a
+                    # digest reference rather than a digest list.
+                    "attachments": group_docs.get(key),
+                    "attachments_mode": group_doc_mode.get(key),
                 }
             )
     return entries
@@ -1266,6 +1295,13 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     out["prompt"] = manifest["prompt"]
     out["models"] = manifest["models"]
     out["budget"] = manifest["budget"]
+    # The declared documents, as DIGESTS and not as rows. Resolving them
+    # to names is the boundary's job, for the same reason params comes
+    # back decoded but a request payload does not: this module returns
+    # what the group row stores, and a join against attachments is a
+    # second question the caller may not be asking.
+    out["attachments"] = group_attachments(conn, group_id)
+    out["attachments_mode"] = group_attachments_mode(conn, group_id)
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
 

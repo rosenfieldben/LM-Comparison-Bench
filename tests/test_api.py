@@ -2745,7 +2745,8 @@ def test_the_served_index_versions_every_asset_url(client):
     # it is asserted rather than derived on purpose: a new asset that the
     # transform failed to version would otherwise pass unnoticed, since
     # every OTHER url would still carry its rev.
-    assert len(referenced) == 13, referenced
+    # 14 since K4 added static/attach.js.
+    assert len(referenced) == 14, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -8650,3 +8651,347 @@ def test_review_repro_rule_one_holds_across_both_modes(client):
         "max_tokens": 16384,
         "provider": {"sort": "throughput"},
     }
+
+
+# ---- Phase K4: the seams a person touches, server half.
+#
+# The views the composer, the history list and the replay banner read
+# from. Every assertion below names its window, because "the API returns
+# attachments" is true of several different payloads and only one of them
+# is the one a given seam reads.
+
+
+def test_review_repro_a_group_detail_names_the_documents_it_declared(client):
+    """WINDOW: the body of GET /groups/{id} for a group created with one
+    document, before any member has run.
+
+    The replay banner draws its chips from exactly this payload. Without
+    the field, a comparison run over a contract replayed as a comparison
+    over a bare prompt: the answers would still be there and nothing on
+    screen would say the models had been reading a document, which is a
+    quieter lie than a missing card because the reader has no way to
+    know anything is absent."""
+    group_id, digest = attached_group(client, "summarize it")
+
+    body = client.get(f"/groups/{group_id}").json()
+
+    assert body["attachments_mode"] == "inline"
+    assert len(body["attachments"]) == 1
+    ref = body["attachments"][0]
+    assert ref["digest"] == digest
+    assert ref["filename"] == "contract.txt"
+    assert ref["byte_size"] == len(b"the contract says forty two")
+    # The chars are what the estimate is computed from; the text itself
+    # is never in a metadata response.
+    assert ref["extracted_chars"] == len("the contract says forty two")
+    assert ref["extractor"] == "text"
+    assert "extracted_text" not in ref
+    assert "content" not in ref
+
+
+def test_a_group_with_no_documents_says_so_with_an_empty_list(client):
+    """WINDOW: the same body, for a group that declared none. Rule one's
+    shape at the read edge: absence renders as absence, so the banner
+    draws no strip at all rather than an empty one."""
+    group_id = client.post(
+        "/groups",
+        json={"prompt": "plain", "models": ["model/alpha"], "budget": "standard"},
+    ).json()["id"]
+
+    body = client.get(f"/groups/{group_id}").json()
+
+    assert body["attachments"] == []
+    assert body["attachments_mode"] is None
+
+
+def test_review_repro_a_history_row_carries_its_comparisons_documents(client):
+    """WINDOW: the group entry inside GET /runs, which is the list the
+    history panel renders and NOT the detail the replay reads.
+
+    Proven separately from the detail above because they are different
+    payloads built by different code: list_runs assembles its entries in
+    one bounded pass and the detail joins per group, so a fix to one
+    would not reach the other."""
+    group_id, digest = attached_group(client, "summarize it")
+    with respx.mock:
+        respx.post(OPENROUTER_URL).mock(
+            return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+        )
+        client.post(
+            "/compare",
+            json={
+                "prompt": "summarize it",
+                "models": ["model/alpha", "model/beta"],
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+            },
+        )
+
+    entry = next(
+        run for run in client.get("/runs").json()["runs"] if run["id"] == group_id
+    )
+
+    assert entry["type"] == "group"
+    assert entry["attachments_mode"] == "inline"
+    assert [ref["filename"] for ref in entry["attachments"]] == ["contract.txt"]
+    assert entry["attachments"][0]["digest"] == digest
+
+
+def test_the_history_list_resolves_every_page_in_one_query(client):
+    """WINDOW: the query count for one GET /runs over several
+    comparisons sharing one document.
+
+    A per-entry lookup would be an N+1 the rest of list_runs was written
+    to avoid, and sharing is the case that makes it visible: one document
+    attached to three comparisons is one row, so asking for it three
+    times would undo exactly the saving storing by digest bought."""
+    digest = upload(client, "shared.txt", b"one document, many uses").json()["digest"]
+    with respx.mock:
+        respx.post(OPENROUTER_URL).mock(
+            return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+        )
+        for i in range(3):
+            group_id = client.post(
+                "/groups",
+                json={
+                    "prompt": f"question {i}",
+                    "models": ["model/alpha"],
+                    "budget": "standard",
+                    "attachments": [digest],
+                },
+            ).json()["id"]
+            # Each group needs a recorded member: list_runs walks runs and
+            # a group with none never becomes an entry, so without this the
+            # page would be empty and the query count trivially zero.
+            client.post(
+                "/compare",
+                json={
+                    "prompt": f"question {i}",
+                    "models": ["model/alpha"],
+                    "group_id": group_id,
+                    "budget": "standard",
+                    "attachments": [digest],
+                },
+            )
+    # sqlite3's own trace hook rather than a patched execute: Connection
+    # exposes execute read-only, and the hook sees every statement the
+    # connection runs including any a helper issues, which is exactly the
+    # question here.
+    seen: list[str] = []
+    client.app.state.db.set_trace_callback(seen.append)
+    try:
+        body = client.get("/runs").json()
+    finally:
+        client.app.state.db.set_trace_callback(None)
+
+    assert sum(1 for sql in seen if "FROM attachments" in sql) == 1, seen
+    # And the resolution still happened, so the count above is not one
+    # query because it is zero queries doing nothing.
+    rows = [run for run in body["runs"] if run["type"] == "group"]
+    assert len(rows) == 3
+    assert all(r["attachments"][0]["filename"] == "shared.txt" for r in rows)
+
+
+def test_review_repro_a_declared_document_that_is_gone_still_appears(client):
+    """WINDOW: GET /groups/{id} after the attachments row is deleted out
+    from under a group that declared it.
+
+    Nothing in the bench deletes an attachment, so this is reachable only
+    by someone editing their own database, which is precisely why the
+    view must survive it honestly. Dropping the unresolvable digest would
+    shrink a three-document comparison to two with nothing on screen
+    saying so, the same silent shrink renderMissingMembers exists to stop
+    one table over."""
+    group_id, digest = attached_group(client, "summarize it")
+    client.app.state.db.execute("DELETE FROM attachments WHERE digest = ?", (digest,))
+    client.app.state.db.commit()
+
+    body = client.get(f"/groups/{group_id}").json()
+
+    assert len(body["attachments"]) == 1
+    ref = body["attachments"][0]
+    assert ref["digest"] == digest
+    # The declaration survives; the metadata cannot, and says so as null
+    # rather than as a plausible-looking blank.
+    assert ref["filename"] is None
+    assert ref["byte_size"] is None
+
+
+def test_declared_documents_come_back_in_declaration_order(client):
+    """WINDOW: the attachments list of GET /groups/{id} for a group
+    declaring three documents whose digests do not sort in that order.
+
+    The order is the order they were composed into the prompt, so a view
+    that showed them in query order would describe a prompt that was
+    never sent. attachments_for returns a mapping, which has no order at
+    all, so this has to be imposed rather than inherited."""
+    digests = [
+        upload(client, f"doc{i}.txt", f"body number {i}".encode()).json()["digest"]
+        for i in range(3)
+    ]
+    # Declared in an order that is not the sorted one, so passing by
+    # accident is not available.
+    declared = [digests[2], digests[0], digests[1]]
+    assert declared != sorted(declared)
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "read all three",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": declared,
+        },
+    ).json()["id"]
+
+    body = client.get(f"/groups/{group_id}").json()
+
+    assert [ref["digest"] for ref in body["attachments"]] == declared
+    assert [ref["filename"] for ref in body["attachments"]] == [
+        "doc2.txt",
+        "doc0.txt",
+        "doc1.txt",
+    ]
+
+
+@respx.mock
+def test_review_repro_an_ungrouped_native_member_is_capability_checked(client):
+    """WINDOW: POST /compare/stream with group_id null, before any
+    upstream request is issued.
+
+    THE REFUSAL WAS TURNING ITSELF INTO THE THING IT REFUSED. The browser
+    degrades to ungrouped runs when the group POST fails, and a native
+    capability refusal is exactly a failing group POST, so the models the
+    check had just rejected were then called one at a time with no group
+    and no check: enforce_group_experiment returns immediately when
+    group_id is None. An image would reach a text-only model and the
+    answer arrive as a bill.
+
+    Asserted on the respx call count and not only on the status, because
+    "refused" and "refused before spending" are different claims and only
+    the second one is the invariant."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/capped", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "what is in this image",
+            "model": "model/capped",
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "model/capped does not accept image input" in detail
+    assert "use inline mode" in detail
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_an_ungrouped_native_member_on_a_vision_model_still_runs(client):
+    """The mirror, so the check above is a check and not a blanket
+    refusal of every ungrouped native run.
+
+    WINDOW: the same endpoint and the same shape, one model over."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/compare/stream",
+        json={
+            "prompt": "what is in this image",
+            "model": "model/alpha",
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 200
+
+
+@respx.mock
+def test_review_repro_an_ungrouped_native_batch_is_checked_before_it_fans_out(client):
+    """WINDOW: POST /compare, group_id null, at entry and before the
+    fan-out acquires a single slot.
+
+    The batch endpoint has its own door and needed its own check: one
+    text-only model in the lineup must refuse the whole comparison, not
+    fail on its own card while the others succeed, because a comparison
+    where one model never saw the image is not the comparison the mode
+    claims."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha", "model/capped"],
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "model/capped does not accept image input" in resp.json()["detail"]
+    assert route.call_count == 0
+
+
+def test_review_repro_the_blind_payload_carries_no_document_metadata(client):
+    """WINDOW: the body of POST /groups/{id}/blind for a comparison that
+    ran over a named document.
+
+    The blind view is built from this payload and from nothing else, so
+    the claim "the blind view never shows attachment names" is a property
+    of what the server hands over rather than of what the page chooses to
+    draw. A filename cannot identify WHICH model wrote an answer, since
+    every model in a comparison reads the same documents, so this is not
+    a leak of the answer key; it is the narrower rule the feature states,
+    and the way to keep it true under later edits is for the name never
+    to arrive."""
+    group_id, digest = attached_group(client, "summarize it")
+    with respx.mock:
+        respx.post(OPENROUTER_URL).mock(
+            return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+        )
+        client.post(
+            "/compare",
+            json={
+                "prompt": "summarize it",
+                "models": ["model/alpha", "model/beta"],
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+            },
+        )
+
+    # json={} rather than a bare POST: the boundary requires an
+    # application/json body on every POST so a hostile cross-site sender
+    # is forced into a preflight it never answers.
+    opened = client.post(f"/groups/{group_id}/blind", json={})
+    assert opened.status_code == 201, opened.json()
+    payload = opened.json()
+
+    serialized = json.dumps(payload)
+    assert "contract.txt" not in serialized
+    assert digest not in serialized
+    assert "attachments" not in payload
+    # Every card is label, id and answer, so there is no field a later
+    # edit could fill a filename into by accident.
+    for card in payload["cards"]:
+        assert set(card) == {"label", "result_id", "response_text", "error"}

@@ -60,6 +60,12 @@
     // Keying the idle display on spend === 0 made such a session claim
     // "nothing priced yet" and wear the estimate tilde over a figure the
     // platform had actually confirmed.
+    // The routing policy this session runs under, as the server reported
+    // it. Held here rather than read back off the badge, because the
+    // badge is presentation: it renders nothing at all for the default
+    // policy, so a reader parsing it could not tell "standard" from "the
+    // catalog has not loaded yet". Null until the catalog answers.
+    dataPolicy: null,
     sessionStats: {
       runs: 0,
       spend: 0,
@@ -96,6 +102,12 @@
   };
 
   function setDataPolicy(policy) {
+    // Recorded before the badge is touched, and deliberately before the
+    // early return below: the attach control states the policy in words
+    // and must be able to do so even in a build where the badge element
+    // is missing. A fact stored only in the DOM is a fact that vanishes
+    // with the element that held it.
+    state.dataPolicy = policy || null;
     // The badge is presentational, so its absence must never cost the page.
     // Measured rather than assumed: the caller is loadCatalog, which boot
     // fires without awaiting, so a throw here rejected that promise and

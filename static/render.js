@@ -418,6 +418,10 @@
         // sample in the same slot, not a new column.
         retry.position,
         retry.controls,
+        // The same documents, for the same reason as the controls: the
+        // group's declaration is fixed and a rerun that brought a
+        // different set would be refused by the server's entry check.
+        retry.documents,
       );
     });
     ui.tools.append(btn);

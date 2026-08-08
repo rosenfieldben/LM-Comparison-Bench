@@ -434,6 +434,36 @@ class Attachment(BaseModel):
     created_at: str
 
 
+class AttachmentRef(BaseModel):
+    """A document a comparison declared, as the history views describe it.
+
+    THE DIGEST IS THE ONLY REQUIRED FIELD, and that is the whole reason
+    this is not just Attachment. A group's declaration is a list of
+    digests; the row those digests name is looked up separately and
+    could be absent, because the declaration lives in the groups table
+    and the bytes live in attachments, and nothing in this application
+    deletes from the second (there is no delete endpoint) but a person
+    with sqlite3 and their own database can.
+
+    When that happens the reference is still a fact: this comparison
+    declared a document with this digest. Dropping it from the list
+    would shrink the declaration silently, which is exactly the failure
+    renderMissingMembers exists to prevent one table over, so the ref is
+    emitted with its metadata null and the renderer says the document is
+    no longer stored.
+
+    No content field, for the reason Attachment gives.
+    """
+
+    digest: str
+    filename: str | None = None
+    mime: str | None = None
+    byte_size: int | None = None
+    extracted_chars: int | None = None
+    extractor: str | None = None
+    extractor_version: str | None = None
+
+
 class PromptCreate(BaseModel):
     # Unknown fields refused; see FORBID_UNKNOWN.
     model_config = FORBID_UNKNOWN
@@ -476,6 +506,13 @@ class GroupEntry(BaseModel):
     # The declared controls, straight off the group row. Only what was
     # set, so history renders a badge for a choice and never for a default.
     params: dict[str, Any] | None = None
+    # The declared documents, so a history row can say a comparison had
+    # one without being opened. Absent on run entries by construction:
+    # RunEntry has no such field, because an ungrouped run carries no
+    # declaration and its payload holds a digest reference rather than
+    # the digest list a chip would need.
+    attachments: list[AttachmentRef] = []
+    attachments_mode: str | None = None
 
 
 class RunList(BaseModel):
@@ -795,6 +832,13 @@ class GroupDetail(BaseModel):
     # chosen control and never a default dressed up as one. None on every
     # pre-H group, which is a fact about those groups rather than a gap.
     params: dict[str, Any] | None = None
+    # The documents this comparison was declared with, resolved to names
+    # and sizes so a replay can show what the models were reading. Empty
+    # on every group that declared none, including every pre-K group.
+    attachments: list[AttachmentRef] = []
+    # inline or native, or None when there are no documents for it to be
+    # a statement about. See store.group_attachments_mode.
+    attachments_mode: str | None = None
 
 
 def _git(args: list[str]) -> str | None:
@@ -1842,6 +1886,34 @@ def enforce_native_mode(digests: list[str], lineup: list[str] | None) -> None:
             )
 
 
+def enforce_native_entry(
+    digests: list[str] | None, mode: str, models: list[str]
+) -> None:
+    """The native promise, re-checked at the endpoint that spends money.
+
+    CREATION IS NOT THE ONLY DOOR, which is the whole reason this exists
+    beside enforce_native_mode rather than inside it. The group check
+    runs in POST /groups and enforce_group_experiment returns
+    immediately when group_id is None, so an UNGROUPED native member
+    reached the upstream call with no capability check at all: the
+    browser degrades to ungrouped runs when the group POST fails, which
+    is exactly the path a native refusal produces, so the refusal was
+    turning itself into the thing it refused. An image would then be
+    posted to a text-only model and the failure discovered by paying for
+    it, which is the one outcome the mode's design forbids.
+
+    Found by wiring the control up end to end in K4; the checks
+    themselves are K3's and are reused rather than restated, so the two
+    doors cannot come to disagree about what native mode promises.
+
+    Called at ENTRY in both compare endpoints, before the semaphore and
+    before any upstream call, so a refusal spends nothing.
+    """
+    if not digests or mode != "native":
+        return
+    enforce_native_mode(digests, models)
+
+
 def native_documents(digests: list[str]) -> list[dict[str, Any]]:
     """The declared images with their data URLs, in declared order.
 
@@ -2138,6 +2210,9 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         attachments=request.attachments,
         attachments_mode=request.attachments_mode,
     )
+    # The native promise, re-checked here because group creation is not
+    # the only door: see enforce_native_entry.
+    enforce_native_entry(request.attachments, request.attachments_mode, request.models)
     # COMPOSED ONCE, for the whole batch. Every member below sends this
     # same string, so identical composed content across models is a
     # property of the code rather than a promise about it. Rule one
@@ -2263,6 +2338,10 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         attachments=request.attachments,
         attachments_mode=request.attachments_mode,
     )
+    # The native promise, re-checked here because group creation is not
+    # the only door: see enforce_native_entry. One model per stream
+    # request, so the lineup this member is checked against is itself.
+    enforce_native_entry(request.attachments, request.attachments_mode, [request.model])
     # Composed at ENTRY, outside the generator, so a composition refusal
     # is a 422 with nothing written rather than an error raised after
     # the response has already begun. Same reasoning as the export's
@@ -2520,6 +2599,13 @@ async def group_detail(group_id: int) -> dict[str, Any]:
     group = store.get_group(app.state.db, group_id)
     if group is None:
         raise HTTPException(404, "no such group")
+    # Digests become names here rather than in the store, so the one
+    # place that joins a declaration to the attachments table is the
+    # boundary that serves it. One query for the whole list.
+    group["attachments"] = _attachment_refs(
+        group["attachments"],
+        store.attachments_for(app.state.db, group["attachments"] or []),
+    )
     return group
 
 
@@ -3558,6 +3644,39 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _attachment_refs(
+    digests: list[str] | None, rows: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """A declaration's digests as refs, IN DECLARATION ORDER.
+
+    The order is the declaration's and never the query's, the same rule
+    enforce_attachments_exist states: attachments_for returns a mapping
+    keyed by digest, and iterating it would show documents in whatever
+    order sqlite handed them back, which is not the order they were
+    composed into the prompt.
+
+    A digest with no row becomes a ref carrying only itself; see
+    AttachmentRef for why that is emitted rather than skipped.
+
+    None in, empty list out: a pre-K group declared nothing and has
+    nothing to show. The two NULLs stay distinguishable where they
+    decide something, which is entry enforcement, and collapse here
+    where the question is only what chips to draw.
+    """
+    if not digests:
+        return []
+    out = []
+    for digest in digests:
+        row = rows.get(digest)
+        if row is None:
+            out.append({"digest": digest})
+            continue
+        view = _attachment_view(row)
+        view.pop("created_at")
+        out.append(view)
+    return out
+
+
 @app.post("/attachments", response_model=Attachment, status_code=201)
 async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     """Store one document, extract its text, and hand back its digest.
@@ -3666,11 +3785,20 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # keeps the id lists list_runs binds comfortably under sqlite's
     # variable limit.
     runs = store.list_runs(app.state.db, limit)
+    # Every page's digests resolved in ONE query rather than one per
+    # entry, which is the same bound list_runs itself keeps. The union is
+    # deduplicated because one document attached to twenty comparisons is
+    # one row, and asking for it twenty times would undo the saving that
+    # storing it by digest bought.
+    wanted = {digest for run in runs for digest in (run.get("attachments") or [])}
+    rows = store.attachments_for(app.state.db, sorted(wanted))
     # Append a marker only when a cut happened, so API consumers can tell
     # a short prompt from a truncated one.
     for run in runs:
         if len(run["prompt_text"]) > 80:
             run["prompt_text"] = run["prompt_text"][:80] + "..."
+        if run["type"] == "group":
+            run["attachments"] = _attachment_refs(run["attachments"], rows)
     return {"runs": runs}
 
 
