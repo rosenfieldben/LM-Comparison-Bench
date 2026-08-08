@@ -4269,7 +4269,14 @@ def _export_lines(
     reason connect() turns WAL on.
     """
     db = app.state.db
-    out: list[dict[str, Any]] = [export_manifest(experiment, REPORT_SEED, thresholds)]
+    # Trials first, manifest prepended after, and the order of the OUTPUT
+    # is unchanged: the manifest is still line one. What changed is when
+    # it is BUILT, because attachments_referenced is a fact about the
+    # trials and a manifest computed before them would be describing a
+    # different read than the one it labels. Building it inside the
+    # snapshot below keeps the label and the lines it describes in the
+    # same window, which is the whole point of the snapshot.
+    out: list[dict[str, Any]] = []
     with store.read_snapshot(db):
         for group in store.experiment_groups(db, experiment_id):
             detail = store.get_group(db, group["id"])
@@ -4294,6 +4301,12 @@ def _export_lines(
                 out.append(
                     export_trial(group, run, result, score_rows.get(result["id"], []))
                 )
+        # Read from the emitted lines rather than from the groups, so the
+        # flag cannot claim a reference no trial line actually carries: a
+        # group with a declaration but no recorded result contributes no
+        # line, and an artifact is described by what is in it.
+        referenced = any(line.get("attachments") for line in out)
+        out.insert(0, export_manifest(experiment, REPORT_SEED, thresholds, referenced))
     return out
 
 

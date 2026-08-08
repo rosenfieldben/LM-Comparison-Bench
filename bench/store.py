@@ -1652,7 +1652,8 @@ def experiment_groups(
     """
     rows = conn.execute(
         """SELECT id, created_at, prompt_text, models_json, budget,
-                  task_id, repeat_index, rotation_index
+                  task_id, repeat_index, rotation_index,
+                  attachments_json, attachments_mode
            FROM groups WHERE experiment_id = ?
            ORDER BY task_id, repeat_index, id""",
         (experiment_id,),
@@ -1662,6 +1663,15 @@ def experiment_groups(
         item = dict(row)
         raw = item.pop("models_json")
         item["models"] = json.loads(raw) if isinstance(raw, str) else None
+        # The declared documents ride along, because the export's trial
+        # lines have to state them and this is the one query the export
+        # runs per experiment. Digests only: the bytes are never in an
+        # export, and the row's decoding follows group_attachments so a
+        # reader of either gets the same answer.
+        raw_docs = item.pop("attachments_json")
+        item["attachments"] = (
+            json.loads(raw_docs) if isinstance(raw_docs, str) else None
+        )
         out.append(item)
     return out
 

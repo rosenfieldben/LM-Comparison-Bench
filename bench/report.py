@@ -348,6 +348,37 @@ def min_ranks(scores: dict[str, float | None]) -> dict[str, int | None]:
     return out
 
 
+def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The distinct documents this experiment's cells declared.
+
+    DIGESTS AND A MODE, never a filename and never content. The filename
+    is what a person picked on their own machine and is not a property of
+    the bytes; two people attaching the same contract under two names
+    would produce one document here, which is correct, and a report that
+    named one of the two would be citing a fact about a filesystem.
+
+    First appearance wins the order, so a report over one dataset reads
+    the documents in the order its cells did rather than in whatever
+    order a set iterated. Byte-identical reports depend on it.
+
+    A document appearing under two modes is listed twice, once per mode,
+    because they are two different treatments of the same bytes and
+    collapsing them would report an experiment nobody ran. Reachable only
+    across cells, since one group holds one mode.
+    """
+    seen: set[tuple[str, str | None]] = set()
+    out: list[dict[str, Any]] = []
+    for group in groups:
+        mode = group.get("attachments_mode")
+        for digest in group.get("attachments") or []:
+            key = (digest, mode)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"digest": digest, "mode": mode})
+    return out
+
+
 def build_report(
     experiment: dict[str, Any],
     groups: list[dict[str, Any]],
@@ -529,6 +560,18 @@ def build_report(
         # its threshold, and a reader comparing two reports has to know
         # which one had the file.
         "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
+        # The documents these numbers were produced over, as provenance
+        # and not as content. Every model in a cell read the same
+        # documents, so this is a property of the experiment rather than
+        # of any arm, which is why it sits here and not on a model row.
+        #
+        # Empty on every experiment the runner produces today, because
+        # per-task attachments in datasets are deferred. Published anyway
+        # rather than omitted when empty, for thresholds_included's
+        # reason: a reader must be able to tell "no documents" from "this
+        # report predates the field", and an absent key cannot say the
+        # first.
+        "attachments": _report_attachments(groups),
         # The caveat, in the payload, as one sentence a page can print.
         # None when nothing was reconstructed, so a reader who sees the
         # key filled in knows it was earned rather than boilerplate.
@@ -1361,6 +1404,7 @@ def export_manifest(
     experiment: dict[str, Any],
     seed: int,
     thresholds: dict[str, Any] | None = None,
+    attachments_referenced: bool = False,
 ) -> dict[str, Any]:
     """Line one: what this artifact IS.
 
@@ -1378,6 +1422,14 @@ def export_manifest(
     different facts here, exactly as they are in build_report: the first
     means nobody supplied the file, the second means the file declared
     nothing.
+
+    attachments_referenced is the same kind of label one subject over:
+    the artifact saying what it does NOT embed. Document bytes are never
+    in an export, so a reader holding one whose trials cite digests needs
+    to be told that the file is incomplete BY DESIGN and where the rest
+    of it is. Without the flag they would have to read every trial line
+    to find out, and an artifact should be able to describe itself from
+    line one.
     """
     return {
         "thresholds": {} if thresholds is None else thresholds,
@@ -1386,6 +1438,17 @@ def export_manifest(
         # declared none from an export nobody handed the file to, and
         # those licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
+        # Whether any trial in this artifact cites a document. False says
+        # the file is complete on its own; true says the trials name
+        # digests whose bytes live in the bench.db that produced this
+        # export and nowhere else, so reproducing those prompts needs
+        # that database and not just this file.
+        #
+        # A BOOLEAN AND NOT A COUNT, matching thresholds_included above:
+        # the question a reader asks at line one is "is this
+        # self-contained", and the digests themselves are on the trial
+        # lines where they belong to a particular trial.
+        "attachments_referenced": attachments_referenced,
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         "experiment_id": experiment["id"],
@@ -1459,6 +1522,31 @@ def export_trial(
         "run_id": run["id"],
         "result_id": result["id"],
         "prompt_text": run["prompt_text"],
+        # THE DOCUMENTS THIS TRIAL RAN OVER, as digests and a mode, and
+        # never as content. Three separate reasons they are stated here
+        # rather than left inside request_json:
+        #
+        # The digests ARE recoverable from request_json, because rule
+        # two's placeholder names them, but recovering them means parsing
+        # a record format back into a data format. That is the same
+        # mistake reading controls off their badges would be, and an
+        # export exists precisely so a reader does not have to do it.
+        #
+        # An export that carried only the composed prompt would let a
+        # reader see WHAT the models read and not WHICH document it came
+        # from, so two exports over the same contract could not be
+        # recognized as such.
+        #
+        # And the mode decides what was measured: the same digest under
+        # inline and under native are different experiments, so a trial
+        # line that named the document without the mode would describe
+        # two possible runs.
+        #
+        # None on every group that declared none, which includes every
+        # experiment the runner produces today; see the manifest's
+        # attachments_referenced.
+        "attachments": group.get("attachments"),
+        "attachments_mode": group.get("attachments_mode"),
         "request_json": result.get("request_json"),
         "response_text": result.get("response_text"),
         "error": result.get("error"),

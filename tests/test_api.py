@@ -5950,7 +5950,7 @@ def test_a_report_for_a_missing_experiment_404s(client):
 
 import hashlib
 
-from bench.report import OUTCOMES, build_report
+from bench.report import OUTCOMES, _report_attachments, build_report
 
 
 @respx.mock
@@ -6036,6 +6036,12 @@ def rebuild_from_export(lines, tasks_by_id):
                     "task_id": trial["task_id"],
                     "repeat_index": trial["repeat_index"],
                     "rotation_index": trial["rotation_index"],
+                    # Rebuilt from the trial line, which is the whole
+                    # claim: the report's document provenance has to come
+                    # out of the artifact rather than out of a database
+                    # the reader does not have.
+                    "attachments": trial["attachments"],
+                    "attachments_mode": trial["attachments_mode"],
                 }
             )
             runs_by_group[gid] = []
@@ -8995,3 +9001,215 @@ def test_review_repro_the_blind_payload_carries_no_document_metadata(client):
     # edit could fill a filename into by accident.
     for card in payload["cards"]:
         assert set(card) == {"label", "result_id", "response_text", "error"}
+
+
+# ---- Phase K5: provenance, export, and the record.
+
+
+@respx.mock
+def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
+    client, tmp_path
+):
+    """WINDOW: one GET /experiments/{id}/export.jsonl over an experiment
+    whose cells declare a document, from the manifest line through every
+    trial line, and then the report rebuilt from those lines and nothing
+    else. No database is in reach of the rebuild, which is the point.
+
+    THE CLAIM: an export is self-sufficient about WHAT WAS READ, not just
+    about what was answered. Content is never in the artifact, so the
+    export cannot make the prompt reproducible on its own and does not
+    pretend to; what it must do is name the documents by digest, say
+    which mode they reached the models in, and label itself at line one
+    as an artifact that references bytes it does not carry.
+
+    HOW THE STATE IS BUILT, said plainly because it is not the runner's
+    doing: the experiment runner does not attach documents, since
+    per-task attachments in datasets are deliberately deferred. The
+    declaration is written onto the cells directly here. That is real
+    state in the real schema (create_group takes both an experiment and
+    attachments) and it is exactly the state the export must survive, so
+    the alternative is shipping an export path over a shape no test ever
+    hands it.
+    """
+    eid, path = two_axes_experiment(client, tmp_path)
+    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    # Every cell of this experiment read the same document, which is what
+    # a corpus-wide attachment would mean.
+    client.app.state.db.execute(
+        "UPDATE groups SET attachments_json = ?, attachments_mode = ?"
+        " WHERE experiment_id = ?",
+        (json.dumps([digest]), "inline", eid),
+    )
+    client.app.state.db.commit()
+
+    lines = export_lines(client, eid)
+
+    manifest = lines[0]
+    assert manifest["type"] == "manifest"
+    # Line one labels the artifact's own incompleteness, the way
+    # thresholds_included does one subject over.
+    assert manifest["attachments_referenced"] is True
+    trials = [line for line in lines if line["type"] == "trial"]
+    assert trials
+    for trial in trials:
+        assert trial["attachments"] == [digest]
+        assert trial["attachments_mode"] == "inline"
+
+    # NEVER CONTENT, in the whole artifact and not only in the fields
+    # that were checked above. The document's text is short and
+    # distinctive precisely so this scan can be exact.
+    whole = json.dumps(lines)
+    assert "the spec says forty two" not in whole
+    assert "content" not in manifest
+
+    # And the report's provenance comes back out of the artifact alone.
+    rebuilt = rebuild_from_export(lines, None)
+    assert rebuilt["attachments"] == [{"digest": digest, "mode": "inline"}]
+
+
+@respx.mock
+def test_an_export_over_no_documents_says_so_at_line_one(client, tmp_path):
+    """WINDOW: the manifest line of an export over an ordinary
+    experiment, which is every experiment the runner produces today.
+
+    The mirror, and the reason the flag is a flag rather than an omitted
+    key: a reader has to be able to tell "this artifact references no
+    documents" from "this artifact predates the field", and only a
+    present false says the first."""
+    eid, path = two_axes_experiment(client, tmp_path)
+
+    lines = export_lines(client, eid)
+
+    assert lines[0]["attachments_referenced"] is False
+    for trial in (line for line in lines if line["type"] == "trial"):
+        assert trial["attachments"] is None
+        assert trial["attachments_mode"] is None
+    assert rebuild_from_export(lines, None)["attachments"] == []
+
+
+@respx.mock
+def test_review_repro_a_cell_that_never_ran_does_not_claim_a_reference(
+    client, tmp_path
+):
+    """WINDOW: the manifest line for an experiment where the ONLY group
+    declaring a document recorded no result.
+
+    An artifact is described by what is in it. Computing the flag from
+    the group rows rather than from the emitted lines would label the
+    export as referencing a document that appears on no trial line in it,
+    which sends a reader looking through the file for a digest that is
+    not there."""
+    eid, path = two_axes_experiment(client, tmp_path)
+    digest = upload(client, "ghost.txt", b"declared but never run").json()["digest"]
+    # A cell of this experiment that declares the document and has no
+    # runs, which is what an interrupted experiment leaves behind.
+    store.create_group(
+        client.app.state.db,
+        "unrun prompt",
+        ["model/alpha"],
+        None,
+        "standard",
+        # experiment_id, not id: create_group reads place["experiment_id"],
+        # and passing the wrong key produced a group with a task id and no
+        # experiment, which is a group this export never looks at. The
+        # test then passed while proving nothing, and the mutation below
+        # is what found it.
+        experiment={
+            "experiment_id": eid,
+            "task_id": "zzz-never-ran",
+            "repeat_index": 0,
+            "rotation_index": 0,
+        },
+        attachments=[digest],
+        attachments_mode="inline",
+    )
+
+    lines = export_lines(client, eid)
+
+    assert lines[0]["attachments_referenced"] is False
+    assert all(line.get("attachments") is None for line in lines[1:])
+
+
+@respx.mock
+def test_the_manifest_stays_line_one_when_it_describes_the_trials(client, tmp_path):
+    """WINDOW: the byte order of the export stream, for an experiment
+    with a document.
+
+    attachments_referenced is a fact about the trials, so the manifest is
+    now BUILT after them. The order it is WRITTEN in must not have moved:
+    a reader streaming the file expects to know what it is holding before
+    the first trial, and the trailing digest covers the whole sequence."""
+    eid, path = two_axes_experiment(client, tmp_path)
+    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    client.app.state.db.execute(
+        "UPDATE groups SET attachments_json = ? WHERE experiment_id = ?",
+        (json.dumps([digest]), eid),
+    )
+    client.app.state.db.commit()
+
+    lines = export_lines(client, eid)
+
+    assert lines[0]["type"] == "manifest"
+    assert [line["type"] for line in lines[1:-1]] == ["trial"] * (len(lines) - 2)
+    assert lines[-1]["type"] == "digest"
+
+
+@respx.mock
+def test_two_exports_of_an_attached_experiment_stay_byte_identical(client, tmp_path):
+    """WINDOW: two full GET /export.jsonl calls with no write between
+    them, over an experiment carrying documents.
+
+    The determinism guarantee has to survive the new fields. The one that
+    could have broken it is the report's provenance list, which is built
+    by deduplicating across cells: a set would have iterated in an order
+    Python does not promise across the whole list, so first-appearance
+    order is imposed rather than inherited."""
+    eid, path = two_axes_experiment(client, tmp_path)
+    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    client.app.state.db.execute(
+        "UPDATE groups SET attachments_json = ?, attachments_mode = ?"
+        " WHERE experiment_id = ?",
+        (json.dumps([digest]), "inline", eid),
+    )
+    client.app.state.db.commit()
+
+    first = read_export(client, eid)
+    second = read_export(client, eid)
+
+    assert first == second
+
+
+def test_the_report_lists_one_document_under_each_mode_it_ran_in():
+    """WINDOW: _report_attachments over hand-built cells, which is the
+    only place two modes over one digest is reachable: a group holds one
+    mode, so it takes two cells to produce the case.
+
+    The same bytes read as extracted text and read as an image are two
+    different treatments, and a provenance list that collapsed them would
+    report an experiment nobody ran."""
+    cells = [
+        {"attachments": ["aaa"], "attachments_mode": "inline"},
+        {"attachments": ["aaa"], "attachments_mode": "native"},
+        # A repeat of the first, which must NOT produce a third entry.
+        {"attachments": ["aaa"], "attachments_mode": "inline"},
+    ]
+
+    assert _report_attachments(cells) == [
+        {"digest": "aaa", "mode": "inline"},
+        {"digest": "aaa", "mode": "native"},
+    ]
+
+
+def test_the_report_keeps_documents_in_first_appearance_order():
+    """WINDOW: the same function over cells whose digests do not sort in
+    declaration order. Byte-identical exports rest on this."""
+    cells = [
+        {"attachments": ["ccc", "aaa"], "attachments_mode": "inline"},
+        {"attachments": ["bbb"], "attachments_mode": "inline"},
+    ]
+
+    assert [entry["digest"] for entry in _report_attachments(cells)] == [
+        "ccc",
+        "aaa",
+        "bbb",
+    ]
