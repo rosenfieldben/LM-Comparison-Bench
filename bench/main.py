@@ -34,7 +34,14 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from bench import store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
-from bench.extract import ExtractionError, extract, suffix_of
+from bench.extract import (
+    CompositionError,
+    ExtractionError,
+    compose,
+    enforce_composed_size,
+    extract,
+    suffix_of,
+)
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
@@ -120,6 +127,14 @@ FORBID_UNKNOWN = ConfigDict(extra="forbid")
 # bounds what comes out of it, and the composed-prompt ceiling bounds
 # what reaches a provider. Three different questions, three bounds.
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
+# How many documents one comparison may carry. This is a side-by-side
+# comparison tool, not a corpus loader: attaching a folder is a question
+# about a dataset, and per-task attachments in datasets are a later
+# phase with their own shape. Four is past every real use of "compare
+# these models on this contract and its two appendices" and keeps the
+# composed prompt somewhere a person can still read.
+MAX_ATTACHMENTS = 4
 
 # The same limit expressed in base64 characters, which is what actually
 # arrives, and it is the one the request model enforces.
@@ -255,6 +270,15 @@ class CompareRequest(BaseModel):
     # README's scripting section. See ExperimentParams for why one shared
     # class is what guarantees that parity.
     params: ExperimentParams | None = None
+    # The documents this member carries, in the group's declared order.
+    # Checked against the group's declaration at entry rather than
+    # trusted: see _attachments_conflict. Sent by the member rather than
+    # read only from the group so a mismatch is detectable at all; a
+    # client that simply omitted them would otherwise be indistinguishable
+    # from one that agreed.
+    attachments: list[str] | None = Field(
+        default=None, min_length=1, max_length=MAX_ATTACHMENTS
+    )
 
 
 class ModelResult(BaseModel):
@@ -333,6 +357,15 @@ class StreamCompareRequest(BaseModel):
     # experiment per group check has something to check. The group's stored
     # copy, written before any upstream call, is the record.
     params: ExperimentParams | None = None
+    # The documents this member carries, in the group's declared order.
+    # Checked against the group's declaration at entry rather than
+    # trusted: see _attachments_conflict. Sent by the member rather than
+    # read only from the group so a mismatch is detectable at all; a
+    # client that simply omitted them would otherwise be indistinguishable
+    # from one that agreed.
+    attachments: list[str] | None = Field(
+        default=None, min_length=1, max_length=MAX_ATTACHMENTS
+    )
 
 
 class CompareResponse(BaseModel):
@@ -472,6 +505,20 @@ class GroupCreate(BaseModel):
     # budgets is not one experiment, so accepting a group that declines to
     # say would be creating the very hole this workstream closes.
     budget: Literal["standard", "extended"]
+    # The ordered digests of documents this comparison carries. Part of
+    # the manifest for the same reason the lineup is: it is what the
+    # comparison IS, fixed before any call, so a member arriving with a
+    # different set is refused against a declaration that already
+    # exists rather than against whatever the first member happened to
+    # send. Order is significant, since two documents composed the other
+    # way round are a different prompt.
+    #
+    # Bounded at a handful. This is a side-by-side comparison tool, not
+    # a corpus loader; per-task attachments in datasets are a later
+    # phase with its own shape.
+    attachments: list[str] | None = Field(
+        default=None, min_length=1, max_length=MAX_ATTACHMENTS
+    )
 
 
 class GroupCreated(BaseModel):
@@ -1623,6 +1670,86 @@ def _enforce_manifest(
         )
 
 
+def enforce_attachments_exist(digests: list[str]) -> list[dict[str, Any]]:
+    """The declared documents, in order, or a 422 naming what is missing.
+
+    Returns them rather than only checking, because every caller that
+    needs the check also needs the rows, and a check that handed back
+    nothing would make each caller fetch them again in a second query
+    that could see a different database.
+
+    ORDER IS THE DECLARATION'S, not the query's. attachments_for returns
+    a mapping precisely so the caller decides the sequence, and here the
+    sequence is what was declared: two documents composed the other way
+    round are a different prompt.
+    """
+    found = store.attachments_for(app.state.db, digests)
+    missing = [digest for digest in digests if digest not in found]
+    if missing:
+        raise HTTPException(
+            422,
+            f"no attachment is stored for {', '.join(d[:12] for d in missing)}. "
+            "Upload the file first; a comparison cannot declare a document "
+            "the bench does not hold.",
+        )
+    return [found[digest] for digest in digests]
+
+
+def enforce_composed(prompt: str, digests: list[str]) -> str:
+    """The composed user message, or a refusal with the arithmetic.
+
+    Composed ONCE here and handed to every member, which is what makes
+    the fairness law structural rather than promised: the members do not
+    each build their own copy of the prompt from the same inputs, they
+    send the same string.
+    """
+    documents = enforce_attachments_exist(digests)
+    composed = compose(prompt, documents, redacted=False)
+    try:
+        enforce_composed_size(composed)
+    except CompositionError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return composed
+
+
+def _attachments_conflict(
+    declared: list[str] | None, requested: list[str] | None
+) -> str | None:
+    """Why this member's attachments do not match the group's, or None.
+
+    H1.2's law extended to documents: the group declares what the
+    comparison is before any call, and a member that brings something
+    else is refused at entry rather than run. Without this a caller
+    could declare one contract and send another, and the record would
+    name the declaration while the money bought the substitution.
+
+    THE TWO NULLS DECIDE THE FIRST BRANCH, which is why the rule is
+    written here and pointed at from the migration. A pre-K group reads
+    None because it was created by a build with no attachment concept:
+    it cannot speak to attachments at all, so a member bringing one is
+    refused rather than waved through on the group's silence. That is
+    the same stricter reading the controls check takes over a NULL
+    params_json, and for the same reason: absence of a declaration is
+    not permission.
+    """
+    wanted = requested or []
+    if declared is None:
+        if wanted:
+            return (
+                "this comparison was created without attachments, so a "
+                "member cannot add one. Start a new comparison and declare "
+                "the document on it."
+            )
+        return None
+    if declared != wanted:
+        return (
+            f"attachments do not match this comparison's declaration "
+            f"({len(declared)} declared, {len(wanted)} sent); a group holds "
+            "one set of documents, in one order, across its runs"
+        )
+    return None
+
+
 def enforce_group_experiment(
     prompt: str,
     params: dict[str, Any],
@@ -1631,6 +1758,7 @@ def enforce_group_experiment(
     model: str | None = None,
     position: int | None = None,
     models: list[str] | None = None,
+    attachments: list[str] | None = None,
 ) -> None:
     """Reject a run whose group already holds a different experiment.
 
@@ -1677,6 +1805,14 @@ def enforce_group_experiment(
     _enforce_manifest(
         store.group_manifest(app.state.db, group_id), budget, model, position, models
     )
+    # Documents join the manifest check, at entry, before the semaphore
+    # and before any upstream call, so a mismatch spends nothing. See
+    # _attachments_conflict for what the two NULLs decide here.
+    mismatch = _attachments_conflict(
+        store.group_attachments(app.state.db, group_id), attachments
+    )
+    if mismatch is not None:
+        raise HTTPException(409, mismatch)
     conflicts = _control_conflicts(group_controls, params)
     if conflicts:
         named = ", ".join(conflicts)
@@ -1790,6 +1926,27 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         request.group_id,
         request.budget,
         models=request.models,
+        attachments=request.attachments,
+    )
+    # COMPOSED ONCE, for the whole batch. Every member below sends this
+    # same string, so identical composed content across models is a
+    # property of the code rather than a promise about it. Rule one
+    # holds when nothing is attached: compose returns the prompt
+    # unchanged and record_prompt stays None, so the payload is byte for
+    # byte what it was before this phase.
+    composed = (
+        enforce_composed(request.prompt, request.attachments)
+        if request.attachments
+        else request.prompt
+    )
+    recorded = (
+        compose(
+            request.prompt,
+            enforce_attachments_exist(request.attachments),
+            redacted=True,
+        )
+        if request.attachments
+        else None
     )
 
     async def limited(model: str) -> dict[str, Any]:
@@ -1832,12 +1989,13 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
             if spend_ceiling_reached():
                 return spend_refusal_result(model, budget)
             result = await run_model(
-                request.prompt,
+                composed,
                 model,
                 app.state.client,
                 max_tokens=budget,
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
+                record_prompt=recorded,
             )
             # Settle before the slot releases. This block is post-spend, so
             # it carries its own fault boundary: the upstream call has
@@ -1903,6 +2061,25 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         request.budget,
         model=request.model,
         position=request.position,
+        attachments=request.attachments,
+    )
+    # Composed at ENTRY, outside the generator, so a composition refusal
+    # is a 422 with nothing written rather than an error raised after
+    # the response has already begun. Same reasoning as the export's
+    # dataset check.
+    composed = (
+        enforce_composed(request.prompt, request.attachments)
+        if request.attachments
+        else request.prompt
+    )
+    recorded = (
+        compose(
+            request.prompt,
+            enforce_attachments_exist(request.attachments),
+            redacted=True,
+        )
+        if request.attachments
+        else None
     )
     max_tokens = effective_budget(request.budget, request.model)
 
@@ -1985,13 +2162,14 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             start = time.perf_counter()
             yield "data: " + json.dumps({"type": "started"}) + "\n\n"
             async for event in stream_model(
-                request.prompt,
+                composed,
                 request.model,
                 app.state.client,
                 max_tokens=max_tokens,
                 holder=holder,
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
+                record_prompt=recorded,
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -2108,6 +2286,18 @@ def ensure_rowid(value: int) -> None:
 # force hostile cross-site senders into a CORS preflight.
 @app.post("/groups", response_model=GroupCreated, status_code=201)
 async def create_group(body: GroupCreate) -> dict[str, Any]:
+    # Declared digests must already be stored, checked HERE so the
+    # manifest cannot name a document that does not exist. A group whose
+    # declaration pointed at nothing would pass entry enforcement (the
+    # member's list would match the group's) and then compose a prompt
+    # with a document missing from it, which is the failure this whole
+    # layer exists to make impossible.
+    if body.attachments:
+        enforce_attachments_exist(body.attachments)
+        # Composed once at declaration, against the longest prompt this
+        # group can hold, so the ceiling is a refusal at creation rather
+        # than a surprise on the first paid member.
+        enforce_composed(body.prompt or "", body.attachments)
     return {
         "id": store.create_group(
             app.state.db,
@@ -2115,6 +2305,7 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             body.models,
             request_controls(body.params) or None,
             body.budget,
+            attachments=body.attachments,
         )
     }
 

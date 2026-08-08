@@ -12,6 +12,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from bench import main
+from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import OPENROUTER_URL, provider_preferences
 
@@ -7914,6 +7915,382 @@ def test_unknown_fields_are_refused_on_the_upload_body(client):
             "filename": "notes.txt",
             "content_base64": b64(b"hi"),
             "mime": "text/plain",
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+# ---- Phase K2: composition, fairness, and the manifest.
+
+
+def attached_group(client, prompt, content=b"the contract says forty two", models=None):
+    """A comparison declaring one document, ready to run.
+
+    Returns the group id and the digest, because every case below needs
+    both: the digest to send with a member, the group to check what was
+    declared.
+    """
+    digest = upload(client, "contract.txt", content).json()["digest"]
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": prompt,
+            "models": models or ["model/alpha", "model/beta"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    ).json()["id"]
+    return group_id, digest
+
+
+@respx.mock
+def test_review_repro_every_model_receives_byte_identical_composed_content(client):
+    """THE FAIRNESS LAW, proven on the wire rather than in the composer.
+
+    Identical content to every model is the whole basis on which a
+    comparison means anything. compose() takes no model argument, so
+    nothing IN it can vary by model; what this asserts is the property
+    one level out, that the composition happens ONCE for the batch and
+    every member sends that same string, rather than each member
+    building its own copy from the same inputs.
+
+    The difference matters because the second arrangement is what an
+    ordinary refactor produces, and it passes every unit test of the
+    composer while being one careless per-model branch away from
+    sending three different prompts to three models and calling the
+    result a comparison.
+    """
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(
+            200, json=response_for(payload["model"], "reply from " + payload["model"])
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    lineup = ["model/alpha", "model/beta", "model/gamma"]
+    group_id, digest = attached_group(client, "summarize the attachment", models=lineup)
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "summarize the attachment",
+            "models": lineup,
+            "group_id": group_id,
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(sent) == 3
+    # BYTE-IDENTICAL, asserted as one distinct value rather than as
+    # pairwise equality, so a third model drifting cannot hide behind a
+    # comparison of the first two.
+    contents = {json.dumps(payload["messages"], sort_keys=True) for payload in sent}
+    assert len(contents) == 1, contents
+    # And what they all received actually carries the document.
+    composed = sent[0]["messages"][-1]["content"]
+    assert "the contract says forty two" in composed
+    assert "----- attachment 1 of 1: contract.txt -----" in composed
+    # The models differ, so the payloads are not identical for the
+    # trivial reason that nothing varied at all.
+    assert {payload["model"] for payload in sent} == {
+        "model/alpha",
+        "model/beta",
+        "model/gamma",
+    }
+
+
+@respx.mock
+def test_review_repro_the_record_carries_a_digest_where_the_content_was(client):
+    """Rule two for a document too large to inline. The wire carries the
+    text; the record carries a reference to it plus the composition,
+    which together reconstruct the wire exactly.
+
+    Asserted on both sides at once, because either alone is satisfiable
+    by a mistake: a record with no content could be a record of a
+    request that never had any.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, json=response_for("model/alpha", "ok")),
+        )[1]
+    )
+    secret = b"the merger closes on tuesday"
+    group_id, digest = attached_group(
+        client, "summarize", content=secret, models=["model/alpha"]
+    )
+
+    client.post(
+        "/compare",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    # The wire had the document.
+    assert "merger closes on tuesday" in sent[0]["messages"][-1]["content"]
+    # The record has a reference to it and not the text.
+    row = client.app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    recorded = row["request_json"]
+    assert "merger closes on tuesday" not in recorded
+    assert f"sha256 {digest}" in recorded
+    # And the reference is enough to put the wire bytes back: the stored
+    # text, composed by the stated composition, IS what was sent.
+    stored = store.get_attachment(client.app.state.db, digest)
+    assert stored is not None
+    rebuilt = compose(
+        "summarize",
+        [
+            {
+                "filename": stored["filename"],
+                "digest": digest,
+                "extracted_text": stored["extracted_text"],
+            }
+        ],
+        redacted=False,
+    )
+    assert rebuilt == sent[0]["messages"][-1]["content"]
+
+
+@respx.mock
+def test_review_repro_an_undeclared_attachment_never_reaches_upstream(client):
+    """H1.2's law extended to documents, and the reviewer's shape: a
+    member that brings a document the comparison never declared is
+    refused AT ENTRY, before the semaphore and before any call.
+
+    Without this a caller could declare one contract and send another.
+    The record would name the declaration and the money would have
+    bought the substitution, which is the exact failure the manifest
+    exists to prevent one field over.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for("model/alpha", "should never happen")
+        )
+    )
+    # A group declaring document A.
+    group_id, declared = attached_group(
+        client, "summarize", content=b"document A", models=["model/alpha"]
+    )
+    # A different document, uploaded but never declared on this group.
+    other = upload(client, "other.txt", b"document B").json()["digest"]
+    assert other != declared
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "budget": "standard",
+            "attachments": [other],
+        },
+    )
+
+    assert resp.status_code == 409
+    assert "do not match this comparison's declaration" in resp.json()["detail"]
+    # NOTHING REACHED UPSTREAM, which is the half a status code cannot
+    # show: the refusal is pre-spend, so no call was made at all.
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_a_member_that_omits_the_declared_attachment_is_refused(client):
+    """The other direction, and the reason members send the list at all.
+    A client that simply omitted it would otherwise be indistinguishable
+    from one that agreed, and would run a comparison against a prompt
+    missing the document the record says it had."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, json=response_for("m", "hi"))
+    )
+    group_id, _digest = attached_group(client, "summarize", models=["model/alpha"])
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "budget": "standard",
+        },
+    )
+
+    assert resp.status_code == 409
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_review_repro_a_pre_k_group_refuses_a_member_bringing_a_document(client):
+    """THE TWO NULLS, at the check site. A pre-K group reads None
+    because it was created by a build with no attachment concept: it
+    cannot speak to attachments at all.
+
+    Read as permission, that silence would let a document be added to a
+    comparison whose record says it has none, which is the stricter
+    reading the controls check already takes over a NULL params_json.
+    """
+    digest = upload(client, "late.txt", b"added later").json()["digest"]
+    group_id = client.post(
+        "/groups",
+        json={"prompt": "hi", "models": ["model/alpha"], "budget": "standard"},
+    ).json()["id"]
+    # The group row genuinely predates attachments in the only sense the
+    # column can express.
+    assert store.group_attachments(client.app.state.db, group_id) is None
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 409
+    assert "created without attachments" in resp.json()["detail"]
+    assert respx.calls.call_count == 0
+
+
+def test_a_group_cannot_declare_a_document_the_bench_does_not_hold(client):
+    """A declaration pointing at nothing would pass entry enforcement,
+    since the member's list would match the group's, and then compose a
+    prompt with the document missing from it."""
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": ["ab" * 32],
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "no attachment is stored for" in resp.json()["detail"]
+
+
+def test_review_repro_an_oversized_composition_is_refused_at_declaration(client):
+    """The composed ceiling, refused where it costs nothing: at group
+    creation, before the first paid member rather than on it.
+
+    Refused rather than truncated. Providers would each cut at their own
+    limit, so two models would answer different questions and nothing in
+    either response would say so."""
+    big = b"x" * (MAX_COMPOSED_CHARS - 100)
+    digest = upload(client, "long.txt", big).json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "x" * 500,
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert str(MAX_COMPOSED_CHARS) in detail
+    assert "not one comparison" in detail
+
+
+@respx.mock
+def test_review_repro_a_comparison_with_no_attachment_sends_the_old_payload(client):
+    """RULE ONE, end to end. With nothing attached the payload is byte
+    for byte what it was before this phase: no wrapper, no preamble, and
+    request_json recorded from the sent payload rather than rebuilt.
+
+    A feature that changed every existing payload the day it shipped
+    would make every comparison run before it incomparable with every
+    one after, which is a silent break of the only thing this tool does.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, json=response_for("model/alpha", "ok")),
+        )[1]
+    )
+
+    client.post(
+        "/compare",
+        json={
+            "prompt": "plain question",
+            "models": ["model/alpha"],
+            "budget": "standard",
+        },
+    )
+
+    assert sent[0]["messages"] == [{"role": "user", "content": "plain question"}]
+    row = client.app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["request_json"])["messages"] == [
+        {"role": "user", "content": "plain question"}
+    ]
+
+
+@respx.mock
+def test_the_streaming_path_composes_the_same_content(client):
+    """Both paths, because the browser streams and /compare is the
+    scripting path: a fairness law that held on one of them would hold
+    where nobody runs comparisons."""
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    group_id, digest = attached_group(client, "summarize")
+
+    for model in ("model/alpha", "model/beta"):
+        stream_events(
+            client,
+            {
+                "prompt": "summarize",
+                "model": model,
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+            },
+        )
+
+    assert len(sent) == 2
+    assert len({json.dumps(p["messages"], sort_keys=True) for p in sent}) == 1
+    assert "the contract says forty two" in sent[0]["messages"][-1]["content"]
+
+
+def test_more_attachments_than_the_cap_are_refused_at_the_boundary(client):
+    digests = [
+        upload(client, f"doc{i}.txt", f"body {i}".encode()).json()["digest"]
+        for i in range(main.MAX_ATTACHMENTS + 1)
+    ]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "hi",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": digests,
         },
     )
 
