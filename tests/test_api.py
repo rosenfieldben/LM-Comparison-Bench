@@ -7691,3 +7691,230 @@ def test_a_twenty_seven_answer_comparison_gets_letters_for_every_card(client):
     assert len(labels) == 27
     assert labels[-1] == "Z" and "AA" in labels
     assert all(label.isalpha() for label in labels)
+
+
+# ---- Phase K1: attachment storage and the upload boundary.
+
+
+def b64(content: bytes) -> str:
+    import base64 as _base64
+
+    return _base64.b64encode(content).decode("ascii")
+
+
+def upload(client, filename, content):
+    return client.post(
+        "/attachments",
+        json={"filename": filename, "content_base64": b64(content)},
+    )
+
+
+def test_an_uploaded_document_is_stored_with_its_extraction_and_provenance(client):
+    """The upload's whole job: keep the bytes once, keep what was read
+    out of them, and keep which parser did the reading.
+
+    The extractor and its version are on the row because a pypdf upgrade
+    changes the text a model reads. A record that could not say which
+    parser produced the prompt would be a record of a comparison nobody
+    can reconstruct.
+    """
+    resp = upload(client, "notes.txt", b"the contract says forty two")
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["filename"] == "notes.txt"
+    assert body["mime"] == "text/plain"
+    assert body["byte_size"] == 27
+    assert body["extracted_chars"] == 27
+    assert body["extractor"] == "text"
+    assert body["extractor_version"] == "1"
+    # The digest is sha256 over the bytes, computed by the server. A
+    # client that could name it could make a record cite content it
+    # never uploaded.
+    assert body["digest"] == hashlib.sha256(b"the contract says forty two").hexdigest()
+
+
+def test_review_repro_re_uploading_identical_bytes_returns_the_existing_row(client):
+    """Stored once by content digest, so attaching one contract to ten
+    comparisons costs one copy of it.
+
+    The second upload names the file differently and gets the FIRST
+    name back, which is the visible consequence of keying by content:
+    the row is already cited by whatever referenced it, and rewriting
+    its label would rewrite history under a citation.
+    """
+    first = upload(client, "contract.pdf.txt", b"identical bytes")
+    second = upload(client, "renamed.txt", b"identical bytes")
+
+    assert first.status_code == second.status_code == 201
+    assert first.json()["digest"] == second.json()["digest"]
+    # One row, not two.
+    rows = client.app.state.db.execute("SELECT count(*) c FROM attachments").fetchone()
+    assert rows["c"] == 1
+    # And the response says which name those bytes are stored under, so
+    # a caller can see it sent content the bench already had.
+    assert second.json()["filename"] == "contract.pdf.txt"
+
+
+def test_review_repro_an_oversized_upload_is_refused_with_both_numbers(client):
+    """The arithmetic shown. A bare "too large" leaves the person
+    guessing whether they are over by a byte or by a factor of ten, and
+    this is a refusal they meet while holding a file they chose."""
+    oversized = b"x" * (main.MAX_ATTACHMENT_BYTES + 1)
+
+    resp = upload(client, "huge.txt", oversized)
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert str(main.MAX_ATTACHMENT_BYTES + 1) in detail
+    assert str(main.MAX_ATTACHMENT_BYTES) in detail
+    assert "8 MiB" in detail
+    assert (
+        client.app.state.db.execute("SELECT count(*) c FROM attachments").fetchone()[
+            "c"
+        ]
+        == 0
+    )
+
+
+def test_the_base64_bound_admits_a_legal_file_at_the_byte_limit(client):
+    """THE EXPANSION, accounted. base64 is 4 characters per 3 bytes, so
+    a body bounded at the decoded limit would refuse the last quarter of
+    every legal file before it was ever decoded.
+
+    A file exactly at the byte limit must therefore pass the string
+    bound, and this asserts the two bounds agree rather than that either
+    is a particular number.
+    """
+    at_limit = b"x" * main.MAX_ATTACHMENT_BYTES
+    encoded = b64(at_limit)
+
+    assert len(encoded) > main.MAX_ATTACHMENT_BYTES
+    assert len(encoded) <= main.MAX_ATTACHMENT_B64_CHARS
+
+
+def test_a_body_past_the_base64_bound_is_refused_before_it_is_decoded(client):
+    """The string bound is what keeps an absurd body out BEFORE the
+    allocation it exists to prevent. Pydantic refuses at the boundary,
+    so the 422 comes from the field rather than from the handler."""
+    resp = client.post(
+        "/attachments",
+        json={
+            "filename": "huge.txt",
+            "content_base64": "A" * (main.MAX_ATTACHMENT_B64_CHARS + 1),
+        },
+    )
+
+    assert resp.status_code == 422
+
+
+def test_content_that_is_not_base64_is_refused_rather_than_silently_dropped(client):
+    """validate=True, deliberately. base64 decoding discards characters
+    outside the alphabet by default, so a corrupted upload would decode
+    to different bytes than the sender holds and store a digest neither
+    of them can reproduce."""
+    resp = client.post(
+        "/attachments",
+        json={"filename": "notes.txt", "content_base64": "not base64 !!!"},
+    )
+
+    assert resp.status_code == 422
+    assert "not valid base64" in resp.json()["detail"]
+
+
+def test_review_repro_a_file_that_cannot_be_read_is_refused_at_upload(client):
+    """PRE-ATTACH AND PRE-SPEND, which is the whole reason extraction
+    runs here rather than at composition.
+
+    A document that cannot be read is a comparison that would run, cost
+    money, and ask every model about a prompt containing nothing from
+    the file. The dataset loader makes the same argument for reading the
+    whole file at creation rather than discovering it at trial 300.
+    """
+    resp = upload(client, "sheet.xlsx", b"anything at all")
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert ".xlsx file" in detail
+    assert ".docx" in detail
+    # Nothing was stored, so nothing can be attached to a comparison.
+    assert (
+        client.app.state.db.execute("SELECT count(*) c FROM attachments").fetchone()[
+            "c"
+        ]
+        == 0
+    )
+
+
+def test_an_empty_upload_is_refused(client):
+    resp = client.post(
+        "/attachments", json={"filename": "empty.txt", "content_base64": b64(b"")}
+    )
+
+    # An empty string fails the field's min_length before the handler.
+    assert resp.status_code == 422
+
+
+def test_review_repro_no_attachment_response_ever_carries_the_content(client):
+    """The privacy posture, asserted rather than intended. The bytes
+    live in the database and stay there: the extracted text is what
+    reaches a model, the digest is what a record cites, and an endpoint
+    serving the original back would give the document a second place to
+    live and break the README's claim that deleting bench.db deletes
+    everything.
+    """
+    secret = b"the merger closes on tuesday"
+    digest = upload(client, "secret.txt", secret).json()["digest"]
+
+    created = upload(client, "secret.txt", secret)
+    fetched = client.get(f"/attachments/{digest}")
+
+    assert fetched.status_code == 200
+    for body in (created.text, fetched.text):
+        assert "merger closes" not in body
+        assert b64(secret) not in body
+    # Metadata is there; content, in any spelling, is not.
+    assert fetched.json()["digest"] == digest
+    assert set(fetched.json()) == {
+        "digest",
+        "filename",
+        "mime",
+        "byte_size",
+        "extracted_chars",
+        "extractor",
+        "extractor_version",
+        "created_at",
+    }
+
+
+def test_an_unknown_digest_is_404(client):
+    assert client.get("/attachments/" + "0" * 64).status_code == 404
+
+
+def test_the_upload_endpoint_refuses_a_cross_site_simple_post(client):
+    """The JSON-only invariant at the new endpoint. A multipart or
+    text/plain POST is a CORS "simple" request a hostile page can fire
+    at localhost with no preflight; requiring JSON forces a preflight
+    this server never answers. That invariant is why the upload takes
+    base64 in a JSON body rather than a multipart form, and it has to
+    hold at the endpoint that most invites multipart."""
+    resp = client.post(
+        "/attachments",
+        content=b"--x\r\nContent-Disposition: form-data; name=f\r\n\r\nhi\r\n--x--",
+        headers={"Content-Type": "multipart/form-data; boundary=x"},
+    )
+
+    assert resp.status_code == 415
+
+
+def test_unknown_fields_are_refused_on_the_upload_body(client):
+    resp = client.post(
+        "/attachments",
+        json={
+            "filename": "notes.txt",
+            "content_base64": b64(b"hi"),
+            "mime": "text/plain",
+        },
+    )
+
+    assert resp.status_code == 422

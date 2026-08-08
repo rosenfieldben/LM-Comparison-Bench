@@ -1819,3 +1819,235 @@ def test_an_exception_inside_the_snapshot_propagates_unchanged(db):
     with pytest.raises(ValueError, match="the real problem"):
         with store.read_snapshot(db):
             raise ValueError("the real problem")
+
+
+# ---- Phase K: one column and one table, proven against the era they land on.
+
+
+PRE_K_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_k_schema.sql").read_text()
+
+
+def test_the_pre_k_fixture_is_the_schema_as_it_stood_at_v0_1_0():
+    """The fixture's provenance, checkable rather than asserted in prose.
+
+    A hand-transcribed era snapshot is a snapshot of what somebody
+    believed the schema was, and the migration test built on it would
+    then prove something about that belief. This one was extracted, and
+    the extraction is repeatable:
+
+        git show v0.1.0:bench/store.py > /tmp/store_at_tag.py
+        python -c "ns={}; exec(open('/tmp/store_at_tag.py').read(), ns);
+                   open('tests/fixtures/pre_k_schema.sql','w')
+                       .write(ns['SCHEMA'].lstrip('\\n'))"
+
+    What this asserts is the part a reader cannot re-run from the test:
+    that the fixture is a strict PREFIX of today's schema in the tables
+    it shares, and that it lacks exactly what Phase K adds. If someone
+    edits the fixture to make a migration test pass, this fails first.
+    """
+    # It is the pre-K era: no attachments table, no attachments column.
+    assert "attachments" not in PRE_K_SCHEMA
+    # And it is a real schema of this database, not a sketch: every
+    # table Phase K does not touch is present exactly as SCHEMA has it.
+    for table in ("prompts", "experiments", "scores", "groups", "runs", "results"):
+        assert f"CREATE TABLE IF NOT EXISTS {table} (" in PRE_K_SCHEMA
+    # The one table Phase K adds is in today's schema and not the
+    # fixture's, which is the difference the migration test rests on.
+    assert "CREATE TABLE IF NOT EXISTS attachments (" in store.SCHEMA
+
+
+def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
+    """The additive-only invariant, proven against the RIGHT era.
+
+    pre_i2_schema.sql predates Phase K by two phases, so it cannot say
+    anything about a column landing on top of I.2 and the guard rider. A
+    database that already has upstream_inference_cost_usd is the one a K
+    migration actually meets, and it is the only one whose ALTER is the
+    one under test. This fixture is the SCHEMA string exactly as it
+    stood at v0.1.0, extracted rather than transcribed.
+
+    Two changes, both additive. groups.attachments_json arrives by ALTER
+    and is NULL on every legacy row, which is the affirmative fact that
+    the group predates attachments entirely: it declared nothing and
+    could not have. The attachments table arrives by CREATE TABLE IF NOT
+    EXISTS, which is additive by construction on any database, new or
+    old, and is why it needs no MIGRATIONS entry.
+    """
+    db_path = tmp_path / "pre_k.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget)
+           VALUES (1, '2026-05-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', '{"seed": 7}', 'standard')"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at,
+                             app_sha, catalog_snapshot_at, data_policy,
+                             catalog_digest)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-05-01T00:00:00+00:00',
+                   'abc1234', '2026-05-01T00:00:00+00:00', 'standard', 'dd')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position, billed_cost_usd, provider,
+                                upstream_inference_cost_usd)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0, 3.1e-05, 'Together', '0.004')"""
+    )
+    legacy.commit()
+    # The pre-state, asserted rather than assumed. Without this the test
+    # could pass against a fixture that already had the column, which
+    # would prove nothing at all about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(groups)")]
+    assert "attachments_json" not in before
+    tables_before = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "attachments" not in tables_before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(groups)")]
+        assert "attachments_json" in columns
+        tables = {
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "attachments" in tables
+
+        # THE TWO NULLS, read through the real reader. None means the
+        # group predates attachments, which is a different fact from an
+        # empty list, and group_attachments is the check site that keeps
+        # them apart.
+        assert store.group_attachments(conn, 1) is None
+
+        # Nothing else about the legacy row moved.
+        assert store.group_prompt(conn, 1) == "legacy prompt"
+        assert store.group_params(conn, 1) == {"seed": 7}
+        run = store.get_run(conn, 1)
+        assert run is not None
+        result = run["results"][0]
+        assert result["response_text"] == "legacy text"
+        assert result["billed_cost_usd"] == 3.1e-05
+        assert result["upstream_inference_cost_usd"] == "0.004"
+
+        # And the new table works on a database that never had it.
+        stored = store.save_attachment(
+            conn,
+            {
+                "digest": "ab" * 32,
+                "filename": "notes.txt",
+                "mime": "text/plain",
+                "byte_size": 2,
+                "content": b"hi",
+                "extracted_text": "hi",
+                "extractor": "text",
+                "extractor_version": "1",
+            },
+        )
+        assert stored["digest"] == "ab" * 32
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        # A second connect adds nothing and breaks nothing.
+        names = [r["name"] for r in again.execute("PRAGMA table_info(groups)")]
+        assert names.count("attachments_json") == 1, names
+        assert again.execute("SELECT count(*) c FROM attachments").fetchone()["c"] == 1
+        assert store.group_attachments(again, 1) is None
+        second = store.get_run(again, 1)
+        assert second is not None
+        assert second["results"][0]["response_text"] == "legacy text"
+    finally:
+        again.close()
+
+
+def test_a_post_k_group_that_declared_nothing_is_not_a_pre_k_group(db):
+    """THE TWO NULLS, from the other side, and the reason nothing writes
+    "[]".
+
+    An empty declaration and a pre-K group both read as None, and they
+    have to, because the column cannot tell them apart: absence gets one
+    spelling, exactly as an empty params mapping stores NULL. What keeps
+    the distinction honest is that a post-K group with no attachment has
+    nothing to enforce either way, so the two collapse to the same
+    behavior rather than to a guess.
+    """
+    empty = store.create_group(db, "hi", ["m/a"], attachments=[])
+    declared = store.create_group(db, "hi", ["m/a"], attachments=["ab" * 32])
+
+    assert store.group_attachments(db, empty) is None
+    assert store.group_attachments(db, declared) == ["ab" * 32]
+    # Stored as NULL rather than "[]", so absence has one spelling.
+    raw = db.execute(
+        "SELECT attachments_json FROM groups WHERE id = ?", (empty,)
+    ).fetchone()
+    assert raw["attachments_json"] is None
+
+
+def test_the_declared_order_is_preserved_rather_than_sorted(db):
+    """Two documents composed in the other order are a different prompt,
+    so the list is a sequence and not a set. Sorting it here would make
+    the manifest describe a comparison nobody declared."""
+    digests = ["cc" * 32, "aa" * 32, "bb" * 32]
+
+    group_id = store.create_group(db, "hi", ["m/a"], attachments=digests)
+
+    assert store.group_attachments(db, group_id) == digests
+
+
+def test_attachments_for_returns_a_mapping_and_omits_what_is_missing(db):
+    """One query rather than N, and a digest with no row is simply
+    absent: the caller's cue to refuse rather than this function's cue
+    to guess."""
+    store.save_attachment(
+        db,
+        {
+            "digest": "aa" * 32,
+            "filename": "one.txt",
+            "mime": "text/plain",
+            "byte_size": 3,
+            "content": b"one",
+            "extracted_text": "one",
+            "extractor": "text",
+            "extractor_version": "1",
+        },
+    )
+
+    found = store.attachments_for(db, ["aa" * 32, "bb" * 32])
+
+    assert set(found) == {"aa" * 32}
+    assert found["aa" * 32]["filename"] == "one.txt"
+    assert store.attachments_for(db, []) == {}
+
+
+def test_no_attachment_reader_selects_the_content_blob(db):
+    """The bytes never leave this module. Asserted on the shape the
+    readers actually return, because a column list is exactly the kind
+    of thing a later edit extends without noticing what it means."""
+    store.save_attachment(
+        db,
+        {
+            "digest": "aa" * 32,
+            "filename": "one.txt",
+            "mime": "text/plain",
+            "byte_size": 6,
+            "content": b"secret",
+            "extracted_text": "secret",
+            "extractor": "text",
+            "extractor_version": "1",
+        },
+    )
+
+    row = store.get_attachment(db, "aa" * 32)
+
+    assert row is not None
+    assert "content" not in row
+    assert "content" not in store.ATTACHMENT_COLUMNS
+    assert "content" not in store.attachments_for(db, ["aa" * 32])["aa" * 32]

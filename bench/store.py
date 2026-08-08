@@ -122,6 +122,18 @@ CREATE TABLE IF NOT EXISTS runs (
     data_policy TEXT,
     catalog_digest TEXT
 );
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY,
+    digest TEXT UNIQUE NOT NULL,
+    filename TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    extracted_text TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -265,6 +277,24 @@ MIGRATIONS = [
     ("groups", "task_id", "TEXT"),
     ("groups", "repeat_index", "INTEGER"),
     ("groups", "rotation_index", "INTEGER"),
+    # Phase K, attachments. One column, nullable and additive; the
+    # attachments table itself needs no entry here for the same reason
+    # the Phase I tables did not, since CREATE TABLE IF NOT EXISTS in
+    # SCHEMA creates it on any database, new or old.
+    #
+    # An ordered JSON array of content digests, and ORDER is part of the
+    # declaration rather than incidental: two documents composed in the
+    # other order are a different prompt, so the list is the manifest's
+    # record of which documents in which sequence.
+    #
+    # THE TWO NULLS, and this column has both, which is why the rule is
+    # written at the check site rather than only here. NULL means the
+    # pre-K era: the group was created by a build that had no attachment
+    # concept, so it declared nothing and could not have. An empty array
+    # would mean a post-K group that declared no attachment, which is a
+    # different fact. Nothing writes "[]" for the same reason params_json
+    # never stores "{}": absence gets exactly one spelling.
+    ("groups", "attachments_json", "TEXT"),
 ]
 
 
@@ -492,6 +522,7 @@ def create_group(
     params: dict[str, Any] | None = None,
     budget: str | None = None,
     experiment: dict[str, Any] | None = None,
+    attachments: list[str] | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -518,14 +549,26 @@ def create_group(
     four are meaningless apart: a task id without a repeat index does not
     identify a cell, and letting them be passed separately would let a
     caller record half a placement.
+
+    attachments is the ordered digest list, and it joins the manifest for
+    the same reason the lineup did: it is part of what the comparison IS,
+    fixed before any call, so a member arriving with a different set can
+    be refused against a declaration that already exists. NOT sorted, and
+    not deduplicated: two documents composed in the other order are a
+    different prompt, so the order given is the order recorded.
+
+    An empty list stores NULL, exactly as an empty params mapping does,
+    because absence gets one spelling. The reader's two NULLs then stay
+    honest: see group_attachments.
     """
     place = experiment or {}
     with conn:
         cur = conn.execute(
             "INSERT INTO groups"
             " (created_at, prompt_text, models_json, params_json, budget,"
-            "  experiment_id, task_id, repeat_index, rotation_index)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  experiment_id, task_id, repeat_index, rotation_index,"
+            "  attachments_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
@@ -536,12 +579,146 @@ def create_group(
                 place.get("task_id"),
                 place.get("repeat_index"),
                 place.get("rotation_index"),
+                json.dumps(attachments) if attachments else None,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
     # single-row INSERT; assert so the int return stays honest.
     assert cur.lastrowid is not None
     return cur.lastrowid
+
+
+# ---- Phase K: attachments, stored once by content digest.
+
+
+# Everything about an attachment except the bytes. Named once so the
+# three readers cannot drift into serving different shapes, and so the
+# omission of `content` is a decision recorded in one place rather than
+# a column list somebody has to remember not to extend. Nothing outside
+# this module reads the BLOB: composition asks for the extracted text,
+# and no endpoint serves the bytes back at all.
+ATTACHMENT_COLUMNS = (
+    "digest",
+    "filename",
+    "mime",
+    "byte_size",
+    "extracted_text",
+    "extractor",
+    "extractor_version",
+    "created_at",
+)
+
+
+def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[str, Any]:
+    """Store one attachment, or return the row that already holds it.
+
+    DEDUPE BY CONTENT DIGEST, which is what makes attaching the same
+    document to ten comparisons cost one copy. The digest is computed
+    from the bytes by the caller at the boundary, never supplied by a
+    client, so two uploads of identical content collapse whatever they
+    were named.
+
+    THE EARLIER FILENAME WINS on a collision, and that is deliberate
+    rather than incidental. The row is keyed by content, so the name is
+    already only one of the names those bytes have had; overwriting it
+    would rewrite the label on every comparison that already cites this
+    digest, which is history changing under a citation. The upload
+    response carries the stored name, so a caller that uploaded
+    `contract-v2.pdf` and got back `contract.pdf` can see that it sent
+    bytes the bench already had.
+
+    INSERT OR IGNORE rather than a read-then-write, because the read and
+    the write would be two statements with a gap between them, and the
+    UNIQUE index is the thing that actually enforces this. The follow-up
+    SELECT is inside the same transaction, so it sees the row whichever
+    of the two paths created it.
+    """
+    with conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO attachments
+               (digest, filename, mime, byte_size, content, extracted_text,
+                extractor, extractor_version, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["digest"],
+                record["filename"],
+                record["mime"],
+                record["byte_size"],
+                record["content"],
+                record["extracted_text"],
+                record["extractor"],
+                record["extractor_version"],
+                _now(),
+            ),
+        )
+        row = conn.execute(
+            f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+    assert row is not None
+    return dict(row)
+
+
+def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
+    """One attachment's metadata and extracted text, never its bytes.
+
+    The BLOB is deliberately not selected. Composition needs the text,
+    the endpoints need the metadata, and nothing in the bench needs the
+    original bytes back: serving them would make the database a file
+    host, and the privacy posture is that the document exists in exactly
+    one place a person can delete.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
+        (digest,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def attachments_for(
+    conn: sqlite3.Connection, digests: list[str]
+) -> dict[str, dict[str, Any]]:
+    """The named attachments by digest, for callers holding a list.
+
+    One query rather than N, and a mapping rather than a list, because
+    every caller wants to look up by digest and an ordered list would
+    make each of them re-index it. A digest with no row is simply absent
+    from the result, which is the caller's cue to refuse rather than
+    this function's cue to guess.
+    """
+    if not digests:
+        return {}
+    placeholders = ", ".join("?" for _ in digests)
+    rows = conn.execute(
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments"
+        f" WHERE digest IN ({placeholders})",
+        tuple(digests),
+    ).fetchall()
+    return {row["digest"]: dict(row) for row in rows}
+
+
+def group_attachments(conn: sqlite3.Connection, group_id: int) -> list[str] | None:
+    """The digests a group declared, in order, or None for a pre-K group.
+
+    THE TWO NULLS, and this is the check site the migration comment
+    points at. None means the group predates attachments entirely: it
+    was created by a build with no attachment concept, so it declared
+    nothing and could not have. An empty list would mean a post-K group
+    that declared no attachment, which is a different fact about a
+    different question.
+
+    Callers must not collapse them. Entry-time enforcement treats None
+    as "this group cannot speak to attachments" and refuses a member
+    that brings one, rather than reading the silence as permission.
+    """
+    row = conn.execute(
+        "SELECT attachments_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    if row is None or row["attachments_json"] is None:
+        return None
+    decoded = json.loads(row["attachments_json"])
+    assert isinstance(decoded, list)
+    return [str(digest) for digest in decoded]
 
 
 def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:

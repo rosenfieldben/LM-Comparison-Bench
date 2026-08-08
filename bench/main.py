@@ -1,6 +1,8 @@
 """FastAPI boundary. Pydantic models live here only; internals use plain dicts."""
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import hashlib
 import hmac
@@ -32,6 +34,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from bench import store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
+from bench.extract import ExtractionError, extract, suffix_of
 from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
@@ -108,6 +111,53 @@ MAX_POSITION = 999
 # field name. That is not worth widening the error renderer for, because the
 # frontend sends fixed bodies and cannot produce this 422 at all.
 FORBID_UNKNOWN = ConfigDict(extra="forbid")
+
+# The largest document the bench will take, measured in DECODED bytes.
+#
+# 8 MiB is past any contract, filing or paper somebody would sensibly
+# compare models on, and well short of what makes a single JSON body a
+# problem to hold in memory. It bounds the upload; MAX_EXTRACTED_CHARS
+# bounds what comes out of it, and the composed-prompt ceiling bounds
+# what reaches a provider. Three different questions, three bounds.
+MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
+
+# The same limit expressed in base64 characters, which is what actually
+# arrives, and it is the one the request model enforces.
+#
+# BASE64 IS 4 CHARACTERS PER 3 BYTES, so the encoded form is 4/3 the
+# size plus padding, and a body sized against the decoded limit would
+# admit only three quarters of a legal file. Ceiling division and then
+# rounding up to the 4-character quantum, plus a small allowance for the
+# newlines some encoders insert every 76 characters, because a wrapped
+# base64 body is still a legal one and refusing it would be refusing a
+# file for how its encoder formatted the envelope.
+#
+# The bound on the STRING is what keeps an absurd body out before it is
+# decoded at all: without it a caller could send a gigabyte of base64
+# and the refusal would arrive after the allocation it was meant to
+# prevent.
+MAX_ATTACHMENT_B64_CHARS = (
+    ((MAX_ATTACHMENT_BYTES + 2) // 3) * 4 + (MAX_ATTACHMENT_BYTES // 57) + 8
+)
+
+# What a browser may call an attachment, by suffix, mapped to what the
+# bench records as its type. Derived from the suffix rather than trusted
+# from the client's Content-Type claim: the browser guesses that field
+# from the same suffix anyway, and on some platforms guesses it wrong,
+# so taking it would be taking a worse copy of what we already have.
+#
+# Recorded rather than acted on. Nothing in the inline path branches on
+# the mime; extraction keys on the suffix and the type is provenance,
+# which is why an unknown suffix never reaches here (extract refuses it
+# first with a message naming what the bench reads).
+ATTACHMENT_MIMES = {
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+}
 
 
 # A seed is an opaque integer to every provider, so the bound exists only to
@@ -290,6 +340,52 @@ class CompareResponse(BaseModel):
     # None when persisting the run failed: the upstream spend already
     # happened, so the results are returned even when history is lost.
     run_id: int | None
+
+
+class AttachmentCreate(BaseModel):
+    """One uploaded document, as base64 inside a JSON body.
+
+    JSON AND NOT MULTIPART, and the inefficiency is bought deliberately.
+    A multipart POST is a CORS "simple" request: a hostile page can fire
+    one at localhost with no preflight, and although it cannot read the
+    response it can make the bench do work. Requiring a JSON body forces
+    cross-origin senders into a preflight this server never answers,
+    which is the invariant the whole boundary rests on, and it outranks
+    the 33 percent base64 costs. See TRUSTED_HOSTS and the media-type
+    guard.
+    """
+
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
+    # The name as the person's filesystem had it. Recorded, shown, and
+    # used to choose the extractor by suffix; never used as a path, and
+    # never written to disk, because the bytes go into the database.
+    filename: str = Field(min_length=1, max_length=255)
+    # Bounded on the ENCODED string, before any decode; see
+    # MAX_ATTACHMENT_B64_CHARS for why that bound is not the byte limit.
+    content_base64: str = Field(min_length=1, max_length=MAX_ATTACHMENT_B64_CHARS)
+
+
+class Attachment(BaseModel):
+    """What the bench says back about a stored document.
+
+    NO CONTENT FIELD, on this or any other response. The bytes are in
+    the database and stay there: the extracted text is what reaches a
+    model, the digest is what a record cites, and an endpoint that
+    served the original back would make the bench a file host and give
+    the document a second place to live. The README's claim that
+    deleting bench.db deletes everything has to stay true.
+    """
+
+    digest: str
+    filename: str
+    mime: str
+    byte_size: int
+    extracted_chars: int
+    extractor: str
+    extractor_version: str
+    created_at: str
 
 
 class PromptCreate(BaseModel):
@@ -3044,6 +3140,120 @@ async def create_prompt(body: PromptCreate) -> dict[str, Any]:
         raise HTTPException(
             409, f"a prompt named {body.name!r} already exists"
         ) from None
+
+
+def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
+    """One stored attachment as the API describes it.
+
+    extracted_chars rather than the text itself, and that is the shape
+    decision worth naming: the length is what a person needs to judge
+    whether the document came through, while the text is the prompt and
+    belongs in the prompt. Serving it here would put a second copy of
+    the document in every metadata response.
+    """
+    return {
+        "digest": row["digest"],
+        "filename": row["filename"],
+        "mime": row["mime"],
+        "byte_size": row["byte_size"],
+        "extracted_chars": len(row["extracted_text"]),
+        "extractor": row["extractor"],
+        "extractor_version": row["extractor_version"],
+        "created_at": row["created_at"],
+    }
+
+
+@app.post("/attachments", response_model=Attachment, status_code=201)
+async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
+    """Store one document, extract its text, and hand back its digest.
+
+    EXTRACTION HAPPENS HERE, before anything is attached and before any
+    money moves, which is the dataset loader's argument applied to
+    documents: a file that cannot be read is a comparison that would
+    run, spend, and ask every model about a prompt containing nothing
+    from the file. Failing at upload is failing in the cheap place, and
+    the message is written to be shown to whoever picked the file.
+
+    THE DIGEST IS THE SERVER'S. It is computed from the decoded bytes
+    here and never accepted from a client, because it is the identity
+    every later record cites: a caller that could name its own digest
+    could make a comparison cite bytes it never uploaded.
+
+    Re-uploading identical content returns the existing row rather than
+    a second copy, so attaching one contract to ten comparisons costs
+    one copy of it. The response carries the STORED filename, which may
+    differ from the one just sent when those bytes were already here
+    under another name; see store.save_attachment for why the earlier
+    name wins.
+    """
+    raw = body.content_base64
+    try:
+        # validate=True so a body with characters outside the base64
+        # alphabet is refused rather than silently discarded. The
+        # default drops them, which would let a corrupted upload decode
+        # to different bytes than the sender has and store a digest
+        # neither of them can reproduce.
+        content = base64.b64decode(raw, validate=True)
+    except (binascii.Error, ValueError) as exc:
+        raise HTTPException(
+            422,
+            f"content_base64 is not valid base64 ({exc}). The bench takes "
+            "the file's bytes base64-encoded inside a JSON body rather "
+            "than as a multipart upload; see the README.",
+        ) from None
+    if len(content) > MAX_ATTACHMENT_BYTES:
+        # The arithmetic shown, because a bare "too large" leaves the
+        # person guessing whether they are over by a byte or by a factor
+        # of ten.
+        raise HTTPException(
+            422,
+            f"{body.filename!r} is {len(content)} bytes, over the "
+            f"{MAX_ATTACHMENT_BYTES} byte limit "
+            f"({MAX_ATTACHMENT_BYTES // (1024 * 1024)} MiB). Attach the "
+            "relevant section instead, or paste its text into the prompt.",
+        )
+    if not content:
+        raise HTTPException(
+            422, f"{body.filename!r} is empty, so there is nothing to attach."
+        )
+    try:
+        extracted = extract(body.filename, content)
+    except ExtractionError as exc:
+        # The extractor's messages are written to be shown, which is
+        # what ExtractionError means; passing the text straight through
+        # is the point of that contract.
+        raise HTTPException(422, str(exc)) from None
+    stored = store.save_attachment(
+        app.state.db,
+        {
+            "digest": hashlib.sha256(content).hexdigest(),
+            "filename": body.filename,
+            "mime": ATTACHMENT_MIMES.get(
+                suffix_of(body.filename), "application/octet-stream"
+            ),
+            "byte_size": len(content),
+            "content": content,
+            "extracted_text": extracted["text"],
+            "extractor": extracted["extractor"],
+            "extractor_version": extracted["extractor_version"],
+        },
+    )
+    return _attachment_view(stored)
+
+
+@app.get("/attachments/{digest}", response_model=Attachment)
+async def get_attachment(digest: str) -> dict[str, Any]:
+    """Metadata for one stored document. Never its content.
+
+    The response model has no content field and this reader never
+    selects the BLOB, so the omission holds in two places rather than
+    resting on one of them. private, no-store rides along like every
+    other dynamic body.
+    """
+    row = store.get_attachment(app.state.db, digest)
+    if row is None:
+        raise HTTPException(404, "no such attachment")
+    return _attachment_view(row)
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)

@@ -13,3 +13,14 @@ fastapi==0.140.8
 uvicorn==0.51.0
 httpx==0.28.1
 pydantic==2.13.4
+# PDF text extraction for attachments, and the only dependency Phase K
+# adds. docx extraction needs none: zipfile and xml.etree over the w:t
+# runs is the whole of it, and txt and md need nothing at all. A parser
+# for PDF is the one place where writing it here would be worse than
+# taking it, since the format is a container with thirty years of
+# variation in it.
+#
+# The extractor and this version are recorded on every attachment row.
+# An upgrade changes the text a model reads, so provenance has to say
+# which parser produced what was read; see bench/extract.py.
+pypdf==6.15.0
