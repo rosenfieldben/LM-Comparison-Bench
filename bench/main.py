@@ -903,6 +903,12 @@ class RunDetail(BaseModel):
     prompt_text: str
     prompt_id: int | None
     results: list[StoredModelResult]
+    # The documents this run sent, resolved to names and sizes. Empty on
+    # every pre-K.1 run, which is an absence rather than a claim: those
+    # runs recorded no declaration, so nothing here can say whether they
+    # carried one. See runs.renditions_json.
+    attachments: list[AttachmentRef] = []
+    renditions: list[dict[str, Any]] | None = None
     # What this run actually was: the build that produced it, how old the
     # prices it was costed against were, and the data-handling policy its
     # payloads declared. None on every pre-G row.
@@ -2259,7 +2265,11 @@ def native_documents(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def composed_for(
-    prompt: str, digests: list[str] | None, mode: str, group_id: int | None = None
+    prompt: str,
+    digests: list[str] | None,
+    mode: str,
+    group_id: int | None = None,
+    defer_native: bool = False,
 ) -> tuple[Any, Any]:
     """The user content to send and the user content to record.
 
@@ -2282,11 +2292,46 @@ def composed_for(
     landing between the two calls could put parser A's text on the wire
     and parser B's reference in the record: a payload the record
     described wrongly while looking exact.
+
+    WHERE THE NATIVE BYTES LIVE, AND FOR HOW LONG. A native payload is
+    the only thing this bench builds that is measured in megabytes: four
+    attachments at the 8 MiB cap, base64'd, is about 42.7 MiB of string
+    per composition. The two endpoints hold that differently and each
+    holds it deliberately.
+
+    POST /compare composes ONCE for the batch and hands every member the
+    same list by reference, so a twelve-model comparison retains one
+    copy, not twelve. Peak is ~42.7 MiB per in-flight batch regardless of
+    lineup width. That is why this function is called before the fan-out
+    there and not inside limited().
+
+    POST /compare/stream is one request per model, so there is no batch
+    to share across and each member would hold its own copy from entry
+    until done, INCLUDING while queued on the semaphore. A five-model
+    comparison against a saturated bench retained five copies to do one
+    call's work. So the stream path passes defer_native and builds
+    inside the held slot instead, which bounds the retained total at
+    MAX_CONCURRENT_UPSTREAM copies, ~213 MiB at the caps, no matter how
+    many members are waiting.
+
+    A group-keyed cache would let the stream path share by reference
+    too, and is deliberately not built: a cache of megabyte payloads
+    needs an eviction policy, and the obvious ones either free the bytes
+    while a slow member still needs them or retain a finished
+    comparison's images indefinitely. Bounding the copies is the smaller
+    mechanism for the same guarantee.
     """
     if not digests:
         return prompt, None
     pins = pins_for(digests, group_id)
     if mode == "native":
+        # VALIDATE NOW, ENCODE LATER, when the caller says it can wait.
+        # Everything that could refuse this comparison has already run at
+        # entry (existence, kind, capability), so deferring the encode
+        # moves no refusal past the point where money is spent; what it
+        # moves is the ALLOCATION.
+        if defer_native:
+            return None, None
         documents = native_documents(pins)
         return (
             compose_native(prompt, documents, redacted=False),
@@ -2551,6 +2596,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # holds when nothing is attached: compose returns the prompt
     # unchanged and record_prompt stays None, so the payload is byte for
     # byte what it was before this phase.
+    pins = pins_for(request.attachments or [], request.group_id)
     composed, recorded = composed_for(
         request.prompt,
         request.attachments,
@@ -2648,6 +2694,10 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
             prompt_id,
             group_id,
             run_provenance(),
+            # What this run actually sent. Redundant with the group's
+            # pin when there is a group, and the ONLY record of it when
+            # there is not; see the MIGRATIONS note on runs.renditions_json.
+            renditions=pins or None,
         )
     except Exception:
         logger.exception("post-upstream processing failed for /compare")
@@ -2687,15 +2737,22 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # is a 422 with nothing written rather than an error raised after
     # the response has already begun. Same reasoning as the export's
     # dataset check.
+    pins = pins_for(request.attachments or [], request.group_id)
+    # Deferred for native: validated here, encoded under the slot. See
+    # composed_for for the retained-memory arithmetic.
     composed, recorded = composed_for(
         request.prompt,
         request.attachments,
         request.attachments_mode,
         request.group_id,
+        defer_native=True,
     )
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
+        # Rebound inside the held slot for native mode; see the acquire
+        # below and composed_for's retained-memory note.
+        nonlocal composed, recorded
         # Server-side observation of the stream, enough to reconstruct
         # a result if the client disconnects before the done event: a
         # stream the user watched happen is still history.
@@ -2738,6 +2795,19 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             # quietly, with no acquisition timeout.
             await app.state.upstream_semaphore.acquire()
             acquired = True
+            # THE ENCODE HAPPENS HERE, inside the held slot, so a queued
+            # member holds no payload copy while it waits. Everything
+            # that could refuse already ran at entry, so this cannot turn
+            # a queued run into a late refusal; it only decides when the
+            # megabytes are allocated. nonlocal because the generator
+            # closed over the entry-time values.
+            if composed is None:
+                composed, recorded = composed_for(
+                    request.prompt,
+                    request.attachments,
+                    request.attachments_mode,
+                    request.group_id,
+                )
             # Recheck the ceiling now that a slot is held, before started is
             # set, before the clock, and before the started frame. The entry
             # check admits every queued run below the limit; without this
@@ -2816,6 +2886,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                         prompt_id,
                         group_id,
                         run_provenance(),
+                        renditions=pins or None,
                     )
                 except Exception:
                     logger.exception(
@@ -4301,6 +4372,18 @@ async def get_run(run_id: int) -> dict[str, Any]:
     run = store.get_run(app.state.db, run_id)
     if run is None:
         raise HTTPException(404, "no such run")
+    # THE UNGROUPED CASE, which used to be a hardcoded empty list in the
+    # browser for lack of anywhere to read. A run records what it sent,
+    # so a lone run can now show its documents exactly as a comparison
+    # does, and reuse from one stops silently dropping them.
+    pinned = store.run_renditions(app.state.db, run_id)
+    run["renditions"] = pinned
+    run["attachments"] = _attachment_refs(
+        [pin["digest"] for pin in pinned] if pinned else None,
+        store.attachments_for(
+            app.state.db, [pin["digest"] for pin in pinned] if pinned else []
+        ),
+    )
     return run
 
 

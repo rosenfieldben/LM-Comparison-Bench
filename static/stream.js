@@ -483,6 +483,11 @@
     // than blocking: grouping is bookkeeping, the comparison is the
     // product.
     let groupId = null;
+    // Whether this batch declared documents, read once. A comparison
+    // that did must not fall back to ungrouped runs; see the refusal
+    // below.
+    const hasDocuments = Object.keys(documents).length > 0;
+    let groupFailure = null;
     // The group POST joins the epoch's controllers so Stop can abort it
     // too: a Stop during this await then leaves the batch ungrouped and,
     // via stoppedEpoch, halts every model that was about to start.
@@ -526,9 +531,43 @@
         }),
         signal: groupController.signal,
       });
-      if (resp.ok) groupId = (await resp.json()).id;
+      if (resp.ok) {
+        groupId = (await resp.json()).id;
+      } else if (hasDocuments) {
+        // FAIL CLOSED. A comparison carrying documents must never run
+        // ungrouped, and the reason is not tidiness: the group is where
+        // the rendition pin lives, so an ungrouped fallback would send
+        // every member whatever each one resolved on its own, which is
+        // the unpinned behaviour K.1 exists to end. Worse, the refusals
+        // this endpoint issues are exactly the ones worth obeying: a
+        // text-only model under native mode, an image declared inline, a
+        // composed prompt past the ceiling. Degrading past them turned
+        // each refusal into the paid call it had just refused.
+        //
+        // The SERVER'S WORDS, not a paraphrase. It named the model and
+        // the modality, or showed the arithmetic; a client-side summary
+        // would drop exactly the part that tells the person what to do.
+        let detail = "HTTP " + resp.status;
+        try {
+          const body = await resp.json();
+          if (body && typeof body.detail === "string") detail = body.detail;
+        } catch (err) {
+          // Non-JSON error body: the status line is the best we have.
+        }
+        groupFailure = detail;
+      }
     } catch (err) {
       // Deliberately swallowed, a Stop abort included; see above.
+      // A network failure with documents staged still fails closed: the
+      // catch leaves groupId null, and the check below refuses to run
+      // rather than guessing that the group was created.
+      if (hasDocuments && groupFailure === null) {
+        groupFailure =
+          "the comparison could not be created, so nothing was sent. " +
+          "Documents are declared on the comparison before any model is " +
+          "called, and running without that declaration would send each " +
+          "model whatever it resolved on its own.";
+      }
     } finally {
       // The window closes here, not when the batch settles. Past this
       // point every run this batch launches registers its controller
@@ -542,6 +581,21 @@
       if (BenchState.pendingBatchEpoch === epoch) {
         BenchState.pendingBatchEpoch = -1;
       }
+    }
+    if (groupFailure !== null) {
+      // NOTHING WAS SENT, and the accounting has to say so. The runs
+      // counter was incremented optimistically at the top of this
+      // function on the assumption that a batch always starts; a batch
+      // that never started is not a run.
+      BenchState.sessionStats.runs -= 1;
+      BenchState.renderStats();
+      resultsEl.replaceChildren();
+      BenchRender.hideRace();
+      runLabelEl.textContent = "";
+      BenchAttach.showRefusal(groupFailure);
+      BenchState.inflightRuns -= 1;
+      BenchControls.updateRunState();
+      return;
     }
     try {
       await Promise.allSettled(

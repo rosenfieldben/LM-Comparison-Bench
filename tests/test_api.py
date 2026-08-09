@@ -10234,3 +10234,246 @@ def test_the_two_spellings_of_a_declaration_must_agree(client):
 
     assert resp.status_code == 422
     assert "two spellings of one declaration" in resp.json()["detail"]
+
+
+# ---- Phase K1.2: fail closed.
+
+
+@respx.mock
+def test_review_repro_a_mixed_native_lineup_spends_nothing(client):
+    """WINDOW: every upstream call made while a native comparison over a
+    vision model AND a text-only model is created and would have run,
+    counted at the respx transport.
+
+    THE REVIEWER'S SHAPE. model/alpha accepts images and model/capped
+    does not, so the comparison cannot be run fairly and creation
+    refuses. What this asserts is not the refusal, which K3 already
+    proved, but that NOTHING ELSE HAPPENS: no member slips past on its
+    own, no fallback sends the image to the model that can take it and
+    an empty prompt to the one that cannot.
+
+    The browser's half of this is the fail-closed rewire in
+    static/stream.js, tombstoned in tests/browser/test_k.py. Both halves
+    are needed: the server must refuse, and the client must not treat a
+    refusal as permission to proceed."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+
+    created = client.post(
+        "/groups",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha", "model/capped"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert created.status_code == 422
+    assert "model/capped does not accept image input" in created.json()["detail"]
+    assert route.call_count == 0
+    # And no group row exists to be picked up by anything later.
+    rows = client.app.state.db.execute("SELECT COUNT(*) c FROM groups").fetchone()
+    assert rows["c"] == 0
+
+
+@respx.mock
+def test_review_repro_an_ungrouped_run_records_the_documents_it_sent(client):
+    """WINDOW: GET /runs/{id} for a run created with no group at all.
+
+    HARDCODED EMPTY BEFORE THIS. The browser's history view returned
+    attachments: [] for a lone run, not because the run had none but
+    because there was nowhere to read: the declaration lived on the
+    group and an ungrouped run has no group. A comparison run over a
+    contract replayed as a comparison over a bare prompt, with nothing
+    on screen saying a document had been involved.
+
+    The digests DO survive inside request_json, in the placeholder, and
+    this deliberately does not parse them out; runs.renditions_json is
+    the data path. See the MIGRATIONS note."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    body = b"the contract says forty two"
+    digest = upload(client, "contract.txt", body).json()["digest"]
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "summarize it",
+            "models": ["model/alpha"],
+            "group_id": None,
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+    assert resp.status_code == 200
+    run_id = resp.json()["run_id"]
+
+    detail = client.get(f"/runs/{run_id}").json()
+
+    assert [ref["digest"] for ref in detail["attachments"]] == [digest]
+    assert detail["attachments"][0]["filename"] == "contract.txt"
+    # The pin too, so a reuse from a lone run can carry the reading and
+    # not merely the file.
+    assert detail["renditions"] == [
+        {
+            "digest": digest,
+            "extractor": "text",
+            "extractor_version": "1",
+            "kind": "document",
+        }
+    ]
+    # NEVER THE CONTENT, on this reader like every other.
+    assert body.decode() not in client.get(f"/runs/{run_id}").text
+
+
+@respx.mock
+def test_a_run_with_no_documents_still_reports_none(client):
+    """The mirror, and the reason the field is a list rather than an
+    omission: a reader must be able to tell "this run carried no
+    documents" from "this run predates the column", and only a present
+    empty list plus a null pin says the first."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    resp = client.post(
+        "/compare",
+        json={"prompt": "plain", "models": ["model/alpha"], "budget": "standard"},
+    )
+
+    detail = client.get(f"/runs/{resp.json()['run_id']}").json()
+
+    assert detail["attachments"] == []
+    assert detail["renditions"] is None
+
+
+# ---- Phase K1.3: allocation inside the slot.
+
+
+@respx.mock
+def test_review_repro_a_queued_native_member_holds_no_payload_copy(client):
+    """WINDOW: the number of times the image BLOB is read out of the
+    database while several native members are queued on the semaphore
+    but not yet admitted.
+
+    THE BOUND IS ON RETAINED MEGABYTES. A native payload is ~42.7 MiB at
+    the caps, and /compare/stream is one request per model, so composing
+    at entry meant every queued member held its own copy while it waited
+    for a slot. Five members against a saturated bench retained five
+    copies to do one call's work.
+
+    store.attachment_content is the ONLY reader that returns the bytes,
+    so counting its calls counts the copies: a member that has not
+    encoded has not read. Asserted while the semaphore is deliberately
+    held, which is the state the bound is about; a test that let the
+    members run would count every copy after the fact and prove nothing
+    about what was retained WHILE QUEUED.
+    """
+    reads = []
+    original = store.attachment_content
+
+    def counting(conn, digest):
+        reads.append(digest)
+        return original(conn, digest)
+
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha", "model/alpha", "model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    ).json()["id"]
+
+    main.store.attachment_content = counting  # type: ignore[assignment]
+    try:
+        # Entry-time work only: validate, do not encode. The endpoint is
+        # called through the app's own validation path rather than by
+        # driving the generator, so this is the real code path.
+        for _ in range(3):
+            composed, recorded = main.composed_for(
+                "what is in this image",
+                [digest],
+                "native",
+                group_id,
+                defer_native=True,
+            )
+            assert composed is None
+            assert recorded is None
+        # Three members validated, nothing encoded.
+        assert reads == []
+
+        # And the encode really does happen when it is not deferred, so
+        # the assertion above is about deferral and not about a path
+        # that never reads bytes at all.
+        composed, recorded = main.composed_for(
+            "what is in this image", [digest], "native", group_id
+        )
+        assert reads == [digest]
+        assert composed[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    finally:
+        main.store.attachment_content = original  # type: ignore[assignment]
+
+
+@respx.mock
+def test_the_batch_endpoint_encodes_once_for_the_whole_lineup(client):
+    """WINDOW: the BLOB reads for one POST /compare over a five-model
+    native lineup.
+
+    The batch's bound is different from the stream's and is stated
+    beside it: /compare composes once and hands every member the same
+    list BY REFERENCE, so a wide lineup retains one copy rather than
+    one per model. This is what "shared by reference" has to mean to be
+    worth anything, and it is asserted rather than assumed because the
+    obvious refactor (compose inside limited()) would keep every test
+    green while turning one copy into five."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    reads = []
+    original = store.attachment_content
+
+    def counting(conn, digest):
+        reads.append(digest)
+        return original(conn, digest)
+
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    lineup = ["model/alpha"] * 5
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "what is in this image",
+            "models": lineup,
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+        },
+    ).json()["id"]
+
+    main.store.attachment_content = counting  # type: ignore[assignment]
+    try:
+        resp = client.post(
+            "/compare",
+            json={
+                "prompt": "what is in this image",
+                "models": lineup,
+                "group_id": group_id,
+                "budget": "standard",
+                "attachments": [digest],
+                "attachments_mode": "native",
+            },
+        )
+    finally:
+        main.store.attachment_content = original  # type: ignore[assignment]
+
+    assert resp.status_code == 200
+    assert len(resp.json()["results"]) == 5
+    # ONE read for five members.
+    assert reads == [digest]

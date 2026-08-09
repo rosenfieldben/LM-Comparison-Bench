@@ -122,7 +122,8 @@ CREATE TABLE IF NOT EXISTS runs (
     app_sha TEXT,
     catalog_snapshot_at TEXT,
     data_policy TEXT,
-    catalog_digest TEXT
+    catalog_digest TEXT,
+    renditions_json TEXT
 );
 CREATE TABLE IF NOT EXISTS attachments (
     id INTEGER PRIMARY KEY,
@@ -362,6 +363,24 @@ MIGRATIONS = [
     # Present is K.1: the reading itself is pinned and resolution
     # honors it or refuses.
     ("groups", "renditions_json", "TEXT"),
+    # The same pin on the RUN, and it is not a duplicate of the group's.
+    #
+    # A grouped run inherits its group's pin and this column agrees with
+    # it. An UNGROUPED run has no group to inherit from, and before this
+    # there was nowhere at all that recorded which documents it carried:
+    # the history view hardcoded an empty list for lack of anywhere to
+    # read, so a comparison run over a contract replayed as a comparison
+    # over a bare prompt with nothing on screen saying otherwise.
+    #
+    # The digests DO survive inside each result's request_json, in the
+    # placeholder standing where the content sat, and this column exists
+    # so nobody has to parse them back out. Reading a record format as a
+    # data format is the same mistake as reading controls off their
+    # badges, and it would have been worse here: the placeholder is a
+    # string the composition owns and may reword.
+    #
+    # NULL is the pre-K.1 era on this table, exactly as on groups.
+    ("runs", "renditions_json", "TEXT"),
 ]
 
 
@@ -1179,6 +1198,42 @@ def group_manifest(conn: sqlite3.Connection, group_id: int) -> dict[str, Any]:
     }
 
 
+def run_renditions(
+    conn: sqlite3.Connection, run_id: int
+) -> list[dict[str, Any]] | None:
+    """What this run pinned, or None on a pre-K.1 run.
+
+    The same repair-on-read discipline group_renditions uses, and for
+    the same reason: an element that is not a rendition object cannot be
+    compared against anything, and rendering a Python repr of a dict
+    into a chip would be worse than showing nothing.
+    """
+    row = conn.execute(
+        "SELECT renditions_json FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    if row is None or row["renditions_json"] is None:
+        return None
+    decoded = json.loads(row["renditions_json"])
+    if not isinstance(decoded, list):
+        return None
+    out = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            return None
+        if not all(
+            isinstance(item.get(key), str)
+            for key in ("digest", "extractor", "extractor_version", "kind")
+        ):
+            return None
+        out.append(
+            {
+                key: item[key]
+                for key in ("digest", "extractor", "extractor_version", "kind")
+            }
+        )
+    return out
+
+
 def save_run(
     conn: sqlite3.Connection,
     prompt_text: str,
@@ -1186,6 +1241,7 @@ def save_run(
     prompt_id: int | None = None,
     group_id: int | None = None,
     provenance: dict[str, Any] | None = None,
+    renditions: list[dict[str, Any]] | None = None,
 ) -> int:
     """Insert a run and its results atomically. Returns the run id.
 
@@ -1199,6 +1255,17 @@ def save_run(
     caller that knows none of it still writes a valid row with those
     columns None.
 
+    renditions is what this run actually sent, pinned. On a grouped
+    run it repeats the group's pin, which is redundant and deliberately
+    so: the group is where a comparison's declaration lives, and the run
+    is where an UNGROUPED comparison's does. Recording it on both means
+    one reader answers both cases instead of two readers agreeing to
+    disagree about which table to consult.
+
+    sort_keys for the reason create_group has it: a list of objects has
+    more than one spelling and two identical pins must produce identical
+    column bytes.
+
     Every key here must appear in the INSERT below. A column that is
     declared, migrated and read back but never written reads as an
     absence, and an absence is a claim: it says this run had no such fact.
@@ -1209,8 +1276,9 @@ def save_run(
         cur = conn.execute(
             """INSERT INTO runs
                (prompt_id, group_id, prompt_text, created_at,
-                app_sha, catalog_snapshot_at, data_policy, catalog_digest)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                app_sha, catalog_snapshot_at, data_policy, catalog_digest,
+                renditions_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 prompt_id,
                 group_id,
@@ -1220,6 +1288,7 @@ def save_run(
                 prov.get("catalog_snapshot_at"),
                 prov.get("data_policy"),
                 prov.get("catalog_digest"),
+                json.dumps(renditions, sort_keys=True) if renditions else None,
             ),
         )
         # lastrowid is always set after this single-row INSERT; assert

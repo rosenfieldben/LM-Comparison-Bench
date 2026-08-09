@@ -578,6 +578,14 @@ A scanned PDF is refused at upload rather than attached empty. The bench
 does no OCR, so a PDF whose pages carry no text layer would otherwise
 reach every model as a document mentioned and never shown.
 
+**A comparison carrying documents fails closed.** If the bench refuses to
+create it (a text-only model under native mode, an image declared inline,
+a composed prompt past the ceiling), nothing is sent: the refusal appears
+at the attach control in the server's own words, and the run counter does
+not move. Earlier builds swallowed that refusal and ran the models
+one at a time without a comparison record, which sent each of them
+whatever it resolved on its own.
+
 **Caps.** At most 4 documents per comparison, at most 8 MiB each, at most
 32 MiB of inflated XML out of any one `.docx`, and a composed prompt of at
 most 200,000 characters. The last one is the one
@@ -647,6 +655,21 @@ cannot honor.
 and that extractor's version, because a `pypdf` upgrade changes the text a
 model reads, and a record that could not say which parser produced it
 would be a record of a prompt nobody can reconstruct.
+
+A comparison **pins the rendition** of every document at creation:
+`(digest, extractor, extractor_version, kind)`. Members receive exactly
+the pinned reading, so a parser upgrade partway through a comparison
+cannot hand the second model a different document from the first; if a
+pinned reading is missing the bench refuses rather than substituting.
+The same pin is recorded on ungrouped runs, so a single-model comparison
+shows its documents on replay too.
+
+The same bytes uploaded under two suffixes are **two renditions**, each
+described truthfully, because a `.docx` is also decodable as text and the
+digest alone cannot say which reading was meant. That ambiguity used to
+resolve to whichever upload arrived first, which let a PNG uploaded as
+`.txt` reach every model as binary in the text path and left the same
+image permanently unusable in native mode.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench

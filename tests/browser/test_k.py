@@ -376,15 +376,23 @@ def test_native_over_an_image_runs_against_a_model_that_accepts_one(bench):
 
 
 def test_native_over_an_image_is_refused_for_a_text_only_model(bench):
-    """WINDOW: the run's card, for a lineup the catalog says cannot take
-    an image. The refusal is the server's and arrives at creation, and
-    what this proves is that it REACHES THE PAGE as a sentence rather
-    than vanishing into a degraded ungrouped run.
+    """WINDOW: the composer's message line and the results area, for a
+    lineup the catalog says cannot take an image.
 
-    That degrade is the reason enforce_native_entry exists: the browser
-    falls back to ungrouped runs when the group POST fails, so before the
-    entry check a native refusal quietly became the paid call it had just
-    refused."""
+    THIS TEST'S SHAPE IS REVERSED BY K1.2 AND THE REVERSAL IS THE POINT.
+    It used to assert the refusal arrived as an ERROR CARD, which was
+    the honest description of what happened: the group POST was refused,
+    the browser swallowed the failure and ran the members ungrouped, and
+    each one came back carrying the server's 422 as its own error. The
+    person got a red card per model and the impression that the
+    comparison had been attempted.
+
+    It had been attempted. That was the defect. enforce_mode_entry
+    stopped the money leaving, but the request still went out per member
+    and every one of them resolved its documents with no pin. Failing
+    closed means no member is issued at all, so there is no card to
+    carry the message and the message belongs where the choice was made.
+    """
     page = bench(["stub/fast"])
     check_only(page, "stub/fast")
     attach(page, png_file())
@@ -394,13 +402,11 @@ def test_native_over_an_image_is_refused_for_a_text_only_model(bench):
     page.get_by_test_id("prompt-input").fill("what is in this image")
     page.get_by_test_id("run-button").click()
 
-    card = page.get_by_test_id("result-card").first
-    expect(card.get_by_test_id("card-status")).to_have_text(
-        "error", timeout=DONE_TIMEOUT
-    )
-    body = card.inner_text()
-    assert "does not accept image input" in body
-    assert "stub/fast" in body
+    msg = page.get_by_test_id("attach-msg")
+    expect(msg).to_contain_text("does not accept image input", timeout=DONE_TIMEOUT)
+    assert "stub/fast" in msg.inner_text()
+    # No card, because no member was issued.
+    expect(page.get_by_test_id("result-card")).to_have_count(0)
 
 
 # ---- The mirrored constants. The H2 bounds precedent, twice more.
@@ -490,3 +496,193 @@ def test_review_repro_the_native_refusal_survives_the_attach_message(bench):
     # The success text must not be what survived.
     assert "attached 1 document" not in msg.inner_text()
     expect(page.get_by_test_id("run-button")).to_be_disabled()
+
+
+# ---- Phase K1.2 and K1.3: fail closed, and honest staging.
+
+
+def test_review_repro_a_refused_native_comparison_runs_nothing(bench):
+    """WINDOW: the results area, the session run counter and the
+    composer's message line, after Run on a native comparison whose
+    lineup mixes a vision model with a text-only one.
+
+    THE REFUSAL WAS TURNING ITSELF INTO A RUN. A failed /groups was
+    swallowed and the batch continued ungrouped, so the comparison the
+    server had just refused went upstream one member at a time. Every
+    member then resolved its own documents with no pin, which is the
+    unpinned behaviour K.1 exists to end, and the text-only model was
+    sent an image the check had already said it could not take.
+
+    Fails closed now: nothing is sent, the run counter does not move
+    because a batch that never started is not a run, and the SERVER'S
+    OWN WORDS land in the composer, naming the model and the modality.
+    A client-side paraphrase would drop exactly the part that says what
+    to do about it."""
+    page = bench(["stub/vision", "stub/fast"])
+    check_only(page, "stub/vision")
+    page.get_by_test_id("lineup-chip").filter(
+        has=page.locator("input[value='stub/fast']")
+    ).click()
+    attach(page, png_file())
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    page.get_by_test_id("attach-mode").select_option("native")
+    page.get_by_test_id("prompt-input").fill("what is in this image")
+    runs_before = page.locator("#stat-runs .v").inner_text()
+
+    page.get_by_test_id("run-button").click()
+
+    msg = page.get_by_test_id("attach-msg")
+    expect(msg).to_contain_text("does not accept image input", timeout=DONE_TIMEOUT)
+    assert "stub/fast" in msg.inner_text()
+    # Nothing ran: no cards, and the counter never moved.
+    expect(page.get_by_test_id("result-card")).to_have_count(0)
+    assert page.locator("#stat-runs .v").inner_text() == runs_before
+    # And the composer is usable again rather than stuck mid-run.
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+
+
+def test_review_repro_run_is_disabled_until_every_picked_file_is_staged(bench):
+    """WINDOW: the Run button between the pick and the last chip, with
+    the file read deliberately slowed.
+
+    THE REVIEWER'S CONSTRUCTION: arrayBuffer is wrapped so the read
+    takes a beat, which is what a real 8 MiB file does and what a fast
+    test never reproduces on its own. Without the busy state a person
+    could press Run the instant the first chip appeared, and the
+    comparison would be created and PINNED over one document while the
+    other two landed in the staging area afterwards, looking exactly as
+    attached as the one that was actually sent.
+    """
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+    page.get_by_test_id("prompt-input").fill("summarize these")
+    # The delay lives in the page, not in the harness, so the state
+    # machine under test is the real one.
+    page.evaluate(
+        """() => {
+             const real = Blob.prototype.arrayBuffer;
+             Blob.prototype.arrayBuffer = function () {
+               return new Promise((resolve) => {
+                 setTimeout(() => resolve(real.call(this)), 400);
+               });
+             };
+           }"""
+    )
+
+    attach(
+        page,
+        text_file("one.txt", b"first document"),
+        text_file("two.txt", b"second document"),
+        text_file("three.txt", b"third document"),
+    )
+
+    # Disabled while the reads are in flight, with the reason on the
+    # button rather than only in a line that may have scrolled.
+    expect(page.get_by_test_id("run-button")).to_be_disabled()
+    assert "still being read" in page.get_by_test_id("run-button").get_attribute(
+        "title"
+    )
+    # And released only once every one of them is staged.
+    expect(chips(page)).to_have_count(3, timeout=DONE_TIMEOUT)
+    expect(page.get_by_test_id("run-button")).to_be_enabled()
+
+
+def test_review_repro_the_cap_holds_across_overlapping_selections(bench):
+    """WINDOW: the composer's message line and chip count when a second
+    pick arrives while the first is still reading.
+
+    Counting only the STAGED set let four files through as two
+    overlapping pairs: the second pick saw two attached, allowed two
+    more, and the server's own bound then refused the whole comparison
+    at Run time, long after the person had finished choosing. The
+    in-flight count is claimed before the first await for exactly this
+    reason."""
+    page = bench(["stub/fast"])
+    page.evaluate(
+        """() => {
+             const real = Blob.prototype.arrayBuffer;
+             Blob.prototype.arrayBuffer = function () {
+               return new Promise((resolve) => {
+                 setTimeout(() => resolve(real.call(this)), 400);
+               });
+             };
+           }"""
+    )
+
+    attach(page, text_file("a.txt", b"a"), text_file("b.txt", b"b"))
+    attach(page, text_file("c.txt", b"c"), text_file("d.txt", b"d"))
+    attach(page, text_file("e.txt", b"e"))
+
+    msg = page.get_by_test_id("attach-msg")
+    expect(msg).to_contain_text("at most 4 documents", timeout=DONE_TIMEOUT)
+    assert "still reading" in msg.inner_text() or "attached" in msg.inner_text()
+    expect(chips(page)).to_have_count(4, timeout=DONE_TIMEOUT)
+
+
+def test_review_repro_a_late_upload_does_not_contaminate_a_replay(bench, open_history):
+    """WINDOW: the composer's staging area after a history entry is
+    opened while an upload is still in flight.
+
+    AN UPLOAD OUTLIVES THE VIEW THAT STARTED IT. Attach a large file,
+    get bored, open a comparison from history, and the upload lands
+    afterwards: the staging area gains a document the loaded view never
+    declared, and the composer then describes neither the history entry
+    on screen nor anything the person chose. Reuse from that view would
+    carry the stray file into a new comparison.
+
+    Same epoch discipline every other async path here follows: stamp at
+    the start, check after each await, drop silently when superseded.
+    The bytes are stored either way, which is what content-addressing
+    buys: nothing is lost and the file can be attached again in the view
+    the person meant."""
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+    run_and_wait(page, "an earlier comparison with no documents")
+
+    page.evaluate(
+        """() => {
+             const real = Blob.prototype.arrayBuffer;
+             Blob.prototype.arrayBuffer = function () {
+               return new Promise((resolve) => {
+                 setTimeout(() => resolve(real.call(this)), 900);
+               });
+             };
+           }"""
+    )
+    attach(page, text_file("stray.txt", b"attached to nothing in particular"))
+
+    # Take the view over while the read is still in flight.
+    open_history()
+    row_for(page, "an earlier comparison with no documents").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # The upload lands after the takeover and must not attach itself.
+    page.wait_for_timeout(1500)
+    expect(chips(page)).to_have_count(0)
+    # And the run is not blocked by a batch nobody is waiting for.
+    expect(page.get_by_test_id("attach-msg")).not_to_contain_text("still being read")
+
+
+def test_an_ungrouped_run_shows_its_documents_on_replay(bench, open_history):
+    """WINDOW: the replay banner for a LONE run, which is the client half
+    of runs.renditions_json.
+
+    The browser used to hardcode an empty list here for lack of anywhere
+    to read. A lone run is produced by any comparison of one model, so
+    this is the ordinary case and not an edge."""
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+    attach(page, text_file())
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    run_and_wait(page, "summarize the attached contract for one model")
+
+    open_history()
+    row_for(page, "summarize the attached contract for one model").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    expect(page.get_by_test_id("run-attachments")).to_be_visible()
+    expect(page.get_by_test_id("run-attachment")).to_have_text("contract.txt")

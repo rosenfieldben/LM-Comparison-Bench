@@ -57,6 +57,27 @@
   // because order is part of the declaration.
   let staged = [];
 
+  // How many files are mid-flight: picked, not yet stored or refused.
+  //
+  // A COUNTER, NOT A BOOLEAN, because selections overlap. A person can
+  // pick two files, then pick two more while the first pair is still
+  // uploading, and a boolean would clear on the first batch's completion
+  // while the second was still in the air. The cap below counts this
+  // too, so four files cannot slip through as two overlapping pairs.
+  let inFlight = 0;
+
+  // The view epoch this staging belongs to, stamped when a batch starts.
+  //
+  // AN UPLOAD OUTLIVES THE VIEW THAT STARTED IT. A person can attach a
+  // large file, get bored, open a comparison from history, and have the
+  // upload land afterwards: the staged set would gain a document the
+  // loaded view never declared, and the composer would then be
+  // describing neither the history entry on screen nor anything the
+  // person chose. Every view takeover advances the epoch already, so a
+  // batch that recorded its epoch can tell whether the view it was
+  // staging for is still the one on screen.
+  let stagingEpoch = -1;
+
   const A = {
     // Read by the stream client when it builds the group POST and every
     // member request; written by the reuse action in history.
@@ -72,6 +93,11 @@
   function suffixOf(name) {
     const dot = name.lastIndexOf(".");
     return dot === -1 ? "" : name.slice(dot).toLowerCase();
+  }
+
+  // Whether a file is still being read or uploaded.
+  function busy() {
+    return inFlight > 0;
   }
 
   // What goes on the wire. RULE ONE at the client edge: with nothing
@@ -300,6 +326,18 @@
   // place that disabled it would be a second place that could forget to
   // re-enable it.
   function blockingReason() {
+    if (busy()) {
+      // RUN IS BLOCKED WHILE ANYTHING IS IN FLIGHT, and this is the
+      // whole of the busy state. Without it a person could pick three
+      // files and press Run the instant the first chip appeared: the
+      // declaration would carry one document, the comparison would be
+      // created and pinned over that one, and the other two would land
+      // in the staging area afterwards looking exactly as attached as
+      // the one that was actually sent.
+      return inFlight === 1
+        ? "a file is still being read"
+        : "files are still being read";
+    }
     if (staged.some(isMissing)) {
       return "a declared document is no longer stored";
     }
@@ -397,21 +435,39 @@
     // five files would leave the person believing they attached five.
     // Nothing is uploaded when the batch would not fit, so the staged
     // set is either what they asked for or unchanged.
-    if (staged.length + picked.length > MAX_ATTACHMENTS) {
+    // THE CAP COUNTS WHAT IS IN FLIGHT, not only what is staged. Two
+    // overlapping selections of two files each are four documents, and
+    // counting only the staged set let the second pair through while the
+    // first was still uploading: the server's own bound then refused the
+    // whole comparison at Run time, long after the person had stopped
+    // choosing files.
+    if (staged.length + inFlight + picked.length > MAX_ATTACHMENTS) {
       msgEl.textContent =
         "at most " +
         MAX_ATTACHMENTS +
         " documents per comparison; " +
         staged.length +
-        " attached and " +
+        " attached" +
+        (inFlight > 0 ? ", " + inFlight + " still reading" : "") +
+        " and " +
         picked.length +
         " more picked. Nothing was attached. Remove one, or attach fewer.";
       return;
+    }
+    // Claimed BEFORE the first await, so a second pick arriving while
+    // this one is in flight sees the true total. Everything from here to
+    // the finally is what the counter is protecting.
+    inFlight += picked.length;
+    const epoch = window.BenchState.viewEpoch;
+    if (stagingEpoch !== epoch) {
+      stagingEpoch = epoch;
     }
     msgEl.textContent =
       picked.length === 1
         ? "reading " + picked[0].name
         : "reading " + picked.length + " files";
+    // Run is disabled from here, not from the first chip.
+    window.BenchControls.updateRunState();
     const added = [];
     for (const file of picked) {
       let stored;
@@ -422,6 +478,8 @@
         // staged: those documents are stored and cited by digest, so
         // discarding them here would be discarding work that already
         // happened. The message says both halves.
+        inFlight -= picked.length;
+        if (stale(epoch)) return;
         staged = staged.concat(added);
         render();
         msgEl.textContent =
@@ -431,6 +489,18 @@
         return;
       }
       added.push(stored);
+    }
+    inFlight -= picked.length;
+    // THE LATE-UPLOAD GUARD. If the view moved on while these files were
+    // reading (a history entry was opened, a run was started), this
+    // batch belongs to a composer nobody is looking at, and adding its
+    // documents to the staging area would attach files to whatever is on
+    // screen now. The bytes are stored either way, which is the point of
+    // content-addressing: nothing is lost, and the person can attach
+    // them again in the view they meant.
+    if (stale(epoch)) {
+      window.BenchControls.updateRunState();
+      return;
     }
     staged = staged.concat(added);
     // The stored filename can differ from the one just picked, because
@@ -478,6 +548,28 @@
     render();
   }
 
+  // The server's refusal, shown at the control that caused it.
+  //
+  // A comparison carrying documents fails CLOSED: when the group POST
+  // is refused, nothing runs and the words the server used land here
+  // rather than in a console nobody has open. The composer is the right
+  // place because every refusal this can carry is about a choice made
+  // here (which files, which mode) and the remedy is a change to that
+  // choice.
+  A.showRefusal = (detail) => {
+    msgEl.textContent = detail;
+  };
+
+  // Whether this staging batch has been superseded by a view takeover.
+  // Read after every await in addFiles, which is the same discipline
+  // runOne and showGroup follow: async work stamps the epoch it started
+  // under and touches shared view state only while that epoch is
+  // current.
+  function stale(epoch) {
+    return epoch !== window.BenchState.viewEpoch;
+  }
+
+  A.busy = busy;
   A.blockingReason = blockingReason;
   // Repaint on new facts from outside, currently the data policy landing
   // with the catalog. Named refresh rather than exposing render, because
