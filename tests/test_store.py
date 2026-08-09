@@ -1866,12 +1866,29 @@ def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
     one under test. This fixture is the SCHEMA string exactly as it
     stood at v0.1.0, extracted rather than transcribed.
 
-    Two changes, both additive. groups.attachments_json arrives by ALTER
-    and is NULL on every legacy row, which is the affirmative fact that
-    the group predates attachments entirely: it declared nothing and
-    could not have. The attachments table arrives by CREATE TABLE IF NOT
-    EXISTS, which is additive by construction on any database, new or
-    old, and is why it needs no MIGRATIONS entry.
+    THREE changes, all additive, and the count is the correction this
+    proof needed. groups.attachments_json AND groups.attachments_mode
+    both arrive by ALTER and are NULL on every legacy row, which is the
+    affirmative fact that the group predates attachments entirely: it
+    declared nothing and could not have. The attachments table arrives
+    by CREATE TABLE IF NOT EXISTS, which is additive by construction on
+    any database and is why it needs no MIGRATIONS entry.
+
+    THE WINDOW IS EVERY COLUMN PHASE K MIGRATES, not one of them. This
+    asserted attachments_json alone, and the MIGRATIONS comment above the
+    block called Phase K "One column", so the test that is specifically
+    about Phase K's era said nothing about half of what Phase K
+    migrates.
+
+    Measured rather than assumed, because the scope of the gap matters:
+    deleting the attachments_mode entry does NOT leave the suite green.
+    The pre-G, pre-H, pre-H1 and pre-I2 era tests catch it too, since
+    their fixtures also predate the column and each one reads the groups
+    table back. So the exposure was never a silent broken migration; it
+    was this proof being narrower than its own subject, and four tests
+    about other eras carrying a Phase K guarantee by accident. A
+    guarantee held only by accident is one an unrelated refactor can
+    drop.
     """
     db_path = tmp_path / "pre_k.db"
     legacy = sqlite3.connect(str(db_path))
@@ -1903,6 +1920,7 @@ def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
     # would prove nothing at all about the migration.
     before = [r[1] for r in legacy.execute("PRAGMA table_info(groups)")]
     assert "attachments_json" not in before
+    assert "attachments_mode" not in before
     tables_before = {
         r[0]
         for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -1914,6 +1932,7 @@ def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
     try:
         columns = [r["name"] for r in conn.execute("PRAGMA table_info(groups)")]
         assert "attachments_json" in columns
+        assert "attachments_mode" in columns
         tables = {
             r["name"]
             for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -1925,6 +1944,10 @@ def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
         # empty list, and group_attachments is the check site that keeps
         # them apart.
         assert store.group_attachments(conn, 1) is None
+        # The mode's own reader, on the same legacy row. Its two NULLs
+        # collapse deliberately (a mode with no documents is a statement
+        # about nothing), so None here is the whole of what it can say.
+        assert store.group_attachments_mode(conn, 1) is None
 
         # Nothing else about the legacy row moved.
         assert store.group_prompt(conn, 1) == "legacy prompt"

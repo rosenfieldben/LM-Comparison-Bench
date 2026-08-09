@@ -145,17 +145,25 @@ MAX_ATTACHMENTS = 4
 # BASE64 IS 4 CHARACTERS PER 3 BYTES, so the encoded form is 4/3 the
 # size plus padding, and a body sized against the decoded limit would
 # admit only three quarters of a legal file. Ceiling division and then
-# rounding up to the 4-character quantum, plus a small allowance for the
+# rounding up to the 4-character quantum, plus an allowance for the
 # newlines some encoders insert every 76 characters, because a wrapped
 # base64 body is still a legal one and refusing it would be refusing a
 # file for how its encoder formatted the envelope.
 #
-# The bound on the STRING is what keeps an absurd body out before it is
-# decoded at all: without it a caller could send a gigabyte of base64
-# and the refusal would arrive after the allocation it was meant to
-# prevent.
+# THE ALLOWANCE IS NOW HONEST IN BOTH DIRECTIONS. It counts TWO
+# characters per wrapped line, not one, because a CRLF-wrapped body is
+# as legal as an LF-wrapped one and a Windows caller is the likeliest
+# person to produce one. And create_attachment now strips whitespace
+# before decoding, so the body this slack admits is a body the decoder
+# will actually accept. Before that fix the two contradicted each other
+# inside one file: the bound made room for newlines that validate=True
+# then refused, so the allowance could never be used and the comment
+# explaining it was false.
+#
+# 76 characters of base64 encode 57 bytes, which is where the divisor
+# comes from.
 MAX_ATTACHMENT_B64_CHARS = (
-    ((MAX_ATTACHMENT_BYTES + 2) // 3) * 4 + (MAX_ATTACHMENT_BYTES // 57) + 8
+    ((MAX_ATTACHMENT_BYTES + 2) // 3) * 4 + 2 * (MAX_ATTACHMENT_BYTES // 57) + 8
 )
 
 # What a browser may call an attachment, by suffix, mapped to what the
@@ -3739,13 +3747,26 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     under another name; see store.save_attachment for why the earlier
     name wins.
     """
-    raw = body.content_base64
+    # WHITESPACE OUT FIRST, THEN STRICT. The two halves answer different
+    # questions and doing only the second answered the wrong one.
+    #
+    # Line breaks every 76 characters are RFC 2045's own wrapping and are
+    # what `base64 file.pdf` emits on Linux and macOS, and what Python's
+    # base64.encodebytes emits. A wrapped body is a legal encoding of the
+    # exact bytes the caller holds, so refusing it refuses a correct
+    # upload for how its encoder formatted the envelope, and the message
+    # it got back said the data was invalid. MAX_ATTACHMENT_B64_CHARS
+    # already budgets for those newlines and said so in its comment,
+    # which made the pair contradict each other in one file: the bound
+    # admitted a body the decoder could never accept.
+    #
+    # Everything else stays strict. validate=True on what remains is what
+    # refuses characters outside the alphabet rather than silently
+    # dropping them, which is the case that matters: the default drop
+    # would let a corrupted upload decode to different bytes than the
+    # sender holds and store a digest neither of them can reproduce.
+    raw = "".join(body.content_base64.split())
     try:
-        # validate=True so a body with characters outside the base64
-        # alphabet is refused rather than silently discarded. The
-        # default drops them, which would let a corrupted upload decode
-        # to different bytes than the sender has and store a digest
-        # neither of them can reproduce.
         content = base64.b64decode(raw, validate=True)
     except (binascii.Error, ValueError) as exc:
         raise HTTPException(

@@ -9466,8 +9466,14 @@ def test_review_repro_no_reader_serves_a_documents_bytes_or_text(client):
     can obtain about a comparison that ran over a document.
 
     WINDOW: four responses from one attached comparison, GET
-    /attachments/{digest}, GET /runs, GET /groups/{id} and the
-    experiment export, scanned whole.
+    /attachments/{digest}, GET /runs, GET /groups/{id} and GET
+    /runs/{id}, scanned whole. The EXPERIMENT EXPORT is a fifth reader
+    and is NOT in this window; it is scanned by
+    test_review_repro_the_export_round_trips_a_comparison_with_a_document.
+    This docstring used to name the export and omit the run detail, so
+    it described a window it did not scan and a reader could believe the
+    export was covered here. A proof whose stated window is wrong is the
+    exact failure this whole test exists to catch, one subject over.
 
     ONE TEST RATHER THAN FOUR ASSERTIONS SPREAD AROUND, because the
     property is "no reader anywhere serves it" and that is a claim about
@@ -9481,6 +9487,19 @@ def test_review_repro_no_reader_serves_a_documents_bytes_or_text(client):
     document in plain text."""
     body = b"the contract says the delivery window is forty two days"
     digest = upload(client, "contract.txt", body).json()["digest"]
+    # A THROWAWAY COMPARISON FIRST, so group ids and run ids diverge.
+    # Without it both are 1 in a fresh per-test database, and the
+    # run-detail leg below fetched /runs/{group_id} by coincidence
+    # rather than by construction. The day a fixture seeds a row, that
+    # GET returns 404 whose body {"detail":"no such run"} contains
+    # neither the document text nor either column name, so all three
+    # assertions pass and the run-detail reader stops being proven while
+    # the test still reads green. Forcing the ids apart retires the
+    # whole coincidence class rather than this one instance of it.
+    client.post(
+        "/groups",
+        json={"prompt": "unrelated", "models": ["model/alpha"], "budget": "standard"},
+    )
     group_id = client.post(
         "/groups",
         json={
@@ -9504,11 +9523,24 @@ def test_review_repro_no_reader_serves_a_documents_bytes_or_text(client):
         },
     )
 
+    # The run this comparison actually recorded, read out of the group
+    # rather than assumed equal to it.
+    detail = client.get(f"/groups/{group_id}").json()
+    run_id = detail["runs"][0]["id"]
+    # The coincidence is dead and stays dead: if these ever coincide
+    # again the test says so instead of quietly scanning the wrong row.
+    assert run_id != group_id, (run_id, group_id)
+    run_detail = client.get(f"/runs/{run_id}")
+    # And the reader answered, so the scan below is over a real payload
+    # rather than over a 404 body that trivially contains nothing.
+    assert run_detail.status_code == 200, run_detail.text
+    assert "model/alpha" in run_detail.text
+
     payloads = {
         "attachment metadata": client.get(f"/attachments/{digest}").text,
         "history list": client.get("/runs").text,
         "group detail": client.get(f"/groups/{group_id}").text,
-        "run detail": client.get(f"/runs/{group_id}").text,
+        "run detail": run_detail.text,
     }
 
     text = body.decode()
@@ -9578,3 +9610,58 @@ def test_the_upload_still_accepts_json_with_a_charset(client):
     )
 
     assert resp.status_code == 201
+
+
+def test_review_repro_a_wrapped_base64_body_uploads(client):
+    """WINDOW: one POST /attachments whose content_base64 is wrapped at
+    76 characters, which is what `base64 file.pdf` emits on Linux and
+    macOS and what Python's base64.encodebytes emits.
+
+    THE TWO BOUNDARIES CONTRADICTED EACH OTHER IN ONE FILE.
+    MAX_ATTACHMENT_B64_CHARS budgeted slack for exactly these newlines
+    and its comment said why ("a wrapped base64 body is still a legal
+    one"), while create_attachment decoded with validate=True, which
+    refuses any newline. The allowance could never be used and the
+    comment explaining it was false.
+
+    The caller's experience is the reason this is not cosmetic: a
+    correct, legal encoding of the exact bytes they hold came back as
+    "content_base64 is not valid base64", a message that says their data
+    is corrupt and gives them no way to tell the difference from a body
+    that really is.
+
+    Both wrappings, because CRLF is as legal as LF and a Windows caller
+    is the likeliest person to produce one.
+    """
+    body = b"the wrapped contract says forty two" * 40
+    encoded = base64.b64encode(body).decode("ascii")
+    lf = "\n".join(encoded[i : i + 76] for i in range(0, len(encoded), 76))
+    crlf = lf.replace("\n", "\r\n")
+    assert "\n" in lf
+
+    for label, payload in (("lf", lf), ("crlf", crlf)):
+        resp = client.post(
+            "/attachments", json={"filename": "contract.txt", "content_base64": payload}
+        )
+
+        assert resp.status_code == 201, (label, resp.text)
+        # The SAME digest as the unwrapped body: whitespace is envelope,
+        # not content, so stripping it must not change what was stored.
+        assert resp.json()["digest"] == hashlib.sha256(body).hexdigest(), label
+        assert resp.json()["byte_size"] == len(body), label
+
+
+def test_a_body_with_real_garbage_is_still_refused(client):
+    """The guard on the fix above. Stripping whitespace must not become
+    stripping anything the alphabet does not contain: validate=True on
+    what remains is what stops a corrupted upload decoding to different
+    bytes than the sender holds and storing a digest neither can
+    reproduce. A fix that relaxed the decoder wholesale would pass the
+    wrapped-body test and lose that."""
+    resp = client.post(
+        "/attachments",
+        json={"filename": "notes.txt", "content_base64": "aGVsbG8h***bm90"},
+    )
+
+    assert resp.status_code == 422
+    assert "not valid base64" in resp.json()["detail"]

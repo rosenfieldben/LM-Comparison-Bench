@@ -455,3 +455,38 @@ def test_the_client_native_suffixes_match_the_extractor():
     assert block, "static/attach.js must declare NATIVE_SUFFIXES"
     declared = set(re.findall(r'"(\.[a-z]+)"', block.group(1)))
     assert declared == set(NATIVE_IMAGE_TYPES)
+
+
+def test_review_repro_the_native_refusal_survives_the_attach_message(bench):
+    """WINDOW: the composer's message line immediately after attaching a
+    non-image while the mode is ALREADY native. The other ordering
+    (attach first, switch mode second) is covered above and passes
+    either way, which is precisely why it could not catch this.
+
+    THE SUCCESS MESSAGE OVERWROTE THE REFUSAL. render() wrote "native
+    mode sends images as content parts..." into the line, and addFiles
+    replaced it with "attached 1 document" on the next statement. Run
+    was correctly disabled, but the only surviving explanation was the
+    button's title attribute, which never appears for a keyboard user
+    and never appears for anyone who does not hover a control that looks
+    inert. The person saw a successful attachment and a Run button that
+    would not press, with nothing on screen connecting the two.
+
+    A successful upload and an unusable staged set are both true. The
+    one that blocks the run is the one that owns the line."""
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+    page.get_by_test_id("prompt-input").fill("what does the contract say")
+    # Mode chosen BEFORE the file, which is the ordinary way round when
+    # somebody has just finished an image comparison.
+    page.get_by_test_id("attach-mode").select_option("native")
+
+    attach(page, text_file())
+
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    msg = page.get_by_test_id("attach-msg")
+    expect(msg).to_contain_text("native mode sends images as content parts")
+    assert "Switch to inline" in msg.inner_text()
+    # The success text must not be what survived.
+    assert "attached 1 document" not in msg.inner_text()
+    expect(page.get_by_test_id("run-button")).to_be_disabled()

@@ -26,6 +26,7 @@ database and the decision to store anything.
 
 import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Iterator
 from io import BytesIO
 from typing import Any
 
@@ -59,7 +60,30 @@ SUPPORTED_SUFFIXES = (".txt", ".md", ".pdf", ".docx")
 _DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _DOCX_TEXT = f"{_DOCX_NS}t"
 _DOCX_PARAGRAPH = f"{_DOCX_NS}p"
+_DOCX_TABLE = f"{_DOCX_NS}tbl"
 _DOCX_DOCUMENT = "word/document.xml"
+
+# The markup-compatibility namespace, which is how OOXML ships the same
+# content twice for readers of different vintages: mc:AlternateContent
+# holds an mc:Choice (the modern form) and an mc:Fallback (the legacy
+# one). A conformant reader consumes EXACTLY ONE branch. Reading both is
+# how a text box arrived in the prompt twice over.
+_MC_NS = "{http://schemas.openxmlformats.org/markup-compatibility/2006}"
+_MC_FALLBACK = f"{_MC_NS}Fallback"
+
+# Branches the walk below refuses to descend into, for three different
+# reasons that happen to share one mechanism.
+#
+# w:tbl because a table's text without its rows and columns is worse
+# than no table at all: the cells arrive as a flat list and nothing says
+# where a row ended, so a reader cannot tell "Q1 100 Q2 250" from any
+# other arrangement of the same four values. Excluding it makes the
+# docstring's promise true and leaves the person able to see that the
+# table is missing and paste it in, which is a workaround they cannot
+# apply to scrambled cells they never learn about.
+#
+# mc:Fallback because it is the duplicate of a branch already taken.
+_DOCX_SKIPPED = (_DOCX_TABLE, _MC_FALLBACK)
 
 
 # The composed prompt's ceiling, in characters, prompt and documents
@@ -141,25 +165,40 @@ def suffix_of(filename: str) -> str:
 
 
 def _decoded(content: bytes) -> str:
-    """Plain text bytes as a string, utf-8 first and cp1252 after.
+    """Plain text bytes as a string, utf-8 first and latin-1 after.
 
     THE FALLBACK IS DECLARED rather than silent, which is the whole
     reason it is spelled out here. utf-8 is the answer for anything
     written this decade; the file that is not utf-8 is almost always a
-    Windows export, and cp1252 decodes every byte sequence without
-    error, so it is a fallback that cannot itself fail.
+    Windows export.
 
-    That last property is why it is also the LAST resort: because it
-    never raises, a wrong guess here becomes mojibake in the prompt
-    rather than a refusal. Every model in the comparison reads the same
-    mojibake, so the comparison stays fair, and the alternative (refuse
-    anything not utf-8) would reject readable files over an encoding the
-    person cannot see.
+    latin-1 AND NOT cp1252, and the difference is the entire point of
+    this being a last resort. The fallback's job is to be TOTAL: it must
+    map every one of the 256 byte values, so that reaching it cannot
+    itself raise. latin-1 does. cp1252 does NOT: it leaves 0x81, 0x8D,
+    0x8F, 0x90 and 0x9D undefined and Python's codec raises
+    UnicodeDecodeError on all five, which escaped ExtractionError
+    entirely and turned a legacy text file into a bare 500. cp1252 is
+    the better GUESS for a Windows export, since it maps curly quotes
+    and dashes where latin-1 gives control characters, but a guess that
+    can crash is not a fallback, and the five holes are exactly the
+    bytes a file mangled by a pipeline is likely to carry.
+
+    Totality is why this is the LAST resort: because it cannot raise, a
+    wrong guess here becomes mojibake in the prompt rather than a
+    refusal. Every model in the comparison reads the same mojibake, so
+    the comparison stays fair, and the alternative (refuse anything not
+    utf-8) would reject readable files over an encoding the person
+    cannot see.
     """
     try:
         return content.decode("utf-8")
     except UnicodeDecodeError:
-        return content.decode("cp1252")
+        # errors="strict" is the default and is left in place on
+        # purpose: latin-1 is total, so a raise here would mean the
+        # premise above had stopped being true and the loud failure is
+        # what would say so.
+        return content.decode("latin-1")
 
 
 def _extract_text(content: bytes) -> str:
@@ -195,6 +234,47 @@ def _extract_pdf(content: bytes) -> str:
     return "\n\n".join(page for page in pages if page.strip())
 
 
+def _paragraphs(node: ET.Element) -> Iterator[ET.Element]:
+    """Every paragraph in the subtree, in document order, EXACTLY ONCE.
+
+    A recursive walk rather than root.iter(w:p), because iter() has no
+    way to express either of the two rules this needs. It skips the
+    branches in _DOCX_SKIPPED entirely, and it descends THROUGH a
+    paragraph after yielding it so a nested one (a text box) is still
+    found and still yielded on its own, once.
+
+    The pairing with _run_text is what makes "once" true: this yields
+    the nested paragraph separately, and _run_text refuses to read it
+    from inside its parent. Change one without the other and the text
+    either doubles or vanishes.
+    """
+    for child in node:
+        if child.tag in _DOCX_SKIPPED:
+            continue
+        if child.tag == _DOCX_PARAGRAPH:
+            yield child
+        yield from _paragraphs(child)
+
+
+def _run_text(paragraph: ET.Element) -> str:
+    """One paragraph's own text: every w:t under it that does not belong
+    to a nested paragraph, a table, or a discarded compatibility branch.
+
+    Not a direct-children scan, because a w:t is legitimately several
+    levels down (w:p > w:hyperlink > w:r > w:t is ordinary), and reading
+    only direct runs would silently drop every linked word.
+    """
+    parts: list[str] = []
+    for child in paragraph:
+        if child.tag in _DOCX_SKIPPED or child.tag == _DOCX_PARAGRAPH:
+            continue
+        if child.tag == _DOCX_TEXT:
+            parts.append(child.text or "")
+        else:
+            parts.append(_run_text(child))
+    return "".join(parts)
+
+
 def _extract_docx(content: bytes) -> str:
     """Paragraph text from WordprocessingML, standard library only.
 
@@ -209,10 +289,24 @@ def _extract_docx(content: bytes) -> str:
     would insert spaces into the middle of words wherever somebody
     bolded half of one.
 
-    What this does not read: tables, headers, footers, footnotes and
-    comments, which live in other parts of the archive. Stated rather
-    than discovered, and a limit worth knowing before attaching a
-    document whose content is mostly tabular.
+    TEXT BOXES ARE EMITTED ONCE, which took a walk rather than a filter.
+    Word nests a whole w:p inside a run for a text box, callout or pull
+    quote, so a naive iter() over every w:p in the tree harvested the
+    inner paragraph's runs into the outer one AND emitted the inner
+    paragraph again on its own, then did it a second time because the
+    same box is written under both mc:Choice and mc:Fallback. Four
+    copies, the first two welded together because runs join without a
+    separator, which produced a sentence the document does not contain.
+    So _paragraphs yields each paragraph exactly once and _run_text
+    stops at a nested paragraph, leaving it to be emitted in its own
+    right.
+
+    What this does not read: TABLES, headers, footers, footnotes and
+    comments. Tables live in this same part of the archive and could be
+    read, and are deliberately skipped anyway: see _DOCX_SKIPPED for why
+    flattened cells are worse than absent ones. The rest genuinely live
+    in other parts. Stated rather than discovered, and a limit worth
+    knowing before attaching a document whose content is mostly tabular.
     """
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
@@ -235,10 +329,7 @@ def _extract_docx(content: bytes) -> str:
             f"this .docx contains unreadable XML ({exc}). The file is "
             "damaged; try re-saving it from Word."
         ) from exc
-    paragraphs = [
-        "".join(node.text or "" for node in paragraph.iter(_DOCX_TEXT))
-        for paragraph in root.iter(_DOCX_PARAGRAPH)
-    ]
+    paragraphs = [_run_text(paragraph) for paragraph in _paragraphs(root)]
     return "\n".join(text for text in paragraphs if text.strip())
 
 

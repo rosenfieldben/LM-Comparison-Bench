@@ -147,19 +147,47 @@ def test_markdown_is_read_as_text_rather_than_rendered():
 
 
 def test_review_repro_a_non_utf8_file_falls_back_rather_than_refusing():
-    """THE DECLARED FALLBACK. cp1252 decodes every byte sequence without
-    raising, so a Windows export lands as text rather than as a refusal
-    over an encoding the person cannot see.
+    """THE DECLARED FALLBACK, and its window is TOTALITY.
 
-    A wrong guess becomes mojibake in the prompt, and every model in the
-    comparison reads the same mojibake, so the comparison stays fair.
-    That is the trade, and it is why the fallback is last rather than
-    first.
+    The claim is not "some Windows bytes decode", it is that the
+    fallback maps EVERY byte value and therefore cannot itself raise.
+    So the window this exercises is all 256 of them, one file per value,
+    plus the five that specifically broke the previous fallback.
+
+    The old proof asserted the universal sentence and exercised 0x93 and
+    0x94, both of which cp1252 maps. It passed while the codec under it
+    raised UnicodeDecodeError on 0x81, 0x8D, 0x8F, 0x90 and 0x9D, which
+    escaped ExtractionError and turned a legacy text file into a bare
+    500. A proof of two mapped bytes is not a proof about a mapping, and
+    that gap is exactly what a named window is for.
     """
-    # 0x93 and 0x94 are cp1252 smart quotes and are not valid utf-8.
+    # The five cp1252 leaves undefined. Every one of them was a 500.
+    for byte in (0x81, 0x8D, 0x8F, 0x90, 0x9D):
+        content = b"Rapport" + bytes([byte]) + b" final"
+        out = extract("legacy.txt", content)
+        assert out["text"] == content.decode("latin-1")
+
+    # And the whole byte space, because "cannot raise" is a claim about
+    # all of it. Each value gets its own file so a failure names the
+    # byte rather than the batch.
+    #
+    # The byte sits BETWEEN two ASCII characters rather than at the end,
+    # because extract() strips the result and a trailing 0x09 would then
+    # be compared against a tab that is no longer there. Interior
+    # whitespace survives, so this asks the question it means to ask.
+    for value in range(256):
+        raw = bytes([value])
+        assert extract("legacy.txt", b"x" + raw + b"y")["text"] == (
+            "x" + raw.decode("latin-1") + "y"
+        )
+
+    # The ordinary Windows export still lands as text. It lands as
+    # latin-1 mojibake now rather than as cp1252 smart quotes, which is
+    # the price of a total fallback and is stated in _decoded: every
+    # model reads the same mojibake, so the comparison stays fair.
     out = extract("legacy.txt", b"he said \x93hello\x94 to her")
 
-    assert out["text"] == "he said “hello” to her"
+    assert out["text"] == "he said \x93hello\x94 to her"
 
 
 # ---- PDF.
@@ -226,6 +254,112 @@ def test_review_repro_runs_inside_a_paragraph_join_without_a_separator():
     out = extract("memo.docx", docx_bytes(None, runs=["un", "believ", "able"]))
 
     assert out["text"] == "unbelievable"
+
+
+def rich_docx(body):
+    """A docx whose body is given verbatim, so a test can build the
+    shapes docx_bytes cannot: tables, text boxes, hyperlinks and the
+    markup-compatibility branches Word emits around a drawing."""
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    mc = "http://schemas.openxmlformats.org/markup-compatibility/2006"
+    document = (
+        f'<?xml version="1.0"?><w:document xmlns:w="{ns}" xmlns:mc="{mc}">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", document)
+    return buffer.getvalue()
+
+
+def test_review_repro_a_docx_text_box_reaches_the_prompt_exactly_once():
+    """WINDOW: the extracted text of one .docx whose body holds a
+    paragraph containing a text box, written the way Word writes one,
+    with the same content under both mc:Choice and mc:Fallback.
+
+    THE OLD WALK PRODUCED FOUR COPIES, TWO OF THEM FUSED. root.iter(w:p)
+    matched the nested paragraph, and the outer paragraph's w:t scan
+    reached into it as well, so the box was harvested once as part of
+    its parent and once on its own; mc:Fallback then doubled the pair.
+    Because runs inside one paragraph join with NO separator, the first
+    copy welded to the body text and produced a token sequence the
+    document does not contain.
+
+    Repetition is a salience signal to a language model, so this was not
+    cosmetic: every model read the boxed sentence four times and the
+    comparison silently over-weighted it. The fairness law held the
+    whole time, which is the point worth keeping: fair is not the same
+    as correct, and this was a fair comparison over a document nobody
+    wrote.
+    """
+    body = (
+        "<w:p><w:r><w:t>Body text. </w:t></w:r>"
+        "<w:r><mc:AlternateContent>"
+        "<mc:Choice><w:txbxContent><w:p><w:r><w:t>BOXED</w:t></w:r></w:p>"
+        "</w:txbxContent></mc:Choice>"
+        "<mc:Fallback><w:txbxContent><w:p><w:r><w:t>BOXED</w:t></w:r></w:p>"
+        "</w:txbxContent></mc:Fallback>"
+        "</mc:AlternateContent></w:r></w:p>"
+    )
+
+    text = extract("report.docx", rich_docx(body))["text"]
+
+    # Once, and on its own line: not fused to the body text, and not
+    # repeated by the fallback branch. The paragraph keeps its own
+    # trailing space, because that space is in the document and only the
+    # whole extraction is stripped, never an interior paragraph.
+    assert text == "Body text. \nBOXED"
+    assert text.count("BOXED") == 1
+    assert "Body text. BOXED" not in text
+
+
+def test_review_repro_a_docx_table_is_absent_rather_than_flattened():
+    """WINDOW: the extracted text of one .docx holding a paragraph, then
+    a two-cell table, then another paragraph.
+
+    THE DOCSTRING SAID TABLES WERE NOT READ AND THEY WERE. w:tbl lives
+    in word/document.xml like everything else, and the old walk matched
+    every w:p at any depth, so each cell's paragraph came through as its
+    own line with nothing marking where a row ended: "Quarter\n100" is
+    indistinguishable from any other arrangement of those values.
+
+    ABSENT IS BETTER THAN FLATTENED, which is the whole judgment here. A
+    person told the table is missing can see the gap and paste the table
+    into the prompt. Nobody notices scrambled cells, and every model
+    answers confidently over them.
+
+    The surrounding paragraphs are asserted too, because "skip the
+    table" must not become "skip everything after the table": the walk
+    prunes a branch rather than stopping.
+    """
+    body = (
+        "<w:p><w:r><w:t>Before.</w:t></w:r></w:p>"
+        "<w:tbl><w:tr>"
+        "<w:tc><w:p><w:r><w:t>Quarter</w:t></w:r></w:p></w:tc>"
+        "<w:tc><w:p><w:r><w:t>100</w:t></w:r></w:p></w:tc>"
+        "</w:tr></w:tbl>"
+        "<w:p><w:r><w:t>After.</w:t></w:r></w:p>"
+    )
+
+    text = extract("report.docx", rich_docx(body))["text"]
+
+    assert text == "Before.\nAfter."
+    assert "Quarter" not in text
+    assert "100" not in text
+
+
+def test_a_hyperlinked_word_is_still_read():
+    """The guard on the fix above. The walk stops at a nested PARAGRAPH,
+    not at every nested element, because a w:t sits several levels down
+    in ordinary markup: w:p > w:hyperlink > w:r > w:t. A direct-children
+    scan would have silently dropped every linked word, which is the
+    obvious wrong way to stop the double-count."""
+    body = (
+        "<w:p><w:r><w:t>See </w:t></w:r>"
+        "<w:hyperlink><w:r><w:t>the spec</w:t></w:r></w:hyperlink></w:p>"
+    )
+
+    assert extract("notes.docx", rich_docx(body))["text"] == "See the spec"
 
 
 def test_a_docx_that_is_not_a_zip_is_refused():

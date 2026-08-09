@@ -548,7 +548,8 @@ plumbing.
   model can participate.
 - **native** hands an image to the provider as a content part and lets
   the model read it itself. That measures layout, tables and handwriting
-  that extraction throws away, and it **changes which models can
+  that extraction cannot give you (see the note on `.docx` tables
+  below), and it **changes which models can
   participate**, because a text-only model cannot take an image at all.
   It is strict mode's bargain in a new costume: a narrower population in
   exchange for a sharper question. So it is declared, recorded on the
@@ -561,6 +562,17 @@ deliberately not taken here: an animated GIF is a sequence of frames, and
 what a provider does with the frames it is not shown is undefined and
 varies, so a comparison over one would not be a comparison over the same
 input.
+
+**Tables in a `.docx` are not read.** They could be: they sit in the same
+part of the archive as the paragraphs. They are skipped on purpose,
+because a table's text without its rows and columns is worse than no
+table at all. Flattened cells arrive as a list of values with nothing
+saying where a row ended, and every model then answers confidently over
+an arrangement the document does not have. An absent table is something
+you can see is absent, so **paste the table into the prompt** and every
+model reads it the way you meant. Scrambled cells are something nobody
+notices. Headers, footers, footnotes and comments are not read either;
+those genuinely live in other parts of the archive.
 
 A scanned PDF is refused at upload rather than attached empty. The bench
 does no OCR, so a PDF whose pages carry no text layer would otherwise

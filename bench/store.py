@@ -279,7 +279,7 @@ MIGRATIONS = [
     ("groups", "task_id", "TEXT"),
     ("groups", "repeat_index", "INTEGER"),
     ("groups", "rotation_index", "INTEGER"),
-    # Phase K, attachments. One column, nullable and additive; the
+    # Phase K, attachments. TWO columns, both nullable and additive; the
     # attachments table itself needs no entry here for the same reason
     # the Phase I tables did not, since CREATE TABLE IF NOT EXISTS in
     # SCHEMA creates it on any database, new or old.

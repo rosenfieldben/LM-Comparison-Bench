@@ -314,11 +314,25 @@
     return null;
   }
 
-  // Bytes to base64, in chunks. btoa over one String.fromCharCode.apply
-  // of an eight-megabyte array overflows the argument stack in every
-  // engine; the chunk size is well under any of their limits and the
-  // concatenation is exact because base64 encodes three bytes at a time
-  // and 0x8000 is divisible by three.
+  // Bytes to a binary string, in chunks, and then ONE btoa over the
+  // whole thing.
+  //
+  // The chunking exists for exactly one reason: String.fromCharCode.apply
+  // over an eight-megabyte array overflows the argument stack in every
+  // engine. 0x8000 is comfortably under every engine's limit and has no
+  // other constraint on it.
+  //
+  // WHAT THE CHUNK SIZE DOES NOT NEED TO BE is a multiple of three. The
+  // comment here used to claim that base64's three-byte quantum made
+  // the concatenation exact and that 0x8000 is divisible by three.
+  // Neither half was true: 0x8000 % 3 is 2, and alignment cannot matter
+  // because the chunks are joined into one binary string and encoded
+  // once at the end. The claim was load-bearing in the worst way, since
+  // it told a reader that per-chunk encoding would be safe. It would
+  // not: encoding each chunk separately emits padding mid-string and
+  // produces a body whose digest is not the file's. If this is ever
+  // changed to encode incrementally, the chunk size MUST become a
+  // multiple of three, and that is the constraint to write down then.
   const B64_CHUNK = 0x8000;
 
   function toBase64(buffer) {
@@ -419,7 +433,6 @@
       added.push(stored);
     }
     staged = staged.concat(added);
-    render();
     // The stored filename can differ from the one just picked, because
     // identical bytes already here keep the name they arrived under.
     // Saying so is cheaper than letting somebody wonder why their file
@@ -433,6 +446,15 @@
         : "attached " +
           added.length +
           (added.length === 1 ? " document" : " documents");
+    // RENDER LAST, so a refusal outranks a success. render() writes the
+    // native-mode warning into this same line, and doing it before the
+    // message above meant the warning was overwritten one statement
+    // later: a person already in native mode who attached a PDF saw
+    // "attached 1 document", a Run button that would not press, and the
+    // reason only in a hover title no keyboard user ever sees. A
+    // successful upload and an unusable staged set are both true, and
+    // the one that blocks the run is the one worth the line.
+    render();
   }
 
   function init() {
