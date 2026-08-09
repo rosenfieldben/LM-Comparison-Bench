@@ -4618,7 +4618,7 @@ class RatingsSubmit(BaseModel):
     ratings: list[Rating] = Field(min_length=1, max_length=MAX_POSITION + 1)
     # The token the server issued when it opened a blind session, echoed
     # back. This is the ONLY thing that can make a rating blind; see
-    # blind_token_valid for why a boolean could not.
+    # blind_session_for for why a boolean could not.
     #
     # Absent is the ordinary case and it is not an error: a sighted
     # rating is a real rating, it simply persists blind = 0. Bounded
@@ -4629,7 +4629,7 @@ class RatingsSubmit(BaseModel):
     # its own answer from the blind session's token instead, because a
     # page that revealed the identities and then claimed blind=true would
     # be testifying about its own past, which is the one witness a blind
-    # record cannot use. See submit_ratings and blind_token_valid.
+    # record cannot use. See submit_ratings and blind_session_for.
     #
     # No client in this repository sends it any more, as of the commit
     # that removed the legacy rate-blind path. It remains only so a
@@ -4679,7 +4679,26 @@ async def submit_ratings(group_id: int, body: RatingsSubmit) -> dict[str, Any]:
             "page may be showing an older comparison than the one it is "
             "rating; reload it.",
         )
-    blind = blind_token_valid(group_id, body.blind_token)
+    shown = blind_session_for(group_id, body.blind_token)
+    blind = shown is not None
+    if shown is not None:
+        # A TOKEN DOES NOT COVER RESULTS ITS SESSION NEVER SHOWED. The
+        # shape is the stale-page check just above, one question in: that
+        # one asks whether the result belongs to this comparison, and
+        # this one asks whether it was on the blind view the token was
+        # issued for. Refused rather than downgraded to sighted, because
+        # a rating for a card that was never displayed is not a judgment
+        # anybody made, and recording it under either flag would be
+        # recording an opinion nobody held.
+        unshown = sorted({r.result_id for r in body.ratings} - shown)
+        if unshown:
+            raise HTTPException(
+                422,
+                f"result ids {unshown} were not in this blind session. "
+                "The comparison has been run again since the session "
+                "opened, so the page is showing cards the blind view "
+                "never contained; reveal and reopen to rate them.",
+            )
     written = 0
     for rating in body.ratings:
         store.add_score(
@@ -4721,19 +4740,22 @@ def _rating_detail(rating: Rating) -> str:
 #
 # Three states, and the None is load-bearing:
 #   absent  no session was ever opened for this group
-#   set     the tokens of every session currently open on it
+#   dict    every session currently open on it, token to result ids
 #   None    a reveal happened; the close is one way and this is the mark
 #
-# A SET rather than one token, because two people rating the same
+# MANY SESSIONS rather than one token, because two people rating the same
 # comparison on one machine are both legitimately blind and neither
 # should invalidate the other. A reveal closes all of them at once, which
 # is correct: once anybody has seen the answer key for this comparison,
 # no rating of it made afterwards is blind however the page is arranged.
-BLIND_SESSIONS: dict[int, set[str] | None] = {}
+#
+# EACH TOKEN CARRIES THE RESULT IDS ITS SHUFFLE SHOWED, which is what
+# makes the value a mapping rather than a set. See blind_session_for.
+BLIND_SESSIONS: dict[int, dict[str, frozenset[int]] | None] = {}
 
 
-def blind_token_valid(group_id: int, token: str | None) -> bool:
-    """Whether these ratings came from an open, unrevealed blind session.
+def blind_session_for(group_id: int, token: str | None) -> frozenset[int] | None:
+    """The results this token's session showed, or None if it showed none.
 
     A TOKEN AND NOT A BOOLEAN, and the difference is the whole of this
     fix. A per-group boolean answered "is a blind session open for this
@@ -4743,20 +4765,45 @@ def blind_token_valid(group_id: int, token: str | None) -> bool:
     somebody else's blind and they persisted blind = 1. Nothing about
     that rating was blind and nothing in the record said so.
 
-    Four ways to arrive without one, all the same answer. No token: a
+    A SET AND NOT A BARE TOKEN, and that is the same defect one size
+    smaller, found by the declaration-completeness lens: the session
+    declares a shuffle over the results that exist when it opens, and
+    the token used to be valid for any result in the group forever
+    after. Run the same comparison again into the same group while a
+    session is open and the new results join it; a rating naming one of
+    them, carrying the old token, persisted blind = 1 for a card no
+    server-built view had ever contained. Reproduced at 6b476b5: results
+    [1, 2] shown, results [3, 4] added, result 3 rated and stored with
+    blind = 1.
+
+    So a token now answers WHICH results it can speak for, and the
+    caller checks membership. What the flag attests is unchanged in
+    words and finally true of every row it is written on.
+
+    Four ways to arrive with no session, all answering None. No token: a
     sighted rating, which is a real rating that is simply not blind. A
     token for a session that was never opened, or one invented: nothing
     issued it. A token after the reveal: somebody has seen the answer
     key. Compared with compare_digest because a token comparison is a
     token comparison, not because the threat model here is timing.
+
+    None therefore means "not blind" at every call site, exactly as the
+    boolean it replaced did, and an empty frozenset cannot occur: a
+    session over no results is refused before a token is minted.
     """
     if token is None:
-        return False
+        return None
     issued = BLIND_SESSIONS.get(group_id)
     if not issued:
         # Absent, revealed (None), or open with nothing outstanding.
-        return False
-    return any(hmac.compare_digest(known, token) for known in issued)
+        return None
+    for known, shown in issued.items():
+        # compare_digest over every key rather than a dict lookup, which
+        # would compare byte by byte and stop early. The token is the
+        # only thing standing between a sighted page and a blind claim.
+        if hmac.compare_digest(known, token):
+            return shown
+    return None
 
 
 @app.post("/groups/{group_id}/blind", status_code=201)
@@ -4771,7 +4818,8 @@ async def open_blind_session(group_id: int) -> dict[str, Any]:
     style rule anyone can undo, plus a frame the rater may have seen.
 
     The response carries a TOKEN, and a rating is recorded blind only if
-    it comes back bearing one. See blind_token_valid.
+    it comes back bearing one, for a result THIS session showed. See
+    blind_session_for.
 
     THE HONEST RESIDUAL, stated here because this is where the feature
     lives and a limit documented somewhere else is a limit nobody reads.
@@ -4825,8 +4873,12 @@ async def open_blind_session(group_id: int) -> dict[str, Any]:
     # while a guessable token would let a page claim a blindness the
     # server never granted it, which is the whole thing this defends.
     token = secrets.token_urlsafe(32)
-    open_tokens = BLIND_SESSIONS.get(group_id) or set()
-    open_tokens.add(token)
+    open_tokens = BLIND_SESSIONS.get(group_id) or {}
+    # What THIS token may later attest: the ids in the shuffle it is
+    # being handed, and no others. A later run into the same group adds
+    # results that this session never showed, and they must not inherit
+    # its blindness.
+    open_tokens[token] = frozenset(r["id"] for r in results)
     BLIND_SESSIONS[group_id] = open_tokens
     return {
         "group_id": group_id,

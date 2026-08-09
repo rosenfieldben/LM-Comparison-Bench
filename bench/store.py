@@ -197,12 +197,18 @@ CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
 # operation run at boot on the file holding somebody's documents.
 #
 # The second is the one that actually decides it. A foreign key cascade
-# is INERT unless the connection sets `PRAGMA foreign_keys = ON`, and
-# the sqlite3 command line leaves it off. Nothing in this application
-# deletes an attachment; the only actor who can is a person with sqlite3
-# and their own bench.db, which is exactly what AttachmentRef's docstring
-# names and exactly the case a key would not have covered. A trigger
-# fires for every deleter, pragma or no pragma.
+# is INERT unless the connection sets `PRAGMA foreign_keys = ON`:
+# "Foreign key constraints are disabled by default (for backwards
+# compatibility), so must be enabled separately for each database
+# connection", and the page's own shell transcript shows the sqlite3
+# command line answering 0 to `PRAGMA foreign_keys`
+# (https://www.sqlite.org/foreignkeys.html, read 2026-08-09). Nothing in
+# this application deletes an attachment; the only actor who can is a
+# person with sqlite3 and their own bench.db, which is exactly what
+# AttachmentRef's docstring names and exactly the case a key would not
+# have covered. A trigger fires for every deleter, pragma or no pragma,
+# and the same page warns against assuming the default will not change,
+# which a trigger does not have to care about either way.
 #
 # What survives a delete without this is not a dangling id: it is the
 # extracted TEXT of the document, sitting in a second table under the

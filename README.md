@@ -558,8 +558,8 @@ plumbing.
 
 **What the native check clears, and what it does not.** It clears
 *modality*: whether the catalog says a model takes image input at all. It
-does not clear *how many*. OpenRouter states that "the number of images
-you can send in a single request varies per provider and per model", and
+does not clear *how many*. OpenRouter states: "The number of images you
+can send in a single request varies per provider and per model", and
 the catalog publishes no per-model number, so there is nothing to check
 the four-document cap against and the bench does not invent one. Four
 images that each model accepts singly will pass creation and can still be
@@ -1174,6 +1174,18 @@ one issued before the reveal all persist `blind = 0`. Several sessions may
 be open on one comparison at once, because two people rating it are both
 legitimately blind; one reveal closes all of them, because the answer key
 is out.
+
+**A token speaks only for the cards its own session showed.** The same
+over-attestation had a smaller version in it: the boolean was true for
+every tab, and the token was true for every *result*, including ones that
+did not exist when the session opened. Run a comparison again into the
+same group while a session is live and the new results join it; a rating
+naming one of them, carrying the old token, used to persist `blind = 1`
+for a card no server-built view had ever contained. Each token now
+carries the result ids of the shuffle it was handed, and a rating for
+anything else is refused rather than quietly downgraded: a rating for a
+card that was never displayed is not a judgment anybody made. Reveal and
+reopen to rate the new answers.
 
 **What the flag attests is the path the rating took**, and stating that is
 the point rather than a hedge. It says these ratings came from a view the

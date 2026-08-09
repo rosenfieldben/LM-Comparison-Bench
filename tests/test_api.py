@@ -10809,3 +10809,90 @@ def test_review_repro_a_re_upload_reports_its_own_character_count(client):
     back = upload(client, "shot.png", png).json()
     assert back["kind"] == "image"
     assert back["extracted_chars"] == 0
+
+
+# ---- Phase K.1 closing review: the declaration-completeness lens, applied
+# ---- to the blind session's manifest.
+
+
+@respx.mock
+def test_review_repro_a_token_cannot_attest_a_card_it_never_showed(client):
+    """WINDOW: POST /groups/{id}/ratings, on a group that gained results
+    AFTER its blind session was opened and while its token is still live.
+
+    THE SESSION DECLARES A SHUFFLE, and the declaration did not pin what
+    the token could later speak for. A blind session issues an
+    anonymized view over the results that exist when it opens. Run the
+    same comparison again into the same group and the new results join
+    it; the old token stayed valid for every result in the group, so a
+    rating naming one of the new ones persisted blind = 1 for a card no
+    server-built view had ever contained.
+
+    THIS IS THE SAME DEFECT THE TOKEN WAS INTRODUCED TO FIX, one size
+    smaller. The per-group boolean over-attested across TABS; the
+    per-group token over-attested across TIME. What the flag claims is
+    "the bench did not tell them", and the bench had never shown them
+    this card at all.
+
+    Refused rather than downgraded to sighted: a rating for a card that
+    was never displayed is not a judgment anybody made, and writing it
+    under either flag would record an opinion nobody held.
+    """
+    group_id, ids = rated_group(client)
+    opened = client.post(f"/groups/{group_id}/blind", json={})
+    assert opened.status_code == 201, opened.text
+    token = opened.json()["token"]
+    shown = sorted(card["result_id"] for card in opened.json()["cards"])
+    assert shown == sorted(ids)
+
+    # The same comparison, run again into the same group. Allowed: the
+    # lineup, prompt, budget and controls all match the declaration.
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    for model in ("model/alpha", "model/beta"):
+        stream_events(
+            client,
+            {"prompt": "rate me", "model": model, "group_id": group_id},
+        )
+    detail = client.get(f"/groups/{group_id}").json()
+    every = [r["id"] for run in detail["runs"] for r in run["results"]]
+    late = [rid for rid in every if rid not in shown]
+    assert late, "the second run produced no new results to rate"
+
+    refused = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "ratings": [{"result_id": late[0], "rating": 5}],
+            "blind_token": token,
+        },
+    )
+    assert refused.status_code == 422, refused.text
+    assert "not in this blind session" in refused.json()["detail"]
+    assert (
+        client.app.state.db.execute(
+            "SELECT COUNT(*) c FROM scores WHERE result_id = ?", (late[0],)
+        ).fetchone()["c"]
+        == 0
+    )
+
+    # The cards the session DID show still rate blind, so the fix did not
+    # buy honesty by breaking the feature.
+    still = client.post(
+        f"/groups/{group_id}/ratings",
+        json={
+            "ratings": [{"result_id": shown[0], "rating": 4}],
+            "blind_token": token,
+        },
+    )
+    assert still.status_code == 201, still.text
+    assert still.json()["blind"] is True
+
+    # And a sighted rating of the new card is still accepted, because
+    # nothing is wrong with rating it: only with calling that blind.
+    sighted = client.post(
+        f"/groups/{group_id}/ratings",
+        json={"ratings": [{"result_id": late[0], "rating": 2}]},
+    )
+    assert sighted.status_code == 201, sighted.text
+    assert sighted.json()["blind"] is False
