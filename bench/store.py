@@ -143,6 +143,8 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     extractor_version TEXT NOT NULL,
     extracted_text TEXT NOT NULL,
     created_at TEXT NOT NULL,
+    kind TEXT,
+    filename TEXT,
     UNIQUE (digest, extractor, extractor_version)
 );
 CREATE TABLE IF NOT EXISTS results (
@@ -311,6 +313,55 @@ MIGRATIONS = [
     # absence attachments_json records and is stored the same way, so a
     # reader never has to reconcile a mode against no documents.
     ("groups", "attachments_mode", "TEXT"),
+    # Phase K.1: the RENDITION PIN. Two columns on attachment_extractions
+    # and one on groups, all nullable and additive.
+    #
+    # A rendition is (digest, extractor, extractor_version, kind): not
+    # "which bytes" but "which reading of which bytes". Phase K keyed
+    # everything on the digest alone, and the digest is a fact about the
+    # file while the text a model reads is a fact about the file AND the
+    # parser AND which parser the suffix chose. Three measured
+    # consequences of the shorter key, all of them silent:
+    #
+    #   PNG bytes uploaded as shot.txt were accepted into inline mode,
+    #   because the check read the STORED filename, and every model
+    #   received seventy characters of latin-1-decoded binary as the
+    #   "document".
+    #
+    #   The same bytes re-uploaded as shot.png were then refused from
+    #   native mode forever, because the row still said shot.txt.
+    #
+    #   A .docx uploaded a second time as .txt made POST and GET
+    #   disagree about the same digest: 324 characters of mojibake from
+    #   one, 25 characters of real text from the other.
+    #
+    # kind and filename on the extraction row are what each rendition
+    # was actually read AS, so a second suffix is a second rendition
+    # rather than a contradiction about the first.
+    #
+    # NO CONSTRAINT CHANGE, and that is what keeps this additive. SQLite
+    # cannot widen UNIQUE (digest, extractor, extractor_version) and
+    # cannot ADD COLUMN UNIQUE, so a four-column key would be
+    # unreachable on any existing database. It is not needed: kind is a
+    # FUNCTION of the extractor ("none" is the image reader and nothing
+    # else is), so the three-column constraint already enforces the
+    # four-part key and the fourth part is recorded rather than
+    # constrained. If a future extractor ever produced two kinds, this
+    # comment is the thing that would have to change first.
+    ("attachment_extractions", "kind", "TEXT"),
+    ("attachment_extractions", "filename", "TEXT"),
+    # The ordered rendition list a group pinned at creation, as JSON
+    # objects rather than the bare digests attachments_json holds.
+    #
+    # THREE ERAS AND THREE NULLS, which is why the rule is written at
+    # the check site (see group_renditions). NULL here with
+    # attachments_json also NULL is pre-K: no attachment concept
+    # existed. NULL here with attachments_json set is post-K and
+    # pre-K.1: documents were declared but only by digest, so which
+    # reading they got was whatever the parser of the day produced.
+    # Present is K.1: the reading itself is pinned and resolution
+    # honors it or refuses.
+    ("groups", "renditions_json", "TEXT"),
 ]
 
 
@@ -432,6 +483,34 @@ def connect(path: str) -> sqlite3.Connection:
     # After the migrations, not before: runs.group_id may only exist
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
+    # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
+    # reader because of a real gap rather than for tidiness.
+    #
+    # attachment_extractions shipped in c9ad170 and nothing backfilled
+    # it, so a database created by any build between the two carries
+    # attachments rows and zero extraction rows. K.1 resolves a pinned
+    # rendition against that table and REFUSES rather than substituting,
+    # so without this every such document would become unusable the day
+    # the pin arrived: a correct refusal about a document the bench is
+    # holding and can read perfectly well.
+    #
+    # The attachments row IS an extraction: it carries the text, the
+    # extractor and the version of the first reading. This copies that
+    # fact into the table that now owns it, once. INSERT OR IGNORE makes
+    # every later boot a no-op, and kind is derived from the EXTRACTOR
+    # rather than from the filename, because the extractor is what
+    # actually did the reading and the filename is the thing K.1 stopped
+    # trusting.
+    conn.execute(
+        """INSERT OR IGNORE INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename)
+           SELECT digest, extractor, extractor_version, extracted_text,
+                  created_at,
+                  CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
+                  filename
+           FROM attachments"""
+    )
     conn.commit()
     return conn
 
@@ -540,6 +619,7 @@ def create_group(
     experiment: dict[str, Any] | None = None,
     attachments: list[str] | None = None,
     attachments_mode: str | None = None,
+    renditions: list[dict[str, Any]] | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -577,15 +657,34 @@ def create_group(
     An empty list stores NULL, exactly as an empty params mapping does,
     because absence gets one spelling. The reader's two NULLs then stay
     honest: see group_attachments.
+
+    renditions is Phase K.1's pin and is the SOURCE of both attachment
+    columns. It carries (digest, extractor, extractor_version, kind) per
+    document in declaration order, and attachments_json is DERIVED from
+    it here rather than passed in beside it. One write, one source: two
+    lists supplied independently could disagree about which documents a
+    group holds, and every digest-only reader downstream (list_runs, the
+    export, the report) would then describe a different comparison from
+    the one the composer built.
+
+    sort_keys on the rendition objects, for the reason params_json has
+    it and attachments_json never needed it: a list of bare strings
+    serializes exactly one way and a list of objects does not. Two
+    identical pins built by two code paths must produce identical column
+    bytes, or the export's trailing digest stops being a function of the
+    experiment.
     """
+    if renditions:
+        # Derived, never supplied. See above.
+        attachments = [str(r["digest"]) for r in renditions]
     place = experiment or {}
     with conn:
         cur = conn.execute(
             "INSERT INTO groups"
             " (created_at, prompt_text, models_json, params_json, budget,"
             "  experiment_id, task_id, repeat_index, rotation_index,"
-            "  attachments_json, attachments_mode)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  attachments_json, attachments_mode, renditions_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
@@ -598,6 +697,7 @@ def create_group(
                 place.get("rotation_index"),
                 json.dumps(attachments) if attachments else None,
                 attachments_mode if attachments else None,
+                json.dumps(renditions, sort_keys=True) if renditions else None,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
@@ -699,14 +799,24 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         # same version is the ordinary case and must stay a no-op.
         conn.execute(
             """INSERT OR IGNORE INTO attachment_extractions
-               (digest, extractor, extractor_version, extracted_text, created_at)
-               VALUES (?, ?, ?, ?, ?)""",
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["extractor"],
                 record["extractor_version"],
                 record["extracted_text"],
                 now,
+                record["kind"],
+                # The name THIS rendition was read under, which is not
+                # necessarily the name on the attachments row: that one
+                # belongs to whichever upload arrived first and must not
+                # be rewritten, because comparisons already cite it. The
+                # rendition records its own so a second suffix can be
+                # described truthfully instead of contradicting the
+                # first.
+                record["filename"],
             ),
         )
         row = conn.execute(
@@ -715,31 +825,105 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         ).fetchone()
     assert row is not None
     out = dict(row)
-    # The row on disk carries the FIRST parser's reading, which is the
-    # era record and is deliberately not rewritten. What this call is
-    # about is the reading just performed, so that is what comes back.
+    # The row on disk carries the FIRST parser's reading under the FIRST
+    # name, which is the era record and is deliberately not rewritten.
+    # What this call is about is the rendition just produced, so that is
+    # what comes back, ALL FOUR PARTS OF IT plus the name it was read
+    # under. Overlaying three of the four was the shape that let a
+    # caller receive the first upload's kind attached to this reading's
+    # text: a rendition that was never stored and never sent.
     out["extracted_text"] = record["extracted_text"]
     out["extractor"] = record["extractor"]
     out["extractor_version"] = record["extractor_version"]
+    out["kind"] = record["kind"]
+    out["filename"] = record["filename"]
     return out
 
 
 def extraction_for(
     conn: sqlite3.Connection, digest: str, extractor: str, version: str
-) -> str | None:
-    """This parser's reading of these bytes, or None if it never read them.
+) -> dict[str, Any] | None:
+    """One RENDITION: this parser's reading of these bytes, or None.
 
-    None is the caller's cue to re-extract from the stored content and
-    save the result, which is the version-miss path. It is never a cue
-    to fall back on another version's text: that is the substitution
-    this table exists to stop.
+    Returns the whole row rather than the text alone, because a
+    rendition is four facts and a caller that received only the text
+    would have to re-derive the other three from somewhere, which is
+    the re-derivation K.1 exists to stop.
+
+    None is the caller's cue to re-extract and save, or, when the
+    rendition was PINNED by a group, to refuse. It is never a cue to
+    fall back on another version's text: that substitution is the whole
+    reason this table is keyed the way it is.
+
+    kind and filename are None on rows written before K.1 and on
+    nothing else, since connect() backfills them from the attachments
+    row at boot. A caller that needs kind derives it from the extractor
+    the way ingest does; see rendition_of.
     """
     row = conn.execute(
-        """SELECT extracted_text FROM attachment_extractions
+        """SELECT digest, extractor, extractor_version, extracted_text,
+                  kind, filename
+           FROM attachment_extractions
            WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
         (digest, extractor, version),
     ).fetchone()
-    return str(row["extracted_text"]) if row is not None else None
+    return dict(row) if row is not None else None
+
+
+def group_renditions(
+    conn: sqlite3.Connection, group_id: int
+) -> list[dict[str, Any]] | None:
+    """The renditions a group pinned, in declaration order, or None.
+
+    THREE ERAS, TWO OF THEM NULL HERE, and this is the check site the
+    migration comment points at.
+
+    None with no attachments_json is pre-K: the group could not have
+    declared a document at all. None WITH attachments_json is post-K and
+    pre-K.1: it declared digests and nothing about how they were to be
+    read, so there is no pin to honor and the caller must fall back on
+    resolving the digest. A list is K.1: the reading is pinned and a
+    member gets exactly it or a refusal.
+
+    Callers must not collapse the first two into "no documents". The
+    pre-K.1 group HAS documents; what it lacks is a statement about
+    which reading of them, and treating that as "declared nothing" would
+    refuse a member that legitimately brings the digests the group
+    holds.
+    """
+    row = conn.execute(
+        "SELECT renditions_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    if row is None or row["renditions_json"] is None:
+        return None
+    decoded = json.loads(row["renditions_json"])
+    if not isinstance(decoded, list):
+        return None
+    out = []
+    for item in decoded:
+        # Repair on read, the same discipline group_manifest applies to
+        # models_json: an element that is not a rendition object cannot
+        # be compared against a request, and enforcing against a broken
+        # declaration would refuse correct work. str() is deliberately
+        # NOT used here: it succeeds on a dict and would turn a
+        # malformed pin into a Python repr that every later comparison
+        # then operates on without raising.
+        if not isinstance(item, dict):
+            return None
+        if not all(
+            isinstance(item.get(key), str)
+            for key in ("digest", "extractor", "extractor_version", "kind")
+        ):
+            return None
+        out.append(
+            {
+                "digest": item["digest"],
+                "extractor": item["extractor"],
+                "extractor_version": item["extractor_version"],
+                "kind": item["kind"],
+            }
+        )
+    return out
 
 
 def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
@@ -1376,6 +1560,10 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     # second question the caller may not be asking.
     out["attachments"] = group_attachments(conn, group_id)
     out["attachments_mode"] = group_attachments_mode(conn, group_id)
+    # The pin, so a replay and a reuse can say which READING the models
+    # were given and not merely which file. None on every pre-K.1 group;
+    # see group_renditions for the three eras.
+    out["renditions"] = group_renditions(conn, group_id)
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
 

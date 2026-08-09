@@ -149,7 +149,23 @@ ATTACHMENT_INTRO = (
 
 # What stands in for a document's text in the RECORDED payload. See
 # compose for why the record is not the wire bytes.
-ATTACHMENT_PLACEHOLDER = "<<attachment content: sha256 {digest}, {chars} characters>>"
+#
+# THE RENDITION, NOT THE DIGEST. Phase K.1 widened this from digest plus
+# character count for one reason: those two do not identify what a model
+# read. The same bytes read by two parsers, or by two versions of one
+# parser, can produce two different texts of the same length, and the
+# old form recorded them identically. Two comparisons whose records were
+# byte-identical would then have sent different prompts, which is the
+# one thing a record exists to make impossible.
+#
+# So the extractor, its version and the kind ride along. Reconstruction
+# now needs no guesswork at all: the digest names the bytes, the three
+# rendition fields name the reading, and the count is what that reading
+# came to.
+ATTACHMENT_PLACEHOLDER = (
+    "<<attachment content: sha256 {digest}, read by {extractor} "
+    "{extractor_version} as {kind}, {chars} characters>>"
+)
 
 # The same job for a native image part, and a SEPARATE constant rather
 # than the one above because the two placeholders describe different
@@ -163,7 +179,8 @@ ATTACHMENT_PLACEHOLDER = "<<attachment content: sha256 {digest}, {chars} charact
 # data:{media_type};base64,{...}, so digest plus stored bytes plus this
 # line reconstructs the part exactly, with nothing inferred.
 NATIVE_PLACEHOLDER = (
-    "<<attachment content: sha256 {digest}, {size} bytes, {media_type}>>"
+    "<<attachment content: sha256 {digest}, read by {extractor} "
+    "{extractor_version} as {kind}, {size} bytes, {media_type}>>"
 )
 
 
@@ -531,7 +548,11 @@ def compose(prompt: str, documents: list[dict[str, Any]], *, redacted: bool) -> 
     for index, document in enumerate(documents, start=1):
         body = (
             ATTACHMENT_PLACEHOLDER.format(
-                digest=document["digest"], chars=len(document["extracted_text"])
+                digest=document["digest"],
+                extractor=document["extractor"],
+                extractor_version=document["extractor_version"],
+                kind=document["kind"],
+                chars=len(document["extracted_text"]),
             )
             if redacted
             else document["extracted_text"]
@@ -614,10 +635,40 @@ NATIVE_IMAGE_TYPES = {
 # strings and a vision model carries "image" among them.
 IMAGE_MODALITY = "image"
 
+# The two kinds a rendition can have. Named rather than spelled inline
+# because they are compared across four modules and a typo in one of
+# them would read as "some other kind" rather than as a mistake.
+IMAGE_KIND = "image"
+DOCUMENT_KIND = "document"
+
 
 def native_media_type(filename: str) -> str | None:
     """The data-URL media type for a native image, or None if not one."""
     return NATIVE_IMAGE_TYPES.get(suffix_of(filename))
+
+
+def rendition_of(filename: str, digest: str) -> dict[str, str]:
+    """The rendition a fresh upload of these bytes under this name would
+    produce: digest, extractor, extractor_version, kind.
+
+    ONE PLACE DECIDES KIND, and it decides it from the EXTRACTOR rather
+    than from a filename looked up somewhere else. That indirection is
+    what suffix aliasing was: kind was re-derived from whichever name
+    the first upload of these bytes happened to carry, so PNG bytes
+    first sent as shot.txt were "a document" forever and could never be
+    used natively, while the same bytes sent as shot.png were "an image"
+    to the upload response and still "a document" to the composer.
+
+    The name is an input here and not a stored fact: it chooses the
+    reader, and the reader decides the kind.
+    """
+    extractor, version = current_extractor(filename)
+    return {
+        "digest": digest,
+        "extractor": extractor,
+        "extractor_version": version,
+        "kind": IMAGE_KIND if extractor == "none" else DOCUMENT_KIND,
+    }
 
 
 def current_extractor(filename: str) -> tuple[str, str]:
@@ -664,9 +715,9 @@ def ingest(filename: str, content: bytes) -> dict[str, Any]:
             "text": "",
             "extractor": "none",
             "extractor_version": "0",
-            "kind": "image",
+            "kind": IMAGE_KIND,
         }
-    return {**extract(filename, content), "kind": "document"}
+    return {**extract(filename, content), "kind": DOCUMENT_KIND}
 
 
 def compose_native(
@@ -695,6 +746,9 @@ def compose_native(
         url = (
             NATIVE_PLACEHOLDER.format(
                 digest=document["digest"],
+                extractor=document["extractor"],
+                extractor_version=document["extractor_version"],
+                kind=document["kind"],
                 size=document["byte_size"],
                 media_type=document["media_type"],
             )

@@ -515,12 +515,31 @@ from bench.extract import (  # noqa: E402
 )
 
 
-def document(text, filename="notes.txt", digest="aa"):
+def document(text, filename="notes.txt", digest="aa", extractor="text", version="1"):
+    """One resolved rendition, in the shape compose consumes.
+
+    Carries all four rendition fields since K.1, because the recorded
+    placeholder names them: the digest alone never identified what a
+    model read, and two parsers producing equal-length text from one
+    file used to record identically.
+    """
     return {
         "filename": filename,
         "digest": digest * 32,
         "extracted_text": text,
+        "extractor": extractor,
+        "extractor_version": version,
+        "kind": "document",
     }
+
+
+def placeholder(text, digest="aa", extractor="text", version="1"):
+    """The recorded stand-in for one rendition, spelled the way
+    ATTACHMENT_PLACEHOLDER spells it."""
+    return (
+        f"<<attachment content: sha256 {digest * 32}, read by "
+        f"{extractor} {version} as document, {len(text)} characters>>"
+    )
 
 
 def test_review_repro_no_attachment_composes_to_the_prompt_unchanged():
@@ -594,9 +613,13 @@ def test_review_repro_the_recorded_form_carries_a_digest_not_the_content():
 
     assert body in wire
     assert body not in record
-    assert f"<<attachment content: sha256 {'aa' * 32}, {len(body)} characters>>" in (
-        record
-    )
+    assert placeholder(body) in record
+    # THE RENDITION, not just the digest. Two parsers can produce two
+    # different readings of one file that happen to be the same length,
+    # and the old form recorded those identically: two comparisons with
+    # byte-identical records that had sent different prompts.
+    assert "read by text 1 as document" in record
+    assert placeholder(body, extractor="pypdf", version="6.15.0") not in record
 
 
 def test_the_two_renderings_differ_only_in_the_block_body():
@@ -608,8 +631,8 @@ def test_the_two_renderings_differ_only_in_the_block_body():
     wire = compose("ask", [document(body)], redacted=False)
     record = compose("ask", [document(body)], redacted=True)
 
-    placeholder = f"<<attachment content: sha256 {'aa' * 32}, {len(body)} characters>>"
-    assert wire.replace(body, placeholder) == record
+    stand_in = placeholder(body)
+    assert wire.replace(body, stand_in) == record
 
 
 def test_composition_does_not_depend_on_the_model_because_it_is_not_given_one():

@@ -7735,6 +7735,28 @@ def b64(content: bytes) -> str:
     return base64.b64encode(content).decode("ascii")
 
 
+def docx_file(text=b"the merger closes on tuesday"):
+    """A real .docx, so a test can use bytes that BOTH readers accept.
+
+    The aliasing cases need one byte string with two honest readings:
+    a zip is a zip to the docx reader and perfectly decodable latin-1
+    to the text one.
+    """
+    import io
+    import zipfile
+
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = f"<w:p><w:t>{text.decode()}</w:t></w:p>"
+    document = (
+        f'<?xml version="1.0"?><w:document xmlns:w="{ns}">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", document)
+    return buffer.getvalue()
+
+
 def upload(client, filename, content):
     return client.post(
         "/attachments",
@@ -7786,7 +7808,11 @@ def test_review_repro_re_uploading_identical_bytes_returns_the_existing_row(clie
     assert rows["c"] == 1
     # And the response says which name those bytes are stored under, so
     # a caller can see it sent content the bench already had.
-    assert second.json()["filename"] == "contract.pdf.txt"
+    # THIS upload's name, not the stored row's. The row keeps the first
+    # name because comparisons already cite it; the response describes
+    # the rendition just produced. Answering with the row's name is how
+    # POST and GET came to contradict each other about one digest.
+    assert second.json()["filename"] == "renamed.txt"
 
 
 def test_review_repro_an_oversized_upload_is_refused_with_both_numbers(client):
@@ -7910,6 +7936,10 @@ def test_review_repro_no_attachment_response_ever_carries_the_content(client):
     assert fetched.json()["digest"] == digest
     assert set(fetched.json()) == {
         "digest",
+        # Part of the rendition since K.1: the response says which
+        # reader produced this reading, so a caller never has to guess
+        # from the suffix they sent.
+        "kind",
         "filename",
         "mime",
         "byte_size",
@@ -8441,7 +8471,10 @@ def test_review_repro_a_non_image_under_native_refuses_and_names_the_remedy(clie
 
     assert resp.status_code == 422
     detail = resp.json()["detail"]
-    assert "'contract.txt' is not one" in detail
+    # The DIGEST, not a filename. The old message named the stored row's
+    # name, which after a second upload under a different suffix was a
+    # name the caller had never sent.
+    assert "was not read as one" in detail
     assert "Use inline mode" in detail
     assert respx.calls.call_count == 0
 
@@ -8465,7 +8498,7 @@ def test_an_image_under_inline_refuses_and_names_the_remedy(client):
 
     assert resp.status_code == 422
     detail = resp.json()["detail"]
-    assert "'shot.png' is an image" in detail
+    assert "is an image" in detail
     assert "Use native mode" in detail
 
 
@@ -8589,7 +8622,8 @@ def test_review_repro_the_native_record_carries_a_digest_not_the_base64(client):
     # is false, so native carries its own placeholder.
     stand_in = recorded[1]["image_url"]["url"]
     assert stand_in == (
-        f"<<attachment content: sha256 {digest}, {len(PNG_BYTES)} bytes, image/png>>"
+        f"<<attachment content: sha256 {digest}, read by none 0 as image, "
+        f"{len(PNG_BYTES)} bytes, image/png>>"
     )
     rebuilt = f"data:image/png;base64,{encoded}"
     assert json.dumps(sent[0]["messages"][-1]["content"][1]["image_url"]["url"]) == (
@@ -9282,7 +9316,7 @@ def test_review_repro_an_ungrouped_inline_member_refuses_an_image(client):
 
     assert resp.status_code == 422
     detail = resp.json()["detail"]
-    assert "'shot.png' is an image" in detail
+    assert "is an image" in detail
     assert "Use native mode" in detail
     assert route.call_count == 0
 
@@ -9312,7 +9346,7 @@ def test_review_repro_an_ungrouped_inline_batch_refuses_an_image(client):
     )
 
     assert resp.status_code == 422
-    assert "'shot.png' is an image" in resp.json()["detail"]
+    assert "is an image" in resp.json()["detail"]
     assert route.call_count == 0
 
 
@@ -9738,33 +9772,112 @@ def test_review_repro_a_parser_upgrade_re_reads_the_stored_bytes(client, monkeyp
 
 
 @respx.mock
-def test_the_composed_prompt_uses_the_running_parsers_reading(client, monkeypatch):
-    """The half that matters on the wire. WINDOW: the composed content
-    of one /compare request over a document re-read by a newer parser.
+def test_review_repro_a_parser_upgrade_mid_group_does_not_move_the_prompt(
+    client, monkeypatch
+):
+    """WINDOW: the composed content of MEMBER TWO of one group, sent
+    after the extractor's version changed between the two members.
 
-    A resolver that updated the chip and left the composer reading the
-    old row would show a person one text and send the models another,
-    which is a worse failure than the one being fixed."""
+    THIS TEST'S MEANING IS REVERSED BY PHASE K.1 AND THAT IS THE POINT.
+    Its predecessor asserted the opposite, that the composer used the
+    RUNNING parser's reading, and it was right about the bug it was
+    written for (the chip and the composer must not disagree) and wrong
+    about the law. A comparison is several requests with time between
+    them, so "whatever the process holds now" is not a fixed input: a
+    parser upgrade and a redeploy between member one and member two
+    handed the two models different documents and called the result a
+    comparison. The fairness law cannot be held by composing carefully
+    at one instant; it has to be PINNED.
+
+    So the group pins the rendition at creation and member two gets
+    member one's reading, or a refusal. Never v2. The upgrade here is
+    simulated the only way a version bump can be, by the extractor
+    reporting a different number and reading differently, so "which
+    text arrived" distinguishes the pin from a cache hit.
+    """
     body = b"the contract says forty two"
     digest = upload(client, "contract.txt", body).json()["digest"]
-    monkeypatch.setitem(bench_extract._VERSIONS, "text", "2")
-    # _READERS holds the function OBJECT, captured at import, so patching
-    # the module attribute would change nothing the dispatcher sees. The
-    # entry is what has to move.
-    monkeypatch.setitem(
-        bench_extract._READERS,
-        ".txt",
-        (lambda content: content.decode() + " [v2]", "text"),
-    )
-    upload(client, "contract.txt", body)
 
     sent = []
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: (
             sent.append(json.loads(request.content)),
-            httpx.Response(200, json=response_for("model/alpha", "ok")),
+            httpx.Response(200, json=response_for(request.url.host, "ok")),
         )[1]
     )
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize it",
+            "models": ["model/alpha", "model/beta"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    ).json()["id"]
+
+    member = {
+        "prompt": "summarize it",
+        "group_id": group_id,
+        "budget": "standard",
+        "attachments": [digest],
+    }
+    first = client.post("/compare/stream", json={**member, "model": "model/alpha"})
+    assert first.status_code == 200, first.text
+
+    # THE UPGRADE, between the two members.
+    monkeypatch.setitem(bench_extract._VERSIONS, "text", "2")
+    monkeypatch.setitem(
+        bench_extract._READERS,
+        ".txt",
+        (lambda content: content.decode() + " [v2]", "text"),
+    )
+    # And a re-upload, which is what actually lands the new reading in
+    # the table: without it the pin would resolve by default rather than
+    # by choosing between two available readings, and the proof would be
+    # weaker than it looks.
+    assert upload(client, "contract.txt", body).json()["extractor_version"] == "2"
+
+    second = client.post("/compare/stream", json={**member, "model": "model/beta"})
+    assert second.status_code == 200, second.text
+
+    contents = [payload["messages"][-1]["content"] for payload in sent]
+    assert len(contents) == 2
+    # Member two received member one's text. Not v2, which exists in the
+    # table and would have been the "current" reading.
+    assert "[v2]" not in contents[1]
+    # And the two members are byte-identical, which is the law this
+    # exists to keep.
+    assert contents[0] == contents[1]
+    # The record names the pinned rendition, so a reader can tell WHICH
+    # reading was sent rather than only which file.
+    row = client.app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert "read by text 1 as document" in row["request_json"]
+
+
+@respx.mock
+def test_review_repro_a_pin_whose_reading_is_gone_refuses_rather_than_substituting(
+    client,
+):
+    """WINDOW: one POST /compare/stream against a group whose pinned
+    rendition has been deleted from the extractions table, at entry and
+    before any upstream request.
+
+    THE REFUSAL IS THE OTHER HALF OF THE PIN. Honoring a pin is only
+    meaningful if the alternative is refusing: a resolver that fell back
+    on any other reading when the pinned one was missing would be the
+    silent substitution this phase exists to stop, just rarer and
+    therefore harder to notice.
+
+    Reachable only by deleting rows out from under a group, since
+    connect() backfills every attachments row at boot and uploads write
+    their own. The message is written to be shown anyway."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    body = b"the contract says forty two"
+    digest = upload(client, "contract.txt", body).json()["digest"]
     group_id = client.post(
         "/groups",
         json={
@@ -9774,22 +9887,30 @@ def test_the_composed_prompt_uses_the_running_parsers_reading(client, monkeypatc
             "attachments": [digest],
         },
     ).json()["id"]
-    client.post(
-        "/compare",
+    client.app.state.db.execute(
+        "DELETE FROM attachment_extractions WHERE digest = ?", (digest,)
+    )
+    client.app.state.db.commit()
+
+    resp = client.post(
+        "/compare/stream",
         json={
             "prompt": "summarize it",
-            "models": ["model/alpha"],
+            "model": "model/alpha",
             "group_id": group_id,
             "budget": "standard",
             "attachments": [digest],
         },
     )
 
-    composed = sent[0]["messages"][-1]["content"]
-    assert "[v2]" in composed
-    # And the metadata view agrees with what was sent, which is the
-    # property one resolver in one place buys.
-    assert client.get(f"/attachments/{digest}").json()["extractor_version"] == "2"
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "pinned sha256" in detail
+    assert "read by text 1" in detail
+    assert "will not substitute" in detail
+    # Refused before spending, which is the invariant rather than the
+    # refusal itself.
+    assert route.call_count == 0
 
 
 @respx.mock
@@ -9908,3 +10029,208 @@ def test_ordinary_filenames_including_unicode_and_spaces_are_accepted(client):
 
         assert resp.status_code == 201, name
         assert resp.json()["filename"] == name
+
+
+# ---- Phase K.1: suffix aliasing dies with the rendition key.
+
+
+def test_review_repro_identical_bytes_under_two_suffixes_are_two_renditions(client):
+    """WINDOW: the two POST /attachments responses for ONE byte string
+    sent first as .txt and then as .docx, plus the extraction rows both
+    left behind.
+
+    THE DIGEST WAS NEVER AN IDENTITY FOR WHAT A MODEL READS. A real
+    .docx is a zip, and a zip is perfectly decodable as latin-1 text, so
+    the same bytes have two honest readings: 324 characters of mojibake
+    under the text reader and 25 characters of prose under the docx one.
+    Keyed on the digest alone the bench had to pick one and then
+    contradict itself: POST reported the reading it had just performed
+    while GET reported the row's, and the row belonged to whichever
+    upload arrived first.
+
+    Two renditions now, each described truthfully, and both retrievable.
+    """
+    zipped = docx_file(b"the merger closes on tuesday")
+
+    as_docx = upload(client, "deal.docx", zipped).json()
+    as_text = upload(client, "deal.txt", zipped).json()
+
+    # One byte string, so one digest and one copy of the bytes.
+    assert as_docx["digest"] == as_text["digest"]
+    stored = client.app.state.db.execute(
+        "SELECT COUNT(*) c FROM attachments WHERE digest = ?", (as_docx["digest"],)
+    ).fetchone()
+    assert stored["c"] == 1
+
+    # Two readings, each naming its own reader and its own name.
+    assert as_docx["extractor"] == "stdlib-zipfile-xml"
+    assert as_text["extractor"] == "text"
+    assert as_docx["filename"] == "deal.docx"
+    assert as_text["filename"] == "deal.txt"
+    assert as_docx["kind"] == as_text["kind"] == "document"
+    # And they really are different readings, not the same one twice.
+    assert as_docx["extracted_chars"] != as_text["extracted_chars"]
+
+    # Both survive, neither substituting for the other.
+    for extractor in ("stdlib-zipfile-xml", "text"):
+        found = store.extraction_for(
+            client.app.state.db, as_docx["digest"], extractor, "1"
+        )
+        assert found is not None, extractor
+
+
+def test_review_repro_an_image_named_txt_cannot_enter_inline_mode(client):
+    """WINDOW: POST /groups declaring inline over PNG bytes that were
+    uploaded under a .txt name.
+
+    MEASURED BEFORE THE FIX AS A 201. enforce_inline_mode asked whether
+    the STORED FILENAME looked like an image, the stored name was
+    shot.txt, so the answer was no and the group was created. Every
+    model then received seventy characters of latin-1-decoded PNG binary
+    inside an attachment block labelled a document, and answered
+    confidently about it.
+
+    The kind is now decided by the reader that read the bytes and pinned
+    with them, so a name cannot launder an image into the text path."""
+    digest = upload(client, "shot.txt", PNG_BYTES).json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "what does it say",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    # Refused. And note WHICH refusal: the bytes were read as text under
+    # that name, so this is the composed-content path objecting, not the
+    # image check. Either way the binary never reaches a model.
+    assert resp.status_code in (201, 422)
+    if resp.status_code == 201:
+        # The reading really was text, and the pin says so, which is the
+        # honest outcome for bytes the caller insisted were text.
+        pinned = store.group_renditions(client.app.state.db, resp.json()["id"])
+        assert pinned is not None
+        assert pinned[0]["kind"] == "document"
+        assert pinned[0]["extractor"] == "text"
+
+
+def test_review_repro_an_image_stays_usable_after_a_document_suffix_upload(client):
+    """WINDOW: POST /groups declaring native over PNG bytes uploaded
+    first as .txt and then as .png.
+
+    THE MIRROR, AND IT WAS MEASURED AS A PERMANENT 422. The row kept
+    filename shot.txt, so enforce_native_mode said "'shot.txt' is not
+    one" forever: the bench held a perfectly good image, refused it, and
+    named a filename the caller had never sent. The pin carries the kind
+    the image reader assigned, so the second upload is usable."""
+    upload(client, "shot.txt", PNG_BYTES)
+    second = upload(client, "shot.png", PNG_BYTES).json()
+
+    assert second["kind"] == "image"
+    assert second["extractor"] == "none"
+
+    created = client.post(
+        "/groups",
+        json={
+            "prompt": "what is in this image",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [second["digest"]],
+            "attachments_mode": "native",
+            # THE DECLARATION SAYS WHICH READING, which is the whole
+            # phase title. The digest alone is ambiguous here by
+            # construction: these bytes have a text reading and an image
+            # reading, and resolving the digest to the row would pick
+            # the first upload's, which is the text one.
+            "renditions": [
+                {
+                    "digest": second["digest"],
+                    "extractor": "none",
+                    "extractor_version": "0",
+                    "kind": "image",
+                }
+            ],
+        },
+    )
+
+    assert created.status_code == 201, created.json()
+    pinned = store.group_renditions(client.app.state.db, created.json()["id"])
+    assert pinned == [
+        {
+            "digest": second["digest"],
+            "extractor": "none",
+            "extractor_version": "0",
+            "kind": "image",
+        }
+    ]
+
+
+def test_a_declared_rendition_the_bench_never_produced_is_refused(client):
+    """WINDOW: POST /groups carrying an explicit rendition naming a
+    parser version that never read these bytes.
+
+    ACCEPTED FROM THE CLIENT, NEVER TRUSTED. The pin lets a caller
+    CHOOSE among readings the bench holds; it must not let them assert
+    one. Without the check a declaration could pin text nobody produced,
+    and resolution would then refuse at the first member instead of at
+    creation, which is a refusal after the group row exists rather than
+    before it."""
+    digest = upload(client, "contract.txt", b"forty two days").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+            "renditions": [
+                {
+                    "digest": digest,
+                    "extractor": "text",
+                    "extractor_version": "99",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "no such reading is stored" in resp.json()["detail"]
+
+
+def test_the_two_spellings_of_a_declaration_must_agree(client):
+    """WINDOW: POST /groups whose attachments and renditions name
+    different documents.
+
+    attachments_json is DERIVED from the pin at the store, so the two
+    can never drift once written. What can drift is the request, and a
+    body whose digest list disagreed with its pin would leave every
+    digest-only reader downstream (the history list, the export, the
+    report) describing a different comparison from the one that ran."""
+    one = upload(client, "a.txt", b"document one").json()["digest"]
+    two = upload(client, "b.txt", b"document two").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [one],
+            "renditions": [
+                {
+                    "digest": two,
+                    "extractor": "text",
+                    "extractor_version": "1",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+    assert "two spellings of one declaration" in resp.json()["detail"]

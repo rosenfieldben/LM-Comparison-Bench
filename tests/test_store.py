@@ -1,4 +1,5 @@
 import json
+import pathlib
 import sqlite3
 from pathlib import Path
 
@@ -1970,6 +1971,7 @@ def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
                 "content": b"hi",
                 "extracted_text": "hi",
                 "extractor": "text",
+                "kind": "document",
                 "extractor_version": "1",
             },
         )
@@ -2039,6 +2041,7 @@ def test_attachments_for_returns_a_mapping_and_omits_what_is_missing(db):
             "content": b"one",
             "extracted_text": "one",
             "extractor": "text",
+            "kind": "document",
             "extractor_version": "1",
         },
     )
@@ -2064,6 +2067,7 @@ def test_no_attachment_reader_selects_the_content_blob(db):
             "content": b"secret",
             "extracted_text": "secret",
             "extractor": "text",
+            "kind": "document",
             "extractor_version": "1",
         },
     )
@@ -2097,6 +2101,7 @@ def test_the_extraction_table_keeps_one_reading_per_parser_version(tmp_path):
             "byte_size": 9,
             "content": b"some text",
             "extractor": "text",
+            "kind": "document",
         }
         first = store.save_attachment(
             conn, {**base, "extracted_text": "some text", "extractor_version": "1"}
@@ -2122,10 +2127,16 @@ def test_the_extraction_table_keeps_one_reading_per_parser_version(tmp_path):
         assert rows[0]["extractor_version"] == "1"
 
         # Both readings retrievable, neither substituting for the other.
-        assert store.extraction_for(conn, base["digest"], "text", "1") == "some text"
-        assert (
-            store.extraction_for(conn, base["digest"], "text", "2") == "some text [v2]"
-        )
+        # The whole RENDITION comes back now, not the text alone: a
+        # caller handed only the text would have to re-derive the other
+        # three facts from somewhere, and every one of those
+        # re-derivations was a place K.1 found a bug.
+        one = store.extraction_for(conn, base["digest"], "text", "1")
+        two = store.extraction_for(conn, base["digest"], "text", "2")
+        assert one is not None and two is not None
+        assert one["extracted_text"] == "some text"
+        assert two["extracted_text"] == "some text [v2]"
+        assert one["kind"] == "document" and one["filename"] == "contract.txt"
         # A version nobody ran is absent rather than approximated. That
         # None is the caller's cue to re-extract, and returning some
         # other version's text here would be exactly the substitution
@@ -2148,6 +2159,7 @@ def test_re_saving_the_same_reading_is_a_no_op(tmp_path):
             "content": b"hi",
             "extracted_text": "hi",
             "extractor": "text",
+            "kind": "document",
             "extractor_version": "1",
         }
         store.save_attachment(conn, record)
@@ -2158,5 +2170,135 @@ def test_re_saving_the_same_reading_is_a_no_op(tmp_path):
             (record["digest"],),
         ).fetchone()
         assert count["c"] == 1
+    finally:
+        conn.close()
+
+
+PRE_K1_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_k1_schema.sql"
+).read_text()
+
+
+def test_review_repro_migration_onto_a_pre_k1_database_is_additive(tmp_path):
+    """WINDOW: a database whose schema is exactly c9ad170's, upgraded by
+    connect(), from the pre-state through the post-state and the
+    backfill.
+
+    A NEW FIXTURE, AND THE OLD ONE COULD NOT HAVE DONE THIS. The pre-K
+    snapshot contains no attachments table at all, so the era test built
+    on it exercises CREATE TABLE IF NOT EXISTS and never an ALTER onto
+    those tables. Reusing it for K.1 would have proved the additive
+    invariant against a table the migration does not touch, which is the
+    wrong window wearing the right name.
+
+    Three additive changes: kind and filename onto attachment_extractions,
+    and renditions_json onto groups. The constraint is deliberately NOT
+    widened, because SQLite cannot, and it does not need to be: kind is a
+    function of the extractor, so UNIQUE (digest, extractor,
+    extractor_version) already enforces the four-part key.
+
+    THE BACKFILL IS THE OTHER HALF. K.1 resolves a pinned rendition and
+    refuses rather than substituting, so a database whose extraction
+    rows were never written would answer "no such reading" for every
+    document it is holding. connect() copies each attachments row into
+    the table it now belongs in, once, and this asserts the pre-state
+    (no rows) so the copy is proven rather than assumed.
+    """
+    db_path = tmp_path / "pre_k1.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget, attachments_json,
+                               attachments_mode)
+           VALUES (1, '2026-06-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', NULL, 'standard', '["ab"]', 'inline')"""
+    )
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ab', 'legacy.txt', 'text/plain', 9, X'6c6567616379',
+                   'legacy text', 'text', '1', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+
+    # The pre-state, asserted. Without it this could pass against a
+    # fixture that already had the columns, proving nothing.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")]
+    assert "kind" not in before
+    assert "filename" not in before
+    group_before = [r[1] for r in legacy.execute("PRAGMA table_info(groups)")]
+    assert "renditions_json" not in group_before
+    rows_before = legacy.execute(
+        "SELECT COUNT(*) FROM attachment_extractions"
+    ).fetchone()[0]
+    assert rows_before == 0
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [
+            r["name"] for r in conn.execute("PRAGMA table_info(attachment_extractions)")
+        ]
+        assert "kind" in after
+        assert "filename" in after
+        group_after = [r["name"] for r in conn.execute("PRAGMA table_info(groups)")]
+        assert "renditions_json" in group_after
+
+        # THE THIRD NULL. This group declared documents and no reading,
+        # which is neither pre-K nor K.1, and group_renditions must say
+        # so rather than collapsing it into "declared nothing".
+        assert store.group_renditions(conn, 1) is None
+        assert store.group_attachments(conn, 1) == ["ab"]
+
+        # Backfilled: the row's own reading is now a rendition the pin
+        # machinery can resolve.
+        found = store.extraction_for(conn, "ab", "text", "1")
+        assert found is not None
+        assert found["extracted_text"] == "legacy text"
+        assert found["kind"] == "document"
+        assert found["filename"] == "legacy.txt"
+
+        # And idempotent: a second connect must not double it.
+        conn.close()
+        again = store.connect(str(db_path))
+        try:
+            count = again.execute(
+                "SELECT COUNT(*) c FROM attachment_extractions"
+            ).fetchone()
+            assert count["c"] == 1
+        finally:
+            again.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_an_image_row_backfills_as_an_image_rendition(tmp_path):
+    """The backfill derives kind from the EXTRACTOR, not the filename,
+    which is the same decision ingest makes and the opposite of the
+    re-derivation K.1 removed. An image row stored under any name comes
+    back as an image."""
+    db_path = tmp_path / "img.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('cd', 'shot.txt', 'image/png', 3, X'010203', '', 'none',
+                   '0', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        found = store.extraction_for(conn, "cd", "none", "0")
+        assert found is not None
+        assert found["kind"] == "image"
     finally:
         conn.close()
