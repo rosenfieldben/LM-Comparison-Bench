@@ -2159,6 +2159,108 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
             )
 
 
+# Characters per token, for turning a composed prompt into something
+# comparable with a context window.
+#
+# THE SAME HEURISTIC THE CHIP SHOWS, deliberately, and the same honesty
+# about it. static/lib.js approxTokens says it plainly: "The bench does
+# NOT tokenize. Every model runs its own tokenizer and they disagree
+# with each other, so any single number here is wrong for at least some
+# of them." Two places using two different estimates would be worse than
+# either: the composer would price a document one way and the refusal
+# another, and a person reconciling them would find no answer.
+#
+# Four is the conventional English figure and is deliberately not tuned.
+# What the ceiling needs is an order of magnitude, and the safety margin
+# below is what absorbs the error.
+CHARS_PER_TOKEN = 4
+
+# How much of a model's window the bench insists on leaving unspoken for.
+#
+# An estimate that came out exactly at the window would be a refusal
+# threshold set at the precise point where the estimate's own error
+# decides the outcome. 10 percent is slack for a tokenizer that
+# disagrees with chars-over-four by more than the heuristic admits,
+# which is ordinary for code, CJK text and heavy markup.
+CONTEXT_HEADROOM = 0.1
+
+
+def enforce_context_window(
+    composed: str, models: list[str] | None, budget: str
+) -> None:
+    """Refuse a comparison no model in the lineup could actually hold.
+
+    THE GLOBAL CEILING IS NOT THIS CHECK. MAX_COMPOSED_CHARS asks whether
+    the bench will send a prompt at all, once, for everybody. This asks
+    whether THIS LINEUP can receive it, and the answer is per model
+    because context windows differ by two orders of magnitude across a
+    catalog: a prompt that is comfortable for one member is a hard
+    provider error for another, and the comparison would come back with
+    some cards answered and some cards erroring, which is not a
+    comparison.
+
+    AT CREATION, before any member runs, so the refusal costs nothing and
+    names every model it applies to at once. A person told "this will not
+    fit" while choosing is being told something they can act on; the same
+    fact arriving as one error card per narrow model is noise.
+
+    THE ARITHMETIC IS SHOWN PER MODEL because the remedy differs by
+    model: drop this one, shorten the document, or pick the other
+    budget. A bare "too long" tells nobody which.
+
+    BOTH HALVES OF THE WINDOW. A context window holds the prompt AND the
+    completion, so the budget the comparison declared has to be counted:
+    a prompt that fits with 16k of headroom does not fit with 64k, and
+    the extended tier is exactly when somebody attaches a long document.
+
+    ABSENT context_length IS SKIPPED, and this is the one place this
+    codebase does NOT apply "absence of evidence is not support". That
+    rule governs CLAIMS: native mode asserts every model saw the image,
+    so an unverifiable model must be refused. This check makes no claim
+    at all, it only declines to send something known not to fit. Refusing
+    an unknown here would take every attached comparison offline the
+    moment the catalog could not be fetched, and MAX_COMPOSED_CHARS still
+    applies to all of them. The distinction is written here because it is
+    the sort of asymmetry a later reader would otherwise take for an
+    oversight.
+    """
+    if not models:
+        return
+    catalog = getattr(app.state, "catalog", None) or {}
+    if not catalog.get("fetched"):
+        return
+    windows = {
+        entry["id"]: entry.get("context_length") for entry in catalog.get("models", [])
+    }
+    # Ceiling division: a prompt is never fewer tokens than this rounds
+    # to, and rounding down at the boundary would admit the one case the
+    # check exists for.
+    prompt_tokens = -(-len(composed) // CHARS_PER_TOKEN)
+    too_small = []
+    for model in models:
+        window = windows.get(model)
+        if not isinstance(window, int):
+            continue
+        needed = prompt_tokens + effective_budget(budget, model)
+        usable = int(window * (1 - CONTEXT_HEADROOM))
+        if needed > usable:
+            too_small.append(
+                f"{model} holds {window} tokens and this needs about "
+                f"{needed} ({prompt_tokens} for the prompt plus "
+                f"{effective_budget(budget, model)} reserved for the answer)"
+            )
+    if too_small:
+        raise HTTPException(
+            422,
+            "this comparison does not fit every model in the lineup: "
+            + "; ".join(too_small)
+            + ". The prompt figure is an estimate, characters over "
+            f"{CHARS_PER_TOKEN}, because the bench does not tokenize and "
+            "every model's tokenizer disagrees. Drop the model, attach a "
+            "shorter document, or use the standard budget.",
+        )
+
+
 def enforce_mode_entry(
     digests: list[str] | None,
     mode: str,
@@ -2993,7 +3095,10 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             # Composed once at declaration, against the longest prompt
             # this group can hold, so the ceiling is a refusal at
             # creation rather than a surprise on the first paid member.
-            enforce_composed(body.prompt or "", pins)
+            composed = enforce_composed(body.prompt or "", pins)
+            # And then per model, because the global ceiling is one
+            # number for everybody and a context window is not.
+            enforce_context_window(composed, body.models, body.budget)
     elif body.attachments_mode != "inline":
         raise HTTPException(
             422,

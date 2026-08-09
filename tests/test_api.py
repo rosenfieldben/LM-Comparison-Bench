@@ -10072,9 +10072,9 @@ def test_review_repro_identical_bytes_under_two_suffixes_are_two_renditions(clie
     assert as_docx["extracted_chars"] != as_text["extracted_chars"]
 
     # Both survive, neither substituting for the other.
-    for extractor in ("stdlib-zipfile-xml", "text"):
+    for extractor, version in (("stdlib-zipfile-xml", "2"), ("text", "1")):
         found = store.extraction_for(
-            client.app.state.db, as_docx["digest"], extractor, "1"
+            client.app.state.db, as_docx["digest"], extractor, version
         )
         assert found is not None, extractor
 
@@ -10477,3 +10477,182 @@ def test_the_batch_endpoint_encodes_once_for_the_whole_lineup(client):
     assert len(resp.json()["results"]) == 5
     # ONE read for five members.
     assert reads == [digest]
+
+
+# ---- Phase K1.4: the composed ceiling, per model.
+
+
+@respx.mock
+def test_review_repro_a_prompt_too_large_for_one_model_refuses_at_creation(client):
+    """WINDOW: POST /groups for a lineup mixing a wide-window model with
+    a narrow one, at creation and before any member runs.
+
+    THE GLOBAL CEILING IS ONE NUMBER FOR EVERYBODY AND A CONTEXT WINDOW
+    IS NOT. MAX_COMPOSED_CHARS asks whether the bench will send a prompt
+    at all; it cannot ask whether THIS lineup can receive it, and windows
+    differ by orders of magnitude across a catalog. A document
+    comfortable for model/alpha at 128000 tokens is a hard provider
+    error for model/vision at 8192, and the comparison would have come
+    back with some cards answered and some erroring, which is not a
+    comparison.
+
+    Refused at creation, so it costs nothing and names every model it
+    applies to at once. The arithmetic is per model because the remedy
+    is: drop that one, shorten the document, or use the other budget.
+    """
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    # 8192-token window; at four characters per token the whole window is
+    # about 32k characters, and the standard budget reserves 16384 of it.
+    big = b"x" * 120_000
+    digest = upload(client, "long.txt", big).json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha", "model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    # The narrow model is named with its window and the arithmetic.
+    assert "model/vision holds 8192 tokens" in detail
+    assert "reserved for the answer" in detail
+    # The wide one is not, because it fits.
+    assert "model/alpha holds" not in detail
+    # Honest about the estimate rather than presenting it as a count.
+    assert "an estimate, characters over 4" in detail
+    assert route.call_count == 0
+
+
+@respx.mock
+def test_a_prompt_that_fits_every_window_is_created(client):
+    """The guard. A ceiling that refused ordinary comparisons would be
+    worse than none, so this is the same lineup with a document that
+    fits the narrowest member."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "short.txt", b"a short contract").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha", "model/capped"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 201
+
+
+@respx.mock
+def test_a_window_smaller_than_the_budget_itself_refuses_any_document(client):
+    """WINDOW: POST /groups over model/vision, whose catalog window of
+    8192 tokens is SMALLER than the 16384 the standard budget reserves,
+    with a document of sixteen characters.
+
+    PINNED BECAUSE IT LOOKS LIKE A BUG AND IS NOT. No document fits this
+    model, because the answer alone does not: the bench would be asking
+    a provider to reserve twice the window for the completion. The
+    refusal names both numbers, so a reader sees immediately that the
+    document is not what is too big.
+
+    THE UNDERLYING MISMATCH IS OLDER THAN THIS CHECK and outside this
+    phase. effective_budget clamps the requested tier to a model's
+    published max_completion_tokens, and model/vision publishes none, so
+    16384 goes to an 8192-token model on every unattached comparison
+    too. The ceiling did not create that; it is the first thing to
+    notice it, and it notices it only where documents are involved. That
+    is flagged rather than silently widened, because widening it would
+    mean the ceiling stopped counting the answer, and the answer is half
+    of what a context window holds."""
+    digest = upload(client, "tiny.txt", b"sixteen chars ok").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "model/vision holds 8192 tokens" in detail
+    assert "16384 reserved for the answer" in detail
+
+
+@respx.mock
+def test_the_budget_tier_is_counted_against_the_window(client):
+    """WINDOW: the same lineup and the same document under the two
+    budget tiers.
+
+    BOTH HALVES OF THE WINDOW. A context window holds the prompt AND the
+    completion, so a prompt that fits with 16k reserved does not fit with
+    64k, and the extended tier is exactly when somebody attaches a long
+    document. A check that counted only the prompt would pass this and
+    then fail at the provider."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    # model/capped: a 64000-token window, and a published completion cap
+    # of 32000 that effective_budget clamps the extended tier down to.
+    # Usable after headroom is 57600. A 120k-character document is about
+    # 30000 prompt tokens, so 30000 + 16384 fits and 30000 + 32000 does
+    # not: the document is identical and only the tier moves.
+    digest = upload(client, "mid.txt", b"y" * 120_000).json()["digest"]
+    body = {
+        "prompt": "summarize",
+        "models": ["model/capped"],
+        "attachments": [digest],
+    }
+
+    standard = client.post("/groups", json={**body, "budget": "standard"})
+    extended = client.post("/groups", json={**body, "budget": "extended"})
+
+    assert standard.status_code == 201, standard.json()
+    assert extended.status_code == 422, extended.json()
+    assert "model/capped holds 64000 tokens" in extended.json()["detail"]
+    # The reserved half is named, so the person can see which number to
+    # change.
+    assert "32000 reserved for the answer" in extended.json()["detail"]
+
+
+@respx.mock
+def test_a_model_the_catalog_gives_no_window_for_is_skipped_not_refused(client):
+    """WINDOW: POST /groups for a lineup containing model/bare, which the
+    catalog lists with context_length null.
+
+    THE ONE PLACE THIS CODEBASE DOES NOT SAY "ABSENCE OF EVIDENCE IS NOT
+    SUPPORT", and the asymmetry is deliberate. That rule governs CLAIMS:
+    native mode asserts every model saw the image, so an unverifiable
+    model must be refused. This check makes no claim; it only declines to
+    send something known not to fit. Refusing unknowns here would take
+    every attached comparison offline the moment the catalog could not be
+    fetched, and MAX_COMPOSED_CHARS still applies to all of them."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest = upload(client, "long.txt", b"x" * 120_000).json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/bare"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    )
+
+    assert resp.status_code == 201

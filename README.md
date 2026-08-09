@@ -563,6 +563,16 @@ what a provider does with the frames it is not shown is undefined and
 varies, so a comparison over one would not be a comparison over the same
 input.
 
+**Tabs and line breaks survive.** A tabbed line in a `.docx` reaches the
+models as a tabbed line, and a break inside a paragraph as a newline.
+Earlier builds dropped both, so `Name<tab>Value` arrived as `NameValue`:
+a word the document does not contain, in the place a reader looks for the
+value.
+
+**Images are checked against their first bytes**, not only their
+extension, so a file named `.png` that is not one is refused at upload
+rather than posted to a provider as an image.
+
 **Tables in a `.docx` are not read.** They could be: they sit in the same
 part of the archive as the paragraphs. They are skipped on purpose,
 because a table's text without its rows and columns is worse than no
@@ -587,8 +597,12 @@ one at a time without a comparison record, which sent each of them
 whatever it resolved on its own.
 
 **Caps.** At most 4 documents per comparison, at most 8 MiB each, at most
-32 MiB of inflated XML out of any one `.docx`, and a composed prompt of at
-most 200,000 characters. The last one is the one
+8 MiB of inflated XML out of any one `.docx`, 256 levels of nesting, and a
+composed prompt of at most 200,000 characters. The composed prompt is
+**also** checked against each model's own context window at creation, with
+the arithmetic shown per model, because a prompt that is comfortable for
+one member of a lineup can be a hard error for another and a comparison
+where some cards answer and some error is not a comparison. The last one is the one
 that matters most: past a provider's context limit some refuse and others
 silently truncate, and a comparison where two providers truncated at
 different points is not one comparison. Refusing at composition makes it

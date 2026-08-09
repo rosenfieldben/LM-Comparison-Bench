@@ -517,6 +517,17 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         model = {
             "id": entry["id"],
             "name": entry.get("name") if isinstance(entry.get("name"), str) else None,
+            # How many tokens the model can hold, prompt and completion
+            # together. Read by the composed-prompt ceiling, which
+            # refuses a comparison no member could actually receive.
+            #
+            # Pinned against the live listing at
+            # https://openrouter.ai/api/v1/models read 2026-08-09, where
+            # context_length is a top-level integer on every one of the
+            # 400 entries. int-or-None rather than trusted, for the
+            # reason every field here is: a string or a null from a
+            # future shape must read as "the catalog did not say", which
+            # the ceiling skips, and never as a number.
             "context_length": (
                 entry.get("context_length")
                 if isinstance(entry.get("context_length"), int)

@@ -18,11 +18,13 @@ import pytest
 
 from bench import extract as bench_extract
 from bench.extract import (
+    MAX_DOCX_DEPTH,
     MAX_EXTRACTED_CHARS,
     MAX_INFLATED_BYTES,
     ExtractionError,
     _extract_pdf,
     extract,
+    ingest,
     suffix_of,
 )
 
@@ -45,6 +47,20 @@ def docx_bytes(*paragraphs, runs=None):
         for text in paragraphs
     )
     document = f'<?xml version="1.0"?><w:document xmlns:w="{ns}"><w:body>{body}</w:body></w:document>'
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", document)
+    return buffer.getvalue()
+
+
+def rich_docx_bytes(body):
+    """A .docx whose body is given verbatim, for shapes docx_bytes cannot
+    build: tab stops, breaks, and deliberate nesting."""
+    ns = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    document = (
+        f'<?xml version="1.0"?><w:document xmlns:w="{ns}">'
+        f"<w:body>{body}</w:body></w:document>"
+    )
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w") as archive:
         archive.writestr("word/document.xml", document)
@@ -299,7 +315,10 @@ def test_a_docx_extracts_its_paragraphs():
 
     assert out["text"] == "first para\nsecond para"
     assert out["extractor"] == "stdlib-zipfile-xml"
-    assert out["extractor_version"] == "1"
+    # "2" since K1.4: the reader now emits tabs and line breaks, so
+    # it produces different text from the same bytes and the
+    # rendition key must be able to tell the two readings apart.
+    assert out["extractor_version"] == "2"
 
 
 def test_review_repro_runs_inside_a_paragraph_join_without_a_separator():
@@ -824,7 +843,7 @@ def test_the_real_ceiling_refuses_a_real_bomb():
     with pytest.raises(ExtractionError) as excinfo:
         extract("bomb.docx", buffer.getvalue())
 
-    assert "32 MiB" in str(excinfo.value)
+    assert "8 MiB" in str(excinfo.value)
 
 
 def test_an_ordinary_docx_is_nowhere_near_the_inflated_ceiling():
@@ -865,3 +884,167 @@ def test_a_pdf_stops_parsing_once_it_is_past_the_character_ceiling():
     with pytest.raises(ExtractionError) as excinfo:
         extract("huge.pdf", many_page_pdf(pages, page))
     assert "too long" in str(excinfo.value) or "characters" in str(excinfo.value)
+
+
+# ---- Phase K1.4: extraction hardening.
+
+
+def test_review_repro_a_deeply_nested_docx_refuses_instead_of_crashing():
+    """WINDOW: one extract() call over a .docx nested past the old
+    recursion limit, and the exception TYPE that comes out of it.
+
+    THE cp1252 SHAPE, AGAIN. _paragraphs and _run_text used one Python
+    frame per level of XML nesting and raised RecursionError at depth
+    991 and 993 against a default limit of 1000. RecursionError is not
+    ExtractionError, so it escaped extract(), escaped ingest(), escaped
+    create_attachment's handler, and turned an upload into a bare 500
+    with no message: the same escape the cp1252 fallback had, and one
+    nested element is cheaper to write than a legacy encoding.
+
+    Two claims, and the second is the one the depth bound adds. The
+    walk no longer crashes at ANY depth, proven a full order of
+    magnitude past the old ceiling, and a document nested past
+    MAX_DOCX_DEPTH is refused with a message rather than read.
+    """
+    # Past the old limit by 10x, and past the new bound.
+    deep = "<w:p>" + "<w:r>" * 10_000 + "<w:t>buried</w:t>" + "</w:r>" * 10_000
+    deep += "</w:p>"
+
+    with pytest.raises(ExtractionError) as excinfo:
+        extract("deep.docx", rich_docx_bytes(deep))
+
+    assert "levels deep" in str(excinfo.value)
+    assert str(MAX_DOCX_DEPTH) in str(excinfo.value)
+
+
+def test_a_document_nested_under_the_bound_still_reads():
+    """The guard on the bound: a limit set below real authoring would be
+    a refusal the bench inflicts on ordinary documents. A table inside a
+    text box inside a nested list measures about twenty levels, so this
+    exercises ten times that and expects text, not a refusal."""
+    body = "<w:p>" + "<w:r>" * 200 + "<w:t>still here</w:t>" + "</w:r>" * 200
+    body += "</w:p>"
+
+    assert extract("nested.docx", rich_docx_bytes(body))["text"] == "still here"
+
+
+def test_review_repro_tabs_and_line_breaks_survive_extraction():
+    """WINDOW: the extracted text of one .docx paragraph containing
+    w:tab and w:br between runs.
+
+    THEY WERE DROPPED, WHICH INVENTED WORDS. _run_text collected w:t and
+    nothing else, so measured, "Name<tab>Value" came out as "NameValue"
+    and "line one<br>line two" as "line oneline two". Every model then
+    read a token the document does not contain, in the position a person
+    would look for the value. It is the table flattening one element
+    down, except this one fabricates rather than omits.
+    """
+    tabbed = (
+        "<w:p><w:r><w:t>Bolt</w:t><w:tab/><w:t>10</w:t>"
+        "<w:tab/><w:t>2.50</w:t></w:r></w:p>"
+    )
+
+    text = extract("prices.docx", rich_docx_bytes(tabbed))["text"]
+
+    assert text == "Bolt\t10\t2.50"
+    # The fabricated number the old reader produced.
+    assert "102.50" not in text
+
+    broken = (
+        "<w:p><w:r><w:t>The contract expires in</w:t><w:br/>"
+        "<w:t>December</w:t></w:r></w:p>"
+    )
+    assert extract("terms.docx", rich_docx_bytes(broken))["text"] == (
+        "The contract expires in\nDecember"
+    )
+
+
+def test_review_repro_a_tab_stop_is_not_a_tab_character():
+    """WINDOW: a paragraph that declares tab STOPS in its properties and
+    types ONE tab in its run.
+
+    THE TRAP IN THE FIX ABOVE. w:pPr/w:tabs/w:tab is a ruler position and
+    shares its qualified name with the tab character; measured, such a
+    paragraph holds three w:tab elements where the author typed one. A
+    walk that mapped every w:tab would have emitted two phantom tabs at
+    the start of the line, which reads as an indent nobody wrote.
+
+    So the fidelity fix is only correct WITH the properties skip, and
+    this is the proof of that pairing rather than of the mapping."""
+    # A PARAGRAPH BEFORE IT, and that is the window rather than a
+    # decoration. extract() strips the whole result, so phantom tabs
+    # emitted at the very start of the document are stripped away with
+    # it: the first version of this proof put the tab-stop paragraph
+    # first and PASSED against the broken walk, because strip() hid
+    # exactly the characters it was meant to catch. In a real document
+    # the paragraph has something above it and the phantom tabs are
+    # interior, which is where they do their damage.
+    body = (
+        "<w:p><w:r><w:t>Parts list</w:t></w:r></w:p>"
+        '<w:p><w:pPr><w:tabs><w:tab w:val="left" w:pos="720"/>'
+        '<w:tab w:val="left" w:pos="1440"/></w:tabs></w:pPr>'
+        "<w:r><w:t>Item</w:t><w:tab/><w:t>Price</w:t></w:r></w:p>"
+    )
+
+    text = extract("stops.docx", rich_docx_bytes(body))["text"]
+
+    assert text == "Parts list\nItem\tPrice"
+    assert text.count("\t") == 1
+
+
+def test_plain_text_keeps_its_tabs_and_interior_line_endings():
+    """WINDOW: extract() over a .txt with interior tabs and CRLF.
+
+    Text needed no change and this pins that, because the docx fix
+    invites a well-meaning normalization pass that would quietly rewrite
+    every plain-text document the bench has ever read. Only the outer
+    strip is applied, which is declared."""
+    out = extract("table.txt", b"\n\nName\tValue\r\nA\tB\n\n")
+
+    assert out["text"] == "Name\tValue\r\nA\tB"
+
+
+@pytest.mark.parametrize(
+    "name,content",
+    [
+        ("shot.png", b"not a png at all, just text pretending"),
+        ("photo.jpg", b"\x89PNG\r\n\x1a\n" + b"png bytes under a jpg name"),
+        ("anim.webp", b"RIFF" + b"\x00\x00\x00\x00" + b"NOTWEBP"),
+    ],
+)
+def test_review_repro_bytes_that_are_not_the_image_they_claim_refuse(name, content):
+    """WINDOW: ingest() for bytes whose first fourteen say they are not
+    what the filename claims.
+
+    THE SUFFIX WAS THE ONLY CHECK. Anything named .png became an image:
+    stored with mime image/png, pinned with kind "image", base64'd into
+    a data URL and posted to a provider. That is the one place this
+    bench hands unvalidated bytes to somebody else's parser, and the
+    failure arrived as a paid call's error rather than as an upload
+    refusal.
+
+    Three cases, one per accepted format, including a real PNG under a
+    .jpg name: the bytes being a valid image of ANOTHER type is the
+    case a naive "does it look like any image" check would wave
+    through, and the mime on the row would then be wrong."""
+    with pytest.raises(ExtractionError) as excinfo:
+        ingest(name, content)
+
+    assert "does not begin like one" in str(excinfo.value)
+
+
+def test_a_real_image_of_each_accepted_type_is_admitted():
+    """The guard: a signature check that refused real images would be
+    worse than none. One valid header per accepted format, including the
+    RIFF container whose length bytes differ per file and must not be
+    compared."""
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d494844520000000100000001080600000"
+        "01f15c4890000000d4944415478da63fcffff3f0300050001ff9a1c86"
+        "9c0000000049454e44ae426082"
+    )
+    assert ingest("shot.png", png)["kind"] == "image"
+    assert ingest("photo.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 40)["kind"] == "image"
+    # The four bytes after RIFF are a per-file length and are skipped.
+    webp = b"RIFF" + (1234).to_bytes(4, "little") + b"WEBPVP8 " + b"\x00" * 32
+    assert ingest("anim.webp", webp)["kind"] == "image"

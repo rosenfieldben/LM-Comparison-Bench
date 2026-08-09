@@ -68,13 +68,30 @@ SUPPORTED_SUFFIXES = (".txt", ".md", ".pdf", ".docx")
 # is checked AFTER the reader returns, so the allocation it would refuse
 # has already happened.
 #
-# 32 MiB, because word/document.xml is markup around text and the text
-# it may legitimately carry is already bounded at MAX_EXTRACTED_CHARS.
-# Even at a lavish twenty bytes of tags per character that is under the
-# cap, so a document refused here was never going to survive the
-# character bound either, and refusing it now is refusing it in the
-# cheap place.
-MAX_INFLATED_BYTES = 32 * 1024 * 1024
+# 8 MiB, which is this constant's own arithmetic finally applied to
+# itself. The reasoning was always "MAX_EXTRACTED_CHARS of text at a
+# lavish twenty bytes of markup per character", and 400,000 times 21 is
+# 8.4 MB. The number written beside it was 32 MiB, four times that, and
+# the gap was doing real damage.
+#
+# MEASURED, at the old cap and at this one. A 95.6 KiB upload compressing
+# at 343:1 inflates to 32.00 MiB of XML; parsing and walking that peaks
+# at 396 MiB of Python objects (12.4x the input) and takes 12.85 seconds.
+# The same shape at 8 MiB peaks at 91 MiB and takes 1.11 seconds. The
+# amplification is the point: an element tree is objects, not bytes, and
+# a hundred kilobytes on the wire became four hundred megabytes in the
+# heap.
+#
+# And every one of those megabytes was wasted anyway. The 32 MiB
+# document extracted to 1,973,721 characters, which MAX_EXTRACTED_CHARS
+# then refused: the work was done to produce text the next line threw
+# away. A cap that admits only what the character bound could accept is
+# the cap that was meant.
+#
+# This is the ONLY bound that fires before the allocation. The depth
+# check below runs during the walk, which is after ET.fromstring has
+# already built the tree, so it cannot protect the heap.
+MAX_INFLATED_BYTES = 8 * 1024 * 1024
 
 # The docx paragraph-text element, in the WordprocessingML namespace.
 # Pinned against the OOXML shape rather than matched loosely: w:t holds
@@ -107,6 +124,71 @@ _MC_FALLBACK = f"{_MC_NS}Fallback"
 #
 # mc:Fallback because it is the duplicate of a branch already taken.
 _DOCX_SKIPPED = (_DOCX_TABLE, _MC_FALLBACK)
+
+# Formatting properties, which hold no text and must not be walked for
+# it. THIS IS NOT TIDINESS, it is the one trap in mapping w:tab.
+#
+# w:pPr/w:tabs/w:tab is a TAB STOP: a ruler position, part of the
+# paragraph's formatting. It shares its qualified name with the tab
+# CHARACTER that appears inside a run. Measured on a paragraph with two
+# stops declared and one tab typed, the tree holds three w:tab elements,
+# so a walk that mapped every w:tab to a tab would have turned
+# "Item<tab>Price" into "\t\tItem\tPrice": two characters the document
+# does not contain, in the position where a reader would take them for
+# an indent.
+_DOCX_PROPERTIES = (f"{_DOCX_NS}pPr", f"{_DOCX_NS}rPr")
+
+# OOXML elements that ARE whitespace, and the characters they stand for.
+#
+# THESE WERE DROPPED ENTIRELY. _run_text collected w:t nodes and nothing
+# else, so a tabbed line came out with its cells welded together:
+# measured, "Name<tab>Value" extracted as "NameValue", and "line
+# one<br>line two" as "line oneline two". Every model then read a word
+# the document does not contain, in the place a person would look for
+# the value. It is the docx sibling of the table flattening K.1 refused,
+# except that this one invented text rather than dropping it.
+#
+# Pinned against ISO/IEC 29500-1 as documented at
+# https://learn.microsoft.com/en-us/dotnet/api/documentformat.openxml.wordprocessing.tabchar
+# and .../documentformat.openxml.wordprocessing.carriagereturn and
+# .../documentformat.openxml.wordprocessing.break, read 2026-08-09:
+# w:tab is a tab character, w:br a break, w:cr a carriage return.
+#
+# "\n" and not "\r" for the two breaks, because they end a line INSIDE
+# one paragraph and _extract_docx already joins paragraphs with "\n": a
+# reader should not have to know which of the two produced a given line.
+#
+# DELIBERATELY NOT MAPPED, and stated so the omission reads as a
+# decision: w:noBreakHyphen and w:softHyphen. The first is a visible
+# hyphen and dropping it joins two words, which is a real if small
+# fidelity loss; the second is an invisible break opportunity that
+# should vanish. Neither is a tab or a line break, which is what this
+# workstream is about, and mapping them is a change to what every
+# existing rendition of every stored .docx says.
+_DOCX_LITERALS = {
+    f"{_DOCX_NS}tab": "\t",
+    f"{_DOCX_NS}br": "\n",
+    f"{_DOCX_NS}cr": "\n",
+}
+
+# How deep a document may nest before the bench stops reading it.
+#
+# THE BOUND IS ABOUT WORK, NOT ABOUT CRASHING. The walks below are
+# iterative now, so no depth raises RecursionError however absurd; what
+# an unbounded depth still buys an attacker is elements to visit, and
+# the byte cap already bounds those. This exists because a document
+# nested past any plausible authoring is not a document the bench should
+# spend on at all, and because saying so with a number is better than
+# discovering the shape later.
+#
+# 256, and the reasoning rather than the round number: a real table
+# inside a text box inside a level-five list measures about 20 levels.
+# Fifteen nested text boxes would be roughly 170, and nested tables
+# inside those add tens more. 256 is the next power of two above any of
+# that, more than ten times the realistic case. Microsoft documents no
+# limit of its own, so there is no authority to cite here and none is
+# invented.
+MAX_DOCX_DEPTH = 256
 
 
 # The composed prompt's ceiling, in characters, prompt and documents
@@ -297,7 +379,7 @@ def _extract_pdf(content: bytes) -> str:
 def _paragraphs(node: ET.Element) -> Iterator[ET.Element]:
     """Every paragraph in the subtree, in document order, EXACTLY ONCE.
 
-    A recursive walk rather than root.iter(w:p), because iter() has no
+    A hand-rolled walk rather than root.iter(w:p), because iter() has no
     way to express either of the two rules this needs. It skips the
     branches in _DOCX_SKIPPED entirely, and it descends THROUGH a
     paragraph after yielding it so a nested one (a text box) is still
@@ -307,13 +389,47 @@ def _paragraphs(node: ET.Element) -> Iterator[ET.Element]:
     the nested paragraph separately, and _run_text refuses to read it
     from inside its parent. Change one without the other and the text
     either doubles or vanishes.
+
+    ITERATIVE, AND THAT IS A BUG FIX RATHER THAN A STYLE PREFERENCE.
+    The recursive form used one Python frame per level of XML nesting,
+    so a document nested past the interpreter's limit raised
+    RecursionError: measured at depth 991 here and 993 in _run_text,
+    against a default limit of 1000. RecursionError is not
+    ExtractionError, so it escaped extract(), escaped ingest(), escaped
+    create_attachment's handler, and turned an upload into a bare 500
+    with no message. That is precisely the shape the cp1252 fallback had,
+    and one nested element is a cheaper thing to write than a legacy
+    encoding.
+
+    An explicit stack of child iterators reproduces the recursion's
+    order exactly: pushing an iterator makes it the top of the stack, so
+    the next element taken is the child's, which is pre-order
+    depth-first, the same sequence the recursive form produced.
     """
-    for child in node:
+    stack: list[Iterator[ET.Element]] = [iter(node)]
+    while stack:
+        try:
+            child = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
         if child.tag in _DOCX_SKIPPED:
             continue
         if child.tag == _DOCX_PARAGRAPH:
             yield child
-        yield from _paragraphs(child)
+        # len(stack) is the depth of the node whose children are being
+        # walked, so the child about to be pushed sits one deeper.
+        # Checked HERE, in the one walk that visits a superset of what
+        # _run_text visits, so the document is covered once.
+        if len(stack) >= MAX_DOCX_DEPTH:
+            raise ExtractionError(
+                f"this .docx nests elements more than {MAX_DOCX_DEPTH} "
+                "levels deep, which no document written by a person does. "
+                "It is either damaged or built to be expensive to read. "
+                "Attach the section you want compared, or paste its text "
+                "into the prompt."
+            )
+        stack.append(iter(child))
 
 
 def _run_text(paragraph: ET.Element) -> str:
@@ -323,15 +439,36 @@ def _run_text(paragraph: ET.Element) -> str:
     Not a direct-children scan, because a w:t is legitimately several
     levels down (w:p > w:hyperlink > w:r > w:t is ordinary), and reading
     only direct runs would silently drop every linked word.
+
+    WHITESPACE ELEMENTS ARE TEXT. w:tab, w:br and w:cr carry no w:t and
+    were therefore dropped, welding a tabbed line's cells together into
+    a word the document does not contain. See _DOCX_LITERALS.
+
+    Iterative for the reason _paragraphs is; the two must stay the same
+    shape or a document deep enough to crash one crashes the pair.
     """
     parts: list[str] = []
-    for child in paragraph:
+    stack: list[Iterator[ET.Element]] = [iter(paragraph)]
+    while stack:
+        try:
+            child = next(stack[-1])
+        except StopIteration:
+            stack.pop()
+            continue
         if child.tag in _DOCX_SKIPPED or child.tag == _DOCX_PARAGRAPH:
+            continue
+        # Formatting, not text. See _DOCX_PROPERTIES: a tab STOP lives
+        # here and shares its name with the tab CHARACTER below.
+        if child.tag in _DOCX_PROPERTIES:
             continue
         if child.tag == _DOCX_TEXT:
             parts.append(child.text or "")
-        else:
-            parts.append(_run_text(child))
+            continue
+        literal = _DOCX_LITERALS.get(child.tag)
+        if literal is not None:
+            parts.append(literal)
+            continue
+        stack.append(iter(child))
     return "".join(parts)
 
 
@@ -437,7 +574,15 @@ _READERS = {
 _VERSIONS = {
     "text": "1",
     "pypdf": pypdf.__version__,
-    "stdlib-zipfile-xml": "1",
+    # BUMPED BY K1.4, and the bump is load-bearing rather than
+    # cosmetic. The docx reader now emits tabs and line breaks where it
+    # used to emit nothing, so it produces DIFFERENT TEXT from the same
+    # bytes. Renditions are keyed on (digest, extractor,
+    # extractor_version), so without this bump the old reading would be
+    # served under the new reader's name: exactly the false provenance
+    # the rendition key exists to prevent, arriving through the one door
+    # it cannot see.
+    "stdlib-zipfile-xml": "2",
 }
 
 
@@ -642,6 +787,68 @@ IMAGE_KIND = "image"
 DOCUMENT_KIND = "document"
 
 
+# What the first bytes of each accepted image format look like.
+#
+# THE SUFFIX WAS THE ONLY CHECK. Anything named .png was an image: it was
+# stored with mime image/png, pinned with kind "image", base64'd into a
+# data URL and posted to a provider, which is the one place in this bench
+# where unvalidated bytes are handed to somebody else's parser. A
+# refusal at upload is the cheap place; a provider error at the first
+# paid call is not.
+#
+# Pinned against the WHATWG MIME Sniffing Standard,
+# https://mimesniff.spec.whatwg.org/, read 2026-08-09, which gives the
+# image type patterns as 89 50 4E 47 0D 0A 1A 0A for PNG, FF D8 FF for
+# JPEG, and 52 49 46 46 ?? ?? ?? ?? 57 45 42 50 56 50 for WebP.
+#
+# BYTES 4 THROUGH 7 OF THE WEBP PATTERN ARE SKIPPED because they are the
+# RIFF chunk's little-endian uint32 length, which differs per file; the
+# spec masks them and so does this. Hence two anchored fragments rather
+# than one.
+#
+# Not imghdr: it is deprecated in 3.11 and removed in 3.13, and its JPEG
+# test is narrower than the spec's. Not Pillow: a decoder is a much
+# larger attack surface than a prefix comparison, and the question here
+# is only whether the bytes claim to be what the name says.
+IMAGE_SIGNATURES: dict[str, tuple[tuple[int, bytes], ...]] = {
+    "image/png": ((0, b"\x89PNG\r\n\x1a\n"),),
+    "image/jpeg": ((0, b"\xff\xd8\xff"),),
+    "image/webp": ((0, b"RIFF"), (8, b"WEBPVP")),
+}
+
+
+def enforce_image_signature(filename: str, content: bytes, media: str) -> None:
+    """Refuse bytes that do not begin the way their name claims.
+
+    A NAME IS A CLAIM AND THE BYTES ARE THE FACT. Everything downstream
+    of the upload trusts the kind: the mime goes on the row, the data
+    URL is built from it, and the provider is told this is a PNG. The
+    only place that claim can be checked cheaply is here, against the
+    first fourteen bytes.
+
+    This is not a validity check and does not pretend to be one: a
+    truncated or corrupt PNG with an intact header passes, and should,
+    because deciding whether an image decodes is the provider's job and
+    would cost a decoder to answer. What it refuses is the case that
+    reaches a provider as nonsense: a text file, a zip, or random bytes
+    renamed.
+    """
+    patterns = IMAGE_SIGNATURES.get(media)
+    if patterns is None:
+        return
+    for offset, magic in patterns:
+        if content[offset : offset + len(magic)] != magic:
+            actual = content[:8].hex(" ") or "nothing"
+            raise ExtractionError(
+                f"{filename!r} is named as {media} and does not begin like "
+                f"one: the first bytes are {actual}. Native mode hands the "
+                "file to the provider unchanged, so a file whose name and "
+                "contents disagree would be sent as an image and refused "
+                "there instead of here. Re-save it in the format its name "
+                "claims, or attach it under its real extension."
+            )
+
+
 def native_media_type(filename: str) -> str | None:
     """The data-URL media type for a native image, or None if not one."""
     return NATIVE_IMAGE_TYPES.get(suffix_of(filename))
@@ -710,7 +917,14 @@ def ingest(filename: str, content: bytes) -> dict[str, Any]:
     declaration rather than here: this function stores, and the
     boundary refuses.
     """
-    if native_media_type(filename) is not None:
+    media = native_media_type(filename)
+    if media is not None:
+        # The name says image; the bytes get asked. See
+        # enforce_image_signature for why the check is here and not at
+        # the boundary: this function is where the kind is decided, and
+        # a kind decided from a name alone is the claim that needs
+        # checking.
+        enforce_image_signature(filename, content, media)
         return {
             "text": "",
             "extractor": "none",
