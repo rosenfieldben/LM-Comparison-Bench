@@ -1371,7 +1371,36 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 2
+
+# WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
+# than in this file, because "without anyone consulting a changelog" is
+# the whole claim above and a bare integer does not honor it. A reader
+# holding a v2 file and a v1 parser needs to know what moved, and the
+# file is the only thing they are guaranteed to have.
+#
+# Keyed by version and emitted for the CURRENT one only: the manifest
+# describes this artifact, not the format's history, and shipping every
+# past note would grow line one forever.
+#
+# Version 2 is Phase K. Trial lines gained `attachments` (the digests a
+# comparison declared, in declaration order) and `attachments_mode`
+# (how they reached the models), and the manifest gained
+# `attachments_referenced`. A v1 reader that indexes trial fields
+# positionally or rejects unknown keys will not absorb those, and one
+# that silently ignores them will read a prompt-only artifact out of a
+# file whose prompts had documents composed into them, which is the
+# reading that would be wrong rather than merely partial.
+EXPORT_SCHEMA_NOTES = {
+    1: "the original export shape",
+    2: (
+        "trial lines carry attachments (declared digests, in declaration "
+        "order) and attachments_mode; the manifest carries "
+        "attachments_referenced. A reader that ignores them will treat a "
+        "comparison whose prompt had documents composed into it as a "
+        "prompt-only one."
+    ),
+}
 
 
 def export_line(payload: dict[str, Any]) -> str:
@@ -1423,6 +1452,11 @@ def export_manifest(
     means nobody supplied the file, the second means the file declared
     nothing.
 
+    export_schema_change states, in the artifact, what the version
+    number means. A reader whose parser predates it can find out what
+    moved from the file in their hand rather than from a changelog they
+    may not have; see EXPORT_SCHEMA_NOTES.
+
     attachments_referenced is the same kind of label one subject over:
     the artifact saying what it does NOT embed. Document bytes are never
     in an export, so a reader holding one whose trials cite digests needs
@@ -1451,6 +1485,10 @@ def export_manifest(
         "attachments_referenced": attachments_referenced,
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
+        # The bump's reason, in the file. See EXPORT_SCHEMA_NOTES: a
+        # version number tells a reader their parser is old and nothing
+        # else, and the artifact is meant to be readable on its own.
+        "export_schema_change": EXPORT_SCHEMA_NOTES[EXPORT_SCHEMA_VERSION],
         "experiment_id": experiment["id"],
         "name": experiment["name"],
         "created_at": experiment["created_at"],

@@ -12,7 +12,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from bench import main
+from bench import main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import OPENROUTER_URL, provider_preferences
@@ -6246,7 +6246,12 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 1
+    assert manifest["export_schema_version"] == 2
+    # The bump is acknowledged here rather than only in the constant, and
+    # the artifact carries its own reason: a reader with a v1 parser can
+    # find out what moved without a changelog.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[2]
+    assert "attachments" in manifest["export_schema_change"]
     assert manifest["estimand_mode"] == "routed_service"
     assert manifest["dataset_digest"]
     assert manifest["bootstrap_unit"] == "task"
@@ -8111,15 +8116,31 @@ def test_review_repro_the_record_carries_a_digest_where_the_content_was(client):
     assert f"sha256 {digest}" in recorded
     # And the reference is enough to put the wire bytes back: the stored
     # text, composed by the stated composition, IS what was sent.
+    #
+    # The text comes from the RENDITION rather than from the attachments
+    # row, which is where it always should have come from and where it
+    # is now the only place to get it. The row keeps the first upload's
+    # reading; what was composed is the one the group pinned, and on a
+    # digest with two readings the row would have rebuilt the wrong
+    # bytes and this assertion would have said so.
     stored = store.get_attachment(client.app.state.db, digest)
     assert stored is not None
+    pinned = store.group_renditions(client.app.state.db, group_id)
+    assert pinned is not None
+    rendition = store.extraction_for(
+        client.app.state.db,
+        digest,
+        pinned[0]["extractor"],
+        pinned[0]["extractor_version"],
+    )
+    assert rendition is not None
     rebuilt = compose(
         "summarize",
         [
             {
                 "filename": stored["filename"],
                 "digest": digest,
-                "extracted_text": stored["extracted_text"],
+                "extracted_text": rendition["extracted_text"],
             }
         ],
         redacted=False,
@@ -10656,3 +10677,135 @@ def test_a_model_the_catalog_gives_no_window_for_is_skipped_not_refused(client):
     )
 
     assert resp.status_code == 201
+
+
+# ---- Phase K1.5: what a history page costs, and what a re-upload says.
+
+
+def _traced(client, path):
+    """One request's SQL, captured. Returns (statements, response)."""
+    seen = []
+    client.app.state.db.set_trace_callback(seen.append)
+    try:
+        resp = client.get(path)
+    finally:
+        client.app.state.db.set_trace_callback(None)
+    return seen, resp
+
+
+@respx.mock
+def test_review_repro_the_history_page_does_not_read_the_documents(client):
+    """WINDOW: GET /runs, with sqlite's trace callback on the app's own
+    connection, over a page carrying three attached comparisons.
+
+    A LIST VIEW DRAWS A CHIP PER DOCUMENT saying how many characters came
+    out of it, and produced that integer by SELECTing the document. Three
+    5038-character contracts cost 15114 characters read to print three
+    numbers, and the page's own bound is 500 entries: the same shape at
+    the ceiling is every body in the visible history, loaded into the
+    event loop's process, to render a row of chips.
+
+    Measured at c9ad170 the cost was worse in a second way, 5 + N
+    statements, because each ref resolved its rendition in its own query.
+    K1.1 removed that when it replaced the resolver, so the statement
+    count was already flat at this commit's parent and only the bodies
+    were left. Both halves are asserted here anyway: a count assertion
+    alone would not have noticed the bodies, and a bytes assertion alone
+    would not notice an N+1 coming back.
+
+    THE ASSERTION IS ON THE SQL, not on a timing. A response that happens
+    to be fast today is not the property; the property is that no
+    statement behind this endpoint names the column at all.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    for i in range(3):
+        body = b"the contract says forty two, number %d " % i + b"x" * 5000
+        group_id, digest = attached_group(
+            client, f"p{i}", content=body, models=["model/alpha"]
+        )
+        assert (
+            client.post(
+                "/compare",
+                json={
+                    "prompt": f"p{i}",
+                    "models": ["model/alpha"],
+                    "group_id": group_id,
+                    "attachments": [digest],
+                },
+            ).status_code
+            == 200
+        )
+
+    seen, resp = _traced(client, "/runs")
+    assert resp.status_code == 200
+    entries = resp.json()["runs"]
+    assert len(entries) == 3
+    # The chips are still drawn: this is not a page that got cheap by
+    # dropping what it was for.
+    assert [len(e["attachments"]) for e in entries] == [1, 1, 1]
+    assert [e["attachments"][0]["extracted_chars"] for e in entries] == [5038] * 3
+
+    bodies = [s for s in seen if "extracted_text" in s]
+    assert bodies == [], f"the page read {len(bodies)} document bodies"
+
+    # And flat in the number of entries, which is the half K1.1 already
+    # fixed and which this pins so it cannot drift back. Compared against
+    # a one-entry page rather than against a remembered constant, so the
+    # test states the property instead of a number.
+    baseline, first = _traced(client, "/runs?limit=1")
+    assert first.status_code == 200
+    assert len(first.json()["runs"]) == 1
+    assert len(seen) == len(baseline)
+
+
+def test_review_repro_a_re_upload_reports_its_own_character_count(client):
+    """WINDOW: the version-hit branch of POST /attachments, on bytes that
+    two different readers have already read.
+
+    THE FIFTH FIELD. _view_overlay exists because the attachments row
+    keeps whichever upload arrived first and a second upload under a
+    different suffix is a DIFFERENT rendition that has to be described as
+    itself. It overlaid four fields and left extracted_chars showing the
+    stored row's, so this sequence answered `extractor: text,
+    extractor_version: 1, extracted_chars: 0`: a text reading of 67 bytes
+    that produced no characters, which is not a thing that happened.
+
+    It only appears on the SECOND upload of the second suffix, because
+    the first one takes the extract-and-save path and answers from the
+    record it just wrote. That is why the four-field version looked
+    right: the case it got wrong is the case a person hits when they
+    re-attach a file they already have.
+    """
+    png = bytes.fromhex(
+        "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
+        "890000000a49444154789c630001000005000"
+        "10d0a2db40000000049454e44ae426082".replace(" ", "")
+    )
+    first_image = upload(client, "shot.png", png).json()
+    assert first_image["kind"] == "image"
+    assert first_image["extracted_chars"] == 0
+
+    as_text = upload(client, "shot.txt", png).json()
+    assert as_text["kind"] == "document"
+    assert as_text["extractor"] == "text"
+    chars = as_text["extracted_chars"]
+    assert chars > 0
+
+    # Same bytes, same suffix, second time: the stored reading is found
+    # and returned rather than recomputed, and it must be THAT reading.
+    again = upload(client, "shot.txt", png).json()
+    assert again["extractor"] == "text"
+    assert again["extractor_version"] == as_text["extractor_version"]
+    assert again["kind"] == "document"
+    assert again["extracted_chars"] == chars, (
+        "the response named the text reader and reported the image "
+        "reading's character count"
+    )
+
+    # The image rendition still answers as itself, so the fix reports the
+    # rendition asked for rather than simply the newest one.
+    back = upload(client, "shot.png", png).json()
+    assert back["kind"] == "image"
+    assert back["extracted_chars"] == 0

@@ -2114,7 +2114,12 @@ def test_the_extraction_table_keeps_one_reading_per_parser_version(tmp_path):
         # The caller is told about the reading it just performed.
         assert first["extractor_version"] == "1"
         assert second["extractor_version"] == "2"
-        assert second["extracted_text"] == "some text [v2]"
+        # The LENGTH of that reading, since K1.5, because the row no
+        # longer carries the text out of the store: the two readings are
+        # 9 and 14 characters, so this still distinguishes them and
+        # still fails if the first upload's reading is handed back.
+        assert second["extracted_chars"] == len("some text [v2]")
+        assert first["extracted_chars"] == len("some text")
 
         # One copy of the bytes, and the row's own reading unchanged.
         rows = conn.execute(
@@ -2302,3 +2307,216 @@ def test_an_image_row_backfills_as_an_image_rendition(tmp_path):
         assert found["kind"] == "image"
     finally:
         conn.close()
+
+
+# ---- Phase K1.5: what survives a delete, and what must not be written.
+
+
+def _attachment_record(digest="e1", text="the settlement figure is 40200"):
+    return {
+        "digest": digest,
+        "filename": "contract.txt",
+        "mime": "text/plain",
+        "byte_size": len(text),
+        "content": text.encode(),
+        "extracted_text": text,
+        "extractor": "text",
+        "extractor_version": "1",
+        "kind": "document",
+    }
+
+
+def test_review_repro_deleting_an_attachment_takes_its_extracted_text(tmp_path):
+    """WINDOW: a DELETE issued the only way a person can issue one, from
+    a second connection with foreign_keys at sqlite's default of OFF,
+    against a database the app has already written.
+
+    THE TEXT IS THE THING THAT SURVIVED, not a dangling id. The bytes and
+    the first reading live on the attachments row and go with it; every
+    OTHER reading lives in attachment_extractions keyed by the same
+    digest, and nothing pointed the delete at them. A person who removed
+    a confidential contract from bench.db was left with its full
+    extracted text still on disk under the digest of the file they had
+    just deleted.
+
+    THE SECOND CONNECTION IS THE POINT rather than incidental. Nothing in
+    the application deletes an attachment, so the only deleter is
+    sqlite3 on the command line, which does not set PRAGMA foreign_keys
+    and would therefore have ignored an ON DELETE CASCADE entirely. This
+    connection is opened raw for exactly that reason: a cascade that only
+    works from inside the app is a cascade that never runs.
+    """
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    try:
+        secret = "the settlement figure is 40200"
+        store.save_attachment(conn, _attachment_record(text=secret))
+        # A SECOND reading of the same bytes, which is the row the
+        # attachments delete never touched. Without it this would pass
+        # against the backfilled copy alone and prove less than it
+        # claims.
+        store.save_attachment(
+            conn,
+            {
+                **_attachment_record(text=secret),
+                "filename": "contract.md",
+                "extractor_version": "2",
+            },
+        )
+
+        # PRE-STATE. Two readings on disk, both carrying the text.
+        held = conn.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = 'e1'"
+        ).fetchall()
+        assert [r["extracted_text"] for r in held] == [secret, secret]
+    finally:
+        conn.close()
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        # Exactly what the README tells a person to type, and no pragma.
+        assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        raw.execute("DELETE FROM attachments WHERE digest = 'e1'")
+        raw.commit()
+        left = raw.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = 'e1'"
+        ).fetchall()
+        assert left == [], f"the text outlived the file: {left}"
+        # And nowhere else in the database either, which is the claim the
+        # README makes rather than the narrower one about two tables.
+        for (table,) in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall():
+            for row in raw.execute(f"SELECT * FROM {table}"):
+                for cell in row:
+                    assert not (isinstance(cell, str) and secret in cell), table
+    finally:
+        raw.close()
+
+
+def test_review_repro_a_failed_base_row_commits_no_extraction(tmp_path):
+    """WINDOW: inside save_attachment's transaction, on a record that
+    violates a NOT NULL on `attachments` and none on
+    `attachment_extractions`.
+
+    INSERT OR IGNORE IGNORES EVERY CONSTRAINT, not only the UNIQUE one it
+    is written for. A record with a NULL mime is silently not inserted,
+    because attachments.mime is NOT NULL; attachment_extractions has no
+    mime column, so its insert succeeded. The order was insert, insert,
+    read, and the read's failure was checked AFTER the `with conn` block
+    had already committed, so the document's text was committed under a
+    digest the attachments table had never heard of and the exception
+    was raised over the top of it.
+
+    A digest with no attachments row is a digest nothing can delete: the
+    cascade above hangs off the row that was never written. This is the
+    one path that could manufacture that state.
+    """
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        secret = "the indemnity cap is 2.5 million"
+        with pytest.raises(RuntimeError, match="was not created"):
+            store.save_attachment(
+                conn,
+                {**_attachment_record(digest="f2", text=secret), "mime": None},
+            )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = 'f2'"
+            ).fetchone()["c"]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) c FROM attachments WHERE digest = 'f2'"
+            ).fetchone()["c"]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_the_stored_count_is_pythons_and_not_sqlites(tmp_path):
+    """WINDOW: connect() upgrading a c9ad170-era database whose stored
+    text contains a NUL, from the pre-state through the backfill.
+
+    THE COUNT MOVED OUT OF THE READER, so a list view no longer loads a
+    body per document to print an integer. The obvious backfill for the
+    new column is `UPDATE attachments SET extracted_chars =
+    length(extracted_text)`, and it is wrong: sqlite's length() stops at
+    the first NUL and would write 12 for the 26-character string below.
+
+    A NUL IS NOT A CONTRIVANCE. A binary file uploaded under a .txt
+    suffix decodes through latin-1, which is total and maps 0x00 to
+    U+0000, so the text of any such upload has them. The number would
+    have been short only for those documents, which is the shape of
+    defect nobody finds by looking at a page that renders.
+    """
+    db_path = tmp_path / "nul.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    text = "page one ends\x00and page two begins"
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ef', 'scan.txt', 'text/plain', 33, X'00',
+                   ?, 'text', '1', '2026-06-01T00:00:00+00:00')""",
+        (text,),
+    )
+    legacy.commit()
+
+    # PRE-STATE: the column does not exist, so this cannot be passing
+    # against a fixture that already carried the right number.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachments)")]
+    assert "extracted_chars" not in before
+    # And the number the SQL backfill would have written, measured rather
+    # than asserted from memory.
+    sqlite_says = legacy.execute(
+        "SELECT length(extracted_text) n FROM attachments WHERE digest = 'ef'"
+    ).fetchone()[0]
+    assert sqlite_says == 13
+    assert len(text) == 33
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [r["name"] for r in conn.execute("PRAGMA table_info(attachments)")]
+        assert "extracted_chars" in after
+        row = store.get_attachment(conn, "ef")
+        assert row is not None
+        assert row["extracted_chars"] == 33
+        # The reader no longer carries the body at all, which is the
+        # other half of the change and the half a count assertion alone
+        # would not notice.
+        assert "extracted_text" not in row
+    finally:
+        conn.close()
+
+
+def test_the_count_backfill_runs_once_and_then_does_nothing(tmp_path):
+    """Idempotent, like the K.1 rendition backfill beside it: a second
+    boot must not re-read every body to rewrite numbers already right."""
+    db_path = tmp_path / "twice.db"
+    conn = store.connect(str(db_path))
+    try:
+        store.save_attachment(conn, _attachment_record(text="forty two"))
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        reads = []
+        again.set_trace_callback(reads.append)
+        third = store.connect(str(db_path))
+        third.close()
+        again.set_trace_callback(None)
+        row = store.get_attachment(again, "e1")
+        assert row is not None
+        assert row["extracted_chars"] == len("forty two")
+        pending = again.execute(
+            "SELECT COUNT(*) c FROM attachments WHERE extracted_chars IS NULL"
+        ).fetchone()["c"]
+        assert pending == 0
+    finally:
+        again.close()

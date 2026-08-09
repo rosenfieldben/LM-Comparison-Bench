@@ -556,6 +556,18 @@ plumbing.
   comparison, and capability-checked at creation against the catalog's
   `input_modalities` rather than discovered at the first paid call.
 
+**What the native check clears, and what it does not.** It clears
+*modality*: whether the catalog says a model takes image input at all. It
+does not clear *how many*. OpenRouter states that "the number of images
+you can send in a single request varies per provider and per model", and
+the catalog publishes no per-model number, so there is nothing to check
+the four-document cap against and the bench does not invent one. Four
+images that each model accepts singly will pass creation and can still be
+refused by the provider at request time. That refusal arrives as the
+member's error, after the call rather than before it, and it is a real
+gap in the pre-spend guarantee rather than an omission: the alternative
+is a made-up limit that refuses comparisons which would have run.
+
 Formats: inline reads `.txt`, `.md`, `.pdf` and `.docx`; native sends
 `.png`, `.jpg`/`.jpeg` and `.webp`. GIF is supported by OpenRouter and
 deliberately not taken here: an animated GIF is a sequence of frames, and
@@ -626,6 +638,18 @@ document back: the metadata responses have no content field and the
 readers behind them never select the blob. Deleting `bench.db` deletes
 your documents along with everything else, which keeps the claim above
 in **Local data** true.
+
+**Deleting one document takes its text with it.** There is no delete
+endpoint; the way to remove a single document is `DELETE FROM attachments
+WHERE digest = ...` in `sqlite3`, and the extracted text lives in a
+second table keyed by the same digest. A database trigger removes those
+rows with the row you deleted, so the text does not stay behind under a
+digest whose file you believed you had removed. It is a trigger and not a
+foreign key on purpose: a foreign key cascade does nothing unless the
+connection sets `PRAGMA foreign_keys = ON`, and the `sqlite3` command
+line does not. What remains after the delete is what should: comparisons
+that cited the document still say they cited it, and the history shows
+the reference with its metadata blank rather than dropping it.
 
 The comparison record cites the digest; it never inlines the bytes.
 `request_json` stores the composed payload with a digest reference

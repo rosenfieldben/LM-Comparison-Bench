@@ -1999,6 +1999,12 @@ def documents_for(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 **row,
                 "extracted_text": rendition["extracted_text"],
+                # The row's stored count belongs to the row's own
+                # reading, and this document is the PINNED one. Carried
+                # over unchanged it would sit in the same dict as a
+                # different reading's text, which is the mismatch
+                # _view_overlay exists to stop one endpoint over.
+                "extracted_chars": len(rendition["extracted_text"]),
                 "extractor": pin["extractor"],
                 "extractor_version": pin["extractor_version"],
                 "kind": pin["kind"],
@@ -2100,6 +2106,23 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
     model the catalog does not list, or lists without input_modalities,
     is the same problem one model down. Absence of evidence is not
     support.
+
+    WHAT THIS CHECK DOES NOT CLAIM, stated here because a preflight that
+    is silent about its own limit reads as a guarantee it is not making.
+    It clears MODALITY and modality only: that the catalog says this
+    model takes image input at all. It does NOT clear the COUNT.
+    OpenRouter's image inputs page says so directly, "The number of
+    images you can send in a single request varies per provider and per
+    model"
+    (https://openrouter.ai/docs/guides/overview/multimodal/image-understanding,
+    read 2026-08-09), and the catalog publishes no per-model number to
+    check MAX_ATTACHMENTS against. There is nothing here to pin, so
+    nothing is guessed: a lineup of four images that every model accepts
+    one of will pass this check and can still be refused upstream at
+    request time, where the refusal is the provider's and is reported as
+    the member's error rather than swallowed. The alternative would be
+    inventing a limit the catalog does not state and refusing
+    comparisons that would have run.
     """
     # The pin's kind again, and the mirror of the case above: bytes
     # first uploaded under a document suffix used to be refused from
@@ -4200,13 +4223,19 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
     whether the document came through, while the text is the prompt and
     belongs in the prompt. Serving it here would put a second copy of
     the document in every metadata response.
+
+    The count is READ, not measured. It used to be len(extracted_text),
+    which meant the reader behind this had to select the body of every
+    document on the page to produce one integer each: measured at 15114
+    characters loaded to render three chips. store.ATTACHMENT_COLUMNS
+    carries the stored column now, and the text does not leave sqlite.
     """
     return {
         "digest": row["digest"],
         "filename": row["filename"],
         "mime": row["mime"],
         "byte_size": row["byte_size"],
-        "extracted_chars": len(row["extracted_text"]),
+        "extracted_chars": row["extracted_chars"],
         "extractor": row["extractor"],
         "extractor_version": row["extractor_version"],
         # Part of the rendition, so it is reported rather than left for
@@ -4219,7 +4248,9 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _view_overlay(pin: dict[str, str], filename: str) -> dict[str, Any]:
+def _view_overlay(
+    pin: dict[str, str], filename: str, extracted_chars: int
+) -> dict[str, Any]:
     """The fields of a view that belong to THIS rendition rather than to
     the stored row.
 
@@ -4231,12 +4262,23 @@ def _view_overlay(pin: dict[str, str], filename: str) -> dict[str, Any]:
     change at 324 characters of mojibake from one and 25 characters of
     real text from the other, with nothing in either response saying
     which reading it meant.
+
+    ALL FIVE FIELDS, and the fifth is here because four was not enough.
+    The overlay named the parser, the version, the kind and the name and
+    left extracted_chars showing the stored row's, so re-uploading a
+    file that had first arrived under an image suffix answered
+    `extractor: text, extractor_version: 1, extracted_chars: 0`:
+    measured on 67 bytes that the text reader had in fact read as 67
+    characters. That is the same defect this function was written to
+    kill, surviving in the one field it did not cover, and it appeared
+    only on the second upload, which is why the first one looked right.
     """
     return {
         "filename": filename,
         "extractor": pin["extractor"],
         "extractor_version": pin["extractor_version"],
         "kind": pin["kind"],
+        "extracted_chars": extracted_chars,
     }
 
 
@@ -4354,21 +4396,31 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     known = store.get_attachment(app.state.db, digest)
     if known is not None:
         current = rendition_of(body.filename, digest)
-        if (
-            store.extraction_for(
-                app.state.db,
-                digest,
-                current["extractor"],
-                current["extractor_version"],
-            )
-            is not None
-        ):
+        # Bound rather than tested for None, because the row IS the
+        # answer: its text is what this rendition reads out of these
+        # bytes, and the response has to report that length rather than
+        # the stored row's. Asking `is not None` and then answering from
+        # `known` was how the two came apart.
+        seen = store.extraction_for(
+            app.state.db,
+            digest,
+            current["extractor"],
+            current["extractor_version"],
+        )
+        if seen is not None:
             # This upload's rendition, not the row's. The row keeps
             # the first upload's name and reading; the caller asked
             # about the file they just sent, and answering with a
             # different rendition is how POST and GET came to
             # contradict each other about one digest.
-            return _attachment_view({**known, **_view_overlay(current, body.filename)})
+            return _attachment_view(
+                {
+                    **known,
+                    **_view_overlay(
+                        current, body.filename, len(seen["extracted_text"])
+                    ),
+                }
+            )
     try:
         # OFF THE LOOP THREAD, the same precedent the scorers use and for
         # the same reason: this is synchronous work whose worst case is

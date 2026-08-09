@@ -135,7 +135,8 @@ CREATE TABLE IF NOT EXISTS attachments (
     extracted_text TEXT NOT NULL,
     extractor TEXT NOT NULL,
     extractor_version TEXT NOT NULL,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    extracted_chars INTEGER
 );
 CREATE TABLE IF NOT EXISTS attachment_extractions (
     id INTEGER PRIMARY KEY,
@@ -182,6 +183,36 @@ CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_experiment_id ON groups(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
+"""
+
+# Deleting an attachment deletes every reading of it.
+#
+# A TRIGGER RATHER THAN "ON DELETE CASCADE", for two reasons that both
+# have to hold.
+#
+# The first is the migration discipline: attachment_extractions already
+# exists on databases in the field, and sqlite cannot add a foreign key
+# to a live table. Getting one there means rebuilding the table and
+# copying it, which is not an additive migration and is a destructive
+# operation run at boot on the file holding somebody's documents.
+#
+# The second is the one that actually decides it. A foreign key cascade
+# is INERT unless the connection sets `PRAGMA foreign_keys = ON`, and
+# the sqlite3 command line leaves it off. Nothing in this application
+# deletes an attachment; the only actor who can is a person with sqlite3
+# and their own bench.db, which is exactly what AttachmentRef's docstring
+# names and exactly the case a key would not have covered. A trigger
+# fires for every deleter, pragma or no pragma.
+#
+# What survives a delete without this is not a dangling id: it is the
+# extracted TEXT of the document, sitting in a second table under the
+# same digest, after the person believed they had removed it.
+TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS attachments_delete_cascades_extractions
+AFTER DELETE ON attachments
+BEGIN
+    DELETE FROM attachment_extractions WHERE digest = OLD.digest;
+END;
 """
 
 # Columns added after a table first shipped. CREATE IF NOT EXISTS skips
@@ -351,6 +382,19 @@ MIGRATIONS = [
     # comment is the thing that would have to change first.
     ("attachment_extractions", "kind", "TEXT"),
     ("attachment_extractions", "filename", "TEXT"),
+    # Phase K.1: the extracted length, STORED rather than measured on
+    # read. A history page shows how much text came out of each
+    # document, and deriving that from the text meant every list
+    # response loaded every body: measured at 15114 characters read to
+    # report three numbers, on a page whose own bound is 500 entries.
+    #
+    # Computed in Python and not by sqlite's length(), which is the
+    # detail that makes this a column instead of an expression. A binary
+    # file uploaded under a .txt suffix decodes through latin-1 into
+    # text containing NUL, and sqlite's length() stops counting there:
+    # measured at 2 for a five-character string. A number that is
+    # sometimes silently short is worse than a query that is slow.
+    ("attachments", "extracted_chars", "INTEGER"),
     # The ordered rendition list a group pinned at creation, as JSON
     # objects rather than the bare digests attachments_json holds.
     #
@@ -502,6 +546,7 @@ def connect(path: str) -> sqlite3.Connection:
     # After the migrations, not before: runs.group_id may only exist
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
+    conn.executescript(TRIGGERS)
     # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
     # reader because of a real gap rather than for tidiness.
     #
@@ -530,6 +575,34 @@ def connect(path: str) -> sqlite3.Connection:
                   filename
            FROM attachments"""
     )
+    # THE COUNT BACKFILL, once per database and never again.
+    #
+    # Every row written before the column existed has it NULL, and the
+    # readers below now report it instead of measuring the text, so a
+    # NULL here would surface as a missing character count on a document
+    # the bench can read perfectly well.
+    #
+    # In Python rather than as `UPDATE ... SET extracted_chars =
+    # length(extracted_text)`, for the reason the migration entry gives:
+    # sqlite's length() stops at the first NUL and the SQL form would
+    # write a short number that nothing later could tell from a right
+    # one. This reads each body once, on the first boot after the
+    # upgrade, to avoid reading all of them on every list request after
+    # it.
+    #
+    # Rows are streamed and only the pairs are kept, so the peak is one
+    # document rather than the whole table.
+    counted = [
+        (len(row["extracted_text"]), row["digest"])
+        for row in conn.execute(
+            "SELECT digest, extracted_text FROM attachments"
+            " WHERE extracted_chars IS NULL"
+        )
+    ]
+    if counted:
+        conn.executemany(
+            "UPDATE attachments SET extracted_chars = ? WHERE digest = ?", counted
+        )
     conn.commit()
     return conn
 
@@ -728,18 +801,23 @@ def create_group(
 # ---- Phase K: attachments, stored once by content digest.
 
 
-# Everything about an attachment except the bytes. Named once so the
+# Everything about an attachment except the bodies. Named once so the
 # three readers cannot drift into serving different shapes, and so the
-# omission of `content` is a decision recorded in one place rather than
-# a column list somebody has to remember not to extend. Nothing outside
-# this module reads the BLOB: composition asks for the extracted text,
-# and no endpoint serves the bytes back at all.
+# omissions are a decision recorded in one place rather than a column
+# list somebody has to remember not to extend.
+#
+# NEITHER BODY IS IN IT. Not `content`: nothing outside this module
+# reads the BLOB, and attachment_content is the single deliberate
+# exception. And no longer `extracted_text` either. The text is a body
+# too, up to MAX_EXTRACTED_CHARS of it per document, and a list view
+# showing a hundred documents used to load a hundred of them to print a
+# hundred integers. extracted_chars is that integer, stored at insert.
 ATTACHMENT_COLUMNS = (
     "digest",
     "filename",
     "mime",
     "byte_size",
-    "extracted_text",
+    "extracted_chars",
     "extractor",
     "extractor_version",
     "created_at",
@@ -793,14 +871,29 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
     UNIQUE index is the thing that actually enforces this. The follow-up
     SELECT is inside the same transaction, so it sees the row whichever
     of the two paths created it.
+
+    THE BASE ROW IS PROVEN BEFORE THE EXTRACTION IS WRITTEN, and the
+    order is the guarantee rather than a tidiness. INSERT OR IGNORE
+    swallows EVERY constraint failure, not only the UNIQUE one it is
+    here for: a record with a NULL mime is silently not inserted, since
+    attachments.mime is NOT NULL, while attachment_extractions has no
+    mime column and takes its row happily. Written extraction-last with
+    the check after the block, that committed the document's text under
+    a digest the attachments table had never heard of, and only then
+    raised. The transaction now ends only after the base row has been
+    read back inside it, so the failing case rolls both statements away
+    and nothing is left holding the text.
     """
     now = _now()
+    # Counted here, once, and stored. See the migration entry for why
+    # this is not sqlite's length().
+    chars = len(record["extracted_text"])
     with conn:
         conn.execute(
             """INSERT OR IGNORE INTO attachments
                (digest, filename, mime, byte_size, content, extracted_text,
-                extractor, extractor_version, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                extractor, extractor_version, created_at, extracted_chars)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["filename"],
@@ -811,8 +904,26 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 record["extractor"],
                 record["extractor_version"],
                 now,
+                chars,
             ),
         )
+        row = conn.execute(
+            f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+        if row is None:
+            # Inside the transaction on purpose: raising here rolls the
+            # ignored insert away with it, and no extraction row has
+            # been written yet. A bare assert would do the same and then
+            # vanish under -O, which is not a thing to leave the orphan
+            # rule resting on.
+            raise RuntimeError(
+                f"the attachments row for {record['digest'][:12]} was not "
+                "created and no reading of it will be stored. INSERT OR "
+                "IGNORE suppresses every constraint failure, so this is "
+                "a record that violates one of the NOT NULLs on the "
+                "table rather than a duplicate."
+            )
         # This parser's reading of these bytes, alongside any earlier
         # parser's. IGNORE because re-uploading the same file under the
         # same version is the ordinary case and must stay a no-op.
@@ -838,11 +949,6 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 record["filename"],
             ),
         )
-        row = conn.execute(
-            f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
-            (record["digest"],),
-        ).fetchone()
-    assert row is not None
     out = dict(row)
     # The row on disk carries the FIRST parser's reading under the FIRST
     # name, which is the era record and is deliberately not rewritten.
@@ -851,7 +957,13 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
     # under. Overlaying three of the four was the shape that let a
     # caller receive the first upload's kind attached to this reading's
     # text: a rendition that was never stored and never sent.
-    out["extracted_text"] = record["extracted_text"]
+    #
+    # The reading itself is now its LENGTH, since the row no longer
+    # carries the text out of this module. The overlay is the same
+    # five fields either way, and _view_overlay one module over has to
+    # keep the same five for the same reason: it took K1.5 to notice
+    # that it had only four.
+    out["extracted_chars"] = chars
     out["extractor"] = record["extractor"]
     out["extractor_version"] = record["extractor_version"]
     out["kind"] = record["kind"]
@@ -946,13 +1058,16 @@ def group_renditions(
 
 
 def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
-    """One attachment's metadata and extracted text, never its bytes.
+    """One attachment's metadata, never its bytes and no longer its text.
 
-    The BLOB is deliberately not selected. Composition needs the text,
-    the endpoints need the metadata, and nothing in the bench needs the
-    original bytes back: serving them would make the database a file
-    host, and the privacy posture is that the document exists in exactly
-    one place a person can delete.
+    NEITHER BODY IS SELECTED. The content BLOB never was: serving it
+    would make the database a file host, and the privacy posture is that
+    the document exists in exactly one place a person can delete. The
+    extracted text is not selected either, because no caller of this
+    function reads it. Composition gets its text from the RENDITION,
+    which is the pinned reading rather than whichever one this row
+    happens to hold, and the endpoints want the length, which is now a
+    column.
     """
     row = conn.execute(
         f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
