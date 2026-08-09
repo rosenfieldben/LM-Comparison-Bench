@@ -27,7 +27,7 @@ import httpx
 from fastapi import FastAPI, HTTPException, Query, Response
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -40,6 +40,7 @@ from bench.extract import (
     ExtractionError,
     compose,
     compose_native,
+    current_extractor,
     enforce_composed_size,
     ingest,
     native_media_type,
@@ -396,6 +397,53 @@ class CompareResponse(BaseModel):
     run_id: int | None
 
 
+def _clean_filename(value: str) -> str:
+    """A filename the bench will accept, or a refusal saying which rule.
+
+    Three rules, each with a reason that is not tidiness.
+
+    NO CONTROL CHARACTERS, and the newline is the one that matters. The
+    name is interpolated verbatim into ATTACHMENT_HEADER, which is a
+    single delimiter line the model is told marks the document's start.
+    A name carrying a newline splits that line in two and lets the
+    second half read as content, which is the delimiter boundary the
+    composition depends on being unambiguous. A NUL would also truncate
+    the name for anything downstream that ever passed it to C.
+
+    NO PATH SEPARATORS. The docstring above says this is never used as a
+    path. That has been true by inspection; rejecting the separators
+    makes it true by construction, so a future reader that did join it
+    to a directory cannot be handed "../../etc/passwd" by a caller. The
+    browser sends the basename already, so this refuses nothing a person
+    can produce through the UI.
+
+    NOT ONLY WHITESPACE. min_length=1 admits " ", which is a name no
+    chip can render and no person typed.
+
+    NOT NORMALIZED AND NOT TRIMMED. The name is recorded as sent,
+    because it is a fact about the caller's filesystem rather than a key
+    the bench derives anything from; suffix_of lowercases separately for
+    its own purposes. Rewriting it here would make the stored name
+    something nobody chose.
+    """
+    if any(ch < " " or ch == "\x7f" for ch in value):
+        raise ValueError(
+            "filename contains a control character. The name is written "
+            "into the attachment delimiter the models read, and a name "
+            "that can break that line across two is a name that can be "
+            "mistaken for document content."
+        )
+    if "/" in value or "\\" in value:
+        raise ValueError(
+            "filename contains a path separator. Send the base name: the "
+            "bench stores the bytes in its database and never writes the "
+            "file to disk, so a path is a claim it cannot honor."
+        )
+    if not value.strip():
+        raise ValueError("filename is only whitespace, so it names nothing.")
+    return value
+
+
 class AttachmentCreate(BaseModel):
     """One uploaded document, as base64 inside a JSON body.
 
@@ -415,7 +463,18 @@ class AttachmentCreate(BaseModel):
     # The name as the person's filesystem had it. Recorded, shown, and
     # used to choose the extractor by suffix; never used as a path, and
     # never written to disk, because the bytes go into the database.
+    #
+    # LENGTH WAS THE ONLY BOUND AND LENGTH IS NOT ENOUGH. The name is
+    # interpolated into the composed prompt's attachment header, put in
+    # a chip's text and title, and returned in JSON, so its shape is
+    # not merely cosmetic. See _clean_filename for each refusal.
     filename: str = Field(min_length=1, max_length=255)
+
+    @field_validator("filename")
+    @classmethod
+    def _check_filename(cls, value: str) -> str:
+        return _clean_filename(value)
+
     # Bounded on the ENCODED string, before any decode; see
     # MAX_ATTACHMENT_B64_CHARS for why that bound is not the byte limit.
     content_base64: str = Field(min_length=1, max_length=MAX_ATTACHMENT_B64_CHARS)
@@ -1768,7 +1827,9 @@ def enforce_attachments_exist(digests: list[str]) -> list[dict[str, Any]]:
             "Upload the file first; a comparison cannot declare a document "
             "the bench does not hold.",
         )
-    return [found[digest] for digest in digests]
+    # Resolved, so the text composed into the prompt is the same text
+    # the chip and the history view name. See _resolved.
+    return [_resolved(found[digest]) for digest in digests]
 
 
 def enforce_composed(prompt: str, digests: list[str]) -> str:
@@ -1953,6 +2014,22 @@ def enforce_mode_entry(digests: list[str] | None, mode: str, models: list[str]) 
     before any upstream call, so a refusal spends nothing.
     """
     if not digests:
+        # THE FOURTH CELL OF THE SAME ASYMMETRY. POST /groups refuses a
+        # mode declared with no document, and until now it was the only
+        # door that did: both compare endpoints returned right here, so
+        # an ungrouped member could send attachments_mode "native" with
+        # nothing attached and be recorded as a native run that sent no
+        # image. Same words as the group door, because it is the same
+        # refusal and a person who has read one should recognize the
+        # other.
+        if mode != "inline":
+            raise HTTPException(
+                422,
+                "attachments_mode was declared without any attachment. A "
+                "mode is a statement about how documents reach the "
+                "models, and there are none, so the declaration would "
+                "record a fact about nothing.",
+            )
         return
     if mode == "native":
         enforce_native_mode(digests, models)
@@ -3670,6 +3747,35 @@ async def create_prompt(body: PromptCreate) -> dict[str, Any]:
         ) from None
 
 
+def _resolved(row: dict[str, Any]) -> dict[str, Any]:
+    """One attachment row, with the RUNNING parser's reading on it.
+
+    ONE RULE, APPLIED BY EVERY READER, which is the whole reason this is
+    a function rather than three lookups. What a document "reads as" is
+    a question the chip, the composer and the history view all ask, and
+    if they resolved it differently a person would be shown one text and
+    the models would be sent another.
+
+    The attachments row carries the FIRST parser's reading and keeps it,
+    because a comparison recorded under that parser cites it. When a
+    later parser has also read these bytes (the upload's version-miss
+    path stores that), the later reading is the current one and this
+    returns it. When it has not, the row's own reading stands: that is
+    the honest era answer, and re-extracting here would put a second of
+    CPU inside a request path that did not ask for it.
+    """
+    current = current_extractor(row["filename"])
+    text = store.extraction_for(app.state.db, row["digest"], *current)
+    if text is None:
+        return row
+    return {
+        **row,
+        "extracted_text": text,
+        "extractor": current[0],
+        "extractor_version": current[1],
+    }
+
+
 def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
     """One stored attachment as the API describes it.
 
@@ -3718,7 +3824,7 @@ def _attachment_refs(
         if row is None:
             out.append({"digest": digest})
             continue
-        view = _attachment_view(row)
+        view = _attachment_view(_resolved(row))
         view.pop("created_at")
         out.append(view)
     return out
@@ -3790,8 +3896,45 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
         raise HTTPException(
             422, f"{body.filename!r} is empty, so there is nothing to attach."
         )
+    digest = hashlib.sha256(content).hexdigest()
+    # THE VERSION-MISS PATH, before any parsing. If these exact bytes
+    # have already been read by exactly this parser at exactly this
+    # version, that reading is the answer and re-doing it would burn a
+    # second of CPU to produce a string already on disk. Anything else,
+    # including bytes the bench holds but a NEWER parser has never read,
+    # falls through and extracts.
+    #
+    # This is the dedupe the provenance claim needs. Keyed on the digest
+    # alone it returned the old text under the old version number after
+    # an upgrade, so the row said which parser produced the text and was
+    # wrong about it.
+    known = store.get_attachment(app.state.db, digest)
+    if known is not None:
+        current = current_extractor(body.filename)
+        if store.extraction_for(app.state.db, digest, *current) is not None:
+            return _attachment_view(_resolved(known))
     try:
-        extracted = ingest(body.filename, content)
+        # OFF THE LOOP THREAD, the same precedent the scorers use and for
+        # the same reason: this is synchronous work whose worst case is
+        # long enough to stall every browser run sharing this process.
+        #
+        # MEASURED, not guessed. A 4000-page PDF at the 7.78 MiB upload
+        # bound took 11.8 seconds to parse in full; bounding the page
+        # loop at MAX_EXTRACTED_CHARS brought that to 1.08 seconds, which
+        # is still the same order as the one-second figure the scorers'
+        # to_thread comment names as unacceptable to block on. A stalled
+        # loop during an upload freezes the SSE progress of comparisons
+        # that have already been paid for, which is the expensive kind of
+        # damage from the cheap kind of input.
+        #
+        # A THREAD, not the scorers' child process. That one is a process
+        # only because `re` holds the GIL through a backtrack, so a
+        # timeout could not actually stop it. pypdf and the stdlib zip
+        # and XML readers are ordinary Python and yield between
+        # bytecodes, so a worker thread genuinely leaves the loop
+        # running, and no deadline is wanted here anyway: a slow parse of
+        # a large legitimate document should finish, not be killed.
+        extracted = await asyncio.to_thread(ingest, body.filename, content)
     except ExtractionError as exc:
         # The extractor's messages are written to be shown, which is
         # what ExtractionError means; passing the text straight through
@@ -3800,7 +3943,7 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     stored = store.save_attachment(
         app.state.db,
         {
-            "digest": hashlib.sha256(content).hexdigest(),
+            "digest": digest,
             "filename": body.filename,
             "mime": native_media_type(body.filename)
             or ATTACHMENT_MIMES.get(
@@ -3828,7 +3971,7 @@ async def get_attachment(digest: str) -> dict[str, Any]:
     row = store.get_attachment(app.state.db, digest)
     if row is None:
         raise HTTPException(404, "no such attachment")
-    return _attachment_view(row)
+    return _attachment_view(_resolved(row))
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)

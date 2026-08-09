@@ -11,13 +11,17 @@ these are the cases the upload boundary needs to be able to stand on.
 """
 
 import io
+import tracemalloc
 import zipfile
 
 import pytest
 
+from bench import extract as bench_extract
 from bench.extract import (
     MAX_EXTRACTED_CHARS,
+    MAX_INFLATED_BYTES,
     ExtractionError,
+    _extract_pdf,
     extract,
     suffix_of,
 )
@@ -79,6 +83,58 @@ def pdf_bytes(text="hello from a pdf"):
     for number, body in enumerate(objects, start=1):
         offsets.append(len(out))
         out += f"{number} 0 obj\n".encode() + body + b"\nendobj\n"
+    start_xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{start_xref}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
+
+
+def many_page_pdf(pages, page_text):
+    """A multi-page PDF at roughly the upload ceiling.
+
+    Built here rather than by repeating pdf_bytes, because the question
+    is how many PAGES the reader visits and that needs one document with
+    many pages rather than many documents.
+    """
+    template = "BT /F1 10 Tf 20 700 Td ({}) Tj ET"
+    objects = []
+    kids = []
+    number = 3
+    page_objects = []
+    for index in range(pages):
+        content = template.format(f"page {index} " + page_text).encode()
+        page_objects.append((number, number + 1, content))
+        kids.append(f"{number} 0 R")
+        number += 2
+    font = number
+    objects.append(b"<< /Type /Catalog /Pages 2 0 R >>")
+    objects.append(
+        f"<< /Type /Pages /Kids [{' '.join(kids)}] /Count {pages} >>".encode()
+    )
+    for _page_num, content_num, content in page_objects:
+        objects.append(
+            f"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+            f"/Resources << /Font << /F1 {font} 0 R >> >> "
+            f"/Contents {content_num} 0 R >>".encode()
+        )
+        objects.append(
+            b"<< /Length "
+            + str(len(content)).encode()
+            + b" >>\nstream\n"
+            + content
+            + b"\nendstream"
+        )
+    objects.append(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for num, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{num} 0 obj\n".encode() + body + b"\nendobj\n"
     start_xref = len(out)
     out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
     for offset in offsets:
@@ -668,3 +724,121 @@ def test_a_null_byte_in_text_survives_extraction():
     out = extract("weird.txt", b"before\x00after")
 
     assert "\x00" in out["text"]
+
+
+def test_review_repro_a_high_ratio_docx_is_refused_before_it_inflates(monkeypatch):
+    """WINDOW: PEAK ALLOCATION during one _extract_docx call over a zip
+    whose member inflates far past the ceiling. Not the refusal, which
+    a check after the read also produces: the whole point is that the
+    memory is never taken.
+
+    THE ZIP BOMB IS THE REGEX FREEZE'S SIBLING. MAX_ATTACHMENT_BYTES
+    bounds the compressed upload at 8 MiB and says nothing about what
+    comes out of it; deflate reaches 1000:1 on repetitive XML, so a
+    small valid .docx can ask this process to materialize a gigabyte.
+    Cheap to write, unbounded to serve, and the damage lands on a
+    process that is also streaming somebody's paid comparison.
+
+    MEASURED WITH tracemalloc BECAUSE THE FIRST VERSION OF THIS PROOF
+    DID NOT BITE. It asserted only that the refusal arrived, and
+    archive.read() with a size check afterwards refuses too, having
+    already allocated everything. The mutation restoring the unbounded
+    read passed it. A test whose subject is "before" has to measure
+    before.
+
+    The ceiling is lowered rather than the bomb enlarged, so the
+    assertion has 64x of headroom without the test itself allocating
+    hundreds of megabytes.
+    """
+    monkeypatch.setattr(bench_extract, "MAX_INFLATED_BYTES", 1024 * 1024)
+    payload = (
+        '<?xml version="1.0"?><w:document xmlns:w="'
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        '"><w:body>'
+        + "<w:p><w:r><w:t>A</w:t></w:r></w:p>" * 2_000_000
+        + "</w:body></w:document>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.writestr("word/document.xml", payload)
+    bomb = buffer.getvalue()
+    # The shape is the point: small enough to sail through the upload
+    # cap, large enough inside to matter.
+    assert len(bomb) < 1024 * 1024
+    assert len(payload) > 60 * 1024 * 1024
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(ExtractionError) as excinfo:
+            extract("bomb.docx", bomb)
+        _current, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert "expands to more than" in str(excinfo.value)
+    # Nowhere near the inflated size. The unbounded read peaks at the
+    # whole 64 MiB; the bounded one cannot exceed the ceiling by more
+    # than the decompressor's own buffers.
+    assert peak < 8 * 1024 * 1024, peak
+
+
+def test_the_real_ceiling_refuses_a_real_bomb():
+    """The same defense at the SHIPPED constant, so the proof above
+    cannot be satisfied by a ceiling that only exists in a test. No
+    memory assertion here: this one is about the number in the module.
+    """
+    payload = (
+        '<?xml version="1.0"?><w:document xmlns:w="'
+        "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+        '"><w:body>'
+        + "<w:p><w:r><w:t>A</w:t></w:r></w:p>" * 2_000_000
+        + "</w:body></w:document>"
+    )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
+        archive.writestr("word/document.xml", payload)
+
+    with pytest.raises(ExtractionError) as excinfo:
+        extract("bomb.docx", buffer.getvalue())
+
+    assert "32 MiB" in str(excinfo.value)
+
+
+def test_an_ordinary_docx_is_nowhere_near_the_inflated_ceiling():
+    """The guard on the cap: a bound set so low it refuses real
+    documents would be a denial of service the bench inflicts on
+    itself. A page of prose is four orders of magnitude under it."""
+    ordinary = docx_bytes("a paragraph of perfectly ordinary prose " * 200)
+
+    assert len(ordinary) < MAX_INFLATED_BYTES
+    assert extract("notes.docx", ordinary)["text"].startswith("a paragraph")
+
+
+def test_a_pdf_stops_parsing_once_it_is_past_the_character_ceiling():
+    """WINDOW: the page count _extract_pdf actually visits for a PDF
+    whose text runs far past MAX_EXTRACTED_CHARS.
+
+    The refusal was always correct; the WORK was not. Parsing every page
+    of a 4000-page document to produce seven million characters that the
+    next line throws away took 11.8 seconds on the loop thread. Stopping
+    at the ceiling reaches the identical refusal after a couple of
+    hundred pages.
+
+    Asserted on the returned length rather than on a timing, because a
+    wall-clock assertion is a flake on a loaded machine. Overshooting
+    the ceiling is required, not incidental: the caller raises on
+    "greater than", so a reader that stopped exactly at the limit would
+    hand back a document that looks like it just fit.
+    """
+    page = "the quick brown fox jumps over the lazy dog " * 40
+    pages = 4000
+    text = _extract_pdf(many_page_pdf(pages, page))
+
+    assert len(text) > MAX_EXTRACTED_CHARS
+    # A couple of hundred pages of margin, not four thousand: the point
+    # is that it stopped, and stopping one page later than necessary is
+    # correct behaviour rather than a miss.
+    assert len(text) < MAX_EXTRACTED_CHARS + 5_000
+    with pytest.raises(ExtractionError) as excinfo:
+        extract("huge.pdf", many_page_pdf(pages, page))
+    assert "too long" in str(excinfo.value) or "characters" in str(excinfo.value)

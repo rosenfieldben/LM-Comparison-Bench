@@ -2074,3 +2074,89 @@ def test_no_attachment_reader_selects_the_content_blob(db):
     assert "content" not in row
     assert "content" not in store.ATTACHMENT_COLUMNS
     assert "content" not in store.attachments_for(db, ["aa" * 32])["aa" * 32]
+
+
+def test_the_extraction_table_keeps_one_reading_per_parser_version(tmp_path):
+    """WINDOW: the attachments and attachment_extractions tables after
+    the same bytes are saved twice under two extractor versions.
+
+    ONE COPY OF THE BYTES, ONE ROW PER READING. The storage promise is
+    about content and stays true; the extraction is keyed by parser and
+    version because the text is a property of the bytes AND the parser.
+
+    The attachments row is NOT rewritten by the second save, which is
+    rule two's requirement: a comparison recorded under the first parser
+    cites this digest and its placeholder names that reading's character
+    count."""
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        base = {
+            "digest": "cd" * 32,
+            "filename": "contract.txt",
+            "mime": "text/plain",
+            "byte_size": 9,
+            "content": b"some text",
+            "extractor": "text",
+        }
+        first = store.save_attachment(
+            conn, {**base, "extracted_text": "some text", "extractor_version": "1"}
+        )
+        second = store.save_attachment(
+            conn,
+            {**base, "extracted_text": "some text [v2]", "extractor_version": "2"},
+        )
+
+        # The caller is told about the reading it just performed.
+        assert first["extractor_version"] == "1"
+        assert second["extractor_version"] == "2"
+        assert second["extracted_text"] == "some text [v2]"
+
+        # One copy of the bytes, and the row's own reading unchanged.
+        rows = conn.execute(
+            "SELECT extracted_text, extractor_version FROM attachments"
+            " WHERE digest = ?",
+            (base["digest"],),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["extracted_text"] == "some text"
+        assert rows[0]["extractor_version"] == "1"
+
+        # Both readings retrievable, neither substituting for the other.
+        assert store.extraction_for(conn, base["digest"], "text", "1") == "some text"
+        assert (
+            store.extraction_for(conn, base["digest"], "text", "2") == "some text [v2]"
+        )
+        # A version nobody ran is absent rather than approximated. That
+        # None is the caller's cue to re-extract, and returning some
+        # other version's text here would be exactly the substitution
+        # this table exists to prevent.
+        assert store.extraction_for(conn, base["digest"], "text", "3") is None
+    finally:
+        conn.close()
+
+
+def test_re_saving_the_same_reading_is_a_no_op(tmp_path):
+    """The ordinary case: the same file uploaded twice under one build
+    must not accumulate extraction rows."""
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        record = {
+            "digest": "ef" * 32,
+            "filename": "n.txt",
+            "mime": "text/plain",
+            "byte_size": 2,
+            "content": b"hi",
+            "extracted_text": "hi",
+            "extractor": "text",
+            "extractor_version": "1",
+        }
+        store.save_attachment(conn, record)
+        store.save_attachment(conn, record)
+
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+        assert count["c"] == 1
+    finally:
+        conn.close()

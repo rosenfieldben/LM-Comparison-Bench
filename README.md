@@ -578,8 +578,9 @@ A scanned PDF is refused at upload rather than attached empty. The bench
 does no OCR, so a PDF whose pages carry no text layer would otherwise
 reach every model as a document mentioned and never shown.
 
-**Caps.** At most 4 documents per comparison, at most 8 MiB each, and a
-composed prompt of at most 200,000 characters. The last one is the one
+**Caps.** At most 4 documents per comparison, at most 8 MiB each, at most
+32 MiB of inflated XML out of any one `.docx`, and a composed prompt of at
+most 200,000 characters. The last one is the one
 that matters most: past a provider's context limit some refuse and others
 silently truncate, and a comparison where two providers truncated at
 different points is not one comparison. Refusing at composition makes it
@@ -628,10 +629,33 @@ the composition can do about it: a document's own text can try to
 instruct the model, and marking the boundary clearly is a mitigation, not
 a guarantee.
 
+The inflated bound is there because the 8 MiB upload cap says nothing
+about what comes out of the upload: deflate reaches ratios past 1000:1 on
+repetitive XML, so a small, perfectly valid `.docx` can ask the process to
+materialize a gigabyte. That would stall comparisons already running and
+paid for, which is the expensive kind of damage from the cheap kind of
+input. Extraction also runs off the event loop, so even a slow legitimate
+parse does not freeze the progress of runs in flight.
+
+Filenames are checked as well as bounded: no control characters, because
+the name is written into the delimiter line the models read and one
+carrying a newline could break that line in two; no path separators,
+because the bytes go into the database and a path is a claim the bench
+cannot honor.
+
 **Provenance.** Every attachment row records the extractor that read it
 and that extractor's version, because a `pypdf` upgrade changes the text a
 model reads, and a record that could not say which parser produced it
-would be a record of a prompt nobody can reconstruct. The replay banner
+would be a record of a prompt nobody can reconstruct.
+
+Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
+version. Upload the same file after a parser upgrade and the bench
+re-reads the stored bytes rather than handing back the old text under the
+new version's name. The bytes are still stored once. Earlier readings are
+kept rather than overwritten, because a comparison recorded under the
+earlier parser cites that reading's character count in its own record, and
+overwriting would make it unreconstructible while leaving it looking
+exact. The replay banner
 and the chip titles show it. Exports carry each trial's digests and mode
 and never any content, and the export manifest carries
 `attachments_referenced` so an artifact says at line one whether it

@@ -53,6 +53,29 @@ MAX_EXTRACTED_CHARS = 400_000
 # fails rather than guessing.
 SUPPORTED_SUFFIXES = (".txt", ".md", ".pdf", ".docx")
 
+# The ceiling on what a reader may INFLATE out of an upload, as opposed
+# to what the upload itself may weigh.
+#
+# THE ZIP BOMB IS THE REGEX FREEZE'S SIBLING and gets the same
+# seriousness. MAX_ATTACHMENT_BYTES bounds the compressed body at 8 MiB
+# and bounds nothing about what comes out of it: deflate reaches ratios
+# past 1000:1 on repetitive XML, so a small, perfectly valid .docx can
+# ask this process to materialize a gigabyte. Like the pathological
+# regex, the input is cheap to write, the work is unbounded, and the
+# damage lands on a process that is also serving somebody's comparison.
+#
+# MAX_EXTRACTED_CHARS is not this bound and cannot stand in for it: it
+# is checked AFTER the reader returns, so the allocation it would refuse
+# has already happened.
+#
+# 32 MiB, because word/document.xml is markup around text and the text
+# it may legitimately carry is already bounded at MAX_EXTRACTED_CHARS.
+# Even at a lavish twenty bytes of tags per character that is under the
+# cap, so a document refused here was never going to survive the
+# character bound either, and refusing it now is refusing it in the
+# cheap place.
+MAX_INFLATED_BYTES = 32 * 1024 * 1024
+
 # The docx paragraph-text element, in the WordprocessingML namespace.
 # Pinned against the OOXML shape rather than matched loosely: w:t holds
 # run text, and a bare local-name match would also collect w:tab, w:tbl
@@ -219,7 +242,27 @@ def _extract_pdf(content: bytes) -> str:
     """
     try:
         reader = pypdf.PdfReader(BytesIO(content))
-        pages = [page.extract_text() or "" for page in reader.pages]
+        pages = []
+        budget = MAX_EXTRACTED_CHARS
+        for page in reader.pages:
+            text = page.extract_text() or ""
+            pages.append(text)
+            # STOP AT THE CEILING RATHER THAN AT THE LAST PAGE. extract()
+            # refuses anything past MAX_EXTRACTED_CHARS, so every page
+            # parsed after the budget is gone is work done to produce
+            # text that will be thrown away. A 4000-page PDF at the
+            # upload bound took 11.8 seconds to parse in full and is
+            # refused either way; this reaches the same refusal after a
+            # couple of hundred pages.
+            #
+            # The overshoot is deliberate: the loop breaks AFTER
+            # appending, so the caller still sees a total above the
+            # ceiling and raises the ordinary oversize refusal. Breaking
+            # before would hand back exactly the limit and read as a
+            # document that just fit.
+            budget -= len(text)
+            if budget < 0:
+                break
     except Exception as exc:
         # pypdf raises a family of its own errors plus whatever the
         # underlying parse hits, and the caller's response to every one
@@ -310,7 +353,32 @@ def _extract_docx(content: bytes) -> str:
     """
     try:
         with zipfile.ZipFile(BytesIO(content)) as archive:
-            document = archive.read(_DOCX_DOCUMENT)
+            # A BOUNDED READ, not archive.read(). Two reasons, and the
+            # second is why the cheap check alone will not do.
+            #
+            # read() inflates the whole member into memory before anyone
+            # can look at how big it turned out to be, which is exactly
+            # the allocation MAX_INFLATED_BYTES exists to refuse.
+            #
+            # And the obvious cheap guard, comparing
+            # getinfo(...).file_size against the cap, reads a number out
+            # of the ZIP HEADER, which is written by whoever built the
+            # archive. An honest bomb declares its size and would be
+            # caught; a dishonest one declares 1 KiB and inflates to a
+            # gigabyte anyway. So the size that decides is the size
+            # actually produced, measured by asking for one byte more
+            # than the ceiling and seeing whether it arrives.
+            with archive.open(_DOCX_DOCUMENT) as member:
+                document = member.read(MAX_INFLATED_BYTES + 1)
+            if len(document) > MAX_INFLATED_BYTES:
+                raise ExtractionError(
+                    "this .docx expands to more than "
+                    f"{MAX_INFLATED_BYTES // (1024 * 1024)} MiB of XML "
+                    "inside, which is far past what a readable document "
+                    "needs however small the file itself is. Attach the "
+                    "section you want compared, or paste its text into "
+                    "the prompt."
+                )
     except KeyError as exc:
         raise ExtractionError(
             "this .docx has no word/document.xml inside it, so it is not "
@@ -550,6 +618,27 @@ IMAGE_MODALITY = "image"
 def native_media_type(filename: str) -> str | None:
     """The data-URL media type for a native image, or None if not one."""
     return NATIVE_IMAGE_TYPES.get(suffix_of(filename))
+
+
+def current_extractor(filename: str) -> tuple[str, str]:
+    """Which parser WOULD read this file today, and at which version.
+
+    Asked before any reading happens, so the caller can look up whether
+    that parser has already read these bytes and skip the work. Split
+    out of extract() rather than duplicated at the boundary, because a
+    second place that decided the extractor's name would be a second
+    place that could disagree with the one that records it.
+    """
+    if native_media_type(filename) is not None:
+        return ("none", "0")
+    reader = _READERS.get(suffix_of(filename))
+    if reader is None:
+        # Unsupported, and extract() is the one that says so with a
+        # message worth showing. A pair that matches no stored row sends
+        # the caller down the extract path, which refuses properly.
+        return ("", "")
+    extractor = reader[1]
+    return (extractor, _VERSIONS[extractor])
 
 
 def ingest(filename: str, content: bytes) -> dict[str, Any]:

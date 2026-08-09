@@ -136,6 +136,15 @@ CREATE TABLE IF NOT EXISTS attachments (
     extractor_version TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS attachment_extractions (
+    id INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    extracted_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE (digest, extractor, extractor_version)
+);
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -621,11 +630,35 @@ ATTACHMENT_COLUMNS = (
 def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[str, Any]:
     """Store one attachment, or return the row that already holds it.
 
-    DEDUPE BY CONTENT DIGEST, which is what makes attaching the same
-    document to ten comparisons cost one copy. The digest is computed
-    from the bytes by the caller at the boundary, never supplied by a
-    client, so two uploads of identical content collapse whatever they
-    were named.
+    THE BYTES DEDUPE BY DIGEST; THE EXTRACTION DEDUPES BY DIGEST AND
+    PARSER VERSION, and the split is the whole of what this function
+    now gets right.
+
+    Bytes are content-addressed, so ten comparisons over one contract
+    cost one copy of it, and that is what the README's storage promise
+    rests on. But the TEXT is not a property of the bytes: it is a
+    property of the bytes AND the parser that read them, and a pypdf
+    upgrade changes it. Keying the extraction on the digest alone meant
+    a re-upload after an upgrade returned the row untouched, so the
+    caller got back extractor_version "6.15.0" for text the running
+    6.16 never produced, and every comparison created from it recorded a
+    provenance claim that was quietly false. The one thing the module
+    docstring says the record must always be able to answer, it could
+    not.
+
+    So each (digest, extractor, extractor_version) gets its own
+    extraction row. A version miss re-extracts FROM THE STORED BYTES
+    rather than asking the caller to re-upload, which is the point of
+    having kept them.
+
+    OLD EXTRACTIONS ARE KEPT, NOT OVERWRITTEN, and that is rule two's
+    doing. A comparison recorded before the upgrade cites this digest
+    and its request_json carries a placeholder naming the character
+    count of the text THAT parser produced. Updating in place would make
+    every such record unreconstructible while leaving it looking exact.
+    The attachments row keeps its first extraction as the era record;
+    the extractions table holds each version, so both the old record and
+    the new comparison can be answered.
 
     THE EARLIER FILENAME WINS on a collision, and that is deliberate
     rather than incidental. The row is keyed by content, so the name is
@@ -642,6 +675,7 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
     SELECT is inside the same transaction, so it sees the row whichever
     of the two paths created it.
     """
+    now = _now()
     with conn:
         conn.execute(
             """INSERT OR IGNORE INTO attachments
@@ -657,7 +691,22 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 record["extracted_text"],
                 record["extractor"],
                 record["extractor_version"],
-                _now(),
+                now,
+            ),
+        )
+        # This parser's reading of these bytes, alongside any earlier
+        # parser's. IGNORE because re-uploading the same file under the
+        # same version is the ordinary case and must stay a no-op.
+        conn.execute(
+            """INSERT OR IGNORE INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (
+                record["digest"],
+                record["extractor"],
+                record["extractor_version"],
+                record["extracted_text"],
+                now,
             ),
         )
         row = conn.execute(
@@ -665,7 +714,32 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
             (record["digest"],),
         ).fetchone()
     assert row is not None
-    return dict(row)
+    out = dict(row)
+    # The row on disk carries the FIRST parser's reading, which is the
+    # era record and is deliberately not rewritten. What this call is
+    # about is the reading just performed, so that is what comes back.
+    out["extracted_text"] = record["extracted_text"]
+    out["extractor"] = record["extractor"]
+    out["extractor_version"] = record["extractor_version"]
+    return out
+
+
+def extraction_for(
+    conn: sqlite3.Connection, digest: str, extractor: str, version: str
+) -> str | None:
+    """This parser's reading of these bytes, or None if it never read them.
+
+    None is the caller's cue to re-extract from the stored content and
+    save the result, which is the version-miss path. It is never a cue
+    to fall back on another version's text: that is the substitution
+    this table exists to stop.
+    """
+    row = conn.execute(
+        """SELECT extracted_text FROM attachment_extractions
+           WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
+        (digest, extractor, version),
+    ).fetchone()
+    return str(row["extracted_text"]) if row is not None else None
 
 
 def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:

@@ -520,3 +520,55 @@ async def test_an_unreported_byok_figure_does_not_erase_one_captured_in_band(con
         await reconcile(conn, client, apply=True, delay_s=0, out=io.StringIO())
 
     assert row_of(conn, run_id)["upstream_inference_cost_usd"] == "0.99"
+
+
+@respx.mock
+async def test_review_repro_a_digest_placeholder_survives_reconciliation(conn):
+    """WINDOW: one result row whose request_json carries a Phase K digest
+    reference, across one reconcile pass that rewrites its billing.
+
+    THE MODULE HAS NO PHASE K DIFF AND THAT IS EXACTLY WHY IT NEEDS A
+    PHASE K TEST. reconcile writes only RECONCILABLE_COLUMNS, and
+    request_json is not one of them, so the placeholder should be
+    untouched. Nothing asserted that, and the placeholder is the whole
+    of rule two's reconstruction claim: the wire bytes are recoverable
+    from the digest plus the stored content plus the recorded
+    composition, and a pass that rewrote or dropped the recorded
+    composition would break that silently for every attached comparison
+    it touched.
+
+    Reconcile runs against a live bench on a second connection, so this
+    is not a hypothetical interleaving: it is the documented way to use
+    the tool.
+    """
+    placeholder = "<<attachment content: sha256 " + "ab" * 32 + ", 27 characters>>"
+    recorded = json.dumps(
+        {
+            "model": "model/alpha",
+            "messages": [{"role": "user", "content": "summarize\n\n" + placeholder}],
+            "max_tokens": 16384,
+        }
+    )
+    run_id = seed(
+        conn,
+        [completed_result("model/alpha", "gen-k", request_json=recorded)],
+    )
+    respx.get(GENERATION_URL).respond(json=audit_body("gen-k", total_cost=0.00031))
+
+    out = io.StringIO()
+    # trust_env=False like every client in this file; see the module
+    # docstring for the poisoned-proxy reason.
+    async with httpx.AsyncClient(trust_env=False) as client:
+        await reconcile(conn, client, apply=True, delay_s=0, out=out)
+
+    row = row_of(conn, run_id)
+    # The money moved, so the pass actually did something and the
+    # assertion below is not about a no-op.
+    assert row["billed_cost_usd"] == 0.00031
+    # And the record of what was sent is byte-for-byte what it was.
+    assert row["request_json"] == recorded
+    assert placeholder in row["request_json"]
+    # Never the content itself, which reconcile has no route to anyway
+    # and which this asserts so a future column addition cannot quietly
+    # acquire one.
+    assert "extracted_text" not in row["request_json"]
