@@ -910,7 +910,13 @@ class RunDetail(BaseModel):
     # runs recorded no declaration, so nothing here can say whether they
     # carried one. See runs.renditions_json.
     attachments: list[AttachmentRef] = []
-    renditions: list[dict[str, Any]] | None = None
+    # The pin, typed rather than left as an open mapping. dict[str, Any]
+    # let this field carry anything the store handed it, which for a
+    # DECLARATION is the wrong shape twice over: a caller could not know
+    # which keys to expect, and a repair-on-read miss upstream would
+    # serialize whatever it found. GroupDetail carries the same type for
+    # the same reason.
+    renditions: list[RenditionPin] | None = None
     # What this run actually was: the build that produced it, how old the
     # prices it was costed against were, and the data-handling policy its
     # payloads declared. None on every pre-G row.
@@ -957,6 +963,19 @@ class GroupDetail(BaseModel):
     # inline or native, or None when there are no documents for it to be
     # a statement about. See store.group_attachments_mode.
     attachments_mode: str | None = None
+    # THE PIN ITSELF, which this model did not carry and the store has
+    # held since K.1. A caller could see WHICH DOCUMENTS a comparison
+    # declared and not HOW THEY WERE READ, so the one fact the pin exists
+    # to fix was the one fact the API would not tell you: a client
+    # replaying a comparison had to guess the rendition or resolve the
+    # digest itself, which is the substitution the pin prevents
+    # everywhere else.
+    #
+    # None on every pre-K.1 group, where it means "this comparison
+    # declared documents and said nothing about how to read them", which
+    # is a different fact from an empty list; see store.group_renditions
+    # for the three eras.
+    renditions: list[RenditionPin] | None = None
 
 
 def _git(args: list[str]) -> str | None:
@@ -3267,6 +3286,17 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                         prompt_id,
                         group_id,
                         run_provenance(),
+                        # THE PIN, which the completed path has passed
+                        # since K.1 and this one did not. An aborted run
+                        # is the row most in need of provenance: it is
+                        # the one whose billing has to be reconciled
+                        # later, and reconstructing what it sent needs
+                        # the reading as much as the digest. Without it
+                        # an aborted attached run replayed as a run that
+                        # declared nothing, which is the ungrouped
+                        # hardcoded-empty-list bug arriving by a second
+                        # route.
+                        renditions=pins or None,
                     )
                 except Exception:
                     logger.exception("failed to persist aborted streamed run")
@@ -3354,9 +3384,19 @@ async def group_detail(group_id: int) -> dict[str, Any]:
     # Digests become names here rather than in the store, so the one
     # place that joins a declaration to the attachments table is the
     # boundary that serves it. One query for the whole list.
-    group["attachments"] = _attachment_refs(
-        group["attachments"],
-        store.attachments_for(app.state.db, group["attachments"] or []),
+    #
+    # FROM THE PIN WHEN THERE IS ONE. A K.1 group declared a specific
+    # reading of each document, and describing it by the digest's base
+    # row showed whichever upload arrived first: the wrong name, the
+    # wrong extractor, the wrong kind. Reuse restages from these refs, so
+    # the next comparison inherited the wrong declaration too. The
+    # digest-only path stays for the two pre-K.1 eras, where there is no
+    # pin to honor and the row IS the answer.
+    pinned = group.get("renditions")
+    digests = group["attachments"]
+    rows = store.attachments_for(app.state.db, digests or [])
+    group["attachments"] = (
+        _pinned_refs(pinned, rows) if pinned else _attachment_refs(digests, rows)
     )
     return group
 
@@ -4534,6 +4574,55 @@ def _view_overlay(
     }
 
 
+def _pinned_refs(
+    pins: list[dict[str, Any]], rows: dict[str, dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """A declaration's PINNED renditions as refs, in declaration order.
+
+    THE BASE ROW IS THE WRONG SOURCE and this exists to stop using it. A
+    ref built from the attachments row describes whichever upload of
+    those bytes arrived first: its name, its extractor, its kind, its
+    media type, its character count. A group that pinned a different
+    reading was therefore shown as the reading it did not choose, in the
+    detail view, in the replay banner and in the chips the reuse action
+    restages from. Reuse made it worse than cosmetic, because the
+    composer then declared the wrong rendition into the next comparison.
+
+    So the rendition's own fields win and the row supplies only what is
+    genuinely a property of the BYTES: the digest and the byte size.
+
+    A pin whose reading is gone keeps its digest and loses the rest,
+    which is AttachmentRef's shape for exactly this case; see there for
+    why a missing document is emitted rather than dropped. It is not a
+    refusal here, because a view that refused to render would tell the
+    person less than a chip saying the document is no longer stored.
+    """
+    resolved = store.extractions_for(app.state.db, pins)
+    out = []
+    for pin in pins:
+        row = rows.get(pin["digest"])
+        rendition = resolved.get(
+            (pin["digest"], pin["extractor"], pin["extractor_version"])
+        )
+        if row is None or rendition is None:
+            out.append({"digest": pin["digest"]})
+            continue
+        out.append(
+            {
+                "digest": pin["digest"],
+                # Of the bytes, so the row is right for it.
+                "byte_size": row["byte_size"],
+                "mime": rendition.get("mime") or row["mime"],
+                "filename": rendition.get("filename") or row["filename"],
+                "extracted_chars": rendition["extracted_chars"],
+                "extractor": pin["extractor"],
+                "extractor_version": pin["extractor_version"],
+                "kind": pin["kind"],
+            }
+        )
+    return out
+
+
 def _attachment_refs(
     digests: list[str] | None, rows: dict[str, dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -4799,13 +4888,19 @@ async def get_run(run_id: int) -> dict[str, Any]:
     # browser for lack of anywhere to read. A run records what it sent,
     # so a lone run can now show its documents exactly as a comparison
     # does, and reuse from one stops silently dropping them.
+    #
+    # FROM THE PIN, like the group detail one endpoint over and for the
+    # same reason: the run recorded a rendition, and describing it by the
+    # digest's base row would show whichever upload arrived first.
     pinned = store.run_renditions(app.state.db, run_id)
     run["renditions"] = pinned
-    run["attachments"] = _attachment_refs(
-        [pin["digest"] for pin in pinned] if pinned else None,
-        store.attachments_for(
-            app.state.db, [pin["digest"] for pin in pinned] if pinned else []
-        ),
+    run["attachments"] = (
+        _pinned_refs(
+            pinned,
+            store.attachments_for(app.state.db, [pin["digest"] for pin in pinned]),
+        )
+        if pinned
+        else []
     )
     return run
 

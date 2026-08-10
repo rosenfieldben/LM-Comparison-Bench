@@ -240,18 +240,23 @@
   // truth defect as any other default rendered as a choice. What is not
   // acceptable is being quiet about it, so the button says so before the
   // click and the composer says so after.
-  // Attachments join routing in the same sentence and for the same
-  // reason, which is worth stating rather than quietly widening: an
-  // ungrouped run has no declaration at all, so there is no digest list
-  // to restore. The digests DO survive inside its recorded payload, in
-  // the placeholder that stands where the content sat, and this
-  // deliberately does not go and parse them out: that would promote a
-  // record format into a data format, which is the same mistake reading
-  // controls back off their badges would be. The declaration is the data
-  // path, and an ungrouped run does not have one.
+  // Attachments used to join routing in this sentence, on the grounds
+  // that an ungrouped run had no declaration at all. K.1 gave it one:
+  // runs.renditions_json records the pinned rendition of every document
+  // the run sent, and the API serves it, so the documents ARE restored
+  // now and only the MODE is not. The mode lives on a group row and a
+  // lone run has none, so reuse cannot say whether those documents went
+  // inline or native and must not guess.
+  //
+  // The digests also survive inside the recorded payload, in the
+  // placeholder that stands where the content sat, and this still
+  // deliberately does not parse them out: the declaration is the data
+  // path, and promoting a record format into one would be the same
+  // mistake as reading controls back off their badges.
   const UNGROUPED_ROUTING_NOTE =
-    "routing is not restored, and neither are attachments: an ungrouped " +
-    "run records no declaration";
+    "routing is not restored, and neither is the attachment mode: an " +
+    "ungrouped run records which documents it sent and how each was " +
+    "read, but not whether they went inline or native";
 
   // The controls a replayed comparison ran under, badges plus the system
   // prompt in full. The badge alone says only that a system prompt existed,
@@ -618,13 +623,20 @@
       id: run.id,
       prompt: run.prompt_text,
       params: run.params,
-      // Empty by construction, not by omission: an ungrouped run has no
-      // declaration to read, and its recorded payload holds a digest
-      // REFERENCE rather than the digest list a chip would need. Reuse
-      // from a lone run therefore drops attachments the same way it
-      // drops routing, and the note below already tells the user that a
-      // lone run is a lossy source.
-      attachments: [],
+      // READ FROM THE RECORD, and this used to be a hardcoded empty
+      // list under a comment saying an ungrouped run "has no declaration
+      // to read". That was true when it was written and K.1 made it
+      // false: runs.renditions_json records what a lone run sent, and
+      // GET /runs/<id> has served it since. The comment survived the
+      // change and the empty list survived with it, so a single-model
+      // comparison replayed as one that declared nothing, and reuse from
+      // it silently dropped the documents.
+      //
+      // The mode is not recorded on a run row, only on a group, so it
+      // stays null here and the strip labels itself accordingly. That IS
+      // a real gap in a lone run's declaration and the note below says
+      // so; it is not a reason to drop the documents as well.
+      attachments: run.attachments || [],
       attachmentsMode: null,
     });
     for (const result of run.results) {

@@ -6246,12 +6246,12 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 2
+    assert manifest["export_schema_version"] == 3
     # The bump is acknowledged here rather than only in the constant, and
-    # the artifact carries its own reason: a reader with a v1 parser can
-    # find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[2]
-    assert "attachments" in manifest["export_schema_change"]
+    # the artifact carries its own reason: a reader with an older parser
+    # can find out what moved without a changelog.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[3]
+    assert "renditions" in manifest["export_schema_change"]
     assert manifest["estimand_mode"] == "routed_service"
     assert manifest["dataset_digest"]
     assert manifest["bootstrap_unit"] == "task"
@@ -11413,3 +11413,296 @@ def test_a_body_inside_the_bound_still_reaches_the_endpoint(client):
     resp = upload(client, "ordinary.txt", b"the contract says forty two")
 
     assert resp.status_code == 201, resp.text
+
+
+# ---- Phase K3.4: the pin survives the round trip.
+
+
+def _two_renditions(client, name_stem="doc"):
+    """One digest the bench holds under two readings, image pinned.
+
+    Uploaded .txt FIRST so the BASE ROW is the text one: that ordering is
+    what makes every "describes the base row" defect visible, and doing
+    it the other way round is the case that always worked.
+    """
+    raw = _png(b"round-trip-case")
+    as_text = upload(client, f"{name_stem}.txt", raw).json()
+    as_image = upload(client, f"{name_stem}.png", raw).json()
+    assert as_text["digest"] == as_image["digest"]
+    return as_image["digest"], {
+        "digest": as_image["digest"],
+        "extractor": "none",
+        "extractor_version": "0",
+        "kind": "image",
+    }
+
+
+@respx.mock
+def test_review_repro_group_detail_describes_the_rendition_it_pinned(client):
+    """WINDOW: GET /groups/{id}, on a group whose pin is NOT the digest's
+    base row.
+
+    THE DETAIL VIEW DESCRIBED THE BASE ROW. group_detail resolved each
+    declared digest through attachments_for and never consulted the pin,
+    so a comparison that declared the image reading came back saying
+    `filename: doc.txt, extractor: text, kind: document`: the reading it
+    had specifically not chosen. GroupDetail carried no renditions field
+    at all, so a caller could see WHICH documents a comparison declared
+    and not HOW they were read, which is the one fact the pin exists for.
+
+    Both halves are asserted, because the response model gaining a field
+    and the metadata coming from the right place are two changes and
+    either could have shipped alone.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest, pin = _two_renditions(client)
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+
+    detail = client.get(f"/groups/{group_id}").json()
+
+    # The pin itself, served.
+    assert detail["renditions"] == [pin]
+    # And the metadata derived from it rather than from the base row.
+    ref = detail["attachments"][0]
+    assert ref["kind"] == "image"
+    assert ref["extractor"] == "none"
+    assert ref["extractor_version"] == "0"
+    assert ref["filename"] == "doc.png"
+    assert ref["mime"] == "image/png"
+    assert ref["extracted_chars"] == 0
+    # The base row is still the text one, which is what made this
+    # reachable and must stay true for the assertion to mean anything.
+    base = store.get_attachment(client.app.state.db, digest)
+    assert base is not None
+    assert (base["filename"], base["extractor"]) == ("doc.txt", "text")
+
+
+@respx.mock
+def test_review_repro_a_reuse_carries_the_pin_and_not_the_base_row(client):
+    """WINDOW: the refs a browser reuse restages, which are exactly the
+    group detail's attachments, followed by the group those refs build.
+
+    THE REUSE IS WHERE THE WRONG DESCRIPTION BECAME A WRONG COMPARISON.
+    attach.js stages the refs verbatim and declares a rendition from
+    them, so refs describing the base row made the next comparison
+    declare the base row's reading: a different experiment under the old
+    label, and a native one refused outright because the restaged ref
+    looked like a .txt.
+
+    Asserted at the API level rather than in the browser because that is
+    where the substitution happened; the browser tombstone one file over
+    proves the page sends what it is handed.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest, pin = _two_renditions(client, "reused")
+    first = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+
+    # What a reuse restages, and the declaration it rebuilds from them.
+    refs = client.get(f"/groups/{first}").json()["attachments"]
+    restaged = [
+        {
+            "digest": ref["digest"],
+            "extractor": ref["extractor"],
+            "extractor_version": ref["extractor_version"],
+            "kind": ref["kind"],
+        }
+        for ref in refs
+    ]
+    assert restaged == [pin]
+
+    second = client.post(
+        "/groups",
+        json={
+            "prompt": "describe again",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [ref["digest"] for ref in refs],
+            "attachments_mode": "native",
+            "renditions": restaged,
+        },
+    )
+    assert second.status_code == 201, second.text
+    assert store.group_renditions(client.app.state.db, second.json()["id"]) == [pin]
+
+
+@respx.mock
+async def test_review_repro_an_aborted_stream_records_the_pin(client):
+    """WINDOW: the run row written by the disconnect path of POST
+    /compare/stream, read back through store.run_renditions.
+
+    THE COMPLETED PATH PASSED renditions AND THE ABORTED ONE DID NOT.
+    An aborted run is the row most in need of provenance: its billing is
+    the least knowable locally, so it is the one a reconcile pass comes
+    back to, and reconstructing what it sent needs the reading as much
+    as the digest. Without the pin it replayed as a run that declared
+    nothing, which is the hardcoded-empty-list defect arriving by a
+    second route.
+
+    Driven through the generator and closed after one frame, the same
+    mechanism test_client_disconnect_persists_partial_run uses: aclose()
+    raises GeneratorExit at the yield exactly as a Starlette client
+    disconnect does, and it is deterministic where a real socket close
+    would race the stream.
+    """
+    from bench.main import StreamCompareRequest, compare_stream
+
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    digest, pin = _two_renditions(client, "aborted")
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+
+    resp = await compare_stream(
+        StreamCompareRequest(
+            prompt="describe",
+            model="model/vision",
+            group_id=group_id,
+            attachments=[digest],
+            attachments_mode="native",
+            renditions=[pin],
+        )
+    )
+    gen = resp.body_iterator
+    started = await gen.__anext__()
+    assert json.loads(started.removeprefix("data: "))["type"] == "started"
+    await gen.aclose()
+
+    row = client.app.state.db.execute(
+        "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert row is not None
+    stored = store.run_renditions(client.app.state.db, row["id"])
+    assert stored == [pin], stored
+    # And the replay reads it back as the image it pinned, not as the
+    # base row's text reading.
+    detail = client.get(f"/runs/{row['id']}").json()
+    assert detail["renditions"] == [pin]
+    assert detail["attachments"][0]["kind"] == "image"
+    assert detail["attachments"][0]["filename"] == "aborted.png"
+
+
+@respx.mock
+def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tmp_path):
+    """WINDOW: one export artifact, read with nothing else in hand: no
+    database, no catalog, no changelog.
+
+    A DIGEST NAMES BYTES AND A RENDITION NAMES THE READING. Version 2
+    trial lines carried the digests and the mode, which cannot separate
+    two trials over one file read two ways while the models were shown
+    different things. The artifact exists to be checkable by somebody who
+    has only the artifact, so the reading has to be in it.
+
+    THE GROUP IS BUILT THROUGH THE STORE rather than by the runner,
+    because the runner calls create_group with no attachments argument at
+    all: an experiment trial cannot carry a document today, which is the
+    per-task-attachments deferral. The export path must still be right
+    for a shape the store can hold, and this is the shape it holds.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    eid, path = two_axes_experiment(client, tmp_path)
+    digest, pin = _two_renditions(client, "cited")
+
+    db = client.app.state.db
+    group_id = store.create_group(
+        db,
+        "describe the attached image",
+        ["model/alpha"],
+        None,
+        "standard",
+        {
+            "experiment_id": eid,
+            "task_id": "attached",
+            "repeat_index": 0,
+            "rotation_index": 0,
+        },
+        attachments=[digest],
+        attachments_mode="native",
+        renditions=[pin],
+    )
+    store.save_run(
+        db,
+        "describe the attached image",
+        [
+            {
+                "model": "model/alpha",
+                "response_text": "an image",
+                "latency_ms": 1.0,
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+                "error": None,
+                "cost_usd": 0.0,
+                "position": 0,
+            }
+        ],
+        None,
+        group_id,
+        None,
+        renditions=[pin],
+    )
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+    manifest = lines[0]
+    assert manifest["export_schema_version"] == 3
+    assert manifest["attachments_referenced"] is True
+
+    cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]
+    assert len(cited) == 1, cited
+    trial = cited[0]
+
+    # THE RE-DERIVATION, done the way a reader with only this file would
+    # do it: read four fields off the line and reconstruct the identity.
+    assert trial["attachments"] == [digest]
+    assert trial["attachments_mode"] == "native"
+    assert trial["renditions"] == [pin]
+    rebuilt = {
+        (r["digest"], r["extractor"], r["extractor_version"], r["kind"])
+        for r in trial["renditions"]
+    }
+    assert rebuilt == {(digest, "none", "0", "image")}
+    # Which is the identity the bench itself holds, checked against the
+    # database the reader would NOT have.
+    assert store.group_renditions(db, group_id) == [pin]
+
+    # And no content, at any version. The artifact cites bytes it does
+    # not embed, which is what attachments_referenced announces.
+    raw = read_export(client, eid).decode()
+    assert "base64" not in raw

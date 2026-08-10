@@ -1145,6 +1145,48 @@ def extraction_for(
     return dict(row) if row is not None else None
 
 
+def extractions_for(
+    conn: sqlite3.Connection, pins: list[dict[str, Any]]
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """The named RENDITIONS, keyed by their full three-part identity.
+
+    extraction_for's plural, and it exists for the reason attachments_for
+    exists beside get_attachment: a view showing a page of comparisons
+    must resolve every pin on it in one query, and calling the singular
+    in a loop is the N+1 K1.1 removed once already.
+
+    Keyed by the triple and not by the digest, because one digest can
+    hold several readings and a mapping keyed by bytes would silently
+    pick one of them: exactly the substitution this whole phase is
+    about.
+
+    Selected by DIGEST and filtered here rather than with a row-value IN,
+    because the number of readings per digest is one or two and the
+    digest column is what the UNIQUE index leads with. A pin with no
+    stored reading is simply absent, which is the caller's cue to refuse
+    or to show the reference bare.
+    """
+    if not pins:
+        return {}
+    digests = sorted({pin["digest"] for pin in pins})
+    placeholders = ", ".join("?" for _ in digests)
+    rows = conn.execute(
+        f"""SELECT digest, extractor, extractor_version, kind, filename, mime,
+                   length(extracted_text) AS extracted_chars
+            FROM attachment_extractions WHERE digest IN ({placeholders})""",
+        tuple(digests),
+    ).fetchall()
+    wanted = {
+        (pin["digest"], pin["extractor"], pin["extractor_version"]) for pin in pins
+    }
+    out = {}
+    for row in rows:
+        key = (row["digest"], row["extractor"], row["extractor_version"])
+        if key in wanted:
+            out[key] = dict(row)
+    return out
+
+
 def group_renditions(
     conn: sqlite3.Connection, group_id: int
 ) -> list[dict[str, Any]] | None:
@@ -2243,7 +2285,7 @@ def experiment_groups(
     rows = conn.execute(
         """SELECT id, created_at, prompt_text, models_json, budget,
                   task_id, repeat_index, rotation_index,
-                  attachments_json, attachments_mode
+                  attachments_json, attachments_mode, renditions_json
            FROM groups WHERE experiment_id = ?
            ORDER BY task_id, repeat_index, id""",
         (experiment_id,),
@@ -2262,6 +2304,42 @@ def experiment_groups(
         item["attachments"] = (
             json.loads(raw_docs) if isinstance(raw_docs, str) else None
         )
+        # And the PIN, which the export needs and which this query did
+        # not select. Digests say which bytes; only the rendition says
+        # which reading, and an artifact that named the first without the
+        # second cannot distinguish two experiments over one file read
+        # two ways. Decoded through the same repair-on-read discipline
+        # group_renditions applies, and NOT by calling it, which would be
+        # one query per group: the two must agree, so the shape check is
+        # the same one.
+        raw_pins = item.pop("renditions_json")
+        pins: list[dict[str, Any]] | None = None
+        if isinstance(raw_pins, str):
+            try:
+                decoded_pins = json.loads(raw_pins)
+            except (TypeError, ValueError):
+                decoded_pins = None
+            if isinstance(decoded_pins, list) and all(
+                isinstance(item_pin, dict)
+                and all(
+                    isinstance(item_pin.get(key), str)
+                    for key in ("digest", "extractor", "extractor_version", "kind")
+                )
+                for item_pin in decoded_pins
+            ):
+                pins = [
+                    {
+                        key: pin[key]
+                        for key in (
+                            "digest",
+                            "extractor",
+                            "extractor_version",
+                            "kind",
+                        )
+                    }
+                    for pin in decoded_pins
+                ]
+        item["renditions"] = pins
         out.append(item)
     return out
 

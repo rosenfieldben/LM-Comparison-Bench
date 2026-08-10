@@ -760,6 +760,22 @@ door could ever choose one; a grouped member that names one is checked
 against the group's pin and refused on a disagreement rather than quietly
 given the pinned reading it did not ask for.
 
+It travels back out as well. `GET /groups/{id}` and `GET /runs/{id}`
+serve the pinned renditions, and every chip, replay banner and history
+row describes **the reading the comparison chose** rather than whichever
+upload of those bytes arrived first. That matters most at reuse: the
+composer restages exactly those refs, so a detail view describing the
+base row made the next comparison declare a reading nobody picked, and a
+correctly pinned native comparison could not be reused at all because the
+restaged reference looked like a `.txt`. A run cut short by a
+disconnect records its pin like any other, since an aborted run is the
+one whose billing most needs reconstructing later.
+
+An **export is schema version 3**: each trial line carries the ordered
+pins, so a reader holding only the artifact can say which *reading* of a
+document was sent and not merely which bytes. The manifest states the
+reason for the bump in the file itself.
+
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
 re-reads the stored bytes rather than handing back the old text under the

@@ -47,10 +47,28 @@
   // and pushed across a socket first.
   const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
-  // Suffixes native mode can send, mirroring NATIVE_IMAGE_TYPES in
-  // bench/extract.py. Used ONLY to explain a refusal before it happens;
-  // the server decides.
-  const NATIVE_SUFFIXES = [".png", ".jpg", ".jpeg", ".webp"];
+  // Whether native mode can send this staged document.
+  //
+  // THE KIND, WHICH IS DECLARED, and not the filename's suffix, which is
+  // not. Every staged entry carries the rendition the server recorded,
+  // including whether these bytes were READ as an image, and the suffix
+  // is at best a second copy of that answer: the same bytes uploaded as
+  // .txt and as .png are two renditions with two kinds and one set of
+  // bytes, so a suffix test asks the wrong question and then answers it
+  // from whichever name happens to be on the entry.
+  //
+  // It was measured wrong in exactly that way. Reusing a comparison that
+  // pinned the IMAGE rendition restaged a ref whose filename was
+  // "shot.txt", so this returned "native mode takes images only" and Run
+  // was disabled on a correctly pinned native comparison.
+  //
+  // Still only an explanation of a refusal the server owns; see
+  // enforce_native_mode, which checks the pin's kind server-side.
+  const IMAGE_KIND = "image";
+
+  function usableInNative(doc) {
+    return doc.kind === IMAGE_KIND;
+  }
 
   // Staged documents, in attachment order, which IS the order they are
   // composed into the prompt. Array and not a Set keyed by digest,
@@ -104,11 +122,6 @@
     MAX_ATTACHMENT_BYTES,
     init,
   };
-
-  function suffixOf(name) {
-    const dot = name.lastIndexOf(".");
-    return dot === -1 ? "" : name.slice(dot).toLowerCase();
-  }
 
   // Whether a file is still being read or uploaded.
   function busy() {
@@ -332,7 +345,7 @@
     // The row stays visible with nothing attached: it is how a person
     // discovers that attaching is possible.
     const wrongForNative = staged.filter(
-      (d) => !isMissing(d) && !NATIVE_SUFFIXES.includes(suffixOf(d.filename)),
+      (d) => !isMissing(d) && !usableInNative(d),
     );
     const notes = [];
     if (staged.length === 0) {
@@ -406,9 +419,7 @@
     }
     if (
       modeEl.value === "native" &&
-      staged.some(
-        (d) => !isMissing(d) && !NATIVE_SUFFIXES.includes(suffixOf(d.filename)),
-      )
+      staged.some((d) => !isMissing(d) && !usableInNative(d))
     ) {
       return "native mode takes images only";
     }

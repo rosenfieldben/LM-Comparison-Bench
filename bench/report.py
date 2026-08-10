@@ -365,17 +365,42 @@ def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     because they are two different treatments of the same bytes and
     collapsing them would report an experiment nobody ran. Reachable only
     across cells, since one group holds one mode.
+
+    AND ONCE PER RENDITION, which is the same argument one level in. Two
+    cells over one digest, one pinning the text reading and one the
+    image, are two treatments exactly as two modes are: the models were
+    shown different things. Keyed on digest and mode alone, the report
+    listed them as one document and named a single reading that only one
+    of the two cells used.
+
+    The rendition rides on the entry rather than replacing the digest,
+    because a reader asking "which documents" wants the digest and a
+    reader asking "what did the models see" wants both. None for a
+    pre-K.1 group, where the answer is genuinely unknown rather than
+    absent.
     """
-    seen: set[tuple[str, str | None]] = set()
+    seen: set[tuple[str, str | None, str | None, str | None]] = set()
     out: list[dict[str, Any]] = []
     for group in groups:
         mode = group.get("attachments_mode")
+        pins = {pin["digest"]: pin for pin in group.get("renditions") or []}
         for digest in group.get("attachments") or []:
-            key = (digest, mode)
+            pin = pins.get(digest)
+            key = (
+                digest,
+                mode,
+                pin["extractor"] if pin else None,
+                pin["extractor_version"] if pin else None,
+            )
             if key in seen:
                 continue
             seen.add(key)
-            out.append({"digest": digest, "mode": mode})
+            entry: dict[str, Any] = {"digest": digest, "mode": mode}
+            if pin is not None:
+                entry["extractor"] = pin["extractor"]
+                entry["extractor_version"] = pin["extractor_version"]
+                entry["kind"] = pin["kind"]
+            out.append(entry)
     return out
 
 
@@ -1371,7 +1396,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 2
+EXPORT_SCHEMA_VERSION = 3
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
 # than in this file, because "without anyone consulting a changelog" is
@@ -1391,6 +1416,14 @@ EXPORT_SCHEMA_VERSION = 2
 # that silently ignores them will read a prompt-only artifact out of a
 # file whose prompts had documents composed into them, which is the
 # reading that would be wrong rather than merely partial.
+# Version 3 is Phase K.3. Trial lines gained `renditions`: the ordered
+# pins, each (digest, extractor, extractor_version, kind), beside the
+# digest list version 2 added. A digest names BYTES and a rendition names
+# the READING of them, and the two are not the same claim: the same file
+# read by two parser versions, or as text and as an image, produced
+# trial lines a v2 reader could not tell apart while the models had been
+# shown different things. An artifact whose whole purpose is to be
+# checkable has to carry the reading.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -1399,6 +1432,13 @@ EXPORT_SCHEMA_NOTES = {
         "attachments_referenced. A reader that ignores them will treat a "
         "comparison whose prompt had documents composed into it as a "
         "prompt-only one."
+    ),
+    3: (
+        "trial lines carry renditions: the ordered pins, each with "
+        "digest, extractor, extractor_version and kind. The digest names "
+        "the bytes and the rendition names the reading of them; two "
+        "trials over one digest read two ways were indistinguishable in "
+        "version 2 while the models had been shown different things."
     ),
 }
 
@@ -1585,6 +1625,12 @@ def export_trial(
         # attachments_referenced.
         "attachments": group.get("attachments"),
         "attachments_mode": group.get("attachments_mode"),
+        # THE READING, not only the bytes. Structured rather than
+        # flattened into strings, so a reader re-derives rendition
+        # identity from the artifact by reading four fields rather than
+        # by parsing a convention. None on a pre-K.1 group, which is the
+        # honest answer for a comparison that pinned nothing.
+        "renditions": group.get("renditions"),
         "request_json": result.get("request_json"),
         "response_text": result.get("response_text"),
         "error": result.get("error"),

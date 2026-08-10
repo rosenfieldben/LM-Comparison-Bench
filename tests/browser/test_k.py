@@ -448,20 +448,37 @@ def test_the_client_byte_cap_matches_the_server_constant():
     assert int(declared.group(1)) * 1024 * 1024 == MAX_ATTACHMENT_BYTES
 
 
-def test_the_client_native_suffixes_match_the_extractor():
-    """The composer explains a native refusal before it happens, using
-    its own copy of the image suffix list. A client list WIDER than the
-    extractor's would let a file through to a refusal the composer
-    promised would not come; a narrower one would refuse a file the
-    bench accepts."""
-    from bench.extract import NATIVE_IMAGE_TYPES
+def test_the_client_asks_the_kind_and_keeps_no_suffix_list():
+    """The composer explains a native refusal before it happens, and
+    K.3 changed WHAT IT ASKS.
 
+    This used to assert that the client's own copy of the image suffix
+    list matched the extractor's, which is the best a duplicated
+    decision can do: keep the two in step. The duplication is gone
+    instead. Every staged entry carries the KIND the server recorded,
+    which is the answer the suffix was standing in for, so the client
+    reads the declaration rather than re-deriving it from a name.
+
+    That it was a re-derivation and not merely a duplicate is what made
+    it wrong rather than redundant: reusing a comparison that pinned the
+    IMAGE rendition restaged a ref named "shot.txt", and the suffix test
+    disabled Run on a correctly pinned native comparison.
+
+    So this asserts the absence, which is the property that can regress:
+    a future edit reintroducing a client-side suffix list fails here even
+    if it copies the list correctly.
+    """
     source = (STATIC / "attach.js").read_text(encoding="utf-8")
-    block = re.search(r"const NATIVE_SUFFIXES = \[(.*?)\];", source, re.S)
 
-    assert block, "static/attach.js must declare NATIVE_SUFFIXES"
-    declared = set(re.findall(r'"(\.[a-z]+)"', block.group(1)))
-    assert declared == set(NATIVE_IMAGE_TYPES)
+    assert "NATIVE_SUFFIXES" not in source
+    assert "doc.kind === IMAGE_KIND" in source
+    # And the string it compares against is the server's, not a third
+    # spelling of it.
+    from bench.extract import IMAGE_KIND
+
+    match = re.search(r'const IMAGE_KIND = "([a-z]+)";', source)
+    assert match, "static/attach.js must name the kind it checks for"
+    assert match.group(1) == IMAGE_KIND
 
 
 def test_review_repro_the_native_refusal_survives_the_attach_message(bench):
@@ -666,27 +683,70 @@ def test_review_repro_a_late_upload_does_not_contaminate_a_replay(bench, open_hi
     expect(page.get_by_test_id("attach-msg")).not_to_contain_text("still being read")
 
 
-def test_an_ungrouped_run_shows_its_documents_on_replay(bench, open_history):
-    """WINDOW: the replay banner for a LONE run, which is the client half
-    of runs.renditions_json.
+def test_review_repro_a_lone_run_shows_its_documents_on_replay(bench, open_history):
+    """WINDOW: showRun, the replay path for an UNGROUPED run, which is
+    the client half of runs.renditions_json.
 
-    The browser used to hardcode an empty list here for lack of anywhere
-    to read. A lone run is produced by any comparison of one model, so
-    this is the ordinary case and not an edge."""
+    THE PREVIOUS VERSION OF THIS TEST NEVER REACHED showRun, and that is
+    the finding it now carries. It ran a one-model comparison through the
+    composer and clicked its history row, on the reasoning that one model
+    is a lone run. It is not: stream.js POSTs /groups before every Run,
+    so a browser comparison of one model is a GROUP entry and the click
+    lands in showGroup, which was already correct. Proven by mutating
+    showRun to throw on its first line: the old test still passed.
+
+    Meanwhile showRun really did hardcode `attachments: []`, under a
+    comment saying an ungrouped run "has no declaration to read" that
+    K.1 had made false. So the test named the right window and exercised
+    a different one, and the bug it was written to prevent sat behind it
+    for two phases.
+
+    A LONE RUN IS MADE THE ONLY WAY ONE CAN BE: through the API, which
+    is exactly who produces them now that the browser always groups.
+    """
     page = bench(["stub/fast"])
     check_only(page, "stub/fast")
-    attach(page, text_file())
-    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
-    run_and_wait(page, "summarize the attached contract for one model")
+    # A run with no group, created outside the composer, carrying a
+    # document and its pin.
+    made = page.evaluate(
+        """async () => {
+             const bytes = "dGhlIGxvbmUgcnVuJ3MgY29udHJhY3Q=";
+             const up = await fetch("/attachments", {
+               method: "POST",
+               headers: {"Content-Type": "application/json"},
+               body: JSON.stringify({
+                 filename: "lone.txt", content_base64: bytes,
+               }),
+             });
+             const stored = await up.json();
+             const resp = await fetch("/compare", {
+               method: "POST",
+               headers: {"Content-Type": "application/json"},
+               body: JSON.stringify({
+                 prompt: "summarize the lone run's contract",
+                 models: ["stub/fast"],
+                 attachments: [stored.digest],
+                 renditions: [{
+                   digest: stored.digest,
+                   extractor: stored.extractor,
+                   extractor_version: stored.extractor_version,
+                   kind: stored.kind,
+                 }],
+               }),
+             });
+             return {status: resp.status, body: await resp.json()};
+           }"""
+    )
+    assert made["status"] == 200, made
 
     open_history()
-    row_for(page, "summarize the attached contract for one model").first.click()
+    row_for(page, "summarize the lone run's contract").first.click()
     expect(page.get_by_test_id("run-label")).to_contain_text(
         "Historical", timeout=DONE_TIMEOUT
     )
 
     expect(page.get_by_test_id("run-attachments")).to_be_visible()
-    expect(page.get_by_test_id("run-attachment")).to_have_text("contract.txt")
+    expect(page.get_by_test_id("run-attachment")).to_have_text("lone.txt")
 
 
 # ---- Phase K3.2: the browser carries what it was handed.
