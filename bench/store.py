@@ -149,6 +149,7 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     kind TEXT,
     filename TEXT,
     mime TEXT,
+    extracted_chars INTEGER,
     UNIQUE (digest, extractor, extractor_version)
 );
 CREATE TABLE IF NOT EXISTS results (
@@ -425,6 +426,21 @@ MIGRATIONS = [
     # is exactly what save_attachment's earlier-name-wins rule promises
     # and what the composer tells the person in words.
     ("attachment_extractions", "mime", "TEXT"),
+    # Phase K.3 closing review: THE SAME COLUMN K1.5 ADDED TO
+    # attachments, ADDED HERE FOR THE SAME REASON, because the closing
+    # review's own sweep found that reason reintroduced.
+    #
+    # extractions_for was written to resolve a page of pins in one query
+    # and counted characters with sqlite's length(), which is precisely
+    # what the attachments column exists to avoid: length() stops at the
+    # first NUL. Measured on one 33-character document containing one,
+    # uploaded and then read back through a pinned ref: POST answered 33
+    # and GET /groups/{id} answered 13, in one session, about one file.
+    #
+    # A stored count and not a Python len() at read time, because the
+    # whole point of that reader is that it does not carry bodies out of
+    # sqlite; see the attachments entry above for the same argument.
+    ("attachment_extractions", "extracted_chars", "INTEGER"),
     # Phase K.1: the extracted length, STORED rather than measured on
     # read. A history page shows how much text came out of each
     # document, and deriving that from the text meant every list
@@ -744,6 +760,22 @@ def connect(path: str) -> sqlite3.Connection:
     if typed:
         conn.executemany(
             "UPDATE attachment_extractions SET mime = ? WHERE id = ?", typed
+        )
+    # THE RENDITION'S CHARACTER COUNT, once per database, in Python. The
+    # attachments backfill above says why this cannot be
+    # `SET extracted_chars = length(extracted_text)`; this is the same
+    # column on the same kind of text one table over.
+    per_reading = [
+        (len(row["extracted_text"]), row["id"])
+        for row in conn.execute(
+            "SELECT id, extracted_text FROM attachment_extractions"
+            " WHERE extracted_chars IS NULL"
+        )
+    ]
+    if per_reading:
+        conn.executemany(
+            "UPDATE attachment_extractions SET extracted_chars = ? WHERE id = ?",
+            per_reading,
         )
     conn.commit()
     return conn
@@ -1072,8 +1104,8 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         conn.execute(
             """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
-                created_at, kind, filename, mime)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, kind, filename, mime, extracted_chars)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["extractor"],
@@ -1093,6 +1125,10 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 # same reason one line up. The base row's belongs to the
                 # first upload, and native composition sends this one.
                 record["mime"],
+                # Counted in Python, like the attachments row's; see the
+                # migration entry for what sqlite's length() does to a
+                # document containing a NUL.
+                chars,
             ),
         )
     out = dict(row)
@@ -1186,8 +1222,8 @@ def extractions_for(
     digests = sorted({pin["digest"] for pin in pins})
     placeholders = ", ".join("?" for _ in digests)
     rows = conn.execute(
-        f"""SELECT digest, extractor, extractor_version, kind, filename, mime,
-                   length(extracted_text) AS extracted_chars
+        f"""SELECT digest, extractor, extractor_version, kind, filename,
+                   mime, extracted_chars
             FROM attachment_extractions WHERE digest IN ({placeholders})""",
         tuple(digests),
     ).fetchall()

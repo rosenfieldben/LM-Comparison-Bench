@@ -2689,3 +2689,68 @@ def test_review_repro_a_deleted_documents_bytes_are_overwritten(tmp_path):
         conn.close()
 
     assert db_path.read_bytes().count(marker.encode()) == 0
+
+
+def test_review_repro_a_pinned_refs_character_count_is_pythons_too(tmp_path):
+    """WINDOW: store.extractions_for, the batch reader the K.3 closing
+    review added, on a rendition whose text contains a NUL.
+
+    K1.5 MOVED THIS COUNT OFF sqlite's length() FOR THE attachments
+    TABLE, argued the reason at length in the migration, and the closing
+    review's own sweep found the reason reintroduced one table over: the
+    new reader was written with `length(extracted_text) AS
+    extracted_chars` because it must not carry bodies out of sqlite, and
+    length() stops at the first NUL.
+
+    Measured before the fix, on one 33-character document containing
+    one: POST /attachments answered 33 and GET /groups/{id} answered 13,
+    in one session, about one file. The upload path had the K1.5 column
+    and the pinned-ref path had the bug it was written to kill.
+
+    The column, not a len() at read time, because the reader's whole
+    purpose is that a page of pins costs no bodies.
+    """
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        text = "page one ends\x00and page two begins"
+        assert len(text) == 33
+        record = {
+            "digest": "ab" * 32,
+            "filename": "nul.txt",
+            "mime": "text/plain",
+            "byte_size": len(text),
+            "content": text.encode("latin-1"),
+            "extracted_text": text,
+            "extractor": "text",
+            "extractor_version": "1",
+            "kind": "document",
+        }
+        stored = store.save_attachment(conn, record)
+        assert stored["extracted_chars"] == 33
+
+        # What sqlite would have said, measured rather than remembered.
+        assert (
+            conn.execute(
+                "SELECT length(extracted_text) n FROM attachment_extractions"
+                " WHERE digest = ?",
+                (record["digest"],),
+            ).fetchone()["n"]
+            == 13
+        )
+
+        pins = [
+            {
+                "digest": record["digest"],
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ]
+        resolved = store.extractions_for(conn, pins)
+        found = resolved[(record["digest"], "text", "1")]
+        assert found["extracted_chars"] == 33
+        # And the reader still carries no body, which is the constraint
+        # that produced the bug in the first place.
+        assert "extracted_text" not in found
+    finally:
+        conn.close()
