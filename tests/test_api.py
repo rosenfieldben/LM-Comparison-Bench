@@ -7813,11 +7813,28 @@ def test_review_repro_re_uploading_identical_bytes_returns_the_existing_row(clie
     assert rows["c"] == 1
     # And the response says which name those bytes are stored under, so
     # a caller can see it sent content the bench already had.
-    # THIS upload's name, not the stored row's. The row keeps the first
-    # name because comparisons already cite it; the response describes
-    # the rendition just produced. Answering with the row's name is how
-    # POST and GET came to contradict each other about one digest.
-    assert second.json()["filename"] == "renamed.txt"
+    #
+    # THE RENDITION'S OWN NAME, which for these two uploads is the FIRST
+    # one, because .txt twice is one reading and therefore one rendition
+    # row. This assertion said "renamed.txt" between K1.4 and the K.3
+    # closing review, and it contradicted three other statements of the
+    # rule while it did: this test's own docstring above,
+    # save_attachment's ("the upload response carries the stored name,
+    # so a caller that uploaded contract-v2.pdf and got back
+    # contract.pdf can see that it sent bytes the bench already had"),
+    # and the README's.
+    #
+    # It also made a message in the composer unreachable. attach.js
+    # compares the returned filename against the picked one to say "was
+    # already stored under that name, so the earlier name stands", and
+    # while the response echoed the picked name that comparison could
+    # never be true.
+    #
+    # The K1.4 overlay it came from was right about the OTHER fields and
+    # about the other case: two suffixes that produce two DIFFERENT
+    # readings are two renditions, and each is described by its own row,
+    # which is still what happens. See _view_overlay.
+    assert second.json()["filename"] == "contract.pdf.txt"
 
 
 def test_review_repro_an_oversized_upload_is_refused_with_both_numbers(client):
@@ -10761,7 +10778,15 @@ def test_review_repro_the_history_page_does_not_read_the_documents(client):
     assert [len(e["attachments"]) for e in entries] == [1, 1, 1]
     assert [e["attachments"][0]["extracted_chars"] for e in entries] == [5038] * 3
 
-    bodies = [s for s in seen if "extracted_text" in s]
+    # A BODY IS THE COLUMN SELECTED BARE, not the identifier appearing.
+    # store.extractions_for names it inside length(), which returns an
+    # integer and reads no text out of sqlite; a substring match called
+    # that a body and turned a correct change into a red test.
+    bodies = [
+        statement
+        for statement in seen
+        if re.search(r"(?<!length\()extracted_text", statement)
+    ]
     assert bodies == [], f"the page read {len(bodies)} document bodies"
 
     # And flat in the number of entries, which is the half K1.1 already
@@ -11706,3 +11731,389 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
     # not embed, which is what attachments_referenced announces.
     raw = read_export(client, eid).decode()
     assert "base64" not in raw
+
+
+# ---- Phase K.3 closing review: the declaration-transport walk, and the
+# ---- one hop of eleven it found still substituting.
+
+
+@respx.mock
+def test_review_repro_the_history_list_shows_the_pinned_reading(client):
+    """WINDOW: GET /runs, the history LIST, on a group whose pin is not
+    the digest's base row.
+
+    THE LAST SUBSTITUTING HOP, and the walk is what found it. K3.4 fixed
+    the two DETAIL views and left the list alone, because the list has a
+    second constraint the detail views do not: it draws up to 500
+    entries and K1.5 proved it flat in the number of them, so the
+    obvious fix (resolve each ref) would have reintroduced the N+1 that
+    phase removed. It resolves every pin on the page in one query
+    instead.
+
+    Measured before: a comparison that pinned the image rendition of
+    bytes first uploaded as .txt listed a chip reading
+    `kind document, filename y.txt, extractor text`.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest, pin = _two_renditions(client, "listed")
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+    assert (
+        client.post(
+            "/compare",
+            json={
+                "prompt": "describe",
+                "models": ["model/vision"],
+                "group_id": group_id,
+                "attachments": [digest],
+                "attachments_mode": "native",
+                "renditions": [pin],
+            },
+        ).status_code
+        == 200
+    )
+
+    entry = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
+    ref = entry["attachments"][0]
+
+    assert ref["kind"] == "image"
+    assert ref["extractor"] == "none"
+    assert ref["filename"] == "listed.png"
+    assert ref["mime"] == "image/png"
+
+
+@respx.mock
+def test_the_pin_reaches_every_layer_that_carries_it(client):
+    """THE DECLARATION-TRANSPORT WALK, as a test rather than as a report.
+
+    One digest the bench holds under two readings, the IMAGE one pinned
+    and the TEXT one on the base row, followed through every layer that
+    carries a declaration. Any layer answering "document", "text" or the
+    .txt name is substituting, which is the defect class this phase
+    exists to end.
+
+    ONE TEST AND NOT ELEVEN, deliberately. The eleven hops have their own
+    tombstones and this does not replace them; what it adds is the
+    property none of them can hold alone, that the pin survives the WHOLE
+    path. Every defect this phase fixed was a single layer behaving
+    reasonably on its own, and a suite of per-layer tests is exactly what
+    was in place while the pin was being dropped at six of them.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest, pin = _two_renditions(client, "walked")
+    db = client.app.state.db
+
+    # The trap: the base row is the reading NOT pinned.
+    base = store.get_attachment(db, digest)
+    assert base is not None
+    assert (base["filename"], base["extractor"], base["mime"]) == (
+        "walked.txt",
+        "text",
+        "text/plain",
+    )
+
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+    assert (
+        client.post(
+            "/compare",
+            json={
+                "prompt": "describe",
+                "models": ["model/vision"],
+                "group_id": group_id,
+                "attachments": [digest],
+                "attachments_mode": "native",
+                "renditions": [pin],
+            },
+        ).status_code
+        == 200
+    )
+    run_id = db.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1").fetchone()["id"]
+
+    # Every hop, in order, each asserted on the value it carries.
+    assert store.group_renditions(db, group_id) == [pin]
+    assert store.run_renditions(db, run_id) == [pin]
+
+    recorded = db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()["request_json"]
+    assert "as image" in recorded and "image/png" in recorded
+    assert "text/plain" not in recorded
+
+    detail = client.get(f"/groups/{group_id}").json()
+    assert detail["renditions"] == [pin]
+    assert detail["attachments"][0]["kind"] == "image"
+
+    run_detail = client.get(f"/runs/{run_id}").json()
+    assert run_detail["renditions"] == [pin]
+    assert run_detail["attachments"][0]["kind"] == "image"
+
+    listed = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
+    assert listed["attachments"][0]["kind"] == "image"
+
+    groups = store.experiment_groups(db, 0)
+    assert groups == [], "no experiment here; the export hop is proven above"
+
+    # And nowhere on the way out does the base row's reading appear.
+    for payload in (detail, run_detail, listed):
+        blob = json.dumps(payload)
+        assert "walked.txt" not in blob, blob
+        assert '"text"' not in blob.replace('"text/plain"', ""), blob
+
+
+def test_review_repro_two_suffixes_with_one_reading_are_one_rendition(client):
+    """WINDOW: the version-hit branch of POST /attachments, on two
+    suffixes that the SAME extractor reads: .md and .txt.
+
+    THE OTHER HALF OF THE SUFFIX QUESTION, and the one the .png/.txt
+    pair hides. Two suffixes that produce two READINGS are two
+    renditions, each described by its own row, which is what
+    _view_overlay was built for. Two suffixes that produce ONE reading
+    are one rendition, and there is no second row to describe: .md and
+    .txt both go to text 1, so the second upload finds the first's row.
+
+    The overlay took the filename from the REQUEST and the media type
+    from that row, so uploading a.md and then a.txt answered
+    `filename a.txt, mime text/markdown`: a pair the bench has never
+    stored, which is the never-existed-rendition shape the overlay
+    exists to prevent, produced by the overlay itself.
+
+    Found by the declaration-completeness lens asking what can differ
+    between two members of one manifest that the declaration does not
+    pin, and finding that a filename can differ without the rendition
+    differing at all.
+    """
+    body = b"# a heading\n\nsome prose"
+    first = upload(client, "a.md", body).json()
+    second = upload(client, "a.txt", body).json()
+
+    assert first["digest"] == second["digest"]
+    # One reading, so one row.
+    assert (
+        client.app.state.db.execute(
+            "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = ?",
+            (first["digest"],),
+        ).fetchone()["c"]
+        == 1
+    )
+    # And the response describes that row, consistently in both fields.
+    assert (second["filename"], second["mime"]) == ("a.md", "text/markdown")
+    stored = store.extraction_for(client.app.state.db, first["digest"], "text", "1")
+    assert stored is not None
+    assert (second["filename"], second["mime"]) == (
+        stored["filename"],
+        stored["mime"],
+    )
+
+    # The .png/.txt pair still gets two renditions, so the fix did not
+    # buy consistency by collapsing readings that genuinely differ.
+    raw = _png(b"two-readings")
+    as_text = upload(client, "b.txt", raw).json()
+    as_image = upload(client, "b.png", raw).json()
+    assert as_text["digest"] == as_image["digest"]
+    assert (as_text["kind"], as_text["mime"]) == ("document", "text/plain")
+    assert (as_image["kind"], as_image["mime"]) == ("image", "image/png")
+
+
+@respx.mock
+def test_review_repro_a_legacy_group_refuses_a_member_that_chooses(client):
+    """WINDOW: pins_for, on a POST-K/PRE-K.1 group: one that declared
+    digests and no reading, with a member that declares one.
+
+    THE GROUP CANNOT VOUCH FOR A PIN IT NEVER TOOK. group_renditions
+    returns None for that era, and the member's declaration fell through
+    to the ungrouped path and was OBEYED. Its neighbour, declaring
+    nothing, still resolved to the row's own rendition: two members of
+    one comparison, two readings, and no declaration anywhere saying
+    they should differ.
+
+    NOT REPRODUCED AS A DIVERGENCE, and the tombstone says so rather
+    than implying otherwise. Making the two actually differ needs two
+    readings of one digest that are both usable in the group's mode,
+    which takes an extractor-version bump between two uploads. What is
+    reproduced is the absence of the check: before the fix this request
+    returned 200 and ran.
+
+    A member declaring the SAME reading every other member will get is
+    still accepted, because it is agreeing rather than choosing.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    digest, image_pin = _two_renditions(client, "legacy")
+    db = client.app.state.db
+    group_id = store.create_group(
+        db,
+        "describe",
+        ["model/alpha"],
+        None,
+        "standard",
+        attachments=[digest],
+        attachments_mode="inline",
+    )
+    # The era: digests declared, no pin. create_group derives one from
+    # the digests now, so the column is cleared to make the row what a
+    # c9ad170 build would have written.
+    db.execute("UPDATE groups SET renditions_json = NULL WHERE id = ?", (group_id,))
+    db.commit()
+    assert store.group_renditions(db, group_id) is None
+    assert store.group_attachments(db, group_id) == [digest]
+
+    refused = client.post(
+        "/compare",
+        json={
+            "prompt": "describe",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments": [digest],
+            "renditions": [image_pin],
+        },
+    )
+    assert refused.status_code == 409, refused.text
+    assert "predates rendition pinning" in refused.json()["detail"]
+    assert respx.calls.call_count == 0
+
+    # Agreeing with the fallback is not choosing, and still runs.
+    agreed = client.post(
+        "/compare",
+        json={
+            "prompt": "describe",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments": [digest],
+            "renditions": [
+                {
+                    "digest": digest,
+                    "extractor": "text",
+                    "extractor_version": "1",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+    assert agreed.status_code == 200, agreed.text
+
+
+def test_review_repro_renditions_without_attachments_are_refused(client):
+    """WINDOW: POST /groups, on a body carrying renditions and no
+    attachments.
+
+    THE FOURTH CELL AGAIN, one field over. A mode declared with no
+    attachment is a 422 and has been since K3; a RENDITIONS list
+    declared with no attachment was silently dropped, so the group
+    stored a declaration the caller believed carried a pin and did not.
+    That is the same "believed it asked for a reading it did not get"
+    failure pins_for refuses one layer down, arriving through the door
+    that writes the declaration rather than the one that reads it.
+    """
+    digest = upload(client, "orphan.txt", b"declared by nothing").json()["digest"]
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "renditions": [
+                {
+                    "digest": digest,
+                    "extractor": "text",
+                    "extractor_version": "1",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    assert "without any attachment" in resp.json()["detail"]
+    # Said in the same shape as its twin, so a person who has read one
+    # recognizes the other.
+    twin = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments_mode": "native",
+        },
+    )
+    assert twin.status_code == 422
+    assert "without any attachment" in twin.json()["detail"]
+
+
+@respx.mock
+def test_review_repro_a_groups_member_runs_carry_their_own_documents(client):
+    """WINDOW: the nested RunDetail objects inside GET /groups/{id},
+    compared against GET /runs/{id} for the same run.
+
+    ONE COMPARISON DESCRIBED ITS DOCUMENTS AT THE TOP LEVEL AND DENIED
+    THEM ONE FIELD DOWN. RunDetail carries attachments and renditions,
+    and the run endpoint fills them; the nested copies came straight
+    from store.get_run and defaulted to [] and None. A client reading
+    the members, which is what the shape invites, saw a comparison whose
+    runs declared nothing while the group above them declared an image.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest, pin = _two_renditions(client, "nested")
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [digest],
+            "attachments_mode": "native",
+            "renditions": [pin],
+        },
+    ).json()["id"]
+    assert (
+        client.post(
+            "/compare",
+            json={
+                "prompt": "describe",
+                "models": ["model/vision"],
+                "group_id": group_id,
+                "attachments": [digest],
+                "attachments_mode": "native",
+                "renditions": [pin],
+            },
+        ).status_code
+        == 200
+    )
+
+    detail = client.get(f"/groups/{group_id}").json()
+    member = detail["runs"][0]
+
+    assert member["renditions"] == [pin]
+    assert member["attachments"][0]["kind"] == "image"
+    # And the two endpoints agree about the same run, which is the
+    # property that was broken rather than merely the field that was
+    # empty.
+    alone = client.get(f"/runs/{member['id']}").json()
+    assert member["renditions"] == alone["renditions"]
+    assert member["attachments"] == alone["attachments"]

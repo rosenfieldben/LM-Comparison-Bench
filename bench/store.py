@@ -403,12 +403,27 @@ MIGRATIONS = [
     # text/plain" in the same breath, so the record contradicted itself
     # about one document.
     #
-    # The UNIQUE key is deliberately NOT widened to include it. The mime
-    # is a function of the filename the rendition was read under, and
-    # the extractor is a function of the same suffix, so
-    # (digest, extractor, extractor_version) already separates every
-    # type the bench can produce. Widening would let two rows differ in
-    # a column nothing chooses by.
+    # THE UNIQUE KEY IS DELIBERATELY NOT WIDENED, and the reason first
+    # written here was wrong. It said the key already separates every
+    # type, because the mime and the extractor are both functions of the
+    # suffix. They are, and that does not follow: .txt and .md are two
+    # suffixes with two media types and ONE extractor at one version, so
+    # the key holds a single row for them and the second upload finds
+    # the first's.
+    #
+    # That is the right outcome and the honest description of it is
+    # different. Those two uploads are one READING: the text extractor
+    # produces identical text from identical bytes whichever suffix
+    # named them, so there is one rendition and one row, and the media
+    # type recorded is the one the first upload was read under. Widening
+    # the key would split one reading into two rows differing only in a
+    # label, which is the "one document into three" mistake the header
+    # ruling refused for filenames.
+    #
+    # What it costs is that a .txt upload of bytes already stored as .md
+    # is answered with the .md rendition, name and type together. That
+    # is exactly what save_attachment's earlier-name-wins rule promises
+    # and what the composer tells the person in words.
     ("attachment_extractions", "mime", "TEXT"),
     # Phase K.1: the extracted length, STORED rather than measured on
     # read. A history page shows how much text came out of each
@@ -1187,6 +1202,49 @@ def extractions_for(
     return out
 
 
+def _decoded_renditions(raw: object) -> list[dict[str, Any]] | None:
+    """One renditions_json column as pins, or None.
+
+    ONE DECODER, because there are now four readers of this column
+    (group_renditions, run_renditions, list_runs and experiment_groups)
+    and four copies of a shape check are four chances for one of them to
+    accept something the others refuse. That is the drift this phase is
+    about, arriving in the code that reads the declaration rather than
+    in the code that writes it.
+
+    Repair on read, the same discipline group_manifest applies to
+    models_json: an element that is not a rendition object cannot be
+    compared against a request, and enforcing against a broken
+    declaration would refuse correct work. str() is deliberately NOT
+    used: it succeeds on a dict and would turn a malformed pin into a
+    Python repr that every later comparison then operates on.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, list):
+        return None
+    out = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            return None
+        if not all(
+            isinstance(item.get(key), str)
+            for key in ("digest", "extractor", "extractor_version", "kind")
+        ):
+            return None
+        out.append(
+            {
+                key: item[key]
+                for key in ("digest", "extractor", "extractor_version", "kind")
+            }
+        )
+    return out
+
+
 def group_renditions(
     conn: sqlite3.Connection, group_id: int
 ) -> list[dict[str, Any]] | None:
@@ -1211,36 +1269,7 @@ def group_renditions(
     row = conn.execute(
         "SELECT renditions_json FROM groups WHERE id = ?", (group_id,)
     ).fetchone()
-    if row is None or row["renditions_json"] is None:
-        return None
-    decoded = json.loads(row["renditions_json"])
-    if not isinstance(decoded, list):
-        return None
-    out = []
-    for item in decoded:
-        # Repair on read, the same discipline group_manifest applies to
-        # models_json: an element that is not a rendition object cannot
-        # be compared against a request, and enforcing against a broken
-        # declaration would refuse correct work. str() is deliberately
-        # NOT used here: it succeeds on a dict and would turn a
-        # malformed pin into a Python repr that every later comparison
-        # then operates on without raising.
-        if not isinstance(item, dict):
-            return None
-        if not all(
-            isinstance(item.get(key), str)
-            for key in ("digest", "extractor", "extractor_version", "kind")
-        ):
-            return None
-        out.append(
-            {
-                "digest": item["digest"],
-                "extractor": item["extractor"],
-                "extractor_version": item["extractor_version"],
-                "kind": item["kind"],
-            }
-        )
-    return out
+    return None if row is None else _decoded_renditions(row["renditions_json"])
 
 
 def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
@@ -1504,35 +1533,15 @@ def run_renditions(
 ) -> list[dict[str, Any]] | None:
     """What this run pinned, or None on a pre-K.1 run.
 
-    The same repair-on-read discipline group_renditions uses, and for
-    the same reason: an element that is not a rendition object cannot be
-    compared against anything, and rendering a Python repr of a dict
-    into a chip would be worse than showing nothing.
+    THE SAME DECODER group_renditions uses, and since K.3 that is
+    literally the same function rather than the same discipline written
+    twice; see _decoded_renditions for why four readers of one column
+    share one shape check.
     """
     row = conn.execute(
         "SELECT renditions_json FROM runs WHERE id = ?", (run_id,)
     ).fetchone()
-    if row is None or row["renditions_json"] is None:
-        return None
-    decoded = json.loads(row["renditions_json"])
-    if not isinstance(decoded, list):
-        return None
-    out = []
-    for item in decoded:
-        if not isinstance(item, dict):
-            return None
-        if not all(
-            isinstance(item.get(key), str)
-            for key in ("digest", "extractor", "extractor_version", "kind")
-        ):
-            return None
-        out.append(
-            {
-                key: item[key]
-                for key in ("digest", "extractor", "extractor_version", "kind")
-            }
-        )
-    return out
+    return None if row is None else _decoded_renditions(row["renditions_json"])
 
 
 def save_run(
@@ -1722,9 +1731,11 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
     # rest of this function already follows.
     group_docs: dict[int, list[str] | None] = {}
     group_doc_mode: dict[int, str | None] = {}
+    group_pins: dict[int, list[dict[str, Any]] | None] = {}
     if group_ids:
         for row in conn.execute(
-            f"SELECT id, created_at, params_json, attachments_json, attachments_mode"
+            f"SELECT id, created_at, params_json, attachments_json,"
+            f" attachments_mode, renditions_json"
             f" FROM groups WHERE id IN ({marks(group_ids)})",
             group_ids,
         ):
@@ -1745,6 +1756,12 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
                     docs = [str(d) for d in decoded_docs]
             group_docs[row["id"]] = docs
             group_doc_mode[row["id"]] = as_text(row["attachments_mode"])
+            # And the PIN, in the same pass and for the same reason the
+            # digests are here: the history list draws a chip per
+            # document and a chip describes a READING. Decoded through
+            # the shared shape check rather than by calling
+            # group_renditions, which would be one query per row.
+            group_pins[row["id"]] = _decoded_renditions(row["renditions_json"])
 
     runs_by_id = {r["id"]: r for r in run_rows}
     members: dict[int, list[dict[str, Any]]] = {}
@@ -1795,6 +1812,10 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
                     # digest reference rather than a digest list.
                     "attachments": group_docs.get(key),
                     "attachments_mode": group_doc_mode.get(key),
+                    # The pinned readings, so the list's chips describe
+                    # what the comparison chose rather than the digest's
+                    # base row. None for the two pre-K.1 eras.
+                    "renditions": group_pins.get(key),
                 }
             )
     return entries
@@ -2312,34 +2333,7 @@ def experiment_groups(
         # group_renditions applies, and NOT by calling it, which would be
         # one query per group: the two must agree, so the shape check is
         # the same one.
-        raw_pins = item.pop("renditions_json")
-        pins: list[dict[str, Any]] | None = None
-        if isinstance(raw_pins, str):
-            try:
-                decoded_pins = json.loads(raw_pins)
-            except (TypeError, ValueError):
-                decoded_pins = None
-            if isinstance(decoded_pins, list) and all(
-                isinstance(item_pin, dict)
-                and all(
-                    isinstance(item_pin.get(key), str)
-                    for key in ("digest", "extractor", "extractor_version", "kind")
-                )
-                for item_pin in decoded_pins
-            ):
-                pins = [
-                    {
-                        key: pin[key]
-                        for key in (
-                            "digest",
-                            "extractor",
-                            "extractor_version",
-                            "kind",
-                        )
-                    }
-                    for pin in decoded_pins
-                ]
-        item["renditions"] = pins
+        item["renditions"] = _decoded_renditions(item.pop("renditions_json"))
         out.append(item)
     return out
 

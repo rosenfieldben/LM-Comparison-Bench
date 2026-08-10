@@ -424,13 +424,20 @@ def _clean_filename(value: str) -> str:
 
     Three rules, each with a reason that is not tidiness.
 
-    NO CONTROL CHARACTERS, and the newline is the one that matters. The
-    name is interpolated verbatim into ATTACHMENT_HEADER, which is a
-    single delimiter line the model is told marks the document's start.
-    A name carrying a newline splits that line in two and lets the
-    second half read as content, which is the delimiter boundary the
-    composition depends on being unambiguous. A NUL would also truncate
-    the name for anything downstream that ever passed it to C.
+    NO CONTROL CHARACTERS, and the REASON CHANGED IN K.3 while the rule
+    did not. This said the name was interpolated into the composed
+    delimiter line, so a newline could split that line and let the
+    second half read as document content. That was true when it was
+    written and K.3 made it false: the header carries the rendition now
+    and the models never see a filename at all, which the composition's
+    own comment says in as many words.
+
+    The rule survives its old reason because the name still goes
+    somewhere a control character breaks. It is the text of a chip and
+    of that chip's title and aria-label, it is a line in the composer's
+    message area, and it is returned in JSON. A newline breaks every
+    line-oriented one of those, and a NUL truncates the name for
+    anything downstream that ever passes it to C.
 
     NO PATH SEPARATORS. The docstring above says this is never used as a
     path. That has been true by inspection; rejecting the separators
@@ -450,10 +457,10 @@ def _clean_filename(value: str) -> str:
     """
     if any(ch < " " or ch == "\x7f" for ch in value):
         raise ValueError(
-            "filename contains a control character. The name is written "
-            "into the attachment delimiter the models read, and a name "
-            "that can break that line across two is a name that can be "
-            "mistaken for document content."
+            "filename contains a control character. The name is shown "
+            "on a chip, in its tooltip and in the composer's message "
+            "line, and a name carrying a newline or a NUL breaks every "
+            "one of those."
         )
     if "/" in value or "\\" in value:
         raise ValueError(
@@ -487,9 +494,10 @@ class AttachmentCreate(BaseModel):
     # never written to disk, because the bytes go into the database.
     #
     # LENGTH WAS THE ONLY BOUND AND LENGTH IS NOT ENOUGH. The name is
-    # interpolated into the composed prompt's attachment header, put in
-    # a chip's text and title, and returned in JSON, so its shape is
-    # not merely cosmetic. See _clean_filename for each refusal.
+    # put in a chip's text, title and aria-label, written into the
+    # composer's message line, and returned in JSON, so its shape is not
+    # merely cosmetic. It is NOT in the composed prompt any more; see
+    # _clean_filename for what that changed and what it did not.
     filename: str = Field(min_length=1, max_length=255)
 
     @field_validator("filename")
@@ -2093,6 +2101,23 @@ def pins_for(
     asked for a reading it did not get; obeying it would let a member
     substitute one, which is the whole thing the pin prevents. So the two
     must agree, exactly as the digests must, and the refusal says so.
+
+    A PRE-K.1 GROUP HAS NOTHING TO CHECK AGAINST, and that case needs its
+    own answer rather than falling through to the ungrouped one. Such a
+    group declared digests and no reading, so its members resolve to the
+    row's own rendition; a member that DECLARED one would have been
+    obeyed, and its neighbour, declaring nothing, would still have taken
+    the row's. Two members of one comparison, two readings, and no
+    declaration anywhere saying they should differ. The group cannot
+    vouch for a pin it never took, so a member's must equal the one
+    every other member will get, and anything else is refused.
+
+    Found by the closing review's own sweep. Not reproduced as a
+    DIVERGENCE: making two members disagree needs two readings of one
+    digest that are both usable in the group's mode, which takes an
+    extractor-version bump between uploads. What is reproduced is the
+    absence of the check, and the fairness law is not a thing to leave
+    resting on how hard it is to reach.
     """
     if group_id is not None:
         pinned = store.group_renditions(app.state.db, group_id)
@@ -2107,18 +2132,43 @@ def pins_for(
                     "is asking for a different comparison.",
                 )
             return pinned
+        if declared is not None and digests:
+            # The reading every member of this legacy group resolves to.
+            fallback = [
+                row_rendition(row) for row in enforce_attachments_exist(digests)
+            ]
+            if _pin_dicts(declared) != fallback:
+                raise HTTPException(
+                    409,
+                    "this comparison predates rendition pinning, so it "
+                    "declared which documents it holds and not how they "
+                    "were to be read. Its members are all given each "
+                    "document's stored reading, and a member naming a "
+                    "different one would be sent something its neighbours "
+                    "were not. Start a new comparison to choose a reading.",
+                )
+            return fallback
     return declared_pins(digests, declared)
 
 
 def documents_for(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Everything composition needs about each pinned rendition.
 
-    The attachments row supplies the bytes' facts (size, mime) and the
-    rendition row supplies the reading's (text, extractor, version,
-    kind, and the NAME IT WAS READ UNDER). The name comes from the
-    rendition rather than from the row on purpose: the row keeps
-    whichever name arrived first, and the composed header should say
-    what this reading actually is.
+    The attachments row supplies the BYTES' facts, which since K.3 is
+    the size and nothing else. Everything a reading can differ in comes
+    from the rendition: the text, the extractor, the version, the kind,
+    the MEDIA TYPE and the name it was read under.
+
+    The mime moved and this sentence did not, which is worth recording
+    because the old wording named the exact defect the code below was
+    changed to stop: the base row's type belongs to whichever upload
+    arrived first, and reading it there sent a PNG to a provider
+    labelled text/plain. A reader who trusted this docstring would
+    simplify the line back and reintroduce it.
+
+    The name is here for the API refs and the chips. It stopped feeding
+    the composed header in K.3, so nothing a model sees depends on
+    it.
 
     Order is the declaration's, as everywhere else. A digest declared
     twice under two renditions is two entries here, which is why this
@@ -3361,6 +3411,21 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             "there are none, so the declaration would record a fact about "
             "nothing.",
         )
+    elif body.renditions:
+        # THE SAME CELL, one field over, and it was silently dropped
+        # while its twin above was a 422. A renditions list with no
+        # attachments is a statement about how documents were to be read
+        # when there are no documents; accepting it stored a group whose
+        # declaration the caller believed included a pin and did not,
+        # which is the "believed it asked for a reading it did not get"
+        # failure pins_for refuses one layer down.
+        raise HTTPException(
+            422,
+            "renditions were declared without any attachment. A rendition "
+            "says how a document was to be read, and there are none, so "
+            "the declaration would record a reading of nothing. Declare "
+            "the documents in attachments as well.",
+        )
     return {
         "id": store.create_group(
             app.state.db,
@@ -3398,6 +3463,30 @@ async def group_detail(group_id: int) -> dict[str, Any]:
     group["attachments"] = (
         _pinned_refs(pinned, rows) if pinned else _attachment_refs(digests, rows)
     )
+    # THE MEMBER RUNS TOO, which this left empty. RunDetail carries
+    # attachments and renditions, and GET /runs/{id} fills them, but the
+    # nested copies here came straight from store.get_run and defaulted
+    # to [] and None. One comparison therefore described its documents at
+    # the top level and denied them one field down, and a client reading
+    # the nested runs (which is what the shape invites) saw a comparison
+    # whose members declared nothing.
+    #
+    # From each RUN's own pin rather than from the group's, because they
+    # can legitimately differ: a pre-K.1 group holds runs written after
+    # the column existed, and a run records what IT sent.
+    for member in group["runs"]:
+        member_pins = store.run_renditions(app.state.db, member["id"])
+        member["renditions"] = member_pins
+        member["attachments"] = (
+            _pinned_refs(
+                member_pins,
+                store.attachments_for(
+                    app.state.db, [pin["digest"] for pin in member_pins]
+                ),
+            )
+            if member_pins
+            else []
+        )
     return group
 
 
@@ -4575,7 +4664,9 @@ def _view_overlay(
 
 
 def _pinned_refs(
-    pins: list[dict[str, Any]], rows: dict[str, dict[str, Any]]
+    pins: list[dict[str, Any]],
+    rows: dict[str, dict[str, Any]],
+    resolved: dict[tuple[str, str, str], dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """A declaration's PINNED renditions as refs, in declaration order.
 
@@ -4597,7 +4688,14 @@ def _pinned_refs(
     refusal here, because a view that refused to render would tell the
     person less than a chip saying the document is no longer stored.
     """
-    resolved = store.extractions_for(app.state.db, pins)
+    # PREFETCHED BY A LIST VIEW, fetched here by a detail one. The
+    # history page holds up to 500 entries and must resolve every pin on
+    # it in ONE query; a detail view holds one comparison and its own
+    # call is the whole cost. Passing the mapping in rather than pushing
+    # the batching into every caller keeps the single-comparison sites
+    # reading as one line.
+    if resolved is None:
+        resolved = store.extractions_for(app.state.db, pins)
     out = []
     for pin in pins:
         row = rows.get(pin["digest"])
@@ -4759,7 +4857,25 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
                     **known,
                     **_view_overlay(
                         current,
-                        body.filename,
+                        # THE RENDITION'S OWN NAME, not the one just
+                        # sent, and the difference only shows when two
+                        # suffixes produce the SAME reading. Upload
+                        # a.md and then a.txt: both are read by text 1,
+                        # so there is ONE rendition row and the second
+                        # upload found it. Answering with the request's
+                        # filename beside that row's media type reported
+                        # `a.txt, text/markdown`, a pair the bench has
+                        # never stored, which is the same
+                        # never-existed-rendition shape this overlay was
+                        # written to stop.
+                        #
+                        # It is also what save_attachment's earlier-name-
+                        # wins rule already says, and what the composer
+                        # tells the person in words: the file was already
+                        # stored under that name, so the earlier name
+                        # stands. The fallback covers a row written
+                        # before K1.4 added the column.
+                        seen.get("filename") or body.filename,
                         len(seen["extracted_text"]),
                         seen.get("mime"),
                     ),
@@ -4868,13 +4984,27 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # storing it by digest bought.
     wanted = {digest for run in runs for digest in (run.get("attachments") or [])}
     rows = store.attachments_for(app.state.db, sorted(wanted))
+    # And every PINNED READING on the page, also in one query. The chips
+    # here describe a reading, and this endpoint described the digest's
+    # base row: a comparison that pinned the image rendition of bytes
+    # first uploaded as .txt listed a chip reading "y.txt, document,
+    # text", which is the reading it did not choose. Found by the
+    # declaration-transport walk, which is the one hop of eleven that
+    # was still substituting after K3.4.
+    every_pin = [pin for run in runs for pin in (run.get("renditions") or [])]
+    resolved = store.extractions_for(app.state.db, every_pin)
     # Append a marker only when a cut happened, so API consumers can tell
     # a short prompt from a truncated one.
     for run in runs:
         if len(run["prompt_text"]) > 80:
             run["prompt_text"] = run["prompt_text"][:80] + "..."
         if run["type"] == "group":
-            run["attachments"] = _attachment_refs(run["attachments"], rows)
+            pinned = run.pop("renditions", None)
+            run["attachments"] = (
+                _pinned_refs(pinned, rows, resolved)
+                if pinned
+                else _attachment_refs(run["attachments"], rows)
+            )
     return {"runs": runs}
 
 
