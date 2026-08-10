@@ -348,6 +348,62 @@ def min_ranks(scores: dict[str, float | None]) -> dict[str, int | None]:
     return out
 
 
+def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The distinct documents this experiment's cells declared.
+
+    DIGESTS AND A MODE, never a filename and never content. The filename
+    is what a person picked on their own machine and is not a property of
+    the bytes; two people attaching the same contract under two names
+    would produce one document here, which is correct, and a report that
+    named one of the two would be citing a fact about a filesystem.
+
+    First appearance wins the order, so a report over one dataset reads
+    the documents in the order its cells did rather than in whatever
+    order a set iterated. Byte-identical reports depend on it.
+
+    A document appearing under two modes is listed twice, once per mode,
+    because they are two different treatments of the same bytes and
+    collapsing them would report an experiment nobody ran. Reachable only
+    across cells, since one group holds one mode.
+
+    AND ONCE PER RENDITION, which is the same argument one level in. Two
+    cells over one digest, one pinning the text reading and one the
+    image, are two treatments exactly as two modes are: the models were
+    shown different things. Keyed on digest and mode alone, the report
+    listed them as one document and named a single reading that only one
+    of the two cells used.
+
+    The rendition rides on the entry rather than replacing the digest,
+    because a reader asking "which documents" wants the digest and a
+    reader asking "what did the models see" wants both. None for a
+    pre-K.1 group, where the answer is genuinely unknown rather than
+    absent.
+    """
+    seen: set[tuple[str, str | None, str | None, str | None]] = set()
+    out: list[dict[str, Any]] = []
+    for group in groups:
+        mode = group.get("attachments_mode")
+        pins = {pin["digest"]: pin for pin in group.get("renditions") or []}
+        for digest in group.get("attachments") or []:
+            pin = pins.get(digest)
+            key = (
+                digest,
+                mode,
+                pin["extractor"] if pin else None,
+                pin["extractor_version"] if pin else None,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            entry: dict[str, Any] = {"digest": digest, "mode": mode}
+            if pin is not None:
+                entry["extractor"] = pin["extractor"]
+                entry["extractor_version"] = pin["extractor_version"]
+                entry["kind"] = pin["kind"]
+            out.append(entry)
+    return out
+
+
 def build_report(
     experiment: dict[str, Any],
     groups: list[dict[str, Any]],
@@ -529,6 +585,18 @@ def build_report(
         # its threshold, and a reader comparing two reports has to know
         # which one had the file.
         "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
+        # The documents these numbers were produced over, as provenance
+        # and not as content. Every model in a cell read the same
+        # documents, so this is a property of the experiment rather than
+        # of any arm, which is why it sits here and not on a model row.
+        #
+        # Empty on every experiment the runner produces today, because
+        # per-task attachments in datasets are deferred. Published anyway
+        # rather than omitted when empty, for thresholds_included's
+        # reason: a reader must be able to tell "no documents" from "this
+        # report predates the field", and an absent key cannot say the
+        # first.
+        "attachments": _report_attachments(groups),
         # The caveat, in the payload, as one sentence a page can print.
         # None when nothing was reconstructed, so a reader who sees the
         # key filled in knows it was earned rather than boilerplate.
@@ -1328,7 +1396,51 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 1
+EXPORT_SCHEMA_VERSION = 3
+
+# WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
+# than in this file, because "without anyone consulting a changelog" is
+# the whole claim above and a bare integer does not honor it. A reader
+# holding a v2 file and a v1 parser needs to know what moved, and the
+# file is the only thing they are guaranteed to have.
+#
+# Keyed by version and emitted for the CURRENT one only: the manifest
+# describes this artifact, not the format's history, and shipping every
+# past note would grow line one forever.
+#
+# Version 2 is Phase K. Trial lines gained `attachments` (the digests a
+# comparison declared, in declaration order) and `attachments_mode`
+# (how they reached the models), and the manifest gained
+# `attachments_referenced`. A v1 reader that indexes trial fields
+# positionally or rejects unknown keys will not absorb those, and one
+# that silently ignores them will read a prompt-only artifact out of a
+# file whose prompts had documents composed into them, which is the
+# reading that would be wrong rather than merely partial.
+# Version 3 is Phase K.3. Trial lines gained `renditions`: the ordered
+# pins, each (digest, extractor, extractor_version, kind), beside the
+# digest list version 2 added. A digest names BYTES and a rendition names
+# the READING of them, and the two are not the same claim: the same file
+# read by two parser versions, or as text and as an image, produced
+# trial lines a v2 reader could not tell apart while the models had been
+# shown different things. An artifact whose whole purpose is to be
+# checkable has to carry the reading.
+EXPORT_SCHEMA_NOTES = {
+    1: "the original export shape",
+    2: (
+        "trial lines carry attachments (declared digests, in declaration "
+        "order) and attachments_mode; the manifest carries "
+        "attachments_referenced. A reader that ignores them will treat a "
+        "comparison whose prompt had documents composed into it as a "
+        "prompt-only one."
+    ),
+    3: (
+        "trial lines carry renditions: the ordered pins, each with "
+        "digest, extractor, extractor_version and kind. The digest names "
+        "the bytes and the rendition names the reading of them; two "
+        "trials over one digest read two ways were indistinguishable in "
+        "version 2 while the models had been shown different things."
+    ),
+}
 
 
 def export_line(payload: dict[str, Any]) -> str:
@@ -1361,6 +1473,7 @@ def export_manifest(
     experiment: dict[str, Any],
     seed: int,
     thresholds: dict[str, Any] | None = None,
+    attachments_referenced: bool = False,
 ) -> dict[str, Any]:
     """Line one: what this artifact IS.
 
@@ -1378,6 +1491,19 @@ def export_manifest(
     different facts here, exactly as they are in build_report: the first
     means nobody supplied the file, the second means the file declared
     nothing.
+
+    export_schema_change states, in the artifact, what the version
+    number means. A reader whose parser predates it can find out what
+    moved from the file in their hand rather than from a changelog they
+    may not have; see EXPORT_SCHEMA_NOTES.
+
+    attachments_referenced is the same kind of label one subject over:
+    the artifact saying what it does NOT embed. Document bytes are never
+    in an export, so a reader holding one whose trials cite digests needs
+    to be told that the file is incomplete BY DESIGN and where the rest
+    of it is. Without the flag they would have to read every trial line
+    to find out, and an artifact should be able to describe itself from
+    line one.
     """
     return {
         "thresholds": {} if thresholds is None else thresholds,
@@ -1386,8 +1512,23 @@ def export_manifest(
         # declared none from an export nobody handed the file to, and
         # those licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
+        # Whether any trial in this artifact cites a document. False says
+        # the file is complete on its own; true says the trials name
+        # digests whose bytes live in the bench.db that produced this
+        # export and nowhere else, so reproducing those prompts needs
+        # that database and not just this file.
+        #
+        # A BOOLEAN AND NOT A COUNT, matching thresholds_included above:
+        # the question a reader asks at line one is "is this
+        # self-contained", and the digests themselves are on the trial
+        # lines where they belong to a particular trial.
+        "attachments_referenced": attachments_referenced,
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
+        # The bump's reason, in the file. See EXPORT_SCHEMA_NOTES: a
+        # version number tells a reader their parser is old and nothing
+        # else, and the artifact is meant to be readable on its own.
+        "export_schema_change": EXPORT_SCHEMA_NOTES[EXPORT_SCHEMA_VERSION],
         "experiment_id": experiment["id"],
         "name": experiment["name"],
         "created_at": experiment["created_at"],
@@ -1459,6 +1600,37 @@ def export_trial(
         "run_id": run["id"],
         "result_id": result["id"],
         "prompt_text": run["prompt_text"],
+        # THE DOCUMENTS THIS TRIAL RAN OVER, as digests and a mode, and
+        # never as content. Three separate reasons they are stated here
+        # rather than left inside request_json:
+        #
+        # The digests ARE recoverable from request_json, because rule
+        # two's placeholder names them, but recovering them means parsing
+        # a record format back into a data format. That is the same
+        # mistake reading controls off their badges would be, and an
+        # export exists precisely so a reader does not have to do it.
+        #
+        # An export that carried only the composed prompt would let a
+        # reader see WHAT the models read and not WHICH document it came
+        # from, so two exports over the same contract could not be
+        # recognized as such.
+        #
+        # And the mode decides what was measured: the same digest under
+        # inline and under native are different experiments, so a trial
+        # line that named the document without the mode would describe
+        # two possible runs.
+        #
+        # None on every group that declared none, which includes every
+        # experiment the runner produces today; see the manifest's
+        # attachments_referenced.
+        "attachments": group.get("attachments"),
+        "attachments_mode": group.get("attachments_mode"),
+        # THE READING, not only the bytes. Structured rather than
+        # flattened into strings, so a reader re-derives rendition
+        # identity from the artifact by reading four fields rather than
+        # by parsing a convention. None on a pre-K.1 group, which is the
+        # honest answer for a comparison that pinned nothing.
+        "renditions": group.get("renditions"),
         "request_json": result.get("request_json"),
         "response_text": result.get("response_text"),
         "error": result.get("error"),

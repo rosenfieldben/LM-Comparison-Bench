@@ -52,6 +52,13 @@
     // the composer, so a rerun issued minutes later replays the experiment
     // it belongs to and not whatever the panel happens to hold by then.
     controls,
+    // The attachment declaration, already in body shape and empty when
+    // there is none. Passed in for the same reason the controls are, and
+    // the reason is sharper here: the server refuses a member whose
+    // documents disagree with its group's, so a rerun that re-read the
+    // composer would 422 the moment somebody detached a file between the
+    // original run and the retry.
+    documents,
   ) {
     // Superseded before it started: spend no money for a dead view.
     if (epoch !== BenchState.viewEpoch) return;
@@ -185,6 +192,7 @@
                     budget,
                     position,
                     controls,
+                    documents,
                   }
                 : null,
             // A user Stop renders as an honest stopped state, not done or
@@ -320,6 +328,13 @@
           // checked against it. Omitted entirely when nothing was set, which
           // is what keeps a blank run's body what it always was.
           ...(hasControls(controls) ? { params: controls } : {}),
+          // The documents this member brings, which the server checks
+          // against the group's declaration before composing anything: a
+          // member that disagrees with its group is refused rather than
+          // quietly sending a different prompt to one model. Spread from
+          // one object so an unattached comparison's body carries no
+          // attachment keys at all, which is rule one.
+          ...documents,
           // Which column this run occupies, so a replay can rebuild the
           // layout from the rows instead of from the current chip order,
           // which drifts as the lineup is edited. A rerun re-sends the
@@ -430,6 +445,12 @@
     // the panel per model would let an edit mid-batch split the group and
     // trip the server's own one-experiment check.
     const controls = BenchControls.experimentParams();
+    // Read once for the whole batch, exactly like the controls above and
+    // for the same reason: one comparison is one experiment, so every
+    // request in it has to carry the same declaration. Re-reading the
+    // control per model would let a mid-batch detach split the group and
+    // trip the server's own entry check.
+    const documents = BenchAttach.declared();
     const epoch = BenchState.newViewEpoch();
     // Reserve the in-flight registry synchronously, before the /groups
     // await below, so the Run button is disabled for the whole batch
@@ -462,6 +483,11 @@
     // than blocking: grouping is bookkeeping, the comparison is the
     // product.
     let groupId = null;
+    // Whether this batch declared documents, read once. A comparison
+    // that did must not fall back to ungrouped runs; see the refusal
+    // below.
+    const hasDocuments = Object.keys(documents).length > 0;
+    let groupFailure = null;
     // The group POST joins the epoch's controllers so Stop can abort it
     // too: a Stop during this await then leaves the batch ungrouped and,
     // via stoppedEpoch, halts every model that was about to start.
@@ -495,12 +521,53 @@
           // checked against rather than a claim assembled after the money
           // moved.
           ...(hasControls(controls) ? { params: controls } : {}),
+          // The documents, declared here with everything else the group
+          // fixes before its first call. This is where the composed size
+          // and, in native mode, every model's image capability are
+          // checked, so a comparison that cannot be run fairly is refused
+          // before any money moves. Empty spread when nothing is
+          // attached, which is rule one.
+          ...documents,
         }),
         signal: groupController.signal,
       });
-      if (resp.ok) groupId = (await resp.json()).id;
+      if (resp.ok) {
+        groupId = (await resp.json()).id;
+      } else if (hasDocuments) {
+        // FAIL CLOSED. A comparison carrying documents must never run
+        // ungrouped, and the reason is not tidiness: the group is where
+        // the rendition pin lives, so an ungrouped fallback would send
+        // every member whatever each one resolved on its own, which is
+        // the unpinned behaviour K.1 exists to end. Worse, the refusals
+        // this endpoint issues are exactly the ones worth obeying: a
+        // text-only model under native mode, an image declared inline, a
+        // composed prompt past the ceiling. Degrading past them turned
+        // each refusal into the paid call it had just refused.
+        //
+        // The SERVER'S WORDS, not a paraphrase. It named the model and
+        // the modality, or showed the arithmetic; a client-side summary
+        // would drop exactly the part that tells the person what to do.
+        let detail = "HTTP " + resp.status;
+        try {
+          const body = await resp.json();
+          if (body && typeof body.detail === "string") detail = body.detail;
+        } catch (err) {
+          // Non-JSON error body: the status line is the best we have.
+        }
+        groupFailure = detail;
+      }
     } catch (err) {
       // Deliberately swallowed, a Stop abort included; see above.
+      // A network failure with documents staged still fails closed: the
+      // catch leaves groupId null, and the check below refuses to run
+      // rather than guessing that the group was created.
+      if (hasDocuments && groupFailure === null) {
+        groupFailure =
+          "the comparison could not be created, so nothing was sent. " +
+          "Documents are declared on the comparison before any model is " +
+          "called, and running without that declaration would send each " +
+          "model whatever it resolved on its own.";
+      }
     } finally {
       // The window closes here, not when the batch settles. Past this
       // point every run this batch launches registers its controller
@@ -515,6 +582,42 @@
         BenchState.pendingBatchEpoch = -1;
       }
     }
+    if (groupFailure !== null) {
+      // NOTHING WAS SENT, and the accounting has to say so. The runs
+      // counter was incremented optimistically at the top of this
+      // function on the assumption that a batch always starts; a batch
+      // that never started is not a run.
+      //
+      // THIS ONE IS SESSION STATE AND NOT VIEW STATE, which is why it is
+      // corrected before the supersession check below rather than after
+      // it. The spend and run totals in the header describe the session,
+      // not whatever is on screen, so a batch that never started must be
+      // taken off them whichever view the person is looking at now.
+      BenchState.sessionStats.runs -= 1;
+      BenchState.renderStats();
+      // EVERYTHING BELOW IS THIS VIEW'S, and this handler had no epoch
+      // check at all. The /groups POST can take arbitrarily long (it
+      // composes, and in native mode it checks every model against the
+      // catalog), and a history entry opened while it was in flight has
+      // already taken the view over. Writing here then wiped the
+      // replayed comparison's cards and put an attach refusal about a
+      // comparison the person had moved on from over the top of it.
+      //
+      // THE COUNTER WAS THE WORSE HALF. newViewEpoch resets
+      // inflightRuns to 0, so this decrement took it to -1, and Stop is
+      // enabled whenever it is not 0: the button stayed live with
+      // nothing running, for the rest of the session. Guarded rather
+      // than clamped, because a clamp would hide the fact that a
+      // superseded batch had touched the counter at all.
+      if (epoch !== BenchState.viewEpoch) return;
+      resultsEl.replaceChildren();
+      BenchRender.hideRace();
+      runLabelEl.textContent = "";
+      BenchAttach.showRefusal(groupFailure);
+      BenchState.inflightRuns -= 1;
+      BenchControls.updateRunState();
+      return;
+    }
     try {
       await Promise.allSettled(
         models.map((model, i) =>
@@ -528,6 +631,7 @@
             epoch,
             i,
             controls,
+            documents,
           ),
         ),
       );

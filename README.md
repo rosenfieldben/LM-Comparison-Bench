@@ -395,7 +395,9 @@ created private to your user (0600, in a 0700 directory if the bench
 creates one), and a pre-existing file that is group or world readable
 is tightened to 0600 at startup with a log line, because umask is
 not a policy. Deleting the file deletes all history; there is no
-other copy.
+other copy. Documents you attach are in there too, as bytes in a
+column rather than as files on disk, which is what keeps that last
+sentence true: see **Attachments**.
 
 Each row carries provenance, so a run stays interpretable after the
 code, the prices, or the lineup have moved on. A group records the
@@ -526,6 +528,279 @@ the request and the card shows that refusal like any other provider
 failure. The field names are pinned against OpenRouter's provider
 routing documentation; the URL and the date it was read are in the
 comment above `DATA_POLICY_PREFS` in `bench/models.py`.
+
+## Attachments
+
+Press **+ Attach** beside the prompt to run a comparison over a document.
+Whatever you attach reaches every model in the comparison identically:
+that is the same fairness law the prompt itself is held to, and nothing
+about attachments is allowed to weaken it.
+
+**Two modes, and they measure different things.** The picker sits next to
+the files because the choice is part of the experiment, not part of the
+plumbing.
+
+- **inline** (the default) extracts the document's text and composes it
+  into the prompt. What is being compared is how each model handles *the
+  bench's reading* of the document. If the extraction is poor, every
+  model is asked the same poorer question, which is exactly the property
+  that keeps the comparison fair even when the parsing is bad. Every
+  model can participate.
+- **native** hands an image to the provider as a content part and lets
+  the model read it itself. That measures layout, tables and handwriting
+  that extraction cannot give you (see the note on `.docx` tables
+  below), and it **changes which models can
+  participate**, because a text-only model cannot take an image at all.
+  It is strict mode's bargain in a new costume: a narrower population in
+  exchange for a sharper question. So it is declared, recorded on the
+  comparison, and capability-checked at creation against the catalog's
+  `input_modalities` rather than discovered at the first paid call.
+
+**What the native check clears, and what it does not.** It clears
+*modality*: whether the catalog says a model takes image input at all. It
+does not clear *how many*. OpenRouter states: "The number of images you
+can send in a single request varies per provider and per model", and
+the catalog publishes no per-model number, so there is nothing to check
+the four-document cap against and the bench does not invent one. Four
+images that each model accepts singly will pass creation and can still be
+refused by the provider at request time. That refusal arrives as the
+member's error, after the call rather than before it, and it is a real
+gap in the pre-spend guarantee rather than an omission: the alternative
+is a made-up limit that refuses comparisons which would have run.
+
+Formats: inline reads `.txt`, `.md`, `.pdf` and `.docx`; native sends
+`.png`, `.jpg`/`.jpeg` and `.webp`. GIF is supported by OpenRouter and
+deliberately not taken here: an animated GIF is a sequence of frames, and
+what a provider does with the frames it is not shown is undefined and
+varies, so a comparison over one would not be a comparison over the same
+input.
+
+**Tabs and line breaks survive.** A tabbed line in a `.docx` reaches the
+models as a tabbed line, and a break inside a paragraph as a newline.
+Earlier builds dropped both, so `Name<tab>Value` arrived as `NameValue`:
+a word the document does not contain, in the place a reader looks for the
+value.
+
+**Images are checked against their first bytes**, not only their
+extension, so a file named `.png` that is not one is refused at upload
+rather than posted to a provider as an image.
+
+**Tables in a `.docx` are not read.** They could be: they sit in the same
+part of the archive as the paragraphs. They are skipped on purpose,
+because a table's text without its rows and columns is worse than no
+table at all. Flattened cells arrive as a list of values with nothing
+saying where a row ended, and every model then answers confidently over
+an arrangement the document does not have. An absent table is something
+you can see is absent, so **paste the table into the prompt** and every
+model reads it the way you meant. Scrambled cells are something nobody
+notices. Headers, footers, footnotes and comments are not read either;
+those genuinely live in other parts of the archive.
+
+A scanned PDF is refused at upload rather than attached empty. The bench
+does no OCR, so a PDF whose pages carry no text layer would otherwise
+reach every model as a document mentioned and never shown.
+
+**A comparison carrying documents fails closed.** If the bench refuses to
+create it (a text-only model under native mode, an image declared inline,
+a composed prompt past the ceiling), nothing is sent: the refusal appears
+at the attach control in the server's own words, and the run counter does
+not move. Earlier builds swallowed that refusal and ran the models
+one at a time without a comparison record, which sent each of them
+whatever it resolved on its own.
+
+**Caps.** At most 4 documents per comparison, at most 8 MiB each, at most
+8 MiB of inflated XML out of any one `.docx`, 256 levels of nesting, and a
+composed prompt of at most 200,000 characters. The composed prompt is
+**also** checked against each model's own context window at creation, with
+the arithmetic shown per model, because a prompt that is comfortable for
+one member of a lineup can be a hard error for another and a comparison
+where some cards answer and some error is not a comparison. The last one is the one
+that matters most: past a provider's context limit some refuse and others
+silently truncate, and a comparison where two providers truncated at
+different points is not one comparison. Refusing at composition makes it
+one refusal with the arithmetic in it instead of N providers each
+deciding for themselves. The size cap is refused with the arithmetic
+shown, and the composer refuses an over-cap batch **whole** rather than
+attaching the first few, because a picker that quietly kept four of five
+would leave you believing you had attached five.
+
+**Where the file goes, and where it stays.** Uploads are ordinary JSON
+POSTs carrying base64, never multipart. That costs 33 percent on the wire
+and buys the invariant the whole boundary rests on: a multipart POST is a
+CORS "simple" request that a hostile page could fire at localhost with no
+preflight, and requiring a JSON body forces cross-origin senders into a
+preflight this server never answers.
+
+The bytes are stored **once, in `bench.db`, keyed by their sha256
+digest**, so attaching one contract to ten comparisons costs one copy of
+it. Nothing is written outside that file, and no endpoint serves a
+document back: the metadata responses have no content field and the
+readers behind them never select the blob. Deleting `bench.db` deletes
+your documents along with everything else, which keeps the claim above
+in **Local data** true.
+
+**Deleting one document takes its text with it.** There is no delete
+endpoint; the way to remove a single document is `DELETE FROM attachments
+WHERE digest = ...` in `sqlite3`, and the extracted text lives in a
+second table keyed by the same digest. A database trigger removes those
+rows with the row you deleted, so the text does not stay behind under a
+digest whose file you believed you had removed. It is a trigger and not a
+foreign key on purpose: a foreign key cascade does nothing unless the
+connection sets `PRAGMA foreign_keys = ON`, and the `sqlite3` command
+line does not. What remains after the delete is what should: comparisons
+that cited the document still say they cited it, and the history shows
+the reference with its metadata blank rather than dropping it.
+
+**The bytes are overwritten, and there is one place they can linger.**
+The bench sets `PRAGMA secure_delete = ON`, so freed pages are zeroed
+rather than merely unlinked; SQLite's default for this is a compile-time
+option and "normally off", so it is set explicitly rather than assumed.
+Measured on forty 120 KiB documents, the marker string appears zero times
+in `bench.db` after the delete and the delete costs 50 ms.
+
+The **write-ahead log is a separate file** and the pragma says nothing
+about it: the same measurement found the deleted content 79,640 times in
+`bench.db-wal`. It goes when the log is checkpointed, which happens on
+its own as the bench runs, and `VACUUM;` in `sqlite3` clears both the log
+and any page freed before this shipped. If you are deleting a document
+because it should not be on the disk, run `VACUUM` after. This is a
+statement about pages in a file, not about a filesystem: a copy-on-write
+volume, a snapshot or an SSD's wear levelling can keep old blocks that no
+database pragma can reach.
+
+The comparison record cites the digest; it never inlines the bytes.
+`request_json` stores the composed payload with a digest reference
+standing where the content sat, so the exact wire bytes are
+reconstructible from the digest, the stored content and the stated
+composition, and a result row is not a second copy of every document ever
+sent. An inline reference names the character count, a native one names
+the byte count and the media type, and the two are separate strings
+because a shared one would have to mislabel one of them.
+
+**Privacy.** A document goes exactly where a prompt goes: to OpenRouter,
+and on to whichever provider it routes to. `BENCH_DATA_POLICY` governs it
+the same way and with the same limit, that the routing constraint is
+OpenRouter's to honor. The attach control states the session's policy in
+words right where you pick the file, including on the default policy,
+because the default's only other signal is an absent badge and silence is
+a poor way to say a contract is going out under ordinary terms.
+
+Treat a document as **untrusted input**. The composition marks each
+attachment with a visible delimiter and tells the model to read it as
+reference material rather than as instructions, which is the only thing
+the composition can do about it: a document's own text can try to
+instruct the model, and marking the boundary clearly is a mitigation, not
+a guarantee.
+
+The inflated bound is there because the 8 MiB upload cap says nothing
+about what comes out of the upload: deflate reaches ratios past 1000:1 on
+repetitive XML, so a small, perfectly valid `.docx` can ask the process to
+materialize a gigabyte. That would stall comparisons already running and
+paid for, which is the expensive kind of damage from the cheap kind of
+input. Extraction also runs off the event loop, so even a slow legitimate
+parse does not freeze the progress of runs in flight.
+
+Filenames are checked as well as bounded: no control characters, because
+a name carrying a newline or a NUL breaks every line-oriented place it is
+shown and truncates for anything downstream that treats it as a C string;
+no path separators, because the bytes go into the database and a path is
+a claim the bench cannot honor.
+
+**The models are not told the filename.** The delimiter line names the
+*rendition*: the kind, the extractor that read it, and the first twelve
+characters of the digest. A filename is not selectable by any
+declaration, and it came off whichever upload of those bytes arrived
+first, so it could differ between two comparisons that pinned the same
+reading and could change under a running comparison. Upload the same
+contract as `old.txt` and then as `new.txt`, declare the second, and the
+prompt used to say `attachment 1 of 1: old.txt`: a file the person never
+sent, named to every model. Delete the row and re-upload under a third
+name and the *same* comparison's next member composed a different prompt,
+with nothing in its declaration having moved. Removing the name deletes an
+input nothing declares; widening the key to include it would have turned
+one document into three. The name is display metadata now, kept in the
+record, on the chips and in the history, where it is useful and where
+nothing depends on it being stable.
+
+**Provenance.** Every attachment row records the extractor that read it
+and that extractor's version, because a `pypdf` upgrade changes the text a
+model reads, and a record that could not say which parser produced it
+would be a record of a prompt nobody can reconstruct.
+
+A comparison **pins the rendition** of every document at creation:
+`(digest, extractor, extractor_version, kind)`, and the reading's media
+type travels with it. Every component is checked against what the bench
+actually stored, so a declaration cannot *relabel* a reading: calling a
+text extraction an image (which would send a `.txt` file to a vision
+model as an image part) or an image a document (which would compose an
+empty block and tell every model a document was attached) are both
+refused at creation with the stored and claimed values named. Members
+receive exactly the pinned reading, so a parser upgrade partway through a
+comparison cannot hand the second model a different document from the
+first; if a
+pinned reading is missing the bench refuses rather than substituting.
+The same pin is recorded on ungrouped runs, so a single-model comparison
+shows its documents on replay too.
+
+The same bytes uploaded under two suffixes are **two renditions**, each
+described truthfully, because a `.docx` is also decodable as text and the
+digest alone cannot say which reading was meant. That ambiguity used to
+resolve to whichever upload arrived first, which let a PNG uploaded as
+`.txt` reach every model as binary in the text path and left the same
+image permanently unusable in native mode.
+
+**The pin travels the whole way, or the operation refuses.** A rendition
+chosen in the composer is what the browser declares, what the group
+stores, what every member resolves, what the composition reads and what
+the payload carries: the same PNG staged as `.txt` and then as `.png`
+used to run the *text* reading in native mode, because the page sent
+digests only and the server fell back to the base row. An ungrouped
+scripted request can name its rendition too, which is the only way that
+door could ever choose one; a grouped member that names one is checked
+against the group's pin and refused on a disagreement rather than quietly
+given the pinned reading it did not ask for.
+
+It travels back out as well. `GET /groups/{id}` and `GET /runs/{id}`
+serve the pinned renditions, and every chip, replay banner and history
+row describes **the reading the comparison chose** rather than whichever
+upload of those bytes arrived first. That matters most at reuse: the
+composer restages exactly those refs, so a detail view describing the
+base row made the next comparison declare a reading nobody picked, and a
+correctly pinned native comparison could not be reused at all because the
+restaged reference looked like a `.txt`. A run cut short by a
+disconnect records its pin like any other, since an aborted run is the
+one whose billing most needs reconstructing later.
+
+An **export is schema version 3**: each trial line carries the ordered
+pins, so a reader holding only the artifact can say which *reading* of a
+document was sent and not merely which bytes. The manifest states the
+reason for the bump in the file itself.
+
+Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
+version. Upload the same file after a parser upgrade and the bench
+re-reads the stored bytes rather than handing back the old text under the
+new version's name. The bytes are still stored once. Earlier readings are
+kept rather than overwritten, because a comparison recorded under the
+earlier parser cites that reading's character count in its own record, and
+overwriting would make it unreconstructible while leaving it looking
+exact. The replay banner
+and the chip titles show it. Exports carry each trial's digests and mode
+and never any content, and the export manifest carries
+`attachments_referenced` so an artifact says at line one whether it
+references bytes it does not embed, exactly as `thresholds_included` says
+whether it embeds the threshold slice.
+
+The token figure on a chip is labeled approximate and is characters over
+four. The bench does not tokenize: every model runs its own tokenizer and
+they disagree, so the number is an order of magnitude and nothing more.
+For a native image there is no figure at all, only a note that the
+provider decides, because an image's token cost depends on tiling and
+resolution handling that this bench cannot see and a fabricated number
+beside a real byte count would be believed.
+
+**Deliberately out of scope:** per-task attachments in datasets, OCR for
+scanned PDFs, native parts for non-image documents, audio and video, and
+multi-file diffing.
 
 ## Experiment controls
 
@@ -966,6 +1241,18 @@ one issued before the reveal all persist `blind = 0`. Several sessions may
 be open on one comparison at once, because two people rating it are both
 legitimately blind; one reveal closes all of them, because the answer key
 is out.
+
+**A token speaks only for the cards its own session showed.** The same
+over-attestation had a smaller version in it: the boolean was true for
+every tab, and the token was true for every *result*, including ones that
+did not exist when the session opened. Run a comparison again into the
+same group while a session is live and the new results join it; a rating
+naming one of them, carrying the old token, used to persist `blind = 1`
+for a card no server-built view had ever contained. Each token now
+carries the result ids of the shuffle it was handed, and a rating for
+anything else is refused rather than quietly downgraded: a rating for a
+card that was never displayed is not a judgment anybody made. Reveal and
+reopen to rate the new answers.
 
 **What the flag attests is the path the rating took**, and stating that is
 the point rather than a hedge. It says these ratings came from a view the
@@ -1435,6 +1722,20 @@ Each trial line carries the derived `outcome` **and** the fields it was
 derived from. That is not redundancy: a reader on a future version of
 these rules can see both what this bench concluded and what it concluded
 it from, and can tell a rule change from a data change.
+
+Each trial line also carries `attachments` and `attachments_mode`: the
+digests of the documents that trial ran over, and how they reached the
+models. Digests and never content, so an export over a confidential
+document is not a second copy of it. The digests are recoverable from
+`request_json` too, since the placeholder there names them, but stating
+them on the line means a reader never has to parse a record format back
+into a data format. The manifest carries `attachments_referenced` for the
+same reason it carries `thresholds_included`: an artifact should say at
+line one whether it is complete on its own, and one that cites documents
+is complete only alongside the `bench.db` that produced it. The flag is
+computed from the trial lines actually emitted, so a cell that declared a
+document and recorded no result does not make the export claim a
+reference no line in it carries.
 
 The response streams and carries `private, no-store` like every other
 dynamic body. It holds every prompt and every answer in the experiment,

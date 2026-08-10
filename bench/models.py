@@ -517,6 +517,17 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         model = {
             "id": entry["id"],
             "name": entry.get("name") if isinstance(entry.get("name"), str) else None,
+            # How many tokens the model can hold, prompt and completion
+            # together. Read by the composed-prompt ceiling, which
+            # refuses a comparison no member could actually receive.
+            #
+            # Pinned against the live listing at
+            # https://openrouter.ai/api/v1/models read 2026-08-09, where
+            # context_length is a top-level integer on every one of the
+            # 400 entries. int-or-None rather than trusted, for the
+            # reason every field here is: a string or a null from a
+            # future shape must read as "the catalog did not say", which
+            # the ceiling skips, and never as a number.
             "context_length": (
                 entry.get("context_length")
                 if isinstance(entry.get("context_length"), int)
@@ -535,7 +546,33 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             # lines, because a wrapped URL is a URL nobody can click:
             # https://openrouter.ai/docs/api-reference/list-available-models
             "supported_parameters": None,
+            # Which kinds of input this model accepts, which is what the
+            # native attachment mode checks against. None means the
+            # catalog did not say, treated as "cannot check" rather than
+            # "accepts everything", exactly as supported_parameters is.
+            #
+            # Pinned against the live model listing at
+            # https://openrouter.ai/api/v1/models read 2026-08-08, where
+            # every one of the 400 entries carries
+            # architecture.input_modalities as an array of strings, for
+            # example ["text", "image", "video", "file", "audio"] on a
+            # multimodal model and ["text"] on a text-only one. The same
+            # field appears in the documented response shape at
+            # https://openrouter.ai/docs/guides/overview/multimodal/image-generation
+            "input_modalities": None,
         }
+        architecture = entry.get("architecture")
+        if isinstance(architecture, dict):
+            modalities = architecture.get("input_modalities")
+            if isinstance(modalities, list):
+                # Strings only, same degrade-in-place rule as
+                # supported_parameters: one malformed element must not
+                # cost the whole entry. An empty list stays a list,
+                # because "this model accepts nothing" is a real if
+                # improbable answer and is not the same as unknown.
+                model["input_modalities"] = sorted(
+                    {x for x in modalities if isinstance(x, str)}
+                )
         supported = entry.get("supported_parameters")
         if isinstance(supported, list):
             # Strings only, so one malformed element degrades itself
@@ -584,14 +621,39 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
     return {"fetched": True, "models": models, "prices": prices, "digest": digest}
 
 
-def _request_record(payload: dict[str, Any]) -> str | None:
+def _request_record(
+    payload: dict[str, Any],
+    record_prompt: str | None = None,
+    controls: Mapping[str, Any] | None = None,
+) -> str | None:
     """The payload as a stable JSON string, or None if it will not serialize.
 
     sort_keys so two identical requests produce identical records and a
     diff of two runs shows real differences rather than key order. Returns
     None rather than raising on an unserializable payload: this is a
     provenance nicety, and the never-raises contract outranks it.
+
+    RULE TWO, RESOLVED FOR SIZE. record_prompt is the composed prompt
+    with a digest reference standing where each attachment's text sat,
+    and when it is given the recorded messages are rebuilt from it. The
+    record is therefore NOT the wire bytes, deliberately, and this is the
+    one place in the bench where those two differ.
+
+    What makes that honest is that the wire bytes are RECONSTRUCTIBLE
+    from what is stored: the record gives the exact structure and the
+    digests, the attachments table gives each document's text by digest,
+    and bench.extract.compose is the stated composition that puts them
+    back together. Inlining the content instead would put a copy of every
+    document into every result row, every export line and every history
+    payload, which is the same document stored N times in the places
+    least able to hold it.
+
+    The messages are rebuilt through control_messages rather than patched
+    in place, so the recorded shape comes from the same function that
+    built the sent one and cannot drift from it.
     """
+    if record_prompt is not None:
+        payload = {**payload, "messages": control_messages(record_prompt, controls)}
     try:
         return json.dumps(payload, sort_keys=True)
     except (TypeError, ValueError):
@@ -780,6 +842,7 @@ async def run_model(
     max_tokens: int = BUDGET_STANDARD,
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
+    record_prompt: str | None = None,
 ) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
@@ -831,7 +894,7 @@ async def run_model(
     # on failure paths, because knowing what a failed request asked for is
     # exactly when this matters. The controls ride along for free, which is
     # what lets a run prove it asked for a temperature a provider ignored.
-    result["request_json"] = _request_record(payload)
+    result["request_json"] = _request_record(payload, record_prompt, controls)
 
     start = time.perf_counter()
     try:
@@ -930,6 +993,7 @@ async def stream_model(
     holder: dict[str, Any] | None = None,
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
+    record_prompt: str | None = None,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
@@ -1000,7 +1064,7 @@ async def stream_model(
     # breath, because this is knowable before the request is even sent and
     # a run cut short mid-stream is exactly the row that should still be
     # able to say what it asked for.
-    result["request_json"] = _request_record(payload)
+    result["request_json"] = _request_record(payload, record_prompt, controls)
     if holder is not None:
         holder["request_json"] = result["request_json"]
     text_parts: list[str] = []

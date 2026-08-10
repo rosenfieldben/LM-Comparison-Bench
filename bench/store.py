@@ -43,6 +43,7 @@ from typing import Any
 # Shared with ingestion on purpose: what run_model refuses to emit,
 # get_run refuses to serve, so both ends of the pipeline enforce the
 # same field-type contract.
+from bench.extract import media_type_for
 from bench.models import as_metric, as_money, as_text, as_token_count
 
 logger = logging.getLogger(__name__)
@@ -109,7 +110,9 @@ CREATE TABLE IF NOT EXISTS groups (
     experiment_id INTEGER NULL REFERENCES experiments(id),
     task_id TEXT,
     repeat_index INTEGER,
-    rotation_index INTEGER
+    rotation_index INTEGER,
+    attachments_json TEXT,
+    attachments_mode TEXT
 );
 CREATE TABLE IF NOT EXISTS runs (
     id INTEGER PRIMARY KEY,
@@ -120,7 +123,34 @@ CREATE TABLE IF NOT EXISTS runs (
     app_sha TEXT,
     catalog_snapshot_at TEXT,
     data_policy TEXT,
-    catalog_digest TEXT
+    catalog_digest TEXT,
+    renditions_json TEXT
+);
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY,
+    digest TEXT UNIQUE NOT NULL,
+    filename TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    byte_size INTEGER NOT NULL,
+    content BLOB NOT NULL,
+    extracted_text TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    extracted_chars INTEGER
+);
+CREATE TABLE IF NOT EXISTS attachment_extractions (
+    id INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    extracted_text TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    kind TEXT,
+    filename TEXT,
+    mime TEXT,
+    extracted_chars INTEGER,
+    UNIQUE (digest, extractor, extractor_version)
 );
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
@@ -156,6 +186,42 @@ CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_experiment_id ON groups(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
+"""
+
+# Deleting an attachment deletes every reading of it.
+#
+# A TRIGGER RATHER THAN "ON DELETE CASCADE", for two reasons that both
+# have to hold.
+#
+# The first is the migration discipline: attachment_extractions already
+# exists on databases in the field, and sqlite cannot add a foreign key
+# to a live table. Getting one there means rebuilding the table and
+# copying it, which is not an additive migration and is a destructive
+# operation run at boot on the file holding somebody's documents.
+#
+# The second is the one that actually decides it. A foreign key cascade
+# is INERT unless the connection sets `PRAGMA foreign_keys = ON`:
+# "Foreign key constraints are disabled by default (for backwards
+# compatibility), so must be enabled separately for each database
+# connection", and the page's own shell transcript shows the sqlite3
+# command line answering 0 to `PRAGMA foreign_keys`
+# (https://www.sqlite.org/foreignkeys.html, read 2026-08-09). Nothing in
+# this application deletes an attachment; the only actor who can is a
+# person with sqlite3 and their own bench.db, which is exactly what
+# AttachmentRef's docstring names and exactly the case a key would not
+# have covered. A trigger fires for every deleter, pragma or no pragma,
+# and the same page warns against assuming the default will not change,
+# which a trigger does not have to care about either way.
+#
+# What survives a delete without this is not a dangling id: it is the
+# extracted TEXT of the document, sitting in a second table under the
+# same digest, after the person believed they had removed it.
+TRIGGERS = """
+CREATE TRIGGER IF NOT EXISTS attachments_delete_cascades_extractions
+AFTER DELETE ON attachments
+BEGIN
+    DELETE FROM attachment_extractions WHERE digest = OLD.digest;
+END;
 """
 
 # Columns added after a table first shipped. CREATE IF NOT EXISTS skips
@@ -265,6 +331,159 @@ MIGRATIONS = [
     ("groups", "task_id", "TEXT"),
     ("groups", "repeat_index", "INTEGER"),
     ("groups", "rotation_index", "INTEGER"),
+    # Phase K, attachments. TWO columns, both nullable and additive; the
+    # attachments table itself needs no entry here for the same reason
+    # the Phase I tables did not, since CREATE TABLE IF NOT EXISTS in
+    # SCHEMA creates it on any database, new or old.
+    #
+    # An ordered JSON array of content digests, and ORDER is part of the
+    # declaration rather than incidental: two documents composed in the
+    # other order are a different prompt, so the list is the manifest's
+    # record of which documents in which sequence.
+    #
+    # THE TWO NULLS, and this column has both, which is why the rule is
+    # written at the check site rather than only here. NULL means the
+    # pre-K era: the group was created by a build that had no attachment
+    # concept, so it declared nothing and could not have. An empty array
+    # would mean a post-K group that declared no attachment, which is a
+    # different fact. Nothing writes "[]" for the same reason params_json
+    # never stores "{}": absence gets exactly one spelling.
+    ("groups", "attachments_json", "TEXT"),
+    # How those documents reach the models: "inline" or "native". NULL
+    # when the group declared no attachment at all, which is the same
+    # absence attachments_json records and is stored the same way, so a
+    # reader never has to reconcile a mode against no documents.
+    ("groups", "attachments_mode", "TEXT"),
+    # Phase K.1: the RENDITION PIN. Two columns on attachment_extractions
+    # and one on groups, all nullable and additive.
+    #
+    # A rendition is (digest, extractor, extractor_version, kind): not
+    # "which bytes" but "which reading of which bytes". Phase K keyed
+    # everything on the digest alone, and the digest is a fact about the
+    # file while the text a model reads is a fact about the file AND the
+    # parser AND which parser the suffix chose. Three measured
+    # consequences of the shorter key, all of them silent:
+    #
+    #   PNG bytes uploaded as shot.txt were accepted into inline mode,
+    #   because the check read the STORED filename, and every model
+    #   received seventy characters of latin-1-decoded binary as the
+    #   "document".
+    #
+    #   The same bytes re-uploaded as shot.png were then refused from
+    #   native mode forever, because the row still said shot.txt.
+    #
+    #   A .docx uploaded a second time as .txt made POST and GET
+    #   disagree about the same digest: 324 characters of mojibake from
+    #   one, 25 characters of real text from the other.
+    #
+    # kind and filename on the extraction row are what each rendition
+    # was actually read AS, so a second suffix is a second rendition
+    # rather than a contradiction about the first.
+    #
+    # NO CONSTRAINT CHANGE, and that is what keeps this additive. SQLite
+    # cannot widen UNIQUE (digest, extractor, extractor_version) and
+    # cannot ADD COLUMN UNIQUE, so a four-column key would be
+    # unreachable on any existing database. It is not needed: kind is a
+    # FUNCTION of the extractor ("none" is the image reader and nothing
+    # else is), so the three-column constraint already enforces the
+    # four-part key and the fourth part is recorded rather than
+    # constrained. If a future extractor ever produced two kinds, this
+    # comment is the thing that would have to change first.
+    ("attachment_extractions", "kind", "TEXT"),
+    ("attachment_extractions", "filename", "TEXT"),
+    # Phase K.3: THE MEDIA TYPE JOINS THE RENDITION, because it was
+    # already a property of the reading and was being stored as a
+    # property of the bytes.
+    #
+    # attachments.mime belongs to whichever upload arrived first. The
+    # same digest read as .txt and as .png is two renditions with two
+    # honest types, and native composition read the base row's: a real
+    # PNG first uploaded under a .txt suffix and later pinned as an
+    # image reached the provider as data:text/plain;base64,iVBORw0KG,
+    # measured. The recorded placeholder said "as image, 41 bytes,
+    # text/plain" in the same breath, so the record contradicted itself
+    # about one document.
+    #
+    # THE UNIQUE KEY IS DELIBERATELY NOT WIDENED, and the reason first
+    # written here was wrong. It said the key already separates every
+    # type, because the mime and the extractor are both functions of the
+    # suffix. They are, and that does not follow: .txt and .md are two
+    # suffixes with two media types and ONE extractor at one version, so
+    # the key holds a single row for them and the second upload finds
+    # the first's.
+    #
+    # That is the right outcome and the honest description of it is
+    # different. Those two uploads are one READING: the text extractor
+    # produces identical text from identical bytes whichever suffix
+    # named them, so there is one rendition and one row, and the media
+    # type recorded is the one the first upload was read under. Widening
+    # the key would split one reading into two rows differing only in a
+    # label, which is the "one document into three" mistake the header
+    # ruling refused for filenames.
+    #
+    # What it costs is that a .txt upload of bytes already stored as .md
+    # is answered with the .md rendition, name and type together. That
+    # is exactly what save_attachment's earlier-name-wins rule promises
+    # and what the composer tells the person in words.
+    ("attachment_extractions", "mime", "TEXT"),
+    # Phase K.3 closing review: THE SAME COLUMN K1.5 ADDED TO
+    # attachments, ADDED HERE FOR THE SAME REASON, because the closing
+    # review's own sweep found that reason reintroduced.
+    #
+    # extractions_for was written to resolve a page of pins in one query
+    # and counted characters with sqlite's length(), which is precisely
+    # what the attachments column exists to avoid: length() stops at the
+    # first NUL. Measured on one 33-character document containing one,
+    # uploaded and then read back through a pinned ref: POST answered 33
+    # and GET /groups/{id} answered 13, in one session, about one file.
+    #
+    # A stored count and not a Python len() at read time, because the
+    # whole point of that reader is that it does not carry bodies out of
+    # sqlite; see the attachments entry above for the same argument.
+    ("attachment_extractions", "extracted_chars", "INTEGER"),
+    # Phase K.1: the extracted length, STORED rather than measured on
+    # read. A history page shows how much text came out of each
+    # document, and deriving that from the text meant every list
+    # response loaded every body: measured at 15114 characters read to
+    # report three numbers, on a page whose own bound is 500 entries.
+    #
+    # Computed in Python and not by sqlite's length(), which is the
+    # detail that makes this a column instead of an expression. A binary
+    # file uploaded under a .txt suffix decodes through latin-1 into
+    # text containing NUL, and sqlite's length() stops counting there:
+    # measured at 2 for a five-character string. A number that is
+    # sometimes silently short is worse than a query that is slow.
+    ("attachments", "extracted_chars", "INTEGER"),
+    # The ordered rendition list a group pinned at creation, as JSON
+    # objects rather than the bare digests attachments_json holds.
+    #
+    # THREE ERAS AND THREE NULLS, which is why the rule is written at
+    # the check site (see group_renditions). NULL here with
+    # attachments_json also NULL is pre-K: no attachment concept
+    # existed. NULL here with attachments_json set is post-K and
+    # pre-K.1: documents were declared but only by digest, so which
+    # reading they got was whatever the parser of the day produced.
+    # Present is K.1: the reading itself is pinned and resolution
+    # honors it or refuses.
+    ("groups", "renditions_json", "TEXT"),
+    # The same pin on the RUN, and it is not a duplicate of the group's.
+    #
+    # A grouped run inherits its group's pin and this column agrees with
+    # it. An UNGROUPED run has no group to inherit from, and before this
+    # there was nowhere at all that recorded which documents it carried:
+    # the history view hardcoded an empty list for lack of anywhere to
+    # read, so a comparison run over a contract replayed as a comparison
+    # over a bare prompt with nothing on screen saying otherwise.
+    #
+    # The digests DO survive inside each result's request_json, in the
+    # placeholder standing where the content sat, and this column exists
+    # so nobody has to parse them back out. Reading a record format as a
+    # data format is the same mistake as reading controls off their
+    # badges, and it would have been worse here: the placeholder is a
+    # string the composition owns and may reword.
+    #
+    # NULL is the pre-K.1 era on this table, exactly as on groups.
+    ("runs", "renditions_json", "TEXT"),
 ]
 
 
@@ -378,6 +597,46 @@ def connect(path: str) -> sqlite3.Connection:
         # which is why this is gated on a real file.
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
+    # DELETED CONTENT IS OVERWRITTEN, and this is set explicitly because
+    # the default is a property of whoever compiled sqlite rather than of
+    # this application. SQLite's own page says it "is determined by the
+    # SQLITE_SECURE_DELETE compile-time option and is normally off"
+    # (https://www.sqlite.org/pragma.html#pragma_secure_delete, read
+    # 2026-08-10); the interpreter in this environment reports 1 because
+    # its build defines that option, so relying on the default would mean
+    # the privacy posture changed with the Python somebody installed.
+    #
+    # WHAT IT BUYS. Deleting an attachment frees the pages its BLOB and
+    # its text occupied, and without this the bytes stay in those pages
+    # until something else claims them. Measured on forty 120 KiB
+    # documents: with the pragma the file holds 0 occurrences of the
+    # marker string after the delete, and the delete costs 0.0507
+    # seconds against 0.0043 with the pragma off. Fifty milliseconds to
+    # remove forty confidential documents is not a cost worth trading
+    # for.
+    #
+    # "FAST" WAS MEASURED AND REJECTED, and it is the trap here. The
+    # documentation calls it an intermediate setting that "purges all old
+    # content from b-tree pages, but leaves forensic traces on freelist
+    # pages", which sounds like most of the benefit for none of the I/O.
+    # A document does not live in b-tree pages: a BLOB of any size lives
+    # in OVERFLOW pages, which go to the freelist. On the same forty
+    # documents:
+    #
+    #   setting   pragma   marker occurrences left   delete
+    #   off            0                   317,887   0.0047s
+    #   fast           2                   317,805   0.0050s
+    #   on             1                         0   0.0536s
+    #
+    # Fast is not an intermediate setting for this data. It is the off
+    # setting with a longer name and eighty-two fewer copies.
+    #
+    # WHAT IT DOES NOT BUY, stated because the README states it too: the
+    # write-ahead log is a separate file and this pragma says nothing
+    # about it. The same measurement found 79,640 occurrences in
+    # bench.db-wal after a delete that left none in bench.db. A
+    # checkpoint clears them; see the README's note on VACUUM.
+    conn.execute("PRAGMA secure_delete = ON")
     conn.executescript(SCHEMA)
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -386,6 +645,138 @@ def connect(path: str) -> sqlite3.Connection:
     # After the migrations, not before: runs.group_id may only exist
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
+    conn.executescript(TRIGGERS)
+    # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
+    # reader because of a real gap rather than for tidiness.
+    #
+    # attachment_extractions shipped in c9ad170 and nothing backfilled
+    # it, so a database created by any build between the two carries
+    # attachments rows and zero extraction rows. K.1 resolves a pinned
+    # rendition against that table and REFUSES rather than substituting,
+    # so without this every such document would become unusable the day
+    # the pin arrived: a correct refusal about a document the bench is
+    # holding and can read perfectly well.
+    #
+    # The attachments row IS an extraction: it carries the text, the
+    # extractor and the version of the first reading. This copies that
+    # fact into the table that now owns it, once. INSERT OR IGNORE makes
+    # every later boot a no-op, and kind is derived from the EXTRACTOR
+    # rather than from the filename, because the extractor is what
+    # actually did the reading and the filename is the thing K.1 stopped
+    # trusting.
+    conn.execute(
+        """INSERT OR IGNORE INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename, mime)
+           SELECT digest, extractor, extractor_version, extracted_text,
+                  created_at,
+                  CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
+                  filename, mime
+           FROM attachments"""
+    )
+    # AND THE ROWS THAT WERE ALREADY THERE, which the statement above
+    # cannot reach and silently skips.
+    #
+    # INSERT OR IGNORE hits the UNIQUE (digest, extractor,
+    # extractor_version) key and does nothing for a digest whose
+    # extraction row already exists. That is right for the text, which
+    # must not be rewritten, and wrong for the columns added later:
+    # every database created by the c9ad170 build has the TABLE but not
+    # the COLUMNS, so its rows arrive here with kind, filename and mime
+    # all NULL and the insert above leaves them that way forever.
+    #
+    # The era test missed it by building its fixture with no extraction
+    # rows at all, which exercises the insert and never the conflict.
+    # That is the wrong-window shape one table over: the fixture held
+    # the state the migration was written for rather than the state it
+    # would meet.
+    #
+    # COALESCE, so a value already present is never overwritten: this
+    # fills gaps and does not re-derive facts. kind comes from the row's
+    # OWN extractor, not the base row's, because an extraction by "none"
+    # is an image whichever upload created the attachments row.
+    conn.execute(
+        """UPDATE attachment_extractions AS e
+              SET kind = COALESCE(
+                      e.kind,
+                      CASE WHEN e.extractor = 'none' THEN 'image'
+                           ELSE 'document' END),
+                  filename = COALESCE(
+                      e.filename,
+                      (SELECT a.filename FROM attachments a
+                        WHERE a.digest = e.digest))
+            WHERE e.kind IS NULL OR e.filename IS NULL"""
+    )
+    # THE COUNT BACKFILL, once per database and never again.
+    #
+    # Every row written before the column existed has it NULL, and the
+    # readers below now report it instead of measuring the text, so a
+    # NULL here would surface as a missing character count on a document
+    # the bench can read perfectly well.
+    #
+    # In Python rather than as `UPDATE ... SET extracted_chars =
+    # length(extracted_text)`, for the reason the migration entry gives:
+    # sqlite's length() stops at the first NUL and the SQL form would
+    # write a short number that nothing later could tell from a right
+    # one. This reads each body once, on the first boot after the
+    # upgrade, to avoid reading all of them on every list request after
+    # it.
+    #
+    # Rows are streamed and only the pairs are kept, so the peak is one
+    # document rather than the whole table.
+    counted = [
+        (len(row["extracted_text"]), row["digest"])
+        for row in conn.execute(
+            "SELECT digest, extracted_text FROM attachments"
+            " WHERE extracted_chars IS NULL"
+        )
+    ]
+    if counted:
+        conn.executemany(
+            "UPDATE attachments SET extracted_chars = ? WHERE digest = ?", counted
+        )
+    # THE MEDIA-TYPE BACKFILL, and it is EXACT rather than a guess.
+    #
+    # Rows written before K.3 have no mime of their own. Every one of
+    # them records the FILENAME it was read under, though, and the
+    # boundary computed the type from exactly that name with exactly
+    # this function, so applying it here reproduces the string that
+    # upload would have written. That is why media_type_for lives in
+    # extract.py rather than at the boundary: two copies of the mapping
+    # would be two answers, and the backfill would then be a guess at
+    # what the other one had said.
+    #
+    # A row with no filename cannot be typed and is left NULL rather
+    # than defaulted; readers below fall back to the base row and say so.
+    # connect() backfills filename from the base row one statement up, so
+    # this is reachable only for a row somebody wrote by hand.
+    typed = [
+        (media_type_for(row["filename"]), row["id"])
+        for row in conn.execute(
+            "SELECT id, filename FROM attachment_extractions"
+            " WHERE mime IS NULL AND filename IS NOT NULL"
+        )
+    ]
+    if typed:
+        conn.executemany(
+            "UPDATE attachment_extractions SET mime = ? WHERE id = ?", typed
+        )
+    # THE RENDITION'S CHARACTER COUNT, once per database, in Python. The
+    # attachments backfill above says why this cannot be
+    # `SET extracted_chars = length(extracted_text)`; this is the same
+    # column on the same kind of text one table over.
+    per_reading = [
+        (len(row["extracted_text"]), row["id"])
+        for row in conn.execute(
+            "SELECT id, extracted_text FROM attachment_extractions"
+            " WHERE extracted_chars IS NULL"
+        )
+    ]
+    if per_reading:
+        conn.executemany(
+            "UPDATE attachment_extractions SET extracted_chars = ? WHERE id = ?",
+            per_reading,
+        )
     conn.commit()
     return conn
 
@@ -492,6 +883,9 @@ def create_group(
     params: dict[str, Any] | None = None,
     budget: str | None = None,
     experiment: dict[str, Any] | None = None,
+    attachments: list[str] | None = None,
+    attachments_mode: str | None = None,
+    renditions: list[dict[str, Any]] | None = None,
 ) -> int:
     """Create the group row, optionally recording what the comparison is.
 
@@ -518,14 +912,45 @@ def create_group(
     four are meaningless apart: a task id without a repeat index does not
     identify a cell, and letting them be passed separately would let a
     caller record half a placement.
+
+    attachments is the ordered digest list, and it joins the manifest for
+    the same reason the lineup did: it is part of what the comparison IS,
+    fixed before any call, so a member arriving with a different set can
+    be refused against a declaration that already exists. NOT sorted, and
+    not deduplicated: two documents composed in the other order are a
+    different prompt, so the order given is the order recorded.
+
+    An empty list stores NULL, exactly as an empty params mapping does,
+    because absence gets one spelling. The reader's two NULLs then stay
+    honest: see group_attachments.
+
+    renditions is Phase K.1's pin and is the SOURCE of both attachment
+    columns. It carries (digest, extractor, extractor_version, kind) per
+    document in declaration order, and attachments_json is DERIVED from
+    it here rather than passed in beside it. One write, one source: two
+    lists supplied independently could disagree about which documents a
+    group holds, and every digest-only reader downstream (list_runs, the
+    export, the report) would then describe a different comparison from
+    the one the composer built.
+
+    sort_keys on the rendition objects, for the reason params_json has
+    it and attachments_json never needed it: a list of bare strings
+    serializes exactly one way and a list of objects does not. Two
+    identical pins built by two code paths must produce identical column
+    bytes, or the export's trailing digest stops being a function of the
+    experiment.
     """
+    if renditions:
+        # Derived, never supplied. See above.
+        attachments = [str(r["digest"]) for r in renditions]
     place = experiment or {}
     with conn:
         cur = conn.execute(
             "INSERT INTO groups"
             " (created_at, prompt_text, models_json, params_json, budget,"
-            "  experiment_id, task_id, repeat_index, rotation_index)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  experiment_id, task_id, repeat_index, rotation_index,"
+            "  attachments_json, attachments_mode, renditions_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 _now(),
                 prompt_text,
@@ -536,12 +961,451 @@ def create_group(
                 place.get("task_id"),
                 place.get("repeat_index"),
                 place.get("rotation_index"),
+                json.dumps(attachments) if attachments else None,
+                attachments_mode if attachments else None,
+                json.dumps(renditions, sort_keys=True) if renditions else None,
             ),
         )
     # lastrowid is Optional in the DBAPI types but always set after a
     # single-row INSERT; assert so the int return stays honest.
     assert cur.lastrowid is not None
     return cur.lastrowid
+
+
+# ---- Phase K: attachments, stored once by content digest.
+
+
+# Everything about an attachment except the bodies. Named once so the
+# three readers cannot drift into serving different shapes, and so the
+# omissions are a decision recorded in one place rather than a column
+# list somebody has to remember not to extend.
+#
+# NEITHER BODY IS IN IT. Not `content`: nothing outside this module
+# reads the BLOB, and attachment_content is the single deliberate
+# exception. And no longer `extracted_text` either. The text is a body
+# too, up to MAX_EXTRACTED_CHARS of it per document, and a list view
+# showing a hundred documents used to load a hundred of them to print a
+# hundred integers. extracted_chars is that integer, stored at insert.
+ATTACHMENT_COLUMNS = (
+    "digest",
+    "filename",
+    "mime",
+    "byte_size",
+    "extracted_chars",
+    "extractor",
+    "extractor_version",
+    "created_at",
+)
+
+
+def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[str, Any]:
+    """Store one attachment, or return the row that already holds it.
+
+    THE BYTES DEDUPE BY DIGEST; THE EXTRACTION DEDUPES BY DIGEST AND
+    PARSER VERSION, and the split is the whole of what this function
+    now gets right.
+
+    Bytes are content-addressed, so ten comparisons over one contract
+    cost one copy of it, and that is what the README's storage promise
+    rests on. But the TEXT is not a property of the bytes: it is a
+    property of the bytes AND the parser that read them, and a pypdf
+    upgrade changes it. Keying the extraction on the digest alone meant
+    a re-upload after an upgrade returned the row untouched, so the
+    caller got back extractor_version "6.15.0" for text the running
+    6.16 never produced, and every comparison created from it recorded a
+    provenance claim that was quietly false. The one thing the module
+    docstring says the record must always be able to answer, it could
+    not.
+
+    So each (digest, extractor, extractor_version) gets its own
+    extraction row. A version miss re-extracts FROM THE STORED BYTES
+    rather than asking the caller to re-upload, which is the point of
+    having kept them.
+
+    OLD EXTRACTIONS ARE KEPT, NOT OVERWRITTEN, and that is rule two's
+    doing. A comparison recorded before the upgrade cites this digest
+    and its request_json carries a placeholder naming the character
+    count of the text THAT parser produced. Updating in place would make
+    every such record unreconstructible while leaving it looking exact.
+    The attachments row keeps its first extraction as the era record;
+    the extractions table holds each version, so both the old record and
+    the new comparison can be answered.
+
+    THE EARLIER FILENAME WINS on a collision, and that is deliberate
+    rather than incidental. The row is keyed by content, so the name is
+    already only one of the names those bytes have had; overwriting it
+    would rewrite the label on every comparison that already cites this
+    digest, which is history changing under a citation. The upload
+    response carries the stored name, so a caller that uploaded
+    `contract-v2.pdf` and got back `contract.pdf` can see that it sent
+    bytes the bench already had.
+
+    INSERT OR IGNORE rather than a read-then-write, because the read and
+    the write would be two statements with a gap between them, and the
+    UNIQUE index is the thing that actually enforces this. The follow-up
+    SELECT is inside the same transaction, so it sees the row whichever
+    of the two paths created it.
+
+    THE BASE ROW IS PROVEN BEFORE THE EXTRACTION IS WRITTEN, and the
+    order is the guarantee rather than a tidiness. INSERT OR IGNORE
+    swallows EVERY constraint failure, not only the UNIQUE one it is
+    here for: a record with a NULL mime is silently not inserted, since
+    attachments.mime is NOT NULL, while attachment_extractions has no
+    mime column and takes its row happily. Written extraction-last with
+    the check after the block, that committed the document's text under
+    a digest the attachments table had never heard of, and only then
+    raised. The transaction now ends only after the base row has been
+    read back inside it, so the failing case rolls both statements away
+    and nothing is left holding the text.
+    """
+    now = _now()
+    # Counted here, once, and stored. See the migration entry for why
+    # this is not sqlite's length().
+    chars = len(record["extracted_text"])
+    with conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO attachments
+               (digest, filename, mime, byte_size, content, extracted_text,
+                extractor, extractor_version, created_at, extracted_chars)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["digest"],
+                record["filename"],
+                record["mime"],
+                record["byte_size"],
+                record["content"],
+                record["extracted_text"],
+                record["extractor"],
+                record["extractor_version"],
+                now,
+                chars,
+            ),
+        )
+        row = conn.execute(
+            f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+        if row is None:
+            # Inside the transaction on purpose: raising here rolls the
+            # ignored insert away with it, and no extraction row has
+            # been written yet. A bare assert would do the same and then
+            # vanish under -O, which is not a thing to leave the orphan
+            # rule resting on.
+            raise RuntimeError(
+                f"the attachments row for {record['digest'][:12]} was not "
+                "created and no reading of it will be stored. INSERT OR "
+                "IGNORE suppresses every constraint failure, so this is "
+                "a record that violates one of the NOT NULLs on the "
+                "table rather than a duplicate."
+            )
+        # This parser's reading of these bytes, alongside any earlier
+        # parser's. IGNORE because re-uploading the same file under the
+        # same version is the ordinary case and must stay a no-op.
+        conn.execute(
+            """INSERT OR IGNORE INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename, mime, extracted_chars)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["digest"],
+                record["extractor"],
+                record["extractor_version"],
+                record["extracted_text"],
+                now,
+                record["kind"],
+                # The name THIS rendition was read under, which is not
+                # necessarily the name on the attachments row: that one
+                # belongs to whichever upload arrived first and must not
+                # be rewritten, because comparisons already cite it. The
+                # rendition records its own so a second suffix can be
+                # described truthfully instead of contradicting the
+                # first.
+                record["filename"],
+                # And the type THIS reading was taken under, for the
+                # same reason one line up. The base row's belongs to the
+                # first upload, and native composition sends this one.
+                record["mime"],
+                # Counted in Python, like the attachments row's; see the
+                # migration entry for what sqlite's length() does to a
+                # document containing a NUL.
+                chars,
+            ),
+        )
+    out = dict(row)
+    # The row on disk carries the FIRST parser's reading under the FIRST
+    # name, which is the era record and is deliberately not rewritten.
+    # What this call is about is the rendition just produced, so that is
+    # what comes back, ALL FOUR PARTS OF IT plus the name it was read
+    # under. Overlaying three of the four was the shape that let a
+    # caller receive the first upload's kind attached to this reading's
+    # text: a rendition that was never stored and never sent.
+    #
+    # The reading itself is now its LENGTH, since the row no longer
+    # carries the text out of this module. The overlay is the same
+    # five fields either way, and _view_overlay one module over has to
+    # keep the same five for the same reason: it took K1.5 to notice
+    # that it had only four.
+    out["extracted_chars"] = chars
+    out["extractor"] = record["extractor"]
+    out["extractor_version"] = record["extractor_version"]
+    out["kind"] = record["kind"]
+    out["filename"] = record["filename"]
+    # And the media type, K.3's addition to the same list. Without it the
+    # FIRST upload of a second suffix answered with the base row's:
+    # uploading a PNG as y.txt and then as y.png returned
+    # `kind: image, mime: text/plain`, measured, which is a rendition the
+    # bench does not hold. The re-upload path had the same hole and
+    # _view_overlay closes that one.
+    out["mime"] = record["mime"]
+    return out
+
+
+def extraction_for(
+    conn: sqlite3.Connection, digest: str, extractor: str, version: str
+) -> dict[str, Any] | None:
+    """One RENDITION: this parser's reading of these bytes, or None.
+
+    Returns the whole row rather than the text alone, because a
+    rendition is four facts and a caller that received only the text
+    would have to re-derive the other three from somewhere, which is
+    the re-derivation K.1 exists to stop.
+
+    None is the caller's cue to re-extract and save, or, when the
+    rendition was PINNED by a group, to refuse. It is never a cue to
+    fall back on another version's text: that substitution is the whole
+    reason this table is keyed the way it is.
+
+    kind and filename are None on rows written before K.1 and on
+    nothing else, since connect() backfills them from the attachments
+    row at boot. A caller that needs kind derives it from the extractor
+    the way ingest does; see rendition_of.
+
+    mime is the type THIS reading was taken under, and it is the field
+    K.3 added because native composition had been reading the digest's
+    base row for it. Backfilled at boot from the rendition's own
+    filename by the same function the boundary uses, so it is None only
+    on a row that has neither, which connect() cannot produce.
+    """
+    row = conn.execute(
+        """SELECT digest, extractor, extractor_version, extracted_text,
+                  kind, filename, mime
+           FROM attachment_extractions
+           WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
+        (digest, extractor, version),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def extractions_for(
+    conn: sqlite3.Connection, pins: list[dict[str, Any]]
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """The named RENDITIONS, keyed by their full three-part identity.
+
+    extraction_for's plural, and it exists for the reason attachments_for
+    exists beside get_attachment: a view showing a page of comparisons
+    must resolve every pin on it in one query, and calling the singular
+    in a loop is the N+1 K1.1 removed once already.
+
+    Keyed by the triple and not by the digest, because one digest can
+    hold several readings and a mapping keyed by bytes would silently
+    pick one of them: exactly the substitution this whole phase is
+    about.
+
+    Selected by DIGEST and filtered here rather than with a row-value IN,
+    because the number of readings per digest is one or two and the
+    digest column is what the UNIQUE index leads with. A pin with no
+    stored reading is simply absent, which is the caller's cue to refuse
+    or to show the reference bare.
+    """
+    if not pins:
+        return {}
+    digests = sorted({pin["digest"] for pin in pins})
+    placeholders = ", ".join("?" for _ in digests)
+    rows = conn.execute(
+        f"""SELECT digest, extractor, extractor_version, kind, filename,
+                   mime, extracted_chars
+            FROM attachment_extractions WHERE digest IN ({placeholders})""",
+        tuple(digests),
+    ).fetchall()
+    wanted = {
+        (pin["digest"], pin["extractor"], pin["extractor_version"]) for pin in pins
+    }
+    out = {}
+    for row in rows:
+        key = (row["digest"], row["extractor"], row["extractor_version"])
+        if key in wanted:
+            out[key] = dict(row)
+    return out
+
+
+def _decoded_renditions(raw: object) -> list[dict[str, Any]] | None:
+    """One renditions_json column as pins, or None.
+
+    ONE DECODER, because there are now four readers of this column
+    (group_renditions, run_renditions, list_runs and experiment_groups)
+    and four copies of a shape check are four chances for one of them to
+    accept something the others refuse. That is the drift this phase is
+    about, arriving in the code that reads the declaration rather than
+    in the code that writes it.
+
+    Repair on read, the same discipline group_manifest applies to
+    models_json: an element that is not a rendition object cannot be
+    compared against a request, and enforcing against a broken
+    declaration would refuse correct work. str() is deliberately NOT
+    used: it succeeds on a dict and would turn a malformed pin into a
+    Python repr that every later comparison then operates on.
+    """
+    if not isinstance(raw, str):
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, list):
+        return None
+    out = []
+    for item in decoded:
+        if not isinstance(item, dict):
+            return None
+        if not all(
+            isinstance(item.get(key), str)
+            for key in ("digest", "extractor", "extractor_version", "kind")
+        ):
+            return None
+        out.append(
+            {
+                key: item[key]
+                for key in ("digest", "extractor", "extractor_version", "kind")
+            }
+        )
+    return out
+
+
+def group_renditions(
+    conn: sqlite3.Connection, group_id: int
+) -> list[dict[str, Any]] | None:
+    """The renditions a group pinned, in declaration order, or None.
+
+    THREE ERAS, TWO OF THEM NULL HERE, and this is the check site the
+    migration comment points at.
+
+    None with no attachments_json is pre-K: the group could not have
+    declared a document at all. None WITH attachments_json is post-K and
+    pre-K.1: it declared digests and nothing about how they were to be
+    read, so there is no pin to honor and the caller must fall back on
+    resolving the digest. A list is K.1: the reading is pinned and a
+    member gets exactly it or a refusal.
+
+    Callers must not collapse the first two into "no documents". The
+    pre-K.1 group HAS documents; what it lacks is a statement about
+    which reading of them, and treating that as "declared nothing" would
+    refuse a member that legitimately brings the digests the group
+    holds.
+    """
+    row = conn.execute(
+        "SELECT renditions_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    return None if row is None else _decoded_renditions(row["renditions_json"])
+
+
+def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
+    """One attachment's metadata, never its bytes and no longer its text.
+
+    NEITHER BODY IS SELECTED. The content BLOB never was: serving it
+    would make the database a file host, and the privacy posture is that
+    the document exists in exactly one place a person can delete. The
+    extracted text is not selected either, because no caller of this
+    function reads it. Composition gets its text from the RENDITION,
+    which is the pinned reading rather than whichever one this row
+    happens to hold, and the endpoints want the length, which is now a
+    column.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments WHERE digest = ?",
+        (digest,),
+    ).fetchone()
+    return dict(row) if row is not None else None
+
+
+def attachment_content(conn: sqlite3.Connection, digest: str) -> bytes | None:
+    """The stored bytes for one attachment. The ONLY reader that returns them.
+
+    Every other reader here omits the BLOB deliberately, and this one is
+    the single exception, so the exception is one function a reviewer can
+    find rather than a column list to audit.
+
+    It exists for native mode alone: an image sent as a content part has
+    to reach the payload as base64, so the bytes must leave the database
+    for exactly that one purpose. Nothing serves them to a client, no
+    endpoint returns them, and the inline path never calls this at all,
+    because inline sends extracted text and has no use for the original.
+    """
+    row = conn.execute(
+        "SELECT content FROM attachments WHERE digest = ?", (digest,)
+    ).fetchone()
+    return bytes(row["content"]) if row is not None else None
+
+
+def attachments_for(
+    conn: sqlite3.Connection, digests: list[str]
+) -> dict[str, dict[str, Any]]:
+    """The named attachments by digest, for callers holding a list.
+
+    One query rather than N, and a mapping rather than a list, because
+    every caller wants to look up by digest and an ordered list would
+    make each of them re-index it. A digest with no row is simply absent
+    from the result, which is the caller's cue to refuse rather than
+    this function's cue to guess.
+    """
+    if not digests:
+        return {}
+    placeholders = ", ".join("?" for _ in digests)
+    rows = conn.execute(
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments"
+        f" WHERE digest IN ({placeholders})",
+        tuple(digests),
+    ).fetchall()
+    return {row["digest"]: dict(row) for row in rows}
+
+
+def group_attachments(conn: sqlite3.Connection, group_id: int) -> list[str] | None:
+    """The digests a group declared, in order, or None for a pre-K group.
+
+    THE TWO NULLS, and this is the check site the migration comment
+    points at. None means the group predates attachments entirely: it
+    was created by a build with no attachment concept, so it declared
+    nothing and could not have. An empty list would mean a post-K group
+    that declared no attachment, which is a different fact about a
+    different question.
+
+    Callers must not collapse them. Entry-time enforcement treats None
+    as "this group cannot speak to attachments" and refuses a member
+    that brings one, rather than reading the silence as permission.
+    """
+    row = conn.execute(
+        "SELECT attachments_json FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    if row is None or row["attachments_json"] is None:
+        return None
+    decoded = json.loads(row["attachments_json"])
+    assert isinstance(decoded, list)
+    return [str(digest) for digest in decoded]
+
+
+def group_attachments_mode(conn: sqlite3.Connection, group_id: int) -> str | None:
+    """How this group's documents reach its models, or None for none.
+
+    None means the group declared no attachment, whether because it
+    predates the feature or because it simply has none. The two collapse
+    here on purpose and it costs nothing: a mode is a statement about
+    documents, and with no documents there is nothing for it to be a
+    statement about, which is why the boundary refuses a mode declared
+    without one.
+    """
+    row = conn.execute(
+        "SELECT attachments_mode FROM groups WHERE id = ?", (group_id,)
+    ).fetchone()
+    return str(row["attachments_mode"]) if row and row["attachments_mode"] else None
 
 
 def group_exists(conn: sqlite3.Connection, group_id: int) -> bool:
@@ -700,6 +1564,22 @@ def group_manifest(conn: sqlite3.Connection, group_id: int) -> dict[str, Any]:
     }
 
 
+def run_renditions(
+    conn: sqlite3.Connection, run_id: int
+) -> list[dict[str, Any]] | None:
+    """What this run pinned, or None on a pre-K.1 run.
+
+    THE SAME DECODER group_renditions uses, and since K.3 that is
+    literally the same function rather than the same discipline written
+    twice; see _decoded_renditions for why four readers of one column
+    share one shape check.
+    """
+    row = conn.execute(
+        "SELECT renditions_json FROM runs WHERE id = ?", (run_id,)
+    ).fetchone()
+    return None if row is None else _decoded_renditions(row["renditions_json"])
+
+
 def save_run(
     conn: sqlite3.Connection,
     prompt_text: str,
@@ -707,6 +1587,7 @@ def save_run(
     prompt_id: int | None = None,
     group_id: int | None = None,
     provenance: dict[str, Any] | None = None,
+    renditions: list[dict[str, Any]] | None = None,
 ) -> int:
     """Insert a run and its results atomically. Returns the run id.
 
@@ -720,6 +1601,17 @@ def save_run(
     caller that knows none of it still writes a valid row with those
     columns None.
 
+    renditions is what this run actually sent, pinned. On a grouped
+    run it repeats the group's pin, which is redundant and deliberately
+    so: the group is where a comparison's declaration lives, and the run
+    is where an UNGROUPED comparison's does. Recording it on both means
+    one reader answers both cases instead of two readers agreeing to
+    disagree about which table to consult.
+
+    sort_keys for the reason create_group has it: a list of objects has
+    more than one spelling and two identical pins must produce identical
+    column bytes.
+
     Every key here must appear in the INSERT below. A column that is
     declared, migrated and read back but never written reads as an
     absence, and an absence is a claim: it says this run had no such fact.
@@ -730,8 +1622,9 @@ def save_run(
         cur = conn.execute(
             """INSERT INTO runs
                (prompt_id, group_id, prompt_text, created_at,
-                app_sha, catalog_snapshot_at, data_policy, catalog_digest)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                app_sha, catalog_snapshot_at, data_policy, catalog_digest,
+                renditions_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 prompt_id,
                 group_id,
@@ -741,6 +1634,7 @@ def save_run(
                 prov.get("catalog_snapshot_at"),
                 prov.get("data_policy"),
                 prov.get("catalog_digest"),
+                json.dumps(renditions, sort_keys=True) if renditions else None,
             ),
         )
         # lastrowid is always set after this single-row INSERT; assert
@@ -867,14 +1761,43 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
         request_by_run.setdefault(row["run_id"], row["request_json"])
     group_created: dict[int, str] = {}
     group_controls: dict[int, dict[str, Any]] = {}
+    # The documents each selected group declared, digests only and read in
+    # the same pass as its controls rather than one query per row: a page
+    # of a hundred comparisons must stay one query, which is the rule the
+    # rest of this function already follows.
+    group_docs: dict[int, list[str] | None] = {}
+    group_doc_mode: dict[int, str | None] = {}
+    group_pins: dict[int, list[dict[str, Any]] | None] = {}
     if group_ids:
         for row in conn.execute(
-            f"SELECT id, created_at, params_json FROM groups"
-            f" WHERE id IN ({marks(group_ids)})",
+            f"SELECT id, created_at, params_json, attachments_json,"
+            f" attachments_mode, renditions_json"
+            f" FROM groups WHERE id IN ({marks(group_ids)})",
             group_ids,
         ):
             group_created[row["id"]] = row["created_at"]
             group_controls[row["id"]] = _decoded_params(row["params_json"])
+            # Decoded through the same repair-on-read discipline
+            # group_attachments uses, and NOT by calling it: that would be
+            # one query per group, which is the N+1 this pass exists to
+            # avoid. The two must agree, so the shape check is the same.
+            raw_docs = row["attachments_json"]
+            docs: list[str] | None = None
+            if isinstance(raw_docs, str):
+                try:
+                    decoded_docs = json.loads(raw_docs)
+                except (TypeError, ValueError):
+                    decoded_docs = None
+                if isinstance(decoded_docs, list):
+                    docs = [str(d) for d in decoded_docs]
+            group_docs[row["id"]] = docs
+            group_doc_mode[row["id"]] = as_text(row["attachments_mode"])
+            # And the PIN, in the same pass and for the same reason the
+            # digests are here: the history list draws a chip per
+            # document and a chip describes a READING. Decoded through
+            # the shared shape check rather than by calling
+            # group_renditions, which would be one query per row.
+            group_pins[row["id"]] = _decoded_renditions(row["renditions_json"])
 
     runs_by_id = {r["id"]: r for r in run_rows}
     members: dict[int, list[dict[str, Any]]] = {}
@@ -917,6 +1840,18 @@ def list_runs(conn: sqlite3.Connection, limit: int = 100) -> list[dict[str, Any]
                     # holds what was declared before any call, so a group
                     # can show a routing badge where a lone run cannot.
                     "params": group_controls.get(key) or None,
+                    # Declared documents, digests in declaration order.
+                    # None for a pre-K group, the same two NULLs
+                    # group_attachments documents; a list entry is never
+                    # emitted for a lone run because an ungrouped run has
+                    # no declaration to read and its payload records a
+                    # digest reference rather than a digest list.
+                    "attachments": group_docs.get(key),
+                    "attachments_mode": group_doc_mode.get(key),
+                    # The pinned readings, so the list's chips describe
+                    # what the comparison chose rather than the digest's
+                    # base row. None for the two pre-K.1 eras.
+                    "renditions": group_pins.get(key),
                 }
             )
     return entries
@@ -1045,6 +1980,17 @@ def get_group(conn: sqlite3.Connection, group_id: int) -> dict[str, Any] | None:
     out["prompt"] = manifest["prompt"]
     out["models"] = manifest["models"]
     out["budget"] = manifest["budget"]
+    # The declared documents, as DIGESTS and not as rows. Resolving them
+    # to names is the boundary's job, for the same reason params comes
+    # back decoded but a request payload does not: this module returns
+    # what the group row stores, and a join against attachments is a
+    # second question the caller may not be asking.
+    out["attachments"] = group_attachments(conn, group_id)
+    out["attachments_mode"] = group_attachments_mode(conn, group_id)
+    # The pin, so a replay and a reuse can say which READING the models
+    # were given and not merely which file. None on every pre-K.1 group;
+    # see group_renditions for the three eras.
+    out["renditions"] = group_renditions(conn, group_id)
     out["runs"] = [get_run(conn, rid) for rid in run_ids]
     return out
 
@@ -1395,7 +2341,8 @@ def experiment_groups(
     """
     rows = conn.execute(
         """SELECT id, created_at, prompt_text, models_json, budget,
-                  task_id, repeat_index, rotation_index
+                  task_id, repeat_index, rotation_index,
+                  attachments_json, attachments_mode, renditions_json
            FROM groups WHERE experiment_id = ?
            ORDER BY task_id, repeat_index, id""",
         (experiment_id,),
@@ -1405,6 +2352,24 @@ def experiment_groups(
         item = dict(row)
         raw = item.pop("models_json")
         item["models"] = json.loads(raw) if isinstance(raw, str) else None
+        # The declared documents ride along, because the export's trial
+        # lines have to state them and this is the one query the export
+        # runs per experiment. Digests only: the bytes are never in an
+        # export, and the row's decoding follows group_attachments so a
+        # reader of either gets the same answer.
+        raw_docs = item.pop("attachments_json")
+        item["attachments"] = (
+            json.loads(raw_docs) if isinstance(raw_docs, str) else None
+        )
+        # And the PIN, which the export needs and which this query did
+        # not select. Digests say which bytes; only the rendition says
+        # which reading, and an artifact that named the first without the
+        # second cannot distinguish two experiments over one file read
+        # two ways. Decoded through the same repair-on-read discipline
+        # group_renditions applies, and NOT by calling it, which would be
+        # one query per group: the two must agree, so the shape check is
+        # the same one.
+        item["renditions"] = _decoded_renditions(item.pop("renditions_json"))
         out.append(item)
     return out
 

@@ -40,7 +40,18 @@ CATALOG = {
         {
             "id": model_id,
             "name": model_id.split("/")[1].title(),
-            "context_length": 8192,
+            # A REALISTIC WINDOW, and the number matters now. It was
+            # 8192, which is smaller than the 16384 the standard budget
+            # reserves for the answer: the stub was declaring a model
+            # that could not hold its own completion, and nothing
+            # noticed until K1.4's per-model context ceiling looked. Any
+            # attached comparison in this suite was then correctly
+            # refused, for a reason that was an artifact of the double
+            # rather than anything the page does. Real models with small
+            # windows publish max_completion_tokens and effective_budget
+            # clamps to it; this one publishes none, so it needs a
+            # window a real 128k model would have.
+            "context_length": 128000,
             "pricing": {"prompt": "0.000001", "completion": "0.000002"},
             **extra,
         }
@@ -56,9 +67,27 @@ CATALOG = {
             # than showing nothing.
             ("stub/nancost", {}),
             ("stub/negcost", {}),
+            # The one model in this catalog that accepts images, so the
+            # native-attachment path has something it can legally run
+            # against. Its siblings above carry TEXT_ONLY below, which is
+            # what makes a native comparison over them a refusal naming
+            # the modality rather than an unverifiable-model refusal:
+            # the two are different messages and the suite checks the
+            # first, so the catalog has to be able to produce it.
+            (
+                "stub/vision",
+                {"architecture": {"input_modalities": ["text", "image"]}},
+            ),
         ]
     ]
 }
+
+# Every model that is not stub/vision declares text and only text. Added
+# after the comprehension rather than inside it because it applies to all
+# but one entry, and a per-entry repetition of the same dict is the kind
+# of thing that drifts in one place.
+for _entry in CATALOG["data"]:
+    _entry.setdefault("architecture", {"input_modalities": ["text"]})
 
 # The billed figure is deliberately NOT 2.9e-5: it has to be
 # distinguishable from the catalog estimate above, or a test asserting the

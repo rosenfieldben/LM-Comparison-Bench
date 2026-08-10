@@ -10,6 +10,9 @@ const {
   fmtCost,
   fmtBilled,
   fmtEstimate,
+  fmtBytes,
+  shortDigest,
+  approxTokens,
   niceScale,
   minRanks,
   tokenizeDiff,
@@ -210,4 +213,50 @@ test("minRanks ties at the top so every tied leader is fastest", () => {
   // every tied row, not whichever one the sort happened to put first.
   const ranks = minRanks([12.5, 12.5, 40]);
   assert.equal(ranks.filter((r) => r === 1).length, 2);
+});
+
+// ---- Attachment chip formatting (Phase K4).
+
+test("fmtBytes uses binary units, matching the MiB the cap is stated in", () => {
+  assert.equal(fmtBytes(0), "0 B");
+  assert.equal(fmtBytes(512), "512 B");
+  assert.equal(fmtBytes(1024), "1.0 KiB");
+  assert.equal(fmtBytes(9.4 * 1024), "9.4 KiB");
+  // Ten and above drops the decimal, so a chip never carries three
+  // digits of noise.
+  assert.equal(fmtBytes(512 * 1024), "512 KiB");
+  assert.equal(fmtBytes(8 * 1024 * 1024), "8.0 MiB");
+  // The upload cap, formatted, must read as the same quantity the
+  // server's refusal quotes. A decimal-unit formatter would say
+  // "8.4 MB" here and the pair would look like a contradiction.
+  assert.equal(fmtBytes(1024 * 1024 * 1024), "1.0 GiB");
+});
+
+test("fmtBytes returns nothing for a value it cannot describe", () => {
+  // A ref whose row is gone carries byte_size null, and the chip asks
+  // for a string it can concatenate rather than the word "NaN".
+  assert.equal(fmtBytes(null), "");
+  assert.equal(fmtBytes(undefined), "");
+  assert.equal(fmtBytes(-1), "");
+  assert.equal(fmtBytes(Number.NaN), "");
+});
+
+test("shortDigest is git's seven characters and never widens", () => {
+  const digest = "a".repeat(64);
+  assert.equal(shortDigest(digest).length, 7);
+  assert.equal(shortDigest("abcdef0123456789"), "abcdef0");
+  // Absent digest is unreachable through the API, but the chip must not
+  // throw its way out of rendering a row.
+  assert.equal(shortDigest(null), "");
+});
+
+test("approxTokens rounds up, so a short document never estimates zero", () => {
+  assert.equal(approxTokens(0), 0);
+  // One character is not zero tokens. Rounding down here would let a
+  // one-line document read as costing nothing.
+  assert.equal(approxTokens(1), 1);
+  assert.equal(approxTokens(4), 1);
+  assert.equal(approxTokens(5), 2);
+  assert.equal(approxTokens(4000), 1000);
+  assert.equal(approxTokens(null), 0);
 });

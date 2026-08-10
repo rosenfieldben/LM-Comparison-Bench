@@ -61,6 +61,28 @@
     <textarea id="prompt" data-testid="prompt-input" rows="1" placeholder="Prompt to send to every checked model"></textarea>
   </div>
 
+  <!-- Documents. Every attached file reaches every model in the
+       comparison identically; the mode decides HOW, and the note beside
+       it says what each mode measures because that choice changes the
+       experiment, not just the plumbing. -->
+  <div id="attach-row">
+    <span class="panel-label" id="attach-label">Documents</span>
+    <div id="attachments" data-testid="attachments"></div>
+    <div id="attach-actions">
+      <label class="attach-btn" for="attach-input">+ Attach</label>
+      <input id="attach-input" data-testid="attach-input" type="file" multiple
+             accept=".txt,.md,.pdf,.docx,.png,.jpg,.jpeg,.webp">
+      <span class="sel-wrap">
+        <select id="attach-mode" data-testid="attach-mode" aria-label="How documents reach the models">
+          <option value="inline">inline: the bench extracts the text</option>
+          <option value="native">native: the model sees the image</option>
+        </select>
+      </span>
+    </div>
+    <div id="attach-msg" data-testid="attach-msg" role="status"></div>
+    <div id="attach-note" data-testid="attach-note"></div>
+  </div>
+
   <div id="lineup-row">
     <span class="panel-label" id="lineup-label">Lineup 0/0</span>
     <div id="models" data-testid="lineup"></div>
@@ -214,6 +236,7 @@
 <script src="/static/lib.js"></script>
 <script src="/static/state.js"></script>
 <script src="/static/controls.js"></script>
+<script src="/static/attach.js"></script>
 <script src="/static/render.js"></script>
 <script src="/static/diff.js"></script>
 <script src="/static/library.js"></script>

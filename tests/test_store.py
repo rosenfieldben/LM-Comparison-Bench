@@ -1,4 +1,5 @@
 import json
+import pathlib
 import sqlite3
 from pathlib import Path
 
@@ -1819,3 +1820,937 @@ def test_an_exception_inside_the_snapshot_propagates_unchanged(db):
     with pytest.raises(ValueError, match="the real problem"):
         with store.read_snapshot(db):
             raise ValueError("the real problem")
+
+
+# ---- Phase K: one column and one table, proven against the era they land on.
+
+
+PRE_K_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_k_schema.sql").read_text()
+
+
+def test_the_pre_k_fixture_is_the_schema_as_it_stood_at_v0_1_0():
+    """The fixture's provenance, checkable rather than asserted in prose.
+
+    A hand-transcribed era snapshot is a snapshot of what somebody
+    believed the schema was, and the migration test built on it would
+    then prove something about that belief. This one was extracted, and
+    the extraction is repeatable:
+
+        git show v0.1.0:bench/store.py > /tmp/store_at_tag.py
+        python -c "ns={}; exec(open('/tmp/store_at_tag.py').read(), ns);
+                   open('tests/fixtures/pre_k_schema.sql','w')
+                       .write(ns['SCHEMA'].lstrip('\\n'))"
+
+    What this asserts is the part a reader cannot re-run from the test:
+    that the fixture is a strict PREFIX of today's schema in the tables
+    it shares, and that it lacks exactly what Phase K adds. If someone
+    edits the fixture to make a migration test pass, this fails first.
+    """
+    # It is the pre-K era: no attachments table, no attachments column.
+    assert "attachments" not in PRE_K_SCHEMA
+    # And it is a real schema of this database, not a sketch: every
+    # table Phase K does not touch is present exactly as SCHEMA has it.
+    for table in ("prompts", "experiments", "scores", "groups", "runs", "results"):
+        assert f"CREATE TABLE IF NOT EXISTS {table} (" in PRE_K_SCHEMA
+    # The one table Phase K adds is in today's schema and not the
+    # fixture's, which is the difference the migration test rests on.
+    assert "CREATE TABLE IF NOT EXISTS attachments (" in store.SCHEMA
+
+
+def test_migration_onto_pre_k_database_is_additive_and_idempotent(tmp_path):
+    """The additive-only invariant, proven against the RIGHT era.
+
+    pre_i2_schema.sql predates Phase K by two phases, so it cannot say
+    anything about a column landing on top of I.2 and the guard rider. A
+    database that already has upstream_inference_cost_usd is the one a K
+    migration actually meets, and it is the only one whose ALTER is the
+    one under test. This fixture is the SCHEMA string exactly as it
+    stood at v0.1.0, extracted rather than transcribed.
+
+    THREE changes, all additive, and the count is the correction this
+    proof needed. groups.attachments_json AND groups.attachments_mode
+    both arrive by ALTER and are NULL on every legacy row, which is the
+    affirmative fact that the group predates attachments entirely: it
+    declared nothing and could not have. The attachments table arrives
+    by CREATE TABLE IF NOT EXISTS, which is additive by construction on
+    any database and is why it needs no MIGRATIONS entry.
+
+    THE WINDOW IS EVERY COLUMN PHASE K MIGRATES, not one of them. This
+    asserted attachments_json alone, and the MIGRATIONS comment above the
+    block called Phase K "One column", so the test that is specifically
+    about Phase K's era said nothing about half of what Phase K
+    migrates.
+
+    Measured rather than assumed, because the scope of the gap matters:
+    deleting the attachments_mode entry does NOT leave the suite green.
+    The pre-G, pre-H, pre-H1 and pre-I2 era tests catch it too, since
+    their fixtures also predate the column and each one reads the groups
+    table back. So the exposure was never a silent broken migration; it
+    was this proof being narrower than its own subject, and four tests
+    about other eras carrying a Phase K guarantee by accident. A
+    guarantee held only by accident is one an unrelated refactor can
+    drop.
+    """
+    db_path = tmp_path / "pre_k.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget)
+           VALUES (1, '2026-05-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', '{"seed": 7}', 'standard')"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at,
+                             app_sha, catalog_snapshot_at, data_policy,
+                             catalog_digest)
+           VALUES (1, NULL, 1, 'legacy prompt', '2026-05-01T00:00:00+00:00',
+                   'abc1234', '2026-05-01T00:00:00+00:00', 'standard', 'dd')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position, billed_cost_usd, provider,
+                                upstream_inference_cost_usd)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0, 3.1e-05, 'Together', '0.004')"""
+    )
+    legacy.commit()
+    # The pre-state, asserted rather than assumed. Without this the test
+    # could pass against a fixture that already had the column, which
+    # would prove nothing at all about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(groups)")]
+    assert "attachments_json" not in before
+    assert "attachments_mode" not in before
+    tables_before = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "attachments" not in tables_before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(groups)")]
+        assert "attachments_json" in columns
+        assert "attachments_mode" in columns
+        tables = {
+            r["name"]
+            for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        assert "attachments" in tables
+
+        # THE TWO NULLS, read through the real reader. None means the
+        # group predates attachments, which is a different fact from an
+        # empty list, and group_attachments is the check site that keeps
+        # them apart.
+        assert store.group_attachments(conn, 1) is None
+        # The mode's own reader, on the same legacy row. Its two NULLs
+        # collapse deliberately (a mode with no documents is a statement
+        # about nothing), so None here is the whole of what it can say.
+        assert store.group_attachments_mode(conn, 1) is None
+
+        # Nothing else about the legacy row moved.
+        assert store.group_prompt(conn, 1) == "legacy prompt"
+        assert store.group_params(conn, 1) == {"seed": 7}
+        run = store.get_run(conn, 1)
+        assert run is not None
+        result = run["results"][0]
+        assert result["response_text"] == "legacy text"
+        assert result["billed_cost_usd"] == 3.1e-05
+        assert result["upstream_inference_cost_usd"] == "0.004"
+
+        # And the new table works on a database that never had it.
+        stored = store.save_attachment(
+            conn,
+            {
+                "digest": "ab" * 32,
+                "filename": "notes.txt",
+                "mime": "text/plain",
+                "byte_size": 2,
+                "content": b"hi",
+                "extracted_text": "hi",
+                "extractor": "text",
+                "kind": "document",
+                "extractor_version": "1",
+            },
+        )
+        assert stored["digest"] == "ab" * 32
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        # A second connect adds nothing and breaks nothing.
+        names = [r["name"] for r in again.execute("PRAGMA table_info(groups)")]
+        assert names.count("attachments_json") == 1, names
+        assert again.execute("SELECT count(*) c FROM attachments").fetchone()["c"] == 1
+        assert store.group_attachments(again, 1) is None
+        second = store.get_run(again, 1)
+        assert second is not None
+        assert second["results"][0]["response_text"] == "legacy text"
+    finally:
+        again.close()
+
+
+def test_a_post_k_group_that_declared_nothing_is_not_a_pre_k_group(db):
+    """THE TWO NULLS, from the other side, and the reason nothing writes
+    "[]".
+
+    An empty declaration and a pre-K group both read as None, and they
+    have to, because the column cannot tell them apart: absence gets one
+    spelling, exactly as an empty params mapping stores NULL. What keeps
+    the distinction honest is that a post-K group with no attachment has
+    nothing to enforce either way, so the two collapse to the same
+    behavior rather than to a guess.
+    """
+    empty = store.create_group(db, "hi", ["m/a"], attachments=[])
+    declared = store.create_group(db, "hi", ["m/a"], attachments=["ab" * 32])
+
+    assert store.group_attachments(db, empty) is None
+    assert store.group_attachments(db, declared) == ["ab" * 32]
+    # Stored as NULL rather than "[]", so absence has one spelling.
+    raw = db.execute(
+        "SELECT attachments_json FROM groups WHERE id = ?", (empty,)
+    ).fetchone()
+    assert raw["attachments_json"] is None
+
+
+def test_the_declared_order_is_preserved_rather_than_sorted(db):
+    """Two documents composed in the other order are a different prompt,
+    so the list is a sequence and not a set. Sorting it here would make
+    the manifest describe a comparison nobody declared."""
+    digests = ["cc" * 32, "aa" * 32, "bb" * 32]
+
+    group_id = store.create_group(db, "hi", ["m/a"], attachments=digests)
+
+    assert store.group_attachments(db, group_id) == digests
+
+
+def test_attachments_for_returns_a_mapping_and_omits_what_is_missing(db):
+    """One query rather than N, and a digest with no row is simply
+    absent: the caller's cue to refuse rather than this function's cue
+    to guess."""
+    store.save_attachment(
+        db,
+        {
+            "digest": "aa" * 32,
+            "filename": "one.txt",
+            "mime": "text/plain",
+            "byte_size": 3,
+            "content": b"one",
+            "extracted_text": "one",
+            "extractor": "text",
+            "kind": "document",
+            "extractor_version": "1",
+        },
+    )
+
+    found = store.attachments_for(db, ["aa" * 32, "bb" * 32])
+
+    assert set(found) == {"aa" * 32}
+    assert found["aa" * 32]["filename"] == "one.txt"
+    assert store.attachments_for(db, []) == {}
+
+
+def test_no_attachment_reader_selects_the_content_blob(db):
+    """The bytes never leave this module. Asserted on the shape the
+    readers actually return, because a column list is exactly the kind
+    of thing a later edit extends without noticing what it means."""
+    store.save_attachment(
+        db,
+        {
+            "digest": "aa" * 32,
+            "filename": "one.txt",
+            "mime": "text/plain",
+            "byte_size": 6,
+            "content": b"secret",
+            "extracted_text": "secret",
+            "extractor": "text",
+            "kind": "document",
+            "extractor_version": "1",
+        },
+    )
+
+    row = store.get_attachment(db, "aa" * 32)
+
+    assert row is not None
+    assert "content" not in row
+    assert "content" not in store.ATTACHMENT_COLUMNS
+    assert "content" not in store.attachments_for(db, ["aa" * 32])["aa" * 32]
+
+
+def test_the_extraction_table_keeps_one_reading_per_parser_version(tmp_path):
+    """WINDOW: the attachments and attachment_extractions tables after
+    the same bytes are saved twice under two extractor versions.
+
+    ONE COPY OF THE BYTES, ONE ROW PER READING. The storage promise is
+    about content and stays true; the extraction is keyed by parser and
+    version because the text is a property of the bytes AND the parser.
+
+    The attachments row is NOT rewritten by the second save, which is
+    rule two's requirement: a comparison recorded under the first parser
+    cites this digest and its placeholder names that reading's character
+    count."""
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        base = {
+            "digest": "cd" * 32,
+            "filename": "contract.txt",
+            "mime": "text/plain",
+            "byte_size": 9,
+            "content": b"some text",
+            "extractor": "text",
+            "kind": "document",
+        }
+        first = store.save_attachment(
+            conn, {**base, "extracted_text": "some text", "extractor_version": "1"}
+        )
+        second = store.save_attachment(
+            conn,
+            {**base, "extracted_text": "some text [v2]", "extractor_version": "2"},
+        )
+
+        # The caller is told about the reading it just performed.
+        assert first["extractor_version"] == "1"
+        assert second["extractor_version"] == "2"
+        # The LENGTH of that reading, since K1.5, because the row no
+        # longer carries the text out of the store: the two readings are
+        # 9 and 14 characters, so this still distinguishes them and
+        # still fails if the first upload's reading is handed back.
+        assert second["extracted_chars"] == len("some text [v2]")
+        assert first["extracted_chars"] == len("some text")
+
+        # One copy of the bytes, and the row's own reading unchanged.
+        rows = conn.execute(
+            "SELECT extracted_text, extractor_version FROM attachments"
+            " WHERE digest = ?",
+            (base["digest"],),
+        ).fetchall()
+        assert len(rows) == 1
+        assert rows[0]["extracted_text"] == "some text"
+        assert rows[0]["extractor_version"] == "1"
+
+        # Both readings retrievable, neither substituting for the other.
+        # The whole RENDITION comes back now, not the text alone: a
+        # caller handed only the text would have to re-derive the other
+        # three facts from somewhere, and every one of those
+        # re-derivations was a place K.1 found a bug.
+        one = store.extraction_for(conn, base["digest"], "text", "1")
+        two = store.extraction_for(conn, base["digest"], "text", "2")
+        assert one is not None and two is not None
+        assert one["extracted_text"] == "some text"
+        assert two["extracted_text"] == "some text [v2]"
+        assert one["kind"] == "document" and one["filename"] == "contract.txt"
+        # A version nobody ran is absent rather than approximated. That
+        # None is the caller's cue to re-extract, and returning some
+        # other version's text here would be exactly the substitution
+        # this table exists to prevent.
+        assert store.extraction_for(conn, base["digest"], "text", "3") is None
+    finally:
+        conn.close()
+
+
+def test_re_saving_the_same_reading_is_a_no_op(tmp_path):
+    """The ordinary case: the same file uploaded twice under one build
+    must not accumulate extraction rows."""
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        record = {
+            "digest": "ef" * 32,
+            "filename": "n.txt",
+            "mime": "text/plain",
+            "byte_size": 2,
+            "content": b"hi",
+            "extracted_text": "hi",
+            "extractor": "text",
+            "kind": "document",
+            "extractor_version": "1",
+        }
+        store.save_attachment(conn, record)
+        store.save_attachment(conn, record)
+
+        count = conn.execute(
+            "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+        assert count["c"] == 1
+    finally:
+        conn.close()
+
+
+PRE_K1_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_k1_schema.sql"
+).read_text()
+
+
+def test_review_repro_migration_onto_a_pre_k1_database_is_additive(tmp_path):
+    """WINDOW: a database whose schema is exactly c9ad170's, upgraded by
+    connect(), from the pre-state through the post-state and the
+    backfill.
+
+    A NEW FIXTURE, AND THE OLD ONE COULD NOT HAVE DONE THIS. The pre-K
+    snapshot contains no attachments table at all, so the era test built
+    on it exercises CREATE TABLE IF NOT EXISTS and never an ALTER onto
+    those tables. Reusing it for K.1 would have proved the additive
+    invariant against a table the migration does not touch, which is the
+    wrong window wearing the right name.
+
+    Three additive changes: kind and filename onto attachment_extractions,
+    and renditions_json onto groups. The constraint is deliberately NOT
+    widened, because SQLite cannot, and it does not need to be: kind is a
+    function of the extractor, so UNIQUE (digest, extractor,
+    extractor_version) already enforces the four-part key.
+
+    THE BACKFILL IS THE OTHER HALF. K.1 resolves a pinned rendition and
+    refuses rather than substituting, so a database whose extraction
+    rows were never written would answer "no such reading" for every
+    document it is holding. connect() copies each attachments row into
+    the table it now belongs in, once, and this asserts the pre-state
+    (no rows) so the copy is proven rather than assumed.
+    """
+    db_path = tmp_path / "pre_k1.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO groups (id, created_at, prompt_text, models_json,
+                               params_json, budget, attachments_json,
+                               attachments_mode)
+           VALUES (1, '2026-06-01T00:00:00+00:00', 'legacy prompt',
+                   '["legacy/a"]', NULL, 'standard', '["ab"]', 'inline')"""
+    )
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ab', 'legacy.txt', 'text/plain', 9, X'6c6567616379',
+                   'legacy text', 'text', '1', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+
+    # The pre-state, asserted. Without it this could pass against a
+    # fixture that already had the columns, proving nothing.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")]
+    assert "kind" not in before
+    assert "filename" not in before
+    group_before = [r[1] for r in legacy.execute("PRAGMA table_info(groups)")]
+    assert "renditions_json" not in group_before
+    rows_before = legacy.execute(
+        "SELECT COUNT(*) FROM attachment_extractions"
+    ).fetchone()[0]
+    assert rows_before == 0
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [
+            r["name"] for r in conn.execute("PRAGMA table_info(attachment_extractions)")
+        ]
+        assert "kind" in after
+        assert "filename" in after
+        group_after = [r["name"] for r in conn.execute("PRAGMA table_info(groups)")]
+        assert "renditions_json" in group_after
+
+        # THE THIRD NULL. This group declared documents and no reading,
+        # which is neither pre-K nor K.1, and group_renditions must say
+        # so rather than collapsing it into "declared nothing".
+        assert store.group_renditions(conn, 1) is None
+        assert store.group_attachments(conn, 1) == ["ab"]
+
+        # Backfilled: the row's own reading is now a rendition the pin
+        # machinery can resolve.
+        found = store.extraction_for(conn, "ab", "text", "1")
+        assert found is not None
+        assert found["extracted_text"] == "legacy text"
+        assert found["kind"] == "document"
+        assert found["filename"] == "legacy.txt"
+
+        # And idempotent: a second connect must not double it.
+        conn.close()
+        again = store.connect(str(db_path))
+        try:
+            count = again.execute(
+                "SELECT COUNT(*) c FROM attachment_extractions"
+            ).fetchone()
+            assert count["c"] == 1
+        finally:
+            again.close()
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def test_an_image_row_backfills_as_an_image_rendition(tmp_path):
+    """The backfill derives kind from the EXTRACTOR, not the filename,
+    which is the same decision ingest makes and the opposite of the
+    re-derivation K.1 removed. An image row stored under any name comes
+    back as an image."""
+    db_path = tmp_path / "img.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('cd', 'shot.txt', 'image/png', 3, X'010203', '', 'none',
+                   '0', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        found = store.extraction_for(conn, "cd", "none", "0")
+        assert found is not None
+        assert found["kind"] == "image"
+    finally:
+        conn.close()
+
+
+# ---- Phase K1.5: what survives a delete, and what must not be written.
+
+
+def _attachment_record(digest="e1", text="the settlement figure is 40200"):
+    return {
+        "digest": digest,
+        "filename": "contract.txt",
+        "mime": "text/plain",
+        "byte_size": len(text),
+        "content": text.encode(),
+        "extracted_text": text,
+        "extractor": "text",
+        "extractor_version": "1",
+        "kind": "document",
+    }
+
+
+def test_review_repro_deleting_an_attachment_takes_its_extracted_text(tmp_path):
+    """WINDOW: a DELETE issued the only way a person can issue one, from
+    a second connection with foreign_keys at sqlite's default of OFF,
+    against a database the app has already written.
+
+    THE TEXT IS THE THING THAT SURVIVED, not a dangling id. The bytes and
+    the first reading live on the attachments row and go with it; every
+    OTHER reading lives in attachment_extractions keyed by the same
+    digest, and nothing pointed the delete at them. A person who removed
+    a confidential contract from bench.db was left with its full
+    extracted text still on disk under the digest of the file they had
+    just deleted.
+
+    THE SECOND CONNECTION IS THE POINT rather than incidental. Nothing in
+    the application deletes an attachment, so the only deleter is
+    sqlite3 on the command line, which does not set PRAGMA foreign_keys
+    and would therefore have ignored an ON DELETE CASCADE entirely. This
+    connection is opened raw for exactly that reason: a cascade that only
+    works from inside the app is a cascade that never runs.
+    """
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    try:
+        secret = "the settlement figure is 40200"
+        store.save_attachment(conn, _attachment_record(text=secret))
+        # A SECOND reading of the same bytes, which is the row the
+        # attachments delete never touched. Without it this would pass
+        # against the backfilled copy alone and prove less than it
+        # claims.
+        store.save_attachment(
+            conn,
+            {
+                **_attachment_record(text=secret),
+                "filename": "contract.md",
+                "extractor_version": "2",
+            },
+        )
+
+        # PRE-STATE. Two readings on disk, both carrying the text.
+        held = conn.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = 'e1'"
+        ).fetchall()
+        assert [r["extracted_text"] for r in held] == [secret, secret]
+    finally:
+        conn.close()
+
+    raw = sqlite3.connect(str(db_path))
+    try:
+        # Exactly what the README tells a person to type, and no pragma.
+        assert raw.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        raw.execute("DELETE FROM attachments WHERE digest = 'e1'")
+        raw.commit()
+        left = raw.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = 'e1'"
+        ).fetchall()
+        assert left == [], f"the text outlived the file: {left}"
+        # And nowhere else in the database either, which is the claim the
+        # README makes rather than the narrower one about two tables.
+        for (table,) in raw.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall():
+            for row in raw.execute(f"SELECT * FROM {table}"):
+                for cell in row:
+                    assert not (isinstance(cell, str) and secret in cell), table
+    finally:
+        raw.close()
+
+
+def test_review_repro_a_failed_base_row_commits_no_extraction(tmp_path):
+    """WINDOW: inside save_attachment's transaction, on a record that
+    violates a NOT NULL on `attachments` and none on
+    `attachment_extractions`.
+
+    INSERT OR IGNORE IGNORES EVERY CONSTRAINT, not only the UNIQUE one it
+    is written for. A record with a NULL mime is silently not inserted,
+    because attachments.mime is NOT NULL; attachment_extractions has no
+    mime column, so its insert succeeded. The order was insert, insert,
+    read, and the read's failure was checked AFTER the `with conn` block
+    had already committed, so the document's text was committed under a
+    digest the attachments table had never heard of and the exception
+    was raised over the top of it.
+
+    A digest with no attachments row is a digest nothing can delete: the
+    cascade above hangs off the row that was never written. This is the
+    one path that could manufacture that state.
+    """
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        secret = "the indemnity cap is 2.5 million"
+        with pytest.raises(RuntimeError, match="was not created"):
+            store.save_attachment(
+                conn,
+                {**_attachment_record(digest="f2", text=secret), "mime": None},
+            )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = 'f2'"
+            ).fetchone()["c"]
+            == 0
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) c FROM attachments WHERE digest = 'f2'"
+            ).fetchone()["c"]
+            == 0
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_the_stored_count_is_pythons_and_not_sqlites(tmp_path):
+    """WINDOW: connect() upgrading a c9ad170-era database whose stored
+    text contains a NUL, from the pre-state through the backfill.
+
+    THE COUNT MOVED OUT OF THE READER, so a list view no longer loads a
+    body per document to print an integer. The obvious backfill for the
+    new column is `UPDATE attachments SET extracted_chars =
+    length(extracted_text)`, and it is wrong: sqlite's length() stops at
+    the first NUL and would write 12 for the 26-character string below.
+
+    A NUL IS NOT A CONTRIVANCE. A binary file uploaded under a .txt
+    suffix decodes through latin-1, which is total and maps 0x00 to
+    U+0000, so the text of any such upload has them. The number would
+    have been short only for those documents, which is the shape of
+    defect nobody finds by looking at a page that renders.
+    """
+    db_path = tmp_path / "nul.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    text = "page one ends\x00and page two begins"
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ef', 'scan.txt', 'text/plain', 33, X'00',
+                   ?, 'text', '1', '2026-06-01T00:00:00+00:00')""",
+        (text,),
+    )
+    legacy.commit()
+
+    # PRE-STATE: the column does not exist, so this cannot be passing
+    # against a fixture that already carried the right number.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachments)")]
+    assert "extracted_chars" not in before
+    # And the number the SQL backfill would have written, measured rather
+    # than asserted from memory.
+    sqlite_says = legacy.execute(
+        "SELECT length(extracted_text) n FROM attachments WHERE digest = 'ef'"
+    ).fetchone()[0]
+    assert sqlite_says == 13
+    assert len(text) == 33
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [r["name"] for r in conn.execute("PRAGMA table_info(attachments)")]
+        assert "extracted_chars" in after
+        row = store.get_attachment(conn, "ef")
+        assert row is not None
+        assert row["extracted_chars"] == 33
+        # The reader no longer carries the body at all, which is the
+        # other half of the change and the half a count assertion alone
+        # would not notice.
+        assert "extracted_text" not in row
+    finally:
+        conn.close()
+
+
+def test_the_count_backfill_runs_once_and_then_does_nothing(tmp_path):
+    """Idempotent, like the K.1 rendition backfill beside it: a second
+    boot must not re-read every body to rewrite numbers already right."""
+    db_path = tmp_path / "twice.db"
+    conn = store.connect(str(db_path))
+    try:
+        store.save_attachment(conn, _attachment_record(text="forty two"))
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        reads = []
+        again.set_trace_callback(reads.append)
+        third = store.connect(str(db_path))
+        third.close()
+        again.set_trace_callback(None)
+        row = store.get_attachment(again, "e1")
+        assert row is not None
+        assert row["extracted_chars"] == len("forty two")
+        pending = again.execute(
+            "SELECT COUNT(*) c FROM attachments WHERE extracted_chars IS NULL"
+        ).fetchone()["c"]
+        assert pending == 0
+    finally:
+        again.close()
+
+
+# ---- Phase K3.5, review findings 8 and 11: the migration onto a
+# ---- populated table, and what a delete leaves behind.
+
+
+def test_review_repro_the_backfill_reaches_rows_that_already_existed(tmp_path):
+    """WINDOW: connect() upgrading a database that ALREADY HAS extraction
+    rows, which is every database the c9ad170 build wrote.
+
+    INSERT OR IGNORE HITS THE UNIQUE KEY AND DOES NOTHING. The backfill
+    copies each attachments row into attachment_extractions, keyed by
+    (digest, extractor, extractor_version). For a digest whose row is
+    already there the insert is skipped, which is right for the text and
+    wrong for every column added afterwards: kind and filename in K.1,
+    mime in K.3. Those rows arrive with all three NULL and keep them
+    forever, so a pin against such a row resolves to a rendition that
+    cannot say what it is.
+
+    THE ERA FIXTURE MISSED IT BY BEING TOO CLEAN. The K.1 test inserts an
+    attachments row and no extraction row, which exercises the INSERT and
+    never the conflict: the fixture held the state the migration was
+    written for rather than the state it would meet. This one holds the
+    conflict.
+    """
+    db_path = tmp_path / "populated.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ab', 'legacy.txt', 'text/plain', 11, X'6c6567616379',
+                   'legacy text', 'text', '1', '2026-06-01T00:00:00+00:00')"""
+    )
+    # The row the insert cannot reach: written by a build that had the
+    # table and not the columns.
+    legacy.execute(
+        """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text, created_at)
+           VALUES ('ab', 'text', '1', 'legacy text',
+                   '2026-06-01T00:00:00+00:00')"""
+    )
+    # And an IMAGE rendition of other bytes, so the kind derivation is
+    # proven to read the row's own extractor rather than a constant.
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('cd', 'shot.png', 'image/png', 3, X'010203', '', 'none',
+                   '0', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text, created_at)
+           VALUES ('cd', 'none', '0', '', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+
+    # PRE-STATE, so this cannot pass against a fixture that already held
+    # the answer.
+    columns = [
+        r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")
+    ]
+    assert "kind" not in columns
+    assert "filename" not in columns
+    assert "mime" not in columns
+    assert (
+        legacy.execute("SELECT COUNT(*) FROM attachment_extractions").fetchone()[0] == 2
+    )
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        document = store.extraction_for(conn, "ab", "text", "1")
+        assert document is not None
+        assert document["kind"] == "document"
+        assert document["filename"] == "legacy.txt"
+        assert document["mime"] == "text/plain"
+        # The text is untouched: this fills gaps, it does not rewrite
+        # readings.
+        assert document["extracted_text"] == "legacy text"
+
+        image = store.extraction_for(conn, "cd", "none", "0")
+        assert image is not None
+        assert image["kind"] == "image"
+        assert image["mime"] == "image/png"
+
+        # Still one row per digest: the backfill filled, it did not
+        # duplicate.
+        assert (
+            conn.execute("SELECT COUNT(*) c FROM attachment_extractions").fetchone()[
+                "c"
+            ]
+            == 2
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_a_deleted_documents_bytes_are_overwritten(tmp_path):
+    """WINDOW: the bytes on disk in bench.db, after a DELETE, read back
+    with the database closed.
+
+    A DELETE FREES PAGES; IT DOES NOT ERASE THEM. Without
+    secure_delete the document's BLOB and its extracted text stay in the
+    freed pages until something else claims them, so a person who removed
+    a confidential contract still has it on disk in a file they believe
+    is clean.
+
+    THE DEFAULT IS NOT THIS APPLICATION'S TO ASSUME. SQLite's own page
+    says the setting comes from a compile-time option and is "normally
+    off"; the interpreter here reports 1 because its build defines that
+    option, so a test that relied on the default would prove nothing
+    about anybody else's machine. connect() sets it explicitly and this
+    asserts the pragma as well as the bytes.
+
+    "FAST" IS THE TRAP AND IS WHY THE ASSERTION IS ON BYTES. It purges
+    b-tree pages and leaves freelist pages, which sounds like most of the
+    win; a BLOB of any size lives in OVERFLOW pages, which go to the
+    freelist. Measured on forty 120 KiB documents, off left 317,887
+    occurrences of the marker, fast left 317,805, and on left none: for
+    this data fast is the off setting with a longer name.
+
+    THIS TOMBSTONE DOES NOT REPRODUCE THE FINDING ON THIS MACHINE, and
+    saying so is more useful than letting it look as though it did. The
+    interpreter here is built with SQLITE_SECURE_DELETE, so the default
+    was already 1 and the bytes were already gone. What it guards is the
+    build where that is not true, which SQLite's page says is the normal
+    one. Proven by mutation rather than by stash: with connect() setting
+    OFF the pragma assertion reads 0 == 1, and with FAST it reads
+    2 == 1.
+    """
+    marker = "CONFIDENTIAL-SETTLEMENT-40200"
+    body = (marker + "-").encode() * 2000
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    try:
+        assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+        store.save_attachment(
+            conn,
+            {
+                "digest": "ab" * 32,
+                "filename": "contract.txt",
+                "mime": "text/plain",
+                "byte_size": len(body),
+                "content": body,
+                "extracted_text": body.decode(),
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            },
+        )
+        # PRE-STATE: the bytes ARE in the file, so the assertion after
+        # the delete is about removal and not about absence.
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert db_path.read_bytes().count(marker.encode()) > 0
+
+        conn.execute("DELETE FROM attachments WHERE digest = ?", ("ab" * 32,))
+        conn.commit()
+        # The write-ahead log is a separate file this pragma says nothing
+        # about; checkpointing is what moves the deletion into the
+        # database file, and the README tells a person to VACUUM.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+    assert db_path.read_bytes().count(marker.encode()) == 0
+
+
+def test_review_repro_a_pinned_refs_character_count_is_pythons_too(tmp_path):
+    """WINDOW: store.extractions_for, the batch reader the K.3 closing
+    review added, on a rendition whose text contains a NUL.
+
+    K1.5 MOVED THIS COUNT OFF sqlite's length() FOR THE attachments
+    TABLE, argued the reason at length in the migration, and the closing
+    review's own sweep found the reason reintroduced one table over: the
+    new reader was written with `length(extracted_text) AS
+    extracted_chars` because it must not carry bodies out of sqlite, and
+    length() stops at the first NUL.
+
+    Measured before the fix, on one 33-character document containing
+    one: POST /attachments answered 33 and GET /groups/{id} answered 13,
+    in one session, about one file. The upload path had the K1.5 column
+    and the pinned-ref path had the bug it was written to kill.
+
+    The column, not a len() at read time, because the reader's whole
+    purpose is that a page of pins costs no bodies.
+    """
+    conn = store.connect(str(tmp_path / "bench.db"))
+    try:
+        text = "page one ends\x00and page two begins"
+        assert len(text) == 33
+        record = {
+            "digest": "ab" * 32,
+            "filename": "nul.txt",
+            "mime": "text/plain",
+            "byte_size": len(text),
+            "content": text.encode("latin-1"),
+            "extracted_text": text,
+            "extractor": "text",
+            "extractor_version": "1",
+            "kind": "document",
+        }
+        stored = store.save_attachment(conn, record)
+        assert stored["extracted_chars"] == 33
+
+        # What sqlite would have said, measured rather than remembered.
+        assert (
+            conn.execute(
+                "SELECT length(extracted_text) n FROM attachment_extractions"
+                " WHERE digest = ?",
+                (record["digest"],),
+            ).fetchone()["n"]
+            == 13
+        )
+
+        pins = [
+            {
+                "digest": record["digest"],
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ]
+        resolved = store.extractions_for(conn, pins)
+        found = resolved[(record["digest"], "text", "1")]
+        assert found["extracted_chars"] == 33
+        # And the reader still carries no body, which is the constraint
+        # that produced the bug in the first place.
+        assert "extracted_text" not in found
+    finally:
+        conn.close()

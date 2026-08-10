@@ -140,7 +140,17 @@
         chip.title = badge.title;
         badges.append(chip);
       }
-      row.append(time, text, badges, count);
+      // A comparison that was run over a document reads very differently
+      // from one that was not, so the row says so without being opened.
+      // Names, because this is the sighted list: the blind view is the
+      // one place identities and document names are withheld, and it is
+      // built from a different payload entirely.
+      const docs = document.createElement("span");
+      docs.className = "hdocs";
+      for (const ref of run.attachments || []) {
+        docs.append(attachmentChip(ref, run.attachments_mode, "history"));
+      }
+      row.append(time, text, badges, docs, count);
       row.title = run.models.join(", ");
       row.addEventListener("click", () =>
         run.type === "group" ? showGroup(run.id) : showRun(run.id),
@@ -184,6 +194,39 @@
     applyHistoryFilter();
   }
 
+  // One document, as a chip, in the one shape both the history row and
+  // the replay banner use. Shared rather than written twice because the
+  // two must agree: a document shown one way in the list and another way
+  // after the click would read as two different documents.
+  //
+  // A ref whose row is gone carries only a digest (see AttachmentRef);
+  // it renders as such rather than being skipped, so a comparison that
+  // declared three documents never reads as having declared two.
+  function attachmentChip(ref, mode, where) {
+    const { fmtBytes, shortDigest } = window.BenchLib;
+    const chip = document.createElement("span");
+    chip.className = "attach-chip ref";
+    chip.dataset.testid = where + "-attachment";
+    const missing = ref.filename === null || ref.filename === undefined;
+    // textContent throughout: a filename is user text.
+    chip.textContent = missing ? "(no longer stored)" : ref.filename;
+    if (missing) chip.classList.add("attach-missing");
+    const bits = [];
+    if (!missing && Number.isFinite(ref.byte_size)) {
+      bits.push(fmtBytes(ref.byte_size));
+    }
+    bits.push("sha256 " + shortDigest(ref.digest));
+    if (mode) bits.push(mode);
+    // The extractor and its version, because a pypdf upgrade changes the
+    // text a model read and a replay that could not say which parser
+    // produced it would be a replay of a prompt nobody can reconstruct.
+    if (!missing && ref.extractor && ref.extractor !== "none") {
+      bits.push("read by " + ref.extractor + " " + ref.extractor_version);
+    }
+    chip.title = bits.join("\n");
+    return chip;
+  }
+
   // Whether routing is recoverable from this source. A group stores its
   // declared controls, so reuse restores them exactly. An ungrouped run has
   // no stored set at all; its controls are derived from its recorded
@@ -197,8 +240,23 @@
   // truth defect as any other default rendered as a choice. What is not
   // acceptable is being quiet about it, so the button says so before the
   // click and the composer says so after.
+  // Attachments used to join routing in this sentence, on the grounds
+  // that an ungrouped run had no declaration at all. K.1 gave it one:
+  // runs.renditions_json records the pinned rendition of every document
+  // the run sent, and the API serves it, so the documents ARE restored
+  // now and only the MODE is not. The mode lives on a group row and a
+  // lone run has none, so reuse cannot say whether those documents went
+  // inline or native and must not guess.
+  //
+  // The digests also survive inside the recorded payload, in the
+  // placeholder that stands where the content sat, and this still
+  // deliberately does not parse them out: the declaration is the data
+  // path, and promoting a record format into one would be the same
+  // mistake as reading controls back off their badges.
   const UNGROUPED_ROUTING_NOTE =
-    "routing is not restored: an ungrouped run does not record it";
+    "routing is not restored, and neither is the attachment mode: an " +
+    "ungrouped run records which documents it sent and how each was " +
+    "read, but not whether they went inline or native";
 
   // The controls a replayed comparison ran under, badges plus the system
   // prompt in full. The badge alone says only that a system prompt existed,
@@ -210,6 +268,28 @@
   // would attribute one comparison's experiment to another.
   function renderRunControls(params, source) {
     runControlsEl.replaceChildren();
+    // The documents this comparison ran over, above the controls,
+    // because they changed what every model READ and the controls only
+    // changed how each one answered. Drawn from the source's stored
+    // declaration and never from the composer's current staging, which
+    // is a different comparison's documents.
+    const refs = source?.attachments || [];
+    if (refs.length > 0) {
+      const strip = document.createElement("div");
+      strip.className = "attach-strip";
+      strip.dataset.testid = "run-attachments";
+      const label = document.createElement("span");
+      label.className = "attach-strip-label";
+      label.textContent =
+        source.attachmentsMode === "native"
+          ? "documents (native: the models saw the images)"
+          : "documents (inline: the bench extracted the text)";
+      strip.append(label);
+      for (const ref of refs) {
+        strip.append(attachmentChip(ref, source.attachmentsMode, "run"));
+      }
+      runControlsEl.append(strip);
+    }
     const badges = window.BenchLib.controlBadges(params);
     if (badges.length > 0) {
       const strip = document.createElement("div");
@@ -463,6 +543,11 @@
         group.prompt ??
         (group.runs.length > 0 ? group.runs[0].prompt_text : ""),
       params: group.params,
+      // Part of the experiment, so reuse carries it forward with the
+      // prompt and the controls. Always a list from the API, empty on
+      // every group that declared none.
+      attachments: group.attachments || [],
+      attachmentsMode: group.attachments_mode || null,
     });
     // Cards in the order the comparison actually had. Runs persist in
     // completion order, so run order alone would shuffle cards between
@@ -538,6 +623,21 @@
       id: run.id,
       prompt: run.prompt_text,
       params: run.params,
+      // READ FROM THE RECORD, and this used to be a hardcoded empty
+      // list under a comment saying an ungrouped run "has no declaration
+      // to read". That was true when it was written and K.1 made it
+      // false: runs.renditions_json records what a lone run sent, and
+      // GET /runs/<id> has served it since. The comment survived the
+      // change and the empty list survived with it, so a single-model
+      // comparison replayed as one that declared nothing, and reuse from
+      // it silently dropped the documents.
+      //
+      // The mode is not recorded on a run row, only on a group, so it
+      // stays null here and the strip labels itself accordingly. That IS
+      // a real gap in a lone run's declaration and the note below says
+      // so; it is not a reason to drop the documents as well.
+      attachments: run.attachments || [],
+      attachmentsMode: null,
     });
     for (const result of run.results) {
       BenchRender.fillColumn(
