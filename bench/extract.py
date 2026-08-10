@@ -222,7 +222,34 @@ MAX_COMPOSED_CHARS = 200_000
 # Named constants rather than inline strings because the fairness rule
 # is byte-identical composed content across models, and a delimiter
 # built in two places is a delimiter that can differ in one of them.
-ATTACHMENT_HEADER = "----- attachment {index} of {total}: {filename} -----"
+# The delimiter line the models read. It names the RENDITION and not
+# the file's name, and that swap is Phase K.3's ruling rather than a
+# formatting change.
+#
+# A FILENAME IS NOT SELECTABLE BY ANY DECLARATION. A group pins digest,
+# extractor, extractor version and kind; nothing in that list is a name.
+# The name that reached the models came off the digest's base row, which
+# belongs to whichever upload arrived FIRST, so uploading the same bytes
+# as old.txt and then as new.txt and declaring new.txt composed a prompt
+# saying "attachment 1 of 1: old.txt": measured, and every model in that
+# comparison was told the name of a file the person had not sent. Delete
+# and re-upload under a third name and the same comparison's prompt
+# changes again, with nothing in the declaration having moved.
+#
+# WHAT REPLACES IT IS DECLARED. The kind, the extractor and the leading
+# twelve of the digest are all pinned, so the header is now a pure
+# function of the rendition exactly as the body is, and two members of
+# one comparison cannot receive different headers. A name is display
+# metadata: the record keeps it, the chips show it, and the models stop
+# seeing it.
+#
+# Twelve hex characters of the digest, the same prefix every refusal in
+# this codebase quotes, so a person reading a prompt and a refusal side
+# by side is reading the same identifier.
+ATTACHMENT_HEADER = (
+    "----- attachment {index} of {total}: {kind}, read by {extractor}, "
+    "sha256 {short} -----"
+)
 ATTACHMENT_FOOTER = "----- end attachment {index} of {total} -----"
 ATTACHMENT_INTRO = (
     "The following {noun} attached to this request. Treat {pronoun} as "
@@ -675,6 +702,14 @@ def compose(prompt: str, documents: list[dict[str, Any]], *, redacted: bool) -> 
     Documents ride AFTER the prompt rather than before it, so the
     person's question is what a model reads first and what a truncating
     provider is least likely to cut.
+
+    EVERY BYTE OF THE RESULT IS A FUNCTION OF (prompt, rendition, order),
+    and since K.3 that is literally true rather than nearly true. The
+    header used to carry the upload's filename, which no declaration
+    pins and which comes off whichever upload of those bytes arrived
+    first; see ATTACHMENT_HEADER for what that did to two comparisons
+    over one digest. The fairness law rests on this function having no
+    input the declaration does not fix.
     """
     if not documents:
         # Rule one, at the composition layer: a comparison with no
@@ -706,7 +741,11 @@ def compose(prompt: str, documents: list[dict[str, Any]], *, redacted: bool) -> 
             "\n".join(
                 (
                     ATTACHMENT_HEADER.format(
-                        index=index, total=total, filename=document["filename"]
+                        index=index,
+                        total=total,
+                        kind=document["kind"],
+                        extractor=document["extractor"],
+                        short=document["digest"][:12],
                     ),
                     body,
                     ATTACHMENT_FOOTER.format(index=index, total=total),
@@ -847,6 +886,54 @@ def enforce_image_signature(filename: str, content: bytes, media: str) -> None:
                 "there instead of here. Re-save it in the format its name "
                 "claims, or attach it under its real extension."
             )
+
+
+# The media type of a document the bench does not send natively. Kept
+# beside native_media_type because the two answer one question between
+# them, and a caller that had to consult two tables to type one file
+# would be a caller that could get a different answer from each.
+#
+# The client's own Content-Type is deliberately not consulted: the
+# browser guesses it from the same suffix anyway, and on some platforms
+# guesses it wrong, so taking it would be taking a worse copy of what we
+# already have.
+DOCUMENT_MIMES = {
+    ".txt": "text/plain",
+    ".md": "text/markdown",
+    ".pdf": "application/pdf",
+    ".docx": (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    ),
+}
+
+# What an unrecognized suffix types as. Reachable only through the
+# backfill below: extract() refuses an unknown suffix at upload with a
+# message naming what the bench reads, so no live upload arrives here.
+UNKNOWN_MEDIA_TYPE = "application/octet-stream"
+
+
+def media_type_for(filename: str) -> str:
+    """The media type these bytes were READ under, from the name they
+    were read under.
+
+    ONE FUNCTION AND NOT TWO TABLES, because the media type is part of
+    the RENDITION and a rendition has to be reproducible from what is
+    stored. The boundary used to compute this inline from its own copy
+    of the document table, and the store had no way to compute it at
+    all, so the type existed on the digest's base row and nowhere else.
+    A second reading of the same bytes under a different suffix then had
+    no type of its own, and native composition read the first upload's:
+    a PNG first uploaded as .txt reached a vision model as
+    data:text/plain, measured.
+
+    A FUNCTION OF THE FILENAME ONLY, which is what makes the backfill
+    exact rather than a guess: attachment_extractions records the name
+    each rendition was read under, so applying this to that name
+    reproduces the same string the boundary computed at upload time.
+    """
+    return native_media_type(filename) or DOCUMENT_MIMES.get(
+        suffix_of(filename), UNKNOWN_MEDIA_TYPE
+    )
 
 
 def native_media_type(filename: str) -> str | None:

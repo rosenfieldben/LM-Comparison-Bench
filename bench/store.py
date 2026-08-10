@@ -43,6 +43,7 @@ from typing import Any
 # Shared with ingestion on purpose: what run_model refuses to emit,
 # get_run refuses to serve, so both ends of the pipeline enforce the
 # same field-type contract.
+from bench.extract import media_type_for
 from bench.models import as_metric, as_money, as_text, as_token_count
 
 logger = logging.getLogger(__name__)
@@ -147,6 +148,7 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     created_at TEXT NOT NULL,
     kind TEXT,
     filename TEXT,
+    mime TEXT,
     UNIQUE (digest, extractor, extractor_version)
 );
 CREATE TABLE IF NOT EXISTS results (
@@ -388,6 +390,26 @@ MIGRATIONS = [
     # comment is the thing that would have to change first.
     ("attachment_extractions", "kind", "TEXT"),
     ("attachment_extractions", "filename", "TEXT"),
+    # Phase K.3: THE MEDIA TYPE JOINS THE RENDITION, because it was
+    # already a property of the reading and was being stored as a
+    # property of the bytes.
+    #
+    # attachments.mime belongs to whichever upload arrived first. The
+    # same digest read as .txt and as .png is two renditions with two
+    # honest types, and native composition read the base row's: a real
+    # PNG first uploaded under a .txt suffix and later pinned as an
+    # image reached the provider as data:text/plain;base64,iVBORw0KG,
+    # measured. The recorded placeholder said "as image, 41 bytes,
+    # text/plain" in the same breath, so the record contradicted itself
+    # about one document.
+    #
+    # The UNIQUE key is deliberately NOT widened to include it. The mime
+    # is a function of the filename the rendition was read under, and
+    # the extractor is a function of the same suffix, so
+    # (digest, extractor, extractor_version) already separates every
+    # type the bench can produce. Widening would let two rows differ in
+    # a column nothing chooses by.
+    ("attachment_extractions", "mime", "TEXT"),
     # Phase K.1: the extracted length, STORED rather than measured on
     # read. A history page shows how much text came out of each
     # document, and deriving that from the text meant every list
@@ -574,11 +596,11 @@ def connect(path: str) -> sqlite3.Connection:
     conn.execute(
         """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
-                created_at, kind, filename)
+                created_at, kind, filename, mime)
            SELECT digest, extractor, extractor_version, extracted_text,
                   created_at,
                   CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
-                  filename
+                  filename, mime
            FROM attachments"""
     )
     # THE COUNT BACKFILL, once per database and never again.
@@ -608,6 +630,32 @@ def connect(path: str) -> sqlite3.Connection:
     if counted:
         conn.executemany(
             "UPDATE attachments SET extracted_chars = ? WHERE digest = ?", counted
+        )
+    # THE MEDIA-TYPE BACKFILL, and it is EXACT rather than a guess.
+    #
+    # Rows written before K.3 have no mime of their own. Every one of
+    # them records the FILENAME it was read under, though, and the
+    # boundary computed the type from exactly that name with exactly
+    # this function, so applying it here reproduces the string that
+    # upload would have written. That is why media_type_for lives in
+    # extract.py rather than at the boundary: two copies of the mapping
+    # would be two answers, and the backfill would then be a guess at
+    # what the other one had said.
+    #
+    # A row with no filename cannot be typed and is left NULL rather
+    # than defaulted; readers below fall back to the base row and say so.
+    # connect() backfills filename from the base row one statement up, so
+    # this is reachable only for a row somebody wrote by hand.
+    typed = [
+        (media_type_for(row["filename"]), row["id"])
+        for row in conn.execute(
+            "SELECT id, filename FROM attachment_extractions"
+            " WHERE mime IS NULL AND filename IS NOT NULL"
+        )
+    ]
+    if typed:
+        conn.executemany(
+            "UPDATE attachment_extractions SET mime = ? WHERE id = ?", typed
         )
     conn.commit()
     return conn
@@ -936,8 +984,8 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         conn.execute(
             """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
-                created_at, kind, filename)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                created_at, kind, filename, mime)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["extractor"],
@@ -953,6 +1001,10 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 # described truthfully instead of contradicting the
                 # first.
                 record["filename"],
+                # And the type THIS reading was taken under, for the
+                # same reason one line up. The base row's belongs to the
+                # first upload, and native composition sends this one.
+                record["mime"],
             ),
         )
     out = dict(row)
@@ -974,6 +1026,13 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
     out["extractor_version"] = record["extractor_version"]
     out["kind"] = record["kind"]
     out["filename"] = record["filename"]
+    # And the media type, K.3's addition to the same list. Without it the
+    # FIRST upload of a second suffix answered with the base row's:
+    # uploading a PNG as y.txt and then as y.png returned
+    # `kind: image, mime: text/plain`, measured, which is a rendition the
+    # bench does not hold. The re-upload path had the same hole and
+    # _view_overlay closes that one.
+    out["mime"] = record["mime"]
     return out
 
 
@@ -996,10 +1055,16 @@ def extraction_for(
     nothing else, since connect() backfills them from the attachments
     row at boot. A caller that needs kind derives it from the extractor
     the way ingest does; see rendition_of.
+
+    mime is the type THIS reading was taken under, and it is the field
+    K.3 added because native composition had been reading the digest's
+    base row for it. Backfilled at boot from the rendition's own
+    filename by the same function the boundary uses, so it is None only
+    on a row that has neither, which connect() cannot produce.
     """
     row = conn.execute(
         """SELECT digest, extractor, extractor_version, extracted_text,
-                  kind, filename
+                  kind, filename, mime
            FROM attachment_extractions
            WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
         (digest, extractor, version),

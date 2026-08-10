@@ -44,9 +44,8 @@ from bench.extract import (
     compose_native,
     enforce_composed_size,
     ingest,
-    native_media_type,
+    media_type_for,
     rendition_of,
-    suffix_of,
 )
 from bench.models import (
     BUDGET_EXTENDED,
@@ -172,23 +171,6 @@ MAX_ATTACHMENT_B64_CHARS = (
 # What a browser may call an attachment, by suffix, mapped to what the
 # bench records as its type. Derived from the suffix rather than trusted
 # from the client's Content-Type claim: the browser guesses that field
-# from the same suffix anyway, and on some platforms guesses it wrong,
-# so taking it would be taking a worse copy of what we already have.
-#
-# Recorded rather than acted on. Nothing in the inline path branches on
-# the mime; extraction keys on the suffix and the type is provenance,
-# which is why an unknown suffix never reaches here (extract refuses it
-# first with a message naming what the bench reads).
-ATTACHMENT_MIMES = {
-    ".txt": "text/plain",
-    ".md": "text/markdown",
-    ".pdf": "application/pdf",
-    ".docx": (
-        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-    ),
-}
-
-
 # A seed is an opaque integer to every provider, so the bound exists only to
 # keep an absurd body out, the same reason MAX_POSITION exists.
 #
@@ -262,6 +244,24 @@ class ExperimentParams(BaseModel):
     routing: Literal["throughput", "price", "default"] | None = None
 
 
+class RenditionPin(BaseModel):
+    """One (digest, extractor, extractor_version, kind), as declared.
+
+    kind rides along rather than being derived from the extractor, even
+    though it is a function of it today, because the pin is a RECORD of
+    what was declared and a record that omitted a field on the grounds
+    that it was currently derivable would stop being a record the day it
+    stopped being derivable.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+    extractor: str = Field(min_length=1, max_length=64)
+    extractor_version: str = Field(min_length=1, max_length=64)
+    kind: Literal["document", "image"]
+
+
 class CompareRequest(BaseModel):
     model_config = FORBID_UNKNOWN
 
@@ -298,6 +298,19 @@ class CompareRequest(BaseModel):
     # member that thought it was sending inline text while the group
     # declared native would be running a different experiment.
     attachments_mode: Literal["inline", "native"] = "inline"
+    # HOW this member believes each document is to be read. Optional,
+    # because a digest-only body is still a complete request and rule
+    # one keeps the unattached payload untouched.
+    #
+    # Two things it does, both K.3's; see pins_for. Grouped, it is
+    # CHECKED against the group's pin and a disagreement is a 409, so a
+    # client cannot believe it asked for a reading it did not get.
+    # Ungrouped, it is the only way to choose one at all: without it this
+    # door resolved every digest to its base row, which is the reading of
+    # whichever upload arrived first.
+    renditions: list[RenditionPin] | None = Field(
+        default=None, min_length=1, max_length=MAX_ATTACHMENTS
+    )
 
 
 class ModelResult(BaseModel):
@@ -390,6 +403,13 @@ class StreamCompareRequest(BaseModel):
     # member that thought it was sending inline text while the group
     # declared native would be running a different experiment.
     attachments_mode: Literal["inline", "native"] = "inline"
+    # The same field CompareRequest carries and for the same reasons;
+    # see pins_for. Both doors or neither: a pin the batch endpoint
+    # honors and the streaming one refuses as an unknown field would be
+    # the one-door shape in the very field this phase is about.
+    renditions: list[RenditionPin] | None = Field(
+        default=None, min_length=1, max_length=MAX_ATTACHMENTS
+    )
 
 
 class CompareResponse(BaseModel):
@@ -591,24 +611,6 @@ class GroupEntry(BaseModel):
 
 class RunList(BaseModel):
     runs: list[GroupEntry | RunEntry]
-
-
-class RenditionPin(BaseModel):
-    """One (digest, extractor, extractor_version, kind), as declared.
-
-    kind rides along rather than being derived from the extractor, even
-    though it is a function of it today, because the pin is a RECORD of
-    what was declared and a record that omitted a field on the grounds
-    that it was currently derivable would stop being a record the day it
-    stopped being derivable.
-    """
-
-    model_config = FORBID_UNKNOWN
-
-    digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
-    extractor: str = Field(min_length=1, max_length=64)
-    extractor_version: str = Field(min_length=1, max_length=64)
-    kind: Literal["document", "image"]
 
 
 class GroupCreate(BaseModel):
@@ -1902,6 +1904,24 @@ def row_rendition(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _pin_dicts(declared: list[Any]) -> list[dict[str, Any]]:
+    """RenditionPin models as the plain dicts the rest of this file uses.
+
+    One spelling of the conversion, because two would be two places that
+    could disagree about which four fields a rendition has, which is the
+    kind of drift this phase is about.
+    """
+    return [
+        {
+            "digest": pin.digest,
+            "extractor": pin.extractor,
+            "extractor_version": pin.extractor_version,
+            "kind": pin.kind,
+        }
+        for pin in declared
+    ]
+
+
 def declared_pins(
     digests: list[str], declared: list[Any] | None
 ) -> list[dict[str, Any]]:
@@ -1921,15 +1941,7 @@ def declared_pins(
     """
     if declared is None:
         return [row_rendition(row) for row in enforce_attachments_exist(digests)]
-    pins = [
-        {
-            "digest": pin.digest,
-            "extractor": pin.extractor,
-            "extractor_version": pin.extractor_version,
-            "kind": pin.kind,
-        }
-        for pin in declared
-    ]
+    pins = _pin_dicts(declared)
     if [pin["digest"] for pin in pins] != digests:
         raise HTTPException(
             422,
@@ -1945,26 +1957,54 @@ def declared_pins(
     return pins
 
 
-def pins_for(digests: list[str], group_id: int | None) -> list[dict[str, Any]]:
-    """The renditions this request must send, pinned or derived.
+def pins_for(
+    digests: list[str], group_id: int | None, declared: list[Any] | None = None
+) -> list[dict[str, Any]]:
+    """The renditions this request must send, pinned, declared or derived.
 
     THE GROUP'S PIN WINS WHENEVER THERE IS ONE, which is the point of
     pinning: member two is handed member one's reading rather than
     whatever the process holds now. group_renditions returns None for
-    the two pre-K.1 eras, and those fall back to the row's own rendition
-    (see row_rendition), which is stable for the same reason.
+    the two pre-K.1 eras, and those fall back to the member's own
+    declaration or, failing that, to the row's own rendition (see
+    row_rendition), which is stable for the same reason.
 
     The digests are checked against the group's pinned digests by
     _attachments_conflict before this runs, so a pin found here always
     matches what the member declared; this function does not re-check
     that and must not, because a second spelling of the same comparison
     is a second thing that can disagree.
+
+    A MEMBER MAY NOW STATE ITS PIN, and both things that buys are K.3's.
+
+    An UNGROUPED member could not choose a reading at all. It sent
+    digests, and this resolved each to its base row, so a scripted
+    /compare over bytes the bench holds under two suffixes always got
+    whichever upload arrived first with no way to say otherwise. That is
+    the "resolves to whatever the digest row says" default this phase
+    exists to remove, surviving at the one door that has no group to
+    read a pin from.
+
+    A GROUPED member that states one is CHECKED AGAINST THE GROUP rather
+    than obeyed or ignored. Ignoring it would let a client believe it had
+    asked for a reading it did not get; obeying it would let a member
+    substitute one, which is the whole thing the pin prevents. So the two
+    must agree, exactly as the digests must, and the refusal says so.
     """
     if group_id is not None:
         pinned = store.group_renditions(app.state.db, group_id)
         if pinned is not None:
+            if declared is not None and _pin_dicts(declared) != pinned:
+                raise HTTPException(
+                    409,
+                    "renditions do not match this comparison's declaration. "
+                    "The group pinned how each document was to be read "
+                    "before its first member ran, and every member is given "
+                    "exactly that reading; a member naming a different one "
+                    "is asking for a different comparison.",
+                )
             return pinned
-    return [row_rendition(row) for row in enforce_attachments_exist(digests)]
+    return declared_pins(digests, declared)
 
 
 def documents_for(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1999,6 +2039,14 @@ def documents_for(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
             {
                 **row,
                 "extracted_text": rendition["extracted_text"],
+                # THE TYPE OF THIS READING, not of the digest's base
+                # row. native_documents builds the data: URL from it and
+                # the recorded placeholder names it, so a base-row value
+                # here sent a PNG to a provider labelled text/plain. The
+                # fallback is the base row only for a rendition written
+                # before the column existed and never booted since,
+                # which connect()'s backfill closes.
+                "mime": rendition.get("mime") or row["mime"],
                 # The row's stored count belongs to the row's own
                 # reading, and this document is the PINNED one. Carried
                 # over unchanged it would sit in the same dict as a
@@ -2289,6 +2337,7 @@ def enforce_mode_entry(
     mode: str,
     models: list[str],
     group_id: int | None = None,
+    renditions: list[Any] | None = None,
 ) -> None:
     """Whichever mode's promise this member declared, re-checked at the
     endpoint that spends money.
@@ -2346,7 +2395,7 @@ def enforce_mode_entry(
                 "record a fact about nothing.",
             )
         return
-    pins = pins_for(digests, group_id)
+    pins = pins_for(digests, group_id, renditions)
     if mode == "native":
         enforce_native_mode(pins, models)
     else:
@@ -2360,11 +2409,21 @@ def native_documents(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
     to become base64 in a payload and nothing else; see
     store.attachment_content.
 
-    THE MEDIA TYPE COMES FROM THE ROW'S mime, not from a suffix lookup
-    on a filename. The row's mime was set by the upload that read these
-    bytes as an image, so it is the same decision the pin's kind
-    records; deriving it again from a filename was how bytes stored
-    under one name became unusable under another.
+    THE MEDIA TYPE COMES FROM THE PINNED RENDITION, which is a
+    correction to what this said and to what it did. It used to read the
+    digest's BASE ROW, on the reasoning that the row's mime "was set by
+    the upload that read these bytes as an image". That is true only
+    when the base row IS the image rendition. The same bytes uploaded as
+    .txt and then as .png leave a base row typed text/plain and a second
+    rendition correctly typed image/png, and pinning the image sent
+    data:text/plain;base64,iVBORw0KG to the provider: measured, with the
+    recorded placeholder saying "as image, 41 bytes, text/plain" in the
+    same line.
+
+    So the type rides on the rendition now, stored beside the reading it
+    belongs to, and documents_for carries it here; see
+    store.MIGRATIONS for why the extraction row grew a mime column and
+    extract.media_type_for for why one function computes it.
     """
     documents = documents_for(pins)
     out = []
@@ -2395,6 +2454,7 @@ def composed_for(
     mode: str,
     group_id: int | None = None,
     defer_native: bool = False,
+    renditions: list[Any] | None = None,
 ) -> tuple[Any, Any]:
     """The user content to send and the user content to record.
 
@@ -2448,7 +2508,7 @@ def composed_for(
     """
     if not digests:
         return prompt, None
-    pins = pins_for(digests, group_id)
+    pins = pins_for(digests, group_id, renditions)
     if mode == "native":
         # VALIDATE NOW, ENCODE LATER, when the caller says it can wait.
         # Everything that could refuse this comparison has already run at
@@ -2714,6 +2774,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         request.attachments_mode,
         request.models,
         request.group_id,
+        request.renditions,
     )
     # COMPOSED ONCE, for the whole batch. Every member below sends this
     # same string, so identical composed content across models is a
@@ -2721,13 +2782,38 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # holds when nothing is attached: compose returns the prompt
     # unchanged and record_prompt stays None, so the payload is byte for
     # byte what it was before this phase.
-    pins = pins_for(request.attachments or [], request.group_id)
+    pins = pins_for(request.attachments or [], request.group_id, request.renditions)
     composed, recorded = composed_for(
         request.prompt,
         request.attachments,
         request.attachments_mode,
         request.group_id,
+        renditions=request.renditions,
     )
+    # THE WINDOW CHECK IS A DOOR CHECK, and this is the second door.
+    #
+    # It shipped at group creation only, which covered the browser and
+    # nothing else: an ungrouped scripted /compare carrying a 40,000
+    # character document against a model holding 8,192 tokens returned
+    # 200 and made one upstream call, measured at 016b6bc, where the
+    # same declaration through /groups was refused 422. That is the
+    # one-door shape this codebase has now found five times, and the
+    # remedy is the same one enforce_mode_entry already took: run the
+    # check at every door with the same arithmetic and the same message.
+    #
+    # Only for attachment-carrying requests, because that is the whole
+    # of what changed. A bare prompt cannot approach a context window
+    # the way MAX_COMPOSED_CHARS bounds it, and adding a refusal to
+    # every unattached comparison would be a new rule wearing this
+    # phase's clothes: the budget-versus-window check for ALL runs is a
+    # named deferral and stays one.
+    #
+    # composed is a string on the inline path and a list of parts on the
+    # native one; the check takes the string, and native is skipped here
+    # for the reason group creation skips it, which is that image tokens
+    # are not a function of character count.
+    if request.attachments and isinstance(composed, str):
+        enforce_context_window(composed, request.models, request.budget)
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -2857,12 +2943,13 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         request.attachments_mode,
         [request.model],
         request.group_id,
+        request.renditions,
     )
     # Composed at ENTRY, outside the generator, so a composition refusal
     # is a 422 with nothing written rather than an error raised after
     # the response has already begun. Same reasoning as the export's
     # dataset check.
-    pins = pins_for(request.attachments or [], request.group_id)
+    pins = pins_for(request.attachments or [], request.group_id, request.renditions)
     # Deferred for native: validated here, encoded under the slot. See
     # composed_for for the retained-memory arithmetic.
     composed, recorded = composed_for(
@@ -2871,7 +2958,15 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         request.attachments_mode,
         request.group_id,
         defer_native=True,
+        renditions=request.renditions,
     )
+    # The third door. See /compare for the census and the measurement;
+    # the lineup a stream member is checked against is itself, exactly
+    # as enforce_mode_entry does one call up. defer_native leaves
+    # composed as None on the native path, which isinstance rejects, so
+    # the same skip applies here for the same reason.
+    if request.attachments and isinstance(composed, str):
+        enforce_context_window(composed, [request.model], request.budget)
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -2932,6 +3027,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     request.attachments,
                     request.attachments_mode,
                     request.group_id,
+                    renditions=request.renditions,
                 )
             # Recheck the ceiling now that a slot is held, before started is
             # set, before the clock, and before the started frame. The entry
@@ -3102,11 +3198,16 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
     # layer exists to make impossible.
     if body.attachments:
         # THE PIN IS TAKEN HERE, at creation, before any member runs.
-        # Derived from each stored row rather than accepted from the
-        # client: the digest names bytes the bench already holds, and
-        # what those bytes were READ as is the bench's own record, not a
-        # claim a caller gets to make. A client that could name the
-        # rendition could pin a reading that was never produced.
+        #
+        # Two branches, and the older half of this comment described
+        # only the first. With no renditions in the body the pin is
+        # DERIVED from each stored row, which is what a digest-only
+        # client means. With them the caller is CHOOSING among readings
+        # the bench holds, and every component of every choice is
+        # verified against the stored row before it is written: see
+        # declared_pins and resolve_rendition. Either way what gets
+        # pinned is the bench's own record of how those bytes were read,
+        # never a claim the caller gets to make about them.
         pins = declared_pins(body.attachments, body.renditions)
         if body.attachments_mode == "native":
             # Every promise native mode makes, checked here rather than
@@ -4198,6 +4299,32 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
     attachments row into the table at boot and uploads write theirs. It
     is written to be shown anyway: a bench that cannot honor a pin must
     say which document and which reading it cannot produce.
+
+    EVERY COMPONENT IS VERIFIED, NOT THREE OF FOUR, and that is the K.3
+    correction. The lookup keys on digest, extractor and version because
+    those are the table's UNIQUE key; kind rode along in the pin and was
+    never compared against the row, so a client could name a reading
+    that exists and RELABEL it. Both halves of that were reachable and
+    both were measured at 016b6bc:
+
+      a text rendition pinned kind="image" passed enforce_native_mode,
+      which reads the pin's kind, and a nine-byte .txt file went to a
+      vision model as data:text/plain;base64,Zm9ydHkgdHdv;
+
+      an image rendition pinned kind="document" passed
+      enforce_inline_mode and composed an EMPTY delimited block, so
+      every model was told a document was attached and shown nothing.
+
+    A pin is a CHOICE AMONG READINGS THE BENCH HOLDS. Choosing one and
+    then describing it as something else is not a choice, and the
+    refusal names both values so the caller can see which of the two
+    they got wrong.
+
+    THE STORED KIND IS DERIVED WHEN THE COLUMN IS NULL rather than
+    conceded. Pre-K.1 rows are backfilled at boot, so a NULL here means
+    a row written by hand; deriving it from the extractor is the same
+    rule ingest applies and is a fact about the row, where accepting the
+    claim would be the substitution this function exists to refuse.
     """
     found = store.extraction_for(
         app.state.db, pin["digest"], pin["extractor"], pin["extractor_version"]
@@ -4211,6 +4338,20 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
             "parser's reading, because the other members of this comparison "
             "were given the pinned one. Re-upload the file to store this "
             "reading again, or start a new comparison.",
+        )
+    stored_kind = found.get("kind") or (
+        IMAGE_KIND if found["extractor"] == "none" else DOCUMENT_KIND
+    )
+    if pin["kind"] != stored_kind:
+        raise HTTPException(
+            422,
+            f"sha256 {pin['digest'][:12]} read by {pin['extractor']} "
+            f"{pin['extractor_version']} is stored as a {stored_kind} and "
+            f"the declaration calls it a {pin['kind']}. The bench will not "
+            "relabel a reading: the kind decides which mode may use it and "
+            f"what the models are shown. Declare it as a {stored_kind}, or "
+            "upload the file under an extension that makes it "
+            f"a {pin['kind']}.",
         )
     return found
 
@@ -4249,7 +4390,7 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def _view_overlay(
-    pin: dict[str, str], filename: str, extracted_chars: int
+    pin: dict[str, str], filename: str, extracted_chars: int, mime: str | None
 ) -> dict[str, Any]:
     """The fields of a view that belong to THIS rendition rather than to
     the stored row.
@@ -4263,7 +4404,14 @@ def _view_overlay(
     real text from the other, with nothing in either response saying
     which reading it meant.
 
-    ALL FIVE FIELDS, and the fifth is here because four was not enough.
+    ALL SIX FIELDS. The sixth is the media type, which K.3 moved onto
+    the rendition for the reason native composition made unavoidable:
+    the same bytes read as .txt and as .png are two types, and the base
+    row holds only the first upload's. POST used to answer
+    `kind: image, mime: text/plain` for the second, measured, which is
+    not a rendition that exists.
+
+    Before that, five, and the fifth is here because four was not enough.
     The overlay named the parser, the version, the kind and the name and
     left extracted_chars showing the stored row's, so re-uploading a
     file that had first arrived under an image suffix answered
@@ -4279,6 +4427,10 @@ def _view_overlay(
         "extractor_version": pin["extractor_version"],
         "kind": pin["kind"],
         "extracted_chars": extracted_chars,
+        # None only for a hand-written row; see store.extraction_for.
+        # Left to the base row's value in that case rather than guessed,
+        # which is what the caller's `**known` spread already holds.
+        **({"mime": mime} if mime else {}),
     }
 
 
@@ -4417,7 +4569,10 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
                 {
                     **known,
                     **_view_overlay(
-                        current, body.filename, len(seen["extracted_text"])
+                        current,
+                        body.filename,
+                        len(seen["extracted_text"]),
+                        seen.get("mime"),
                     ),
                 }
             )
@@ -4453,10 +4608,10 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
         {
             "digest": digest,
             "filename": body.filename,
-            "mime": native_media_type(body.filename)
-            or ATTACHMENT_MIMES.get(
-                suffix_of(body.filename), "application/octet-stream"
-            ),
+            # One function, in extract.py, because the store needs the
+            # same answer to backfill a rendition's type and two copies
+            # of the mapping would be two answers. See media_type_for.
+            "mime": media_type_for(body.filename),
             "byte_size": len(content),
             "content": content,
             "extracted_text": extracted["text"],

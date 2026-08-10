@@ -12,6 +12,7 @@ and a proof about the wrong one of those reads as coverage while leaving
 the others unguarded. Each test below says which surface it exercises.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -686,3 +687,126 @@ def test_an_ungrouped_run_shows_its_documents_on_replay(bench, open_history):
 
     expect(page.get_by_test_id("run-attachments")).to_be_visible()
     expect(page.get_by_test_id("run-attachment")).to_have_text("contract.txt")
+
+
+# ---- Phase K3.2: the browser carries what it was handed.
+
+
+def wait_for_cards(page, cards=1):
+    for i in range(cards):
+        expect(
+            page.get_by_test_id("result-card").nth(i).get_by_test_id("card-status")
+        ).to_have_text("done", timeout=DONE_TIMEOUT)
+
+
+def group_post_body(page, prompt):
+    """Click Run and return the POST /groups body the page actually sent.
+
+    Read from the REQUEST rather than from the composer's own
+    description of itself, which is the whole point of the two tests
+    below: the defect they cover is precisely that the page described a
+    declaration it did not send, so a proof that read the chips would
+    have agreed with the bug.
+
+    expect_request rather than a route interceptor and a DOM wait,
+    because the request IS the assertion's subject. A declaration the
+    server refuses produces no card at all, and waiting on the card
+    would turn a wrong body into a timeout instead of a diff.
+    """
+    with page.expect_request(
+        lambda request: request.url.endswith("/groups") and request.method == "POST",
+        timeout=DONE_TIMEOUT,
+    ) as info:
+        page.get_by_test_id("prompt-input").fill(prompt)
+        page.get_by_test_id("run-button").click()
+    return json.loads(info.value.post_data)
+
+
+def test_review_repro_the_browser_sends_the_rendition_it_staged(bench, open_history):
+    """WINDOW: the POST /groups body the composer actually puts on the
+    wire, on a page that staged the same bytes twice under two suffixes.
+
+    THE PIN NEVER LEFT THE PAGE. The upload response has carried the
+    whole rendition since K.1 and attach.js kept only the digest, so the
+    browser made a weaker declaration than a hand-written API body: with
+    no renditions the server resolves each digest to its BASE ROW's
+    reading, which belongs to whichever upload of those bytes arrived
+    first. Stage the identical PNG as .txt and then as .png, choose
+    native, and the comparison ran the TEXT rendition.
+
+    ASSERTED FROM THE CAPTURED REQUEST, not from the chips. A chip
+    reading "image" beside a body declaring the text rendition is
+    exactly the state this defect produced, so a proof that read the UI
+    would have agreed with the bug.
+    """
+    page = bench(["stub/vision"])
+    check_only(page, "stub/vision")
+
+    # The .txt first, which is what makes the base row disagree with the
+    # rendition the person then chooses.
+    attach(page, {"name": "y.txt", "mimeType": "text/plain", "buffer": PNG_BYTES})
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    page.get_by_test_id("attachment-remove").first.click()
+    expect(chips(page)).to_have_count(0)
+
+    attach(page, {"name": "y.png", "mimeType": "image/png", "buffer": PNG_BYTES})
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    page.get_by_test_id("attach-mode").select_option("native")
+
+    body = group_post_body(page, "describe the attached image")
+
+    assert body["attachments_mode"] == "native"
+    assert "renditions" in body, "the browser declared digests and no reading"
+    pin = body["renditions"][0]
+    assert pin["kind"] == "image"
+    assert pin["extractor"] == "none"
+    assert pin["extractor_version"] == "0"
+    assert pin["digest"] == body["attachments"][0]
+    # And the comparison actually runs on it, which is the half a body
+    # assertion alone would not prove: pre-fix the server resolved the
+    # base row, found a text rendition, and refused native mode outright.
+    wait_for_cards(page)
+
+
+def test_the_group_post_declares_exactly_what_the_upload_returned(bench):
+    """WINDOW: the POST /attachments response and the POST /groups body,
+    compared field by field in one page load.
+
+    THE BROWSER CONTRACT IS ITSELF UNDER TEST, which is the gap that hid
+    the defect above. Every earlier browser test staged files whose base
+    row and chosen rendition COINCIDE, because one upload of one file is
+    both. Under those fixtures a page that sent only digests and a page
+    that sent the full pin are indistinguishable, and the whole suite
+    agreed with either.
+
+    So this asserts the equality directly rather than a consequence of
+    it: whatever the upload said the rendition is, that is what the
+    group declares. A future edit that drops a field from declared()
+    fails here even if every fixture still coincides.
+    """
+    page = bench(["stub/fast"])
+    uploads = []
+
+    def capture_upload(route, request):
+        response = route.fetch()
+        if request.method == "POST":
+            uploads.append(response.json())
+        route.fulfill(response=response)
+
+    page.route(re.compile(r"/attachments$"), capture_upload)
+    check_only(page, "stub/fast")
+    attach(page, text_file())
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+
+    body = group_post_body(page, "summarize the attached contract")
+
+    assert len(uploads) == 1, uploads
+    stored = uploads[0]
+    assert body.get("renditions") == [
+        {
+            "digest": stored["digest"],
+            "extractor": stored["extractor"],
+            "extractor_version": stored["extractor_version"],
+            "kind": stored["kind"],
+        }
+    ]

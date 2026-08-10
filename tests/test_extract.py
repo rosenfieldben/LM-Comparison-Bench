@@ -586,7 +586,12 @@ def test_the_prompt_leads_and_the_document_follows_in_a_marked_block():
     out = compose("summarize this", [document("the contract text")], redacted=False)
 
     assert out.startswith("summarize this\n\n")
-    assert "----- attachment 1 of 1: notes.txt -----" in out
+    # The header names the RENDITION since K.3, not the upload's name:
+    # a name is not selectable by any declaration. See ATTACHMENT_HEADER.
+    assert (
+        "----- attachment 1 of 1: document, read by text, "
+        "sha256 aaaaaaaaaaaa -----" in out
+    )
     assert "the contract text" in out
     assert "----- end attachment 1 of 1 -----" in out
     assert out.index("summarize this") < out.index("the contract text")
@@ -612,7 +617,13 @@ def test_two_documents_are_numbered_and_keep_their_declared_order():
     )
 
     assert "2 documents are attached" in out
-    assert out.index("attachment 1 of 2: a.txt") < out.index("attachment 2 of 2: b.txt")
+    # Ordered by their own digests, which is what a declaration pins;
+    # the filenames a.txt and b.txt are no longer in the composed bytes.
+    assert out.index(
+        "attachment 1 of 2: document, read by text, sha256 aaaa"
+    ) < out.index("attachment 2 of 2: document, read by text, sha256 bbbb")
+    assert "a.txt" not in out
+    assert "b.txt" not in out
     assert out.index("first body") < out.index("second body")
 
 

@@ -8062,7 +8062,15 @@ def test_review_repro_every_model_receives_byte_identical_composed_content(clien
     # And what they all received actually carries the document.
     composed = sent[0]["messages"][-1]["content"]
     assert "the contract says forty two" in composed
-    assert "----- attachment 1 of 1: contract.txt -----" in composed
+    # The header names the RENDITION and not the upload's filename, which
+    # K.3 removed from the composed bytes: a name is not selectable by
+    # any declaration, so it could differ between two comparisons that
+    # pinned the same reading. See extract.ATTACHMENT_HEADER.
+    assert (
+        f"----- attachment 1 of 1: document, read by text, sha256 {digest[:12]} -----"
+        in composed
+    )
+    assert "contract.txt" not in composed
     # The models differ, so the payloads are not identical for the
     # trivial reason that nothing varied at all.
     assert {payload["model"] for payload in sent} == {
@@ -8138,9 +8146,15 @@ def test_review_repro_the_record_carries_a_digest_where_the_content_was(client):
         "summarize",
         [
             {
-                "filename": stored["filename"],
                 "digest": digest,
                 "extracted_text": rendition["extracted_text"],
+                # The rendition's own three, which is now everything the
+                # composition reads: the filename left the composed
+                # bytes in K.3, so a reconstruction that supplied one
+                # would be supplying something the wire never carried.
+                "extractor": pinned[0]["extractor"],
+                "extractor_version": pinned[0]["extractor_version"],
+                "kind": pinned[0]["kind"],
             }
         ],
         redacted=False,
@@ -10896,3 +10910,456 @@ def test_review_repro_a_token_cannot_attest_a_card_it_never_showed(client):
     )
     assert sighted.status_code == 201, sighted.text
     assert sighted.json()["blind"] is False
+
+
+# ---- Phase K3.1: the pin is verified in every component, and the media
+# ---- type is part of it.
+
+
+def _png(seed: bytes) -> bytes:
+    """A PNG-signatured file whose tail varies, so each is its own digest.
+
+    The signature is what enforce_image_signature checks; nothing here
+    decodes the image, and a real one would only make the fixture
+    larger without making the assertion stronger.
+    """
+    return (
+        bytes.fromhex("89504e470d0a1a0a0000000d49484452")
+        + b"\x00" * 8
+        + b"\x08\x06\x00\x00\x00"
+        + seed
+    )
+
+
+@respx.mock
+def test_review_repro_a_text_rendition_cannot_be_relabelled_an_image(client):
+    """WINDOW: POST /groups, on a renditions pin whose digest, extractor
+    and version all resolve and whose KIND does not match the row.
+
+    THE LOOKUP WAS THE CHECK, AND IT IS THREE FIELDS WIDE.
+    attachment_extractions is keyed by (digest, extractor,
+    extractor_version), so resolve_rendition found the row by those
+    three and returned it. kind rode along in the pin and was compared
+    against nothing, and every gate downstream reads the PIN's kind:
+    enforce_native_mode refuses `p["kind"] != IMAGE_KIND`, so a text
+    rendition that called itself an image satisfied it.
+
+    Measured at 016b6bc: this exact body returned 201, and the member
+    that followed sent `data:text/plain;base64,Zm9ydHkgdHdv` to a vision
+    model as an image content part. Nine bytes of ASCII, announced to
+    the provider as an image.
+
+    A pin CHOOSES among readings the bench holds. Choosing one and
+    relabelling it is not a choice, and the refusal names both values.
+    """
+    stored = upload(client, "contract.txt", b"forty two").json()
+    assert stored["kind"] == "document"
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "describe the image",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [stored["digest"]],
+            "attachments_mode": "native",
+            "renditions": [
+                {
+                    "digest": stored["digest"],
+                    "extractor": "text",
+                    "extractor_version": "1",
+                    "kind": "image",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    # Both values named, so the caller can see which of the two is wrong.
+    assert "stored as a document" in detail
+    assert "calls it a image" in detail
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_review_repro_an_image_rendition_cannot_be_relabelled_a_document(client):
+    """WINDOW: POST /groups in INLINE mode, on a pin that renames an
+    image rendition a document. The mirror of the case above, and the
+    one whose damage is silent rather than loud.
+
+    An image carries an empty extraction by construction, so
+    enforce_inline_mode refuses it BY THE PIN'S KIND. Relabelled, it
+    passed, and the comparison composed a delimited block with nothing
+    between the delimiters. Measured at 016b6bc, the wire carried:
+
+        ----- attachment 1 of 1: shot.png -----
+        <nothing>
+        ----- end attachment 1 of 1 -----
+
+    Every model told a document was attached, and shown none of it.
+    Nothing in any response says so, which is why this one is worse than
+    the loud one: the comparison runs, costs money, and measures how
+    each model handles being shown nothing.
+    """
+    stored = upload(client, "shot.png", _png(b"inline-forgery")).json()
+    assert stored["kind"] == "image"
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [stored["digest"]],
+            "attachments_mode": "inline",
+            "renditions": [
+                {
+                    "digest": stored["digest"],
+                    "extractor": "none",
+                    "extractor_version": "0",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert "stored as a image" in detail
+    assert "calls it a document" in detail
+    assert respx.calls.call_count == 0
+
+
+@respx.mock
+def test_review_repro_the_pinned_renditions_media_type_reaches_the_wire(client):
+    """WINDOW: the native payload and its recorded twin, on a digest
+    whose BASE ROW was written by a different rendition than the one the
+    group pinned.
+
+    THE MEDIA TYPE WAS A PROPERTY OF THE BYTES AND IS A PROPERTY OF THE
+    READING. attachments.mime belongs to whichever upload arrived first.
+    Upload a PNG as y.txt and it is typed text/plain; upload the same
+    bytes as y.png and a second rendition exists, correctly an image,
+    while the base row keeps text/plain. native_documents read
+    document["mime"] off that base row.
+
+    Measured at 016b6bc, with the image rendition pinned:
+
+        POST .png response   ->  kind: image, mime: text/plain
+        wire                 ->  data:text/plain;base64,iVBORw0KG
+        recorded placeholder ->  "as image, 41 bytes, text/plain"
+
+    A real PNG announced to the provider as text, and a record that
+    contradicted itself about one document in one line.
+
+    THE UPLOAD ORDER IS THE POINT, not incidental: .txt first is what
+    makes the base row disagree with the pin, and doing it the other way
+    round is the case that always worked and hid this.
+    """
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(
+            200, json=response_for(payload["model"], "an image of nothing")
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    raw = _png(b"media-type-case")
+    as_text = upload(client, "y.txt", raw).json()
+    as_image = upload(client, "y.png", raw).json()
+    assert as_text["digest"] == as_image["digest"]
+    # The response describes the rendition asked for, both times.
+    assert (as_text["kind"], as_text["mime"]) == ("document", "text/plain")
+    assert (as_image["kind"], as_image["mime"]) == ("image", "image/png")
+    # And the base row still belongs to the first upload, which is the
+    # state that made this reachable.
+    base = store.get_attachment(client.app.state.db, as_text["digest"])
+    assert base is not None
+    assert (base["filename"], base["mime"]) == ("y.txt", "text/plain")
+
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "budget": "standard",
+            "attachments": [as_image["digest"]],
+            "attachments_mode": "native",
+            "renditions": [
+                {
+                    "digest": as_image["digest"],
+                    "extractor": "none",
+                    "extractor_version": "0",
+                    "kind": "image",
+                }
+            ],
+        },
+    ).json()["id"]
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "describe",
+            "models": ["model/vision"],
+            "group_id": group_id,
+            "attachments": [as_image["digest"]],
+            "attachments_mode": "native",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    urls = [
+        part["image_url"]["url"]
+        for part in sent[0]["messages"][-1]["content"]
+        if part["type"] == "image_url"
+    ]
+    assert len(urls) == 1
+    assert urls[0].startswith("data:image/png;base64,"), urls[0][:40]
+    assert "text/plain" not in urls[0]
+
+    # The record says the same thing the wire did, which is the half a
+    # wire assertion alone would not have caught.
+    recorded = client.app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()["request_json"]
+    assert "image/png" in recorded
+    assert "text/plain" not in recorded
+
+
+@respx.mock
+def test_review_repro_the_composed_header_names_no_filename(client):
+    """WINDOW: the composed user message, on a digest uploaded twice
+    under two names, declared by the SECOND name.
+
+    A FILENAME IS NOT SELECTABLE BY ANY DECLARATION. A group pins
+    digest, extractor, extractor version and kind. The composed header
+    carried the name off the digest's BASE ROW, which belongs to
+    whichever upload arrived first, so declaring new.txt composed
+    `----- attachment 1 of 1: old.txt -----`: measured at 016b6bc, and
+    every model in that comparison was told the name of a file the
+    person had not sent.
+
+    The same mechanism made a comparison's prompt change with no
+    declaration moving: delete the row and re-upload the identical bytes
+    under a third name, and the next member of a running group composes
+    a different header. Widening the key to include the name would have
+    fixed that by making one document into three; removing the name
+    fixes it by deleting an input nothing declares.
+
+    The name is display metadata now and stays in the record and the
+    chips, which the two assertions at the end hold.
+    """
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(200, json=response_for(payload["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    body = b"the settlement figure is forty two"
+    old = upload(client, "old.txt", body).json()
+    new = upload(client, "new.txt", body).json()
+    assert old["digest"] == new["digest"]
+    digest = new["digest"]
+
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    ).json()["id"]
+    assert (
+        client.post(
+            "/compare",
+            json={
+                "prompt": "summarize",
+                "models": ["model/alpha"],
+                "group_id": group_id,
+                "attachments": [digest],
+            },
+        ).status_code
+        == 200
+    )
+
+    composed = sent[0]["messages"][-1]["content"]
+    assert "old.txt" not in composed
+    assert "new.txt" not in composed
+    assert (
+        f"----- attachment 1 of 1: document, read by text, sha256 {digest[:12]} -----"
+        in composed
+    )
+    # Every value in that header is pinned by the declaration, which is
+    # the property the fairness law needs and the filename never had.
+    pinned = store.group_renditions(client.app.state.db, group_id)
+    assert pinned is not None
+    assert pinned[0]["kind"] == "document"
+    assert pinned[0]["extractor"] == "text"
+    assert pinned[0]["digest"] == digest
+
+    # Display metadata survives where display metadata belongs.
+    detail = client.get(f"/groups/{group_id}").json()
+    assert detail["attachments"][0]["filename"] == "old.txt"
+
+
+@respx.mock
+def test_review_repro_a_delete_and_reupload_does_not_move_a_pinned_prompt(client):
+    """WINDOW: two compositions of ONE group's declaration, with the
+    document deleted and re-uploaded under a different name in between.
+
+    THE INVARIANT, not its symptom: a comparison that pinned a rendition
+    sends the same composed bytes to every member, and nothing outside
+    the declaration may move them. The filename is outside it.
+
+    The two-uploads case does not prove this and was written that way
+    first: both uploads of one digest leave ONE base row, so both
+    compositions read the same name and agree even while the name is
+    still in the header. The wrong shape passed against the broken code,
+    which is how it was caught. What moves the base row is DELETING it,
+    which the trigger K1.5 added makes a clean operation, and uploading
+    the identical bytes again under a new name.
+
+    Measured against this tree with the header reverted to the filename:
+    member one composed `attachment 1 of 1: original.txt` and member two
+    composed `attachment 1 of 1: renamed.txt`, from one group, one
+    declaration, one pin, one set of bytes. That is the fairness law
+    broken by a rename.
+    """
+    sent = []
+
+    def route(request):
+        payload = json.loads(request.content)
+        sent.append(payload)
+        return httpx.Response(200, json=response_for(payload["model"], "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    body = b"clause four survives termination"
+    digest = upload(client, "original.txt", body).json()["digest"]
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "summarize",
+            "models": ["model/alpha", "model/beta"],
+            "budget": "standard",
+            "attachments": [digest],
+        },
+    ).json()["id"]
+
+    # One request per model, which is what a declared lineup requires and
+    # is also the path the browser takes: the members are separate
+    # requests with time between them, which is the whole reason a pin
+    # exists rather than a careful single composition.
+    def member(model, position):
+        sent.clear()
+        with client.stream(
+            "POST",
+            "/compare/stream",
+            json={
+                "prompt": "summarize",
+                "model": model,
+                "position": position,
+                "group_id": group_id,
+                "attachments": [digest],
+            },
+        ) as resp:
+            assert resp.status_code == 200, resp.read()
+            for _ in resp.iter_lines():
+                pass
+        return sent[0]["messages"][-1]["content"]
+
+    first = member("model/alpha", 0)
+
+    # The rename, done the only way a person can do it: remove the row
+    # and upload the same bytes again. The trigger takes the extraction
+    # rows with it, so this is a genuine round trip and not a patched
+    # column.
+    client.app.state.db.execute("DELETE FROM attachments WHERE digest = ?", (digest,))
+    client.app.state.db.commit()
+    assert (
+        client.app.state.db.execute(
+            "SELECT COUNT(*) c FROM attachment_extractions WHERE digest = ?", (digest,)
+        ).fetchone()["c"]
+        == 0
+    )
+    again = upload(client, "renamed.txt", body).json()
+    assert again["digest"] == digest
+    base = store.get_attachment(client.app.state.db, digest)
+    assert base is not None
+    assert base["filename"] == "renamed.txt", "the base row did not move"
+
+    second = member("model/beta", 1)
+
+    assert first == second, (first, second)
+    assert "original.txt" not in first
+    assert "renamed.txt" not in second
+
+
+# ---- Phase K3.3: every door checks the window.
+
+
+@respx.mock
+@pytest.mark.parametrize("door", ["compare", "stream"])
+def test_review_repro_every_door_checks_the_context_window(client, door):
+    """WINDOW: entry to POST /compare and POST /compare/stream, on an
+    ungrouped request carrying a 40,000 character document against
+    model/vision, which the catalog gives an 8,192 token window.
+
+    THE CHECK EXISTED AT ONE DOOR. enforce_context_window shipped inside
+    POST /groups, which covers the browser because the browser always
+    creates a group first, and covers nothing else. Measured at
+    016b6bc: the same declaration returned 422 at /groups and 200 with
+    ONE UPSTREAM CALL at each of the other two.
+
+    That is the fifth instance of the one-door shape in this codebase
+    and the reason the commit body carries a census: the remedy for a
+    class is not another patch on the instance.
+
+    Ungrouped deliberately, because a grouped member is already stopped
+    by the group's own refusal at creation. The gap is the scripted
+    caller who never makes a group, which is the API's documented
+    surface.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
+    )
+    digest = upload(client, "big.txt", b"z" * 40_000).json()["digest"]
+
+    if door == "compare":
+        resp = client.post(
+            "/compare",
+            json={
+                "prompt": "summarize",
+                "models": ["model/vision"],
+                "attachments": [digest],
+            },
+        )
+        status, detail = resp.status_code, resp.json()["detail"]
+    else:
+        with client.stream(
+            "POST",
+            "/compare/stream",
+            json={
+                "prompt": "summarize",
+                "model": "model/vision",
+                "attachments": [digest],
+            },
+        ) as resp:
+            status = resp.status_code
+            detail = json.loads(b"".join(resp.iter_bytes()))["detail"]
+
+    assert status == 422, detail
+    # The same arithmetic and the same actionable message as the group
+    # door, not a second refusal that happens to also refuse.
+    assert "model/vision holds 8192 tokens" in detail
+    assert "Drop the model, attach a shorter document" in detail
+    # PRE-SPEND. The whole point of moving the check to entry.
+    assert respx.calls.call_count == 0

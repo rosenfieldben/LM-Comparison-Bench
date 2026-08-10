@@ -684,10 +684,26 @@ input. Extraction also runs off the event loop, so even a slow legitimate
 parse does not freeze the progress of runs in flight.
 
 Filenames are checked as well as bounded: no control characters, because
-the name is written into the delimiter line the models read and one
-carrying a newline could break that line in two; no path separators,
-because the bytes go into the database and a path is a claim the bench
-cannot honor.
+a name carrying a newline or a NUL breaks every line-oriented place it is
+shown and truncates for anything downstream that treats it as a C string;
+no path separators, because the bytes go into the database and a path is
+a claim the bench cannot honor.
+
+**The models are not told the filename.** The delimiter line names the
+*rendition*: the kind, the extractor that read it, and the first twelve
+characters of the digest. A filename is not selectable by any
+declaration, and it came off whichever upload of those bytes arrived
+first, so it could differ between two comparisons that pinned the same
+reading and could change under a running comparison. Upload the same
+contract as `old.txt` and then as `new.txt`, declare the second, and the
+prompt used to say `attachment 1 of 1: old.txt`: a file the person never
+sent, named to every model. Delete the row and re-upload under a third
+name and the *same* comparison's next member composed a different prompt,
+with nothing in its declaration having moved. Removing the name deletes an
+input nothing declares; widening the key to include it would have turned
+one document into three. The name is display metadata now, kept in the
+record, on the chips and in the history, where it is useful and where
+nothing depends on it being stable.
 
 **Provenance.** Every attachment row records the extractor that read it
 and that extractor's version, because a `pypdf` upgrade changes the text a
@@ -695,9 +711,16 @@ model reads, and a record that could not say which parser produced it
 would be a record of a prompt nobody can reconstruct.
 
 A comparison **pins the rendition** of every document at creation:
-`(digest, extractor, extractor_version, kind)`. Members receive exactly
-the pinned reading, so a parser upgrade partway through a comparison
-cannot hand the second model a different document from the first; if a
+`(digest, extractor, extractor_version, kind)`, and the reading's media
+type travels with it. Every component is checked against what the bench
+actually stored, so a declaration cannot *relabel* a reading: calling a
+text extraction an image (which would send a `.txt` file to a vision
+model as an image part) or an image a document (which would compose an
+empty block and tell every model a document was attached) are both
+refused at creation with the stored and claimed values named. Members
+receive exactly the pinned reading, so a parser upgrade partway through a
+comparison cannot hand the second model a different document from the
+first; if a
 pinned reading is missing the bench refuses rather than substituting.
 The same pin is recorded on ungrouped runs, so a single-model comparison
 shows its documents on replay too.
@@ -708,6 +731,17 @@ digest alone cannot say which reading was meant. That ambiguity used to
 resolve to whichever upload arrived first, which let a PNG uploaded as
 `.txt` reach every model as binary in the text path and left the same
 image permanently unusable in native mode.
+
+**The pin travels the whole way, or the operation refuses.** A rendition
+chosen in the composer is what the browser declares, what the group
+stores, what every member resolves, what the composition reads and what
+the payload carries: the same PNG staged as `.txt` and then as `.png`
+used to run the *text* reading in native mode, because the page sent
+digests only and the server fell back to the base row. An ungrouped
+scripted request can name its rendition too, which is the only way that
+door could ever choose one; a grouped member that names one is checked
+against the group's pin and refused on a disagreement rather than quietly
+given the pinned reading it did not ask for.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench

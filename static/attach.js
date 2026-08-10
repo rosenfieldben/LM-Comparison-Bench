@@ -100,18 +100,59 @@
     return inFlight > 0;
   }
 
+  // The four facts that identify one READING of one document. Null when
+  // a staged entry does not carry all four, which is a reuse ref whose
+  // row is gone; Run is already blocked while one of those is present.
+  //
+  // typeof rather than truthiness, because an image's extractor_version
+  // is the string "0" and a falsy test would drop exactly the rendition
+  // native mode needs.
+  function rendition(doc) {
+    const parts = ["digest", "extractor", "extractor_version", "kind"];
+    if (
+      !parts.every((key) => typeof doc[key] === "string" && doc[key] !== "")
+    ) {
+      return null;
+    }
+    return {
+      digest: doc.digest,
+      extractor: doc.extractor,
+      extractor_version: doc.extractor_version,
+      kind: doc.kind,
+    };
+  }
+
   // What goes on the wire. RULE ONE at the client edge: with nothing
   // staged this returns an empty object, so a comparison with no
   // document sends exactly the body it sent before this control existed.
   // A payload that gained an "attachments": [] key the day the feature
   // shipped would make every earlier comparison incomparable with every
   // later one, and the server would refuse the mode besides.
+  //
+  // THE RENDITIONS RIDE ALONG, and until K.3 they did not. The upload
+  // response has carried the whole rendition since K.1 and this kept
+  // only the digest, so the browser made a WEAKER declaration than a
+  // hand-written API body: the server fell back to resolving each digest
+  // to its base row's reading, which belongs to whichever upload of
+  // those bytes arrived first. Staging the same PNG as .txt and then as
+  // .png and choosing native therefore ran the TEXT rendition, because
+  // the base row was the .txt one. The pin the person chose in the
+  // picker never left the page.
+  //
+  // Omitted entirely, rather than sent partially, when any staged entry
+  // is missing its rendition: the server treats absent renditions as
+  // "resolve each digest yourself", which is the honest request to make
+  // when the page does not know, and a partial list would be a
+  // declaration that disagreed with its own digest list.
   function declared() {
     if (staged.length === 0) return {};
-    return {
+    const body = {
       attachments: staged.map((d) => d.digest),
       attachments_mode: modeEl.value,
     };
+    const pins = staged.map(rendition);
+    if (pins.every((pin) => pin !== null)) body.renditions = pins;
+    return body;
   }
 
   // Prefill from a stored comparison, for the reuse action. Refs come
