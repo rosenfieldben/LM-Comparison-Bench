@@ -587,8 +587,29 @@
       // counter was incremented optimistically at the top of this
       // function on the assumption that a batch always starts; a batch
       // that never started is not a run.
+      //
+      // THIS ONE IS SESSION STATE AND NOT VIEW STATE, which is why it is
+      // corrected before the supersession check below rather than after
+      // it. The spend and run totals in the header describe the session,
+      // not whatever is on screen, so a batch that never started must be
+      // taken off them whichever view the person is looking at now.
       BenchState.sessionStats.runs -= 1;
       BenchState.renderStats();
+      // EVERYTHING BELOW IS THIS VIEW'S, and this handler had no epoch
+      // check at all. The /groups POST can take arbitrarily long (it
+      // composes, and in native mode it checks every model against the
+      // catalog), and a history entry opened while it was in flight has
+      // already taken the view over. Writing here then wiped the
+      // replayed comparison's cards and put an attach refusal about a
+      // comparison the person had moved on from over the top of it.
+      //
+      // THE COUNTER WAS THE WORSE HALF. newViewEpoch resets
+      // inflightRuns to 0, so this decrement took it to -1, and Stop is
+      // enabled whenever it is not 0: the button stayed live with
+      // nothing running, for the rest of the session. Guarded rather
+      // than clamped, because a clamp would hide the fact that a
+      // superseded batch had touched the counter at all.
+      if (epoch !== BenchState.viewEpoch) return;
       resultsEl.replaceChildren();
       BenchRender.hideRace();
       runLabelEl.textContent = "";

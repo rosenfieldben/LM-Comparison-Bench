@@ -24,6 +24,7 @@ No I/O and no clock: bytes in, text out. The caller owns the file, the
 database and the decision to store anything.
 """
 
+import multiprocessing
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterator
@@ -236,19 +237,28 @@ MAX_COMPOSED_CHARS = 200_000
 # and re-upload under a third name and the same comparison's prompt
 # changes again, with nothing in the declaration having moved.
 #
-# WHAT REPLACES IT IS DECLARED. The kind, the extractor and the leading
-# twelve of the digest are all pinned, so the header is now a pure
-# function of the rendition exactly as the body is, and two members of
-# one comparison cannot receive different headers. A name is display
-# metadata: the record keeps it, the chips show it, and the models stop
-# seeing it.
+# WHAT REPLACES IT IS DECLARED, AND ALL FOUR OF IT. The kind, the
+# extractor, its version and the leading twelve of the digest are the
+# whole pin, so the header is a pure function of the rendition exactly
+# as the body is, and two members of one comparison cannot receive
+# different headers. A name is display metadata: the record keeps it,
+# the chips show it, and the models stop seeing it.
+#
+# THE VERSION IS HERE ON PRINCIPLE RATHER THAN ON NECESSITY, and the
+# ruling that put it here is worth recording. Three fields would have
+# been unambiguous in practice: two versions of one parser produce
+# different TEXT, so the bodies differ and nothing could be confused.
+# But this phase exists because layers dropped parts of the pin one at a
+# time, each for a locally sound reason, and a header that carried three
+# of four would be that same shape at exactly the hop the phase is
+# about. Four of four travel.
 #
 # Twelve hex characters of the digest, the same prefix every refusal in
 # this codebase quotes, so a person reading a prompt and a refusal side
 # by side is reading the same identifier.
 ATTACHMENT_HEADER = (
-    "----- attachment {index} of {total}: {kind}, read by {extractor}, "
-    "sha256 {short} -----"
+    "----- attachment {index} of {total}: {kind}, read by {extractor} "
+    "{extractor_version}, sha256 {short} -----"
 )
 ATTACHMENT_FOOTER = "----- end attachment {index} of {total} -----"
 ATTACHMENT_INTRO = (
@@ -354,8 +364,141 @@ def _extract_text(content: bytes) -> str:
     return _decoded(content)
 
 
+# How long one PDF may parse before the bench stops waiting for it.
+#
+# THE ONLY READER WITH NO BOUND OF ITS OWN, which is why this exists and
+# why the other two do not need it. .docx has MAX_INFLATED_BYTES and
+# MAX_DOCX_DEPTH, both bounds on the input; plain text is bounded by the
+# upload cap. A PDF's cost is not a function of its size at all, and it
+# is SUPERLINEAR in a quantity the file never declares. One page whose
+# content stream shows a single glyph N times, measured in-process:
+#
+#   operators   file        wall     resident growth
+#     100,000   1,636 B     1.13s     25.9 MiB
+#     400,000   4,688 B     6.20s     84.4 MiB
+#   1,000,000  10,810 B    33.91s    166.7 MiB
+#
+# Ten times the operators for thirty times the time, from files that
+# arrive in one packet. The 8 MiB upload cap admits roughly 775 times
+# the last of those.
+#
+# AN OPERATION BUDGET WAS TRIED FIRST, MEASURED, AND REJECTED, and
+# recording that is the point of this paragraph. pypdf's
+# visitor_operand_before fires per operator and can abort the loop
+# mid-page, which sounds like exactly the bound wanted. It is not: with
+# the loop aborted at 50,000 operators the three files above still cost
+# most of what they cost unbounded, because the work is in tokenizing
+# the decompressed content stream BEFORE the operator loop begins and no
+# visitor is reachable from there. A budget that leaves the dominant
+# term unbounded is a bound in name. It would also have added a Python
+# callback to every operator of every honest parse to buy that nothing.
+#
+# So this is the scorers' precedent, reused rather than reinvented: a
+# short-lived child process the parent kills from outside. It bounds
+# whatever phase is slow, including the one no callback can see, and it
+# bounds MEMORY too, because the allocation happens somewhere the kernel
+# can reclaim: the parent's resident growth across all three files above
+# is zero after the change, where it was 166.7 MiB.
+#
+# TEN SECONDS, against a measured legitimate worst case of 1.17 seconds:
+# a 4,000-page PDF of ordinary prose at 1.49 MiB, which the per-page
+# budget below stops after about two hundred pages. That is 8.5 times
+# the honest ceiling, so no real document meets it, and the spawn costs
+# 0.044 seconds measured round trip on an upload that took longer than
+# that to arrive.
+#
+# WHAT IT DOES NOT DO, said plainly: a file that parses in nine seconds
+# is still admitted and still costs nine seconds. The deadline bounds
+# the tail, not the middle. What makes the middle survivable is the
+# concurrency bound at the boundary (see main.EXTRACTION_SLOTS), because
+# the damage of a slow parse is proportional to how many of them can run
+# at once.
+PDF_DEADLINE_SECONDS = 10.0
+
+
+def _pdf_pages(content: bytes, sink: Any) -> None:
+    """The child process's whole job: parse, send, exit.
+
+    Module level and not a closure, because spawn pickles the target by
+    reference and a closure cannot be pickled at all.
+
+    Every exception is caught and RETURNED rather than raised, so the
+    parent distinguishes "the parse failed and here is why" from "the
+    child died", which are different messages to a person. A traceback
+    escaping here would reach the parent only as a nonzero exit code.
+    """
+    try:
+        sink.send(("ok", _pdf_pages_here(content)))
+    except Exception as exc:  # noqa: BLE001 - reported, not handled
+        sink.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        sink.close()
+
+
 def _extract_pdf(content: bytes) -> str:
+    """Page text through pypdf, under a hard deadline, in a child process.
+
+    See PDF_DEADLINE_SECONDS for why this one reader gets a process when
+    the other two get nothing.
+
+    THE PARENT READS BEFORE IT JOINS, which is the one place this differs
+    from the scorers' version and it is not a style choice. Their payload
+    is a two-item tuple holding a bool, so join-then-recv is safe. This
+    payload is up to MAX_EXTRACTED_CHARS of text, far past any pipe
+    buffer, and a child blocked writing it while the parent waits for the
+    child to exit is the textbook deadlock their comment names. poll()
+    takes the deadline and draws its clock from
+    multiprocessing.connection.wait exactly as join() does, so the
+    timeout means the same thing either way.
+    """
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    worker = context.Process(target=_pdf_pages, args=(content, sender), daemon=True)
+    worker.start()
+    # The parent's copy of the write end, closed so the pipe reports EOF
+    # if the child dies without sending.
+    sender.close()
+    try:
+        if not receiver.poll(PDF_DEADLINE_SECONDS):
+            raise ExtractionError(
+                f"this PDF did not finish parsing within "
+                f"{PDF_DEADLINE_SECONDS:.0f} seconds and was stopped. A "
+                "document's parsing cost is not a function of its size, so "
+                "a small file can ask for an unbounded amount of work. "
+                "Attach a text or Word version, or paste the text into the "
+                "prompt."
+            )
+        try:
+            state, payload = receiver.recv()
+        except EOFError:
+            raise ExtractionError(
+                "this PDF could not be read: the parser exited without "
+                "producing anything, which usually means the file asked "
+                "for more memory than this machine has. Attach a text or "
+                "Word version, or paste the text into the prompt."
+            ) from None
+        if state == "error":
+            # The child's own message, in the same words the in-process
+            # version used, so the two paths cannot come to say different
+            # things about one failure.
+            raise ExtractionError(
+                f"this PDF could not be read ({payload}). It may be "
+                "encrypted, damaged, or not a PDF. Attach a text or Word "
+                "version, or paste the text into the prompt."
+            )
+        return str(payload)
+    finally:
+        if worker.is_alive():
+            worker.terminate()
+        worker.join()
+        receiver.close()
+
+
+def _pdf_pages_here(content: bytes) -> str:
     """Page text through pypdf, joined with blank lines between pages.
+
+    Runs in the child; see _extract_pdf. Raises whatever pypdf raises,
+    which the child turns into a message.
 
     Pages joined rather than concatenated, because a page boundary is
     real structure in the source and running the last line of one page
@@ -366,40 +509,38 @@ def _extract_pdf(content: bytes) -> str:
     in extract(), which can say the useful thing (this looks like a
     scan) rather than this function saying the useless one.
     """
-    try:
-        reader = pypdf.PdfReader(BytesIO(content))
-        pages = []
-        budget = MAX_EXTRACTED_CHARS
-        for page in reader.pages:
-            text = page.extract_text() or ""
-            pages.append(text)
-            # STOP AT THE CEILING RATHER THAN AT THE LAST PAGE. extract()
-            # refuses anything past MAX_EXTRACTED_CHARS, so every page
-            # parsed after the budget is gone is work done to produce
-            # text that will be thrown away. A 4000-page PDF at the
-            # upload bound took 11.8 seconds to parse in full and is
-            # refused either way; this reaches the same refusal after a
-            # couple of hundred pages.
-            #
-            # The overshoot is deliberate: the loop breaks AFTER
-            # appending, so the caller still sees a total above the
-            # ceiling and raises the ordinary oversize refusal. Breaking
-            # before would hand back exactly the limit and read as a
-            # document that just fit.
-            budget -= len(text)
-            if budget < 0:
-                break
-    except Exception as exc:
-        # pypdf raises a family of its own errors plus whatever the
-        # underlying parse hits, and the caller's response to every one
-        # of them is identical: refuse the upload and say why. Catching
-        # the family by name would be a list to keep in step with a
-        # dependency, which is the same defect as a stated field order.
-        raise ExtractionError(
-            f"this PDF could not be read ({type(exc).__name__}: {exc}). "
-            "It may be encrypted, damaged, or not a PDF. Attach a text "
-            "or Word version, or paste the text into the prompt."
-        ) from exc
+    reader = pypdf.PdfReader(BytesIO(content))
+    pages = []
+    budget = MAX_EXTRACTED_CHARS
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        pages.append(text)
+        # STOP AT THE CEILING RATHER THAN AT THE LAST PAGE. extract()
+        # refuses anything past MAX_EXTRACTED_CHARS, so every page parsed
+        # after the budget is gone is work done to produce text that will
+        # be thrown away. A 4000-page PDF of ordinary prose at 1.49 MiB
+        # takes 1.17 seconds this way and is refused either way.
+        #
+        # THIS IS A BUDGET AND NOT A BOUND, which the deadline above
+        # exists because of: it stops the loop between pages and cannot
+        # stop anything happening inside one. A single page whose content
+        # stream shows one glyph 100,000 times never reaches the second
+        # iteration.
+        #
+        # The overshoot is deliberate: the loop breaks AFTER appending,
+        # so the caller still sees a total above the ceiling and raises
+        # the ordinary oversize refusal. Breaking before would hand back
+        # exactly the limit and read as a document that just fit.
+        budget -= len(text)
+        if budget < 0:
+            break
+    # pypdf raises a family of its own errors plus whatever the
+    # underlying parse hits, and the caller's response to every one of
+    # them is identical: refuse the upload and say why. Catching the
+    # family by name would be a list to keep in step with a dependency,
+    # which is the same defect as a stated field order. The catch lives
+    # in _pdf_pages now, one frame out, because it has to run inside the
+    # child.
     return "\n\n".join(page for page in pages if page.strip())
 
 
@@ -570,6 +711,31 @@ def _extract_docx(content: bytes) -> str:
         raise ExtractionError(
             "this .docx is not a readable zip archive, so it is damaged or "
             "is not a Word document. Try re-saving it from Word."
+        ) from exc
+    except RuntimeError as exc:
+        # THE ENCRYPTED MEMBER, and it arrives as a bare RuntimeError
+        # rather than as anything in zipfile's own exception hierarchy:
+        # "File 'word/document.xml' is encrypted, password required for
+        # extraction", raised from ZipFile.open when the general-purpose
+        # flag's low bit is set. Nothing above catches RuntimeError, so
+        # it escaped extract() entirely, escaped create_attachment's
+        # ExtractionError handler, and reached the person as a bare 500
+        # with no message at all.
+        #
+        # A password-protected Word document is an ordinary thing to try
+        # to attach, which is what makes this worth a sentence rather
+        # than a generic apology. It is the same shape as the cp1252
+        # hole K.1 closed: a real input whose failure mode was outside
+        # the one exception type the boundary knew about.
+        #
+        # Caught HERE and not around ET.fromstring, because the raise
+        # comes out of the archive read, and caught narrowly by type
+        # rather than with a bare except so a RuntimeError from anywhere
+        # else still surfaces as the bug it would be.
+        raise ExtractionError(
+            f"this .docx could not be opened ({exc}). A password-protected "
+            "Word document has to be unlocked before it can be attached: "
+            "open it in Word, remove the password, and save a copy."
         ) from exc
     try:
         root = ET.fromstring(document)
@@ -745,6 +911,7 @@ def compose(prompt: str, documents: list[dict[str, Any]], *, redacted: bool) -> 
                         total=total,
                         kind=document["kind"],
                         extractor=document["extractor"],
+                        extractor_version=document["extractor_version"],
                         short=document["digest"][:12],
                     ),
                     body,

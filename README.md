@@ -651,6 +651,23 @@ line does not. What remains after the delete is what should: comparisons
 that cited the document still say they cited it, and the history shows
 the reference with its metadata blank rather than dropping it.
 
+**The bytes are overwritten, and there is one place they can linger.**
+The bench sets `PRAGMA secure_delete = ON`, so freed pages are zeroed
+rather than merely unlinked; SQLite's default for this is a compile-time
+option and "normally off", so it is set explicitly rather than assumed.
+Measured on forty 120 KiB documents, the marker string appears zero times
+in `bench.db` after the delete and the delete costs 50 ms.
+
+The **write-ahead log is a separate file** and the pragma says nothing
+about it: the same measurement found the deleted content 79,640 times in
+`bench.db-wal`. It goes when the log is checkpointed, which happens on
+its own as the bench runs, and `VACUUM;` in `sqlite3` clears both the log
+and any page freed before this shipped. If you are deleting a document
+because it should not be on the disk, run `VACUUM` after. This is a
+statement about pages in a file, not about a filesystem: a copy-on-write
+volume, a snapshot or an SSD's wear levelling can keep old blocks that no
+database pragma can reach.
+
 The comparison record cites the digest; it never inlines the bytes.
 `request_json` stores the composed payload with a digest reference
 standing where the content sat, so the exact wire bytes are

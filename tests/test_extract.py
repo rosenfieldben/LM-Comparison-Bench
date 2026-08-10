@@ -13,6 +13,7 @@ these are the cases the upload boundary needs to be able to stand on.
 import io
 import tracemalloc
 import zipfile
+import zlib
 
 import pytest
 
@@ -589,7 +590,7 @@ def test_the_prompt_leads_and_the_document_follows_in_a_marked_block():
     # The header names the RENDITION since K.3, not the upload's name:
     # a name is not selectable by any declaration. See ATTACHMENT_HEADER.
     assert (
-        "----- attachment 1 of 1: document, read by text, "
+        "----- attachment 1 of 1: document, read by text 1, "
         "sha256 aaaaaaaaaaaa -----" in out
     )
     assert "the contract text" in out
@@ -620,8 +621,8 @@ def test_two_documents_are_numbered_and_keep_their_declared_order():
     # Ordered by their own digests, which is what a declaration pins;
     # the filenames a.txt and b.txt are no longer in the composed bytes.
     assert out.index(
-        "attachment 1 of 2: document, read by text, sha256 aaaa"
-    ) < out.index("attachment 2 of 2: document, read by text, sha256 bbbb")
+        "attachment 1 of 2: document, read by text 1, sha256 aaaa"
+    ) < out.index("attachment 2 of 2: document, read by text 1, sha256 bbbb")
     assert "a.txt" not in out
     assert "b.txt" not in out
     assert out.index("first body") < out.index("second body")
@@ -1059,3 +1060,120 @@ def test_a_real_image_of_each_accepted_type_is_admitted():
     # The four bytes after RIFF are a per-file length and are skipped.
     webp = b"RIFF" + (1234).to_bytes(4, "little") + b"WEBPVP8 " + b"\x00" * 32
     assert ingest("anim.webp", webp)["kind"] == "image"
+
+
+# ---- Phase K3.5, review findings 7 and 9: the two ways a real file can
+# ---- get past the extractor's bounds.
+
+
+def operator_bomb(operators: int) -> bytes:
+    """One page whose content stream shows a single glyph N times.
+
+    A VALID PDF, not a malformed one, which is the point: nothing here
+    is damaged and no parser is being tricked. The file is small because
+    the operators are the amplification, not the bytes.
+    """
+    stream = b"BT /F1 1 Tf\n" + (b"(a) Tj\n" * operators) + b"ET\n"
+    packed = zlib.compress(stream, 9)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        b"<< /Length "
+        + str(len(packed)).encode()
+        + b" /Filter /FlateDecode >>\nstream\n"
+        + packed
+        + b"\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += str(index).encode() + b" 0 obj\n" + body + b"\nendobj\n"
+    start = len(out)
+    out += b"xref\n0 " + str(len(objects) + 1).encode() + b"\n0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        b"trailer\n<< /Size "
+        + str(len(objects) + 1).encode()
+        + b" /Root 1 0 R >>\nstartxref\n"
+        + str(start).encode()
+        + b"\n%%EOF\n"
+    )
+    return bytes(out)
+
+
+def test_review_repro_a_pdf_that_will_not_finish_is_stopped(monkeypatch):
+    """WINDOW: _extract_pdf, on a valid one-page PDF whose parse cost is
+    not a function of its size.
+
+    THE UPLOAD CAP BOUNDS THE FILE AND NOTHING ELSE. A 10,810-byte PDF
+    showing one glyph a million times took 33.91 seconds and grew the
+    process by 166.7 MiB, in-process, on the event loop's thread pool.
+    Measured, along with 1.13s at 100,000 operators and 6.20s at 400,000:
+    ten times the operators for thirty times the time, from a file that
+    arrives in one packet, with the 8 MiB cap admitting roughly 775 times
+    the largest of the three.
+
+    The deadline is patched down here rather than waited out, because a
+    test that spent the real ten seconds proving a ten-second bound would
+    be paying the bound to assert it. What is under test is that the
+    parent stops waiting and says so; the number itself is argued at
+    PDF_DEADLINE_SECONDS from the measurements above.
+    """
+    monkeypatch.setattr(bench_extract, "PDF_DEADLINE_SECONDS", 0.5)
+
+    with pytest.raises(ExtractionError) as caught:
+        bench_extract.extract("bomb.pdf", operator_bomb(1_000_000))
+
+    message = str(caught.value)
+    assert "did not finish parsing" in message
+    # The remedy, because the message is written to be shown to whoever
+    # picked the file.
+    assert "Attach a text or Word version" in message
+
+
+def test_an_ordinary_pdf_still_reads():
+    """The other half of the deadline: it must not fire on real work.
+
+    A small honest PDF through the same child-process path, so the
+    machinery is proven to WORK and not merely to refuse. Without this a
+    deadline of zero would pass the test above.
+    """
+    text = bench_extract.extract("ok.pdf", operator_bomb(3))["text"]
+
+    assert "aaa" in text.replace(" ", "")
+
+
+def test_review_repro_an_encrypted_docx_refuses_instead_of_crashing():
+    """WINDOW: _extract_docx, on a zip whose word/document.xml member is
+    encrypted. A password-protected Word document is an ordinary thing
+    to try to attach.
+
+    zipfile raises a bare RuntimeError for this, not BadZipFile and not
+    KeyError: "File 'word/document.xml' is encrypted, password required
+    for extraction". Nothing caught RuntimeError, so it escaped
+    extract(), escaped create_attachment's ExtractionError handler, and
+    reached the person as a 500 with no message. Same shape as the
+    cp1252 hole K.1 closed: a real input whose failure mode was outside
+    the one exception type the boundary knew about.
+    """
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("word/document.xml", "<x/>")
+    raw = bytearray(buffer.getvalue())
+    # The general-purpose flag's low bit, in the local header and in the
+    # central directory entry. Set by hand because zipfile can read an
+    # encrypted archive and cannot write one.
+    raw[raw.find(b"PK\x03\x04") + 6] |= 1
+    raw[raw.find(b"PK\x01\x02") + 8] |= 1
+
+    with pytest.raises(ExtractionError) as caught:
+        bench_extract.extract("locked.docx", bytes(raw))
+
+    message = str(caught.value)
+    assert "password-protected" in message
+    assert "remove the password" in message

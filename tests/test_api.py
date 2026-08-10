@@ -8067,8 +8067,8 @@ def test_review_repro_every_model_receives_byte_identical_composed_content(clien
     # any declaration, so it could differ between two comparisons that
     # pinned the same reading. See extract.ATTACHMENT_HEADER.
     assert (
-        f"----- attachment 1 of 1: document, read by text, sha256 {digest[:12]} -----"
-        in composed
+        f"----- attachment 1 of 1: document, read by text 1, "
+        f"sha256 {digest[:12]} -----" in composed
     )
     assert "contract.txt" not in composed
     # The models differ, so the payloads are not identical for the
@@ -11194,8 +11194,8 @@ def test_review_repro_the_composed_header_names_no_filename(client):
     assert "old.txt" not in composed
     assert "new.txt" not in composed
     assert (
-        f"----- attachment 1 of 1: document, read by text, sha256 {digest[:12]} -----"
-        in composed
+        f"----- attachment 1 of 1: document, read by text 1, "
+        f"sha256 {digest[:12]} -----" in composed
     )
     # Every value in that header is pinned by the declaration, which is
     # the property the fairness law needs and the filename never had.
@@ -11363,3 +11363,53 @@ def test_review_repro_every_door_checks_the_context_window(client, door):
     assert "Drop the model, attach a shorter document" in detail
     # PRE-SPEND. The whole point of moving the check to entry.
     assert respx.calls.call_count == 0
+
+
+# ---- Phase K3.5, review finding 10: the body bound has to precede the
+# ---- allocation it bounds.
+
+
+def test_review_repro_an_oversize_body_is_refused_before_it_is_read(client):
+    """WINDOW: the ASGI guard, on a POST whose declared Content-Length is
+    past the cap.
+
+    THE FIELD BOUND WAS NOT A BOUND ON ANYTHING. MAX_ATTACHMENT_B64_CHARS
+    is a Pydantic max_length, and Pydantic sees the field only after
+    Starlette has awaited the whole body into one bytes object and
+    json.loads has built a str from it. A caller sending a gigabyte of
+    base64 got a tidy 422 that arrived after the gigabyte had been
+    buffered, twice. That is the same argument MAX_INFLATED_BYTES makes
+    about reading a zip member: a refusal that runs after the allocation
+    refuses nothing.
+
+    Asserted on the DECLARED length, which is the cheap half and the one
+    an honest client sends. The streamed count behind it is the belt for
+    a chunked body, which carries no Content-Length at all, and cannot be
+    driven through TestClient's transport.
+    """
+    oversize = main.MAX_REQUEST_BYTES + 1
+
+    resp = client.post(
+        "/attachments",
+        content=b"",
+        headers={
+            "Content-Type": "application/json",
+            "Content-Length": str(oversize),
+        },
+    )
+
+    assert resp.status_code == 413, resp.text
+    detail = resp.json()["detail"]
+    assert "before it was read" in detail
+    # The arithmetic, because "too large" alone leaves the caller
+    # guessing by how much.
+    assert str(main.MAX_REQUEST_BYTES) in detail
+    assert str(main.MAX_ATTACHMENT_BYTES) in detail
+
+
+def test_a_body_inside_the_bound_still_reaches_the_endpoint(client):
+    """The other half: the guard must not refuse the largest legal
+    upload. Without this a cap of one byte would pass the test above."""
+    resp = upload(client, "ordinary.txt", b"the contract says forty two")
+
+    assert resp.status_code == 201, resp.text

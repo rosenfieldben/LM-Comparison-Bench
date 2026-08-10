@@ -566,6 +566,46 @@ def connect(path: str) -> sqlite3.Connection:
         # which is why this is gated on a real file.
         conn.execute("PRAGMA journal_mode = WAL")
         conn.execute("PRAGMA busy_timeout = 5000")
+    # DELETED CONTENT IS OVERWRITTEN, and this is set explicitly because
+    # the default is a property of whoever compiled sqlite rather than of
+    # this application. SQLite's own page says it "is determined by the
+    # SQLITE_SECURE_DELETE compile-time option and is normally off"
+    # (https://www.sqlite.org/pragma.html#pragma_secure_delete, read
+    # 2026-08-10); the interpreter in this environment reports 1 because
+    # its build defines that option, so relying on the default would mean
+    # the privacy posture changed with the Python somebody installed.
+    #
+    # WHAT IT BUYS. Deleting an attachment frees the pages its BLOB and
+    # its text occupied, and without this the bytes stay in those pages
+    # until something else claims them. Measured on forty 120 KiB
+    # documents: with the pragma the file holds 0 occurrences of the
+    # marker string after the delete, and the delete costs 0.0507
+    # seconds against 0.0043 with the pragma off. Fifty milliseconds to
+    # remove forty confidential documents is not a cost worth trading
+    # for.
+    #
+    # "FAST" WAS MEASURED AND REJECTED, and it is the trap here. The
+    # documentation calls it an intermediate setting that "purges all old
+    # content from b-tree pages, but leaves forensic traces on freelist
+    # pages", which sounds like most of the benefit for none of the I/O.
+    # A document does not live in b-tree pages: a BLOB of any size lives
+    # in OVERFLOW pages, which go to the freelist. On the same forty
+    # documents:
+    #
+    #   setting   pragma   marker occurrences left   delete
+    #   off            0                   317,887   0.0047s
+    #   fast           2                   317,805   0.0050s
+    #   on             1                         0   0.0536s
+    #
+    # Fast is not an intermediate setting for this data. It is the off
+    # setting with a longer name and eighty-two fewer copies.
+    #
+    # WHAT IT DOES NOT BUY, stated because the README states it too: the
+    # write-ahead log is a separate file and this pragma says nothing
+    # about it. The same measurement found 79,640 occurrences in
+    # bench.db-wal after a delete that left none in bench.db. A
+    # checkpoint clears them; see the README's note on VACUUM.
+    conn.execute("PRAGMA secure_delete = ON")
     conn.executescript(SCHEMA)
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
@@ -602,6 +642,39 @@ def connect(path: str) -> sqlite3.Connection:
                   CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
                   filename, mime
            FROM attachments"""
+    )
+    # AND THE ROWS THAT WERE ALREADY THERE, which the statement above
+    # cannot reach and silently skips.
+    #
+    # INSERT OR IGNORE hits the UNIQUE (digest, extractor,
+    # extractor_version) key and does nothing for a digest whose
+    # extraction row already exists. That is right for the text, which
+    # must not be rewritten, and wrong for the columns added later:
+    # every database created by the c9ad170 build has the TABLE but not
+    # the COLUMNS, so its rows arrive here with kind, filename and mime
+    # all NULL and the insert above leaves them that way forever.
+    #
+    # The era test missed it by building its fixture with no extraction
+    # rows at all, which exercises the insert and never the conflict.
+    # That is the wrong-window shape one table over: the fixture held
+    # the state the migration was written for rather than the state it
+    # would meet.
+    #
+    # COALESCE, so a value already present is never overwritten: this
+    # fills gaps and does not re-derive facts. kind comes from the row's
+    # OWN extractor, not the base row's, because an extraction by "none"
+    # is an image whichever upload created the attachments row.
+    conn.execute(
+        """UPDATE attachment_extractions AS e
+              SET kind = COALESCE(
+                      e.kind,
+                      CASE WHEN e.extractor = 'none' THEN 'image'
+                           ELSE 'document' END),
+                  filename = COALESCE(
+                      e.filename,
+                      (SELECT a.filename FROM attachments a
+                        WHERE a.digest = e.digest))
+            WHERE e.kind IS NULL OR e.filename IS NULL"""
     )
     # THE COUNT BACKFILL, once per database and never again.
     #

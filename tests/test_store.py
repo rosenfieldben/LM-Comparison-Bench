@@ -2520,3 +2520,172 @@ def test_the_count_backfill_runs_once_and_then_does_nothing(tmp_path):
         assert pending == 0
     finally:
         again.close()
+
+
+# ---- Phase K3.5, review findings 8 and 11: the migration onto a
+# ---- populated table, and what a delete leaves behind.
+
+
+def test_review_repro_the_backfill_reaches_rows_that_already_existed(tmp_path):
+    """WINDOW: connect() upgrading a database that ALREADY HAS extraction
+    rows, which is every database the c9ad170 build wrote.
+
+    INSERT OR IGNORE HITS THE UNIQUE KEY AND DOES NOTHING. The backfill
+    copies each attachments row into attachment_extractions, keyed by
+    (digest, extractor, extractor_version). For a digest whose row is
+    already there the insert is skipped, which is right for the text and
+    wrong for every column added afterwards: kind and filename in K.1,
+    mime in K.3. Those rows arrive with all three NULL and keep them
+    forever, so a pin against such a row resolves to a rendition that
+    cannot say what it is.
+
+    THE ERA FIXTURE MISSED IT BY BEING TOO CLEAN. The K.1 test inserts an
+    attachments row and no extraction row, which exercises the INSERT and
+    never the conflict: the fixture held the state the migration was
+    written for rather than the state it would meet. This one holds the
+    conflict.
+    """
+    db_path = tmp_path / "populated.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_K1_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('ab', 'legacy.txt', 'text/plain', 11, X'6c6567616379',
+                   'legacy text', 'text', '1', '2026-06-01T00:00:00+00:00')"""
+    )
+    # The row the insert cannot reach: written by a build that had the
+    # table and not the columns.
+    legacy.execute(
+        """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text, created_at)
+           VALUES ('ab', 'text', '1', 'legacy text',
+                   '2026-06-01T00:00:00+00:00')"""
+    )
+    # And an IMAGE rendition of other bytes, so the kind derivation is
+    # proven to read the row's own extractor rather than a constant.
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at)
+           VALUES ('cd', 'shot.png', 'image/png', 3, X'010203', '', 'none',
+                   '0', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text, created_at)
+           VALUES ('cd', 'none', '0', '', '2026-06-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+
+    # PRE-STATE, so this cannot pass against a fixture that already held
+    # the answer.
+    columns = [
+        r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")
+    ]
+    assert "kind" not in columns
+    assert "filename" not in columns
+    assert "mime" not in columns
+    assert (
+        legacy.execute("SELECT COUNT(*) FROM attachment_extractions").fetchone()[0] == 2
+    )
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        document = store.extraction_for(conn, "ab", "text", "1")
+        assert document is not None
+        assert document["kind"] == "document"
+        assert document["filename"] == "legacy.txt"
+        assert document["mime"] == "text/plain"
+        # The text is untouched: this fills gaps, it does not rewrite
+        # readings.
+        assert document["extracted_text"] == "legacy text"
+
+        image = store.extraction_for(conn, "cd", "none", "0")
+        assert image is not None
+        assert image["kind"] == "image"
+        assert image["mime"] == "image/png"
+
+        # Still one row per digest: the backfill filled, it did not
+        # duplicate.
+        assert (
+            conn.execute("SELECT COUNT(*) c FROM attachment_extractions").fetchone()[
+                "c"
+            ]
+            == 2
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_a_deleted_documents_bytes_are_overwritten(tmp_path):
+    """WINDOW: the bytes on disk in bench.db, after a DELETE, read back
+    with the database closed.
+
+    A DELETE FREES PAGES; IT DOES NOT ERASE THEM. Without
+    secure_delete the document's BLOB and its extracted text stay in the
+    freed pages until something else claims them, so a person who removed
+    a confidential contract still has it on disk in a file they believe
+    is clean.
+
+    THE DEFAULT IS NOT THIS APPLICATION'S TO ASSUME. SQLite's own page
+    says the setting comes from a compile-time option and is "normally
+    off"; the interpreter here reports 1 because its build defines that
+    option, so a test that relied on the default would prove nothing
+    about anybody else's machine. connect() sets it explicitly and this
+    asserts the pragma as well as the bytes.
+
+    "FAST" IS THE TRAP AND IS WHY THE ASSERTION IS ON BYTES. It purges
+    b-tree pages and leaves freelist pages, which sounds like most of the
+    win; a BLOB of any size lives in OVERFLOW pages, which go to the
+    freelist. Measured on forty 120 KiB documents, off left 317,887
+    occurrences of the marker, fast left 317,805, and on left none: for
+    this data fast is the off setting with a longer name.
+
+    THIS TOMBSTONE DOES NOT REPRODUCE THE FINDING ON THIS MACHINE, and
+    saying so is more useful than letting it look as though it did. The
+    interpreter here is built with SQLITE_SECURE_DELETE, so the default
+    was already 1 and the bytes were already gone. What it guards is the
+    build where that is not true, which SQLite's page says is the normal
+    one. Proven by mutation rather than by stash: with connect() setting
+    OFF the pragma assertion reads 0 == 1, and with FAST it reads
+    2 == 1.
+    """
+    marker = "CONFIDENTIAL-SETTLEMENT-40200"
+    body = (marker + "-").encode() * 2000
+    db_path = tmp_path / "bench.db"
+    conn = store.connect(str(db_path))
+    try:
+        assert conn.execute("PRAGMA secure_delete").fetchone()[0] == 1
+        store.save_attachment(
+            conn,
+            {
+                "digest": "ab" * 32,
+                "filename": "contract.txt",
+                "mime": "text/plain",
+                "byte_size": len(body),
+                "content": body,
+                "extracted_text": body.decode(),
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            },
+        )
+        # PRE-STATE: the bytes ARE in the file, so the assertion after
+        # the delete is about removal and not about absence.
+        conn.commit()
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        assert db_path.read_bytes().count(marker.encode()) > 0
+
+        conn.execute("DELETE FROM attachments WHERE digest = ?", ("ab" * 32,))
+        conn.commit()
+        # The write-ahead log is a separate file this pragma says nothing
+        # about; checkpointing is what moves the deletion into the
+        # database file, and the README tells a person to VACUUM.
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+    assert db_path.read_bytes().count(marker.encode()) == 0

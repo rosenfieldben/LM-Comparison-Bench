@@ -76,7 +76,22 @@
   // person chose. Every view takeover advances the epoch already, so a
   // batch that recorded its epoch can tell whether the view it was
   // staging for is still the one on screen.
-  let stagingEpoch = -1;
+  // WHICH STAGING SET THE UPLOADS IN FLIGHT BELONG TO.
+  //
+  // A SECOND EPOCH, beside BenchState.viewEpoch, because the two guard
+  // different things and the view's own is blind to this one. Opening a
+  // history entry or starting a run advances the VIEW epoch, so an
+  // upload in flight is correctly discarded. REUSE does not: it replaces
+  // the staged set from a stored comparison without leaving the
+  // composer, so the view epoch never moves, and an upload that was
+  // still reading when the person clicked reuse appended its document
+  // onto the reused experiment's declaration and could be sent with it.
+  //
+  // This counter moves on every event that replaces what is staged, so
+  // "the set I started uploading into" is a thing an in-flight batch can
+  // check. It was previously assigned in addFiles and read nowhere,
+  // which is why it did not catch this.
+  let stagingEpoch = 0;
 
   const A = {
     // Read by the stream client when it builds the group POST and every
@@ -162,6 +177,12 @@
   // four documents would be a different experiment wearing the old
   // label. The chip says so and Run is blocked while one is present.
   function setFrom(refs, mode) {
+    // The staged set is being REPLACED, so anything still uploading into
+    // the old one belongs to a declaration that no longer exists. Its
+    // bytes are stored either way, which is the point of
+    // content-addressing: nothing is lost and the person can attach them
+    // again to the experiment they are now composing.
+    stagingEpoch += 1;
     staged = Array.isArray(refs) ? refs.slice() : [];
     // Absent mode CLEARS to inline rather than leaving the last choice
     // standing, the same rule setExperimentParams follows: what the
@@ -172,6 +193,7 @@
   }
 
   function clear() {
+    stagingEpoch += 1;
     staged = [];
     modeEl.value = "inline";
     msgEl.textContent = "";
@@ -500,9 +522,7 @@
     // the finally is what the counter is protecting.
     inFlight += picked.length;
     const epoch = window.BenchState.viewEpoch;
-    if (stagingEpoch !== epoch) {
-      stagingEpoch = epoch;
-    }
+    const staging = stagingEpoch;
     msgEl.textContent =
       picked.length === 1
         ? "reading " + picked[0].name
@@ -520,7 +540,7 @@
         // discarding them here would be discarding work that already
         // happened. The message says both halves.
         inFlight -= picked.length;
-        if (stale(epoch)) return;
+        if (stale(epoch, staging)) return;
         staged = staged.concat(added);
         render();
         msgEl.textContent =
@@ -539,7 +559,7 @@
     // screen now. The bytes are stored either way, which is the point of
     // content-addressing: nothing is lost, and the person can attach
     // them again in the view they meant.
-    if (stale(epoch)) {
+    if (stale(epoch, staging)) {
       window.BenchControls.updateRunState();
       return;
     }
@@ -606,8 +626,12 @@
   // runOne and showGroup follow: async work stamps the epoch it started
   // under and touches shared view state only while that epoch is
   // current.
-  function stale(epoch) {
-    return epoch !== window.BenchState.viewEpoch;
+  //
+  // BOTH EPOCHS, because either one moving means these documents belong
+  // to a declaration nobody is composing any more. See stagingEpoch for
+  // the case the view epoch cannot see.
+  function stale(epoch, staging) {
+    return epoch !== window.BenchState.viewEpoch || staging !== stagingEpoch;
   }
 
   A.busy = busy;

@@ -810,3 +810,137 @@ def test_the_group_post_declares_exactly_what_the_upload_returned(bench):
             "kind": stored["kind"],
         }
     ]
+
+
+# ---- Phase K3.5, review finding 6: two epoch races the late-upload test
+# ---- does not reach, because both stay inside one view.
+
+
+def slow_reads(page, ms=900):
+    """Make every File read take ms milliseconds, so an upload can be
+    raced deterministically rather than by luck."""
+    page.evaluate(
+        """(ms) => {
+             const real = Blob.prototype.arrayBuffer;
+             Blob.prototype.arrayBuffer = function () {
+               return new Promise((resolve) => {
+                 setTimeout(() => resolve(real.call(this)), ms);
+               });
+             };
+           }""",
+        ms,
+    )
+
+
+def test_review_repro_a_reuse_during_an_upload_does_not_gain_a_document(
+    bench, open_history
+):
+    """WINDOW: the composer's staging area after REUSE replaces it while
+    an upload is still in flight. Same shape as the late-upload test and
+    a different guard, which is exactly why that one does not cover this.
+
+    THE VIEW EPOCH CANNOT SEE THIS ONE. Opening a history entry advances
+    BenchState.viewEpoch, so the late upload is discarded. Reuse does
+    not: it rewrites the staged set from a stored comparison WITHOUT
+    leaving the composer, so the view epoch never moves, stale() was
+    false, and the in-flight upload appended its document onto the reused
+    experiment's declaration. The person then had a comparison declaring
+    a document they had chosen for a different one, and Run would send
+    it.
+
+    attach.js keeps its own stagingEpoch for this, moved by every event
+    that replaces what is staged.
+    """
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+
+    # An earlier comparison that declared ONE named document, so reuse
+    # has something specific to restore and a stray addition is visible.
+    attach(page, text_file("declared.txt", b"the comparison being reused"))
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    run_and_wait(page, "the comparison worth reusing")
+
+    # Back to a clean composer, then open the replay FIRST.
+    #
+    # THE ORDER IS THE WHOLE TEST. Opening a history entry advances the
+    # view epoch, so an upload started BEFORE it is already covered by
+    # the late-upload guard and proves nothing about this one. The
+    # reachable sequence is: open the replay, then pick a file while
+    # looking at it, then click reuse. Every step after the epoch bump,
+    # so the view epoch never moves again and only the staging epoch can
+    # catch the upload. Written the other way round first, this test
+    # passed against the broken code.
+    page.get_by_test_id("attachment-remove").first.click()
+    expect(chips(page)).to_have_count(0)
+    open_history()
+    row_for(page, "the comparison worth reusing").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    slow_reads(page)
+    attach(page, text_file("stray.txt", b"chosen for a different comparison"))
+    page.get_by_test_id("reuse-comparison").click()
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+
+    # The upload lands after the reuse and must not join it.
+    page.wait_for_timeout(1500)
+    expect(chips(page)).to_have_count(1)
+    expect(page.get_by_test_id("attachment-name")).to_have_text("declared.txt")
+    names = page.get_by_test_id("attachment-name").all_inner_texts()
+    assert "stray.txt" not in names, names
+
+
+def test_review_repro_a_superseded_group_failure_leaves_stop_alone(bench, open_history):
+    """WINDOW: the attached-group failure handler in stream.js, on a
+    /groups POST that is still in flight when a history entry takes the
+    view over.
+
+    NO EPOCH CHECK AT ALL. The handler wrote to shared view state
+    unconditionally: it cleared the results grid, blanked the run label
+    and put an attach refusal on screen, over a replay the person had
+    already opened.
+
+    THE COUNTER IS THE WORSE HALF and is what this asserts, because it
+    outlives the moment. newViewEpoch resets inflightRuns to 0, so the
+    handler's decrement took it to -1, and Stop is enabled whenever the
+    counter is not zero: the button stayed live, with nothing running,
+    for the rest of the session, and every later state update kept it
+    that way.
+
+    The failure is a real one rather than a stubbed error: a text-only
+    model under native mode, which POST /groups refuses. Delayed with a
+    route handler so the race is deterministic.
+    """
+    page = bench(["stub/fast"])
+    check_only(page, "stub/fast")
+    run_and_wait(page, "an earlier comparison to replay")
+
+    def slow_group(route):
+        page.wait_for_timeout(1200)
+        route.continue_()
+
+    page.route(re.compile(r"/groups$"), slow_group)
+
+    # stub/fast is text-only, so native mode is refused at creation.
+    attach(page, png_file())
+    expect(chips(page)).to_have_count(1, timeout=DONE_TIMEOUT)
+    page.get_by_test_id("attach-mode").select_option("native")
+    page.get_by_test_id("prompt-input").fill("describe this image")
+    page.get_by_test_id("run-button").click()
+
+    # Take the view over while the group POST is still in flight.
+    open_history()
+    row_for(page, "an earlier comparison to replay").first.click()
+    expect(page.get_by_test_id("run-label")).to_contain_text(
+        "Historical", timeout=DONE_TIMEOUT
+    )
+
+    # The refusal lands after the takeover.
+    page.wait_for_timeout(2500)
+
+    counter = page.evaluate("() => window.BenchState.inflightRuns")
+    assert counter == 0, f"inflightRuns went to {counter}"
+    expect(page.get_by_test_id("stop-button")).to_be_disabled()
+    # And the replay it landed on top of is still the replay.
+    expect(page.get_by_test_id("run-label")).to_contain_text("Historical")

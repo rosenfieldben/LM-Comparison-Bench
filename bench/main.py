@@ -1142,6 +1142,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
+    # Created here beside the upstream one and for the same reason: a
+    # module-level asyncio.Semaphore binds to whatever loop imported it,
+    # which is not this one under a test client.
+    app.state.extraction_semaphore = asyncio.Semaphore(EXTRACTION_SLOTS)
     # One catalog snapshot per boot feeds both pricing and the model
     # picker. Failure is tolerated: the bench must work offline, cost
     # renders as unavailable and the picker falls back to exact ids.
@@ -1353,6 +1357,34 @@ CONTENT_SECURITY_POLICY = (
 )
 
 
+# The largest request body the bench will read at all.
+#
+# THE FIELD BOUND IS NOT A BOUND ON ALLOCATION, which is the whole reason
+# this exists alongside MAX_ATTACHMENT_B64_CHARS. That one is a Pydantic
+# max_length, and Pydantic sees the field only after Starlette has
+# awaited the whole body into one bytes object and json.loads has built
+# a str from it. A caller sending a gigabyte of base64 was refused with
+# a tidy 422 that arrived after the gigabyte had been buffered twice.
+# The refusal has to precede the allocation or it is not a bound on
+# anything, which is the same argument MAX_INFLATED_BYTES makes about
+# reading a zip member.
+#
+# The attachment envelope plus a kilobyte, and the kilobyte is the
+# filename, the JSON braces and the key names. Every other body this
+# application takes is small by construction, so one number serves them
+# all and a per-route table would be a second thing to keep in step.
+MAX_REQUEST_BYTES = MAX_ATTACHMENT_B64_CHARS + 1024
+
+
+class _BodyTooLarge(Exception):
+    """Raised out of the wrapped receive when a body runs past the cap.
+
+    An exception and not a 413 written from inside receive, because
+    receive has no send: the guard catches this around its call to the
+    app and answers there, where it still holds both.
+    """
+
+
 class LocalOnlyGuard:
     """Reject requests that could only come from a hostile browser page.
 
@@ -1381,8 +1413,12 @@ class LocalOnlyGuard:
         # the body, so SSE streaming and the generator cancellation the
         # streaming endpoint depends on stay untouched, which is the reason
         # this guard is pure ASGI.
+        started = False
+
         async def framed_send(message: Message) -> None:
+            nonlocal started
             if message["type"] == "http.response.start":
+                started = True
                 headers = MutableHeaders(scope=message)
                 headers["x-frame-options"] = "DENY"
                 headers["content-security-policy"] = CONTENT_SECURITY_POLICY
@@ -1456,7 +1492,55 @@ class LocalOnlyGuard:
             )
             await response(scope, receive, framed_send)
             return
-        await self.app(scope, receive, framed_send)
+        # THE DECLARED LENGTH FIRST, because it is free and because it is
+        # what an honest client sends. Refused here, nothing is read at
+        # all: not one chunk off the socket.
+        declared = headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_REQUEST_BYTES:
+            await self._too_large(scope, receive, framed_send)
+            return
+        # AND THE BYTES ACTUALLY READ, because Content-Length is a claim.
+        # A chunked body carries none, and a lying one carries a small
+        # one; either way the count below is the fact. Enforced per chunk
+        # as it arrives, so the refusal lands after at most one chunk
+        # past the cap rather than after the whole body.
+        read = 0
+
+        async def limited_receive() -> Message:
+            nonlocal read
+            message = await receive()
+            if message["type"] == "http.request":
+                read += len(message.get("body", b""))
+                if read > MAX_REQUEST_BYTES:
+                    raise _BodyTooLarge
+            return message
+
+        try:
+            await self.app(scope, limited_receive, framed_send)
+        except _BodyTooLarge:
+            # Only when nothing has been sent yet. A streaming response
+            # that has already begun cannot be turned into a 413, and
+            # this application has exactly one of those; swallowing the
+            # exception there leaves the generator to unwind and the
+            # disconnect path to persist what the server saw, which is
+            # the behaviour that path already has for a dropped client.
+            if not started:
+                await self._too_large(scope, receive, framed_send)
+
+    async def _too_large(self, scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {
+                "detail": (
+                    f"the request body is larger than the "
+                    f"{MAX_REQUEST_BYTES} byte limit and was refused "
+                    "before it was read. An attachment may be at most "
+                    f"{MAX_ATTACHMENT_BYTES} bytes; base64 costs a third "
+                    "on top of that."
+                )
+            },
+            status_code=413,
+        )
+        await response(scope, receive, send)
 
 
 app.add_middleware(LocalOnlyGuard)
@@ -2228,6 +2312,22 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
                 "use inline mode, which extracts the text and gives every "
                 "model the same reading of it.",
             )
+
+
+# How many documents may be parsed at once.
+#
+# TWO, and the number is small on purpose. Extraction is CPU work
+# happening beside an event loop whose other job is streaming paid
+# comparisons, so the question is not "how many can the machine take"
+# but "how much of this machine may an upload take while a comparison is
+# in flight". Two keeps a second person's upload from queueing behind
+# the first for its whole duration while still leaving the loop most of
+# the machine.
+#
+# A semaphore and not a smaller thread pool, because the default
+# executor is shared with everything else that calls to_thread and
+# shrinking it would slow those too.
+EXTRACTION_SLOTS = 2
 
 
 # Characters per token, for turning a composed prompt into something
@@ -4590,14 +4690,25 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
         # that have already been paid for, which is the expensive kind of
         # damage from the cheap kind of input.
         #
-        # A THREAD, not the scorers' child process. That one is a process
-        # only because `re` holds the GIL through a backtrack, so a
-        # timeout could not actually stop it. pypdf and the stdlib zip
-        # and XML readers are ordinary Python and yield between
-        # bytecodes, so a worker thread genuinely leaves the loop
-        # running, and no deadline is wanted here anyway: a slow parse of
-        # a large legitimate document should finish, not be killed.
-        extracted = await asyncio.to_thread(ingest, body.filename, content)
+        # A THREAD HERE, AND A CHILD PROCESS ONE LAYER IN, which is a
+        # correction to what this comment used to claim. It said no
+        # deadline was wanted because "a slow parse of a large legitimate
+        # document should finish, not be killed", and that premise was
+        # true of the readers it was written about and false of one of
+        # them. A PDF's parse cost is not a function of its size: 10,810
+        # bytes bought 33.91 seconds. See extract.PDF_DEADLINE_SECONDS
+        # for the measurements and for why the deadline lives around the
+        # PDF reader alone rather than around this call.
+        #
+        # BOUNDED CONCURRENCY, which is the half a deadline cannot
+        # provide. asyncio.to_thread uses the default executor, which is
+        # min(32, cpu + 4) threads, so thirty-two simultaneous uploads
+        # were thirty-two simultaneous parses competing for the same
+        # cores as the event loop that is streaming somebody's paid
+        # comparison. The deadline bounds each one; this bounds how many
+        # there are, and the two together bound the total.
+        async with app.state.extraction_semaphore:
+            extracted = await asyncio.to_thread(ingest, body.filename, content)
     except ExtractionError as exc:
         # The extractor's messages are written to be shown, which is
         # what ExtractionError means; passing the text straight through
