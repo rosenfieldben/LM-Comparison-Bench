@@ -60,17 +60,29 @@ CATALOG = {
             ("stub/slow", {}),
             ("stub/flaky", {}),
             ("stub/null", {}),
+            # THE REASONING PERSONALITIES PUBLISH A DESCRIPTOR, because a
+            # model that emits reasoning deltas while advertising no
+            # reasoning support is an incoherent fixture, and because the
+            # bench now reads exactly this to decide whether it may send
+            # an unprompted cap. mandatory true is the incident's own
+            # shape: the model thinks whether or not it is asked to, so
+            # bounding the thinking cannot start any.
+            #
             # Thinks and never speaks; see the streaming dispatch.
-            ("stub/exhausted", {}),
+            ("stub/exhausted", {"reasoning": {"mandatory": True}}),
             # Thinks hard AND answers: the healthy contrast, so the
             # exhaustion rule has something to stay quiet about.
-            ("stub/thinker", {}),
+            ("stub/thinker", {"reasoning": {"mandatory": True}}),
             # Answers, but spends nearly all of the output thinking.
             # The route the reservation could not reach.
-            ("stub/mostly-thinking", {}),
+            ("stub/mostly-thinking", {"reasoning": {"mandatory": True}}),
             # Exhausted on the first attempt, healthy on the second, so a
             # rerun crosses the indicator's boundary in one card.
-            ("stub/exhausted-once", {}),
+            ("stub/exhausted-once", {"reasoning": {"mandatory": True}}),
+            # Thinks a little, then refuses. Spends a fraction of the
+            # budget and produces no text, which is the shape that was
+            # being told its budget had run out.
+            ("stub/filtered", {"reasoning": {"mandatory": True}}),
             ("stub/html", {}),
             ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
             # Priced in the catalog on purpose: their billed figure is
@@ -333,6 +345,43 @@ def build_app() -> Starlette:
                     }
                 )
                 yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model == "stub/filtered":
+            # A CONTENT FILTER THAT THOUGHT FIRST. No text, so the
+            # empty-response path is reached; reasoning equal to
+            # completion, so the shape test fires; and 37 of 16384
+            # tokens, so the budget plainly did not run out. Before the
+            # correction this card claimed its completion budget had
+            # been exhausted and then advised buying the extended tier.
+            async def gen():
+                await asyncio.sleep(0.01)
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {"reasoning": "considering..."}}],
+                    }
+                )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "content_filter"}],
+                    }
+                )
+                yield sse(
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 13,
+                            "completion_tokens": 37,
+                            "cost": BILLED_COST,
+                            "cost_details": {"upstream_inference_cost": 0},
+                            "completion_tokens_details": {"reasoning_tokens": 37},
+                            "prompt_tokens_details": {"cached_tokens": 0},
+                        },
+                    }
+                )
                 yield b"data: [DONE]\n\n"
 
             return gen()

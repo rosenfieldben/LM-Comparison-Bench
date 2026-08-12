@@ -1196,6 +1196,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for m in app.state.catalog["models"]
         if isinstance(m.get("max_completion_tokens"), int)
     }
+    # WHICH MODELS THINK WITHOUT BEING ASKED. Built like the clamp above
+    # and for the same reason: a per-request dict lookup off boot state,
+    # because the catalog is app state and models.py must stay pure.
+    #
+    # A set of the true ones rather than a dict of bools, so a model the
+    # catalog never mentioned reads as absent, which is the same answer
+    # as false and the answer rule one wants for an unknown. On an
+    # offline boot the set is empty and no reservation rides at all,
+    # which is the conservative direction: an unfetched catalog cannot
+    # tell us that switching thinking on would be free of side effects.
+    app.state.reasoning_defaults = {
+        m["id"]
+        for m in app.state.catalog["models"]
+        if m.get("may_send_reasoning_cap") is True
+    }
     if not app.state.catalog["fetched"]:
         logger.warning(
             "OpenRouter catalog fetch failed; cost display and model "
@@ -3031,6 +3046,7 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
                 record_prompt=recorded,
+                may_send_reasoning_cap=model in app.state.reasoning_defaults,
             )
             # Settle before the slot releases. This block is post-spend, so
             # it carries its own fault boundary: the upstream call has
@@ -3242,6 +3258,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 provider_prefs=request_provider_prefs(controls),
                 controls=controls,
                 record_prompt=recorded,
+                may_send_reasoning_cap=(request.model in app.state.reasoning_defaults),
             ):
                 if event["type"] != "done":
                     if first_delta_ms is None:
@@ -3863,6 +3880,7 @@ async def run_one_trial(
                 holder=holder,
                 provider_prefs=trial_provider_prefs(experiment, model, controls),
                 controls=controls,
+                may_send_reasoning_cap=model in app.state.reasoning_defaults,
             ):
                 if event["type"] == "done":
                     result = event["result"]
@@ -4415,6 +4433,7 @@ async def score_one_result(
             # not one of them, and pinning it to a provider chosen for
             # somebody else's lineup would be a claim nobody made.
             provider_prefs=app.state.provider_prefs,
+            may_send_reasoning_cap=judge_model in app.state.reasoning_defaults,
         )
     # Post-spend. The call has happened, so nothing below may turn a paid
     # verdict into an exception, and the charge is recorded whether or not

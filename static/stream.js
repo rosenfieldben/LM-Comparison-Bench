@@ -165,9 +165,20 @@
           // suggest; setting a reasoning effort under Experiment controls
           // is what remains. On standard both apply, and the larger
           // budget goes first because it is one click away.
+          //
+          // AND ON finish_reason TOO, which is a correction. Keying the
+          // remedy on the shape alone made it fire on refusals and
+          // content filters: those cards spend a fraction of the budget,
+          // and telling their reader to buy the extended tier and run
+          // again is advice that costs real money and cannot work. The
+          // old substring gate at least never fired there. A remedy
+          // about the budget belongs only on a card whose budget
+          // actually ran out, which is what "length" means.
           let shownError = result.error;
+          const truncated = result.finish_reason === "length";
           if (shownError != null) {
             if (
+              truncated &&
               BenchLib.reasoningAteTheOutput(
                 result.completion_tokens,
                 result.reasoning_tokens,

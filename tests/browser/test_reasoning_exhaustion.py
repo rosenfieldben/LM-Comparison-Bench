@@ -310,3 +310,63 @@ def test_review_repro_a_rerun_does_not_keep_the_previous_indicator(bench):
 
     expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
     expect(card.get_by_test_id("reasoning-warning")).to_have_count(0)
+
+
+def test_review_repro_a_refusal_is_not_told_its_budget_ran_out(bench):
+    """WINDOW: a live card's terminal render for a model that thought a
+    little and then refused.
+
+    THE DEFECT THIS BRANCH SHIPPED AND THIS FIXES. The shape test is
+    close to a tautology on the empty-response path: it is only reached
+    when there is no visible text, so any reasoning model that thought
+    and said nothing has reasoning at or near its completion count
+    whatever went wrong. Every firing row in the original table happened
+    to carry finish_reason "length", so the table certified the label as
+    honest and could not see that a refusal lands in the same bucket.
+
+    stub/filtered spends 37 tokens of a 16384 budget, 0.2%, and stops on
+    a content filter. It was being told "completion budget exhausted
+    during reasoning", and because static/stream.js keyed its remedy on
+    the same predicate, the card then advised buying the extended tier
+    and running again: a four times larger retry, at real cost, for a
+    failure no budget can fix. The wording it replaced never did that,
+    because the old remedy gate required the substring
+    "finish_reason: length".
+
+    The card now states the accounting fact without the causal claim,
+    and offers no budget remedy at all.
+    """
+    page = bench(["stub/filtered"])
+    check_all_chips(page)
+    run(page, "filtered refusal")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    error = card.get_by_test_id("card-error")
+    # The accounting fact survives: where the money went and why it
+    # stopped are both on the card.
+    expect(error).to_contain_text("the whole completion went to reasoning")
+    expect(error).to_contain_text("37 reasoning tokens")
+    expect(error).to_contain_text("finish_reason: content_filter")
+    # The claim the numbers do not support is gone.
+    expect(error).not_to_contain_text("exhausted")
+    # And so is the advice that would have cost money.
+    expect(error).not_to_contain_text("try extended budget")
+
+
+def test_a_real_truncation_still_gets_the_causal_label_and_the_remedy(bench):
+    """WINDOW: the same render, for the shape where the claim is true.
+
+    The other side of the gate. Narrowing a label is only correct if it
+    still fires where it belongs, and stub/exhausted is the incident's
+    own shape: reasoning equal to completion, finish_reason "length".
+    """
+    page = bench(["stub/exhausted"])
+    check_all_chips(page)
+    run(page, "true truncation")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    error = card.get_by_test_id("card-error")
+    expect(error).to_contain_text("completion budget exhausted during reasoning")
+    expect(error).to_contain_text("try extended budget or a lower reasoning effort")

@@ -3072,25 +3072,17 @@ def test_blank_controls_leave_the_boot_provider_block_untouched(client):
     body = json.loads(respx.calls[0].request.content)
     assert body["provider"] == {"sort": "throughput"}
     assert body["messages"] == [{"role": "user", "content": "p"}]
-    for control_key in ("temperature", "top_p", "seed"):
+    # reasoning is back in this list. It briefly left, when the
+    # visible-output reservation rode every request; it returned when the
+    # reservation was gated on the catalog's capability flag, because
+    # this lineup's models publish no reasoning descriptor and the bench
+    # therefore does not vouch for them. An unset control and an
+    # unvouched reservation are both simply absent.
+    for control_key in ("temperature", "top_p", "seed", "reasoning"):
         assert control_key not in body, control_key
-    # reasoning IS present now, and it is not a control default: it is the
-    # bench's own visible-output reservation, the one field sent
-    # unprompted. It left this absence list in the reasoning-exhaustion
-    # fix and gained an assertion of its own, because "no key here" and
-    # "this key is exactly the reservation" are different claims and only
-    # the second one is still true.
-    assert body["reasoning"] == {"max_tokens": 8192}
-    assert "effort" not in body["reasoning"]
     # The whole key set, so a control added later cannot slip in unnoticed
     # by being absent from the list above.
-    assert set(body) == {
-        "model",
-        "messages",
-        "max_tokens",
-        "provider",
-        "reasoning",
-    }
+    assert set(body) == {"model", "messages", "max_tokens", "provider"}
 
 
 @respx.mock
@@ -3387,16 +3379,8 @@ def test_an_explicitly_null_control_is_blank_not_set_to_null(client):
     assert resp.status_code == 200
     body = json.loads(respx.calls[0].request.content)
     # Byte-for-byte the blank payload: nulls reached neither the top level
-    # nor the message list. reasoning is the bench's reservation and not a
-    # control, so an explicit null control cannot produce or suppress it.
-    assert set(body) == {
-        "model",
-        "messages",
-        "max_tokens",
-        "provider",
-        "reasoning",
-    }
-    assert body["reasoning"] == {"max_tokens": 8192}
+    # nor the message list.
+    assert set(body) == {"model", "messages", "max_tokens", "provider"}
     assert body["messages"] == [{"role": "user", "content": "p"}]
 
     gid = client.post(
@@ -8789,15 +8773,12 @@ def test_review_repro_rule_one_holds_across_both_modes(client):
         "messages": [{"role": "user", "content": "plain question"}],
         "max_tokens": 16384,
         "provider": {"sort": "throughput"},
-        # THE ONE DELIBERATE ADDITION, recaptured rather than hand-edited
-        # when the reasoning-exhaustion fix landed. Rule one says an
-        # unattached comparison sends what it always did; the reservation
-        # is a documented exception to "never send a default", taken
-        # because the alternative is a comparison that bills in full and
-        # shows nothing. What rule one still guarantees, and what this
-        # line still proves, is that ATTACHMENTS add nothing: the payload
-        # here is the no-attachment payload exactly.
-        "reasoning": {"max_tokens": 8192},
+        # No reasoning key, and its absence is load-bearing twice over.
+        # ATTACHMENTS add nothing, which is what this test was written
+        # for. And the visible-output reservation adds nothing either on
+        # a model the catalog does not vouch for, which is what stopped
+        # the reasoning-exhaustion fix from breaking rule one for every
+        # run in the bench.
     }
 
 
@@ -12183,7 +12164,16 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
     reservation is identical across all of them, which is the property:
     it is a function of the budget, and the budget is one number for the
     comparison.
+
+    THE VOUCHING IS DECLARED HERE rather than baked into TEST_CATALOG,
+    and that placement is deliberate. The default lineup must stay
+    unvouched, because the rule-one tests prove that an unvouched model
+    receives the pre-feature payload byte for byte, and a catalog that
+    vouched for everything would quietly delete that proof. So a test
+    about the reservation says so, and every other test keeps testing
+    the silent path.
     """
+    app.state.reasoning_defaults = {"model/alpha", "model/beta", "model/vision"}
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(
             200, json=response_for(json.loads(request.content)["model"], "ok")
@@ -12226,6 +12216,7 @@ def test_a_visible_answer_still_fits_in_the_reserved_room(client):
     end, that a comparison with the cap in place returns real text and
     records it.
     """
+    app.state.reasoning_defaults = {"model/alpha"}
     long_answer = "the answer, at length. " * 200
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(
@@ -12243,3 +12234,147 @@ def test_a_visible_answer_still_fits_in_the_reserved_room(client):
     assert result["response_text"] == long_answer
     body = json.loads(respx.calls[0].request.content)
     assert body["reasoning"]["max_tokens"] == 8192
+
+
+@respx.mock
+def test_review_repro_the_reservation_asks_the_catalog_before_it_rides(
+    client, monkeypatch
+):
+    """WINDOW: a /compare round trip, from the boot catalog through to
+    the bytes on the wire, at both answers to the catalog's question.
+
+    THE DEFECT THIS ANSWERS was found by an adversarial review after the
+    fix had already shipped, and it inverted the fix's own purpose.
+    OpenRouter's request schema says of the reasoning object's enabled
+    key: "Default: inferred from 'effort' or 'max_tokens'". So a request
+    carrying a cap and no enabled key does not merely BOUND thinking, it
+    turns thinking ON. On a model whose catalog entry says thinking is
+    off by default, an unprompted cap starts buying reasoning tokens
+    that were never being bought.
+
+    That is the opposite of the fix. It was written to stop money
+    disappearing into invisible thinking, and unguarded it would have
+    started spending money on thinking that was not happening, on every
+    run, silently, in an instrument whose entire product is a comparison
+    between models. Measured against the live catalog on 2026-08-12: 23
+    of 406 models publish default_enabled false without mandatory.
+
+    BOTH ANSWERS ARE ASSERTED, which is the point. A test that only
+    proved the cap rides for a vouched model would pass just as well if
+    the gate were deleted.
+    """
+    seen: list[dict] = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "ok")
+        )
+    )
+
+    for vouched in (False, True):
+        app.state.reasoning_defaults = {"model/alpha"} if vouched else set()
+        resp = client.post(
+            "/compare",
+            json={"prompt": "catalog gate", "models": ["model/alpha"]},
+        )
+        assert resp.status_code == 200, resp.text
+        # The call this iteration just made, by index from the end. The
+        # router accumulates across the loop and a reset here would make
+        # the two iterations indistinguishable if it ever stopped working.
+        seen.append(json.loads(respx.calls[-1].request.content))
+
+    unvouched, vouched_body = seen
+    # Silence is not a degraded reservation, it is the whole pre-feature
+    # payload: an unvouched model gets exactly what it got before any of
+    # this existed.
+    assert "reasoning" not in unvouched
+    assert set(unvouched) == {"model", "messages", "max_tokens", "provider"}
+    # And the vouched one differs in that one key and nothing else, so
+    # the gate cannot be shown to have changed anything except whether
+    # the reservation rides.
+    assert vouched_body["reasoning"] == {"max_tokens": 8192}
+    assert set(vouched_body) - set(unvouched) == {"reasoning"}
+    assert {k: v for k, v in vouched_body.items() if k != "reasoning"} == unvouched
+
+
+def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
+    """WINDOW: fetch_catalog's parse of one raw catalog entry, before any
+    of it reaches app state.
+
+    The gate is only worth having if the flags it reads are the ones
+    OpenRouter published, so this walks every shape they come in. Two
+    independent questions collapse into one derived boolean, and both
+    have to be answered yes.
+
+    DOES IT THINK UNPROMPTED (mandatory, or default_enabled): if not,
+    a cap would switch thinking on rather than bound it, because the
+    request schema infers enabled from max_tokens.
+
+    DOES IT ADVERTISE THE PARAMETER (supported_parameters): if not,
+    strict mode's require_parameters would exclude every provider that
+    does not support the field, either emptying the pool or silently
+    narrowing it, and narrowing it changes what is being measured.
+
+    The second condition is redundant against the catalog as it stands,
+    where all 157 reasoning-by-default models advertise the parameter.
+    It is asserted here so that stays a property of the code.
+    """
+    from bench.models import MODELS_URL, fetch_catalog
+
+    reasoning_ok = ["max_tokens", "reasoning"]
+    entries = [
+        # Always reasons and takes the field. The incident's own shape,
+        # and the only shape that may receive an unprompted cap.
+        {
+            "id": "m/mandatory",
+            "reasoning": {"mandatory": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Reasons unless told not to, and takes the field.
+        {
+            "id": "m/on",
+            "reasoning": {"default_enabled": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Thinking is OFF. Sending a cap here would switch it on.
+        {
+            "id": "m/off",
+            "reasoning": {"default_enabled": False},
+            "supported_parameters": reasoning_ok,
+        },
+        # A descriptor that answers neither question.
+        {
+            "id": "m/unstated",
+            "reasoning": {"supported_efforts": ["low"]},
+            "supported_parameters": reasoning_ok,
+        },
+        # Thinks unprompted but does NOT advertise the parameter. This
+        # is the strict-mode case: no such model exists in today's
+        # catalog, and the gate must still refuse it.
+        {
+            "id": "m/thinks-but-unadvertised",
+            "reasoning": {"mandatory": True},
+            "supported_parameters": ["max_tokens"],
+        },
+        # Thinks unprompted, and the catalog does not say what it takes.
+        {"id": "m/thinks-no-param-list", "reasoning": {"mandatory": True}},
+        # No descriptor at all.
+        {"id": "m/none", "supported_parameters": reasoning_ok},
+    ]
+
+    async def go():
+        async with httpx.AsyncClient(trust_env=False) as c:
+            with respx.mock:
+                respx.get(MODELS_URL).respond(json={"data": entries})
+                return await fetch_catalog(c)
+
+    catalog = asyncio.run(go())
+    flags = {m["id"]: m["may_send_reasoning_cap"] for m in catalog["models"]}
+    assert flags == {
+        "m/mandatory": True,
+        "m/on": True,
+        "m/off": False,
+        "m/unstated": False,
+        "m/thinks-but-unadvertised": False,
+        "m/thinks-no-param-list": False,
+        "m/none": False,
+    }

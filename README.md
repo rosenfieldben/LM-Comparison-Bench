@@ -313,18 +313,40 @@ and reruns reuse the budget of the run they retry. The API accepts
 
 ### Reserving room for the answer
 
-Every request asks for half its completion budget to be left for the
-visible answer, sending `reasoning: {"max_tokens": N}` beside the cap:
-8192 of the standard tier's 16384, 32768 of extended's 65536. The judge
-reserves on the same rule, 256 of its 512.
+A request to a model that **already reasons** asks for half its
+completion budget to be left for the visible answer, sending
+`reasoning: {"max_tokens": N}` beside the cap: 8192 of the standard
+tier's 16384, 32768 of extended's 65536. The judge reserves on the same
+rule, 256 of its 512.
 
-How binding that request is depends on the model, and the honest range
-is wide. See **How far the reservation actually reaches** below before
-treating it as a guarantee.
+"Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
+request schema says of the reasoning object's `enabled` key: "Default:
+inferred from `effort` or `max_tokens`". So a cap sent on its own does
+not merely bound thinking, it **switches thinking on**. On a model whose
+catalog entry says reasoning is off by default, an unprompted cap would
+start buying reasoning tokens nobody was buying, on every run, which is
+the opposite of what this exists to do.
+
+The bench therefore sends the cap only where the catalog answers yes to
+both of two questions: does the model reason regardless (`mandatory` or
+`default_enabled`), and does it advertise the `reasoning` parameter.
+The second matters under **strict mode**, which sends
+`require_parameters: true`: there, a provider that does not support a
+request parameter is excluded rather than allowed to ignore it, so an
+unadvertised field would narrow the provider pool and thereby change
+what is being measured. Where either answer is no, or the catalog is
+silent, nothing is sent and the payload is byte-identical to what it was
+before this feature existed.
+
+How binding the request is where it IS sent depends on the model, and
+the honest range is wide. See **How far the reservation actually
+reaches** below before treating it as a guarantee.
 
 This is the one default the bench sends unprompted, and it is a
 deliberate exception to "never send a default" (see **Experiment
-controls**), taken because the alternative was observed in production. A
+controls**), narrowed by the gate above to models where the thing being
+bounded was going to happen anyway. It was taken because the
+alternative was observed in production. A
 comparison on document prompts reasoned until the completion cap closed
 on it: every card billed in full, between $3.38 and $3.50, with no
 visible answer at all. The generation records were unambiguous about
@@ -360,6 +382,13 @@ allocation at 1024 tokens, and for Gemini 3 "Google internally maps this
 budget value to a `thinkingLevel`, so you will not get precise token
 control".
 
+Before any of that, the gate: the cap is only sent where the catalog
+says the model reasons by default. Measured on 2026-08-12, 157 of 406
+models qualify (83 `mandatory`, 74 `default_enabled`); 23 publish
+reasoning as off by default and are deliberately left alone; the rest
+either do not say or publish no reasoning descriptor at all, and silence
+is treated as "do not send".
+
 Two further cases drop it entirely. If you set a reasoning effort under
 **Experiment controls**, the reservation stands down, because the same
 page both forbids sending an effort and a cap together ("One of the
@@ -372,7 +401,9 @@ rules](https://openrouter.ai/docs/guides/routing/provider-selection).
 
 So exhaustion stays possible on most routes, which is why the rest of
 this section is about what the bench does after the fact rather than
-before it.
+before it. That is not a consolation prize: the instrumentation below
+reads the tokens that came back, so it works everywhere, including on
+every route the gate and the vendor's own translation leave uncovered.
 
 ### When it happens anyway, the card says so
 
@@ -387,16 +418,39 @@ no visible answer: completion budget exhausted during reasoning
 ```
 
 with the count included as the evidence for the claim, matching the
-card's own reasoning metric. The old wording is kept exactly for a
-genuinely empty response with no thinking behind it, which is a
-different failure.
+card's own reasoning metric.
 
-The trigger is the token shape and nothing else: reasoning tokens at or
-above nine tenths of the completion count. No model name is involved, no
-request field is read, and the same rule is applied on the server and in
-the browser to the same two numbers. That is what lets it work on the
-uncovered routes above, because a provider that ignores a request
-parameter still reports its usage honestly.
+That exact wording is reserved for a card whose budget genuinely ran
+out, which OpenRouter reports as `finish_reason: length`. The reason for
+the gate is worth stating, because getting it wrong cost real money in
+an earlier draft of this very feature. A card reaches this path only
+when it produced no visible text at all, so for any reasoning model the
+reasoning count is at or near the completion count no matter WHY the
+response was empty: a refusal, a content filter and a provider abort all
+look identical to a truncation by that measure. On the shape alone, a
+content filter that spent 37 of 16384 tokens was told its completion
+budget had been exhausted, and the card then advised buying the extended
+tier and running again.
+
+A card that went to reasoning without the budget running out says so
+instead, keeping the accounting fact and dropping the claim:
+
+```
+no visible answer: the whole completion went to reasoning
+(37 reasoning tokens, finish_reason: content_filter)
+```
+
+and it is offered no budget remedy, because no budget would help. The
+old wording is kept exactly for a genuinely empty response with no
+thinking behind it, which is a third failure again.
+
+The trigger is the token shape plus that one normalized field: reasoning
+tokens at or above nine tenths of the completion count, and whether
+generation stopped at the cap. No model name is involved, and both
+inputs are things that came BACK rather than things the bench sent,
+which is what lets this work on every route above where the reservation
+could not act: a provider that ignores a request parameter still reports
+its usage and its stop reason honestly.
 
 The card also offers the knob you can turn. On standard it suggests the
 extended budget or a lower reasoning effort; on extended, where there is
@@ -2221,7 +2275,10 @@ picked up without restarts, and verify by eyeball after UI changes:
   ends with "try extended budget". A column whose budget went to
   reasoning instead says "no visible answer: completion budget
   exhausted during reasoning" with the count, and ends with "try
-  extended budget or a lower reasoning effort". A column that answered
+  extended budget or a lower reasoning effort". A column that stopped
+  for any other reason says "the whole completion went to reasoning"
+  with the count and the stop reason, and is offered no budget remedy.
+  A column that answered
   but spent nearly all its output thinking carries the share line
   between its metrics and its text, and keeps it on replay. Switch
   the control to extended and run again: the models now answer or

@@ -1543,18 +1543,26 @@ async def test_review_repro_blank_controls_send_the_pre_h_payload_byte_for_byte(
     cannot fail there; its force is forward. It fails the moment any
     control acquires a default that reaches the wire.
 
-    RECAPTURED ONCE, DELIBERATELY, for the reasoning-exhaustion fix. Both
-    payloads now carry reasoning.max_tokens, which is the bench's own
-    visible-output reservation rather than a control default: the one
-    field sent unprompted, documented as an exception where rule one is
-    stated. The fixture was regenerated the way it was captured, by
-    running run_model and stream_model against respx and writing down the
-    bytes they sent, NOT by editing the JSON to match. Editing it would
-    have made this test assert that the code agrees with itself.
+    RECAPTURED ONCE AND THEN PUT BACK, which is worth recording because
+    the round trip is the evidence for a claim this repo makes about
+    itself. The reasoning-exhaustion fix first sent its visible-output
+    reservation on every request, and these bytes were regenerated to
+    match by RUNNING the code against respx, never by editing the JSON.
+    An adversarial review then found that a reasoning cap with no
+    enabled key infers enabled true, so an unprompted cap does not
+    merely bound thinking on a model whose default is off, it switches
+    thinking on and bills for it. The reservation was gated on the
+    catalog's own capability flag, and with that gate a blank-controls
+    request to a model the catalog does not vouch for sends exactly what
+    it sent before the fix existed. These are main's bytes again, to the
+    character.
 
-    Its force is unchanged: a control acquiring a default still fails
-    here, because the reservation is not keyed on any control and its
-    value is a fraction of the budget.
+    So rule one is not broken by default any more. It is broken only for
+    a model the catalog says already reasons, where the cap bounds
+    thinking that was going to happen regardless. That is a far narrower
+    exception than the one this docstring used to describe, and the
+    fixture reverting is how the narrowing was proved rather than
+    asserted.
     """
     for kind, controls in (
         ("run_model", None),
@@ -1751,13 +1759,13 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
 
     recorded = json.loads(result["request_json"])
     assert recorded["temperature"] == 0.2
-    for absent in ("top_p", "seed"):
+    # reasoning rejoined this list when the reservation was gated on the
+    # catalog. This caller passes no may_send_reasoning_cap, so the bench
+    # does not vouch for the model, so nothing is sent: an unset control
+    # and an unvouched reservation are both simply absent, which is what
+    # rule one asks for in both cases.
+    for absent in ("top_p", "seed", "reasoning"):
         assert absent not in recorded, absent
-    # reasoning is recorded like any other field the bench sent, which is
-    # what makes the reservation auditable: a run can be shown to have
-    # asked for the cap it asked for. It carries the reservation and no
-    # effort, because this caller declared none.
-    assert recorded["reasoning"] == {"max_tokens": 8192}
 
 
 # ---- Phase I3: rubric judging, blind by construction.
@@ -2123,7 +2131,16 @@ async def test_review_repro_thinking_cannot_eat_the_whole_budget(client):
     for budget, expected in ((BUDGET_STANDARD, 8192), (BUDGET_EXTENDED, 32768)):
         respx.post(OPENROUTER_URL).respond(json=FIXTURE)
 
-        await run_model("the prompt", "vendor/model", client, max_tokens=budget)
+        await run_model(
+            "the prompt",
+            "vendor/model",
+            client,
+            max_tokens=budget,
+            # The catalog vouches for this model: it thinks whether or
+            # not it is asked to, so bounding the thinking cannot start
+            # any. See reasoning_reservation for why that is the gate.
+            may_send_reasoning_cap=True,
+        )
 
         body = json.loads(respx.calls[-1].request.content)
         assert body["reasoning"] == {"max_tokens": expected}, budget
@@ -2174,6 +2191,7 @@ async def test_the_reservation_stands_down_for_a_declared_effort(client):
         client,
         max_tokens=BUDGET_STANDARD,
         controls={"effort": "high"},
+        may_send_reasoning_cap=True,
     )
 
     body = json.loads(respx.calls[-1].request.content)
@@ -2182,10 +2200,10 @@ async def test_the_reservation_stands_down_for_a_declared_effort(client):
     # The guard itself, behind the ordering that would otherwise cover
     # for it. See the docstring: this is the assertion the mutation
     # kills.
-    assert reasoning_reservation(BUDGET_STANDARD, {"effort": "high"}) == {}
+    assert reasoning_reservation(BUDGET_STANDARD, {"effort": "high"}, True) == {}
     # And it stands down only for a declared effort, not for any
     # controls at all, so a request with a temperature still reserves.
-    assert reasoning_reservation(BUDGET_STANDARD, {"temperature": 0.5}) == {
+    assert reasoning_reservation(BUDGET_STANDARD, {"temperature": 0.5}, True) == {
         "reasoning": {"max_tokens": 8192}
     }
 
@@ -2204,7 +2222,14 @@ async def test_the_judge_reserves_room_for_its_verdict(client):
         json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
     )
 
-    await judge_response(client, "rubric", None, "the answer", "vendor/judge")
+    await judge_response(
+        client,
+        "rubric",
+        None,
+        "the answer",
+        "vendor/judge",
+        may_send_reasoning_cap=True,
+    )
 
     body = json.loads(respx.calls[-1].request.content)
     assert body["max_tokens"] == JUDGE_MAX_TOKENS
@@ -2304,6 +2329,14 @@ from bench.models import (  # noqa: E402
 # is that no row needs to know what produced it.
 EMPTY_RESPONSE_SHAPES = (
     # (label, finish_reason, completion, reasoning, expected error)
+    #
+    # THE FIRST THREE ROWS ALL CARRIED finish_reason "length", which is
+    # how this table came to certify a label that lied. Every firing case
+    # was a real truncation, so the table could not see that the shape
+    # test fires on refusals too: at this call site there is no visible
+    # text by construction, so a refusal that thought at all has
+    # reasoning at or near completion and lands in the same bucket. The
+    # rows below the truncations are the ones that were missing.
     (
         "the incident, exactly equal",
         "length",
@@ -2349,6 +2382,34 @@ EMPTY_RESPONSE_SHAPES = (
         None,
         "empty response (finish_reason: length)",
     ),
+    # ---- The shape fires, the budget did NOT run out. Measured before
+    # ---- the correction: each of these was told its completion budget
+    # ---- had been exhausted, and the card appended "try extended
+    # ---- budget" on top.
+    (
+        "a content filter that thought first, 0.2% of the budget spent",
+        "content_filter",
+        37,
+        37,
+        "no visible answer: the whole completion went to reasoning "
+        "(37 reasoning tokens, finish_reason: content_filter)",
+    ),
+    (
+        "a refusal that stopped clean, 1% of the budget spent",
+        "stop",
+        210,
+        198,
+        "no visible answer: the whole completion went to reasoning "
+        "(198 reasoning tokens, finish_reason: stop)",
+    ),
+    (
+        "a provider abort with no reason worth the name",
+        None,
+        4,
+        4,
+        "no visible answer: the whole completion went to reasoning "
+        "(4 reasoning tokens, finish_reason: unknown)",
+    ),
     (
         "reasoning reported but no completion count",
         None,
@@ -2384,6 +2445,14 @@ def test_review_repro_the_label_says_where_the_completion_went(
     rule does not know or care. The threshold rows are the boundary, one
     on each side of it, so a change to REASONING_SHARE_EXHAUSTED cannot
     pass unnoticed.
+
+    THREE OUTCOMES, and the middle one is a correction an adversarial
+    review forced. The shape test is close to a tautology here, because
+    this function is only reached when there was no visible text at all,
+    so any reasoning model that thought and said nothing has a ratio near
+    1.0 whatever went wrong. "Exhausted" therefore needs finish_reason
+    behind it, and without that gate a content filter that spent 0.2% of
+    its budget was told the budget was gone.
 
     THE OLD WORDING IS KEPT, not superseded, for a genuinely empty
     response with no thinking behind it. That is a different failure, a

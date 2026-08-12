@@ -341,14 +341,29 @@ REASONING_BUDGET_SHARE = 0.5
 
 
 def reasoning_reservation(
-    max_tokens: int, controls: Mapping[str, Any] | None = None
+    max_tokens: int,
+    controls: Mapping[str, Any] | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> dict[str, Any]:
     """The reasoning cap for a request at this budget, or nothing.
 
     Returns the fragment to merge into a payload, so a caller cannot
-    forget the not-both rule by assembling the field itself.
+    forget either of the two rules below by assembling the field itself.
 
-    Empty when the operator declared an effort, per the pinned page; see
+    EMPTY UNLESS THE MODEL ALREADY THINKS, which is the guard that keeps
+    this a bound rather than a purchase. A reasoning object with a cap
+    and no enabled key infers enabled true, so on a model whose catalog
+    entry says thinking is off, an unprompted cap would switch thinking
+    ON and start billing for it. may_send_reasoning_cap comes from the
+    catalog's own capability flags; see fetch_catalog for the pinned
+    wording and the measured counts.
+
+    The default is False, deliberately, so a caller that does not know
+    sends nothing. That is rule one's answer for an unknown, and it
+    makes the protective case the one that has to be asked for rather
+    than the one that happens by omission.
+
+    EMPTY WHEN THE OPERATOR DECLARED AN EFFORT, per the pinned page; see
     REASONING_BUDGET_SHARE for why the declaration wins over the
     default.
 
@@ -356,6 +371,8 @@ def reasoning_reservation(
     above its share of the budget. At the two real tiers the division is
     exact anyway; the floor matters only if a future tier is odd.
     """
+    if not may_send_reasoning_cap:
+        return {}
     if controls and controls.get("effort") is not None:
         return {}
     return {"reasoning": {"max_tokens": int(max_tokens * REASONING_BUDGET_SHARE)}}
@@ -658,6 +675,8 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # False until the catalog says otherwise; see the parse below.
+            "may_send_reasoning_cap": False,
             # What the underlying-model estimand checks against. None
             # means the catalog did not say, which strict mode treats as
             # "cannot check" rather than as "supports everything": see
@@ -704,6 +723,60 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             model["supported_parameters"] = sorted(
                 {x for x in supported if isinstance(x, str)}
             )
+        # WHETHER THIS MODEL THINKS WITHOUT BEING ASKED, which decides
+        # whether the visible-output reservation may ride unprompted.
+        #
+        # Pinned against the reasoning-tokens guide's "Discovering
+        # per-model reasoning options" section,
+        # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+        # read 2026-08-12: "default_enabled: Default on/off state when
+        # the user has not set reasoning.enabled" and "mandatory: When
+        # true, hide disable controls and do not send effort: 'none' --
+        # the model rejects it."
+        #
+        # THE REASON THIS FLAG HAD TO EXIST. The request schema on the
+        # same page says of the enabled key: "Default: inferred from
+        # 'effort' or 'max_tokens'". So a request carrying a reasoning
+        # cap and nothing else does not merely BOUND thinking, it turns
+        # thinking ON. On a model whose default is off, an unprompted
+        # cap would start buying reasoning tokens that were never being
+        # bought, on every run, in an instrument whose product is a
+        # comparison between models. Measured against the live catalog
+        # on 2026-08-12: of 406 models, 23 publish default_enabled false
+        # without mandatory, and they are the frontier lineup.
+        #
+        # AND THE MODEL MUST ADVERTISE THE PARAMETER, which is the second
+        # condition and it is about strict mode rather than about money.
+        # STRICT_PREFS sends require_parameters true, and under it a
+        # provider that does not support a request parameter is not
+        # allowed to ignore it, it is EXCLUDED. So an unprompted
+        # reasoning field on a model that does not advertise reasoning
+        # would either empty the provider pool outright or silently
+        # narrow it, and this file already states at STRICT_PREFS why
+        # narrowing it is the one thing that must not happen: it "changes
+        # which providers are eligible, which silently changes what is
+        # being measured".
+        #
+        # As the catalog stands on 2026-08-12 the condition is redundant,
+        # because all 157 models that reason by default also advertise
+        # the parameter. It is here so that stays a fact about the code
+        # rather than a fact about one morning's catalog: the flag that
+        # says a model thinks and the list that says it accepts the
+        # field are different publications and nothing keeps them in
+        # step.
+        #
+        # Three flags collapse to one derived boolean because only one
+        # question is being asked: may the bench send this model a
+        # reasoning cap it did not ask for. False when the catalog says
+        # thinking is off, false when it does not say, and false when
+        # the parameter is unadvertised. Rule one's default for an
+        # unknown is silence.
+        reasoning = entry.get("reasoning")
+        if isinstance(reasoning, dict):
+            model["may_send_reasoning_cap"] = (
+                reasoning.get("mandatory") is True
+                or reasoning.get("default_enabled") is True
+            ) and "reasoning" in (model["supported_parameters"] or ())
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
@@ -900,6 +973,15 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
 # below anything a real exhaustion misses.
 REASONING_SHARE_EXHAUSTED = 0.9
 
+# OpenRouter's NORMALIZED word for a completion the cap cut off. Reading
+# it couples this to no vendor: run_model's own comment on the field says
+# OpenRouter "maps each provider's vocabulary onto a common set", and the
+# provider's own word arrives separately as native_finish_reason.
+#
+# It is the only field that answers "did the budget actually run out",
+# and the label needs that answer; see empty_response_error.
+FINISH_TRUNCATED = "length"
+
 
 def reasoning_ate_the_output(
     completion_tokens: int | None, reasoning_tokens: int | None
@@ -948,15 +1030,48 @@ def empty_response_error(
     the evidence for the claim; a reader who doubts the label can check
     it against the card's own metrics.
 
-    The old wording is kept exactly for a genuinely empty response with
-    no reasoning behind it, which is a different failure (a provider
-    returning null content on a refusal) and still described correctly by
-    the sentence that was already there.
+    THREE OUTCOMES, NOT TWO, AND THE THIRD IS A CORRECTION. An
+    adversarial review found that the shape test is close to a TAUTOLOGY
+    at this call site. This function is only reached when
+    _flatten_content came back falsy, so completion minus reasoning is
+    the count of completion tokens that were neither thinking nor
+    visible text, which is around zero for any reasoning model that
+    produced nothing. The ratio is therefore at or near 1.0 whatever the
+    REASON for the emptiness: a refusal, a content filter, a provider
+    abort and a real truncation all land in the same bucket.
+
+    So the shape alone cannot carry the word "exhausted", which claims
+    the budget ran out. Measured before the fix, a content_filter
+    refusal that spent 37 of 16384 tokens, 0.2% of its budget, was told
+    its completion budget had been exhausted, and static/stream.js then
+    appended "try extended budget" because it keys its remedy on the
+    same predicate. The branch was recommending a four-times-larger
+    retry for a failure no budget can fix, which is a sharper version of
+    the very thing the old wording was replaced for.
+
+    finish_reason is what discriminates, and reading it costs nothing
+    this fix cares about: it is OpenRouter's normalized value, so it
+    names no vendor, and it is a field that came BACK, so it is as
+    available on an ignored-parameter route as the counts are.
+
+    The old wording is kept for a genuinely empty response with no
+    reasoning behind it, which is a third failure again and was always
+    described correctly by the sentence already there.
     """
     if reasoning_ate_the_output(completion_tokens, reasoning_tokens):
+        if finish_reason == FINISH_TRUNCATED:
+            return (
+                "no visible answer: completion budget exhausted during "
+                f"reasoning ({reasoning_tokens} reasoning tokens)"
+            )
+        # The accounting fact without the causal claim. Everything the
+        # reader can act on survives: where the money went, how much of
+        # it, and why generation stopped. Only the assertion the numbers
+        # do not support is gone.
         return (
-            "no visible answer: completion budget exhausted during "
-            f"reasoning ({reasoning_tokens} reasoning tokens)"
+            "no visible answer: the whole completion went to reasoning "
+            f"({reasoning_tokens} reasoning tokens, finish_reason: "
+            f"{finish_reason or 'unknown'})"
         )
     return f"empty response (finish_reason: {finish_reason or 'unknown'})"
 
@@ -1056,6 +1171,7 @@ async def run_model(
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
     record_prompt: str | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
@@ -1106,7 +1222,7 @@ async def run_model(
         # cannot collide in practice, because the reservation stands
         # down when an effort is set, but the ordering means the rule
         # holds even if that guard were ever wrong.
-        **reasoning_reservation(max_tokens, controls),
+        **reasoning_reservation(max_tokens, controls, may_send_reasoning_cap),
         # Last, and only the controls that were set. The merge is safe
         # because control_payload emits from a fixed key list that shares
         # nothing with the keys above; a test asserts that, so a future
@@ -1211,9 +1327,14 @@ async def run_model(
         # reasoning model can spend a whole budget without ever producing
         # visible text. Both must surface as an error so every result
         # carries either text or an error, a contract the frontend relies
-        # on to pick a render state; empty_response_error is what tells
-        # the two apart. Non-str oddities land here too rather than
-        # leaking into response_text.
+        # on to pick a render state.
+        #
+        # empty_response_error tells the three cases apart, and it needs
+        # finish_reason to do it: at this call site there is no visible
+        # text by construction, so the token shape alone cannot separate
+        # a refusal that thought a little from a budget that ran out.
+        # Non-str oddities land here too rather than leaking into
+        # response_text.
         result["error"] = empty_response_error(
             result["finish_reason"],
             result["completion_tokens"],
@@ -1232,6 +1353,7 @@ async def stream_model(
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
     record_prompt: str | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
@@ -1297,7 +1419,7 @@ async def stream_model(
         # reason. The streaming path is the one the browser uses, so a
         # reservation that covered only the batch endpoint would cover
         # almost nothing a person actually runs.
-        **reasoning_reservation(max_tokens, controls),
+        **reasoning_reservation(max_tokens, controls, may_send_reasoning_cap),
         # See run_model: last, and only what was set, so a blank controls
         # set leaves this payload byte for byte what it was before.
         **control_payload(controls),
@@ -1663,6 +1785,7 @@ async def judge_response(
     reference: str | None,
     response_text: str | None,
     provider_prefs: dict[str, Any] | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> dict[str, Any]:
     """One rubric score from a judge model, or an error saying why not.
 
@@ -1710,8 +1833,12 @@ async def judge_response(
         # sentence" needs.
         #
         # No controls here by construction: the judge does not take the
-        # experiment's, so the not-both rule cannot bite.
-        **reasoning_reservation(JUDGE_MAX_TOKENS),
+        # experiment's, so the not-both rule cannot bite. The catalog
+        # flag still gates it: a judge model that does not think by
+        # default must not be made to start, least of all inside a 512
+        # token budget where the thinking would crowd out the verdict
+        # it was hired to give.
+        **reasoning_reservation(JUDGE_MAX_TOKENS, None, may_send_reasoning_cap),
     }
     if provider_prefs:
         payload["provider"] = provider_prefs
