@@ -2315,6 +2315,7 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
 from bench.models import (  # noqa: E402
     REASONING_SHARE_EXHAUSTED,
+    _ingest_usage,
     empty_response_error,
     reasoning_ate_the_output,
 )
@@ -2674,3 +2675,129 @@ def test_the_stored_counts_have_exactly_one_source():
 
     for column in RECONCILABLE_COLUMNS:
         assert "token" not in column, column
+
+
+# ---- A1's live probe, replayed. The two usage blocks below are real
+# ---- wire bytes, not a hand-built shape, which is why they get their
+# ---- own fixture and their own test rather than a paragraph in a
+# ---- commit body nobody can execute.
+
+PROBE = json.loads(
+    (Path(__file__).parent / "fixtures" / "probe_reasoning_enable.json").read_text()
+)
+
+
+def test_review_repro_a_bare_cap_enables_thinking_on_a_model_that_had_it_off():
+    """WINDOW: the two usage objects of a matched pair of live calls,
+    fed through the bench's own ingest.
+
+    THE CLAIM THIS SETTLES. The gate in fetch_catalog refuses to send an
+    unprompted reasoning cap to a model whose catalog entry says
+    thinking is off. That gate was built on a schema comment, "Default:
+    inferred from 'effort' or 'max_tokens'", which is an inference about
+    what OpenRouter does with a field. Inferences about other people's
+    systems are exactly what this repo requires to be pinned, and a
+    pinned quote is still not a measurement.
+
+    IT IS A MEASUREMENT NOW. Two calls to google/gemma-4-31b-it on
+    DeepInfra, 2026-08-12, differing in nothing but the presence of
+    reasoning.max_tokens:
+
+      gen-1786546333-86V1vJMk7JsWwwPhajoN  no field   0 reasoning tokens
+      gen-1786546398-Z4GhaMYohdT9FWGFiYhc  cap 256  312 reasoning tokens
+
+    The model publishes mandatory false and default_enabled false. It
+    was not thinking. The cap alone made it think, and billed 8.1 times
+    as much for the same question.
+
+    REPLAYED THROUGH _ingest_usage rather than asserted as arithmetic on
+    the JSON, so this also proves the bench reads these real blocks the
+    way the fix assumes it does. A synthetic fixture cannot do that;
+    every stub in this suite was written by someone who already believed
+    the shape.
+    """
+    control: dict = {}
+    capped: dict = {}
+    _ingest_usage(control, PROBE["control"]["usage"])
+    _ingest_usage(capped, PROBE["capped"]["usage"])
+
+    # The model was not thinking.
+    assert control["reasoning_tokens"] == 0
+    # The cap alone made it think.
+    assert capped["reasoning_tokens"] == 312
+    # And it is not a rounding: 92% of the completion went to reasoning.
+    assert capped["reasoning_tokens"] / capped["completion_tokens"] > 0.9
+
+    # THE COST OF HAVING SHIPPED THIS UNGATED, on one short question.
+    ratio = capped["billed_cost_usd"] / control["billed_cost_usd"]
+    assert 8.0 < ratio < 8.2, ratio
+
+
+def test_the_probes_capped_response_clears_the_exhaustion_threshold():
+    """WINDOW: the same two blocks, read by the shape test that drives
+    the card's label and its indicator.
+
+    A REAL RESPONSE ON THE RIGHT SIDE OF THE LINE. Every other case
+    exercising REASONING_SHARE_EXHAUSTED in this suite is a number
+    somebody chose. This one came off the wire at 312 of 338, and it
+    clears nine tenths, which is the first evidence that the threshold
+    is reachable by an ordinary short answer from an ordinary model
+    rather than only by a $3.50 document prompt.
+
+    AND ITS finish_reason IS "stop", NOT "length", which is precisely
+    the distinction A2 was corrected to make. Nothing was truncated
+    here; the budget did not run out. A label built on the token shape
+    alone would have told this run its completion budget was exhausted.
+    """
+    assert reasoning_ate_the_output(338, 312) is True
+    assert PROBE["capped"]["_finish_reason"] == "stop"
+    # So the honest sentence is the one without the causal claim, and no
+    # budget remedy is offered for a run whose budget was never the
+    # constraint.
+    assert empty_response_error("stop", 338, 312) == (
+        "no visible answer: the whole completion went to reasoning "
+        "(312 reasoning tokens, finish_reason: stop)"
+    )
+    # The control is nowhere near it, which is the other half.
+    assert reasoning_ate_the_output(35, 0) is False
+
+
+def test_review_repro_a_non_byok_run_reports_an_upstream_cost():
+    """WINDOW: the cost_details of both probe calls, and the column the
+    bench derives from them.
+
+    AN UNDOCUMENTED SHAPE THE PROBE CAUGHT IN PASSING. OpenRouter's
+    usage-accounting page says upstream_inference_cost "is only
+    available for BYOK (Bring Your Own Key) requests. For all other
+    requests it will be 0 or null." Both probe calls carry
+    is_byok false AND a nonzero upstream_inference_cost, equal to cost
+    to the last digit, alongside two fields the page does not mention at
+    all: upstream_inference_prompt_cost and
+    upstream_inference_completions_cost.
+
+    WHAT IT COSTS THE BENCH. _as_upstream_cost degrades only a zero or
+    absent value to None, so a value like this one is STORED, and the
+    README's claim that a NULL there is "the honest record of this run
+    was not BYOK" does not hold on this route: the column is populated
+    for a run that was not BYOK. The number is also not the separate
+    provider bill the column exists to hold; it is the credit charge
+    repeated.
+
+    NOT FIXED HERE, deliberately. Gating the column on is_byok is a
+    behaviour change to the money record and it is the reviewer's call,
+    not a thing to slip into a test-writing pass. What this test does is
+    stop the shape being rediscovered: it pins what the wire actually
+    sent, so the decision is made against evidence whenever it is made.
+    """
+    for kind in ("control", "capped"):
+        usage = PROBE[kind]["usage"]
+        assert usage["is_byok"] is False, kind
+        upstream = usage["cost_details"]["upstream_inference_cost"]
+        assert upstream > 0, kind
+        # Not a second, independent figure. The same charge again.
+        assert upstream == usage["cost"], kind
+
+    # And the bench stores it, which is the part that matters.
+    result: dict = {}
+    _ingest_usage(result, PROBE["capped"]["usage"])
+    assert result["upstream_inference_cost_usd"] is not None

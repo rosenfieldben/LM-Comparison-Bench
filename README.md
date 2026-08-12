@@ -103,9 +103,23 @@ what the upstream provider billed you directly. The bench records it in
 its own column beside the credit charge and **never meters it**, because a
 direct provider bill is not money OpenRouter can decline and a ceiling
 that pretended otherwise would be describing a control it does not have.
-Off BYOK the field is absent or zero and the column is NULL, which is the
-honest record of "this run was not BYOK"; a stored zero would be
-indistinguishable from a BYOK run that genuinely cost nothing.
+The documentation says that off BYOK the field "will be 0 or null", and
+`_as_upstream_cost` degrades a zero or absent value to None on that
+basis, so that a stored zero could not be confused with a BYOK run that
+genuinely cost nothing.
+
+**That is not always what arrives.** Both calls of the reasoning probe
+above carry `is_byok: false` together with a *nonzero*
+`upstream_inference_cost` equal to `cost` to the last digit, and two
+further fields the documentation does not mention at all
+(`upstream_inference_prompt_cost`,
+`upstream_inference_completions_cost`). So on that route the column is
+populated for a run that was not BYOK, and what it holds is the credit
+charge repeated rather than a separate provider bill. Read a populated
+`upstream_inference_cost_usd` as "the provider reported this figure",
+not as "this run was BYOK". The measurement is pinned in the fixture
+named above; whether the column should start gating on `is_byok` is an
+open question about the money record and has not been decided here.
 
 It travels the whole way: served on the result, written by the reconcile
 pass from the generation record, carried on the export's trial lines, and
@@ -321,8 +335,23 @@ rule, 256 of its 512.
 
 "Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
 request schema says of the reasoning object's `enabled` key: "Default:
-inferred from `effort` or `max_tokens`". So a cap sent on its own does
-not merely bound thinking, it **switches thinking on**. On a model whose
+inferred from `effort` or `max_tokens`", so a cap sent on its own should
+not merely bound thinking but **switch it on**. That was tested rather
+than assumed. Two live calls to `google/gemma-4-31b-it` (served by
+DeepInfra, 2026-08-12), a model publishing `default_enabled: false`,
+differing in nothing but that one field:
+
+| | control | with `reasoning: {"max_tokens": 256}` |
+|---|---|---|
+| generation | `gen-1786546333-86V1vJMk7JsWwwPhajoN` | `gen-1786546398-Z4GhaMYohdT9FWGFiYhc` |
+| completion tokens | 35 | 338 |
+| reasoning tokens | **0** | **312** |
+| cost | $1.629e-05 | $1.3182e-04 |
+
+Both stopped normally. The cap alone enables thinking, and billed 8.1x
+for the same short question. Both usage blocks are in the repository at
+`tests/fixtures/probe_reasoning_enable.json` and a test replays them. On
+a model whose
 catalog entry says reasoning is off by default, an unprompted cap would
 start buying reasoning tokens nobody was buying, on every run, which is
 the opposite of what this exists to do.
@@ -619,6 +648,16 @@ OpenRouter's published schema for the generation endpoint either, so the
 reconcile path reads the key opportunistically and stores whatever comes
 back. Nothing here has observed it come back: read a NULL there as "never
 reported", not as "the provider served unquantized weights".
+
+**Reasoning text is not recorded, only its token count.** Some routes
+return the thinking itself in-band, in `message.reasoning` with
+`reasoning_details` blocks beside it; `google/gemma-4-31b-it` on
+DeepInfra did so on 2026-08-12
+(`gen-1786546398-Z4GhaMYohdT9FWGFiYhc`). The bench reads
+neither field. What a card shows and a row stores is
+`reasoning_tokens` from the usage object, which is a count of thinking
+and not the thinking, so a replayed run can say how much of the budget
+went to reasoning and can never say what the reasoning was.
 
 Some of that is only knowable after the fact. A run stopped mid-stream
 never receives a usage object, and OpenRouter's `/generation` endpoint

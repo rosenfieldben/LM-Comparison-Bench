@@ -734,16 +734,45 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # true, hide disable controls and do not send effort: 'none' --
         # the model rejects it."
         #
-        # THE REASON THIS FLAG HAD TO EXIST. The request schema on the
-        # same page says of the enabled key: "Default: inferred from
-        # 'effort' or 'max_tokens'". So a request carrying a reasoning
-        # cap and nothing else does not merely BOUND thinking, it turns
-        # thinking ON. On a model whose default is off, an unprompted
-        # cap would start buying reasoning tokens that were never being
-        # bought, on every run, in an instrument whose product is a
-        # comparison between models. Measured against the live catalog
-        # on 2026-08-12: of 406 models, 23 publish default_enabled false
-        # without mandatory, and they are the frontier lineup.
+        # THE REASON THIS FLAG HAD TO EXIST, and it is MEASURED rather
+        # than reasoned from the documentation. The request schema says
+        # of the enabled key: "Default: inferred from 'effort' or
+        # 'max_tokens'", which implies a cap sent alone does not merely
+        # BOUND thinking but turns it ON. That implication was tested
+        # against the wire before this gate was trusted.
+        #
+        # THE PROBE, two live calls to google/gemma-4-31b-it served by
+        # DeepInfra on 2026-08-12, a model whose descriptor publishes
+        # default_enabled false and mandatory false:
+        #
+        #   gen-1786546333-86V1vJMk7JsWwwPhajoN, control, no field
+        #     completion 35, reasoning_tokens 0, cost 1.629e-05
+        #
+        #   gen-1786546398-Z4GhaMYohdT9FWGFiYhc, the identical call
+        #   with ONLY reasoning: {"max_tokens": 256} added
+        #     completion 338, reasoning_tokens 312, cost 0.00013182,
+        #     plus a full visible chain of thought in message.reasoning
+        #     with reasoning_details blocks
+        #
+        # Both finish_reason stop. Zero reasoning tokens without the
+        # field, 312 with it, and 8.1 times the cost for the same short
+        # question. The cap alone enables thinking. Nothing else
+        # differed between the two calls, so this is not an inference
+        # about a schema comment; it is the observed behaviour of the
+        # one field this code decides whether to send.
+        #
+        # Both usage blocks are in the tree verbatim, at
+        # tests/fixtures/probe_reasoning_enable.json, and a test replays
+        # them through _ingest_usage rather than restating their
+        # arithmetic.
+        #
+        # WHAT THAT WOULD HAVE COST UNGATED. On a model whose default is
+        # off, an unprompted cap starts buying reasoning tokens that were
+        # never being bought, on every run, in an instrument whose
+        # product is a comparison between models. Measured against the
+        # live catalog on 2026-08-12: of 406 models, 23 publish
+        # default_enabled false without mandatory, and they are the
+        # frontier lineup.
         #
         # AND THE MODEL MUST ADVERTISE THE PARAMETER, which is the second
         # condition and it is about strict mode rather than about money.

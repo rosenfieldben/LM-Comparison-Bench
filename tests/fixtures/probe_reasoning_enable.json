@@ -1,0 +1,65 @@
+{
+  "_what_this_is": "The A1 live probe. Two real OpenRouter usage blocks, verbatim from the wire, that settle whether a reasoning cap sent alone BOUNDS thinking or ENABLES it. Recorded here rather than quoted in a commit body so the evidence is in the tree, and read by a test so it cannot go stale unnoticed.",
+  "_model": "google/gemma-4-31b-it",
+  "_provider": "DeepInfra",
+  "_measured": "2026-08-12",
+  "_descriptor": "the catalog publishes mandatory false and default_enabled false for this model, which is the bucket the gate refuses",
+  "_reading": "0 reasoning tokens without the field, 312 with it, 92% of the completion. Cost 8.1x. Nothing differed between the two calls but the presence of reasoning.max_tokens.",
+  "control": {
+    "_generation_id": "gen-1786546333-86V1vJMk7JsWwwPhajoN",
+    "_request": "no reasoning field sent",
+    "_finish_reason": "stop",
+    "usage": {
+      "prompt_tokens": 23,
+      "completion_tokens": 35,
+      "total_tokens": 58,
+      "cost": 1.629e-05,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 1.629e-05,
+        "upstream_inference_prompt_cost": 2.99e-06,
+        "upstream_inference_completions_cost": 1.33e-05
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 0,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    }
+  },
+  "capped": {
+    "_generation_id": "gen-1786546398-Z4GhaMYohdT9FWGFiYhc",
+    "_request": "identical, plus only reasoning: {\"max_tokens\": 256}",
+    "_finish_reason": "stop",
+    "_also_returned": "a full visible chain of thought in message.reasoning, a multi-draft deliberation, with reasoning_details blocks beside it. The bench reads neither field.",
+    "usage": {
+      "prompt_tokens": 26,
+      "completion_tokens": 338,
+      "total_tokens": 364,
+      "cost": 0.00013182,
+      "is_byok": false,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "cache_write_tokens": 0,
+        "audio_tokens": 0,
+        "video_tokens": 0
+      },
+      "cost_details": {
+        "upstream_inference_cost": 0.00013182,
+        "upstream_inference_prompt_cost": 3.38e-06,
+        "upstream_inference_completions_cost": 0.00012844
+      },
+      "completion_tokens_details": {
+        "reasoning_tokens": 312,
+        "image_tokens": 0,
+        "audio_tokens": 0
+      }
+    }
+  }
+}
