@@ -54,7 +54,9 @@ from bench.models import (
     QUANTIZATION_LEVELS,
     as_money,
     as_text,
+    endpoint_supports_reasoning,
     fetch_catalog,
+    fetch_endpoints,
     judge_response,
     keepalive_socket_options,
     missing_parameters,
@@ -3797,6 +3799,48 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     return experiment
 
 
+async def trial_may_send_reasoning_cap(experiment: dict[str, Any], model: str) -> bool:
+    """Whether one trial may carry the visible-output reservation.
+
+    THE MODEL AGGREGATE DOES NOT VOUCH FOR A PINNED ENDPOINT, which is
+    the whole reason this is a function rather than a dict lookup.
+    app.state.reasoning_defaults is derived from the model-level
+    catalog, which is a UNION across every host that serves the model.
+    A strict pin selects ONE host and sends allow_fallbacks false with
+    require_parameters true, under which a parameter the pinned host
+    does not accept does not degrade: it empties the provider pool.
+    Measured on 2026-08-12, one model's three endpoints advertised 18,
+    12 and 17 parameters and differed in which, so the union really does
+    over-claim.
+
+    So a pinned trial asks the endpoint listing, and an unpinned one
+    keeps the model-level answer, which is correct for it: without a pin
+    the request may be served by any eligible host and the union is the
+    right question.
+
+    ABSENCE OF EVIDENCE IS NOT SUPPORT. When the listing cannot answer,
+    whether because it did not fetch, or no endpoint matched the pin, or
+    the matched endpoint published no parameter list, this returns False
+    and the reservation is simply not sent. That is the same instinct
+    the estimand's creation-time check carries in prose ("refuses rather
+    than assume support"), applied where a refusal would cost a run: not
+    sending an optional field is free, and sending one the pinned host
+    may reject is not.
+    """
+    if not (experiment.get("estimand_mode") == "underlying_model"):
+        return model in app.state.reasoning_defaults
+    pin = (experiment.get("provider_pins") or {}).get(model)
+    if pin is None:
+        return model in app.state.reasoning_defaults
+    # The model-level gate still has to pass: a pinned endpoint that
+    # accepts the field says nothing about whether the MODEL reasons
+    # unprompted, and both questions must be answered yes.
+    if model not in app.state.reasoning_defaults:
+        return False
+    listing = await fetch_endpoints(app.state.client, model)
+    return endpoint_supports_reasoning(listing, pin) is True
+
+
 def trial_provider_prefs(
     experiment: dict[str, Any], model: str, controls: dict[str, Any]
 ) -> dict[str, Any]:
@@ -3880,7 +3924,11 @@ async def run_one_trial(
                 holder=holder,
                 provider_prefs=trial_provider_prefs(experiment, model, controls),
                 controls=controls,
-                may_send_reasoning_cap=model in app.state.reasoning_defaults,
+                # Asks the PINNED endpoint when there is one; see
+                # trial_may_send_reasoning_cap.
+                may_send_reasoning_cap=await trial_may_send_reasoning_cap(
+                    experiment, model
+                ),
             ):
                 if event["type"] == "done":
                     result = event["result"]
@@ -4433,7 +4481,6 @@ async def score_one_result(
             # not one of them, and pinning it to a provider chosen for
             # somebody else's lineup would be a claim nobody made.
             provider_prefs=app.state.provider_prefs,
-            may_send_reasoning_cap=judge_model in app.state.reasoning_defaults,
         )
     # Post-spend. The call has happened, so nothing below may turn a paid
     # verdict into an exception, and the charge is recorded whether or not

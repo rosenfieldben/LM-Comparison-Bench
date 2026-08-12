@@ -12329,17 +12329,101 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
 
     reasoning_ok = ["max_tokens", "reasoning"]
     entries = [
-        # Always reasons and takes the field. The incident's own shape,
-        # and the only shape that may receive an unprompted cap.
+        # THE REVIEW'S OWN EXAMPLES FIRST, verbatim from the live catalog
+        # on 2026-08-12, because a gate argued about in the abstract is a
+        # gate nobody can check. Both cleared the previous gate.
+        #
+        # openai/gpt-5.1 publishes default_enabled TRUE and
+        # default_effort "none" together. The contract says "If the
+        # value is 'none', treat it as 'reasoning off by default'", so
+        # this model does not reason and a cap would switch it on.
         {
-            "id": "m/mandatory",
-            "reasoning": {"mandatory": True},
+            "id": "openai/gpt-5.1",
+            "reasoning": {
+                "mandatory": False,
+                "default_enabled": True,
+                "supported_efforts": ["high", "medium", "low", "none"],
+                "default_effort": "none",
+            },
             "supported_parameters": reasoning_ok,
         },
-        # Reasons unless told not to, and takes the field.
+        # A Flash Lite variant: it DOES reason, at default_effort
+        # minimal, which is approximately 10% of max_tokens. It publishes
+        # no supports_max_tokens, so a cap is read as an effort request
+        # and half the budget determines approximately MEDIUM, which is
+        # approximately 50%. Sending it would quintuple the thinking this
+        # model was going to do, unprompted.
+        {
+            "id": "google/gemini-3.1-flash-lite",
+            "reasoning": {
+                "mandatory": False,
+                "default_enabled": True,
+                "supported_efforts": ["high", "medium", "low", "minimal"],
+                "default_effort": "minimal",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # Mandatory AND minimal, so the mandatory branch alone is not
+        # enough either: it always reasons, and a cap would still raise
+        # the effort it reasons at.
+        {
+            "id": "m/mandatory-but-minimal",
+            "reasoning": {
+                "mandatory": True,
+                "default_effort": "minimal",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # ONE DIMENSION AT A TIME, and this row exists because the first
+        # version of this table could not isolate default_effort. Both
+        # real examples above also lack supports_max_tokens, so removing
+        # the default_effort check left their verdicts unchanged and the
+        # mutation that deletes it passed. A test that cannot fail for
+        # the reason it was written proves nothing about that reason.
+        #
+        # This shape clears every other condition and is refused ONLY by
+        # default_effort "none". The live catalog contains no such model
+        # today; the rule still has to be right, because the catalog is
+        # somebody else's file and can gain one any morning.
+        {
+            "id": "m/enabled-but-effort-none",
+            "reasoning": {
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # The mirror: identical but for an effort that is not "none", so
+        # the pair differs in exactly one field and the verdicts differ.
+        {
+            "id": "m/enabled-and-effort-medium",
+            "reasoning": {
+                "default_enabled": True,
+                "default_effort": "medium",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # Always reasons AND takes a real token budget, which is the
+        # only shape that may receive an unprompted cap.
+        {
+            "id": "m/mandatory",
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Reasons unless told not to, and takes a real budget.
         {
             "id": "m/on",
-            "reasoning": {"default_enabled": True},
+            "reasoning": {"default_enabled": True, "supports_max_tokens": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Reasons, but the cap would be an effort rather than a ceiling.
+        # This is the largest bucket in the real catalog, 149 of 410, and
+        # it includes the model the incident happened on.
+        {
+            "id": "m/reasons-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "high"},
             "supported_parameters": reasoning_ok,
         },
         # Thinking is OFF. Sending a cap here would switch it on.
@@ -12359,11 +12443,14 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
         # catalog, and the gate must still refuse it.
         {
             "id": "m/thinks-but-unadvertised",
-            "reasoning": {"mandatory": True},
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
             "supported_parameters": ["max_tokens"],
         },
         # Thinks unprompted, and the catalog does not say what it takes.
-        {"id": "m/thinks-no-param-list", "reasoning": {"mandatory": True}},
+        {
+            "id": "m/thinks-no-param-list",
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
+        },
         # No descriptor at all.
         {"id": "m/none", "supported_parameters": reasoning_ok},
     ]
@@ -12377,8 +12464,18 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
     catalog = asyncio.run(go())
     flags = {m["id"]: m["may_send_reasoning_cap"] for m in catalog["models"]}
     assert flags == {
+        # The review's two named examples, both refused.
+        "openai/gpt-5.1": False,
+        "google/gemini-3.1-flash-lite": False,
+        "m/mandatory-but-minimal": False,
+        # The isolating pair: one field apart, opposite answers.
+        "m/enabled-but-effort-none": False,
+        "m/enabled-and-effort-medium": True,
+        # Reasons with a real budget: the cap is a ceiling, so it rides.
         "m/mandatory": True,
         "m/on": True,
+        # Reasons, but the cap would set an effort instead of bounding.
+        "m/reasons-no-budget": False,
         "m/off": False,
         "m/unstated": False,
         "m/thinks-but-unadvertised": False,

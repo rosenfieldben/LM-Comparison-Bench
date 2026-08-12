@@ -336,8 +336,19 @@ and reruns reuse the budget of the run they retry. The API accepts
 A request to a model that **already reasons** asks for half its
 completion budget to be left for the visible answer, sending
 `reasoning: {"max_tokens": N}` beside the cap: 8192 of the standard
-tier's 16384, 32768 of extended's 65536. The judge reserves on the same
-rule, 256 of its 512.
+tier's 16384, 32768 of extended's 65536.
+
+**The judge reserves nothing**, and the arithmetic is why. Its budget is
+512 tokens. Half of that is 256, which the contract's Anthropic minimum
+raises to 1024 (*"that value is used directly with a minimum of 1024
+tokens"*), and the contract also requires that *"`max_tokens` must be
+strictly higher than the reasoning budget"*. 512 is not higher than
+1024, so the request is unsatisfiable by the contract's own rules.
+Raising the judge's budget past 2048 to make a half share legal would
+buy reasoning headroom for a task whose entire output is a number and a
+sentence. A judge that exhausts already records the trial as unscored,
+which is the true statement and a different situation from a comparison
+card that billed for thinking and showed nothing.
 
 "Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
 request schema says of the reasoning object's `enabled` key: "Default:
@@ -363,15 +374,39 @@ start buying reasoning tokens nobody was buying, on every run, which is
 the opposite of what this exists to do.
 
 The bench therefore sends the cap only where the catalog answers yes to
-both of two questions: does the model reason regardless (`mandatory` or
-`default_enabled`), and does it advertise the `reasoning` parameter.
-The second matters under **strict mode**, which sends
-`require_parameters: true`: there, a provider that does not support a
-request parameter is excluded rather than allowed to ignore it, so an
-unadvertised field would narrow the provider pool and thereby change
-what is being measured. Where either answer is no, or the catalog is
-silent, nothing is sent and the payload is byte-identical to what it was
-before this feature existed.
+**all three** of these questions.
+
+**Does the model reason regardless?** `mandatory: true`, or
+`default_enabled: true` with a `default_effort` that is not `"none"`.
+That last clause is not a technicality: `openai/gpt-5.1` publishes
+`default_enabled: true` and `default_effort: "none"` together, and the
+contract says *"If the value is `none`, treat it as 'reasoning off by
+default'"*. Reading only the first flag would switch its reasoning on.
+
+**Is the cap actually a ceiling?** `supports_max_tokens: true`. Without
+it, the contract says the value *"will be used to determine the effort
+level"*, and half a budget determines approximately `medium`. On a model
+whose default effort is `minimal`, roughly 10%, that is a fivefold
+increase in thinking bought unprompted. The Gemini 3.1 and 3.5 Flash
+Lite variants publish exactly that shape.
+
+**Does it advertise the parameter?** `reasoning` in
+`supported_parameters`. Under **strict mode**, which sends
+`require_parameters: true`, a provider that does not support a request
+parameter is excluded rather than allowed to ignore it, so an
+unadvertised field would narrow the provider pool and change what is
+being measured.
+
+Where any answer is no, or the catalog is silent, nothing is sent and
+the payload is byte-identical to what it was before this feature
+existed.
+
+**A strict pin is checked against the pinned endpoint**, never the model
+aggregate. OpenRouter publishes capabilities per endpoint and a model's
+list is the union across hosts; one real model's three endpoints
+advertised 18, 12 and 17 parameters on 2026-08-12. A pinned run asks
+`/models/:author/:slug/endpoints` about that one host, and when the
+listing cannot answer, the field is not sent.
 
 How binding the request is where it IS sent depends on the model, and
 the honest range is wide. See **How far the reservation actually
@@ -417,12 +452,31 @@ allocation at 1024 tokens, and for Gemini 3 "Google internally maps this
 budget value to a `thinkingLevel`, so you will not get precise token
 control".
 
-Before any of that, the gate: the cap is only sent where the catalog
-says the model reasons by default. Measured on 2026-08-12, 157 of 406
-models qualify (83 `mandatory`, 74 `default_enabled`); 23 publish
-reasoning as off by default and are deliberately left alone; the rest
-either do not say or publish no reasoning descriptor at all, and silence
-is treated as "do not send".
+Before any of that, the gate. Measured against the live catalog on
+2026-08-12, of 410 models:
+
+| | count |
+|---|---|
+| the cap is a true ceiling, so it rides | **8** |
+| reasons, but no budget support: a cap would set an effort | 149 |
+| `default_effort: "none"`, so reasoning is off | 2 |
+| `default_enabled: false`, so reasoning is off | 23 |
+| does not reason unprompted, or the catalog does not say | 98 |
+| no reasoning descriptor at all | 130 |
+
+**Eight.** An earlier version of this gate vouched for 159, and the 151
+it withdrew are the finding rather than a regression: on 149 of them the
+field was never a ceiling, and on 2 it would have switched reasoning on.
+
+Stated plainly, because it is the honest cost: the model the original
+incident happened on publishes `mandatory: true` but no
+`supports_max_tokens`, so **it no longer receives a reservation**. The
+vendor's prose names its family as supporting `reasoning.max_tokens`
+while the per-model flag does not, and where a contract contradicts
+itself the narrower reading is the safe one. The request-side arm of
+this fix therefore covers eight routes and not the one that started it.
+The general answer was always the instrumentation below, which reads the
+tokens that come back and works on all 410.
 
 Two further cases drop it entirely. If you set a reasoning effort under
 **Experiment controls**, the reservation stands down, because the same

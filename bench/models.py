@@ -74,6 +74,23 @@ OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 MODELS_URL = os.environ.get("MODELS_URL", "https://openrouter.ai/api/v1/models")
+
+# The PER-ENDPOINT capability listing, which is a different publication
+# from the model-level one MODELS_URL returns and can disagree with it.
+# Pinned against
+# https://openrouter.ai/docs/api-reference/list-endpoints-for-a-model,
+# read 2026-08-12: GET /api/v1/models/:author/:slug/endpoints, whose
+# data.endpoints[] each carry provider_name and their own
+# supported_parameters.
+#
+# MEASURED, because "can disagree" is the whole reason this exists. On
+# 2026-08-12 nvidia/nemotron-3-ultra-550b-a55b published three
+# endpoints advertising 18, 12 and 17 parameters respectively, differing
+# in which ones. A model-level aggregate is a union over hosts, so it
+# proves nothing about the ONE host a strict pin selects.
+ENDPOINTS_URL = os.environ.get(
+    "ENDPOINTS_URL", "https://openrouter.ai/api/v1/models/{model}/endpoints"
+)
 GENERATION_URL = os.environ.get(
     "GENERATION_URL", "https://openrouter.ai/api/v1/generation"
 )
@@ -530,6 +547,94 @@ CONTROL_PARAMETERS: dict[str, str] = {
 }
 
 
+async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, Any]:
+    """The per-endpoint capability listing for one model, or an honest
+    failure.
+
+    Never raises, the same contract fetch_catalog carries. Returns
+    fetched False when the listing could not be obtained, which callers
+    must treat as absence of evidence rather than absence of support:
+    strict mode refuses on it, exactly as it refuses on a model the
+    catalog does not list.
+
+    Only the two fields a decision is made from are kept. Anything else
+    the endpoint publishes is not this function's business, and a parser
+    that carried it would invite somebody to make a second decision from
+    a field nobody checked.
+    """
+    out: dict[str, Any] = {"fetched": False, "endpoints": []}
+    try:
+        response = await client.get(
+            ENDPOINTS_URL.format(model=model), timeout=PRICES_TIMEOUT_S
+        )
+        if response.status_code != 200:
+            return out
+        data = response.json()["data"]
+        entries = data["endpoints"]
+        if not isinstance(entries, list):
+            return out
+    except (httpx.HTTPError, ValueError, LookupError, TypeError):
+        return out
+    endpoints = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        supported = entry.get("supported_parameters")
+        endpoints.append(
+            {
+                "provider": _as_label(entry.get("provider_name")),
+                # None when the endpoint did not publish a list, which is
+                # not the same as publishing an empty one.
+                "supported_parameters": (
+                    sorted({x for x in supported if isinstance(x, str)})
+                    if isinstance(supported, list)
+                    else None
+                ),
+            }
+        )
+    out["fetched"] = True
+    out["endpoints"] = endpoints
+    return out
+
+
+def endpoint_supports_reasoning(
+    listing: Mapping[str, Any], provider: str | None
+) -> bool | None:
+    """Whether the PINNED endpoint advertises the reasoning parameter.
+
+    Three-valued on purpose. True and False are answers; None means the
+    listing could not answer, either because it was never fetched, or
+    because no endpoint matched the pin, or because the matched endpoint
+    published no parameter list. Callers must not collapse None into
+    False silently: strict mode's rule is that absence of evidence is
+    refused rather than assumed, and the two need different sentences.
+
+    WHY THIS CANNOT READ THE MODEL AGGREGATE. A strict pin selects ONE
+    host with allow_fallbacks false. The model-level
+    supported_parameters is a union across hosts, so it can advertise a
+    parameter that the pinned host does not accept, and under
+    require_parameters an unaccepted parameter does not degrade, it
+    empties the provider pool. Vouching for a pinned endpoint with an
+    aggregate is the specific mistake this function exists to make
+    impossible.
+
+    Matching is on the normalized slug both sides already use, so a pin
+    recorded as "deepinfra" finds a provider_name of "DeepInfra".
+    """
+    if not listing.get("fetched") or provider is None:
+        return None
+    want = normalized_provider_slug(provider)
+    for endpoint in listing.get("endpoints") or ():
+        name = endpoint.get("provider")
+        if name is None or normalized_provider_slug(name) != want:
+            continue
+        supported = endpoint.get("supported_parameters")
+        if supported is None:
+            return None
+        return "reasoning" in supported
+    return None
+
+
 def missing_parameters(
     supported: list[str] | None, controls: Mapping[str, Any] | None
 ) -> list[str]:
@@ -790,7 +895,38 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # default_enabled false without mandatory, and they are the
         # frontier lineup.
         #
-        # AND THE MODEL MUST ADVERTISE THE PARAMETER, which is the second
+        # TWO MORE DIMENSIONS OF THE SAME CONTRACT, added after a review
+        # showed the gate above was reading one flag of a five-key object
+        # and calling it the answer. Both are quoted from the same page,
+        # re-read in full 2026-08-12.
+        #
+        # DEFAULT_EFFORT "none" MEANS OFF, whatever default_enabled says:
+        # "If the value is 'none', treat it as 'reasoning off by default'
+        # rather than pre-selecting disable when the user explicitly
+        # turns reasoning on." openai/gpt-5.1 publishes default_enabled
+        # true AND default_effort none, so the previous gate vouched for
+        # it and a cap would have switched its reasoning on. That is the
+        # exact failure the gate was built to prevent, surviving inside
+        # the gate.
+        #
+        # A CAP WITHOUT BUDGET SUPPORT IS NOT A CEILING, IT IS AN EFFORT:
+        # "For models that only support 'reasoning.effort' (see below),
+        # the 'max_tokens' value will be used to determine the effort
+        # level", and the table below it puts medium at "approximately
+        # 50% of max_tokens", which is this constant's share. So on a
+        # route without supports_max_tokens, sending half the budget does
+        # not bound thinking at half; it ASKS FOR MEDIUM. On a model
+        # whose default effort is minimal (approximately 10%) that is a
+        # fivefold increase in thinking, bought unprompted. The Gemini
+        # 3.1 and 3.5 Flash Lite variants publish exactly that shape:
+        # default_enabled true, default_effort minimal, no
+        # supports_max_tokens.
+        #
+        # So the reservation now rides only where it is a TRUE CEILING.
+        # Anything else is a request to think differently, which is the
+        # operator's call and not the bench's.
+        #
+        # AND THE MODEL MUST ADVERTISE THE PARAMETER, which is the third
         # condition and it is about strict mode rather than about money.
         # STRICT_PREFS sends require_parameters true, and under it a
         # provider that does not support a request parameter is not
@@ -802,26 +938,66 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # which providers are eligible, which silently changes what is
         # being measured".
         #
-        # As the catalog stands on 2026-08-12 the condition is redundant,
-        # because all 157 models that reason by default also advertise
-        # the parameter. It is here so that stays a fact about the code
+        # As the catalog stands the condition is redundant, because
+        # every model that clears the other two also advertises the
+        # parameter. It is here so that stays a fact about the code
         # rather than a fact about one morning's catalog: the flag that
         # says a model thinks and the list that says it accepts the
         # field are different publications and nothing keeps them in
         # step.
         #
-        # Three flags collapse to one derived boolean because only one
+        # THE PARTITION, measured against the live catalog on
+        # 2026-08-12, 410 models:
+        #
+        #     8  the cap is a true ceiling, so it rides
+        #   149  reasons, but no budget support: a cap would set effort
+        #     0  reasons with budget support, parameter unadvertised
+        #     2  default_effort none, so reasoning is OFF
+        #    23  default_enabled false, so reasoning is OFF
+        #    98  does not reason unprompted, or the catalog does not say
+        #   130  no reasoning descriptor at all
+        #
+        # The previous gate vouched for 159 of these. This one vouches
+        # for 8, and the 151 it withdraws are the finding rather than a
+        # regression: on 149 of them the field was never a ceiling, and
+        # on the other 2 it would have switched reasoning on.
+        #
+        # WHAT THAT COSTS, STATED PLAINLY. The incident's own model,
+        # which publishes mandatory true and default_effort high, does
+        # NOT publish supports_max_tokens, so it no longer receives a
+        # reservation. The vendor's prose names its family as supporting
+        # reasoning.max_tokens while the per-model flag does not, and
+        # the two disagree; where a contract contradicts itself the
+        # narrower reading is the safe one, because sending the field
+        # anyway would ask a model whose operator chose nothing to think
+        # at an effort nobody declared.
+        #
+        # That leaves the request-side arm of this fix covering 8 routes
+        # and not the one that started it, which is worth saying out
+        # loud rather than burying. The general answer was always the
+        # instrumentation: the relabelled error and the card indicator
+        # read the tokens that come BACK, so they work on all 410.
+        #
+        # Four flags collapse to one derived boolean because only one
         # question is being asked: may the bench send this model a
-        # reasoning cap it did not ask for. False when the catalog says
-        # thinking is off, false when it does not say, and false when
-        # the parameter is unadvertised. Rule one's default for an
-        # unknown is silence.
+        # reasoning cap it did not ask for, and will that cap be a
+        # ceiling when it arrives. Rule one's default for an unknown is
+        # silence.
         reasoning = entry.get("reasoning")
         if isinstance(reasoning, dict):
+            already_reasons = reasoning.get("mandatory") is True or (
+                reasoning.get("default_enabled") is True
+                # "none" is off, and it is checked here rather than
+                # folded into default_enabled because the catalog really
+                # does publish both together.
+                and reasoning.get("default_effort") != "none"
+            )
             model["may_send_reasoning_cap"] = (
-                reasoning.get("mandatory") is True
-                or reasoning.get("default_enabled") is True
-            ) and "reasoning" in (model["supported_parameters"] or ())
+                already_reasons
+                # Without this the cap is an effort request, not a cap.
+                and reasoning.get("supports_max_tokens") is True
+                and "reasoning" in (model["supported_parameters"] or ())
+            )
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
@@ -1766,6 +1942,43 @@ async def fetch_generation(
 # the verdict fits; nowhere near large enough to pay for an essay.
 JUDGE_MAX_TOKENS = 512
 
+# THE JUDGE SENDS NO REASONING RESERVATION, and the arithmetic is why.
+#
+# Pinned against
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# re-read 2026-08-12. Two sentences settle it:
+#
+#   "When using the reasoning.max_tokens parameter, that value is used
+#   directly with a minimum of 1024 tokens."
+#
+#   "Important: max_tokens must be strictly higher than the reasoning
+#   budget to ensure there are tokens available for the final response
+#   after thinking."
+#
+# Put them together against this budget. A judge asking for half of 512
+# sends a reasoning budget of 256, which the minimum raises to 1024, and
+# 1024 is not strictly lower than an outer max_tokens of 512. The
+# request is unsatisfiable by the contract's own arithmetic, and it was
+# being sent to every Anthropic judge that reasons by default. An
+# earlier version of this file shipped it, and the test that was
+# supposed to guard it mocked a 200 and read only the outgoing JSON, so
+# a request no provider could honour looked correct forever.
+#
+# RAISING THE BUDGET IS NOT THE FIX. To satisfy both rules the judge
+# would need an outer budget above 1024 with the reservation below it,
+# so at least 2048 to keep a half share, which is four times what a
+# verdict costs today, once per scored trial, at the judge's price. The
+# bench would be buying reasoning headroom for a task whose entire
+# output is a number and a sentence.
+#
+# AND A JUDGE THAT EXHAUSTS IS ALREADY HONEST. When a judge reasons past
+# its cap the trial is recorded as UNSCORED rather than failed, which is
+# the true statement: nobody graded it. That is a different situation
+# from a comparison card that billed for thinking and showed nothing,
+# because no claim about a model's answer depends on it. The failure
+# mode the reservation exists to prevent does not apply here.
+JUDGE_SENDS_NO_RESERVATION = True
+
 JUDGE_TIMEOUT_S = 60.0
 
 # The instruction that constrains the verdict's shape. Prompt-level
@@ -1867,7 +2080,6 @@ async def judge_response(
     reference: str | None,
     response_text: str | None,
     provider_prefs: dict[str, Any] | None = None,
-    may_send_reasoning_cap: bool = False,
 ) -> dict[str, Any]:
     """One rubric score from a judge model, or an error saying why not.
 
@@ -1914,13 +2126,14 @@ async def judge_response(
         # deliberation, and 256 visible is far more than "a number and a
         # sentence" needs.
         #
-        # No controls here by construction: the judge does not take the
-        # experiment's, so the not-both rule cannot bite. The catalog
-        # flag still gates it: a judge model that does not think by
-        # default must not be made to start, least of all inside a 512
-        # token budget where the thinking would crowd out the verdict
-        # it was hired to give.
-        **reasoning_reservation(JUDGE_MAX_TOKENS, None, may_send_reasoning_cap),
+        # NO RESERVATION AT ALL, deliberately, and the reason is
+        # arithmetic rather than caution. See JUDGE_SENDS_NO_RESERVATION
+        # beside JUDGE_MAX_TOKENS: half of 512 is 256, the documented
+        # Anthropic minimum raises that to 1024, and the contract also
+        # requires the outer max_tokens to be strictly higher than the
+        # reasoning budget. 512 is not higher than 1024, so the request
+        # this used to build could not be honoured by the rules it was
+        # built from.
     }
     if provider_prefs:
         payload["provider"] = provider_prefs

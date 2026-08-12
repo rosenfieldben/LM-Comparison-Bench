@@ -2240,59 +2240,82 @@ async def test_the_reservation_stands_down_for_a_declared_effort(client):
 
 
 @respx.mock
-async def test_the_judge_reserves_room_for_its_verdict(client):
-    """WINDOW: the judge's payload. Its budget is 512 tokens against a
-    rubric it has never seen, which is the shape most likely to invite a
-    model to think past its cap; a judge that reasons itself out of a
-    verdict leaves the trial unscored rather than failed.
+async def test_review_repro_the_judge_sends_no_unsatisfiable_reservation(client):
+    """WINDOW: the judge's outgoing payload, asserted against the PINNED
+    CONTRACT rather than against a mock's willingness to answer.
 
     SUSPENSION POINT: the await on judge_response. The payload is read
-    after it resolves, so the assertion cannot race the request it is
-    about.
+    after it resolves.
 
-    THE ARGUMENTS WERE IN THE WRONG ORDER, and an adversarial review is
-    what caught it. As first written this passed judge_model="rubric",
-    rubric=None, reference="the answer" and response_text="vendor/judge",
-    so it posted a request to a model called "rubric" asking it to grade
-    the string "vendor/judge" against no rubric at all. It PASSED, every
-    time, because the two things it asserted (the budget and the
-    reservation) are both computed from constants and neither one reads
-    a single argument this test was scrambling.
+    THE DEFECT, and it is arithmetic rather than judgement. The judge
+    used to reserve half of its 512 token budget, sending
+    reasoning.max_tokens 256. Two pinned rules make that request
+    impossible to honour:
 
-    That is a vacuous guard sitting over the judge, which is
-    money-adjacent machinery: every scored trial pays for one of these.
-    A test that cannot tell a correct call from a nonsensical one
-    certifies nothing about either.
+      "When using the reasoning.max_tokens parameter, that value is
+      used directly with a minimum of 1024 tokens."
 
-    The call is now shaped like every other judge_response call in this
-    file, and the assertions below name the arguments they came from, so
-    a future scramble changes an expected value instead of nothing."""
+      "Important: max_tokens must be strictly higher than the reasoning
+      budget to ensure there are tokens available for the final response
+      after thinking."
+
+    256 is raised to 1024 by the first rule. The second then requires
+    the outer max_tokens to exceed 1024, and it is 512. Every Anthropic
+    judge that reasons by default was receiving a request the contract
+    forbids.
+
+    WHY NOBODY NOTICED, which is the lens this test now carries. The
+    old test mocked a 200 and asserted the outgoing JSON contained
+    {"max_tokens": 256}. A mock cannot refuse. It answered "did we send
+    what we meant to send" when the question was "could anyone honour
+    what we sent", and those come apart precisely when a contract has
+    a minimum in it. The assertions below are written against the
+    contract's numbers, so the arithmetic is checked rather than the
+    mock's manners.
+    """
     respx.post(OPENROUTER_URL).respond(
         json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
     )
 
-    out = await judge_response(
-        client,
-        "judge/one",
-        "the rubric",
-        None,
-        "the answer",
-        may_send_reasoning_cap=True,
-    )
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
 
     body = json.loads(respx.calls[-1].request.content)
+    # THE FIELD IS ABSENT. Not smaller, not conditional: absent.
+    assert "reasoning" not in body
     assert body["max_tokens"] == JUDGE_MAX_TOKENS
-    # THE ARGUMENTS ARRIVED WHERE THEY WERE SENT. Cheap, and it is the
-    # whole difference between this test and the one it replaces: the
-    # model is the model, and the rubric and the answer are both in the
-    # prompt the judge actually receives.
-    assert body["model"] == "judge/one"
-    sent = " ".join(m["content"] for m in body["messages"])
-    assert "the rubric" in sent
-    assert "the answer" in sent
-    # And the call was a real one end to end, so the verdict parses.
+    # And the call still works, so the stand-down costs nothing here.
     assert out["score"] == 1
-    assert body["reasoning"] == {"max_tokens": JUDGE_MAX_TOKENS // 2}
+
+
+def test_the_judge_budget_could_not_satisfy_the_pinned_minimum():
+    """WINDOW: the arithmetic itself, with no request and no mock.
+
+    The shape that was being sent, checked against the two pinned rules
+    it had to satisfy. This is the test that would have caught the
+    defect on the day it was written, because it consults the contract
+    instead of a stub.
+
+    ANTHROPIC_REASONING_MINIMUM is not a number this repository chose.
+    It is the vendor's, quoted beside JUDGE_MAX_TOKENS, and it is
+    written down here so that raising the judge's budget later is a
+    decision somebody makes on purpose rather than one that silently
+    re-enables an impossible request.
+    """
+    anthropic_minimum = 1024
+
+    would_have_sent = int(JUDGE_MAX_TOKENS * REASONING_BUDGET_SHARE)
+    assert would_have_sent == 256
+    # Rule one raises it.
+    effective = max(would_have_sent, anthropic_minimum)
+    assert effective == 1024
+    # Rule two then cannot be satisfied: the outer budget must be
+    # STRICTLY higher than the reasoning budget.
+    assert not JUDGE_MAX_TOKENS > effective
+
+    # What it would take to make a half-share judge reservation legal,
+    # recorded so the cost of the alternative is visible: an outer
+    # budget above twice the minimum.
+    assert 2 * anthropic_minimum > JUDGE_MAX_TOKENS
 
 
 def test_no_model_name_appears_in_the_reservation_logic():
@@ -2932,3 +2955,122 @@ def test_review_repro_a_non_byok_run_reports_an_upstream_cost():
     result: dict = {}
     _ingest_usage(result, PROBE["capped"]["usage"])
     assert result["upstream_inference_cost_usd"] is not None
+
+
+# ---- T3: a strict pin selects one endpoint, and only that endpoint's
+# ---- published capabilities may vouch for the field sent to it.
+
+from bench.models import (  # noqa: E402
+    ENDPOINTS_URL,
+    endpoint_supports_reasoning,
+    fetch_endpoints,
+)
+
+
+@respx.mock
+async def test_review_repro_a_pinned_endpoint_is_not_vouched_for_by_the_aggregate(
+    client,
+):
+    """WINDOW: the endpoint listing for one model, read the way a strict
+    pin reads it.
+
+    SUSPENSION POINT: the await on fetch_endpoints. Everything asserted
+    is on the returned listing, which is fully assembled before the
+    coroutine returns.
+
+    THE DEFECT. A strict pin sends order plus allow_fallbacks false plus
+    require_parameters true, which selects ONE host and forbids it from
+    ignoring a parameter it does not support. The bench decided whether
+    to send the reasoning field from the MODEL-level catalog, which is a
+    union across every host that serves the model. A union can advertise
+    what the pinned host does not accept, and under require_parameters
+    that does not degrade into a silent ignore: it empties the provider
+    pool.
+
+    MEASURED, not imagined. On 2026-08-12 one real model published three
+    endpoints advertising 18, 12 and 17 parameters, differing in which.
+    The shape below is that shape: an aggregate that lists reasoning,
+    and a pinned endpoint that does not.
+
+    ASSERTED AGAINST THE PINNED CONTRACT, not against a mock's
+    willingness to answer: the question is what the LISTING says, and a
+    200 proves only that something replied.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    # The generous host. A model-level aggregate is the
+                    # union, so it would say "reasoning supported".
+                    {
+                        "provider_name": "DeepInfra",
+                        "supported_parameters": ["max_tokens", "reasoning", "seed"],
+                    },
+                    # The pinned host, which does not take the field.
+                    {
+                        "provider_name": "BaseTen",
+                        "supported_parameters": ["max_tokens", "temperature"],
+                    },
+                    # A host that published no list at all.
+                    {"provider_name": "Together"},
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is True
+
+    # THE WHOLE POINT: one model, two endpoints, opposite answers.
+    assert endpoint_supports_reasoning(listing, "deepinfra") is True
+    assert endpoint_supports_reasoning(listing, "baseten") is False
+    # Slug normalization, so a pin recorded lowercase finds a
+    # provider_name that is not.
+    assert endpoint_supports_reasoning(listing, "DeepInfra") is True
+
+    # THREE-VALUED, and the None cases are the ones strict mode must not
+    # collapse into support.
+    assert endpoint_supports_reasoning(listing, "together") is None
+    assert endpoint_supports_reasoning(listing, "novita") is None
+    assert endpoint_supports_reasoning(listing, None) is None
+
+
+@respx.mock
+async def test_an_unfetchable_endpoint_listing_is_absence_of_evidence(client):
+    """WINDOW: fetch_endpoints against every way the listing can fail to
+    answer.
+
+    SUSPENSION POINT: the await on fetch_endpoints, once per shape.
+
+    Strict mode's rule is that absence of evidence is refused rather
+    than assumed, and the caller can only apply it if this function
+    reports the difference. fetched False is not an empty listing and
+    must never read as one.
+    """
+    url = ENDPOINTS_URL.format(model="vendor/model")
+
+    for shape, route in (
+        ("a 404, which is what an unknown model returns", lambda: httpx.Response(404)),
+        ("a 500", lambda: httpx.Response(500)),
+        ("a body that is not JSON", lambda: httpx.Response(200, text="nope")),
+        ("JSON without the data key", lambda: httpx.Response(200, json={})),
+        (
+            "data without endpoints",
+            lambda: httpx.Response(200, json={"data": {"id": "x"}}),
+        ),
+        (
+            "endpoints that is not a list",
+            lambda: httpx.Response(200, json={"data": {"endpoints": "nope"}}),
+        ),
+    ):
+        respx.get(url).mock(side_effect=lambda request, r=route: r())
+        listing = await fetch_endpoints(client, "vendor/model")
+        assert listing["fetched"] is False, shape
+        # And the decision made from it is "cannot tell", never False,
+        # so a caller that distinguishes them still can.
+        assert endpoint_supports_reasoning(listing, "deepinfra") is None, shape
+
+    # A transport failure is the same answer.
+    respx.get(url).mock(side_effect=httpx.ConnectError("down"))
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is False
