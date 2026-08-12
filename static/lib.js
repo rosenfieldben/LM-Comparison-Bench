@@ -230,13 +230,29 @@
 
   // The share of a completion that reasoning must reach before the card
   // says the thinking took the answer's place. This is the same 0.9 as
-  // REASONING_SHARE_EXHAUSTED in bench/models.py, and it is the same rule
-  // applied to the same two numbers, deliberately duplicated rather than
-  // shipped from the server: the server can only label a result it
-  // synthesized an error for, and the indicator has to fire on a card
-  // that came back with text too. A test in each language pins the
-  // threshold, so a change to one that is not made to the other is a
-  // failing test rather than a silent divergence.
+  // REASONING_SHARE_EXHAUSTED in bench/models.py, and it is the same
+  // rule applied to the same two numbers.
+  //
+  // WHY IT IS DUPLICATED, stated accurately after an adversarial review
+  // found the previous answer false. That answer said the server "can
+  // only label a result it synthesized an error for". The server can do
+  // no such limited thing: _ingest_usage runs unconditionally and
+  // before the empty-text branch, so both counts are populated on every
+  // result including those that carry text, and a boolean could be
+  // attached to the result and shipped like any other field.
+  //
+  // The real reason is smaller and is a judgement rather than a
+  // constraint. Shipping the flag would touch ModelResult, the stream's
+  // done event, the store's read-time repair and three call sites, and
+  // this file has to keep reasoningShare regardless, which already
+  // reads both counts. So the duplication is one constant and one
+  // comparison against a refactor across four layers, and it was not
+  // judged worth it. Revisit that if a third consumer ever appears.
+  //
+  // The drift guard is behavioural, not textual: a Python test executes
+  // this file through node over a shared table of shapes and compares
+  // the two answer sheets. A change to either implementation that
+  // alters an answer fails it; a rename or a rewrap does not.
   const REASONING_SHARE_EXHAUSTED = 0.9;
 
   // Whether a result's output went to thinking rather than to an answer.

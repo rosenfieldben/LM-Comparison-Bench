@@ -1396,7 +1396,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 3
+EXPORT_SCHEMA_VERSION = 4
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1425,6 +1425,28 @@ EXPORT_SCHEMA_VERSION = 3
 # trial lines a v2 reader could not tell apart while the models had been
 # shown different things. An artifact whose whole purpose is to be
 # checkable has to carry the reading.
+#
+# Version 4 is the units-and-money boundary, and it is a bump this
+# repository first declined to make. The manifest gained token_counts,
+# one sentence naming the unit of the four counts on every trial line
+# and separating them from max_tokens, which is a ceiling that was sent
+# rather than a count. No trial field changed value, meaning or
+# presence, and the argument for staying at 3 was that a reader
+# ignoring the key reads a version 3 artifact exactly.
+#
+# That answered half the policy. The rule above is a disjunction, and
+# its first limb is a reader that will not ABSORB the change: a strict
+# parser, the kind this repository itself relies on at its own
+# boundaries, rejects an unknown key rather than ignoring it. Two files
+# both calling themselves version 3 while carrying different manifest
+# shapes is the exact ambiguity the number exists to remove, and
+# bumping is cheaper than arguing about it.
+#
+# Trial lines also gained is_byok, beside upstream_inference_cost_usd
+# and for the reason that column was split: a populated upstream figure
+# was found on a run with is_byok false, so an artifact carrying the
+# figure without the flag invites a reader to conclude BYOK from a
+# number that does not mean it.
 def _manifest_token_note() -> str:
     """The one sentence the artifact says about its token units.
 
@@ -1456,6 +1478,17 @@ EXPORT_SCHEMA_NOTES = {
         "the bytes and the rendition names the reading of them; two "
         "trials over one digest read two ways were indistinguishable in "
         "version 2 while the models had been shown different things."
+    ),
+    4: (
+        "the manifest carries token_counts, naming the unit of the four "
+        "token counts on every trial line and separating them from "
+        "max_tokens, which is a ceiling that was sent rather than a "
+        "count; trial lines carry is_byok beside "
+        "upstream_inference_cost_usd, because that figure has been "
+        "observed on runs that were not BYOK and does not by itself say "
+        "which a run was. Version 3 carried renditions: the ordered "
+        "pins, each with digest, extractor, extractor_version and kind, "
+        "and version 4 carries them unchanged."
     ),
 }
 
@@ -1550,12 +1583,11 @@ def export_manifest(
         # property of the format and not of any run, and a note stamped
         # onto every line is one a reader stops seeing.
         #
-        # NO SCHEMA BUMP, and the reason matters. EXPORT_SCHEMA_VERSION
-        # rises when a line's shape changes in a way a reader could not
-        # absorb; this changes no field's value, meaning, or presence. A
-        # v3 parser that ignores the key reads precisely what it read
-        # before, and correctly. What is new is a sentence about fields
-        # that were always there.
+        # This key is half of why version 4 exists; see
+        # EXPORT_SCHEMA_NOTES. It changes no field's value, meaning or
+        # presence, so a reader that ignores unknown keys is unaffected,
+        # but a reader that REJECTS them is not, and the policy above
+        # counts that reader too.
         "token_counts": _manifest_token_note(),
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
@@ -1686,6 +1718,10 @@ def export_trial(
         # holding a citable artifact that cannot be reconciled against
         # the provider invoice the run was actually paid on.
         "upstream_inference_cost_usd": result.get("upstream_inference_cost_usd"),
+        # The discriminator beside the figure. An artifact that carried
+        # one without the other would invite the reading the column was
+        # split to prevent.
+        "is_byok": result.get("is_byok"),
         "app_sha": run.get("app_sha"),
         "catalog_digest": run.get("catalog_digest"),
         "data_policy": run.get("data_policy"),

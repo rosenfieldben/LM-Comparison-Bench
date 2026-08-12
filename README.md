@@ -103,23 +103,29 @@ what the upstream provider billed you directly. The bench records it in
 its own column beside the credit charge and **never meters it**, because a
 direct provider bill is not money OpenRouter can decline and a ceiling
 that pretended otherwise would be describing a control it does not have.
-The documentation says that off BYOK the field "will be 0 or null", and
-`_as_upstream_cost` degrades a zero or absent value to None on that
-basis, so that a stored zero could not be confused with a BYOK run that
-genuinely cost nothing.
-
+The documentation says that off BYOK the field "will be 0 or null".
 **That is not always what arrives.** Both calls of the reasoning probe
 above carry `is_byok: false` together with a *nonzero*
 `upstream_inference_cost` equal to `cost` to the last digit, and two
 further fields the documentation does not mention at all
 (`upstream_inference_prompt_cost`,
-`upstream_inference_completions_cost`). So on that route the column is
-populated for a run that was not BYOK, and what it holds is the credit
-charge repeated rather than a separate provider bill. Read a populated
-`upstream_inference_cost_usd` as "the provider reported this figure",
-not as "this run was BYOK". The measurement is pinned in the fixture
-named above; whether the column should start gating on `is_byok` is an
-open question about the money record and has not been decided here.
+`upstream_inference_completions_cost`, both observed and neither
+stored).
+
+So the record was split rather than filtered. `upstream_inference_cost`
+is stored **exactly as the wire reported it**, including a zero;
+suppressing an observed money figure to protect a column's intended
+meaning would have fixed this paragraph by falsifying the database.
+NULL there now means one thing only: the wire sent nothing usable.
+
+The meaning moved to its own column. **`is_byok`** says whether
+OpenRouter billed the run against your own provider key, in three
+states: true, false, and NULL for a row written before the column
+existed or a provider that did not report it. Read them separately: the
+flag says which kind of run it was, and the upstream figure is whatever
+was reported, which on some non-BYOK routes is the credit charge
+repeated rather than a separate provider bill. The measurement behind
+all of this is pinned in the fixture named above.
 
 It travels the whole way: served on the result, written by the reconcile
 pass from the generation record, carried on the export's trial lines, and
@@ -474,7 +480,9 @@ old wording is kept exactly for a genuinely empty response with no
 thinking behind it, which is a third failure again.
 
 The trigger is the token shape plus that one normalized field: reasoning
-tokens at or above nine tenths of the completion count, and whether
+tokens at or above nine tenths of the completion count (the threshold
+is `REASONING_SHARE_EXHAUSTED`, defined once in `bench/models.py` and
+checked against the browser's copy by an executing test), and whether
 generation stopped at the cap. No model name is involved, and both
 inputs are things that came BACK rather than things the bench sent,
 which is what lets this work on every route above where the reservation

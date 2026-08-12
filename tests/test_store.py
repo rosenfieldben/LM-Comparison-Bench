@@ -2754,3 +2754,136 @@ def test_review_repro_a_pinned_refs_character_count_is_pythons_too(tmp_path):
         assert "extracted_text" not in found
     finally:
         conn.close()
+
+
+PRE_BYOK_SCHEMA = (
+    Path(__file__).parent / "fixtures" / "pre_byok_schema.sql"
+).read_text()
+
+
+def test_the_pre_byok_fixture_is_the_schema_as_it_stood_before_the_column():
+    """The fixture's provenance, asserted rather than trusted.
+
+    A hand-transcribed era snapshot is a snapshot of what somebody
+    believed the schema was, and a migration proof built on one proves
+    the belief. This file was extracted from the SCHEMA string at the
+    commit before is_byok landed, so the only thing that can make it
+    wrong is an edit to the fixture itself, which is what this catches.
+    """
+    assert "is_byok" not in PRE_BYOK_SCHEMA
+    # The right era rather than merely an old one: the column this test
+    # is about lands beside upstream_inference_cost_usd, so a fixture
+    # predating THAT would be answering a different question.
+    assert "upstream_inference_cost_usd TEXT" in PRE_BYOK_SCHEMA
+    for table in ("prompts", "runs", "results", "groups"):
+        assert f"CREATE TABLE IF NOT EXISTS {table} (" in PRE_BYOK_SCHEMA
+
+
+def test_migration_onto_pre_byok_database_is_additive_and_idempotent(tmp_path):
+    """WINDOW: a database created before results.is_byok existed, from
+    its own era's schema, opened by today's store.connect.
+
+    ONE COLUMN, and the reason it is a column rather than a reading of
+    an existing one is the whole point. upstream_inference_cost_usd was
+    being asked to carry a money figure AND an implicit claim that a
+    populated cell meant BYOK. A live probe found is_byok false beside a
+    nonzero upstream cost, so the claim was never true, and the ruling
+    was to record reality and move the meaning: the figure is stored as
+    the wire sent it, and the discriminator gets its own column.
+
+    NULL ON EVERY LEGACY ROW, which is an answer and not a gap. A row
+    written before this column existed genuinely does not know whether
+    its run was BYOK, and that is different from knowing it was not.
+    The three states are the point: 1, 0 and NULL.
+
+    IDEMPOTENT is asserted by connecting twice, because store.connect
+    runs the migrations on every open and a second ALTER on an existing
+    column is an error, not a no-op.
+    """
+    db_path = tmp_path / "pre_byok.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_BYOK_SCHEMA)
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, NULL, 'legacy prompt', '2026-05-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position, billed_cost_usd,
+                                upstream_inference_cost_usd)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0, 3.1e-05, '0.004')"""
+    )
+    legacy.commit()
+    # THE PRE-STATE, asserted rather than assumed. Without this the test
+    # could pass against a fixture that already carried the column,
+    # which would prove nothing at all about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(results)")]
+    assert "is_byok" not in before
+    assert "upstream_inference_cost_usd" in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(results)")]
+        assert "is_byok" in columns
+        row = conn.execute(
+            "SELECT upstream_inference_cost_usd, is_byok FROM results WHERE id = 1"
+        ).fetchone()
+        # The legacy money figure is untouched by the migration.
+        assert row["upstream_inference_cost_usd"] == "0.004"
+        # And the new column is NULL: this row cannot say whether it was
+        # BYOK, which is not the same as saying it was not.
+        assert row["is_byok"] is None
+    finally:
+        conn.close()
+
+    # Idempotent: a second open must not attempt the ALTER again.
+    again = store.connect(str(db_path))
+    try:
+        assert (
+            again.execute("SELECT is_byok FROM results WHERE id = 1").fetchone()[
+                "is_byok"
+            ]
+            is None
+        )
+    finally:
+        again.close()
+
+
+def test_review_repro_the_three_states_of_is_byok_survive_a_round_trip(tmp_path):
+    """WINDOW: three results saved and read back, one per state.
+
+    THE COLUMN EXISTS TO HOLD A DISTINCTION, so a round trip that only
+    proved True survives would miss the half that matters. False is a
+    reported fact and NULL is the absence of one, and sqlite stores both
+    a Python False and a Python None in ways that are easy to conflate:
+    0 and NULL are both falsy on the way back out.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(
+            conn,
+            "p",
+            [
+                make_result(model="m/byok", is_byok=True),
+                make_result(model="m/credits", is_byok=False),
+                # No key at all: the provider did not report one.
+                make_result(model="m/silent"),
+            ],
+        )
+        rows = {
+            r["model"]: r["is_byok"]
+            for r in conn.execute(
+                "SELECT model, is_byok FROM results WHERE run_id = ?", (run_id,)
+            )
+        }
+        # Stored as sqlite integers, and the three states stay distinct.
+        assert rows["m/byok"] == 1
+        assert rows["m/credits"] == 0
+        assert rows["m/silent"] is None
+        # The distinction that a falsy check would destroy.
+        assert rows["m/credits"] is not None
+    finally:
+        conn.close()

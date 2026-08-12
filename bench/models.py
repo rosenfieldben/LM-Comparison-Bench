@@ -293,9 +293,25 @@ REASONING_BUDGET_SHARE = 0.5
 # When the two would collide the OPERATOR'S CONTROL RIDES and the
 # reservation stands down. Effort is a declared part of the experiment,
 # this is the bench's own default, and a default that overwrote a
-# declaration is the one thing rule one forbids. What protects that
-# request instead is the indicator, which reads the tokens that came
-# back rather than the field that went out.
+# declaration is the one thing rule one forbids.
+#
+# THAT REQUEST IS THEN UNPROTECTED BY BOTH HALVES OF THIS FIX, which an
+# earlier version of this comment denied. It claimed the card's
+# indicator covers the gap "because it reads the tokens that came back
+# rather than the field that went out". Read the arithmetic: an effort
+# of high allocates approximately 80% of max_tokens per the vendor's own
+# table, and REASONING_SHARE_EXHAUSTED is 0.9, so
+# reasoning_ate_the_output(16384, 13107) is False and the indicator
+# provably never fires at the share a declared effort produces. It is a
+# comment that justified a decision by naming a safety net that is not
+# under it.
+#
+# The decision still stands, on its own merits: not sending an
+# undefined combination and letting the operator's declaration ride is
+# the defensible reading of rule one under real ambiguity, and the
+# exposure is bounded to requests where an operator deliberately set an
+# effort. But it is exposure, and it is named here rather than
+# explained away.
 #
 # HOW FEW ROUTES TAKE A REAL BUDGET, measured rather than assumed, and
 # this is the correction that matters most. GET /api/v1/models on
@@ -970,6 +986,17 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
     result["billed_cost_usd"] = as_money(usage.get("cost"))
     result["upstream_inference_cost_usd"] = _as_upstream_cost(usage.get("cost_details"))
+    # Whether OpenRouter billed this against your own provider key. Its
+    # own field, because the upstream figure above cannot carry the
+    # meaning: a live probe found is_byok false beside a nonzero upstream
+    # cost, so the presence of that number says nothing about BYOK.
+    #
+    # isinstance rather than truthiness, and no coercion: a provider that
+    # omits the flag leaves None, which is "not reported" and is not the
+    # same answer as false. Anything that is not a bool is treated as
+    # absent rather than guessed at.
+    is_byok = usage.get("is_byok")
+    result["is_byok"] = is_byok if isinstance(is_byok, bool) else None
     # Reasoning tokens are the reason the two-tier budget exists: they are
     # billed as completion tokens and consume max_tokens, but never appear
     # in the visible answer. Cached prompt tokens are the other direction,
@@ -1166,17 +1193,31 @@ def _as_upstream_cost(source: Any) -> str | None:
     exactly comparable to that invoice; converting it to a float and back
     would introduce a rounding this bench has no reason to perform.
 
-    Zero degrades to None deliberately. The documentation says the field
-    "will be 0 or null" for non-BYOK requests, so a stored 0 would be
-    indistinguishable from a BYOK run that genuinely cost nothing, and
-    the absence is the more honest record of "not a BYOK run".
+    A ZERO IS NOW STORED AS A ZERO, which reverses an earlier decision
+    and the reversal is the point. This used to degrade 0 to None on the
+    documented grounds that "For all other requests it will be 0 or
+    null", so a stored 0 could not be confused with a BYOK run that
+    genuinely cost nothing. A live probe on 2026-08-12 broke that
+    reasoning from both ends: a non-BYOK run returned a NONZERO upstream
+    figure equal to the credit charge, so a populated cell never meant
+    BYOK in the first place, and is_byok now has a column of its own to
+    say what this value was never able to say.
+
+    With the discriminator moved out, suppressing an observed money
+    figure would only make the database disagree with the wire. NULL here
+    means the wire sent nothing usable, and nothing else.
+
+    Not-a-number, infinity and negatives still degrade, because those are
+    not money figures at all; that is the same rule as_money applies to
+    every monetary field in this file and it is about validity rather
+    than about meaning.
     """
     if not isinstance(source, dict):
         return None
     value = source.get("upstream_inference_cost")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value < 0:
         return None
     return repr(value)
 
@@ -1225,6 +1266,7 @@ async def run_model(
         "request_json": None,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -1423,6 +1465,7 @@ async def stream_model(
         "request_json": None,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -1635,6 +1678,7 @@ async def fetch_generation(
         "generation_id": generation_id,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "provider": None,
         "quantization": None,
         "native_finish_reason": None,
@@ -1688,12 +1732,21 @@ async def fetch_generation(
     # whole job is to be comparable with what is already stored.
     #
     # Not persisted, because RECONCILABLE_COLUMNS in bench/store.py does
-    # not list them, so a reconcile pass reads these and drops them. They
-    # are kept anyway as the ONE PLACE the two units can be compared: a
-    # reader debugging a suspicious row can print this record and see
-    # both. Adding columns for them would put two counts per result in the
+    # not list them, so a reconcile pass reads these and drops them.
+    # Adding columns for them would put two counts per result in the
     # database and reintroduce, permanently, exactly the ambiguity this
     # workstream exists to remove.
+    #
+    # They are kept anyway, and the reason has been corrected. This
+    # comment used to call the record "the ONE PLACE the two units can
+    # be compared", which is false: only the native pair is read here,
+    # so there is no second unit in this dict to compare anything with.
+    # What the record actually offers is two SOURCES of the same unit,
+    # the counts OpenRouter reported in-band on the response and the
+    # counts its generation endpoint reports afterwards. Those can
+    # disagree, and a reader debugging a suspicious row can print this
+    # record and see whether they do. That is a smaller claim than the
+    # one it replaces and it is the true one.
     #
     # Pinned against the Get a Generation reference, read 2026-08-12.
     record["prompt_tokens"] = as_token_count(data.get("native_tokens_prompt"))

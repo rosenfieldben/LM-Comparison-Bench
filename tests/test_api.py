@@ -6252,11 +6252,18 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 3
+    assert manifest["export_schema_version"] == 4
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[3]
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[4]
+    # Version 4 is the units-and-money boundary. Its note still names
+    # renditions, deliberately: EXPORT_SCHEMA_NOTES emits only the
+    # CURRENT version's sentence, so a v4 note that dropped the v3
+    # explanation would leave a v4 artifact unable to explain a field it
+    # still carries.
+    assert "token_counts" in manifest["export_schema_change"]
+    assert "is_byok" in manifest["export_schema_change"]
     assert "renditions" in manifest["export_schema_change"]
     # ONE UNIT, SAID ONCE, for a reader who was never in the room. Trial
     # lines put four counts and one ceiling side by side, and the
@@ -11726,7 +11733,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 3
+    assert manifest["export_schema_version"] == 4
     assert manifest["attachments_referenced"] is True
 
     cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]

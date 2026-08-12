@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS results (
     provider TEXT,
     quantization TEXT,
     native_finish_reason TEXT,
-    upstream_inference_cost_usd TEXT
+    upstream_inference_cost_usd TEXT,
+    is_byok INTEGER
 );
 """
 
@@ -309,6 +310,28 @@ MIGRATIONS = [
     # population has to be able to say how it was narrowed.
     ("experiments", "quantizations_json", "TEXT"),
     ("results", "upstream_inference_cost_usd", "TEXT"),
+    # THE DISCRIMINATOR, moved out of a value's meaning and into a column
+    # of its own.
+    #
+    # upstream_inference_cost_usd was carrying two jobs: a money figure,
+    # and an implicit claim that a populated cell meant "this run was
+    # BYOK". The second job was never the wire's to keep. A live probe on
+    # 2026-08-12 (tests/fixtures/probe_reasoning_enable.json) returned
+    # is_byok false alongside a NONZERO upstream_inference_cost equal to
+    # the credit charge, which the vendor's own page says cannot happen:
+    # "For all other requests it will be 0 or null."
+    #
+    # Suppressing that figure to protect the column's intended meaning
+    # would have fixed a README paragraph by falsifying the database, so
+    # the figure is stored as received and the meaning moves here. The
+    # wire sends this discriminator on every usage block, so the record
+    # should carry it.
+    #
+    # INTEGER because SQLite has no bool; 1, 0 and NULL. NULL is the
+    # honest answer for every row written before this column existed and
+    # for any provider that omits the flag, and it is not the same
+    # answer as 0.
+    ("results", "is_byok", "INTEGER"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
     # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
@@ -1648,9 +1671,9 @@ def save_run(
                 generation_id, finish_reason, position, request_json,
                 billed_cost_usd, reasoning_tokens, cached_tokens,
                 provider, quantization, native_finish_reason,
-                upstream_inference_cost_usd)
+                upstream_inference_cost_usd, is_byok)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?)""",
+                       ?, ?)""",
             [
                 (
                     run_id,
@@ -1680,6 +1703,11 @@ def save_run(
                     # here computes with it and a float round trip would
                     # round money on the way in. See _as_upstream_cost.
                     as_text(r.get("upstream_inference_cost_usd")),
+                    # A bool, or None when the provider did not report
+                    # one. sqlite3 adapts True and False to 1 and 0 and
+                    # leaves None as NULL, which is the three-state
+                    # record this column exists to keep.
+                    r.get("is_byok"),
                 )
                 for r in results
             ],
@@ -1924,7 +1952,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
         """SELECT id, model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
-                  billed_cost_usd, reasoning_tokens, cached_tokens,
+                  billed_cost_usd, reasoning_tokens, cached_tokens, is_byok,
                   provider, quantization, native_finish_reason,
                   upstream_inference_cost_usd
            FROM results WHERE run_id = ?

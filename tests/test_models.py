@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -2061,14 +2062,44 @@ async def test_the_byok_upstream_charge_is_captured_beside_the_credit_cost(clien
 
 
 @respx.mock
-async def test_a_non_byok_response_records_no_upstream_charge(client):
-    """The documentation says the field "will be 0 or null" off BYOK, so
-    a stored 0 would be indistinguishable from a BYOK run that genuinely
-    cost nothing. Absence is the more honest record."""
-    for details in (
-        {},
-        {"upstream_inference_cost": 0},
-        {"upstream_inference_cost": None},
+async def test_review_repro_an_observed_upstream_figure_is_stored_as_received(client):
+    """WINDOW: run_model's returned result, over every shape cost_details
+    arrives in.
+
+    THIS TEST USED TO ASSERT THE OPPOSITE FOR A ZERO, and the reversal
+    is the record of a ruling rather than a change of taste. The old
+    rule degraded a wire-sent 0 to None, reasoning from the vendor's
+    "will be 0 or null" that a stored 0 could not be told apart from a
+    BYOK run that genuinely cost nothing.
+
+    A live probe broke that reasoning from both ends. A run with
+    is_byok FALSE came back with a NONZERO upstream figure equal to the
+    credit charge, so a populated cell never meant BYOK, and the
+    inference the suppression was protecting did not exist. is_byok now
+    has a column of its own and says the thing this value was being
+    asked to imply.
+
+    With the discriminator moved out, suppressing an observed money
+    figure would only make the database disagree with the wire. So a
+    zero is stored as a zero, and NULL in that column means the wire
+    sent nothing usable.
+
+    NOT-A-NUMBER AND NEGATIVES STILL DEGRADE, which is a different rule
+    and survives untouched: those are not money figures at all, and
+    as_money applies the same test to every monetary field here.
+    """
+    for details, expected in (
+        # Nothing reported.
+        ({}, None),
+        # Reported as zero. Stored as zero, which is the reversal.
+        ({"upstream_inference_cost": 0}, "0"),
+        # Explicitly null.
+        ({"upstream_inference_cost": None}, None),
+        # A real figure, kept verbatim as text so it stays comparable to
+        # a provider invoice.
+        ({"upstream_inference_cost": 1.629e-05}, "1.629e-05"),
+        # Not money. Still degrades.
+        ({"upstream_inference_cost": -1}, None),
     ):
         body = json.loads(json.dumps(FIXTURE))
         body["usage"] = {"cost": 0.5, "cost_details": details}
@@ -2077,7 +2108,7 @@ async def test_a_non_byok_response_records_no_upstream_charge(client):
         out = await run_model("hi", "a/b", client, max_tokens=100)
 
         assert out["billed_cost_usd"] == 0.5
-        assert out["upstream_inference_cost_usd"] is None
+        assert out["upstream_inference_cost_usd"] == expected, details
 
 
 def test_a_pin_normalizes_to_the_documented_lowercase_slug():
@@ -2217,22 +2248,50 @@ async def test_the_judge_reserves_room_for_its_verdict(client):
 
     SUSPENSION POINT: the await on judge_response. The payload is read
     after it resolves, so the assertion cannot race the request it is
-    about."""
+    about.
+
+    THE ARGUMENTS WERE IN THE WRONG ORDER, and an adversarial review is
+    what caught it. As first written this passed judge_model="rubric",
+    rubric=None, reference="the answer" and response_text="vendor/judge",
+    so it posted a request to a model called "rubric" asking it to grade
+    the string "vendor/judge" against no rubric at all. It PASSED, every
+    time, because the two things it asserted (the budget and the
+    reservation) are both computed from constants and neither one reads
+    a single argument this test was scrambling.
+
+    That is a vacuous guard sitting over the judge, which is
+    money-adjacent machinery: every scored trial pays for one of these.
+    A test that cannot tell a correct call from a nonsensical one
+    certifies nothing about either.
+
+    The call is now shaped like every other judge_response call in this
+    file, and the assertions below name the arguments they came from, so
+    a future scramble changes an expected value instead of nothing."""
     respx.post(OPENROUTER_URL).respond(
         json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
     )
 
-    await judge_response(
+    out = await judge_response(
         client,
-        "rubric",
+        "judge/one",
+        "the rubric",
         None,
         "the answer",
-        "vendor/judge",
         may_send_reasoning_cap=True,
     )
 
     body = json.loads(respx.calls[-1].request.content)
     assert body["max_tokens"] == JUDGE_MAX_TOKENS
+    # THE ARGUMENTS ARRIVED WHERE THEY WERE SENT. Cheap, and it is the
+    # whole difference between this test and the one it replaces: the
+    # model is the model, and the rubric and the answer are both in the
+    # prompt the judge actually receives.
+    assert body["model"] == "judge/one"
+    sent = " ".join(m["content"] for m in body["messages"])
+    assert "the rubric" in sent
+    assert "the answer" in sent
+    # And the call was a real one end to end, so the verdict parses.
+    assert out["score"] == 1
     assert body["reasoning"] == {"max_tokens": JUDGE_MAX_TOKENS // 2}
 
 
@@ -2486,23 +2545,95 @@ def test_the_shape_test_reads_only_the_two_counts():
     assert reasoning_ate_the_output(0, 1000) is False
 
 
-def test_the_two_languages_agree_on_the_threshold():
-    """WINDOW: static/lib.js as text, read from disk at assert time.
+# The shapes both implementations are asked about. Boundaries on both
+# sides of the threshold, the incident, row 694, and every way a count
+# can be missing.
+CROSS_LANGUAGE_SHAPES = [
+    [21350, 21350],
+    [8500, 8000],
+    [1000, 900],
+    [1000, 899],
+    [3400, 2944],
+    [3400, 3060],
+    [500, 0],
+    [0, 0],
+    [None, None],
+    [500, None],
+    [None, 500],
+    # SMALL COMPLETIONS, and they are in this table because the first
+    # version of it did not have them and was therefore blind to the
+    # exact mutation that motivated the rewrite. A guard inserted into
+    # the JavaScript reading `if (completionTokens < 200) return false`
+    # left every row above unchanged, so the two languages disagreed on
+    # every short response while this test stayed green. Writing a
+    # better test and not re-running the mutation against it would have
+    # shipped the same hole in nicer clothing.
+    #
+    # The first two are the live probe's own numbers, which is the
+    # cheapest way to be sure a row is reachable: something really did
+    # return them.
+    [37, 37],
+    [35, 0],
+    [150, 140],
+    [199, 190],
+    [4, 4],
+    [1, 1],
+]
 
-    The rule is written twice, once per language, so this checks the
-    numbers have not drifted.
 
-    Duplicated on purpose rather than shipped from the server: the
-    server can only label a result it synthesized an error for, and the
-    card's indicator has to fire on a result that came back WITH text.
-    Two implementations of one rule need a test that fails when only one
-    of them changes, and this is it.
+def test_review_repro_the_two_languages_agree_on_every_shape():
+    """WINDOW: both implementations of the exhaustion rule, executed,
+    over one shared table.
+
+    THIS TEST USED TO BE A STRING SEARCH, and an adversarial review
+    proved it was a false guard in BOTH directions. It asserted that
+    two source lines appeared verbatim in static/lib.js.
+
+      Inserting `if (completionTokens < 200) return false;` into
+      reasoningAteTheOutput left it PASSING and the node suite passing,
+      with the two languages now disagreeing on every small response. A
+      behaviour change it could not see.
+
+      Renaming a local or rewrapping the return failed it, on
+      JavaScript whitespace, with both implementations still identical.
+      A formatting change it could not tolerate.
+
+    A guard that misses what it is for and fires on what it is not is a
+    tax that teaches people to delete it. So it runs the JavaScript now:
+    node executes lib.js against the same shapes Python is asked about,
+    and the two answer sheets are compared. Text is not consulted at
+    all.
+
+    The threshold is included in the comparison rather than asserted
+    separately, because a shared constant that drifted would show up as
+    a disagreement on the boundary rows, which is the symptom that
+    matters rather than the digit that caused it.
     """
-    js = (Path(__file__).parent.parent / "static" / "lib.js").read_text()
-    assert f"REASONING_SHARE_EXHAUSTED = {REASONING_SHARE_EXHAUSTED};" in js
-    assert (
-        "return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;" in js
+    script = """
+const lib = require(process.argv[1]);
+const shapes = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify({
+  verdicts: shapes.map(([c, r]) => lib.reasoningAteTheOutput(c, r)),
+  threshold: lib.REASONING_SHARE_EXHAUSTED,
+}));
+"""
+    lib = Path(__file__).parent.parent / "static" / "lib.js"
+    proc = subprocess.run(
+        ["node", "-e", script, str(lib), json.dumps(CROSS_LANGUAGE_SHAPES)],
+        capture_output=True,
+        text=True,
+        check=True,
     )
+    js = json.loads(proc.stdout)
+
+    python_verdicts = [reasoning_ate_the_output(c, r) for c, r in CROSS_LANGUAGE_SHAPES]
+    assert js["verdicts"] == python_verdicts, list(
+        zip(CROSS_LANGUAGE_SHAPES, python_verdicts, js["verdicts"])
+    )
+    assert js["threshold"] == REASONING_SHARE_EXHAUSTED
+    # And the table straddles the boundary, so agreement is a fact about
+    # the rule rather than about a table that only asks easy questions.
+    assert True in python_verdicts and False in python_verdicts
 
 
 @respx.mock
