@@ -147,16 +147,45 @@
         // card, so this is the only place it would be recorded.
         try {
           // Presentation only, never persisted: the stored error stays the
-          // server's exact words. The extended budget is the one knob the
-          // user can turn when reasoning burned the whole standard budget,
-          // so say so right where the failure is reported.
+          // server's exact words. A remedy belongs next to the failure it
+          // answers, so the card carries the knob the user can actually
+          // turn.
+          //
+          // THE EXHAUSTION CASE IS KEYED ON THE COUNTS, not on the
+          // sentence. The old branch matched the substring
+          // "finish_reason: length", and R2's honest label does not
+          // contain it, so leaving this alone would have silently
+          // withdrawn the remedy from exactly the cards it was written
+          // for. Reading the numbers instead also means the remedy
+          // appears on a route where the server could not label anything,
+          // and it survives the next rewording of the prose.
+          //
+          // LOWER EFFORT IS THE REMEDY EXTENDED CARDS GET, because
+          // extended is the top tier and there is no larger budget to
+          // suggest; setting a reasoning effort under Experiment controls
+          // is what remains. On standard both apply, and the larger
+          // budget goes first because it is one click away.
           let shownError = result.error;
-          if (
-            shownError != null &&
-            budget === "standard" &&
-            shownError.includes("finish_reason: length")
-          ) {
-            shownError += "; try extended budget";
+          if (shownError != null) {
+            if (
+              BenchLib.reasoningAteTheOutput(
+                result.completion_tokens,
+                result.reasoning_tokens,
+              )
+            ) {
+              shownError +=
+                budget === "standard"
+                  ? "; try extended budget or a lower reasoning effort"
+                  : "; try a lower reasoning effort";
+            } else if (
+              budget === "standard" &&
+              shownError.includes("finish_reason: length")
+            ) {
+              // Truncation that was not reasoning: a long answer cut off
+              // by the cap. The budget is the only remedy for that one,
+              // and this is the branch that was here before.
+              shownError += "; try extended budget";
+            }
           }
           // The spend ceiling refusing a run is a working control, not a
           // failure. It arrives as run_id null like a persistence failure

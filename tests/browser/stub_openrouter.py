@@ -62,6 +62,9 @@ CATALOG = {
             ("stub/null", {}),
             # Thinks and never speaks; see the streaming dispatch.
             ("stub/exhausted", {}),
+            # Thinks hard AND answers: the healthy contrast, so the
+            # exhaustion rule has something to stay quiet about.
+            ("stub/thinker", {}),
             ("stub/html", {}),
             ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
             # Priced in the catalog on purpose: their billed figure is
@@ -120,6 +123,24 @@ EXHAUSTED_USAGE = {
     "prompt_tokens_details": {"cached_tokens": 0},
 }
 
+# ROW 694, the healthy contrast from the incident's own database: 2944
+# reasoning tokens, a real answer, a clean finish. The exhaustion rule
+# has to stay silent here, and the margin is not close: 2944 of 3400 is
+# 0.87, under the 0.9 threshold but near enough that a careless widening
+# of the rule would start warning about runs that worked.
+#
+# The default USAGE above is 5 reasoning tokens of 8 completion, which is
+# healthy too but degenerate, and a rule tested only against that would
+# look far safer than it is.
+HEALTHY_REASONING_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 3400,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 2944},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
 
 # The host OpenRouter routed to, echoed on every chunk and on the
 # non-streaming body, the way the real API reports it.
@@ -169,6 +190,8 @@ def usage_for(model: str):
         return {**USAGE, "cost": float("nan")}
     if model == "stub/negcost":
         return {**USAGE, "cost": -1.0}
+    if model == "stub/thinker":
+        return HEALTHY_REASONING_USAGE
     return USAGE
 
 

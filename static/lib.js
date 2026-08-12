@@ -228,6 +228,37 @@
     return ranks;
   }
 
+  // The share of a completion that reasoning must reach before the card
+  // says the thinking took the answer's place. This is the same 0.9 as
+  // REASONING_SHARE_EXHAUSTED in bench/models.py, and it is the same rule
+  // applied to the same two numbers, deliberately duplicated rather than
+  // shipped from the server: the server can only label a result it
+  // synthesized an error for, and the indicator has to fire on a card
+  // that came back with text too. A test in each language pins the
+  // threshold, so a change to one that is not made to the other is a
+  // failing test rather than a silent divergence.
+  const REASONING_SHARE_EXHAUSTED = 0.9;
+
+  // Whether a result's output went to thinking rather than to an answer.
+  //
+  // NUMBERS ONLY, which is the entire design. No model name, no
+  // finish_reason, no inspection of what was requested: this reads the
+  // two counts that come back from any provider. That is what lets it
+  // fire on a route where the reservation could not act, because a
+  // provider that ignores an unknown request parameter still reports its
+  // usage honestly. It is also why nothing here needs updating when a new
+  // reasoning model appears.
+  //
+  // Absent counts are not evidence, and zero reasoning tokens are
+  // evidence of the opposite, so both fall out through the same falsy
+  // guard. Older history rows predate the reasoning column entirely and
+  // carry null; they read as "no" rather than as "unknown", which is the
+  // conservative direction for something that draws a warning.
+  function reasoningAteTheOutput(completionTokens, reasoningTokens) {
+    if (!reasoningTokens || !completionTokens) return false;
+    return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -241,6 +272,8 @@
     tokenizeDiff,
     diffTokens,
     controlBadges,
+    reasoningAteTheOutput,
+    REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;

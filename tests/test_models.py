@@ -2258,3 +2258,220 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
     # And the constant it reads is a plain number, not a per-model table.
     assert isinstance(REASONING_BUDGET_SHARE, float)
+
+
+from bench.models import (  # noqa: E402
+    REASONING_SHARE_EXHAUSTED,
+    empty_response_error,
+    reasoning_ate_the_output,
+)
+
+# ---- The reasoning-exhaustion fix, R2: the label says where the money
+# ---- went, and it says it because of the token shape.
+
+
+# Every case is a TOKEN SHAPE with a name describing the shape, not a
+# model. Three of them are drawn from real records and are labelled with
+# which; the rest are the boundaries of the rule. The point of the table
+# is that no row needs to know what produced it.
+EMPTY_RESPONSE_SHAPES = (
+    # (label, finish_reason, completion, reasoning, expected error)
+    (
+        "the incident, exactly equal",
+        "length",
+        21350,
+        21350,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)",
+    ),
+    (
+        "a different model, a different tier, same shape",
+        "length",
+        8192,
+        8100,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(8100 reasoning tokens)",
+    ),
+    (
+        "exactly at the threshold",
+        "length",
+        1000,
+        900,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(900 reasoning tokens)",
+    ),
+    (
+        "one token under the threshold",
+        "length",
+        1000,
+        899,
+        "empty response (finish_reason: length)",
+    ),
+    (
+        "empty with no reasoning at all, the old wording kept",
+        "stop",
+        40,
+        0,
+        "empty response (finish_reason: stop)",
+    ),
+    (
+        "a provider that reported no usage",
+        "length",
+        None,
+        None,
+        "empty response (finish_reason: length)",
+    ),
+    (
+        "reasoning reported but no completion count",
+        None,
+        None,
+        5000,
+        "empty response (finish_reason: unknown)",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "shape,finish,completion,reasoning,expected",
+    EMPTY_RESPONSE_SHAPES,
+    ids=[row[0] for row in EMPTY_RESPONSE_SHAPES],
+)
+def test_review_repro_the_label_says_where_the_completion_went(
+    shape, finish, completion, reasoning, expected
+):
+    """WINDOW: the synthesized error for a 200 that carried no visible
+    text, at the moment it is composed.
+
+    THE DEFECT WAS A TRUE SENTENCE THAT MISLED. "empty response
+    (finish_reason: length)" names the symptom and omits the cause. The
+    card it appeared on had been billed $3.38 to $3.50 for 21350 tokens
+    of thinking, and nothing in the message suggested that a retry would
+    spend the same money the same way. It reads like a provider glitch.
+    It was an accounting fact.
+
+    PARAMETRIZED ON SHAPE, NOT ON A MODEL, which is the constraint this
+    whole fix is under and which this table is the demonstration of. The
+    second row is a deliberately different tier and a different pair of
+    numbers from the incident's; it is not the incident's model and the
+    rule does not know or care. The threshold rows are the boundary, one
+    on each side of it, so a change to REASONING_SHARE_EXHAUSTED cannot
+    pass unnoticed.
+
+    THE OLD WORDING IS KEPT, not superseded, for a genuinely empty
+    response with no thinking behind it. That is a different failure, a
+    provider returning null content, and the sentence that was already
+    there describes it correctly.
+    """
+    assert empty_response_error(finish, completion, reasoning) == expected, shape
+
+
+def test_the_shape_test_reads_only_the_two_counts():
+    """The predicate on its own, away from the sentence it produces.
+
+    Nothing here is a request field. It cannot see the budget, the
+    reservation, the effort or the model, which is exactly what lets the
+    identical rule run on a route where the reservation was ignored: a
+    provider that drops an unknown parameter still reports its usage.
+    """
+    assert reasoning_ate_the_output(21350, 21350) is True
+    assert reasoning_ate_the_output(1000, 900) is True
+    assert reasoning_ate_the_output(1000, 899) is False
+    # Absent counts are not evidence, and zero reasoning is evidence of
+    # the opposite. Both fall out through one falsy guard.
+    assert reasoning_ate_the_output(None, None) is False
+    assert reasoning_ate_the_output(1000, None) is False
+    assert reasoning_ate_the_output(None, 1000) is False
+    assert reasoning_ate_the_output(1000, 0) is False
+    assert reasoning_ate_the_output(0, 1000) is False
+
+
+def test_the_two_languages_agree_on_the_threshold():
+    """The rule is written twice, once per language, so this checks the
+    numbers have not drifted.
+
+    Duplicated on purpose rather than shipped from the server: the
+    server can only label a result it synthesized an error for, and the
+    card's indicator has to fire on a result that came back WITH text.
+    Two implementations of one rule need a test that fails when only one
+    of them changes, and this is it.
+    """
+    js = (Path(__file__).parent.parent / "static" / "lib.js").read_text()
+    assert f"REASONING_SHARE_EXHAUSTED = {REASONING_SHARE_EXHAUSTED};" in js
+    assert (
+        "return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;" in js
+    )
+
+
+@respx.mock
+async def test_review_repro_an_exhausted_batch_result_is_labelled(client):
+    """WINDOW: run_model's returned result, end to end from a payload
+    that looks exactly like the incident's.
+
+    THE ORDERING THIS PROTECTS. The empty-text branch used to run BEFORE
+    _ingest_usage, so it read two Nones no matter what the provider
+    reported and could never have produced this label. Moving the
+    ingest above it is the fix; this is the test that notices if it
+    moves back.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "choices": [{"message": {"content": None}, "finish_reason": "length"}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 21350,
+                "completion_tokens_details": {"reasoning_tokens": 21350},
+            },
+        }
+    )
+
+    result = await run_model("a document question", "vendor/model", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)"
+    )
+    # And the counts the label was drawn from are on the record beside
+    # it, so a reader can check the claim rather than trust it.
+    assert result["completion_tokens"] == 21350
+    assert result["reasoning_tokens"] == 21350
+
+
+@respx.mock
+async def test_review_repro_an_exhausted_stream_is_labelled_identically(client):
+    """WINDOW: the done event of a stream that emitted reasoning deltas
+    and no content, from the first chunk to iterator exhaustion.
+
+    SUSPENSION POINT: the `async for` over aiter_lines inside
+    stream_model. The result is only complete after the final usage
+    chunk has been folded in and done() has run, so the assertion is on
+    the done event rather than on anything observable mid-iteration.
+
+    ONE FAILURE MUST NOT HAVE TWO DESCRIPTIONS. The browser uses the
+    streaming endpoint and a script uses the batch one; a label whose
+    purpose is honesty is worth nothing if it depends on which door the
+    caller came through. Both now call one function, and this asserts
+    the two produce the identical sentence.
+    """
+    body = (
+        'data: {"id":"gen-x","choices":[{"delta":{"reasoning":"thinking"}}]}\n\n'
+        'data: {"id":"gen-x","choices":[{"delta":{},"finish_reason":"length"}],'
+        '"usage":{"prompt_tokens":1200,"completion_tokens":21350,'
+        '"completion_tokens_details":{"reasoning_tokens":21350}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [event async for event in stream_model("a document question", "m", client)]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["result"]["response_text"] is None
+    assert done["result"]["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)"
+    )
+    # The two endpoints, one sentence.
+    assert done["result"]["error"] == empty_response_error("length", 21350, 21350)

@@ -18,6 +18,8 @@ const {
   tokenizeDiff,
   diffTokens,
   controlBadges,
+  reasoningAteTheOutput,
+  REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
 
@@ -259,4 +261,46 @@ test("approxTokens rounds up, so a short document never estimates zero", () => {
   assert.equal(approxTokens(5), 2);
   assert.equal(approxTokens(4000), 1000);
   assert.equal(approxTokens(null), 0);
+});
+
+// ---- The reasoning-exhaustion fix, R2 and R4: the shape test the card
+// ---- draws its remedy and its indicator from.
+
+// Every case is a token shape. None of them knows what produced it,
+// which is the property under test as much as any single answer is.
+const EXHAUSTION_SHAPES = [
+  ["the incident, exactly equal", 21350, 21350, true],
+  ["a different tier, same shape", 8192, 8100, true],
+  ["exactly at the threshold", 1000, 900, true],
+  ["one token under the threshold", 1000, 899, false],
+  ["a healthy answer, row 694's shape", 3400, 2944, false],
+  ["no thinking at all", 500, 0, false],
+  ["a provider that reported no usage", null, null, false],
+  ["a history row from before the column existed", 500, null, false],
+  ["reasoning without a completion count", null, 5000, false],
+  ["both zero", 0, 0, false],
+];
+
+test("reasoningAteTheOutput keys on the two counts and nothing else", () => {
+  for (const [shape, completion, reasoning, expected] of EXHAUSTION_SHAPES) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), expected, shape);
+  }
+});
+
+test("the threshold is the one the server uses", () => {
+  // The rule is written twice, once per language, because the server can
+  // only label a result it synthesized an error for while the card's
+  // indicator must also fire on a result that came back with text. The
+  // Python side asserts this file's text; this asserts the value.
+  assert.equal(REASONING_SHARE_EXHAUSTED, 0.9);
+});
+
+test("row 694's healthy shape is not mistaken for exhaustion", () => {
+  // The contrast case from the incident's own database: 2944 reasoning
+  // tokens, a real answer, end_turn. A rule that fired here would put a
+  // warning on every reasoning model that worked.
+  assert.equal(reasoningAteTheOutput(3400, 2944), false);
+  // And it stays false right up to the boundary.
+  assert.equal(reasoningAteTheOutput(3400, 3059), false);
+  assert.equal(reasoningAteTheOutput(3400, 3060), true);
 });

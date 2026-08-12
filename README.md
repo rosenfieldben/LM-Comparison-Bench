@@ -348,8 +348,37 @@ per the [provider-selection
 rules](https://openrouter.ai/docs/guides/routing/provider-selection). (A
 model that supports effort but not a cap is covered: the same page says
 the cap is used to pick an effort level, so it is translated rather than
-lost.) On those two routes exhaustion remains possible and the bench's
-answer is instrumentation rather than prevention.
+lost.) On those two routes exhaustion remains possible, and what the
+bench offers instead is described next.
+
+### When it happens anyway, the card says so
+
+A run that produced no visible answer used to report `empty response
+(finish_reason: length)`. That is true and useless: it names the symptom,
+omits where the money went, and reads like a provider glitch, so the
+natural response is to retry and spend it again. Such a card now reads
+
+```
+no visible answer: completion budget exhausted during reasoning
+(21350 reasoning tokens)
+```
+
+with the count included as the evidence for the claim, matching the
+card's own reasoning metric. The old wording is kept exactly for a
+genuinely empty response with no thinking behind it, which is a
+different failure.
+
+The trigger is the token shape and nothing else: reasoning tokens at or
+above nine tenths of the completion count. No model name is involved, no
+request field is read, and the same rule is applied on the server and in
+the browser to the same two numbers. That is what lets it work on the
+uncovered routes above, because a provider that ignores a request
+parameter still reports its usage honestly.
+
+The card also offers the knob you can turn. On standard it suggests the
+extended budget or a lower reasoning effort; on extended, where there is
+no larger budget to move to, it suggests only the lower effort. Set one
+under **Experiment controls**.
 
 ## Reliability
 
@@ -2120,8 +2149,12 @@ picked up without restarts, and verify by eyeball after UI changes:
   the other columns sit untouched, and History shows both the
   failure and the successful rerun in one group. Columns replayed
   from History must never show the control.
-- Budget: run a hard puzzle that empties the standard budget; the
-  errored column's message ends with "try extended budget". Switch
+- Budget: run a hard puzzle that empties the standard budget with a
+  long answer rather than with thinking; the errored column's message
+  ends with "try extended budget". A column whose budget went to
+  reasoning instead says "no visible answer: completion budget
+  exhausted during reasoning" with the count, and ends with "try
+  extended budget or a lower reasoning effort". Switch
   the control to extended and run again: the models now answer or
   prove they need even more, and each attempt's History replay shows
   the budget badge it actually ran with. Reload the page and confirm

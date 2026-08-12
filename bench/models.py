@@ -838,6 +838,80 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     )
 
 
+# The share of a completion that reasoning must reach before "the
+# thinking took the answer's place" is a description rather than a guess.
+#
+# NOT EQUALITY, even though the incident's own numbers were exactly equal,
+# tokens_completion 21350 against native_tokens_reasoning 21350. A
+# provider that counts a dropped partial token, or a trailing whitespace
+# delta that _flatten_content discards, into completion_tokens puts the
+# ratio a hair under one; a test that fired only on exact equality would
+# fall back to the old useless wording over a rounding difference. Nine
+# tenths sits far above what an ordinary short response reaches and far
+# below anything a real exhaustion misses.
+REASONING_SHARE_EXHAUSTED = 0.9
+
+
+def reasoning_ate_the_output(
+    completion_tokens: int | None, reasoning_tokens: int | None
+) -> bool:
+    """Whether a completion that produced no visible answer went to
+    thinking.
+
+    NUMBERS ONLY. No model name, no finish_reason, no request field: this
+    reads what came BACK. That is deliberate and it is what makes the
+    same judgement possible on a route where R1's reservation could not
+    act, because a provider that ignores an unknown parameter still
+    reports its token counts honestly. The frontend's indicator applies
+    the identical rule to the identical two numbers for the same reason.
+
+    Both counts degrade to None when a provider omits usage, and 0 is a
+    real answer meaning "nothing was spent thinking"; either way there is
+    no evidence of exhaustion here, so the falsy guard covers both.
+    """
+    if not reasoning_tokens or not completion_tokens:
+        return False
+    return reasoning_tokens >= completion_tokens * REASONING_SHARE_EXHAUSTED
+
+
+def empty_response_error(
+    finish_reason: str | None,
+    completion_tokens: int | None,
+    reasoning_tokens: int | None,
+) -> str:
+    """The error for a 200 that carried no visible text.
+
+    ONE FUNCTION FOR TWO SITES, the batch path and the stream's done(),
+    which previously carried the same sentence written out twice. A label
+    whose whole purpose is honesty must not be able to drift between the
+    endpoint a script uses and the endpoint the browser uses.
+
+    WHY THE OLD WORDING WAS A DEFECT AND NOT MERELY TERSE. "empty
+    response (finish_reason: length)" is true and tells the reader
+    nothing they can act on: it names the symptom, omits where the money
+    went, and reads like a provider glitch. The card it appeared on had
+    been billed between $3.38 and $3.50 for 21350 tokens of thinking. A
+    person reading it retried, at cost, because nothing in it suggested
+    the retry would do the same thing.
+
+    KEYED ON SHAPE, NOT ON A NAME, so it fires for any model that thinks
+    its budget away. The reasoning count goes in the text because it is
+    the evidence for the claim; a reader who doubts the label can check
+    it against the card's own metrics.
+
+    The old wording is kept exactly for a genuinely empty response with
+    no reasoning behind it, which is a different failure (a provider
+    returning null content on a refusal) and still described correctly by
+    the sentence that was already there.
+    """
+    if reasoning_ate_the_output(completion_tokens, reasoning_tokens):
+        return (
+            "no visible answer: completion budget exhausted during "
+            f"reasoning ({reasoning_tokens} reasoning tokens)"
+        )
+    return f"empty response (finish_reason: {finish_reason or 'unknown'})"
+
+
 # OpenRouter returns the generation id in this response header on every
 # endpoint, available the moment the response starts and therefore before
 # any chunk has been read. Pinned against the vendor's own words rather
@@ -1067,24 +1141,36 @@ async def run_model(
     result["provider"] = _as_label(data.get("provider"))
     result["native_finish_reason"] = _as_label(choice.get("native_finish_reason"))
 
-    text = _flatten_content(content)
-    if text:
-        result["response_text"] = text
-    else:
-        # Some providers return 200 with null content on refusals. Surface
-        # that as an error so every result carries either text or an error,
-        # a contract the frontend relies on to pick a render state. Non-str
-        # oddities land here too rather than leaking into response_text.
-        result["error"] = (
-            f"empty response (finish_reason: {result['finish_reason'] or 'unknown'})"
-        )
-
     # A missing or oddly shaped usage object leaves the counts and the
     # billed cost None rather than guessed. The guard that makes that safe
     # (isinstance, not truthiness, so a value like "n/a" cannot raise on
     # .get) lives in _ingest_usage now, which is where its comment lives
     # too.
+    #
+    # BEFORE the empty-text branch below, which is a move rather than an
+    # accident of layout: that branch now reads the token counts this
+    # writes, and with the old ordering it read two Nones and could never
+    # produce the exhaustion label. The streaming path never had the
+    # problem, because usage is ingested per chunk and done() runs last.
     _ingest_usage(result, data.get("usage"))
+
+    text = _flatten_content(content)
+    if text:
+        result["response_text"] = text
+    else:
+        # Some providers return 200 with null content on refusals, and a
+        # reasoning model can spend a whole budget without ever producing
+        # visible text. Both must surface as an error so every result
+        # carries either text or an error, a contract the frontend relies
+        # on to pick a render state; empty_response_error is what tells
+        # the two apart. Non-str oddities land here too rather than
+        # leaking into response_text.
+        result["error"] = empty_response_error(
+            result["finish_reason"],
+            result["completion_tokens"],
+            result["reasoning_tokens"],
+        )
+
     return result
 
 
@@ -1187,12 +1273,15 @@ async def stream_model(
         if text_parts:
             result["response_text"] = "".join(text_parts)
         result["error"] = error
-        # Same guard as run_model: a clean stream that produced no text
-        # must still carry an error so the frontend has a render state.
+        # Same guard as run_model, and the same function, so the two
+        # endpoints cannot describe one failure two ways. Usage is
+        # ingested per chunk above, so the counts this reads are the
+        # final ones by the time done() runs.
         if result["response_text"] is None and error is None:
-            result["error"] = (
-                "empty response (finish_reason: "
-                f"{result['finish_reason'] or 'unknown'})"
+            result["error"] = empty_response_error(
+                result["finish_reason"],
+                result["completion_tokens"],
+                result["reasoning_tokens"],
             )
         return {"type": "done", "result": result}
 
