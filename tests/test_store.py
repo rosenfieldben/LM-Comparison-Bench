@@ -2763,7 +2763,9 @@ PRE_BYOK_SCHEMA = (
 
 
 def test_the_pre_byok_fixture_is_the_schema_as_it_stood_before_the_column():
-    """The fixture's provenance, asserted rather than trusted.
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    The fixture's provenance, asserted rather than trusted.
 
     A hand-transcribed era snapshot is a snapshot of what somebody
     believed the schema was, and a migration proof built on one proves
@@ -3109,7 +3111,10 @@ def test_review_repro_two_processes_first_opening_one_database_do_not_race(tmp_p
 
 
 def test_a_migration_failure_that_is_not_a_race_still_raises(tmp_path):
-    """The other side of the tolerance above.
+    """WINDOW: connect()'s migration loop, pointed at a table that does
+    not exist.
+
+    The other side of the tolerance above.
 
     Catching every OperationalError would turn a genuinely broken
     migration into a database quietly missing a column, which is the

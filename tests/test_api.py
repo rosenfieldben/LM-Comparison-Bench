@@ -12179,10 +12179,20 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
     tombstone counts distinct composed contents: a third member drifting
     cannot hide behind a comparison of the first two.
 
-    Every model here is a stub with a different personality, and the
-    reservation is identical across all of them, which is the property:
-    it is a function of the budget, and the budget is one number for the
-    comparison.
+    THE BUDGET IS NOT ONE NUMBER FOR THE COMPARISON, and an earlier
+    version of this docstring said it was. effective_budget clamps the
+    requested tier to each model's published completion cap, so members
+    of one lineup can legitimately be sent different ceilings. The
+    original three models all publish no cap, so they happened to share
+    one, and the distinct-value assertion below was proving something
+    narrower than the sentence above it claimed.
+
+    model/capped is in the lineup now, at 32000 against the other
+    members' 65536, so the lineup really does span two budgets. What is
+    asserted is the property that actually matters: EVERY member gets a
+    reservation, and every member's reservation is half of ITS OWN
+    ceiling. A member left out entirely, or one whose reservation was
+    computed from somebody else's budget, still fails.
 
     THE VOUCHING IS DECLARED HERE rather than baked into TEST_CATALOG,
     and that placement is deliberate. The default lineup must stay
@@ -12192,7 +12202,12 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
     about the reservation says so, and every other test keeps testing
     the silent path.
     """
-    app.state.reasoning_defaults = {"model/alpha", "model/beta", "model/vision"}
+    app.state.reasoning_defaults = {
+        "model/alpha",
+        "model/beta",
+        "model/vision",
+        "model/capped",
+    }
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(
             200, json=response_for(json.loads(request.content)["model"], "ok")
@@ -12203,22 +12218,37 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
         "/compare",
         json={
             "prompt": "a hard question",
-            "models": ["model/alpha", "model/beta", "model/vision"],
+            "models": [
+                "model/alpha",
+                "model/beta",
+                "model/vision",
+                # Clamped to 32000 while the others send 65536, so the
+                # lineup spans two ceilings on purpose.
+                "model/capped",
+            ],
             "budget": "extended",
         },
     )
     assert resp.status_code == 200, resp.text
 
     sent = [json.loads(call.request.content) for call in respx.calls]
-    assert len(sent) == 3
-    reservations = {json.dumps(body["reasoning"], sort_keys=True) for body in sent}
-    assert len(reservations) == 1, reservations
-    # And it is the budget's half, checked against each member's own
-    # declared budget rather than against a constant, so a per-model
-    # clamp that changed one member's budget would have to change its
-    # reservation with it.
+    assert len(sent) == 4
+    # EVERY member carries one, which is the coverage half: a
+    # reservation that rode only some requests would leave the same
+    # comparison partly exposed, invisibly.
+    assert all("reasoning" in body for body in sent), [
+        b["model"] for b in sent if "reasoning" not in b
+    ]
+    # And each is half of ITS OWN ceiling, never of a constant and never
+    # of another member's. This is the assertion the clamped member
+    # makes non-trivial.
     for body in sent:
-        assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}
+        assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}, body[
+            "model"
+        ]
+    # The lineup really does span two ceilings, so the check above is
+    # not quietly comparing four identical numbers.
+    assert len({body["max_tokens"] for body in sent}) == 2
 
 
 @respx.mock

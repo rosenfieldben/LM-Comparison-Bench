@@ -2087,6 +2087,10 @@ async def test_review_repro_an_observed_upstream_figure_is_stored_as_received(cl
     NOT-A-NUMBER AND NEGATIVES STILL DEGRADE, which is a different rule
     and survives untouched: those are not money figures at all, and
     as_money applies the same test to every monetary field here.
+
+    SUSPENSION POINT: the await on run_model, once per shape in the
+    loop. Each iteration's assertion runs after its own await resolves,
+    so the shapes cannot observe each other's results.
     """
     for details, expected in (
         # Nothing reported.
@@ -3451,6 +3455,11 @@ async def test_review_repro_interior_whitespace_is_never_swallowed(client):
     Visibility is a question about a whole response, so it is asked
     where a whole response is assembled, and the stored text is never
     trimmed.
+
+    SUSPENSION POINT: the `async for` over aiter_lines inside
+    stream_model. response_text is only final once done() has run, so
+    the assertion is on the done event rather than on anything
+    observable mid-iteration.
     """
     body = (
         'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
@@ -3477,6 +3486,10 @@ async def test_the_judge_is_not_paid_to_grade_whitespace(client):
     THE CALL COUNT IS THE LOAD-BEARING ASSERTION. Asserting only the
     returned verdict would pass against a mocked judge that happens to
     return a zero, and the defect is that real money was spent asking.
+
+    SUSPENSION POINT: the await on judge_response, which in the fixed
+    code suspends nowhere at all because the guard returns before any
+    request is built. That is precisely what the call count proves.
     """
     respx.post(OPENROUTER_URL).respond(
         json={"choices": [{"message": {"content": "1"}}]}
