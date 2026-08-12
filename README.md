@@ -380,6 +380,29 @@ extended budget or a lower reasoning effort; on extended, where there is
 no larger budget to move to, it suggests only the lower effort. Set one
 under **Experiment controls**.
 
+### Counts and caps are different numbers
+
+Every token count the bench stores is a count of tokens **actually
+used**, in the model's own tokenizer, as OpenRouter reported it. There is
+one source for all of them, the `usage` object on the response, described
+by [the usage-accounting
+page](https://openrouter.ai/docs/use-cases/usage-accounting) as "Prompt
+and completion token counts using the model's native tokenizer". The
+normalized figures exist only on the generation endpoint, which is a
+post-hoc reconciliation pass most rows never get, and they are
+deliberately not persisted: two counts per row would be exactly the
+ambiguity this is written to prevent.
+
+`max_tokens` is not one of those numbers. It is the completion ceiling
+the run was **sent**, after per-model clamping, and comparing it with a
+count is not an operation that means anything. That comparison is not
+hypothetical: a replay card once showed "budget 65536" beside a reasoning
+metric reading 21350, and the 44186 difference looked like output that
+had gone unaccounted for. It had not gone anywhere. The badge now reads
+"budget cap", the token metrics say in their tooltips what they count,
+and every export's manifest states the distinction once in its
+`token_counts` field.
+
 ## Reliability
 
 The shared HTTP client enables TCP keepalive probes (SO_KEEPALIVE,

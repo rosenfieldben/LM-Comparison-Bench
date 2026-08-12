@@ -258,6 +258,15 @@
     const ttft = metricCell("ttft", "ttft");
     const total = metricCell("total", "total");
     const tok = metricCell("tok", "tok i/o");
+    // THE UNIT, SAID ONCE, on the surface that shows the number. Both
+    // figures come from OpenRouter's usage object, which the
+    // usage-accounting page describes as "Prompt and completion token
+    // counts using the model's native tokenizer"
+    // (openrouter.ai/docs/use-cases/usage-accounting, read 2026-08-12).
+    // One unit for both halves of the pair, and this says which.
+    tok.v.title =
+      "prompt/completion tokens actually used, counted by the model's " +
+      "own tokenizer as OpenRouter reported them";
     // Reasoning tokens are billed and consume the completion budget while
     // never appearing in the answer, which is the whole reason the two
     // tiers exist. A cell of its own makes that burn a number on every
@@ -265,7 +274,8 @@
     const reasoning = metricCell("reasoning", "reasoning");
     reasoning.v.title =
       "hidden reasoning tokens, billed as completion tokens and counted " +
-      "against the budget";
+      "against the budget. Same unit as tok i/o: actually used, counted " +
+      "by the model's own tokenizer";
     const cost = metricCell("cost", "cost");
     cost.v.title = COST_ESTIMATE_TITLE;
     metrics.append(ttft.cell, total.cell, tok.cell, reasoning.cell, cost.cell);
@@ -585,7 +595,24 @@
     if (opts.budgetBadge && result.max_tokens != null) {
       const note = document.createElement("span");
       note.className = "budget-note";
-      note.textContent = "budget " + result.max_tokens;
+      note.dataset.testid = "budget-note";
+      // A CAP, LABELLED AS ONE, and the label is the fix rather than
+      // decoration. This badge read "budget 65536" beside a reasoning
+      // metric reading 21350, and a reader subtracting them got 44186
+      // tokens that never existed: one number is the ceiling the bench
+      // SENT, the other is what the provider COUNTED. Both are tokens,
+      // so nothing about the pair announced that they answer different
+      // questions, and the phantom difference misdirected a diagnosis
+      // for a full round.
+      //
+      // "cap" is the whole remedy. The two numbers now cannot be read as
+      // one arithmetic, and the title says which is which for anyone who
+      // hovers.
+      note.textContent = "budget cap " + result.max_tokens;
+      note.title =
+        "the completion ceiling this run was sent, after per-model " +
+        "clamping. Not a count: compare it against tok i/o, which is " +
+        "what was actually used";
       ui.tools.append(note);
     }
   }

@@ -6274,6 +6274,14 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
     # can find out what moved without a changelog.
     assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[3]
     assert "renditions" in manifest["export_schema_change"]
+    # ONE UNIT, SAID ONCE, for a reader who was never in the room. Trial
+    # lines put four counts and one ceiling side by side, and the
+    # subtraction that invites is the one that manufactured a phantom
+    # 44186 tokens on a card. Not a schema bump: no field's value,
+    # meaning or presence changed, so a v3 parser ignoring this key reads
+    # exactly what it read before.
+    assert manifest["token_counts"] == report._manifest_token_note()
+    assert "max_tokens is not a count" in manifest["token_counts"]
     assert manifest["estimand_mode"] == "routed_service"
     assert manifest["dataset_digest"]
     assert manifest["bootstrap_unit"] == "task"

@@ -16,6 +16,8 @@ trigger, on the server and on the card alike, which is what makes the
 behaviour reach a provider that ignored the reservation entirely.
 """
 
+import re
+
 import pytest
 from playwright.sync_api import expect
 
@@ -137,3 +139,33 @@ def test_a_healthy_reasoning_card_is_left_alone(bench):
     card = cards(page).first
     expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
     expect(card.get_by_test_id("card-error")).to_have_count(0)
+
+
+def test_review_repro_the_replayed_budget_badge_says_it_is_a_cap(bench, open_history):
+    """WINDOW: a history replay's card tools, which is the only place the
+    budget badge is drawn.
+
+    THE PHANTOM 44K, ON THE PAGE. The badge read "budget 65536" next to a
+    reasoning metric reading 21350. Both are token figures and nothing
+    said they answer different questions, so the difference looked like
+    44186 tokens that had gone somewhere unexplained. They had gone
+    nowhere: one number is the ceiling the bench sent, the other is what
+    the provider counted, and subtracting them is not an operation that
+    means anything.
+
+    The badge now says "cap", which is the entire remedy, and the title
+    says which number to compare it against instead.
+    """
+    page = bench(["stub/exhausted"])
+    check_all_chips(page)
+    page.get_by_test_id("budget-extended").click()
+    run(page, "cap label replay")
+    expect(status_of(cards(page).first)).to_have_text("error", timeout=DONE_TIMEOUT)
+
+    open_history()
+    row = page.get_by_test_id("history-row").filter(has_text="cap label replay")
+    row.first.click()
+
+    badge = page.get_by_test_id("budget-note").first
+    expect(badge).to_have_text("budget cap 65536")
+    expect(badge).to_have_attribute("title", re.compile("Not a count"))

@@ -2475,3 +2475,85 @@ async def test_review_repro_an_exhausted_stream_is_labelled_identically(client):
     )
     # The two endpoints, one sentence.
     assert done["result"]["error"] == empty_response_error("length", 21350, 21350)
+
+
+# ---- The reasoning-exhaustion fix, R3: one unit per surface, and every
+# ---- surface says which.
+
+
+def test_review_repro_a_cap_is_never_rendered_as_a_count():
+    """WINDOW: the card's budget badge and its token metrics, read out of
+    static/render.js.
+
+    THE PHANTOM 44K. The badge said "budget 65536" and the reasoning
+    metric said 21350. Both are numbers of tokens, nothing on the card
+    distinguished them, and 65536 minus 21350 is 44186 tokens that were
+    never generated and never billed. A reader took that difference for
+    unaccounted output and the diagnosis went the wrong way for a full
+    round. The two numbers answer different questions: one is the
+    ceiling the bench SENT, the other is what the provider COUNTED.
+
+    ASSERTED ON THE SOURCE, not through a browser, because the property
+    is that the word is present in the markup the renderer emits; the
+    browser tombstone beside this one checks that it reaches the page.
+    """
+    render = (Path(__file__).parent.parent / "static" / "render.js").read_text()
+
+    assert 'note.textContent = "budget cap " + result.max_tokens;' in render
+    # The bare form is gone, which is the half a "contains cap" assertion
+    # would miss.
+    assert '"budget " + result.max_tokens' not in render
+    # And each surface that shows a count says what the count is.
+    assert "prompt/completion tokens actually used" in render
+    assert "Not a count: compare it against tok i/o" in render
+
+
+def test_the_export_manifest_states_the_unit_once():
+    """The citable artifact, whose readers were not in the room.
+
+    Every trial line carries four counts and one ceiling side by side.
+    prompt_tokens next to max_tokens invites precisely the subtraction
+    that manufactured the phantom above, and an export outlives the
+    conversation that produced it.
+
+    ONCE, in the manifest, because it is a property of the format rather
+    than of any run: a note stamped on every trial line is one a reader
+    stops seeing by line three.
+    """
+    from bench.report import _manifest_token_note
+
+    # The note names every count field and singles out the one field on
+    # the trial line that is not a count.
+    for field in (
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+    ):
+        assert field in _manifest_token_note()
+    assert "max_tokens is not a count" in _manifest_token_note()
+    assert "model's own tokenizer" in _manifest_token_note()
+
+
+def test_the_stored_counts_have_exactly_one_source():
+    """THE AUDIT'S CENTRAL FINDING, asserted so it cannot quietly stop
+    being true.
+
+    One unit per surface is only enforceable if there is one place the
+    unit is decided. Every count the bench stores enters through
+    _ingest_usage, reading OpenRouter's usage object, which the
+    usage-accounting page describes as "Prompt and completion token
+    counts using the model's native tokenizer". The generation
+    endpoint's counts are parsed by _generation_record and never
+    persisted, because RECONCILABLE_COLUMNS does not list them, so they
+    cannot become a second unit in the database by accident.
+
+    This walks the store's reconcilable list rather than trusting the
+    comment beside it: a future entry that added a token column would
+    put two counts per result on one row, and that is the shape this
+    workstream exists to prevent.
+    """
+    from bench.store import RECONCILABLE_COLUMNS
+
+    for column in RECONCILABLE_COLUMNS:
+        assert "token" not in column, column

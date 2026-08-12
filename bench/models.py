@@ -815,6 +815,23 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     """
     if not isinstance(usage, dict):
         return
+    # THE UNIT EVERY STORED COUNT IS IN, entering here and nowhere else.
+    # OpenRouter's usage-accounting page, read 2026-08-12: "Prompt and
+    # completion token counts using the model's native tokenizer". So the
+    # four counts below are NATIVE, all four of them, from one object, and
+    # the bench has exactly one unit for counts because it has exactly one
+    # source for them.
+    #
+    # The normalized figures (tokens_prompt, tokens_completion) exist only
+    # on the generation endpoint, which is a post-hoc pass most rows never
+    # get, so there is no in-band normalized count to mix these with even
+    # if something wanted to.
+    #
+    # What is NOT in this unit and must never be compared with it:
+    # max_tokens, which is a ceiling the bench sent rather than anything a
+    # tokenizer counted. Every surface that shows the two together labels
+    # the cap as a cap; see the budget note in static/render.js for what
+    # happened when one did not.
     result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
     result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
     result["billed_cost_usd"] = as_money(usage.get("cost"))
@@ -1476,6 +1493,26 @@ async def fetch_generation(
     record["provider"] = _as_label(data.get("provider_name"))
     record["quantization"] = _as_label(data.get("quantization"))
     record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))
+    # THE NATIVE FIELDS ON PURPOSE, and parsed but NOT PERSISTED, which
+    # is a deliberate pair of choices rather than an oversight in either
+    # direction.
+    #
+    # Native, because store's counts are native (see _ingest_usage) and
+    # the endpoint offers both: "native_tokens_completion - Native
+    # completion tokens as reported by provider" beside a plain
+    # "tokens_completion - Number of tokens in the completion". Reading
+    # the normalized pair here would put a second unit into a record whose
+    # whole job is to be comparable with what is already stored.
+    #
+    # Not persisted, because RECONCILABLE_COLUMNS in bench/store.py does
+    # not list them, so a reconcile pass reads these and drops them. They
+    # are kept anyway as the ONE PLACE the two units can be compared: a
+    # reader debugging a suspicious row can print this record and see
+    # both. Adding columns for them would put two counts per result in the
+    # database and reintroduce, permanently, exactly the ambiguity this
+    # workstream exists to remove.
+    #
+    # Pinned against the Get a Generation reference, read 2026-08-12.
     record["prompt_tokens"] = as_token_count(data.get("native_tokens_prompt"))
     record["completion_tokens"] = as_token_count(data.get("native_tokens_completion"))
     record["reasoning_tokens"] = as_token_count(data.get("native_tokens_reasoning"))

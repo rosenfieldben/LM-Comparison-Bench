@@ -1398,6 +1398,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # which format it is in without anyone consulting a changelog.
 EXPORT_SCHEMA_VERSION = 3
 
+
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
 # than in this file, because "without anyone consulting a changelog" is
 # the whole claim above and a bare integer does not honor it. A reader
@@ -1424,6 +1425,22 @@ EXPORT_SCHEMA_VERSION = 3
 # trial lines a v2 reader could not tell apart while the models had been
 # shown different things. An artifact whose whole purpose is to be
 # checkable has to carry the reading.
+def _manifest_token_note() -> str:
+    """The one sentence the artifact says about its token units.
+
+    A function rather than an inline literal so a test can read it
+    without building an export, and so there is one place the wording
+    lives if a field is ever added to the trial line.
+    """
+    return (
+        "prompt_tokens, completion_tokens, reasoning_tokens and "
+        "cached_tokens are counts of tokens actually used, in the "
+        "model's own tokenizer, as OpenRouter reported them. "
+        "max_tokens is not a count: it is the completion ceiling the "
+        "run was sent, after per-model clamping."
+    )
+
+
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -1523,6 +1540,23 @@ def export_manifest(
         # self-contained", and the digests themselves are on the trial
         # lines where they belong to a particular trial.
         "attachments_referenced": attachments_referenced,
+        # THE UNIT, ONCE, FOR THE WHOLE ARTIFACT. Every trial line carries
+        # four counts and one ceiling side by side, and an export is read
+        # by people who were not here: prompt_tokens next to max_tokens
+        # invites exactly the subtraction that manufactured a phantom
+        # 44186 tokens on a card and misdirected a live diagnosis.
+        #
+        # In the manifest rather than repeated per trial, because it is a
+        # property of the format and not of any run, and a note stamped
+        # onto every line is one a reader stops seeing.
+        #
+        # NO SCHEMA BUMP, and the reason matters. EXPORT_SCHEMA_VERSION
+        # rises when a line's shape changes in a way a reader could not
+        # absorb; this changes no field's value, meaning, or presence. A
+        # v3 parser that ignores the key reads precisely what it read
+        # before, and correctly. What is new is a sentence about fields
+        # that were always there.
+        "token_counts": _manifest_token_note(),
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         # The bump's reason, in the file. See EXPORT_SCHEMA_NOTES: a
