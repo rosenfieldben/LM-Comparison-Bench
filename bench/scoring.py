@@ -183,7 +183,11 @@ def score_response(
     across scorers without knowing which is which.
     """
     kind = spec["kind"]
-    if response is None:
+    # Whitespace is not a wrong answer, it is an absent one, and the
+    # detail below is the distinction this guard exists to preserve.
+    # Falling through would score it 0.0 with no detail, which reads as
+    # a model that answered badly rather than one that did not answer.
+    if response is None or not response.strip():
         return _verdict(0.0, False, "no response text: the trial did not complete")
     subject = response[:MAX_SUBJECT_CHARS]
 

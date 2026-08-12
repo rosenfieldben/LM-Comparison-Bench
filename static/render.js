@@ -7,7 +7,7 @@
 // click/completion time, so the globals exist by then.
 (function () {
   const { shortName, fmtCost, fmtBilled, niceScale } = window.BenchLib;
-  const { reasoningAteTheOutput, reasoningShare } = window.BenchLib;
+  const { reasoningAteTheOutput, reasoningShare, remedyFor } = window.BenchLib;
 
   // The cost cell's default explanation, restored on reset so a rerun of a
   // billed run does not keep claiming the previous attempt's charge.
@@ -545,13 +545,30 @@
     ui.tools.append(btn);
   }
 
+  // Whether the budget-and-effort advice is relevant to this card at
+  // all. Two shapes qualify and they are different failures:
+  //
+  //   the output went to reasoning AND the cap closed, which is the
+  //   exhaustion case the whole fix is about
+  //
+  //   the cap closed on a long answer with no reasoning behind it,
+  //   which a larger budget genuinely does fix
+  //
+  // Keyed on finish_reason and the counts, never on the error's prose.
+  // The old code matched the substring "finish_reason: length" in a
+  // sentence, which is the coupling that silently withdrew the remedy
+  // the first time the sentence was reworded.
+  function exhaustionRemedyApplies(result) {
+    return result.finish_reason === "length";
+  }
+
   // Draws the reasoning indicator, or removes a previous one.
   //
   // The removal branch is not defensive padding: completeColumn runs
   // again on a rerun of the same card, and an indicator left over from
   // the previous attempt would describe tokens the current result never
   // spent. resetColumn clears the metrics for the same reason.
-  function addReasoningIndicator(ui, result) {
+  function addReasoningIndicator(ui, result, opts) {
     // Idempotent on its own, not only via resetColumn. completeColumn
     // can run twice on one card without a reset: stream.js calls finish()
     // again with a synthetic error result when the primary render throws,
@@ -575,10 +592,27 @@
     // numbers are the provider's and go through String coercion only.
     warn.textContent =
       share + "% of completion tokens went to reasoning, not to the answer";
+    // THE SECOND SURFACE THAT GAVE UNACTIONABLE ADVICE. This title
+    // hardcoded "Lower the reasoning effort under Experiment controls"
+    // and rendered on every card the indicator fired for, including
+    // runs already at the UI minimum, where there is nothing lower to
+    // choose. Fixing the error line alone would have left the card
+    // still saying it.
+    //
+    // Derived from the same rule now, so the two sentences on one card
+    // cannot contradict each other. When no lower effort is selectable
+    // the accounting sentence stands alone, which is the honest answer.
+    const advice = remedyFor(result, {
+      extendedCap: opts.extendedCap,
+      effort: opts.effort,
+    });
     warn.title =
       "reasoning tokens are billed as completion tokens and never appear " +
-      "in the answer. Lower the reasoning effort under Experiment " +
-      "controls to spend less of the budget thinking";
+      "in the answer" +
+      (advice.includes("lower reasoning effort")
+        ? ". Lower the reasoning effort under Experiment controls to " +
+          "spend less of the budget thinking"
+        : "");
     ui.body.before(warn);
   }
 
@@ -617,7 +651,7 @@
     // history as well as live runs: a stored row carries both counts, and
     // a warning that appeared only while you watched would be missing
     // from every card anyone came back to.
-    addReasoningIndicator(ui, result);
+    addReasoningIndicator(ui, result, opts);
     if (opts.unsaved) {
       // run_id came back null: the server spent the money and streamed
       // the response but could not persist it. Saying nothing would let
@@ -631,7 +665,24 @@
         "will not appear in History";
       ui.body.before(warn);
     }
-    const error = "shownError" in opts ? opts.shownError : result.error;
+    // THE REMEDY IS DERIVED HERE, not passed in, so a replayed card
+    // and a live one cannot disagree about what to advise. fillColumn
+    // used to supply no shownError at all, so replays showed the
+    // server's bare sentence and lost the advice entirely, on the
+    // surface where somebody is deciding whether to spend again.
+    //
+    // Everything it needs is on the stored row: max_tokens is the
+    // effective post-clamp ceiling the run was SENT, and the counts and
+    // finish_reason came back with it. The caller supplies only what a
+    // row cannot carry, the extended tier's clamp for this model and
+    // the effort that was selected.
+    let error = "shownError" in opts ? opts.shownError : result.error;
+    if (error != null && exhaustionRemedyApplies(result)) {
+      error += remedyFor(result, {
+        extendedCap: opts.extendedCap,
+        effort: opts.effort,
+      });
+    }
     applyError(ui, error);
     // A user Stop is neither done nor a provider failure, and a spend
     // refusal is neither of those nor a failure of any kind: the ceiling
@@ -686,11 +737,19 @@
     }
   }
 
-  function fillColumn(ui, result, sourceLabel) {
+  function fillColumn(ui, result, sourceLabel, opts) {
+    const extra = opts || {};
     completeColumn(ui, result, sourceLabel, {
       streamed: false,
       budgetBadge: true,
       retry: null,
+      // A stored row carries the cap it was SENT but not what another
+      // tier would send, and not which effort was selected. Both come
+      // from the caller, which is history, and both are optional: a
+      // replay with neither still derives the effort clause correctly
+      // and simply cannot offer the budget one.
+      extendedCap: extra.extendedCap,
+      effort: extra.effort,
     });
   }
 

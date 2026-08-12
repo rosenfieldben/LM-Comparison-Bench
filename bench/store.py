@@ -661,10 +661,33 @@ def connect(path: str) -> sqlite3.Connection:
     # checkpoint clears them; see the README's note on VACUUM.
     conn.execute("PRAGMA secure_delete = ON")
     conn.executescript(SCHEMA)
+    # ADDITIVE MIGRATIONS, and the try is not laziness.
+    #
+    # THE RACE. The PRAGMA and the ALTER are two statements, so two
+    # processes first-opening the same old database can both read a
+    # column as absent and both try to add it. The loser gets
+    # "duplicate column name" and, before this, an OperationalError out
+    # of connect(): the bench refusing to start because something else
+    # started it correctly a millisecond earlier. The window is small
+    # and real, and it is exactly the window a fresh checkout opens when
+    # a person runs the app and the test suite at once.
+    #
+    # Catching the duplicate and re-checking is the smallest fix that
+    # keeps the invariant: the column exists afterwards either way, and
+    # anything OTHER than a duplicate is still an error worth raising,
+    # so a genuinely broken migration is not swallowed.
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in cols:
+        if column in cols:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            # Somebody else added it between the PRAGMA and here. That
+            # is the outcome this loop wanted, so it is not a failure.
+            logger.debug("migration raced on %s.%s, already added", table, column)
     # After the migrations, not before: runs.group_id may only exist
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)

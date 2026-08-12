@@ -2,6 +2,7 @@ import json
 import pathlib
 import sqlite3
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -3057,3 +3058,69 @@ def test_a_poisoned_flag_cell_degrades_rather_than_lying(tmp_path):
         assert stored == "null"
     finally:
         conn.close()
+
+
+def test_review_repro_two_processes_first_opening_one_database_do_not_race(tmp_path):
+    """WINDOW: the ALTER inside connect()'s migration loop, at the exact
+    moment the column already exists.
+
+    THE RACE. The PRAGMA check and the ALTER are two statements. Two
+    processes first-opening the same old database can both read a
+    column as absent and both try to add it; the loser gets "duplicate
+    column name" out of connect() and the bench refuses to start,
+    because something else started it correctly a millisecond earlier.
+    That is the window a fresh checkout opens when somebody runs the app
+    and the test suite at once.
+
+    REPRODUCED DETERMINISTICALLY, and the mechanism is worth stating
+    because the obvious version of this test is vacuous. Adding the
+    column before connect() runs does NOT reproduce the race: the
+    PRAGMA then sees it, the loop skips, and the ALTER never executes.
+    That test passes whether or not the tolerance exists, which is how
+    it was first written here.
+
+    What reproduces it is a name whose case differs. Python's set
+    membership is case-sensitive and SQLite's column names are not, so
+    a migration entry spelled IS_BYOK is reported absent by the PRAGMA
+    and rejected as a duplicate by the ALTER. That is precisely the
+    loser's situation, without threads and without a timing window to
+    hope for.
+    """
+    db_path = tmp_path / "raced.db"
+    first = store.connect(str(db_path))
+    first.close()
+
+    with mock.patch.object(store, "MIGRATIONS", (("results", "IS_BYOK", "INTEGER"),)):
+        # PRE-STATE: the loop really will attempt the ALTER, because the
+        # check does not see the column under this spelling.
+        probe = sqlite3.connect(str(db_path))
+        cols = {r[1] for r in probe.execute("PRAGMA table_info(results)")}
+        assert "IS_BYOK" not in cols
+        assert "is_byok" in cols
+        probe.close()
+
+        # And connect() survives it rather than refusing to start.
+        conn = store.connect(str(db_path))
+        try:
+            run_id = store.save_run(conn, "p", [make_result(model="m/a", is_byok=True)])
+            assert store.get_run(conn, run_id)["results"][0]["is_byok"] is True
+        finally:
+            conn.close()
+
+
+def test_a_migration_failure_that_is_not_a_race_still_raises(tmp_path):
+    """The other side of the tolerance above.
+
+    Catching every OperationalError would turn a genuinely broken
+    migration into a database quietly missing a column, which is the
+    failure mode additive migrations exist to prevent. Only the
+    duplicate is tolerated, and this proves the rest are not by
+    pointing the loop at a table that does not exist.
+    """
+    db_path = tmp_path / "broken.db"
+    conn = store.connect(str(db_path))
+    conn.close()
+
+    with mock.patch.object(store, "MIGRATIONS", (("no_such_table", "c", "INTEGER"),)):
+        with pytest.raises(sqlite3.OperationalError):
+            store.connect(str(db_path))

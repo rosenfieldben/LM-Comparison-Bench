@@ -327,6 +327,39 @@ REASONING_BUDGET_SHARE = 0.5
 # this table exists for is against REASONING_BUDGET_SHARE, which is a
 # number. A future share of 0.25 would move the boundary to low without
 # anybody editing a tier list, which is the point.
+# THE SMALLEST REASONING BUDGET ANY PINNED PROVIDER WILL ACCEPT, and
+# the rule that makes a small budget unsatisfiable rather than merely
+# tight.
+#
+# NAMED FOR WHAT IT IS RATHER THAN FOR WHO PUBLISHED IT, and that is not
+# cosmetic. A first draft called this ANTHROPIC_REASONING_MINIMUM and
+# the universality tripwire failed the moment the constant was read from
+# reasoning_reservation, correctly: a vendor's name had entered
+# executable code. The floor is applied to every request regardless of
+# route, so the name says that and the quote below says whose behaviour
+# the number was measured from. Prose about a contract may name a
+# vendor; a line that runs may not.
+#
+# Both rules quoted from
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# read 2026-08-12:
+#
+#   "When using the reasoning.max_tokens parameter, that value is used
+#   directly with a minimum of 1024 tokens."
+#
+#   "Important: max_tokens must be strictly higher than the reasoning
+#   budget to ensure there are tokens available for the final response
+#   after thinking."
+#
+# A minimum turns a request into a demand the sender did not make. Ask
+# for 256 and the provider hears 1024, and if the outer budget is not
+# strictly above that, nothing can satisfy the pair.
+#
+# ONE NUMBER FOR THE WHOLE FILE, because the judge's 512 budget and a
+# per-model clamp reach the same wall from opposite directions and must
+# not be two rules that can drift apart.
+PROVIDER_REASONING_MINIMUM = 1024
+
 EFFORT_SHARES = {
     "none": 0.0,
     "minimal": 0.1,
@@ -453,6 +486,35 @@ def reasoning_reservation(
     REASONING_BUDGET_SHARE for why the declaration wins over the
     default.
 
+    EMPTY WHEN THE ARITHMETIC CANNOT BE SATISFIED, which is the rule
+    that used to be a special case at the judge and is now general.
+
+    A provider minimum turns a small request into a larger demand: ask
+    for 256 and the pinned floor makes it 1024. Two things then go
+    wrong, and both are checked, because a future share could reach
+    either one first.
+
+      The share falls BELOW the minimum. The request that arrives is
+      not the request that was sent, and the visible room this function
+      exists to reserve is not the room that will be left. At an outer
+      budget of 1200 a half share asks for 600 and the provider hears
+      1024, leaving 176 visible tokens instead of the promised 600.
+
+      The outer budget is NOT STRICTLY GREATER than what the provider
+      will use. Nothing can satisfy that pair; the contract says so in
+      as many words.
+
+    KEYED ON THE ARITHMETIC, NEVER ON THE CALL SITE. The judge's 512
+    token budget and a per-model clamp of 1024 are the same failure
+    reached from opposite directions, so they are one rule with two
+    instances rather than two rules that can drift apart. The judge
+    calls this function like everybody else and gets {} from it.
+
+    THE CLAMP IS WHY THIS IS REACHABLE at all: effective_budget lowers
+    the requested tier to any published completion cap, and the catalog
+    accepts any cap above zero, so a budget below 2048 comes from a real
+    catalog entry rather than from a hypothetical.
+
     int() truncates rather than rounds, so the cap is never a token
     above its share of the budget. At the two real tiers the division is
     exact anyway; the floor matters only if a future tier is odd.
@@ -461,7 +523,12 @@ def reasoning_reservation(
         return {}
     if controls and controls.get("effort") is not None:
         return {}
-    return {"reasoning": {"max_tokens": int(max_tokens * REASONING_BUDGET_SHARE)}}
+    want = int(max_tokens * REASONING_BUDGET_SHARE)
+    # What the provider will actually use, after its own floor.
+    effective = max(want, PROVIDER_REASONING_MINIMUM)
+    if want < PROVIDER_REASONING_MINIMUM or max_tokens <= effective:
+        return {}
+    return {"reasoning": {"max_tokens": want}}
 
 
 # ---- The underlying-model estimand.
@@ -1191,6 +1258,15 @@ def _request_record(
 def _flatten_content(content: object) -> str | None:
     """Collapse a message content value to plain text or None.
 
+    PER-FRAGMENT PRESENCE, NOT WHOLE-RESPONSE VISIBILITY, and the
+    division of labour is easy to get wrong. This runs once per
+    streaming delta, so a lone " " is a real fragment of a real
+    sentence: returning None for it would drop that delta from both the
+    accumulated text and the event yielded to the browser, and
+    "Hello world" would arrive as "Helloworld". Whether a whole response
+    is VISIBLE is a different question, asked at the two call sites that
+    assemble one, with strip().
+
     Content-parts lists (multimodal providers) flatten to their text
     parts. Anything that is not a non-empty str after that returns None:
     response_text is str or None by contract, and a raw list would crash
@@ -1412,8 +1488,17 @@ def empty_response_error(
         # reader can act on survives: where the money went, how much of
         # it, and why generation stopped. Only the assertion the numbers
         # do not support is gone.
+        #
+        # "nearly all of" rather than "the whole", because the predicate
+        # fires at nine tenths and the sentence was claiming ten. On a
+        # response of 338 completion tokens with 312 reasoning, which is
+        # a real measured shape in this repository, 26 tokens did reach
+        # the answer and the old wording denied it. A sentence written
+        # to stop a label overstating its evidence must not overstate
+        # its own.
         return (
-            "no visible answer: the whole completion went to reasoning "
+            "no visible answer: nearly all of the completion went to "
+            "reasoning "
             f"({reasoning_tokens} reasoning tokens, finish_reason: "
             f"{finish_reason or 'unknown'})"
         )
@@ -1679,7 +1764,17 @@ async def run_model(
     _ingest_usage(result, data.get("usage"))
 
     text = _flatten_content(content)
-    if text:
+    # STRIP AS A PREDICATE, NEVER AS A TRANSFORM. Whitespace is not a
+    # visible answer: a response of spaces and newlines used to be
+    # truthy here, so response_text was set, the empty-response guard
+    # below never ran, and a fully billed reasoning burn rendered as a
+    # blank card with no error and therefore no remedy.
+    #
+    # What is STORED is still the text exactly as it arrived. Only the
+    # question "did this produce anything a reader can see" is asked
+    # with strip(), because trimming the stored value would edit a
+    # model's output on its way into the record.
+    if text is not None and text.strip():
         result["response_text"] = text
     else:
         # Some providers return 200 with null content on refusals, and a
@@ -1801,8 +1896,13 @@ async def stream_model(
 
     def done(error: str | None) -> dict[str, Any]:
         result["latency_ms"] = elapsed_ms()
-        if text_parts:
-            result["response_text"] = "".join(text_parts)
+        # The same predicate as run_model, on the whole response rather
+        # than on any one delta. joined is kept verbatim; only the
+        # decision uses strip(). See _flatten_content for why the strip
+        # cannot live there.
+        joined = "".join(text_parts)
+        if joined.strip():
+            result["response_text"] = joined
         result["error"] = error
         # Same guard as run_model, and the same function, so the two
         # endpoints cannot describe one failure two ways. Usage is
@@ -2212,7 +2312,11 @@ async def judge_response(
     data-handling promise as the run itself. There is no path here that
     can send it under a different policy.
     """
-    if response_text is None:
+    # Whitespace is not an answer, and paying a judge to grade it is
+    # money spent on a verdict nobody can use. parse_verdict at the
+    # other end of this file already applies the same test to what comes
+    # back; this applies it to what goes out.
+    if response_text is None or not response_text.strip():
         # A trial that produced no text. Scored without asking anyone,
         # because there is nothing to grade and paying a judge to say so
         # would be spending money to learn what the row already says.
@@ -2245,14 +2349,17 @@ async def judge_response(
         # deliberation, and 256 visible is far more than "a number and a
         # sentence" needs.
         #
-        # NO RESERVATION AT ALL, deliberately, and the reason is
-        # arithmetic rather than caution. See JUDGE_SENDS_NO_RESERVATION
-        # beside JUDGE_MAX_TOKENS: half of 512 is 256, the documented
-        # Anthropic minimum raises that to 1024, and the contract also
-        # requires the outer max_tokens to be strictly higher than the
-        # reasoning budget. 512 is not higher than 1024, so the request
-        # this used to build could not be honoured by the rules it was
-        # built from.
+        # NO RESERVATION, and it is the GENERAL rule that says so
+        # rather than a special case here. reasoning_reservation
+        # computes half of 512, sees 256 fall below the pinned 1024
+        # minimum, and returns nothing. See JUDGE_SENDS_NO_RESERVATION
+        # beside JUDGE_MAX_TOKENS for the arithmetic in full.
+        #
+        # Called rather than omitted on purpose: if the judge's budget
+        # were ever raised past the point where the arithmetic works,
+        # this line starts reserving without anybody having to remember
+        # that it should.
+        **reasoning_reservation(JUDGE_MAX_TOKENS, None, True),
     }
     if provider_prefs:
         payload["provider"] = provider_prefs

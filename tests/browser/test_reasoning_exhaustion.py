@@ -18,6 +18,7 @@ behaviour reach a provider that ignored the reservation entirely.
 
 import re
 
+import httpx
 import pytest
 from playwright.sync_api import expect
 
@@ -345,7 +346,7 @@ def test_review_repro_a_refusal_is_not_told_its_budget_ran_out(bench):
     error = card.get_by_test_id("card-error")
     # The accounting fact survives: where the money went and why it
     # stopped are both on the card.
-    expect(error).to_contain_text("the whole completion went to reasoning")
+    expect(error).to_contain_text("nearly all of the completion went to reasoning")
     expect(error).to_contain_text("37 reasoning tokens")
     expect(error).to_contain_text("finish_reason: content_filter")
     # The claim the numbers do not support is gone.
@@ -370,3 +371,128 @@ def test_a_real_truncation_still_gets_the_causal_label_and_the_remedy(bench):
     error = card.get_by_test_id("card-error")
     expect(error).to_contain_text("completion budget exhausted during reasoning")
     expect(error).to_contain_text("try extended budget or a lower reasoning effort")
+
+
+def test_review_repro_the_reservation_reaches_the_wire_in_a_browser_run(
+    bench, stub_url
+):
+    """WINDOW: the payloads the stub actually recorded, for a vouched
+    model and an unvouched one in the same run.
+
+    UNTIL THIS TEST EXISTED THE GATE HAD NEVER FIRED IN A BROWSER RUN.
+    No stub catalog entry published supported_parameters, and
+    fetch_catalog requires "reasoning" to be in that list, so
+    may_send_reasoning_cap was False for every model and
+    app.state.reasoning_defaults booted empty in every browser session.
+    Every browser assertion about the reasoning field was testing the
+    ungated path, and no mutation of the gate could have failed one.
+
+    BOTH ANSWERS IN ONE RUN, because a test that only showed the cap
+    arriving would pass just as well with the gate deleted.
+    """
+    page = bench(["stub/exhausted", "stub/fast"])
+    check_all_chips(page)
+    run(page, "gate on the wire")
+    for i in range(2):
+        expect(status_of(cards(page).nth(i))).not_to_have_text(
+            "working", timeout=DONE_TIMEOUT
+        )
+
+    recorded = httpx.get(stub_url + "/_test/requests", trust_env=False).json()[
+        "requests"
+    ]
+    sent = {
+        r["model"]: r
+        for r in recorded
+        if r["messages"][0]["content"] == "gate on the wire"
+    }
+
+    # VOUCHED: mandatory, budget support, parameter advertised. The cap
+    # rides, and it is half the budget this run was actually sent.
+    vouched = sent["stub/exhausted"]
+    assert vouched["reasoning"] == {"max_tokens": vouched["max_tokens"] // 2}
+
+    # UNVOUCHED: publishes no reasoning descriptor at all. Nothing is
+    # sent, and the payload is the pre-feature payload.
+    assert "reasoning" not in sent["stub/fast"]
+
+
+def test_review_repro_a_clamped_budget_is_not_told_to_buy_a_bigger_one(bench):
+    """WINDOW: a live card for a model whose published cap is below the
+    standard tier, at the EXTENDED tier.
+
+    THE DEFECT. The advice branched on the tier the user had selected,
+    not on the ceiling the run was actually sent. effective_budget
+    clamps the requested tier to a model's published completion cap, so
+    stub/capped-thinker sends 4096 whichever tier is chosen. Telling
+    that reader to try extended budget is telling them to spend four
+    times as much to send a byte-identical request.
+
+    NO EXISTING TEST COULD SEE THIS: every other exhaustion fixture
+    publishes no cap, so standard and extended genuinely differ there
+    and the tier-keyed code passed.
+
+    The card still says where the money went; only the advice that
+    cannot work is gone.
+    """
+    page = bench(["stub/capped-thinker"])
+    check_all_chips(page)
+    page.get_by_test_id("budget-extended").click()
+    run(page, "clamped budget")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    error = card.get_by_test_id("card-error")
+    # The accounting fact survives.
+    expect(error).to_contain_text("completion budget exhausted during reasoning")
+    # The impossible advice does not.
+    expect(error).not_to_contain_text("extended budget")
+    # And the cap it turns on is visible on the live card, not only on
+    # replays, because this is the surface where somebody is deciding
+    # whether to spend again.
+    expect(card.get_by_test_id("budget-note")).to_have_text("budget cap 4096")
+
+
+def test_review_repro_a_replayed_card_carries_the_same_remedy(bench, open_history):
+    """WINDOW: one card twice, live and then replayed from History.
+
+    THE DEFECT. fillColumn passed no shownError, so completeColumn fell
+    back to the server's bare sentence and every replayed card lost the
+    advice entirely, on the surface where somebody is deciding whether
+    to spend again. The remedy is derived inside completeColumn now, so
+    both paths reach it.
+    """
+    page = bench(["stub/exhausted"])
+    check_all_chips(page)
+    run(page, "replay remedy")
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    live = card.get_by_test_id("card-error").inner_text()
+    assert "lower reasoning effort" in live
+
+    open_history()
+    page.get_by_test_id("history-row").filter(has_text="replay remedy").first.click()
+
+    replayed = cards(page).first.get_by_test_id("card-error")
+    expect(replayed).to_have_text(live)
+
+
+def test_review_repro_a_whitespace_only_answer_is_not_a_blank_success(bench):
+    """WINDOW: a live card whose only visible output is whitespace.
+
+    THE DEFECT. `if text:` was true for spaces and newlines, so
+    response_text was set, no error was synthesized, and a fully billed
+    reasoning burn rendered as a clean done card that displayed nothing
+    at all. No error means no label, no remedy and no indicator: a
+    worse outcome than the original incident, because even the useless
+    sentence was gone.
+    """
+    page = bench(["stub/whitespace"])
+    check_all_chips(page)
+    run(page, "whitespace only")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("card-error")).to_contain_text(
+        "completion budget exhausted during reasoning"
+    )

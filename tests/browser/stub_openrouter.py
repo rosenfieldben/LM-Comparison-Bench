@@ -35,6 +35,30 @@ GENERATION_ID_HEADER = "X-Generation-Id"
 # 13e-6 + 16e-6 = 2.9e-5 USD per completed run. stub/capped publishes a
 # completion cap far below the extended budget so the clamp has
 # something to bite on.
+# WHAT IT TAKES TO CLEAR THE RESERVATION GATE, spelled out once.
+#
+# UNTIL THIS EXISTED, NO BROWSER TEST EVER EXERCISED THE GATE. No entry
+# published supported_parameters at all, and fetch_catalog requires
+# "reasoning" to be in that list, so may_send_reasoning_cap was False
+# for every stub model and app.state.reasoning_defaults booted empty in
+# every browser run. Every browser assertion about the reasoning field
+# was therefore testing the ungated path, and a mutation of the gate
+# could not have failed a single one of them.
+#
+# Three conditions, and the descriptor has to satisfy all of them:
+# mandatory (so a cap cannot switch thinking on), supports_max_tokens
+# (so the cap is a ceiling rather than an effort request), and the
+# parameter advertised (so strict mode cannot exclude every provider).
+VOUCHED = {
+    "reasoning": {"mandatory": True, "supports_max_tokens": True},
+    "supported_parameters": ["max_tokens", "reasoning", "temperature", "seed", "top_p"],
+}
+
+# The plain personalities stay UNVOUCHED on purpose. test_h.py asserts
+# that a blank-controls payload is byte-identical to the pre-feature
+# one, and that proof needs a model the bench does not vouch for.
+PLAIN = {"supported_parameters": ["max_tokens", "temperature", "seed", "top_p"]}
+
 CATALOG = {
     "data": [
         {
@@ -56,10 +80,10 @@ CATALOG = {
             **extra,
         }
         for model_id, extra in [
-            ("stub/fast", {}),
-            ("stub/slow", {}),
-            ("stub/flaky", {}),
-            ("stub/null", {}),
+            ("stub/fast", PLAIN),
+            ("stub/slow", PLAIN),
+            ("stub/flaky", PLAIN),
+            ("stub/null", PLAIN),
             # THE REASONING PERSONALITIES PUBLISH A DESCRIPTOR, because a
             # model that emits reasoning deltas while advertising no
             # reasoning support is an incoherent fixture, and because the
@@ -69,22 +93,34 @@ CATALOG = {
             # bounding the thinking cannot start any.
             #
             # Thinks and never speaks; see the streaming dispatch.
-            ("stub/exhausted", {"reasoning": {"mandatory": True}}),
+            ("stub/exhausted", VOUCHED),
             # Thinks hard AND answers: the healthy contrast, so the
             # exhaustion rule has something to stay quiet about.
-            ("stub/thinker", {"reasoning": {"mandatory": True}}),
+            ("stub/thinker", VOUCHED),
             # Answers, but spends nearly all of the output thinking.
             # The route the reservation could not reach.
-            ("stub/mostly-thinking", {"reasoning": {"mandatory": True}}),
+            ("stub/mostly-thinking", VOUCHED),
             # Exhausted on the first attempt, healthy on the second, so a
             # rerun crosses the indicator's boundary in one card.
-            ("stub/exhausted-once", {"reasoning": {"mandatory": True}}),
+            ("stub/exhausted-once", VOUCHED),
             # Thinks a little, then refuses. Spends a fraction of the
             # budget and produces no text, which is the shape that was
             # being told its budget had run out.
-            ("stub/filtered", {"reasoning": {"mandatory": True}}),
-            ("stub/html", {}),
-            ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
+            ("stub/filtered", VOUCHED),
+            ("stub/html", PLAIN),
+            ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}, **PLAIN}),
+            # Reasons AND publishes a cap below the standard tier, so
+            # extended and standard clamp to the same 4096. This is the
+            # shape where "try extended budget" is advice to spend four
+            # times as much on a byte-identical request, and there was
+            # no fixture for it.
+            (
+                "stub/capped-thinker",
+                {"top_provider": {"max_completion_tokens": 4096}, **VOUCHED},
+            ),
+            # Emits whitespace and nothing else, with the exhausted
+            # usage shape. Visually blank, fully billed.
+            ("stub/whitespace", VOUCHED),
             # Priced in the catalog on purpose: their billed figure is
             # poisoned, so the card must fall back to the estimate rather
             # than showing nothing.
@@ -385,7 +421,31 @@ def build_app() -> Starlette:
                 yield b"data: [DONE]\n\n"
 
             return gen()
-        if model == "stub/exhausted":
+        if model == "stub/whitespace":
+            # WHITESPACE IS NOT AN ANSWER. Spaces and newlines used to
+            # be truthy, so this shape rendered as a clean done card
+            # that displayed nothing and said nothing, on a run billed
+            # in full for its thinking.
+            async def gen():
+                await asyncio.sleep(0.01)
+                for chunk in ("   ", "\n\n", "  "):
+                    yield sse(
+                        {
+                            "provider": PROVIDER,
+                            "choices": [{"delta": {"content": chunk}}],
+                        }
+                    )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model in ("stub/exhausted", "stub/capped-thinker"):
             # THE INCIDENT, reproduced as a personality rather than as a
             # model. It thinks and never speaks: reasoning deltas only,
             # then a stop with no content, and a usage object whose

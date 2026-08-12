@@ -551,7 +551,7 @@ A card that went to reasoning without the budget running out says so
 instead, keeping the accounting fact and dropping the claim:
 
 ```
-no visible answer: the whole completion went to reasoning
+no visible answer: nearly all of the completion went to reasoning
 (37 reasoning tokens, finish_reason: content_filter)
 ```
 
@@ -569,10 +569,33 @@ which is what lets this work on every route above where the reservation
 could not act: a provider that ignores a request parameter still reports
 its usage and its stop reason honestly.
 
-The card also offers the knob you can turn. On standard it suggests the
-extended budget or a lower reasoning effort; on extended, where there is
-no larger budget to move to, it suggests only the lower effort. Set one
-under **Experiment controls**.
+**The card offers only knobs that exist.** The advice is derived from
+the ceiling this run was actually sent and from what you can actually
+select, never from the tier you clicked:
+
+- a larger budget is suggested only when one exists. The requested tier
+  is clamped to a model's published completion cap, and falls back to
+  standard for every model on an offline boot, so extended is often
+  byte-identical to standard. Suggesting it there would be telling you
+  to spend four times as much on the same request.
+- a lower reasoning effort is suggested only when a lower one is
+  selectable. `low` is the floor; "unset" is not lower, because on a
+  vouched model the bench then sends its own half-budget reservation.
+- when neither can help, the card says nothing beyond the accounting
+  sentence. Silence is the honest answer when every remedy is known not
+  to work.
+
+The same derivation runs for replayed cards, so a card in History gives
+the same advice it gave live, and the budget cap is shown on live cards
+too, since that is the surface where somebody is about to spend.
+
+**Whitespace is not an answer.** A response of spaces and newlines used
+to be stored as visible output, so a fully billed reasoning burn could
+render as a blank card with no error, no label and no remedy. It now
+joins empty for every purpose: the exhaustion path, the judge (which is
+not paid to grade it) and the scorer (which records it as a trial that
+did not complete rather than a wrong answer). The stored text is never
+trimmed; only the question "is any of this visible" uses `strip()`.
 
 ### The indicator, on cards that answered
 
@@ -2468,7 +2491,7 @@ picked up without restarts, and verify by eyeball after UI changes:
   reasoning instead says "no visible answer: completion budget
   exhausted during reasoning" with the count, and ends with "try
   extended budget or a lower reasoning effort". A column that stopped
-  for any other reason says "the whole completion went to reasoning"
+  for any other reason says "nearly all of the completion went to reasoning"
   with the count and the stop reason, and is offered no budget remedy.
   A column that answered
   but spent nearly all its output thinking carries the share line

@@ -165,39 +165,14 @@
           // suggest; setting a reasoning effort under Experiment controls
           // is what remains. On standard both apply, and the larger
           // budget goes first because it is one click away.
-          //
-          // AND ON finish_reason TOO, which is a correction. Keying the
-          // remedy on the shape alone made it fire on refusals and
-          // content filters: those cards spend a fraction of the budget,
-          // and telling their reader to buy the extended tier and run
-          // again is advice that costs real money and cannot work. The
-          // old substring gate at least never fired there. A remedy
-          // about the budget belongs only on a card whose budget
-          // actually ran out, which is what "length" means.
-          let shownError = result.error;
-          const truncated = result.finish_reason === "length";
-          if (shownError != null) {
-            if (
-              truncated &&
-              BenchLib.reasoningAteTheOutput(
-                result.completion_tokens,
-                result.reasoning_tokens,
-              )
-            ) {
-              shownError +=
-                budget === "standard"
-                  ? "; try extended budget or a lower reasoning effort"
-                  : "; try a lower reasoning effort";
-            } else if (
-              budget === "standard" &&
-              shownError.includes("finish_reason: length")
-            ) {
-              // Truncation that was not reasoning: a long answer cut off
-              // by the cap. The budget is the only remedy for that one,
-              // and this is the branch that was here before.
-              shownError += "; try extended budget";
-            }
-          }
+          // NO REMEDY IS COMPUTED HERE ANY MORE. completeColumn derives
+          // it, so a live card and a replayed one say the same thing;
+          // this path used to own the logic and replays therefore had
+          // none at all. What is passed instead is the two facts a
+          // result object cannot carry: what the extended tier would
+          // actually clamp to for THIS model, and which effort the
+          // operator selected.
+          const shownError = result.error;
           // The spend ceiling refusing a run is a working control, not a
           // failure. It arrives as run_id null like a persistence failure
           // does, so the marker the server sets is what tells them apart;
@@ -207,7 +182,13 @@
           BenchRender.completeColumn(ui, result, model + " (live)", {
             streamed: textNode !== null,
             shownError: shownError,
-            budgetBadge: false,
+            // The number the advice turns on, now shown on the surface
+            // where somebody is about to spend rather than only on
+            // replays. The badge says "budget cap N" and its title
+            // distinguishes a ceiling from a count.
+            budgetBadge: true,
+            extendedCap: BenchControls.effectiveCap(model, "extended"),
+            effort: controls?.effort,
             // run_id null on the done event means the server spent the money
             // and streamed the response but could not persist it. A refusal
             // is run_id null too, but deliberately: it persists nothing

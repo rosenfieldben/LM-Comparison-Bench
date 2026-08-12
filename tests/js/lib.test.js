@@ -20,6 +20,8 @@ const {
   controlBadges,
   reasoningAteTheOutput,
   reasoningShare,
+  remedyFor,
+  LOWEST_SELECTABLE_EFFORT,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
@@ -361,4 +363,76 @@ test("the rounded share can read 90 on a card the rule stays quiet about", () =>
   // described.
   assert.equal(reasoningAteTheOutput(1000, 899), false);
   assert.equal(reasoningShare(1000, 899), 90);
+});
+
+// ---- T5: advice that cannot work is not offered.
+//
+// Every case below is stated against a PINNED RULE rather than against
+// what the function happens to do: the clamp comes from
+// effective_budget in bench/main.py, and the effort floor from the
+// option list in static/index.html.
+
+test("no budget advice when a larger budget does not exist", () => {
+  // effective_budget clamps the requested tier to a model's published
+  // completion cap. stub/capped publishes 4096, so extended and
+  // standard both send 4096 and "try extended budget" is an instruction
+  // to spend four times as much on an identical request.
+  const clamped = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096 });
+  assert.ok(!clamped.includes("extended budget"));
+
+  // Same rule, the offline case, which is the one that makes the old
+  // advice impossible for EVERY model: with no catalog there are no
+  // published caps, so extended falls back to the standard tier.
+  const offline = remedyFor({ max_tokens: 16384 }, { extendedCap: 16384 });
+  assert.ok(!offline.includes("extended budget"));
+
+  // And it IS offered when a larger budget genuinely exists.
+  const room = remedyFor({ max_tokens: 16384 }, { extendedCap: 65536 });
+  assert.ok(room.includes("try extended budget"));
+});
+
+test("no lower-effort advice at the UI minimum", () => {
+  // index.html offers unset, low, medium, high. low is the floor.
+  assert.equal(LOWEST_SELECTABLE_EFFORT, "low");
+
+  const atFloor = remedyFor(
+    { max_tokens: 4096 },
+    { extendedCap: 4096, effort: "low" },
+  );
+  // Nothing can help, so nothing is said: the accounting sentence
+  // stands alone.
+  assert.equal(atFloor, "");
+
+  for (const effort of ["medium", "high", undefined, ""]) {
+    const out = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort });
+    assert.ok(out.includes("a lower reasoning effort"), String(effort));
+  }
+});
+
+test("both clauses when both remedies exist, joined once", () => {
+  const both = remedyFor(
+    { max_tokens: 16384 },
+    { extendedCap: 65536, effort: "high" },
+  );
+  assert.equal(both, "; try extended budget or a lower reasoning effort");
+});
+
+test("remedyFor reads the cap the run was sent, never a tier name", () => {
+  // THE DEFECT, stated as a test. The old code branched on the selected
+  // tier, so a run at the extended tier that clamped down to 4096 was
+  // told to try extended, which is where it already was. A tier name
+  // is not on the result object at all now, and this asserts the
+  // decision follows max_tokens.
+  const sameCap = { max_tokens: 4096 };
+  assert.ok(
+    !remedyFor(sameCap, { extendedCap: 4096 }).includes("extended budget"),
+  );
+  assert.ok(
+    remedyFor(sameCap, { extendedCap: 65536 }).includes("extended budget"),
+  );
+
+  // Missing information is not an invitation to advise: a caller that
+  // cannot say what extended would send gets no budget clause.
+  assert.ok(!remedyFor(sameCap, {}).includes("extended budget"));
+  assert.ok(!remedyFor({}, { extendedCap: 65536 }).includes("extended budget"));
 });

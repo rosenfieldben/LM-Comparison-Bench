@@ -571,6 +571,16 @@
         BenchRender.makeColumn(result.model),
         result,
         result.model + ", comparison #" + group.id,
+        // WHAT A STORED ROW CANNOT CARRY. max_tokens on the row is
+        // the cap this run was SENT; whether a larger one exists is a
+        // question about the catalog today, and the effort is on the
+        // comparison rather than the result. Supplying both is what
+        // lets a replayed card derive the same advice a live one did,
+        // instead of showing the server's bare sentence.
+        {
+          extendedCap: BenchControls.effectiveCap(result.model, "extended"),
+          effort: group.params?.effort,
+        },
       );
     }
     renderMissingMembers(group, results);
@@ -644,6 +654,16 @@
         BenchRender.makeColumn(result.model),
         result,
         result.model + ", run #" + run.id,
+        // WHAT A STORED ROW CANNOT CARRY. max_tokens on the row is
+        // the cap this run was SENT; whether a larger one exists is a
+        // question about the catalog today, and the effort is on the
+        // comparison rather than the result. Supplying both is what
+        // lets a replayed card derive the same advice a live one did,
+        // instead of showing the server's bare sentence.
+        {
+          extendedCap: BenchControls.effectiveCap(result.model, "extended"),
+          effort: run.params?.effort,
+        },
       );
     }
     window.scrollTo({ top: 0 });

@@ -290,6 +290,61 @@
     return Math.round((reasoningTokens / completionTokens) * 100);
   }
 
+  // The lowest reasoning effort the UI can actually select. Mirrors
+  // the option list in index.html; "unset" is NOT lower, because on a
+  // vouched model the bench then sends its own half-budget reservation
+  // rather than nothing.
+  const LOWEST_SELECTABLE_EFFORT = "low";
+
+  // WHAT THE CARD SHOULD SUGGEST, given what this run actually got and
+  // what the reader can actually change.
+  //
+  // THE DEFECT THIS REPLACES. The advice keyed on the budget TIER the
+  // user had selected, and offered "try extended budget" whenever that
+  // tier was standard. But the server clamps the requested tier to
+  // whatever completion cap a model publishes, and falls back to the
+  // standard tier entirely when the catalog is offline, so extended can
+  // be byte-identical to standard. On those runs the card told a reader
+  // to spend four times as much to send exactly the same request. It
+  // also offered "a lower reasoning effort" without reading the effort
+  // that was set, so a run already at the UI minimum was told to lower
+  // something that cannot go lower.
+  //
+  // KEYED ON result.max_tokens, the EFFECTIVE post-clamp ceiling this
+  // run was actually sent, and on the caller's own report of what the
+  // extended tier would clamp to for this model. A tier name cannot
+  // answer either question.
+  //
+  // Returns "" when nothing would help, and the caller keeps the
+  // accounting sentence alone. Silence is the honest answer when every
+  // remedy is known not to work.
+  function remedyFor(result, options) {
+    const opts = options || {};
+    const sent = result.max_tokens;
+    const extendedCap = opts.extendedCap;
+    const parts = [];
+    // A bigger budget is only advice if a bigger budget exists.
+    if (
+      typeof sent === "number" &&
+      typeof extendedCap === "number" &&
+      extendedCap > sent
+    ) {
+      parts.push("extended budget");
+    }
+    // A lower effort is only advice if a lower effort is selectable.
+    // Absent means the operator chose nothing, which is above the
+    // minimum: choosing "low" would genuinely reduce the thinking.
+    const effort = opts.effort;
+    if (!effort || effort !== LOWEST_SELECTABLE_EFFORT) {
+      parts.push("a lower reasoning effort");
+    }
+    if (!parts.length) return "";
+    // One "try" for the whole clause, so a single remedy reads "try a
+    // lower reasoning effort" rather than losing the verb, and a pair
+    // reads "try extended budget or a lower reasoning effort".
+    return "; try " + parts.join(" or ");
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -305,6 +360,8 @@
     controlBadges,
     reasoningAteTheOutput,
     reasoningShare,
+    remedyFor,
+    LOWEST_SELECTABLE_EFFORT,
     REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };

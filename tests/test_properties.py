@@ -174,11 +174,23 @@ def test_stream_model_error_iff_stream_had_no_terminator(content, terminal):
 
     events = asyncio.run(drive())
     error = events[-1]["result"]["error"]
-    had_text = any(e["type"] == "delta" for e in events[:-1])
+    # VISIBLE text, not merely delta events, and the difference is now
+    # load-bearing. Whitespace-only output stopped counting as an answer:
+    # a response of spaces and newlines used to be truthy, so it was
+    # stored as response_text, no empty-response error was synthesized,
+    # and a fully billed reasoning burn rendered as a blank card with no
+    # error and therefore no remedy.
+    #
+    # Hypothesis generates whitespace strings, so the old
+    # any(type == "delta") reading would have turned that correct fix
+    # into an intermittent red here on whichever run first drew " " as
+    # its only content, in a file about the STREAM TERMINATOR contract
+    # rather than about visibility.
+    visible = "".join(e["text"] for e in events[:-1] if e["type"] == "delta").strip()
 
     if terminal == "none":
         assert error == "stream ended before completion: no [DONE] and no finish reason"
-    elif had_text:
+    elif visible:
         # A terminator plus visible text is a clean, complete success.
         assert error is None
     else:

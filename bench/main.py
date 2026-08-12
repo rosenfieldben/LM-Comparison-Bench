@@ -1831,6 +1831,22 @@ def ceiling_cost(result: dict[str, Any]) -> float | None:
     return billed if billed is not None else as_money(result.get("cost_usd"))
 
 
+def visible_or_none(parts: list[str]) -> str | None:
+    """The accumulated deltas, or None when nothing visible arrived.
+
+    One meaning of response_text across every path that builds a result.
+    The client's own assembly applies the same test, and a disconnect
+    row that stored "   " while a completed row stored None would make
+    the judge, the scorer and the card disagree about the same
+    situation.
+
+    The text is returned VERBATIM when it is visible; only the decision
+    uses strip(), never the stored value.
+    """
+    joined = "".join(parts)
+    return joined if joined.strip() else None
+
+
 def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
     """A synthetic result for a run refused at the post-admission recheck.
 
@@ -3335,11 +3351,24 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             if started and not handled:
                 aborted = {
                     "model": request.model,
-                    "response_text": "".join(parts) or None,
+                    # The same predicate the client applies: whitespace is
+                    # not a visible answer, so it is not stored as one.
+                    # These rows already carry an explicit error, but
+                    # response_text has to mean one thing everywhere or
+                    # the judge and the scorer disagree with the card.
+                    "response_text": visible_or_none(parts),
                     "latency_ms": round((time.perf_counter() - start) * 1000, 1),
                     "prompt_tokens": None,
                     "completion_tokens": None,
                     "error": "stream aborted before completion",
+                    # PARITY WITH A REAL RESULT. A field is omitted here
+                    # only when a value would be a claim the server
+                    # cannot make, and None is not a claim. The SSE done
+                    # frame serializes this dict directly, so without
+                    # these a stream client sees the keys on every real
+                    # run and not on an aborted one.
+                    "upstream_inference_cost_usd": None,
+                    "is_byok": None,
                     "cost_usd": None,
                     "ttft_ms": first_delta_ms,
                     "max_tokens": max_tokens,
@@ -3967,11 +3996,24 @@ async def run_one_trial(
         # builds, so the trial lands as the failure it was.
         result = {
             "model": model,
-            "response_text": "".join(parts) or None,
+            # The same predicate the client applies: whitespace is
+            # not a visible answer, so it is not stored as one.
+            # These rows already carry an explicit error, but
+            # response_text has to mean one thing everywhere or
+            # the judge and the scorer disagree with the card.
+            "response_text": visible_or_none(parts),
             "latency_ms": None,
             "prompt_tokens": None,
             "completion_tokens": None,
             "error": "stream ended without a terminal event",
+            # PARITY WITH A REAL RESULT. A field is omitted here
+            # only when a value would be a claim the server
+            # cannot make, and None is not a claim. The SSE done
+            # frame serializes this dict directly, so without
+            # these a stream client sees the keys on every real
+            # run and not on an aborted one.
+            "upstream_inference_cost_usd": None,
+            "is_byok": None,
             "cost_usd": None,
             "ttft_ms": first_delta_ms,
             "max_tokens": max_tokens,

@@ -9,7 +9,7 @@ under everything a provider might return.
 import time
 from pathlib import Path
 
-from hypothesis import given
+from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from bench import scoring
@@ -125,7 +125,35 @@ def test_score_and_passed_never_disagree(reference, response):
 
 @given(response=st.text(max_size=200))
 def test_a_reference_always_matches_itself_under_contains(response):
+    """The property holds for anything that IS an answer.
+
+    NARROWED, and the narrowing is the point rather than an escape. A
+    whitespace-only response is no longer scored at all: it returns the
+    no-response verdict, because a blank card is a trial that did not
+    complete rather than a model that answered badly, and the two need
+    different detail lines. Hypothesis generates whitespace strings, so
+    the unrestricted property was asserting that a non-answer matches
+    itself, which is a sentence with no meaning.
+
+    The blank case has its own assertion below rather than being
+    silently excluded here.
+    """
+    assume(response.strip())
     assert score_response(spec("contains"), response, response)["passed"] is True
+
+
+@given(blank=st.text(alphabet=" \t\n\r", max_size=20))
+def test_a_blank_response_is_absent_rather_than_wrong(blank):
+    """The other half of the narrowing above, over every shape of blank.
+
+    A trial that produced nothing visible must be recorded as not having
+    completed, not as having answered incorrectly. The DETAIL is what
+    carries that distinction; both branches score 0.0, so a test
+    asserting only the score would pass against the defect.
+    """
+    out = score_response(spec("contains"), "the reference", blank)
+    assert out["passed"] is False
+    assert out["detail"] == "no response text: the trial did not complete"
 
 
 # ---- The judge's verdict parser. Never guesses a number.

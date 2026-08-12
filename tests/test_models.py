@@ -2295,7 +2295,7 @@ def test_the_judge_budget_could_not_satisfy_the_pinned_minimum():
     defect on the day it was written, because it consults the contract
     instead of a stub.
 
-    ANTHROPIC_REASONING_MINIMUM is not a number this repository chose.
+    PROVIDER_REASONING_MINIMUM is not a number this repository chose.
     It is the vendor's, quoted beside JUDGE_MAX_TOKENS, and it is
     written down here so that raising the judge's budget later is a
     decision somebody makes on purpose rather than one that silently
@@ -2474,7 +2474,7 @@ EMPTY_RESPONSE_SHAPES = (
         "content_filter",
         37,
         37,
-        "no visible answer: the whole completion went to reasoning "
+        "no visible answer: nearly all of the completion went to reasoning "
         "(37 reasoning tokens, finish_reason: content_filter)",
     ),
     (
@@ -2482,7 +2482,7 @@ EMPTY_RESPONSE_SHAPES = (
         "stop",
         210,
         198,
-        "no visible answer: the whole completion went to reasoning "
+        "no visible answer: nearly all of the completion went to reasoning "
         "(198 reasoning tokens, finish_reason: stop)",
     ),
     (
@@ -2490,7 +2490,7 @@ EMPTY_RESPONSE_SHAPES = (
         None,
         4,
         4,
-        "no visible answer: the whole completion went to reasoning "
+        "no visible answer: nearly all of the completion went to reasoning "
         "(4 reasoning tokens, finish_reason: unknown)",
     ),
     (
@@ -2909,7 +2909,7 @@ def test_the_probes_capped_response_clears_the_exhaustion_threshold():
     # budget remedy is offered for a run whose budget was never the
     # constraint.
     assert empty_response_error("stop", 338, 312) == (
-        "no visible answer: the whole completion went to reasoning "
+        "no visible answer: nearly all of the completion went to reasoning "
         "(312 reasoning tokens, finish_reason: stop)"
     )
     # The control is nowhere near it, which is the other half.
@@ -3284,3 +3284,209 @@ async def test_review_repro_the_generation_record_parses_the_flag_it_documents(c
         respx.get(GENERATION_URL).respond(json=body)
         record = await fetch_generation(client, "gen-x")
         assert record["is_byok"] is expected, body
+
+
+# ---- One arithmetic rule, two instances: the judge's small budget and
+# ---- a per-model clamp reach the same wall from opposite directions.
+
+from bench.models import PROVIDER_REASONING_MINIMUM  # noqa: E402
+
+# Every budget is checked against the CONTRACT, not against what a mock
+# would accept. A mock returns 200 for any cap, which is exactly how the
+# judge shipped an impossible request.
+RESERVATION_BUDGETS = [512, 1023, 1024, 1200, 2047, 2048, 4096, 16384, 65536]
+
+
+@pytest.mark.parametrize("budget", RESERVATION_BUDGETS)
+def test_review_repro_the_reservation_is_never_unsatisfiable(budget):
+    """WINDOW: the payload fragment reasoning_reservation returns, at
+    every budget a real catalog can produce.
+
+    THE DEFECT, and it is the judge's defect reached through the clamp.
+    effective_budget lowers the requested tier to whatever completion
+    cap a model publishes, and fetch_catalog accepts any cap above zero,
+    so an effective budget below 2048 comes from a real catalog entry.
+    At those budgets a half share falls under the pinned provider
+    minimum, and the request that ARRIVES is not the request that was
+    SENT.
+
+    TWO PINNED RULES DECIDE IT, quoted in the source beside the
+    constant: reasoning.max_tokens "is used directly with a minimum of
+    1024 tokens", and max_tokens "must be strictly higher than the
+    reasoning budget".
+
+    ASSERTED AGAINST THOSE RULES, which is the whole point of this test
+    existing rather than the payload-shape ones. Those assert the field
+    equals a number the code computed, which no provider ever agreed to.
+    This one recomputes what the provider would do and checks the pair
+    can be honoured.
+    """
+    sent = reasoning_reservation(budget, None, True)
+
+    if not sent:
+        # Standing down is always safe. What must be true is that it
+        # only happens when it has to.
+        want = int(budget * REASONING_BUDGET_SHARE)
+        unsatisfiable = want < PROVIDER_REASONING_MINIMUM or budget <= max(
+            want, PROVIDER_REASONING_MINIMUM
+        )
+        assert unsatisfiable, (
+            f"stood down at {budget} where the arithmetic works: "
+            f"share {want}, minimum {PROVIDER_REASONING_MINIMUM}"
+        )
+        return
+
+    asked = sent["reasoning"]["max_tokens"]
+    # What the provider will actually use, after applying its floor.
+    effective = max(asked, PROVIDER_REASONING_MINIMUM)
+    # RULE ONE: the request is not silently enlarged past what was asked.
+    assert asked >= PROVIDER_REASONING_MINIMUM, budget
+    assert effective == asked, budget
+    # RULE TWO: the outer budget is strictly greater, so there is room
+    # for an answer after the thinking.
+    assert budget > effective, budget
+
+
+def test_the_boundary_is_where_the_arithmetic_says_it_is():
+    """WINDOW: the two budgets on either side of the pinned minimum.
+
+    The recon that found this named 1024 as the boundary case; the
+    arithmetic puts the actual edge at twice the minimum, because the
+    share is a half. Both sides are asserted so a change to either the
+    share or the minimum moves this test rather than passing quietly.
+    """
+    edge = 2 * PROVIDER_REASONING_MINIMUM
+    assert reasoning_reservation(edge - 1, None, True) == {}
+    assert reasoning_reservation(edge, None, True) == {
+        "reasoning": {"max_tokens": PROVIDER_REASONING_MINIMUM}
+    }
+    # And the judge's own budget is on the standing-down side, which is
+    # why its stand-down needs no special case in the code.
+    assert JUDGE_MAX_TOKENS < edge
+    assert reasoning_reservation(JUDGE_MAX_TOKENS, None, True) == {}
+
+
+# ---- T5: whitespace-only output is not a visible answer, end to end.
+
+
+@respx.mock
+async def test_review_repro_a_whitespace_only_answer_is_an_exhausted_card(client):
+    """WINDOW: run_model's returned result for a response whose entire
+    content is spaces and newlines.
+
+    SUSPENSION POINT: the await on run_model. Everything asserted is on
+    the returned result.
+
+    THE DEFECT. `if text:` is true for "   \\n\\n  ", so response_text
+    was set, the empty-response guard never ran, and a fully billed
+    reasoning burn came back as a clean card with no error at all. No
+    error means no label, no remedy and no indicator: the card renders
+    visually blank and says nothing, which is a worse version of the
+    original incident because even the useless sentence is gone.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "choices": [
+                {"message": {"content": "   \n\n  "}, "finish_reason": "length"}
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 21350,
+                "completion_tokens_details": {"reasoning_tokens": 21350},
+            },
+        }
+    )
+
+    result = await run_model("a document question", "vendor/model", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == empty_response_error("length", 21350, 21350)
+
+
+@respx.mock
+async def test_review_repro_a_whitespace_only_stream_is_an_exhausted_card(client):
+    """WINDOW: the done event of a stream whose only content deltas are
+    whitespace.
+
+    SUSPENSION POINT: the `async for` over aiter_lines. The result is
+    complete only once done() has run.
+
+    AND THE DELTAS ARE STILL YIELDED, which is the half that stops the
+    obvious fix from being wrong. The browser renders text as it
+    arrives; suppressing a whitespace delta would make the answer
+    assemble incorrectly on screen even when the response is fine.
+    """
+    body = (
+        'data: {"choices":[{"delta":{"content":" "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"\\n\\n"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}],'
+        '"usage":{"prompt_tokens":1200,"completion_tokens":21350,'
+        '"completion_tokens_details":{"reasoning_tokens":21350}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [e async for e in stream_model("q", "vendor/model", client)]
+
+    done = events[-1]
+    assert done["result"]["response_text"] is None
+    assert done["result"]["error"] == empty_response_error("length", 21350, 21350)
+    # The deltas reached the browser regardless.
+    assert [e["text"] for e in events[:-1] if e["type"] == "delta"] == [" ", "\n\n"]
+
+
+@respx.mock
+async def test_review_repro_interior_whitespace_is_never_swallowed(client):
+    """WINDOW: a stream whose deltas are a real sentence, split so that
+    one of them is a lone space.
+
+    THE TEST THAT STOPS THE TEMPTING WRONG FIX. Putting the strip inside
+    _flatten_content looks tidier and is silent corruption: that
+    function runs once per delta, so returning None for " " would drop
+    that fragment from both the accumulated text and the yielded event,
+    and "Hel world" would arrive and persist as "Helworld".
+
+    Visibility is a question about a whole response, so it is asked
+    where a whole response is assembled, and the stored text is never
+    trimmed.
+    """
+    body = (
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [e async for e in stream_model("q", "vendor/model", client)]
+
+    # Byte for byte, interior space intact, and no error.
+    assert events[-1]["result"]["response_text"] == "Hel world"
+    assert events[-1]["result"]["error"] is None
+
+
+@respx.mock
+async def test_the_judge_is_not_paid_to_grade_whitespace(client):
+    """WINDOW: judge_response with a blank answer, and the request log.
+
+    THE CALL COUNT IS THE LOAD-BEARING ASSERTION. Asserting only the
+    returned verdict would pass against a mocked judge that happens to
+    return a zero, and the defect is that real money was spent asking.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={"choices": [{"message": {"content": "1"}}]}
+    )
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "   \n ")
+
+    assert len(respx.calls) == 0
+    # And the verdict says the trial did not complete, rather than that
+    # the model answered badly. Both would score 0.0, so the detail is
+    # what carries the distinction.
+    assert out["detail"] == "no response text: the trial did not complete"
+    assert out["passed"] is None
