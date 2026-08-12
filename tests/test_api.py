@@ -12405,6 +12405,32 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
             },
             "supported_parameters": reasoning_ok,
         },
+        # ---- THE NO-HARM EXTENSION, and its contrasting pair. Neither
+        # ---- publishes supports_max_tokens, so neither is a ceiling
+        # ---- case; they are separated purely by what a cap would DO to
+        # ---- the thinking they already always perform.
+        #
+        # Mandatory at HIGH, approximately 80%. Every documented outcome
+        # of a cap at half the budget bounds or lowers that: honoured is
+        # a bound, translated lands near medium which is below high, and
+        # ignored changes nothing. Enable-harm is impossible because
+        # mandatory means thinking never stopped. So the cap rides.
+        # This is the shape of the model the incident happened on.
+        {
+            "id": "m/mandatory-at-high-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "high"},
+            "supported_parameters": reasoning_ok,
+        },
+        # Mandatory at MINIMAL, approximately 10%. Identical in every
+        # other respect, and refused, because a translation toward
+        # medium would RAISE this model's thinking fivefold. The pair is
+        # the whole argument: the extension keys on the direction a cap
+        # can move the thinking, never on who made the model.
+        {
+            "id": "m/mandatory-at-minimal-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "minimal"},
+            "supported_parameters": reasoning_ok,
+        },
         # Always reasons AND takes a real token budget, which is the
         # only shape that may receive an unprompted cap.
         {
@@ -12418,12 +12444,16 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
             "reasoning": {"default_enabled": True, "supports_max_tokens": True},
             "supported_parameters": reasoning_ok,
         },
-        # Reasons, but the cap would be an effort rather than a ceiling.
-        # This is the largest bucket in the real catalog, 149 of 410, and
-        # it includes the model the incident happened on.
+        # Reasons by default at a high effort, but NOT mandatory and with
+        # no budget support. Refused, and the reason is the boundary of
+        # the no-harm extension: that extension requires mandatory,
+        # because only mandatory proves thinking is unconditionally on.
+        # default_enabled is a DEFAULT, and a default is a statement
+        # about what happens when nobody chose, not a guarantee that
+        # thinking is happening on this request.
         {
-            "id": "m/reasons-no-budget",
-            "reasoning": {"mandatory": True, "default_effort": "high"},
+            "id": "m/enabled-at-high-not-mandatory",
+            "reasoning": {"default_enabled": True, "default_effort": "high"},
             "supported_parameters": reasoning_ok,
         },
         # Thinking is OFF. Sending a cap here would switch it on.
@@ -12471,11 +12501,16 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
         # The isolating pair: one field apart, opposite answers.
         "m/enabled-but-effort-none": False,
         "m/enabled-and-effort-medium": True,
+        # The no-harm extension's contrasting pair: same mandatory flag,
+        # same missing budget support, opposite verdicts, decided only
+        # by which way a cap could move the thinking.
+        "m/mandatory-at-high-no-budget": True,
+        "m/mandatory-at-minimal-no-budget": False,
         # Reasons with a real budget: the cap is a ceiling, so it rides.
         "m/mandatory": True,
         "m/on": True,
-        # Reasons, but the cap would set an effort instead of bounding.
-        "m/reasons-no-budget": False,
+        # Reasons at high, but not mandatory: outside the extension.
+        "m/enabled-at-high-not-mandatory": False,
         "m/off": False,
         "m/unstated": False,
         "m/thinks-but-unadvertised": False,

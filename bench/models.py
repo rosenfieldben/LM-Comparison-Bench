@@ -284,6 +284,29 @@ _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 # half of the budget can starve the other.
 REASONING_BUDGET_SHARE = 0.5
 
+# THE DOCUMENTED EFFORT LADDER, as share of max_tokens. Pinned against
+# the reasoning-tokens guide's "Reasoning Effort Level" section,
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# read 2026-08-12, quoted in the order the page lists them: max
+# "approximately 95% of max_tokens", xhigh "Same allocation as max
+# (approximately 95%)", high "approximately 80%", medium "approximately
+# 50%", low "approximately 20%", minimal "approximately 10%", and
+# "'effort': 'none' - Disables reasoning entirely".
+#
+# Ratios rather than an ordered list of names, because the comparison
+# this table exists for is against REASONING_BUDGET_SHARE, which is a
+# number. A future share of 0.25 would move the boundary to low without
+# anybody editing a tier list, which is the point.
+EFFORT_SHARES = {
+    "none": 0.0,
+    "minimal": 0.1,
+    "low": 0.2,
+    "medium": 0.5,
+    "high": 0.8,
+    "xhigh": 0.95,
+    "max": 0.95,
+}
+
 # Pinned against OpenRouter's reasoning-tokens guide at
 # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
 # re-read in full 2026-08-12. This block was rewritten at R4 after that
@@ -992,12 +1015,54 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
                 # does publish both together.
                 and reasoning.get("default_effort") != "none"
             )
-            model["may_send_reasoning_cap"] = (
+            advertised = "reasoning" in (model["supported_parameters"] or ())
+            # THE CEILING CASE: supports_max_tokens makes the cap a cap.
+            a_true_ceiling = (
                 already_reasons
-                # Without this the cap is an effort request, not a cap.
                 and reasoning.get("supports_max_tokens") is True
-                and "reasoning" in (model["supported_parameters"] or ())
+                and advertised
             )
+            # THE NO-HARM CASE, and it is reasoned from consequences
+            # rather than from either side of a contract that
+            # contradicts itself. See the block above EFFORT_SHARES for
+            # the contradiction; this is what settles it without picking
+            # a winner and without naming a vendor.
+            #
+            # Take a model that is MANDATORY and whose default_effort is
+            # at or above the share this bench would ask for. Enumerate
+            # every outcome the contract documents for a cap sent to it:
+            #
+            #   the route honours it as a budget      thinking is BOUNDED
+            #   the route translates it to an effort  the translation
+            #     lands at approximately the share sent, which is at or
+            #     below this model's own default, so thinking is LOWERED
+            #     or unchanged
+            #   the provider ignores it entirely      NOTHING CHANGES
+            #
+            # None of the three raises thinking, and mandatory means
+            # thinking was already on, so the enable-harm the whole gate
+            # exists to prevent cannot occur. The two harms are the only
+            # reasons the other conditions exist, so where both are
+            # impossible the conditions have nothing left to protect.
+            #
+            # The comparison is against REASONING_BUDGET_SHARE and not
+            # against the word "medium", so it stays true if that
+            # constant moves.
+            declared_effort = reasoning.get("default_effort")
+            # A non-str default_effort is absence, not a lookup key: the
+            # catalog is somebody else's file and may publish anything.
+            default_share = (
+                EFFORT_SHARES.get(declared_effort)
+                if isinstance(declared_effort, str)
+                else None
+            )
+            cannot_raise_or_enable = (
+                reasoning.get("mandatory") is True
+                and default_share is not None
+                and default_share >= REASONING_BUDGET_SHARE
+                and advertised
+            )
+            model["may_send_reasoning_cap"] = a_true_ceiling or cannot_raise_or_enable
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.

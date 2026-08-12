@@ -468,15 +468,32 @@ Before any of that, the gate. Measured against the live catalog on
 it withdrew are the finding rather than a regression: on 149 of them the
 field was never a ceiling, and on 2 it would have switched reasoning on.
 
-Stated plainly, because it is the honest cost: the model the original
-incident happened on publishes `mandatory: true` but no
-`supports_max_tokens`, so **it no longer receives a reservation**. The
-vendor's prose names its family as supporting `reasoning.max_tokens`
-while the per-model flag does not, and where a contract contradicts
-itself the narrower reading is the safe one. The request-side arm of
-this fix therefore covers eight routes and not the one that started it.
-The general answer was always the instrumentation below, which reads the
-tokens that come back and works on all 410.
+**A fourth route in, derived from harm rather than from the contract.**
+Eight was the count when the gate demanded `supports_max_tokens`, and
+that demand excluded the model the original incident happened on, which
+publishes `mandatory: true` and `default_effort: "high"` but no budget
+flag. Rather than pick a side in a contract that contradicts itself (see
+**Pinned observations**), the gate asks what a cap could actually DO.
+
+Where a model is `mandatory` (thinking is unconditionally on, so a cap
+cannot enable anything) and its `default_effort` is at or above the
+share the bench would request, enumerate every documented outcome:
+
+| the route | the effect of a half-budget cap |
+|---|---|
+| honours it as a budget | thinking is **bounded** |
+| translates it to an effort | lands near `medium`, at or below this model's own default, so thinking is **lowered or unchanged** |
+| ignores it | **nothing changes** |
+
+None of the three raises thinking, and none can switch it on. So the cap
+rides there too. That re-covers the incident's own model by rule and
+keeps `google/gemini-3.5-flash-lite` out, which is `mandatory` at
+`minimal`: a translation toward medium would raise its thinking
+fivefold. The comparison is against the share constant, not the word
+"medium", so it stays correct if the share moves.
+
+With that extension the count is **56 of 410**: 8 where the cap is a
+true ceiling, 48 where it provably cannot enable or intensify.
 
 Two further cases drop it entirely. If you set a reasoning effort under
 **Experiment controls**, the reservation stands down, because the same
@@ -591,6 +608,39 @@ had gone unaccounted for. It had not gone anywhere. The badge now reads
 "budget cap", the token metrics say in their tooltips what they count,
 and every export's manifest states the distinction once in its
 `token_counts` field.
+
+### Pinned observations
+
+Things measured against the live API that its documentation does not
+say, or says differently. Each is dated, and each is pinned by a fixture
+or a test rather than by this list alone.
+
+- **2026-08-12. A bare `reasoning.max_tokens` enables thinking.** Two
+  calls to `google/gemma-4-31b-it` on DeepInfra differing in nothing
+  else: 0 reasoning tokens without the field, 312 with it, 8.1x the
+  cost. Fixture: `tests/fixtures/probe_reasoning_enable.json`.
+- **2026-08-12. `upstream_inference_cost` is not BYOK-only.** The
+  usage-accounting page says it "will be 0 or null" for non-BYOK
+  requests; both probe calls carry `is_byok: false` with a nonzero value
+  equal to `cost`, plus `upstream_inference_prompt_cost` and
+  `upstream_inference_completions_cost`, which the page does not
+  mention. Observed, not stored.
+- **2026-08-12. Reasoning text can arrive in-band.** Some routes return
+  the thinking itself in `message.reasoning` with `reasoning_details`
+  beside it. The bench reads neither.
+- **2026-08-12. The reasoning contract contradicts itself about which
+  models take a token budget.** The prose says "Currently supported by:
+  Gemini thinking models; Anthropic reasoning models (by using the
+  `reasoning.max_tokens` parameter)", while the per-model
+  `supports_max_tokens` flag is absent on 25 of 27 Anthropic entries and
+  on every Gemini entry. The gate does not pick a side: it admits those
+  models only where a cap provably cannot enable or intensify thinking
+  (see above).
+- **2026-08-12. Endpoint capabilities differ from the model
+  aggregate.** `nvidia/nemotron-3-ultra-550b-a55b` published three
+  endpoints advertising 18, 12 and 17 parameters, differing in which. A
+  model's `supported_parameters` is a union across hosts, so it cannot
+  vouch for the one host a strict pin selects.
 
 ## Reliability
 
