@@ -311,12 +311,16 @@ and reruns reuse the budget of the run they retry. The API accepts
 `"budget": "standard" | "extended"` on `/compare` and
 `/compare/stream`; anything else is a 422.
 
-### Thinking cannot take the whole budget
+### Reserving room for the answer
 
-Every request reserves half its completion budget for the visible
-answer, sending `reasoning: {"max_tokens": N}` beside the cap: 8192 of
-the standard tier's 16384, 32768 of extended's 65536. The judge reserves
-on the same rule, 256 of its 512.
+Every request asks for half its completion budget to be left for the
+visible answer, sending `reasoning: {"max_tokens": N}` beside the cap:
+8192 of the standard tier's 16384, 32768 of extended's 65536. The judge
+reserves on the same rule, 256 of its 512.
+
+How binding that request is depends on the model, and the honest range
+is wide. See **How far the reservation actually reaches** below before
+treating it as a guarantee.
 
 This is the one default the bench sends unprompted, and it is a
 deliberate exception to "never send a default" (see **Experiment
@@ -338,18 +342,37 @@ at standard it leaves 8192, which is a long answer by any measure. A
 smaller share would start refusing thought a hard prompt legitimately
 needs.
 
-**Two routes it does not cover.** If you set a reasoning effort under
-**Experiment controls**, the reservation stands down: OpenRouter takes
-an effort or a cap and [not
-both](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens),
-and a declared part of your experiment outranks a bench default. And a
-provider that does not support the parameter at all simply ignores it,
-per the [provider-selection
-rules](https://openrouter.ai/docs/guides/routing/provider-selection). (A
-model that supports effort but not a cap is covered: the same page says
-the cap is used to pick an effort level, so it is translated rather than
-lost.) On those two routes exhaustion remains possible, and what the
-bench offers instead is described next.
+#### How far the reservation actually reaches
+
+On a small minority of models it is a hard token budget. On most it is a
+hint that means approximately the right thing. On a few it is nothing at
+all. All three are worth knowing before you rely on it.
+
+Measured against the live catalog on 2026-08-12: of 406 models, 275
+publish `reasoning` support, and **10** advertise `supports_max_tokens`.
+Those ten get a real budget. For the rest, [the reasoning-tokens
+guide](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+says the cap "will be used to determine the effort level", and its own
+table puts `medium` at "approximately 50% of max_tokens", which is
+exactly the share being asked for. The intent survives; the precision
+does not. Two named routes are looser still: Anthropic floors the
+allocation at 1024 tokens, and for Gemini 3 "Google internally maps this
+budget value to a `thinkingLevel`, so you will not get precise token
+control".
+
+Two further cases drop it entirely. If you set a reasoning effort under
+**Experiment controls**, the reservation stands down, because the same
+page both forbids sending an effort and a cap together ("One of the
+following (not both)") and elsewhere suggests sending the cap
+"instead of (or alongside)" the effort, naming no winner for the
+collision; rather than discover the resolution in production, the bench
+sends only your declaration. And a provider that does not support the
+parameter ignores it, per the [provider-selection
+rules](https://openrouter.ai/docs/guides/routing/provider-selection).
+
+So exhaustion stays possible on most routes, which is why the rest of
+this section is about what the bench does after the fact rather than
+before it.
 
 ### When it happens anyway, the card says so
 
@@ -379,6 +402,27 @@ The card also offers the knob you can turn. On standard it suggests the
 extended budget or a lower reasoning effort; on extended, where there is
 no larger budget to move to, it suggests only the lower effort. Set one
 under **Experiment controls**.
+
+### The indicator, on cards that answered
+
+An error label can only appear on a card that produced no text. A card
+that returns 500 tokens of answer after 20000 tokens of thinking is a
+successful card by every definition, carries no error, and still put
+almost everything it was billed for somewhere you cannot see.
+
+Those cards now carry a line between the metrics and the answer:
+
+```
+94% of completion tokens went to reasoning, not to the answer
+```
+
+It appears whenever reasoning reaches the same nine-tenths threshold,
+names the actual share so the magnitude is visible rather than implied,
+and stays on the card through a history replay because a stored row
+carries both counts. It reads nothing but those two counts, which is
+what makes it the coverage for the routes where the reservation is only
+a hint: a provider that ignored the request parameter still reports its
+usage honestly.
 
 ### Counts and caps are different numbers
 
@@ -2177,7 +2221,9 @@ picked up without restarts, and verify by eyeball after UI changes:
   ends with "try extended budget". A column whose budget went to
   reasoning instead says "no visible answer: completion budget
   exhausted during reasoning" with the count, and ends with "try
-  extended budget or a lower reasoning effort". Switch
+  extended budget or a lower reasoning effort". A column that answered
+  but spent nearly all its output thinking carries the share line
+  between its metrics and its text, and keeps it on replay. Switch
   the control to extended and run again: the models now answer or
   prove they need even more, and each attempt's History replay shows
   the budget badge it actually ran with. Reload the page and confirm

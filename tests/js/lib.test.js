@@ -19,6 +19,7 @@ const {
   diffTokens,
   controlBadges,
   reasoningAteTheOutput,
+  reasoningShare,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
@@ -303,4 +304,61 @@ test("row 694's healthy shape is not mistaken for exhaustion", () => {
   // And it stays false right up to the boundary.
   assert.equal(reasoningAteTheOutput(3400, 3059), false);
   assert.equal(reasoningAteTheOutput(3400, 3060), true);
+});
+
+// R4: the indicator names the fraction, so the card shows a magnitude
+// rather than only a warning.
+
+test("reasoningShare rounds to a whole percent and degrades to null", () => {
+  assert.equal(reasoningShare(21350, 21350), 100);
+  assert.equal(reasoningShare(8500, 8000), 94);
+  assert.equal(reasoningShare(3400, 2944), 87);
+  // Rounded, not truncated: 0.945 reads as 95, not 94.
+  assert.equal(reasoningShare(1000, 945), 95);
+  // A row that predates the reasoning column, and a divide by zero.
+  assert.equal(reasoningShare(500, null), null);
+  assert.equal(reasoningShare(null, 500), null);
+  assert.equal(reasoningShare(0, 0), null);
+  // Zero reasoning is a real answer, not an absent one, so it is 0 and
+  // not null. The predicate is what decides whether anything is shown.
+  assert.equal(reasoningShare(500, 0), 0);
+});
+
+test("the indicator's threshold and its number come from one rule", () => {
+  // Everything the predicate fires on has a share at or above the
+  // threshold, and everything it stays quiet about is below it. Two
+  // functions, one boundary; a change to either alone breaks this.
+  for (const [shape, completion, reasoning] of [
+    ["the incident", 21350, 21350],
+    ["answered but mostly thinking", 8500, 8000],
+    ["exactly at the threshold", 1000, 900],
+  ]) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), true, shape);
+    assert.ok(
+      reasoningShare(completion, reasoning) >= REASONING_SHARE_EXHAUSTED * 100,
+      shape,
+    );
+  }
+  for (const [shape, completion, reasoning] of [
+    ["one token under", 1000, 899],
+    ["row 694", 3400, 2944],
+  ]) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), false, shape);
+  }
+});
+
+test("the rounded share can read 90 on a card the rule stays quiet about", () => {
+  // 899 of 1000 is 0.899, which the predicate rejects, and which rounds
+  // to 90 for display. Recorded rather than smoothed over: the two
+  // functions answer different questions and only one of them is
+  // allowed to be approximate.
+  //
+  // It is invisible in practice, and that is the point of writing it
+  // down. The share is rendered ONLY on a card the predicate fired for,
+  // so a reader never sees "90%" beside a card that was left alone.
+  // Nothing needs to change here unless the share is ever shown
+  // unconditionally, and then this test is where the problem is already
+  // described.
+  assert.equal(reasoningAteTheOutput(1000, 899), false);
+  assert.equal(reasoningShare(1000, 899), 90);
 });

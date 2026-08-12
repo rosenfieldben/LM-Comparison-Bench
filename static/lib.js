@@ -259,6 +259,21 @@
     return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;
   }
 
+  // The share itself, rounded to a whole percent for display. Separate
+  // from the predicate above because they answer different questions and
+  // one of them is allowed to be approximate: the predicate decides
+  // whether to say anything, this decides what the sentence reads.
+  //
+  // Rounded rather than truncated, and to a percent rather than to a
+  // decimal, because it is a magnitude for a person to react to and not
+  // an input to anything. Null when either count is missing, so a caller
+  // cannot render "null%" from a row that predates the column.
+  function reasoningShare(completionTokens, reasoningTokens) {
+    if (completionTokens == null || reasoningTokens == null) return null;
+    if (completionTokens === 0) return null;
+    return Math.round((reasoningTokens / completionTokens) * 100);
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -273,6 +288,7 @@
     diffTokens,
     controlBadges,
     reasoningAteTheOutput,
+    reasoningShare,
     REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };

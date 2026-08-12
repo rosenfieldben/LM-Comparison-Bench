@@ -169,3 +169,136 @@ def test_review_repro_the_replayed_budget_badge_says_it_is_a_cap(bench, open_his
     badge = page.get_by_test_id("budget-note").first
     expect(badge).to_have_text("budget cap 65536")
     expect(badge).to_have_attribute("title", re.compile("Not a count"))
+
+
+# ---- R4: the indicator. Every case below is a TOKEN SHAPE. The stub
+# ---- personalities are named for what they do with a budget, and the
+# ---- parametrization is over the numbers, so nothing here would change
+# ---- if every model in the catalog were renamed tomorrow.
+INDICATOR_SHAPES = (
+    # (stub personality, shape described, expected indicator text or None)
+    (
+        "stub/exhausted",
+        "all of the output was thinking, no answer at all",
+        "100% of completion tokens went to reasoning, not to the answer",
+    ),
+    (
+        "stub/mostly-thinking",
+        "an answer arrived, but 94% of the output was thinking",
+        "94% of completion tokens went to reasoning, not to the answer",
+    ),
+    (
+        "stub/thinker",
+        "row 694's shape: thought hard, answered, 87%",
+        None,
+    ),
+    (
+        "stub/fast",
+        "a short answer with a little thinking behind it",
+        None,
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "model,shape,expected",
+    INDICATOR_SHAPES,
+    ids=[row[1] for row in INDICATOR_SHAPES],
+)
+def test_review_repro_the_card_flags_output_that_went_to_thinking(
+    bench, model, shape, expected
+):
+    """WINDOW: a live card's terminal render, between the metrics row and
+    the response body.
+
+    WHY AN INDICATOR AND NOT JUST THE ERROR LABEL. The server can only
+    relabel a result it synthesized an error for, which means a result
+    with no visible text at all. The stub/mostly-thinking row is the case
+    that proves the gap: it ANSWERS, so it is a successful card carrying
+    no error to relabel, and 94% of what it was billed for went somewhere
+    the reader cannot see. Nothing on that card said so.
+
+    THIS IS ALSO THE UNSUPPORTED-ROUTE CASE, which is why it reads the
+    counts rather than anything about the request. A provider that
+    ignored the reservation entirely still reports its usage honestly, so
+    these two numbers arrive true whether or not the cap was ever
+    applied. Measured against the live catalog on 2026-08-12: of 276
+    models carrying a reasoning descriptor, 10 set supports_max_tokens.
+    The indicator is not a fallback for a rare case; it is the coverage
+    for most of them.
+
+    THE QUIET ROWS ARE HALF THE TEST. A warning that appears on cards
+    that worked is one nobody reads on the cards that did not, so
+    row 694's shape and an ordinary short answer are both asserted
+    silent.
+    """
+    page = bench([model])
+    check_all_chips(page)
+    run(page, "indicator " + shape)
+
+    card = cards(page).first
+    expect(status_of(card)).not_to_have_text("working", timeout=DONE_TIMEOUT)
+    indicator = card.get_by_test_id("reasoning-warning")
+    if expected is None:
+        expect(indicator).to_have_count(0)
+    else:
+        expect(indicator).to_have_text(expected)
+
+
+def test_the_indicator_survives_a_history_replay(bench, open_history):
+    """The same card, come back to later.
+
+    A stored row carries both counts, so the indicator is re-derivable
+    and must be re-derived: a warning that existed only while you watched
+    would be missing from every card anyone returned to, which is every
+    card in a comparison worth citing.
+    """
+    page = bench(["stub/mostly-thinking"])
+    check_all_chips(page)
+    run(page, "indicator replay")
+    expect(status_of(cards(page).first)).to_have_text("done", timeout=DONE_TIMEOUT)
+
+    open_history()
+    row = page.get_by_test_id("history-row").filter(has_text="indicator replay")
+    row.first.click()
+
+    expect(cards(page).first.get_by_test_id("reasoning-warning")).to_have_text(
+        "94% of completion tokens went to reasoning, not to the answer"
+    )
+
+
+def test_review_repro_a_rerun_does_not_keep_the_previous_indicator(bench):
+    """WINDOW: one card across two attempts, from the first terminal
+    render through the rerun's.
+
+    A STALE WARNING IS A FALSE ONE. The indicator is a card-level sibling
+    of the body, so clearing the body on a rerun leaves it standing. A
+    card that reran to a clean answer would go on saying that most of its
+    output went to reasoning, describing tokens the attempt on screen
+    never spent, and the reader has no way to tell that the line is about
+    a result that no longer exists.
+
+    ASSERTED ON ONE CARD ACROSS A BOUNDARY, which is why the stub is
+    fail-once rather than two personalities. Two cards, one warned and
+    one not, would pass whether or not anything was ever cleaned up. The
+    only thing that proves cleanup is the same element going away.
+
+    The exact defect save-warn already had, and the fix is the same list
+    it is cleaned from.
+    """
+    page = bench(["stub/exhausted-once"])
+    check_all_chips(page)
+    run(page, "rerun clears the indicator")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    # PRE-STATE: the indicator is really there before the rerun, so its
+    # later absence means removal and not that it never drew.
+    expect(card.get_by_test_id("reasoning-warning")).to_have_text(
+        "100% of completion tokens went to reasoning, not to the answer"
+    )
+
+    card.get_by_test_id("tool-rerun").click()
+
+    expect(status_of(card)).to_have_text("done", timeout=DONE_TIMEOUT)
+    expect(card.get_by_test_id("reasoning-warning")).to_have_count(0)

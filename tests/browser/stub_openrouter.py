@@ -65,6 +65,12 @@ CATALOG = {
             # Thinks hard AND answers: the healthy contrast, so the
             # exhaustion rule has something to stay quiet about.
             ("stub/thinker", {}),
+            # Answers, but spends nearly all of the output thinking.
+            # The route the reservation could not reach.
+            ("stub/mostly-thinking", {}),
+            # Exhausted on the first attempt, healthy on the second, so a
+            # rerun crosses the indicator's boundary in one card.
+            ("stub/exhausted-once", {}),
             ("stub/html", {}),
             ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
             # Priced in the catalog on purpose: their billed figure is
@@ -141,6 +147,26 @@ HEALTHY_REASONING_USAGE = {
     "prompt_tokens_details": {"cached_tokens": 0},
 }
 
+# A RUN THAT ANSWERED AND STILL SPENT ALMOST EVERYTHING THINKING, which
+# is the shape the server cannot say anything about. There is text, so no
+# error is synthesized, so there is no message to relabel; the result is
+# a perfectly ordinary successful card that happens to have put 94% of
+# its billed output somewhere the reader cannot see.
+#
+# This is also the shape of an UNSUPPORTED ROUTE. A provider that ignores
+# the reservation reports its usage honestly either way, so a rule
+# reading these two numbers works exactly where the request-side fix does
+# not. 8000 of 8500 is 0.94, comfortably over the threshold, with a real
+# answer attached.
+MOSTLY_THINKING_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8500,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 8000},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
 
 # The host OpenRouter routed to, echoed on every chunk and on the
 # non-streaming body, the way the real API reports it.
@@ -192,6 +218,8 @@ def usage_for(model: str):
         return {**USAGE, "cost": -1.0}
     if model == "stub/thinker":
         return HEALTHY_REASONING_USAGE
+    if model == "stub/mostly-thinking":
+        return MOSTLY_THINKING_USAGE
     return USAGE
 
 
@@ -220,7 +248,16 @@ def build_app() -> Starlette:
     # Closure state instead of module globals: each harness session
     # builds its own app, so flaky's fail-once behavior and the request
     # log reset with the stub process.
-    state = {"requests": [], "flaky_failed": False, "flaky_slow_failed": False}
+    state = {
+        "requests": [],
+        "flaky_failed": False,
+        "flaky_slow_failed": False,
+        # First attempt exhausts, every attempt after it answers normally.
+        # Same fail-once shape as flaky, for the same reason: a rerun has
+        # to be able to cross a boundary within ONE card, and asserting on
+        # two separate cards never proves the first one was cleaned up.
+        "exhausted_once_spent": False,
+    }
 
     async def models(request):
         return JSONResponse(CATALOG)
@@ -278,6 +315,27 @@ def build_app() -> Starlette:
 
                 return gen()
             return text_stream(model, reply_text(model), "flaky-slow", delay=2.0)
+        if model == "stub/exhausted-once" and not state["exhausted_once_spent"]:
+            state["exhausted_once_spent"] = True
+
+            async def gen():
+                await asyncio.sleep(0.01)
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {"reasoning": "thinking..."}}],
+                    }
+                )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
         if model == "stub/exhausted":
             # THE INCIDENT, reproduced as a personality rather than as a
             # model. It thinks and never speaks: reasoning deltas only,

@@ -269,34 +269,66 @@ REASONING_BUDGET_SHARE = 0.5
 
 # Pinned against OpenRouter's reasoning-tokens guide at
 # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
-# read 2026-08-10. Three sentences from it decide the shape below.
+# re-read in full 2026-08-12. This block was rewritten at R4 after that
+# re-read contradicted two things the first version asserted; both
+# corrections are below and both are the docs' fault rather than a
+# change of mind.
 #
 # THE FIELD. reasoning is a top-level object and the cap is its
 # max_tokens key: "'max_tokens': 2000, // Specific token limit
 # (Anthropic-style)".
 #
-# NOT BOTH, and this is the constraint that stops the reservation being
-# unconditional. The page introduces the two keys as "One of the
-# following (not both)", so a request carrying an operator's declared
-# effort must NOT also carry this cap. When the two would collide the
-# OPERATOR'S CONTROL RIDES and the reservation stands down: effort is a
-# declared part of the experiment and this is the bench's own default,
-# and a default that overwrote a declaration would be the one thing
-# rule one forbids. What protects that request instead is the indicator,
-# which reads the tokens that came back rather than the field that went
-# out.
+# NOT BOTH, WHICH THE PAGE SAYS AND THEN UNSAYS. The schema comment
+# introduces the two keys as "One of the following (not both)". Thirty
+# lines later the per-model discovery section describes
+# supports_max_tokens as a reason to "send 'reasoning.max_tokens'
+# instead of (or alongside) 'reasoning.effort'". The page therefore
+# forbids the combination in one place and sanctions it in another,
+# names no winner if both arrive, and documents no error for the
+# collision.
 #
-# UNSUPPORTED ROUTES DEGRADE TWO DIFFERENT WAYS, both documented, and
-# the honest limit is the union of them. For a model that takes effort
-# and not a cap, "For models that only support 'reasoning.effort' (see
-# below), the 'max_tokens' value will be used to determine the effort
-# level", so the reservation is TRANSLATED rather than lost. For a
-# provider that does not support the parameter at all, the
-# provider-selection page's rule applies and it is dropped: providers
-# "can still receive the request, but will ignore unknown parameters".
-# On that second kind of route the guarantee is not prevention, and the
-# README says so: what remains is honest instrumentation, the relabelled
-# error and the card's indicator.
+# So the bench takes the CONSERVATIVE reading and never sends both, and
+# the reason is not the schema comment: it is that an undefined
+# resolution is not something to discover in production at $3.50 a card.
+# When the two would collide the OPERATOR'S CONTROL RIDES and the
+# reservation stands down. Effort is a declared part of the experiment,
+# this is the bench's own default, and a default that overwrote a
+# declaration is the one thing rule one forbids. What protects that
+# request instead is the indicator, which reads the tokens that came
+# back rather than the field that went out.
+#
+# HOW FEW ROUTES TAKE A REAL BUDGET, measured rather than assumed, and
+# this is the correction that matters most. GET /api/v1/models on
+# 2026-08-12 returned 406 models. 275 publish "reasoning" in
+# supported_parameters and 276 carry a reasoning descriptor object, but
+# only TEN of those set supports_max_tokens true. A comment claiming
+# this caps thinking on every route would be false on roughly 96% of
+# the reasoning models in the catalog.
+#
+# WHAT HAPPENS ON THE OTHER 266, and why the reservation is still worth
+# sending. It is TRANSLATED, not dropped: "For models that only support
+# 'reasoning.effort' (see below), the 'max_tokens' value will be used to
+# determine the effort level." The effort table puts medium at
+# "approximately 50% of max_tokens", which is this constant's share, so
+# a half-budget cap lands on the effort bucket that means the same
+# thing. The intent survives the translation. The precision does not,
+# and "approximately" is the vendor's word, not a hedge added here.
+#
+# Two named routes are looser still, both from the same page. Anthropic
+# applies "budget_tokens = max(min(max_tokens * {effort_ratio}, 128000),
+# 1024)", so a small budget floors at 1024 rather than at its share. And
+# for Gemini 3, "Google internally maps this budget value to a
+# 'thinkingLevel', so you will not get precise token control."
+#
+# Finally, a provider that does not support the parameter at all ignores
+# it outright, per the provider-selection page: providers "can still
+# receive the request, but will ignore unknown parameters".
+#
+# THE HONEST SUMMARY, which the README states in the same words: on ten
+# models this is a hard cap; on most it is a strong hint that means the
+# right thing approximately; on some it is nothing. That is why R2's
+# label and R4's indicator read the tokens that came BACK. They are not
+# a fallback for a rare case. They are the coverage for the common one.
 #
 # WHY A CAP AND NOT AN EFFORT for the bench's own default: an effort is
 # a word whose token cost is the provider's to decide, and the whole
