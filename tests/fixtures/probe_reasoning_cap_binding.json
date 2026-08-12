@@ -1,0 +1,49 @@
+{
+  "_what_this_is": "Probe two. Whether a reasoning cap sent to a mandatory-reasoning model WITHOUT supports_max_tokens binds, is rejected, or does neither. Run because the pinned contract contradicts itself: its prose names Anthropic reasoning models as supporting reasoning.max_tokens, while the per-model supports_max_tokens flag is absent on 25 of 27 Anthropic entries.",
+  "_model": "anthropic/claude-fable-5",
+  "_permaslug": "anthropic/claude-5-fable-20260609",
+  "_provider": "Amazon Bedrock",
+  "_endpoint_id": "6ffa85d6-4e53-47f3-a76e-1ba543eb4773",
+  "_measured": "2026-08-12",
+  "_descriptor": "mandatory true, default_effort high, supports_max_tokens ABSENT. This is the model the original incident happened on, and the one the gate's no-harm extension re-covers by rule.",
+  "_protocol": "Two calls, identical but for the reasoning field. max_tokens 2048 on both. The cap is 1024, which honours the documented Anthropic minimum ('that value is used directly with a minimum of 1024 tokens') with the outer budget strictly greater, as the contract also requires.",
+  "_outcome": "THE THIRD BRANCH: neither bind nor reject. The cap was ACCEPTED, status 200, no error, and NEITHER call produced a single reasoning token. A mandatory-reasoning model answered a trivial prompt without thinking at all.",
+  "_what_this_proves": "Acceptance and non-enablement. Sending the cap to this route did not switch reasoning on, did not raise it, and was not refused, which is exactly the no-harm arithmetic the gate's extension is built on, corroborated on the incident's own model.",
+  "_what_this_does_NOT_prove": "Whether the cap CLAMPS. Neither call produced reasoning, so there was no thinking to bound and the clamping question is UNMEASURED. A trivial prompt provokes no deliberation. Measuring it needs a prompt hard enough to make this model think, and it is deliberately not claimed here.",
+  "control": {
+    "_generation_id": "gen-1786560226-fq4YvL5syFCS3zqdPOMo",
+    "_request": "max_tokens 2048, no reasoning field",
+    "generation_record": {
+      "native_tokens_prompt": 20,
+      "native_tokens_completion": 71,
+      "native_tokens_reasoning": 0,
+      "native_tokens_cached": 0,
+      "tokens_prompt": 11,
+      "tokens_completion": 65,
+      "finish_reason": "stop",
+      "native_finish_reason": "end_turn",
+      "is_byok": false,
+      "upstream_inference_cost": 0,
+      "total_cost": 0.00375,
+      "provider_name": "Amazon Bedrock"
+    }
+  },
+  "capped": {
+    "_generation_id": "gen-1786560251-TPHWD5yYlFa5qRDnF3jf",
+    "_request": "identical, plus reasoning: {\"max_tokens\": 1024}",
+    "generation_record": {
+      "native_tokens_prompt": 20,
+      "native_tokens_completion": 66,
+      "native_tokens_reasoning": 0,
+      "native_tokens_cached": 0,
+      "tokens_prompt": 11,
+      "tokens_completion": 62,
+      "finish_reason": "stop",
+      "native_finish_reason": "end_turn",
+      "is_byok": false,
+      "upstream_inference_cost": 0,
+      "total_cost": 0.0035,
+      "provider_name": "Amazon Bedrock"
+    }
+  }
+}

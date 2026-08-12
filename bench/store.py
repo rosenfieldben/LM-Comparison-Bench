@@ -2154,8 +2154,10 @@ def apply_reconciliation(
                    provider = COALESCE(?, provider),
                    quantization = COALESCE(?, quantization),
                    native_finish_reason = COALESCE(?, native_finish_reason),
+                   -- FILL-ONLY, and the argument order is the whole
+                   -- decision. See the comment on the bound value.
                    upstream_inference_cost_usd = COALESCE(
-                       ?, upstream_inference_cost_usd
+                       upstream_inference_cost_usd, ?
                    )
                WHERE id = ?""",
             (
@@ -2164,12 +2166,38 @@ def apply_reconciliation(
                 record["provider"],
                 record["quantization"],
                 record["native_finish_reason"],
-                # COALESCE like the text columns, not the money CASE. It
-                # is TEXT recorded verbatim for reconciliation against a
-                # provider invoice, and an unreported figure means "not
-                # reported" rather than "known to be nothing": there is
-                # no poisoned-value case to clear, because nothing
-                # computes with it.
+                # THE IN-BAND FIGURE WINS, and this is the one column
+                # where the reconcile pass fills a gap rather than
+                # correcting a value. The choice is deliberate and it is
+                # made here because the two sources are known to
+                # disagree.
+                #
+                # MEASURED. For generation
+                # gen-1786560251-TPHWD5yYlFa5qRDnF3jf, the in-band usage
+                # block reported upstream_inference_cost 0.0035 while
+                # the generation endpoint reported 0, for the same
+                # generation, with is_byok false at both. See
+                # tests/fixtures/probe_reasoning_cap_binding.json.
+                #
+                # WHY IN-BAND. It is contemporaneous with the charge,
+                # and in the one observed disagreement it is the source
+                # carrying MORE information: overwriting 0.0035 with 0
+                # loses a figure an operator could reconcile against an
+                # invoice, while the reverse loses nothing. A pass whose
+                # purpose is to recover facts must not be able to erase
+                # one.
+                #
+                # THIS BECAME REACHABLE WHEN ZEROS STARTED BEING STORED.
+                # While a zero degraded to NULL the endpoint's zero
+                # arrived as NULL and COALESCE kept the stored value by
+                # accident. Storing reality made the clobber real, so
+                # the ordering had to become a decision instead of a
+                # coincidence.
+                #
+                # The other columns keep the opposite order on purpose:
+                # for provider, quantization and the native finish
+                # reason the endpoint IS the authority, and a later
+                # correction there is the point of reconciling at all.
                 record["upstream_inference_cost_usd"],
                 result_id,
             ),

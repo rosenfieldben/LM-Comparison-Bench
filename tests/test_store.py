@@ -2887,3 +2887,95 @@ def test_review_repro_the_three_states_of_is_byok_survive_a_round_trip(tmp_path)
         assert rows["m/credits"] is not None
     finally:
         conn.close()
+
+
+def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tmp_path):
+    """WINDOW: one result row across a reconcile pass, with the two
+    sources disagreeing exactly as they were measured disagreeing.
+
+    THE TWO SOURCES DISAGREE, and this is not hypothetical. For
+    generation gen-1786560251-TPHWD5yYlFa5qRDnF3jf the in-band usage
+    block reported upstream_inference_cost 0.0035 while the generation
+    endpoint reported 0, for the same generation, with is_byok false at
+    both. See tests/fixtures/probe_reasoning_cap_binding.json.
+
+    THE DEFECT THIS BRANCH CREATED AND THIS FIXES. The pass wrote
+    COALESCE(new, existing), so the endpoint won. That was harmless
+    while a zero degraded to NULL, because the endpoint's zero arrived
+    as NULL and the stored value survived by accident. Storing reality,
+    which was the whole point of the earlier ruling, made the clobber
+    real: a reconcile pass began overwriting a figure an operator could
+    reconcile against an invoice with a zero that says nothing.
+
+    A pass whose purpose is to RECOVER facts must not be able to erase
+    one. The in-band figure is contemporaneous with the charge and, in
+    the one observed disagreement, carries more information.
+
+    BOTH DIRECTIONS ARE ASSERTED. Fill-only would be a bug of its own if
+    it stopped filling.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        store.save_run(
+            conn,
+            "p",
+            [make_result(model="m/in-band", upstream_inference_cost_usd="0.0035")],
+        )
+        row = conn.execute(
+            "SELECT id FROM results WHERE model = 'm/in-band'"
+        ).fetchone()
+        # PRE-STATE: the in-band figure really is stored before the pass.
+        assert (
+            conn.execute(
+                "SELECT upstream_inference_cost_usd FROM results WHERE id = ?",
+                (row["id"],),
+            ).fetchone()["upstream_inference_cost_usd"]
+            == "0.0035"
+        )
+
+        store.apply_reconciliation(
+            conn,
+            row["id"],
+            {
+                "billed_cost_usd": 0.0035,
+                "provider": "Amazon Bedrock",
+                "quantization": None,
+                "native_finish_reason": "end_turn",
+                # What the endpoint returned for this same generation.
+                "upstream_inference_cost_usd": "0",
+            },
+        )
+        kept = conn.execute(
+            "SELECT upstream_inference_cost_usd, provider FROM results WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        assert kept["upstream_inference_cost_usd"] == "0.0035"
+        # And the columns where the endpoint IS the authority still take
+        # its answer, so this is a per-column decision rather than a
+        # blanket refusal to reconcile.
+        assert kept["provider"] == "Amazon Bedrock"
+
+        # FILL-ONLY STILL FILLS: a row with no in-band figure takes the
+        # endpoint's.
+        store.save_run(conn, "p2", [make_result(model="m/empty")])
+        gap = conn.execute("SELECT id FROM results WHERE model = 'm/empty'").fetchone()
+        store.apply_reconciliation(
+            conn,
+            gap["id"],
+            {
+                "billed_cost_usd": 1.0,
+                "provider": "X",
+                "quantization": None,
+                "native_finish_reason": None,
+                "upstream_inference_cost_usd": "0.004",
+            },
+        )
+        assert (
+            conn.execute(
+                "SELECT upstream_inference_cost_usd FROM results WHERE id = ?",
+                (gap["id"],),
+            ).fetchone()["upstream_inference_cost_usd"]
+            == "0.004"
+        )
+    finally:
+        conn.close()

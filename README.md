@@ -636,6 +636,38 @@ or a test rather than by this list alone.
   on every Gemini entry. The gate does not pick a side: it admits those
   models only where a cap provably cannot enable or intensify thinking
   (see above).
+- **2026-08-12. A cap on a mandatory route was accepted and changed
+  nothing.** Two calls to `anthropic/claude-fable-5` via Amazon Bedrock,
+  the second adding `reasoning: {"max_tokens": 1024}` (the documented
+  Anthropic minimum, with the outer budget strictly greater): accepted
+  without error, and **zero reasoning tokens on both**. Neither bound
+  nor rejected. Whether the cap would clamp real thinking is
+  **unmeasured**, because a trivial prompt provoked none. Fixture:
+  `tests/fixtures/probe_reasoning_cap_binding.json`.
+- **2026-08-12. `mandatory: true` does not mean reasoning occurs.** It
+  says the operator may not turn thinking off, not that the model will
+  think on any given request. The same mandatory model returned a direct
+  answer with no reasoning tokens, twice. Reasoning is route and prompt
+  dependent; Bedrock is the third provider observed serving this model.
+- **2026-08-12. The upstream figure is route dependent, not
+  BYOK dependent.** Two non-BYOK runs disagree: DeepInfra reported
+  `upstream_inference_cost` equal to the credit charge, Bedrock reported
+  `0`. So a populated value does not mean BYOK and a zero does not mean
+  otherwise. The value carries no information about billing mode, which
+  is why `is_byok` is its own column.
+- **2026-08-12. The in-band usage block and the generation endpoint
+  disagree about the upstream figure for the same generation.**
+  `gen-1786560251` reported `upstream_inference_cost` 0.0035 in-band and
+  `0` at the endpoint, with `is_byok: false` at both. Reconciliation
+  therefore chooses its source deliberately: the in-band figure is
+  contemporaneous with the charge and wins, and the pass fills a gap
+  there rather than correcting a value. It is also a second independent
+  proof that a nonzero upstream figure cannot imply BYOK.
+- **2026-08-12. Native and normalized token counts really do
+  diverge.** One generation record publishes both for the same
+  completion: 65 normalized against 71 native, and 62 against 66 on the
+  paired call. Everything the bench stores is the native family, which
+  is also the family OpenRouter prices on.
 - **2026-08-12. Endpoint capabilities differ from the model
   aggregate.** `nvidia/nemotron-3-ultra-550b-a55b` published three
   endpoints advertising 18, 12 and 17 parameters, differing in which. A

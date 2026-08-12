@@ -3074,3 +3074,147 @@ async def test_an_unfetchable_endpoint_listing_is_absence_of_evidence(client):
     respx.get(url).mock(side_effect=httpx.ConnectError("down"))
     listing = await fetch_endpoints(client, "vendor/model")
     assert listing["fetched"] is False
+
+
+# ---- Probe two, replayed. The contract contradicts itself about which
+# ---- models take a token budget, so the contradiction was measured on
+# ---- the incident's own model rather than argued about further.
+
+CAP_PROBE = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "probe_reasoning_cap_binding.json"
+    ).read_text()
+)
+
+
+def test_review_repro_a_cap_on_a_mandatory_route_neither_enabled_nor_was_refused():
+    """WINDOW: the two generation records of a matched pair of live
+    calls, read as the gate's no-harm arithmetic reads them.
+
+    THE QUESTION. anthropic/claude-fable-5 publishes mandatory true and
+    default_effort high but no supports_max_tokens. The contract's prose
+    says its family takes reasoning.max_tokens; the per-model flag says
+    otherwise. The gate refuses to pick a side and instead admits the
+    model only because a cap provably cannot enable or intensify its
+    thinking. This is that claim, measured.
+
+    THE THIRD BRANCH. The cap was ACCEPTED, status 200, no error, and
+    NEITHER call produced a reasoning token. So on this route the field
+    is neither honoured as a binding budget nor rejected: it is simply
+    taken and nothing changes. That is precisely the "ignored outright"
+    row of the extension's table, and it is the row that makes the
+    extension safe.
+
+    WHAT THIS DELIBERATELY DOES NOT CLAIM is asserted below as well as
+    said, because an unmeasured thing recorded as measured is worse than
+    an untested one. There was no thinking to bound, so clamping is
+    UNMEASURED.
+    """
+    control = CAP_PROBE["control"]["generation_record"]
+    capped = CAP_PROBE["capped"]["generation_record"]
+
+    # ACCEPTED: a rejected request has no generation record with a
+    # normal stop in it.
+    assert capped["finish_reason"] == "stop"
+    assert capped["native_finish_reason"] == "end_turn"
+
+    # NOT ENABLED, which is the half the gate's extension rests on.
+    assert control["native_tokens_reasoning"] == 0
+    assert capped["native_tokens_reasoning"] == 0
+
+    # NOT INTENSIFIED, and not made more expensive: the capped call was
+    # very slightly cheaper, which is noise on a 70 token answer and is
+    # asserted as "no increase" rather than as a direction.
+    assert capped["total_cost"] <= control["total_cost"]
+
+    # AND THE CLAMP IS UNMEASURED. Asserted rather than merely written
+    # in prose: with zero reasoning tokens on both sides there is no
+    # observation of a bound, and a later reader must not mistake this
+    # fixture for one.
+    assert control["native_tokens_reasoning"] == capped["native_tokens_reasoning"] == 0
+    assert "UNMEASURED" in CAP_PROBE["_what_this_does_NOT_prove"]
+
+
+def test_mandatory_reasoning_does_not_mean_reasoning_happened():
+    """WINDOW: the same two records, read against the catalog flag that
+    describes the model.
+
+    A CORRECTION TO A READING THIS BRANCH RELIED ON. The gate treats
+    mandatory true as "thinking is unconditionally on", and uses that to
+    argue enable-harm is impossible. The argument survives, because a
+    cap cannot enable thinking that is already on AND cannot enable
+    thinking that does not happen. But the premise as stated was too
+    strong: this model is mandatory, and on this route with this prompt
+    it produced zero reasoning tokens, twice.
+
+    mandatory describes what the OPERATOR may not turn off, not what the
+    model will do on any given request. Reasoning is route and prompt
+    dependent, and a trivial question gets a direct answer.
+    """
+    for side in ("control", "capped"):
+        assert CAP_PROBE[side]["generation_record"]["native_tokens_reasoning"] == 0
+    # The descriptor that says mandatory is recorded beside the result
+    # that contradicts the naive reading of it.
+    assert "mandatory true" in CAP_PROBE["_descriptor"]
+
+
+def test_review_repro_the_upstream_figure_is_route_dependent_not_byok_dependent():
+    """WINDOW: the cost_details of BOTH probes, side by side.
+
+    THE STRONGEST EVIDENCE YET FOR SPLITTING is_byok INTO ITS OWN
+    COLUMN, and it arrived by accident. Two non-BYOK runs, two different
+    answers for the same field:
+
+      probe one, DeepInfra   is_byok false, upstream 1.3182e-04,
+                             equal to the credit charge
+      probe two, Bedrock     is_byok false, upstream 0
+
+    So a populated upstream_inference_cost does not mean BYOK, and an
+    upstream of zero does not mean non-BYOK either: it means this route
+    reported zero. The value is route dependent and carries no
+    information about billing mode at all.
+
+    That is why the discriminator had to stop living inside the value.
+    A reader holding one number cannot tell which of these two runs they
+    have; a reader holding the number AND is_byok can.
+    """
+    from bench.models import _as_upstream_cost
+
+    bedrock = CAP_PROBE["capped"]["generation_record"]
+    assert bedrock["is_byok"] is False
+    assert bedrock["upstream_inference_cost"] == 0
+
+    deepinfra = PROBE["capped"]["usage"]
+    assert deepinfra["is_byok"] is False
+    assert deepinfra["cost_details"]["upstream_inference_cost"] > 0
+
+    # Both are stored as received, so the database disagrees with
+    # neither wire, and the zero is a zero rather than a NULL.
+    assert _as_upstream_cost({"upstream_inference_cost": 0}) == "0"
+    assert _as_upstream_cost(deepinfra["cost_details"]) == "0.00013182"
+
+
+def test_the_native_and_normalized_counts_really_do_differ():
+    """WINDOW: one generation record, comparing the two count families
+    it publishes for the same completion.
+
+    R3 ARGUED THIS FROM DOCUMENTATION and here it is on the wire. The
+    generation endpoint returns tokens_completion beside
+    native_tokens_completion for one identical response, and they are
+    not the same number: 65 against 71 on the control, 62 against 66 on
+    the capped call, roughly a 9% and 6% divergence.
+
+    That is the whole reason the units audit insisted on one unit per
+    surface. Everything the bench stores is the NATIVE family, which is
+    also the family OpenRouter prices on, and a reader who mixed the two
+    would be out by that margin on every row.
+    """
+    for side in ("control", "capped"):
+        rec = CAP_PROBE[side]["generation_record"]
+        assert rec["native_tokens_completion"] != rec["tokens_completion"], side
+        assert rec["native_tokens_completion"] > rec["tokens_completion"], side
+    control = CAP_PROBE["control"]["generation_record"]
+    assert (control["native_tokens_completion"], control["tokens_completion"]) == (
+        71,
+        65,
+    )

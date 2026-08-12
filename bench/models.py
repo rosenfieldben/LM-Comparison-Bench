@@ -1039,11 +1039,28 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             #     or unchanged
             #   the provider ignores it entirely      NOTHING CHANGES
             #
-            # None of the three raises thinking, and mandatory means
-            # thinking was already on, so the enable-harm the whole gate
-            # exists to prevent cannot occur. The two harms are the only
-            # reasons the other conditions exist, so where both are
-            # impossible the conditions have nothing left to protect.
+            # None of the three raises thinking. The other harm,
+            # switching thinking ON where it was off, cannot occur
+            # either, and the reason is worth stating carefully because
+            # a first version of this comment overstated it.
+            #
+            # It said mandatory means thinking is already on. Probe two
+            # (tests/fixtures/probe_reasoning_cap_binding.json) measured
+            # a mandatory model answering a trivial prompt with ZERO
+            # reasoning tokens, twice, so mandatory describes what an
+            # operator may not turn OFF rather than what the model will
+            # do on any given request. Reasoning is route and prompt
+            # dependent.
+            #
+            # The argument survives that correction intact, because a
+            # cap cannot enable thinking that is already running and
+            # cannot enable thinking that does not happen: the same
+            # probe sent this exact cap to this exact model and the
+            # reasoning count stayed at zero on both sides. What
+            # mandatory rules out is the operator having chosen off,
+            # which is the only way an unprompted cap could turn
+            # something on. Both harms are therefore impossible, and
+            # they are the only reasons the other conditions exist.
             #
             # The comparison is against REASONING_BUDGET_SHARE and not
             # against the word "medium", so it stays true if that
