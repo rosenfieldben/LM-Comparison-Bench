@@ -2097,7 +2097,10 @@ def results_awaiting_reconciliation(
     way. The endpoint does report the figure, beside `is_byok`. But it
     "is only available for BYOK (Bring Your Own Key) requests. For all
     other requests it will be 0 or null", and NULL in that column is the
-    affirmative fact "this run was not BYOK". There is no column for
+    affirmative fact "the wire sent no usable figure", which is NOT
+    the same as "this run was not BYOK": that inference was measured
+    false on this branch, and is_byok is the column that answers it.
+    There is no column for
     "asked, and the answer was no", so a clause on it would park EVERY
     ordinary row on this list forever: the pass would never converge, and
     `python -m bench.reconcile` would report work to do on a database
@@ -2223,12 +2226,26 @@ def apply_reconciliation(
                 # made here because the two sources are known to
                 # disagree.
                 #
-                # MEASURED. For generation
-                # gen-1786560251-TPHWD5yYlFa5qRDnF3jf, the in-band usage
-                # block reported upstream_inference_cost 0.0035 while
-                # the generation endpoint reported 0, for the same
-                # generation, with is_byok false at both. See
-                # tests/fixtures/probe_reasoning_cap_binding.json.
+                # MEASURED, and the provenance of each half is stated
+                # separately because they do not come from the same
+                # place and an earlier version of this comment implied
+                # they did.
+                #
+                # For generation gen-1786560251-TPHWD5yYlFa5qRDnF3jf the
+                # GENERATION ENDPOINT reported upstream_inference_cost 0
+                # with is_byok false. That half is verbatim in
+                # tests/fixtures/probe_reasoning_cap_binding.json; the
+                # 0.0035 in that file is total_cost, which is a
+                # different key.
+                #
+                # The IN-BAND usage block for the same generation
+                # reported upstream_inference_cost 0.0035, and that half
+                # was reported by the operator who ran the probe rather
+                # than captured into the fixture. It is recorded as a
+                # reported observation in the fixture's
+                # _in_band_disagreement field, labelled as such, because
+                # evidence whose provenance is not stated is evidence
+                # nobody can check.
                 #
                 # WHY IN-BAND. It is contemporaneous with the charge,
                 # and in the one observed disagreement it is the source

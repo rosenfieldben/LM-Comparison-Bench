@@ -144,7 +144,10 @@ def test_a_reference_always_matches_itself_under_contains(response):
 
 @given(blank=st.text(alphabet=" \t\n\r", max_size=20))
 def test_a_blank_response_is_absent_rather_than_wrong(blank):
-    """The other half of the narrowing above, over every shape of blank.
+    """WINDOW: one score_response call's returned dict, read for its
+    detail string as well as its score.
+
+    The other half of the narrowing above, over every shape of blank.
 
     A trial that produced nothing visible must be recorded as not having
     completed, not as having answered incorrectly. The DETAIL is what

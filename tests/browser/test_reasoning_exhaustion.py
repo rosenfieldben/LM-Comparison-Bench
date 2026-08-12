@@ -242,7 +242,21 @@ def test_review_repro_the_card_flags_output_that_went_to_thinking(
     run(page, "indicator " + shape)
 
     card = cards(page).first
-    expect(status_of(card)).not_to_have_text("working", timeout=DONE_TIMEOUT)
+    # THE BARRIER IS POSITIVE ON PURPOSE. The obvious wait, "not working",
+    # is vacuous here: render.js prints the WORD "thinking" for the state
+    # "working", so no card ever displays "working" and the wait clears at
+    # t=0. The two silent rows would then assert to_have_count(0) against
+    # a card that had not finished rendering, and would pass with the
+    # indicator deleted outright. A terminal word is the real barrier, and
+    # it is strictly after addReasoningIndicator: completeColumn calls the
+    # indicator first and setState last, in one synchronous pass.
+    #
+    # Two words rather than one because the shapes end differently by
+    # design: the row with no visible answer is an error card, the other
+    # three answered. Anchored so "error" cannot match a longer word.
+    expect(status_of(card)).to_have_text(
+        re.compile(r"^(done|error)$"), timeout=DONE_TIMEOUT
+    )
     indicator = card.get_by_test_id("reasoning-warning")
     if expected is None:
         expect(indicator).to_have_count(0)

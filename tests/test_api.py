@@ -15,7 +15,11 @@ from fastapi.testclient import TestClient
 from bench import main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
-from bench.models import OPENROUTER_URL, provider_preferences
+from bench.models import (
+    OPENROUTER_URL,
+    PROVIDER_REASONING_MINIMUM,
+    provider_preferences,
+)
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -12249,6 +12253,33 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
     # The lineup really does span two ceilings, so the check above is
     # not quietly comparing four identical numbers.
     assert len({body["max_tokens"] for body in sent}) == 2
+    # AND THE PAIR IS PINNED-LEGAL ON THE BYTES. The two pinned rules
+    # were asserted only over invented budgets, in
+    # test_the_reservation_obeys_the_pinned_provider_arithmetic, while
+    # the test that reads a real outgoing payload checked only that the
+    # number was half of the ceiling.
+    #
+    # A TRIPWIRE, NOT A TOMBSTONE, and the difference is stated because
+    # claiming otherwise would be a false comment. Against today's
+    # constants these two lines cannot fail on their own: the equality
+    # asserted just above is strictly stronger for this lineup, and
+    # reasoning_reservation's own guard stands the field down rather
+    # than emit an illegal pair, which is separately tombstoned at the
+    # 1024 boundary. What they catch is a future change that keeps the
+    # share honest and the wire illegal, which is a published cap
+    # between 1024 and 2048, or a share moved without the guard moving
+    # with it. Nothing on the wire side would notice either today.
+    #
+    # Both rules quoted from
+    # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    # read 2026-08-12: "that value is used directly with a minimum of
+    # 1024 tokens", and "Important: max_tokens must be strictly higher
+    # than the reasoning budget".
+    for body in sent:
+        assert body["reasoning"]["max_tokens"] >= PROVIDER_REASONING_MINIMUM, body[
+            "model"
+        ]
+        assert body["max_tokens"] > body["reasoning"]["max_tokens"], body["model"]
 
 
 @respx.mock
@@ -12343,6 +12374,155 @@ def test_review_repro_the_reservation_asks_the_catalog_before_it_rides(
     assert vouched_body["reasoning"] == {"max_tokens": 8192}
     assert set(vouched_body) - set(unvouched) == {"reasoning"}
     assert {k: v for k, v in vouched_body.items() if k != "reasoning"} == unvouched
+
+
+from bench.main import trial_may_send_reasoning_cap  # noqa: E402
+from bench.models import ENDPOINTS_URL  # noqa: E402
+
+
+@respx.mock
+async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client):
+    """WINDOW: trial_may_send_reasoning_cap itself, called directly once
+    per branch, with the endpoint route's call count read between calls.
+
+    SUSPENSION POINT: the await on fetch_endpoints, reached on the last
+    two branches only. Nothing asserted here is mutable across it: the
+    listing is fully assembled before the coroutine returns, and the
+    call counter is read after each await settles.
+
+    THE DEFECT THIS ANSWERS is an absence rather than a wrong answer.
+    The closing review found this function had no test at any level:
+    replacing its entire body with "return model in
+    app.state.reasoning_defaults", which is the pre-T3 behaviour it was
+    written to replace, left 885 tests passing. The strict-pin fix was
+    therefore load-bearing and unguarded at once.
+
+    ASSERTED AGAINST THE PINNED CONTRACT. The endpoint listing below is
+    the shape measured on 2026-08-12, where one model's hosts published
+    18, 12 and 17 parameters and differed in which; what decides the
+    last two branches is the presence of "reasoning" in the PINNED
+    host's supported_parameters, not the fact that a mock answered 200.
+    Both hosts return the same 200 from the same route, and give
+    opposite answers.
+
+    THE CALL COUNTER IS HALF THE TEST. Three of the five branches must
+    answer from the model-level catalog WITHOUT asking the network, and
+    a version that always asked would return the same booleans while
+    spending a request per trial. Only the counter can tell them apart.
+    """
+    route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "DeepInfra",
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    {
+                        "provider_name": "BaseTen",
+                        "supported_parameters": ["max_tokens", "temperature"],
+                    },
+                ]
+            }
+        }
+    )
+    app.state.reasoning_defaults = {"model/alpha"}
+    pinned = {"model/alpha": "baseten"}
+
+    # BRANCH ONE: not the strict estimand. The pin is present and must
+    # be ignored, because without underlying_model the request does not
+    # carry allow_fallbacks false and a host may still decline the field
+    # harmlessly.
+    assert (
+        await trial_may_send_reasoning_cap(
+            {"estimand_mode": "as_served", "provider_pins": pinned}, "model/alpha"
+        )
+        is True
+    )
+    assert route.call_count == 0
+
+    # BRANCH TWO: strict, but this model has no pin. Any eligible host
+    # may serve it, so the union is the right question and the answer
+    # is again the model-level one.
+    assert (
+        await trial_may_send_reasoning_cap(
+            {"estimand_mode": "underlying_model", "provider_pins": {}}, "model/alpha"
+        )
+        is True
+    )
+    assert route.call_count == 0
+
+    # BRANCH THREE: pinned, but the MODEL is not vouched. Both questions
+    # must answer yes, and this one shortcuts before the network: an
+    # endpoint that accepts the field says nothing about whether the
+    # model reasons unprompted.
+    app.state.reasoning_defaults = set()
+    assert (
+        await trial_may_send_reasoning_cap(
+            {"estimand_mode": "underlying_model", "provider_pins": pinned},
+            "model/alpha",
+        )
+        is False
+    )
+    assert route.call_count == 0
+
+    # BRANCH FOUR: pinned to the host that publishes the field. This is
+    # the only branch that may return True through the listing.
+    app.state.reasoning_defaults = {"model/alpha"}
+    assert (
+        await trial_may_send_reasoning_cap(
+            {
+                "estimand_mode": "underlying_model",
+                "provider_pins": {"model/alpha": "deepinfra"},
+            },
+            "model/alpha",
+        )
+        is True
+    )
+    assert route.call_count == 1
+
+    # BRANCH FIVE, THE ONE THAT DEFEATS THE MUTATION. Same model, same
+    # vouching, same 200 from the same route: only the pin differs, and
+    # the pinned host does not publish reasoning. The pre-T3 body would
+    # say True here and empty the provider pool.
+    assert (
+        await trial_may_send_reasoning_cap(
+            {"estimand_mode": "underlying_model", "provider_pins": pinned},
+            "model/alpha",
+        )
+        is False
+    )
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_a_pinned_trial_with_no_listing_sends_nothing(client):
+    """WINDOW: trial_may_send_reasoning_cap on a vouched, pinned model
+    whose endpoint listing cannot answer.
+
+    SUSPENSION POINT: the await on fetch_endpoints, which returns its
+    unfetched listing rather than raising. Nothing asserted spans it.
+
+    ABSENCE OF EVIDENCE IS NOT SUPPORT, and this is where that costs
+    something. Under a strict pin, sending a field the host does not
+    take empties the provider pool and the run fails; not sending an
+    optional field is free. So a listing that 404s decides against the
+    field, not for it.
+    """
+    route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(404)
+    app.state.reasoning_defaults = {"model/alpha"}
+
+    assert (
+        await trial_may_send_reasoning_cap(
+            {
+                "estimand_mode": "underlying_model",
+                "provider_pins": {"model/alpha": "deepinfra"},
+            },
+            "model/alpha",
+        )
+        is False
+    )
+    assert route.call_count == 1
 
 
 def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():

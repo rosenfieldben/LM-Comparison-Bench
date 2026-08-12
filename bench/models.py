@@ -1067,36 +1067,30 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # step.
         #
         # THE PARTITION, measured against the live catalog on
-        # 2026-08-12, 410 models:
+        # 2026-08-12, 410 models, counting BOTH arms of the gate below:
         #
         #     8  the cap is a true ceiling, so it rides
-        #   149  reasons, but no budget support: a cap would set effort
-        #     0  reasons with budget support, parameter unadvertised
+        #    48  a cap provably cannot enable or intensify, so it rides
+        #   101  reasons, but a cap could raise the effort it reasons at
         #     2  default_effort none, so reasoning is OFF
         #    23  default_enabled false, so reasoning is OFF
         #    98  does not reason unprompted, or the catalog does not say
         #   130  no reasoning descriptor at all
         #
-        # The previous gate vouched for 159 of these. This one vouches
-        # for 8, and the 151 it withdraws are the finding rather than a
-        # regression: on 149 of them the field was never a ceiling, and
-        # on the other 2 it would have switched reasoning on.
+        # 56 receive a reservation. An earlier gate vouched for 159 by
+        # reading default_enabled alone; a stricter one vouched for 8 by
+        # demanding supports_max_tokens; this one is 56 because the
+        # no-harm arm below admits a model whose thinking a cap cannot
+        # move upward.
         #
-        # WHAT THAT COSTS, STATED PLAINLY. The incident's own model,
-        # which publishes mandatory true and default_effort high, does
-        # NOT publish supports_max_tokens, so it no longer receives a
-        # reservation. The vendor's prose names its family as supporting
-        # reasoning.max_tokens while the per-model flag does not, and
-        # the two disagree; where a contract contradicts itself the
-        # narrower reading is the safe one, because sending the field
-        # anyway would ask a model whose operator chose nothing to think
-        # at an effort nobody declared.
-        #
-        # That leaves the request-side arm of this fix covering 8 routes
-        # and not the one that started it, which is worth saying out
-        # loud rather than burying. The general answer was always the
-        # instrumentation: the relabelled error and the card indicator
-        # read the tokens that come BACK, so they work on all 410.
+        # THE INCIDENT'S OWN MODEL IS COVERED, by rule rather than by
+        # name. It publishes mandatory true and default_effort high and
+        # NO supports_max_tokens, so it fails the ceiling arm and clears
+        # the no-harm one. This paragraph said the opposite for three
+        # commits after the extension landed directly beneath it, which
+        # is the exact failure mode this repository treats as a defect:
+        # a comment describing an earlier version of the code it sits
+        # on top of.
         #
         # Four flags collapse to one derived boolean because only one
         # question is being asked: may the bench send this model a
@@ -1320,12 +1314,25 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     figure "is only available for BYOK (Bring Your Own Key) requests.
     For all other requests it will be 0 or null."
 
-    So on the ordinary credits path it is absent and the column is NULL,
-    which is the honest record of "this run was not BYOK". Under BYOK the
-    two diverge and only one of them is what the operator actually paid a
-    provider. The ceiling still meters credits and only credits: it is a
-    guard on the OpenRouter balance this process can spend, and a direct
-    provider bill is not money OpenRouter can decline.
+    THAT LAST SENTENCE IS THE CONTRACT'S, AND THE MEASUREMENTS
+    CONTRADICT IT. This docstring used to draw the obvious inference
+    from it, that an absent figure is the honest record of "this run was
+    not BYOK", and that inference is false. Two live captures in this
+    repository report is_byok false beside a nonzero upstream figure:
+    probe one (probe_reasoning_enable.json), where a DeepInfra route
+    reported the credit charge to the last digit, and probe two
+    (probe_reasoning_cap_binding.json), where the in-band block and the
+    generation endpoint disagreed with each other about the same
+    generation. So presence and absence here say nothing about billing
+    mode; is_byok is its own column precisely because this one cannot
+    stand in for it.
+
+    What the figure IS, unchanged: a number the provider reported, which
+    is not the credit charge, stored verbatim to be reconciled against a
+    provider's own invoice. The ceiling still meters credits and only
+    credits: it is a guard on the OpenRouter balance this process can
+    spend, and a direct provider bill is not money OpenRouter can
+    decline.
     """
     if not isinstance(usage, dict):
         return
@@ -2340,15 +2347,6 @@ async def judge_response(
         "model": judge_model,
         "messages": judge_messages(rubric, reference, response_text),
         "max_tokens": JUDGE_MAX_TOKENS,
-        # THE JUDGE GETS THE RESERVATION TOO, and it needs it most. Its
-        # budget is 512 tokens against a rubric it has never seen, which
-        # is exactly the shape that invites a model to think past its
-        # cap; a judge that reasons itself out of a verdict returns no
-        # score, and the trial is recorded as unscored rather than as
-        # failed. 256 tokens of thinking still fits a rubric's
-        # deliberation, and 256 visible is far more than "a number and a
-        # sentence" needs.
-        #
         # NO RESERVATION, and it is the GENERAL rule that says so
         # rather than a special case here. reasoning_reservation
         # computes half of 512, sees 256 fall below the pinned 1024

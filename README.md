@@ -694,7 +694,13 @@ or a test rather than by this list alone.
   therefore chooses its source deliberately: the in-band figure is
   contemporaneous with the charge and wins, and the pass fills a gap
   there rather than correcting a value. It is also a second independent
-  proof that a nonzero upstream figure cannot imply BYOK.
+  proof that a nonzero upstream figure cannot imply BYOK. **The two
+  halves have unequal provenance and the fixture says so:** the
+  endpoint's `0` is captured verbatim, the in-band `0.0035` was read off
+  the response by the operator who ran the probe and reported as prose,
+  and no streamed usage block for that generation is stored anywhere
+  here. Recorded under `_in_band_disagreement` in
+  `tests/fixtures/probe_reasoning_cap_binding.json`.
 - **2026-08-12. Native and normalized token counts really do
   diverge.** One generation record publishes both for the same
   completion: 65 normalized against 71 native, and 62 against 66 on the

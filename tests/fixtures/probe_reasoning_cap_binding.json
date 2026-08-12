@@ -28,6 +28,16 @@
       "provider_name": "Amazon Bedrock"
     }
   },
+  "_in_band_disagreement": {
+    "_what_this_is": "The two sources for ONE generation's upstream_inference_cost do not agree. Recorded here because bench/store.py's reconciliation cites it as the reason it fills rather than corrects that column.",
+    "_generation_id": "gen-1786560251-TPHWD5yYlFa5qRDnF3jf",
+    "_provenance_of_each_half": "UNEQUAL, and stated separately so nobody has to guess. The endpoint half is verbatim under 'capped' below, captured from the generation record. The in-band half was READ OFF THE RESPONSE BY THE OPERATOR who ran the probe and reported to this branch as prose; it was not captured into this file, and no streamed usage block for this generation is stored anywhere in the repository. It is a reported observation, not a transcript.",
+    "generation_endpoint_reported": 0,
+    "in_band_usage_block_reported": 0.0035,
+    "is_byok_at_both": false,
+    "_what_this_proves": "Second independent proof that a nonzero upstream figure cannot imply BYOK: is_byok is false at both sources and one of them still reports a nonzero upstream charge. The first proof was probe one, on a different model and a different provider.",
+    "_what_this_does_NOT_prove": "Which source is right about the money. Only that they differ, that a reconciliation pass must therefore CHOOSE, and that a pass which overwrites 0.0035 with 0 destroys a figure an operator could have reconciled against an invoice."
+  },
   "capped": {
     "_generation_id": "gen-1786560251-TPHWD5yYlFa5qRDnF3jf",
     "_request": "identical, plus reasoning: {\"max_tokens\": 1024}",
