@@ -239,6 +239,96 @@ def provider_preferences(
 _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 
 
+# How much of a completion budget thinking may consume before the bench
+# stops it and leaves the rest for a visible answer.
+#
+# THE INCIDENT. A production comparison on document prompts reasoned
+# until the completion cap closed on it: billed in full, between $3.38
+# and $3.50 per card, with ZERO visible output. The generation record is
+# unambiguous about where the budget went, tokens_completion 21350
+# against native_tokens_reasoning 21350, and the card carried no answer
+# at all. Row 694 of the same database is the healthy contrast: 2944
+# reasoning tokens, a real answer, end_turn.
+#
+# NOT A PROPERTY OF ONE MODEL, which is why nothing here names one.
+# Exhaustion is what happens when a model thinks hard against a
+# completion cap, and any model that reasons can do it on a hard enough
+# prompt. The reservation is therefore a function of the BUDGET and of
+# nothing else; there is a test asserting no model name appears in this
+# logic.
+#
+# ONE HALF, and the arithmetic rather than the round number. The
+# extended tier is 65536, so thinking is capped at 32768 and a maximal
+# thinker still leaves 32768 for the answer, which is four times the
+# whole standard tier. The standard tier is 16384, capped at 8192, and
+# 8192 visible tokens is a long answer by any measure. Lower would start
+# refusing thought that a hard prompt legitimately needs; higher shrinks
+# the guarantee this exists to make. Half is the point where neither
+# half of the budget can starve the other.
+REASONING_BUDGET_SHARE = 0.5
+
+# Pinned against OpenRouter's reasoning-tokens guide at
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# read 2026-08-10. Three sentences from it decide the shape below.
+#
+# THE FIELD. reasoning is a top-level object and the cap is its
+# max_tokens key: "'max_tokens': 2000, // Specific token limit
+# (Anthropic-style)".
+#
+# NOT BOTH, and this is the constraint that stops the reservation being
+# unconditional. The page introduces the two keys as "One of the
+# following (not both)", so a request carrying an operator's declared
+# effort must NOT also carry this cap. When the two would collide the
+# OPERATOR'S CONTROL RIDES and the reservation stands down: effort is a
+# declared part of the experiment and this is the bench's own default,
+# and a default that overwrote a declaration would be the one thing
+# rule one forbids. What protects that request instead is the indicator,
+# which reads the tokens that came back rather than the field that went
+# out.
+#
+# UNSUPPORTED ROUTES DEGRADE TWO DIFFERENT WAYS, both documented, and
+# the honest limit is the union of them. For a model that takes effort
+# and not a cap, "For models that only support 'reasoning.effort' (see
+# below), the 'max_tokens' value will be used to determine the effort
+# level", so the reservation is TRANSLATED rather than lost. For a
+# provider that does not support the parameter at all, the
+# provider-selection page's rule applies and it is dropped: providers
+# "can still receive the request, but will ignore unknown parameters".
+# On that second kind of route the guarantee is not prevention, and the
+# README says so: what remains is honest instrumentation, the relabelled
+# error and the card's indicator.
+#
+# WHY A CAP AND NOT AN EFFORT for the bench's own default: an effort is
+# a word whose token cost is the provider's to decide, and the whole
+# defect is a token count nobody bounded. A cap is the thing that can be
+# checked against the budget it is a fraction of.
+#
+# Reasoning tokens are charged either way, which is the other half of
+# why this is worth sending: "Reasoning tokens are considered output
+# tokens and charged accordingly."
+
+
+def reasoning_reservation(
+    max_tokens: int, controls: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """The reasoning cap for a request at this budget, or nothing.
+
+    Returns the fragment to merge into a payload, so a caller cannot
+    forget the not-both rule by assembling the field itself.
+
+    Empty when the operator declared an effort, per the pinned page; see
+    REASONING_BUDGET_SHARE for why the declaration wins over the
+    default.
+
+    int() truncates rather than rounds, so the cap is never a token
+    above its share of the budget. At the two real tiers the division is
+    exact anyway; the floor matters only if a future tier is odd.
+    """
+    if controls and controls.get("effort") is not None:
+        return {}
+    return {"reasoning": {"max_tokens": int(max_tokens * REASONING_BUDGET_SHARE)}}
+
+
 # ---- The underlying-model estimand.
 #
 # Everything in this block applies ONLY when an experiment declared
@@ -881,6 +971,19 @@ async def run_model(
         # policy lives. The default keeps a direct caller on today's
         # behavior.
         "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
+        # THE VISIBLE-OUTPUT RESERVATION, on every request that does not
+        # already carry a declared effort. See reasoning_reservation and
+        # REASONING_BUDGET_SHARE: this is the one field the bench sends
+        # UNPROMPTED, a deliberate and documented exception to "never
+        # send a default", taken because the alternative is a comparison
+        # that bills in full and shows nothing.
+        #
+        # BEFORE control_payload rather than after, so an operator's
+        # declared effort would win a collision by overwriting this. It
+        # cannot collide in practice, because the reservation stands
+        # down when an effort is set, but the ordering means the rule
+        # holds even if that guard were ever wrong.
+        **reasoning_reservation(max_tokens, controls),
         # Last, and only the controls that were set. The merge is safe
         # because control_payload emits from a fixed key list that shares
         # nothing with the keys above; a test asserts that, so a future
@@ -1055,6 +1158,11 @@ async def stream_model(
         # (read 2026-07-25). The usage block arrives because the platform
         # sends it, not because this asks.
         "stream_options": {"include_usage": True},
+        # See run_model: the reservation rides here too, and for the same
+        # reason. The streaming path is the one the browser uses, so a
+        # reservation that covered only the batch endpoint would cover
+        # almost nothing a person actually runs.
+        **reasoning_reservation(max_tokens, controls),
         # See run_model: last, and only what was set, so a blank controls
         # set leaves this payload byte for byte what it was before.
         **control_payload(controls),
@@ -1434,6 +1542,18 @@ async def judge_response(
         "model": judge_model,
         "messages": judge_messages(rubric, reference, response_text),
         "max_tokens": JUDGE_MAX_TOKENS,
+        # THE JUDGE GETS THE RESERVATION TOO, and it needs it most. Its
+        # budget is 512 tokens against a rubric it has never seen, which
+        # is exactly the shape that invites a model to think past its
+        # cap; a judge that reasons itself out of a verdict returns no
+        # score, and the trial is recorded as unscored rather than as
+        # failed. 256 tokens of thinking still fits a rubric's
+        # deliberation, and 256 visible is far more than "a number and a
+        # sentence" needs.
+        #
+        # No controls here by construction: the judge does not take the
+        # experiment's, so the not-both rule cannot bite.
+        **reasoning_reservation(JUDGE_MAX_TOKENS),
     }
     if provider_prefs:
         payload["provider"] = provider_prefs

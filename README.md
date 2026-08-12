@@ -290,7 +290,7 @@ never left sitting under the banner.
 Every run carries one of two completion budgets, picked next to the
 Run button: standard (16384 tokens) or extended (65536). Reasoning
 models spend the budget on hidden thinking before any visible
-answer, so a hard problem can empty the standard budget and come
+answer, so a hard problem can run the standard budget down and come
 back as "finish_reason: length"; extended exists for exactly that
 case, and the error message says so when it applies. The choice is
 per session and resets to standard on the next visit. The requested
@@ -310,6 +310,46 @@ on replayed columns; older runs predate the field and show none),
 and reruns reuse the budget of the run they retry. The API accepts
 `"budget": "standard" | "extended"` on `/compare` and
 `/compare/stream`; anything else is a 422.
+
+### Thinking cannot take the whole budget
+
+Every request reserves half its completion budget for the visible
+answer, sending `reasoning: {"max_tokens": N}` beside the cap: 8192 of
+the standard tier's 16384, 32768 of extended's 65536. The judge reserves
+on the same rule, 256 of its 512.
+
+This is the one default the bench sends unprompted, and it is a
+deliberate exception to "never send a default" (see **Experiment
+controls**), taken because the alternative was observed in production. A
+comparison on document prompts reasoned until the completion cap closed
+on it: every card billed in full, between $3.38 and $3.50, with no
+visible answer at all. The generation records were unambiguous about
+where the money went, 21350 completion tokens against 21350 reasoning
+tokens. Nothing bounded the thinking because nothing had asked to.
+
+Exhaustion is a property of thinking hard against a completion cap, not
+of any particular model, so the reservation is a function of the budget
+and of nothing else. No model name appears anywhere in it, and a test
+parses the function to prove that.
+
+Half rather than some other share: at extended, a maximal thinker still
+leaves 32768 tokens for the answer, four times the entire standard tier;
+at standard it leaves 8192, which is a long answer by any measure. A
+smaller share would start refusing thought a hard prompt legitimately
+needs.
+
+**Two routes it does not cover.** If you set a reasoning effort under
+**Experiment controls**, the reservation stands down: OpenRouter takes
+an effort or a cap and [not
+both](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens),
+and a declared part of your experiment outranks a bench default. And a
+provider that does not support the parameter at all simply ignores it,
+per the [provider-selection
+rules](https://openrouter.ai/docs/guides/routing/provider-selection). (A
+model that supports effort but not a cap is covered: the same page says
+the cap is used to pick an effort level, so it is translated rather than
+lost.) On those two routes exhaustion remains possible and the bench's
+answer is instrumentation rather than prevention.
 
 ## Reliability
 

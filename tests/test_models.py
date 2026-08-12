@@ -1542,6 +1542,19 @@ async def test_review_repro_blank_controls_send_the_pre_h_payload_byte_for_byte(
     On pre-fix code there are no controls to leave blank, so this test
     cannot fail there; its force is forward. It fails the moment any
     control acquires a default that reaches the wire.
+
+    RECAPTURED ONCE, DELIBERATELY, for the reasoning-exhaustion fix. Both
+    payloads now carry reasoning.max_tokens, which is the bench's own
+    visible-output reservation rather than a control default: the one
+    field sent unprompted, documented as an exception where rule one is
+    stated. The fixture was regenerated the way it was captured, by
+    running run_model and stream_model against respx and writing down the
+    bytes they sent, NOT by editing the JSON to match. Editing it would
+    have made this test assert that the code agrees with itself.
+
+    Its force is unchanged: a control acquiring a default still fails
+    here, because the reservation is not keyed on any control and its
+    value is a fraction of the budget.
     """
     for kind, controls in (
         ("run_model", None),
@@ -1738,8 +1751,13 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
 
     recorded = json.loads(result["request_json"])
     assert recorded["temperature"] == 0.2
-    for absent in ("top_p", "seed", "reasoning"):
+    for absent in ("top_p", "seed"):
         assert absent not in recorded, absent
+    # reasoning is recorded like any other field the bench sent, which is
+    # what makes the reservation auditable: a run can be shown to have
+    # asked for the cap it asked for. It carries the reservation and no
+    # effort, because this caller declared none.
+    assert recorded["reasoning"] == {"max_tokens": 8192}
 
 
 # ---- Phase I3: rubric judging, blind by construction.
@@ -2065,3 +2083,178 @@ def test_quantizations_ride_the_documented_filter_and_only_when_asked():
 
     assert pinned["quantizations"] == ["fp8"]
     assert "quantizations" not in plain
+
+
+from bench.models import (
+    BUDGET_EXTENDED,
+    REASONING_BUDGET_SHARE,
+    reasoning_reservation,
+)
+
+# ---- The reasoning-exhaustion fix, R1: visible-output room is reserved
+# ---- on every request, and the reservation is a function of the budget.
+
+
+@respx.mock
+async def test_review_repro_thinking_cannot_eat_the_whole_budget(client):
+    """WINDOW: the payload run_model puts on the wire, at both budget
+    tiers.
+
+    THE INCIDENT. A production comparison on document prompts reasoned
+    until the completion cap closed on it: billed in full, $3.38 to
+    $3.50 per card, zero visible output. The generation record showed
+    tokens_completion 21350 against native_tokens_reasoning 21350, which
+    is the whole budget spent on thinking and nothing left to say it
+    with. Nothing bounded the thinking, because nothing asked to.
+
+    THE RESERVATION IS A FUNCTION OF THE BUDGET AND OF NOTHING ELSE,
+    which is what this asserts and why it is parametrized on the tier
+    rather than on a model. 16384 reserves 8192 for the answer; 65536
+    reserves 32768, which is four times the entire standard tier. A
+    model name appears nowhere in the arithmetic and a separate test
+    proves it appears nowhere in the code.
+    """
+    for budget, expected in ((BUDGET_STANDARD, 8192), (BUDGET_EXTENDED, 32768)):
+        respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+        await run_model("the prompt", "vendor/model", client, max_tokens=budget)
+
+        body = json.loads(respx.calls[-1].request.content)
+        assert body["reasoning"] == {"max_tokens": expected}, budget
+        # Half, stated as the relationship rather than as two constants,
+        # so changing the share cannot leave this test agreeing with a
+        # number nobody meant.
+        assert body["reasoning"]["max_tokens"] == int(
+            body["max_tokens"] * REASONING_BUDGET_SHARE
+        )
+
+
+@respx.mock
+async def test_the_reservation_stands_down_for_a_declared_effort(client):
+    """WINDOW: the same payload, when the operator declared a reasoning
+    effort.
+
+    NOT BOTH, and the pinned page is what decides it: OpenRouter
+    introduces effort and max_tokens as "One of the following (not
+    both)". So a request carrying a declared effort must not also carry
+    the bench's cap, and the operator's declaration is the one that
+    rides: it is part of the experiment, the reservation is the bench's
+    own default, and a default overwriting a declaration is what rule
+    one exists to forbid.
+
+    That leaves those requests unprotected by R1, which is exactly why
+    the card's indicator keys on the tokens that came BACK rather than
+    on the field that went out.
+
+    TWO DEFENCES, AND BOTH ARE CHECKED HERE, which is a fact this test
+    learned the hard way. Mutating the guard to return the cap
+    unconditionally left this test PASSING, because control_payload
+    merges last and replaces the whole reasoning value rather than
+    merging into it, so the ordering alone produced a correct request.
+    That is the design working, but a test that only reads the payload
+    cannot tell a live guard from a dead one hiding behind the ordering.
+    So the guard is also asserted directly, on the function, where the
+    same mutation does fail.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    await run_model(
+        "the prompt",
+        "vendor/model",
+        client,
+        max_tokens=BUDGET_STANDARD,
+        controls={"effort": "high"},
+    )
+
+    body = json.loads(respx.calls[-1].request.content)
+    assert body["reasoning"] == {"effort": "high"}
+    assert "max_tokens" not in body["reasoning"]
+    # The guard itself, behind the ordering that would otherwise cover
+    # for it. See the docstring: this is the assertion the mutation
+    # kills.
+    assert reasoning_reservation(BUDGET_STANDARD, {"effort": "high"}) == {}
+    # And it stands down only for a declared effort, not for any
+    # controls at all, so a request with a temperature still reserves.
+    assert reasoning_reservation(BUDGET_STANDARD, {"temperature": 0.5}) == {
+        "reasoning": {"max_tokens": 8192}
+    }
+
+
+@respx.mock
+async def test_the_judge_reserves_room_for_its_verdict(client):
+    """WINDOW: the judge's payload. Its budget is 512 tokens against a
+    rubric it has never seen, which is the shape most likely to invite a
+    model to think past its cap; a judge that reasons itself out of a
+    verdict leaves the trial unscored rather than failed."""
+    respx.post(OPENROUTER_URL).respond(
+        json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
+    )
+
+    await judge_response(client, "rubric", None, "the answer", "vendor/judge")
+
+    body = json.loads(respx.calls[-1].request.content)
+    assert body["max_tokens"] == JUDGE_MAX_TOKENS
+    assert body["reasoning"] == {"max_tokens": JUDGE_MAX_TOKENS // 2}
+
+
+def test_no_model_name_appears_in_the_reservation_logic():
+    """THE UNIVERSALITY CONSTRAINT, asserted rather than promised.
+
+    Exhaustion is a property of thinking against a completion cap, not
+    of one vendor, and the incident was diagnosed on one model only
+    because that is the one that was running. A fix that branched on a
+    name would protect exactly the model whose failure was noticed and
+    leave every other reasoning model exposed, while looking finished.
+
+    PARSED, NOT GREPPED, and the difference is the whole reason this
+    test is written the way it is. A grep over the source fires on the
+    pinned documentation quotes beside the constant, which say
+    "(Anthropic-style)" and "(OpenAI-style)" because that is what
+    OpenRouter's page says and a pinned quote must be verbatim. Those
+    are prose about a wire format, not a branch. What must contain no
+    vendor is the CODE, so this walks the function's AST and inspects
+    every name, attribute and string literal that can actually execute.
+
+    The vendor list is not a security boundary. It is a tripwire for one
+    specific mistake, and it names the vendors this repo's own fixtures
+    and catalogs mention.
+    """
+    import ast
+
+    source = (Path(__file__).parent.parent / "bench" / "models.py").read_text()
+    tree = ast.parse(source)
+    target = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "reasoning_reservation"
+    )
+    body = list(target.body)
+    # Drop the docstring, which is prose by definition.
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    assert body, "the reservation has no executable body to check"
+
+    executable = " ".join(ast.dump(node) for node in body).lower()
+    for vendor in (
+        "fable",
+        "claude",
+        "anthropic",
+        "openai",
+        "gpt",
+        "gemini",
+        "google",
+        "deepseek",
+        "qwen",
+        "llama",
+        "mistral",
+        "grok",
+    ):
+        assert vendor not in executable, vendor
+
+    # And the constant it reads is a plain number, not a per-model table.
+    assert isinstance(REASONING_BUDGET_SHARE, float)

@@ -251,8 +251,14 @@ def test_the_group_row_records_the_controls_the_run_declared(bench, bench_url):
     assert sent["temperature"] == 0.5
     assert sent["provider"]["sort"] == "price"
     assert "routing" not in sent
-    for absent in ("top_p", "seed", "reasoning"):
+    for absent in ("top_p", "seed"):
         assert absent not in sent, absent
+    # reasoning left that list when the visible-output reservation
+    # landed. It is no longer an unset control, it is the bench's own
+    # cap, so the honest assertion is what it contains rather than that
+    # it is missing: this run declared no effort, so it carries the
+    # budget's half and not a tier word.
+    assert sent["reasoning"] == {"max_tokens": sent["max_tokens"] // 2}
 
 
 # ---- H3: reuse a comparison.

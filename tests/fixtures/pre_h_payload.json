@@ -1,4 +1,4 @@
 {
-  "run_model": "{\"model\":\"vendor/model\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt\"}],\"max_tokens\":16384,\"provider\":{\"sort\":\"throughput\"}}",
-  "stream_model": "{\"model\":\"vendor/model\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt\"}],\"max_tokens\":16384,\"provider\":{\"sort\":\"throughput\"},\"stream\":true,\"stream_options\":{\"include_usage\":true}}"
+  "run_model": "{\"model\":\"vendor/model\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt\"}],\"max_tokens\":16384,\"provider\":{\"sort\":\"throughput\"},\"reasoning\":{\"max_tokens\":8192}}",
+  "stream_model": "{\"model\":\"vendor/model\",\"messages\":[{\"role\":\"user\",\"content\":\"the prompt\"}],\"max_tokens\":16384,\"provider\":{\"sort\":\"throughput\"},\"stream\":true,\"stream_options\":{\"include_usage\":true},\"reasoning\":{\"max_tokens\":8192}}"
 }

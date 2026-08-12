@@ -60,6 +60,8 @@ CATALOG = {
             ("stub/slow", {}),
             ("stub/flaky", {}),
             ("stub/null", {}),
+            # Thinks and never speaks; see the streaming dispatch.
+            ("stub/exhausted", {}),
             ("stub/html", {}),
             ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
             # Priced in the catalog on purpose: their billed figure is
@@ -104,6 +106,20 @@ USAGE = {
     "completion_tokens_details": {"reasoning_tokens": 5},
     "prompt_tokens_details": {"cached_tokens": 2},
 }
+
+# The usage object of a run that spent its whole budget thinking. The
+# completion count equals the reasoning count, which is what the
+# production incident's generation record showed and what the relabelled
+# error and the card indicator both key on.
+EXHAUSTED_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8192,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 8192},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
 
 # The host OpenRouter routed to, echoed on every chunk and on the
 # non-streaming body, the way the real API reports it.
@@ -239,6 +255,38 @@ def build_app() -> Starlette:
 
                 return gen()
             return text_stream(model, reply_text(model), "flaky-slow", delay=2.0)
+        if model == "stub/exhausted":
+            # THE INCIDENT, reproduced as a personality rather than as a
+            # model. It thinks and never speaks: reasoning deltas only,
+            # then a stop with no content, and a usage object whose
+            # completion count IS its reasoning count, which is the
+            # signature the production generation record carried
+            # (tokens_completion equal to native_tokens_reasoning).
+            #
+            # Named for the SHAPE and not for the model that produced it,
+            # because exhaustion is a property of thinking against a cap
+            # and any reasoning model can do it. A stub named after a
+            # vendor would have quietly taught every test that this is
+            # one vendor's problem.
+            async def gen():
+                for _ in range(3):
+                    await asyncio.sleep(0.01)
+                    yield sse(
+                        {
+                            "provider": PROVIDER,
+                            "choices": [{"delta": {"reasoning": "thinking..."}}],
+                        }
+                    )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
         if model == "stub/null":
 
             async def gen():

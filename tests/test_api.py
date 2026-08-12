@@ -3072,11 +3072,25 @@ def test_blank_controls_leave_the_boot_provider_block_untouched(client):
     body = json.loads(respx.calls[0].request.content)
     assert body["provider"] == {"sort": "throughput"}
     assert body["messages"] == [{"role": "user", "content": "p"}]
-    for control_key in ("temperature", "top_p", "seed", "reasoning"):
+    for control_key in ("temperature", "top_p", "seed"):
         assert control_key not in body, control_key
+    # reasoning IS present now, and it is not a control default: it is the
+    # bench's own visible-output reservation, the one field sent
+    # unprompted. It left this absence list in the reasoning-exhaustion
+    # fix and gained an assertion of its own, because "no key here" and
+    # "this key is exactly the reservation" are different claims and only
+    # the second one is still true.
+    assert body["reasoning"] == {"max_tokens": 8192}
+    assert "effort" not in body["reasoning"]
     # The whole key set, so a control added later cannot slip in unnoticed
     # by being absent from the list above.
-    assert set(body) == {"model", "messages", "max_tokens", "provider"}
+    assert set(body) == {
+        "model",
+        "messages",
+        "max_tokens",
+        "provider",
+        "reasoning",
+    }
 
 
 @respx.mock
@@ -3373,8 +3387,16 @@ def test_an_explicitly_null_control_is_blank_not_set_to_null(client):
     assert resp.status_code == 200
     body = json.loads(respx.calls[0].request.content)
     # Byte-for-byte the blank payload: nulls reached neither the top level
-    # nor the message list.
-    assert set(body) == {"model", "messages", "max_tokens", "provider"}
+    # nor the message list. reasoning is the bench's reservation and not a
+    # control, so an explicit null control cannot produce or suppress it.
+    assert set(body) == {
+        "model",
+        "messages",
+        "max_tokens",
+        "provider",
+        "reasoning",
+    }
+    assert body["reasoning"] == {"max_tokens": 8192}
     assert body["messages"] == [{"role": "user", "content": "p"}]
 
     gid = client.post(
@@ -8759,6 +8781,15 @@ def test_review_repro_rule_one_holds_across_both_modes(client):
         "messages": [{"role": "user", "content": "plain question"}],
         "max_tokens": 16384,
         "provider": {"sort": "throughput"},
+        # THE ONE DELIBERATE ADDITION, recaptured rather than hand-edited
+        # when the reasoning-exhaustion fix landed. Rule one says an
+        # unattached comparison sends what it always did; the reservation
+        # is a documented exception to "never send a default", taken
+        # because the alternative is a comparison that bills in full and
+        # shows nothing. What rule one still guarantees, and what this
+        # line still proves, is that ATTACHMENTS add nothing: the payload
+        # here is the no-attachment payload exactly.
+        "reasoning": {"max_tokens": 8192},
     }
 
 
@@ -12117,3 +12148,87 @@ def test_review_repro_a_groups_member_runs_carry_their_own_documents(client):
     alone = client.get(f"/runs/{member['id']}").json()
     assert member["renditions"] == alone["renditions"]
     assert member["attachments"] == alone["attachments"]
+
+
+# ---- The reasoning-exhaustion fix, R1, at the endpoint: the reservation
+# ---- rides every member of a comparison, with one arithmetic.
+
+
+@respx.mock
+def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client):
+    """WINDOW: the captured payloads of a FULL MULTI-MODEL comparison,
+    the fairness walk's shape applied to the reservation.
+
+    A GUARANTEE THAT COVERS SOME MEMBERS IS NOT A GUARANTEE. The
+    incident's comparison had several cards and every one of them billed
+    in full for nothing; a reservation that rode only the first request,
+    or that varied by member, would leave the same comparison partly
+    exposed and would do it invisibly, because the cards that worked
+    would look exactly like cards that were protected.
+
+    So this asserts across the whole lineup at once, as ONE DISTINCT
+    VALUE rather than pairwise, which is the same reason the fairness
+    tombstone counts distinct composed contents: a third member drifting
+    cannot hide behind a comparison of the first two.
+
+    Every model here is a stub with a different personality, and the
+    reservation is identical across all of them, which is the property:
+    it is a function of the budget, and the budget is one number for the
+    comparison.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "ok")
+        )
+    )
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "a hard question",
+            "models": ["model/alpha", "model/beta", "model/vision"],
+            "budget": "extended",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    sent = [json.loads(call.request.content) for call in respx.calls]
+    assert len(sent) == 3
+    reservations = {json.dumps(body["reasoning"], sort_keys=True) for body in sent}
+    assert len(reservations) == 1, reservations
+    # And it is the budget's half, checked against each member's own
+    # declared budget rather than against a constant, so a per-model
+    # clamp that changed one member's budget would have to change its
+    # reservation with it.
+    for body in sent:
+        assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}
+
+
+@respx.mock
+def test_a_visible_answer_still_fits_in_the_reserved_room(client):
+    """The other half of the reservation, and the one that stops it from
+    being a cure worse than the disease.
+
+    Capping thinking is only correct if what remains is enough to answer
+    with. At the standard tier the reservation leaves 8192 visible
+    tokens, which is a long answer; this proves the round trip end to
+    end, that a comparison with the cap in place returns real text and
+    records it.
+    """
+    long_answer = "the answer, at length. " * 200
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for("model/alpha", long_answer)
+        )
+    )
+
+    resp = client.post(
+        "/compare", json={"prompt": "answer at length", "models": ["model/alpha"]}
+    )
+
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["error"] is None
+    assert result["response_text"] == long_answer
+    body = json.loads(respx.calls[0].request.content)
+    assert body["reasoning"]["max_tokens"] == 8192
