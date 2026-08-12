@@ -44,7 +44,7 @@ from typing import Any
 # get_run refuses to serve, so both ends of the pipeline enforce the
 # same field-type contract.
 from bench.extract import media_type_for
-from bench.models import as_metric, as_money, as_text, as_token_count
+from bench.models import as_flag, as_metric, as_money, as_text, as_token_count
 
 logger = logging.getLogger(__name__)
 
@@ -1707,7 +1707,11 @@ def save_run(
                     # one. sqlite3 adapts True and False to 1 and 0 and
                     # leaves None as NULL, which is the three-state
                     # record this column exists to keep.
-                    r.get("is_byok"),
+                    # Through the same rule the read path uses, so the
+                    # write and the read cannot disagree, and so a caller
+                    # that is not run_model cannot put a string into an
+                    # INTEGER column that would accept one.
+                    as_flag(r.get("is_byok")),
                 )
                 for r in results
             ],
@@ -1902,6 +1906,16 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
         "cached_tokens",
     ):
         row[field] = as_token_count(row[field])
+    # THE FLAG COLUMN, converted here so no reader has to know that
+    # SQLite has no boolean. scores_for_results already does exactly
+    # this for its own flags and says why; is_byok is the one that was
+    # left out of the rule when it landed.
+    #
+    # Identity matters downstream: report._cost_totals asks whether the
+    # flag is True, and an unconverted 1 fails that test while passing
+    # an equality test, so a bug here would look like a working report
+    # that quietly attributed nothing.
+    row["is_byok"] = as_flag(row["is_byok"])
     for field in ("latency_ms", "ttft_ms", "cost_usd"):
         row[field] = as_metric(row[field])
     # Money, so the finite rule applies on the way out too: a poisoned
@@ -2116,6 +2130,14 @@ RECONCILABLE_COLUMNS = (
     # the value was fetched on every pass and thrown away, which is a
     # helper with no call site wearing a different hat.
     "upstream_inference_cost_usd",
+    # The BYOK discriminator. Without this entry fetch_generation would
+    # parse it on every pass and drop it, which is exactly what this
+    # tuple's comment above describes for the figure beside it.
+    #
+    # Deliberately NOT added to the predicate that chooses rows to
+    # reconcile: a NULL clause there would park every row written before
+    # the column existed on the work list forever.
+    "is_byok",
 )
 
 
@@ -2158,7 +2180,13 @@ def apply_reconciliation(
                    -- decision. See the comment on the bound value.
                    upstream_inference_cost_usd = COALESCE(
                        upstream_inference_cost_usd, ?
-                   )
+                   ),
+                   -- COALESCE, not the billed_cost_usd CASE: an absent
+                   -- flag means "the endpoint did not say", so it must
+                   -- not erase one captured in band. sqlite3 binds
+                   -- Python False as 0, and COALESCE(0, ...) keeps the
+                   -- 0, so a reported False still writes.
+                   is_byok = COALESCE(?, is_byok)
                WHERE id = ?""",
             (
                 record["billed_cost_usd"],
@@ -2199,6 +2227,7 @@ def apply_reconciliation(
                 # reason the endpoint IS the authority, and a later
                 # correction there is the point of reconciling at all.
                 record["upstream_inference_cost_usd"],
+                record["is_byok"],
                 result_id,
             ),
         )

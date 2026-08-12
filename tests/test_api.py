@@ -7617,6 +7617,12 @@ def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
                         "completion_tokens": 1,
                         "cost": 0.25,
                         "cost_details": {"upstream_inference_cost": 0.0042},
+                        # THE FLAG THIS TEST ALWAYS NEEDED. It is named
+                        # for a BYOK charge and its stub never said the
+                        # run was BYOK; it inferred that from the figure
+                        # being present, which is exactly the inference
+                        # the report was corrected to stop making.
+                        "is_byok": True,
                     },
                 }
             ),
@@ -7649,7 +7655,13 @@ def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
     # The report's cost section, beside the total and not inside it.
     cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
     assert cost["total_usd"] == pytest.approx(0.25)
-    assert cost["upstream"] == {"trials": 1, "values": ["0.0042"]}
+    # Bucketed by what the wire SAID, not by what was present. Only the
+    # byok bucket may be read as a second bill.
+    assert cost["upstream"]["byok"] == {"trials": 1, "values": ["0.0042"]}
+    assert cost["upstream"]["not_byok"] == {"trials": 0, "values": []}
+    assert cost["upstream"]["unknown"] == {"trials": 0, "values": []}
+    # And it is still never added to the credit total.
+    assert cost["total_usd"] == pytest.approx(0.25)
 
 
 @respx.mock
@@ -12517,3 +12529,135 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
         "m/thinks-no-param-list": False,
         "m/none": False,
     }
+
+
+# ---- T4: is_byok is a boolean on every surface, or an explicit null.
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "wire,expected",
+    [({"is_byok": True}, True), ({"is_byok": False}, False), ({}, None)],
+    ids=["reported true", "reported false", "not reported"],
+)
+def test_review_repro_is_byok_survives_every_surface_as_a_json_boolean(
+    client, wire, expected
+):
+    """WINDOW: one run, read back through every surface that serves it:
+    the batch response, the run detail, the group detail, and the
+    export line.
+
+    THE DEFECT. ModelResult never declared the field, and it carries
+    pydantic's default extra="ignore", so the key was DELETED from every
+    body serialized through it. That is /compare, and via
+    StoredModelResult it is GET /runs/{id} and GET /groups/{id} too. The
+    SSE done frame json.dumps the raw dict and so carried it, which left
+    the API and the stream disagreeing about the same run.
+
+    THREE STATES OR NOTHING. A consumer that cannot tell true from false
+    from absent cannot use the flag for the one thing it exists for,
+    which is deciding whether an upstream figure is a second bill. So
+    each surface is asserted to CONTAIN the key, by membership, and then
+    for its value by identity. Membership is the load-bearing half: an
+    assertion written as `body.get("is_byok") == expected` passes for
+    the not-reported case with the key entirely absent, which is exactly
+    the defect.
+    """
+    usage = {"prompt_tokens": 5, "completion_tokens": 5, "cost": 0.5, **wire}
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json={**response_for("model/alpha", "hi"), "usage": usage}
+        )
+    )
+
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    resp = client.post(
+        "/compare",
+        json={"prompt": "p", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["results"][0]
+    run_id = resp.json()["run_id"]
+
+    # 1. The batch response.
+    assert "is_byok" in body
+    assert body["is_byok"] is expected
+
+    # 2. The run detail.
+    detail = client.get(f"/runs/{run_id}").json()["results"][0]
+    assert "is_byok" in detail
+    assert detail["is_byok"] is expected
+
+    # 3. The group detail, which reaches the same row by another route.
+    group = client.get(f"/groups/{gid}").json()["runs"][0]["results"][0]
+    assert "is_byok" in group
+    assert group["is_byok"] is expected
+
+
+@respx.mock
+def test_review_repro_a_non_byok_upstream_figure_is_not_reported_as_a_second_bill(
+    client, tmp_path
+):
+    """WINDOW: an experiment report's cost block, for a run whose wire
+    shape is the live probe's.
+
+    THE DEFECT, and it published money that did not exist. _cost_totals
+    collected every non-null upstream figure and the report called them
+    all BYOK charges billed direct. Presence was taken as proof of
+    billing mode. tests/fixtures/probe_reasoning_enable.json is a
+    verbatim capture of a NON-BYOK call carrying an upstream figure
+    equal to the credit charge to the last digit, so on that route the
+    report published OpenRouter's own charge a second time as a separate
+    provider invoice for a bring-your-own-key run that never happened.
+
+    THE PROBE'S OWN SHAPE IS THE FIXTURE HERE, so this cannot pass by
+    testing a number nobody has seen.
+    """
+    probe = json.loads(
+        (Path(__file__).parent / "fixtures" / "probe_reasoning_enable.json").read_text()
+    )["capped"]["usage"]
+    assert probe["is_byok"] is False
+    assert probe["cost_details"]["upstream_inference_cost"] > 0
+
+    # The experiment runner streams, so the probe's usage block is
+    # delivered the way a real trial would receive it.
+    def route(request):
+        return httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse({"choices": [], "usage": probe}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "p"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
+
+    # The figure is recorded, because the wire reported it.
+    assert cost["upstream"]["not_byok"]["trials"] == 1
+    # And it is NOT a bill.
+    assert cost["upstream"]["byok"] == {"trials": 0, "values": []}
+    assert cost["upstream"]["unknown"] == {"trials": 0, "values": []}
+    # NOT DOUBLED, which is the assertion that actually catches the
+    # defect. The credit charge and the upstream figure are the SAME
+    # number on this route, to the last digit, which is precisely why
+    # the old report could publish it twice without anything looking
+    # odd. A test comparing the two strings could never see that; a test
+    # that pins the total to ONE copy of the charge can.
+    charge = probe["cost"]
+    assert cost["total_usd"] == pytest.approx(charge)
+    assert cost["total_usd"] != pytest.approx(charge * 2)
+    # And the figure that would have been added is recorded verbatim,
+    # unsummed, in the bucket that says what it actually is.
+    assert cost["upstream"]["not_byok"]["values"] == [
+        repr(probe["cost_details"]["upstream_inference_cost"])
+    ]

@@ -364,6 +364,20 @@ class ModelResult(BaseModel):
     # OpenRouter balance this process can spend and a direct provider
     # bill is not money OpenRouter can decline.
     upstream_inference_cost_usd: str | None = None
+    # WHETHER OPENROUTER BILLED THIS AGAINST YOUR OWN PROVIDER KEY.
+    #
+    # Declared here or it does not exist on the wire: this model carries
+    # pydantic's default extra="ignore", so a key the class does not
+    # name is deleted from every response serialized through it. That is
+    # /compare, and via StoredModelResult it is GET /runs/{id} and
+    # GET /groups/{id} as well. The SSE done frame json.dumps the raw
+    # dict and so happened to carry it already, which made the API and
+    # the stream disagree about the same run.
+    #
+    # None is "not reported", which is not the same claim as False, and
+    # the default keeps every legacy row and every synthetic result
+    # valid without pretending to know.
+    is_byok: bool | None = None
 
 
 class StreamCompareRequest(BaseModel):
@@ -1884,6 +1898,8 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         # both client functions always set it, and here there is no payload
         # to record because none was built.
         "billed_cost_usd": None,
+        "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,

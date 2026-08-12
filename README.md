@@ -120,12 +120,21 @@ NULL there now means one thing only: the wire sent nothing usable.
 
 The meaning moved to its own column. **`is_byok`** says whether
 OpenRouter billed the run against your own provider key, in three
-states: true, false, and NULL for a row written before the column
-existed or a provider that did not report it. Read them separately: the
-flag says which kind of run it was, and the upstream figure is whatever
-was reported, which on some non-BYOK routes is the credit charge
-repeated rather than a separate provider bill. The measurement behind
-all of this is pinned in the fixture named above.
+states: true, false, and null for a row written before the column
+existed or a provider that did not report it.
+
+It is a **JSON boolean on every surface**: `/compare`, `GET /runs/{id}`,
+`GET /groups/{id}`, the streaming done frame, and the v4 export line.
+Reconciliation parses it from the generation record and fills it where
+the wire never said, without erasing what it did.
+
+**The report reads it.** Upstream figures are split three ways, and only
+the `byok` bucket is described as a bill. A non-BYOK run that reports an
+upstream figure is shown as what it is, the same money already inside
+the credit total, and a run with no flag recorded is left unattributed
+rather than guessed at. Before this, every figure was labelled a direct
+provider charge, which on one measured route published OpenRouter's own
+charge a second time as an invoice nobody was owed.
 
 It travels the whole way: served on the result, written by the reconcile
 pass from the generation record, carried on the export's trial lines, and

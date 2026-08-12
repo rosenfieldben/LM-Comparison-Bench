@@ -35,6 +35,36 @@ def as_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def as_flag(value: object) -> bool | None:
+    """A three-state flag: True, False, or None for "not reported".
+
+    ONE RULE FOR THE WRITE AND THE READ, which is the reason this is a
+    function rather than an isinstance check at each site. SQLite has no
+    boolean: it stores 1, 0 and NULL, so a flag column round-trips as an
+    int unless somebody converts it back, and the conversion has to
+    happen in exactly the same way on both sides or the two disagree.
+
+    THE TRAP THIS EXISTS TO CLOSE. In Python `1 == True` is True but
+    `1 is True` is False, so a reader who checks identity gets the wrong
+    answer from an unconverted row while a reader who checks equality
+    gets the right one by luck. A truthiness check is worse again: it
+    folds 0 and None together, and those are the two states this column
+    was created to tell apart.
+
+    None for anything that is not a bool or an int in (0, 1), which is
+    the same isinstance discipline _ingest_usage applies at the wire.
+    A poisoned cell degrades to "not reported" rather than to a
+    confident True, because SQLite's column affinity will accept a
+    string into an INTEGER column and a later reader must not be told
+    something the wire never said.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
 def as_metric(value: object) -> float | None:
     """A finite float measurement or None; bools and junk become None.
 
@@ -1975,6 +2005,13 @@ async def fetch_generation(
     # example response carries "total_cost": 0.0015 beside
     # "upstream_inference_cost": 0.0012 and "is_byok": false.
     record["upstream_inference_cost_usd"] = _as_upstream_cost(data)
+    # THE DISCRIMINATOR, at the TOP level of data here rather than
+    # nested under cost_details as the streaming usage object puts it.
+    # The comment above already quoted the pinned example as carrying
+    # "is_byok": false beside the figure, and then did not read it, which
+    # is the same fetched-and-dropped shape RECONCILABLE_COLUMNS calls
+    # out one step later.
+    record["is_byok"] = as_flag(data.get("is_byok"))
     record["provider"] = _as_label(data.get("provider_name"))
     record["quantization"] = _as_label(data.get("quantization"))
     record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))

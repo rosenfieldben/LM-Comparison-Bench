@@ -3218,3 +3218,69 @@ def test_the_native_and_normalized_counts_really_do_differ():
         71,
         65,
     )
+
+
+# ---- T4: the flag crosses every surface as a boolean, or as null.
+
+from bench.models import as_flag  # noqa: E402
+
+
+def test_as_flag_keeps_three_states_and_refuses_to_guess():
+    """WINDOW: the shared rule, with no database and no wire.
+
+    ONE RULE FOR THE WRITE AND THE READ. SQLite has no boolean, so a
+    flag column round-trips as an int unless something converts it, and
+    the conversion has to be identical on both sides or the two
+    disagree.
+
+    bool() would be the obvious implementation and it is wrong twice: it
+    turns None into False, collapsing "not reported" into "reported as
+    no", and it turns the string 'yes' into True, which is a claim the
+    wire never made.
+    """
+    assert as_flag(True) is True
+    assert as_flag(False) is False
+    # What SQLite hands back.
+    assert as_flag(1) is True
+    assert as_flag(0) is False
+    # Absence stays absence.
+    assert as_flag(None) is None
+    # And anything else degrades rather than being guessed at.
+    for junk in ("yes", "true", "", 2, -1, 1.0, [], {}):
+        assert as_flag(junk) is None, junk
+
+
+@respx.mock
+async def test_review_repro_the_generation_record_parses_the_flag_it_documents(client):
+    """WINDOW: fetch_generation's returned record, over every shape the
+    endpoint can put the flag in.
+
+    SUSPENSION POINT: the await on fetch_generation, once per shape.
+    Every assertion is on the returned record.
+
+    THE DEFECT. The record dict declared "is_byok": None and the parse
+    block never assigned it, so every reconciled row learned None
+    forever. The comment directly above the parse quoted the pinned
+    example as carrying "is_byok": false beside the figure it did read,
+    which is the fetched-and-dropped shape this repository already names
+    one step later in RECONCILABLE_COLUMNS.
+
+    THE ENDPOINT PUTS IT AT THE TOP LEVEL of data, unlike the streaming
+    usage object which nests the cost figure under cost_details. Reading
+    the wrong level would return None for every row and look exactly
+    like the defect.
+    """
+    for body, expected in (
+        ({"data": {"is_byok": True}}, True),
+        ({"data": {"is_byok": False}}, False),
+        # Absent is not false.
+        ({"data": {}}, None),
+        # And a non-bool is not a guess.
+        ({"data": {"is_byok": "yes"}}, None),
+        # Nested where the usage object puts its figure, which is the
+        # wrong level: reading there must not find it.
+        ({"data": {"cost_details": {"is_byok": True}}}, None),
+    ):
+        respx.get(GENERATION_URL).respond(json=body)
+        record = await fetch_generation(client, "gen-x")
+        assert record["is_byok"] is expected, body

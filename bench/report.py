@@ -37,6 +37,7 @@ from typing import Any
 # only consumer. Importing it rather than re-deriving "the last row" is
 # the whole point of J4: a correct helper with no call sites is a rule
 # nothing obeys.
+from bench.models import as_flag
 from bench.scoring import latest_per_key
 
 # The message the disconnect path writes, shared rather than duplicated.
@@ -1339,29 +1340,60 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
         if r.get("billed_cost_usd") is None and r.get("cost_usd") is not None
     ]
     unpriced = len(results) - len(billed) - len(estimated)
-    # The BYOK figures, verbatim and NEVER SUMMED. total_usd above is what
-    # OpenRouter charged, in credits, and it is the number the spend
-    # ceiling meters. This is what an upstream provider billed directly on
-    # a bring-your-own-key run, which is a different bill in a different
-    # place that OpenRouter cannot decline; adding the two would produce a
-    # figure nobody is owed. Kept as the strings that were stored, because
-    # the whole use for them is matching a provider's own invoice line and
-    # a float would reformat the number being matched.
-    upstream = [
-        r["upstream_inference_cost_usd"]
-        for r in results
-        if r.get("upstream_inference_cost_usd") is not None
-    ]
+    # THE UPSTREAM FIGURES, verbatim and NEVER SUMMED into total_usd,
+    # and now SPLIT BY WHETHER ANYBODY SAID THEY WERE A SECOND BILL.
+    #
+    # WHAT WAS WRONG. This used to collect every non-null figure and the
+    # report called them all BYOK charges billed direct. Presence was
+    # taken as proof of billing mode, and it is not: two live captures
+    # in this repository are non-BYOK runs, one carrying an upstream
+    # figure equal to the credit charge to the last digit
+    # (probe_reasoning_enable.json) and one carrying zero
+    # (probe_reasoning_cap_binding.json). On the first route the report
+    # published OpenRouter's own charge a second time, as a separate
+    # provider invoice, for a bring-your-own-key run that never
+    # happened.
+    #
+    # is_byok is the only thing that can answer the question, and it is
+    # asked affirmatively: TRUE is a bill, FALSE is the same money seen
+    # twice, and NULL is a row written before the flag existed, which is
+    # genuinely unknown and must not be asserted either way.
+    #
+    # as_flag on the way in because this function is fed from two
+    # places: a store read, which already normalizes, and an export
+    # line, which carries whatever JSON held. An `is True` test against
+    # an unconverted 1 is False, so without this the byok bucket would
+    # be permanently empty and the report would say nothing at all.
+    #
+    # Kept as the strings that were stored, because the whole use for
+    # them is matching a provider's own invoice line and a float would
+    # reformat the number being matched.
+    upstream: dict[str, list[str]] = {"byok": [], "not_byok": [], "unknown": []}
+    for r in results:
+        figure = r.get("upstream_inference_cost_usd")
+        if figure is None:
+            continue
+        flag = as_flag(r.get("is_byok"))
+        bucket = "byok" if flag is True else "not_byok" if flag is False else "unknown"
+        upstream[bucket].append(figure)
+    any_upstream = any(upstream.values())
     return {
         "total_usd": sum(billed) + sum(estimated),
         "billed_trials": len(billed),
         "estimated_trials": len(estimated),
         "unpriced_trials": unpriced,
-        # None rather than an empty block when no run was BYOK, so the
-        # key being filled in means something happened rather than that
-        # the report always says this.
+        # None rather than an empty block when no run reported an
+        # upstream figure at all, so the key being filled in means
+        # something happened rather than that the report always says
+        # this. Each bucket carries its own trial count, and only the
+        # byok one may be described as a bill.
         "upstream": (
-            {"trials": len(upstream), "values": upstream} if upstream else None
+            {
+                name: {"trials": len(values), "values": values}
+                for name, values in upstream.items()
+            }
+            if any_upstream
+            else None
         ),
     }
 

@@ -2943,6 +2943,7 @@ def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tm
                 "native_finish_reason": "end_turn",
                 # What the endpoint returned for this same generation.
                 "upstream_inference_cost_usd": "0",
+                "is_byok": False,
             },
         )
         kept = conn.execute(
@@ -2968,6 +2969,7 @@ def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tm
                 "quantization": None,
                 "native_finish_reason": None,
                 "upstream_inference_cost_usd": "0.004",
+                "is_byok": None,
             },
         )
         assert (
@@ -2977,5 +2979,81 @@ def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tm
             ).fetchone()["upstream_inference_cost_usd"]
             == "0.004"
         )
+    finally:
+        conn.close()
+
+
+def test_review_repro_the_three_states_survive_the_read_path_by_identity(tmp_path):
+    """WINDOW: a row from save_run through get_run, which is the path
+    every in-process reader actually uses.
+
+    THE EXISTING ROUND TRIP READ WITH RAW SQL and asserted `== 1`,
+    `== 0`, `is None`. That proves SQLite's encoding, which was never in
+    doubt, and leaves untested the surface that actually goes wrong.
+
+    THE TRAP. SQLite has no boolean, so an unconverted row hands back
+    the int 1. In Python `1 == True` is True and `1 is True` is False,
+    so an equality assertion passes on a broken read path and an
+    identity assertion does not. report._cost_totals asks `is True`; a
+    silent failure here would look like a working report that quietly
+    attributed nothing to anybody.
+
+    So every assertion below is by IDENTITY, deliberately.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(
+            conn,
+            "p",
+            [
+                make_result(model="m/byok", is_byok=True),
+                make_result(model="m/credits", is_byok=False),
+                make_result(model="m/silent"),
+            ],
+        )
+        rows = {
+            r["model"]: r["is_byok"] for r in store.get_run(conn, run_id)["results"]
+        }
+
+        assert rows["m/byok"] is True
+        assert rows["m/credits"] is False
+        assert rows["m/silent"] is None
+        # Spelled out, because these are the assertions that would pass
+        # against a raw int and are the reason the test is written this
+        # way at all.
+        assert isinstance(rows["m/byok"], bool)
+        assert isinstance(rows["m/credits"], bool)
+    finally:
+        conn.close()
+
+
+def test_a_poisoned_flag_cell_degrades_rather_than_lying(tmp_path):
+    """WINDOW: a row written around the store, read back through it.
+
+    SQLite's column affinity accepts a string into an INTEGER column, so
+    a row can carry 'yes' whatever save_run does. A reader must be told
+    "not reported" rather than a confident True, and must not be handed
+    a 500 either: repair on read exists precisely so a poisoned cell
+    does not become a permanent error on an endpoint.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(conn, "p", [make_result(model="m/a")])
+        with conn:
+            conn.execute("UPDATE results SET is_byok = 'yes'")
+        # The poison really is in the file, so the read path is what is
+        # being tested rather than the writer.
+        raw = conn.execute("SELECT typeof(is_byok) AS t FROM results").fetchone()["t"]
+        assert raw == "text"
+
+        assert store.get_run(conn, run_id)["results"][0]["is_byok"] is None
+
+        # And save_run itself refuses to create one.
+        second = store.save_run(conn, "p2", [make_result(model="m/b", is_byok="yes")])
+        assert store.get_run(conn, second)["results"][0]["is_byok"] is None
+        stored = conn.execute(
+            "SELECT typeof(is_byok) AS t FROM results WHERE model = 'm/b'"
+        ).fetchone()["t"]
+        assert stored == "null"
     finally:
         conn.close()
