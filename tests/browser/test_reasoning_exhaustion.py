@@ -123,7 +123,11 @@ def test_review_repro_an_extended_card_offers_the_only_remedy_left(bench):
 
 
 def test_a_healthy_reasoning_card_is_left_alone(bench):
-    """The other side of the rule, and the one that keeps it useful.
+    """WINDOW: a live card's terminal render, the same window as the
+    firing cases, so the silence is observed where the warning would
+    have been.
+
+    The other side of the rule, and the one that keeps it useful.
 
     stub/thinker returns real text alongside real reasoning tokens,
     which is row 694's shape: thinking happened, an answer came out, and
@@ -246,7 +250,11 @@ def test_review_repro_the_card_flags_output_that_went_to_thinking(
 
 
 def test_the_indicator_survives_a_history_replay(bench, open_history):
-    """The same card, come back to later.
+    """WINDOW: a replayed card's render, after a full round trip
+    through the database, so the counts are the stored ones rather than
+    the ones the stream held in memory.
+
+    The same card, come back to later.
 
     A stored row carries both counts, so the indicator is re-derivable
     and must be re-derived: a warning that existed only while you watched

@@ -12214,7 +12214,10 @@ def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client
 
 @respx.mock
 def test_a_visible_answer_still_fits_in_the_reserved_room(client):
-    """The other half of the reservation, and the one that stops it from
+    """WINDOW: a full /compare round trip, from the posted request to
+    the persisted result, with the sent payload read back afterwards.
+
+    The other half of the reservation, and the one that stops it from
     being a cure worse than the disease.
 
     Capping thinking is only correct if what remains is enough to answer

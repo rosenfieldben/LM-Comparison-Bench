@@ -2113,6 +2113,12 @@ async def test_review_repro_thinking_cannot_eat_the_whole_budget(client):
     reserves 32768, which is four times the entire standard tier. A
     model name appears nowhere in the arithmetic and a separate test
     proves it appears nowhere in the code.
+
+    SUSPENSION POINT: the await on run_model, once per tier. The payload
+    is read from respx's recorded call AFTER that await returns, so the
+    loop's second iteration cannot observe the first one's request; the
+    -1 index is the call the iteration just made, not whichever finished
+    last.
     """
     for budget, expected in ((BUDGET_STANDARD, 8192), (BUDGET_EXTENDED, 32768)):
         respx.post(OPENROUTER_URL).respond(json=FIXTURE)
@@ -2141,6 +2147,10 @@ async def test_the_reservation_stands_down_for_a_declared_effort(client):
     rides: it is part of the experiment, the reservation is the bench's
     own default, and a default overwriting a declaration is what rule
     one exists to forbid.
+
+    SUSPENSION POINT: the await on run_model. Only one request is made,
+    and every assertion runs after it resolves, including the two direct
+    calls to reasoning_reservation, which suspend nowhere at all.
 
     That leaves those requests unprotected by R1, which is exactly why
     the card's indicator keys on the tokens that came BACK rather than
@@ -2185,7 +2195,11 @@ async def test_the_judge_reserves_room_for_its_verdict(client):
     """WINDOW: the judge's payload. Its budget is 512 tokens against a
     rubric it has never seen, which is the shape most likely to invite a
     model to think past its cap; a judge that reasons itself out of a
-    verdict leaves the trial unscored rather than failed."""
+    verdict leaves the trial unscored rather than failed.
+
+    SUSPENSION POINT: the await on judge_response. The payload is read
+    after it resolves, so the assertion cannot race the request it is
+    about."""
     respx.post(OPENROUTER_URL).respond(
         json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
     )
@@ -2198,7 +2212,10 @@ async def test_the_judge_reserves_room_for_its_verdict(client):
 
 
 def test_no_model_name_appears_in_the_reservation_logic():
-    """THE UNIVERSALITY CONSTRAINT, asserted rather than promised.
+    """WINDOW: bench/models.py as it sits on disk, parsed rather than
+    imported, so what is checked is the source a reviewer reads.
+
+    THE UNIVERSALITY CONSTRAINT, asserted rather than promised.
 
     Exhaustion is a property of thinking against a completion cap, not
     of one vendor, and the incident was diagnosed on one model only
@@ -2218,8 +2235,19 @@ def test_no_model_name_appears_in_the_reservation_logic():
     The vendor list is not a security boundary. It is a tripwire for one
     specific mistake, and it names the vendors this repo's own fixtures
     and catalogs mention.
+
+    WORD BOUNDARIES, NOT SUBSTRINGS, and the closing review is what
+    taught this. The first version asked `vendor in dumped`, and running
+    the same check across the frontend flagged "fable" inside
+    registerDiffable. That is the K1.5 defect exactly, where a tombstone
+    matched `extracted_text` inside `length(extracted_text)`, and a
+    tripwire that cries wolf is one somebody eventually deletes. The
+    scope here is one small function so nothing was actually matching,
+    but a test whose passing depends on the function staying small is
+    not the test that was wanted.
     """
     import ast
+    import re
 
     source = (Path(__file__).parent.parent / "bench" / "models.py").read_text()
     tree = ast.parse(source)
@@ -2254,7 +2282,7 @@ def test_no_model_name_appears_in_the_reservation_logic():
         "mistral",
         "grok",
     ):
-        assert vendor not in executable, vendor
+        assert not re.search(rf"(?<![a-z0-9]){vendor}(?![a-z0-9])", executable), vendor
 
     # And the constant it reads is a plain number, not a per-model table.
     assert isinstance(REASONING_BUDGET_SHARE, float)
@@ -2366,7 +2394,10 @@ def test_review_repro_the_label_says_where_the_completion_went(
 
 
 def test_the_shape_test_reads_only_the_two_counts():
-    """The predicate on its own, away from the sentence it produces.
+    """WINDOW: reasoning_ate_the_output called directly, with no
+    request, no response and no I/O anywhere in the frame.
+
+    The predicate on its own, away from the sentence it produces.
 
     Nothing here is a request field. It cannot see the budget, the
     reservation, the effort or the model, which is exactly what lets the
@@ -2386,7 +2417,9 @@ def test_the_shape_test_reads_only_the_two_counts():
 
 
 def test_the_two_languages_agree_on_the_threshold():
-    """The rule is written twice, once per language, so this checks the
+    """WINDOW: static/lib.js as text, read from disk at assert time.
+
+    The rule is written twice, once per language, so this checks the
     numbers have not drifted.
 
     Duplicated on purpose rather than shipped from the server: the
@@ -2407,11 +2440,18 @@ async def test_review_repro_an_exhausted_batch_result_is_labelled(client):
     """WINDOW: run_model's returned result, end to end from a payload
     that looks exactly like the incident's.
 
+    SUSPENSION POINT: the await on run_model. Everything asserted here
+    is on the returned result, which run_model finishes assembling
+    before it returns, so there is no window in which the error and the
+    counts could be read half-written.
+
     THE ORDERING THIS PROTECTS. The empty-text branch used to run BEFORE
     _ingest_usage, so it read two Nones no matter what the provider
     reported and could never have produced this label. Moving the
     ingest above it is the fix; this is the test that notices if it
-    moves back.
+    moves back. That ordering is INSIDE run_model and is not a
+    suspension question: both steps run between one await and the
+    return.
     """
     respx.post(OPENROUTER_URL).respond(
         json={
@@ -2509,7 +2549,12 @@ def test_review_repro_a_cap_is_never_rendered_as_a_count():
 
 
 def test_the_export_manifest_states_the_unit_once():
-    """The citable artifact, whose readers were not in the room.
+    """WINDOW: the manifest note as the report module composes it,
+    read from the function rather than from a built export, so the
+    wording is checked in one place and the export test checks that it
+    arrives.
+
+    The citable artifact, whose readers were not in the room.
 
     Every trial line carries four counts and one ceiling side by side.
     prompt_tokens next to max_tokens invites precisely the subtraction
@@ -2536,7 +2581,10 @@ def test_the_export_manifest_states_the_unit_once():
 
 
 def test_the_stored_counts_have_exactly_one_source():
-    """THE AUDIT'S CENTRAL FINDING, asserted so it cannot quietly stop
+    """WINDOW: store.RECONCILABLE_COLUMNS at import time, which is the
+    list that decides what a reconcile pass is allowed to write.
+
+    THE AUDIT'S CENTRAL FINDING, asserted so it cannot quietly stop
     being true.
 
     One unit per surface is only enforceable if there is one place the
