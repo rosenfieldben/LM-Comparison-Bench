@@ -2355,10 +2355,52 @@ async def stream_model(
     # success: a load balancer idle-closing the connection or a provider
     # crashing with a clean close both land here, and done(None) would show
     # and persist a truncated answer as complete, corrupting the
-    # comparison. But a stream that delivered a finish_reason and then
-    # closed without [DONE] is semantically complete (the provider stated
-    # why it stopped), so flagging that would be a false alarm. done()
-    # already carries the partial text accumulated so far.
+    # comparison. done() already carries the partial text accumulated so
+    # far.
+    #
+    # ACCEPTING A finish_reason IN PLACE OF [DONE] IS THIS REPOSITORY'S
+    # DECISION AND NOT THE CONTRACT'S. A review asked for the rule to be
+    # pinned; it cannot be, because the documentation does not state it.
+    # What the streaming page DOES say, read in full 2026-08-13 at
+    # https://openrouter.ai/docs/api-reference/streaming:
+    #
+    #   Every client example it publishes treats the sentinel as the
+    #   terminator and nothing else: "if (event.data === '[DONE]')
+    #   break;".
+    #
+    #   Of the ERROR path only, it says a "choices array is included
+    #   with finish_reason: 'error' to properly terminate the stream"
+    #   and "The stream is terminated after this unified error event".
+    #
+    #   It warns that "OpenRouter occasionally sends comments to prevent
+    #   connection timeouts", which is why the connection staying open
+    #   is not evidence of anything either.
+    #
+    # So the page names exactly one finish_reason as a terminator, the
+    # error one, and says nothing about "stop" or "length" ending a
+    # stream without the sentinel. The tolerance below is wider than
+    # that.
+    #
+    # WHY IT IS STILL RIGHT. The two readings fail in opposite
+    # directions and the costs are not equal. Requiring [DONE] would
+    # fail a run that was PAID FOR, complete, and told us why it
+    # stopped, on the strength of a sentinel the provider owed us and
+    # did not send: money spent and the answer discarded. Accepting the
+    # finish_reason risks the narrow case below.
+    #
+    # THE RISK, NAMED. A connection cut AFTER the finish_reason chunk
+    # and BEFORE the usage chunk is recorded as a success with no token
+    # counts and no charge. That row is not silently wrong: it lands
+    # unpriced, which the report counts and shows, and it carries a
+    # generation id, so results_awaiting_reconciliation offers it and
+    # the generation endpoint supplies the money afterwards. The failure
+    # mode is a delay in the billing record, not a corrupted comparison.
+    #
+    # IT IS NOT MEASURED. No live capture in this repository shows a
+    # provider ending a normal stream without [DONE]. The tolerance is
+    # a judgement about which way to be wrong, and it is written down
+    # here so the next reader inherits the judgement rather than
+    # mistaking it for a documented rule.
     if not saw_done and result["finish_reason"] is None:
         yield done("stream ended before completion: no [DONE] and no finish reason")
         return
@@ -2498,6 +2540,19 @@ async def fetch_generation(
 # would buy headroom no rubric needs, once per scored trial, at the
 # judge's own price. Large enough that a reasoning model's preamble plus
 # the verdict fits; nowhere near large enough to pay for an essay.
+# A JUDGE ROUTE MUST NOT HAVE MANDATORY REASONING, which is a
+# constraint on choosing one rather than a setting. The pinned formula
+# budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)
+# floors every ratio on the ladder to 1024 at this budget, and the
+# companion rule requires the outer budget to be STRICTLY higher than
+# the reasoning budget. 512 is not. Sending nothing does not rescue it:
+# omission hands the decision to the provider, and on a mandatory route
+# the provider cannot decide zero.
+#
+# So the reservation standing down here is necessary and not
+# sufficient. Unmeasured, because proving it would mean paying a
+# mandatory-reasoning judge to fail; asserted from the contract's own
+# arithmetic instead, beside the test that does the sums.
 JUDGE_MAX_TOKENS = 512
 
 # THE JUDGE SENDS NO REASONING RESERVATION, and the arithmetic is why.

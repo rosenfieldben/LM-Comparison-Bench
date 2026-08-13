@@ -874,12 +874,42 @@ async def test_review_repro_clean_eof_without_done_is_error(client):
 
 
 @respx.mock
-async def test_review_repro_finish_reason_without_done_not_flagged(client):
-    """External review finding 2 refinement (inverse lock): a stream that
-    delivered a finish_reason and then closed without [DONE] is
-    semantically complete (the provider stated why it stopped), so flagging
-    it aborted would be a false alarm. Guards against over-correcting the
-    fix above into treating every missing [DONE] as an error."""
+async def test_review_repro_finish_reason_without_done_is_a_labelled_tolerance(
+    client,
+):
+    """WINDOW: the done event of a stream that stated a finish_reason and
+    then closed without the sentinel.
+
+    SUSPENSION POINT: the awaits inside collect, which drains the whole
+    generator. Everything asserted is on the final result, assembled
+    before the last event is yielded.
+
+    THIS IS A DECISION, NOT A CONTRACT, and saying so is the point of
+    the rewrite. The test used to assert that such a stream "is
+    semantically complete (the provider stated why it stopped)" as
+    though the platform said so. A review checked, and it does not. The
+    streaming page, read in full 2026-08-13, names exactly ONE
+    finish_reason as a terminator:
+
+      "A choices array is included with finish_reason: 'error' to
+      properly terminate the stream"
+
+    and every client example it publishes breaks on the sentinel and
+    nothing else. Nothing on the page says "stop" or "length" ends a
+    stream without [DONE].
+
+    SO WHAT IS ASSERTED HERE is the repository's own rule, labelled as
+    such, together with the cost of the case it tolerates. Requiring
+    [DONE] would discard a PAID, complete answer over a sentinel the
+    provider owed and withheld. Accepting the finish_reason risks the
+    second half below.
+
+    THE RISK IS ASSERTED, NOT WAVED AT. A cut after the finish_reason
+    chunk and before the usage chunk succeeds with no counts and no
+    charge, and the second half of this test pins exactly what that row
+    looks like, so the tolerance's cost is a fixture rather than a
+    sentence: unpriced, and carrying an id the reconcile pass can use.
+    """
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
@@ -900,6 +930,18 @@ async def test_review_repro_finish_reason_without_done_not_flagged(client):
     assert result["response_text"] == "Hello"
     assert result["error"] is None
     assert result["finish_reason"] == "stop"
+    # THE COST OF THE TOLERANCE, pinned. No usage chunk arrived, so this
+    # run is recorded with no counts and no charge. It is not silently
+    # wrong: it is UNPRICED, which the report counts and displays, and
+    # every one of these fields being absent is what makes it so.
+    assert result["completion_tokens"] is None
+    assert result["prompt_tokens"] is None
+    assert result["billed_cost_usd"] is None
+    # The local estimate is not in this dict at all: it is derived from
+    # the counts one layer up, and there are no counts. Asserted by
+    # MEMBERSHIP because "absent" and "None" are the same to .get() and
+    # only one of them is what happens here.
+    assert "cost_usd" not in result
 
 
 # ---- G2: billed truth, read in-band.
@@ -1771,7 +1813,7 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
 
 # ---- Phase I3: rubric judging, blind by construction.
 
-from bench.models import JUDGE_MAX_TOKENS
+from bench.models import EFFORT_SHARES, JUDGE_MAX_TOKENS
 
 
 def judge_body(text):
@@ -2322,6 +2364,60 @@ def test_the_judge_budget_could_not_satisfy_the_pinned_minimum():
     assert 2 * anthropic_minimum > JUDGE_MAX_TOKENS
 
 
+def test_review_repro_the_judge_budget_cannot_be_satisfied_by_a_mandatory_route():
+    """WINDOW: the provider's OWN default allocation at the judge's
+    budget, computed from the pinned formula. No request and no mock.
+
+    THE GAP THIS CLOSES was named by a review: standing down proves the
+    bench sends nothing impossible, and says nothing about whether the
+    route can answer once omission hands the decision back to it. Those
+    are different questions and only the first was asked. The test above
+    checks what the bench WOULD have sent; this one checks what happens
+    when it sends nothing at all.
+
+    THE FORMULA IS THE CONTRACT'S, quoted at
+    https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    re-read 2026-08-13, under the heading "Reasoning Max Tokens for
+    Anthropic Models":
+
+      budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)
+
+    Every ratio on that ladder, applied to 512, lands under 1024 and is
+    floored to it. So on a route whose reasoning is MANDATORY, where
+    omission cannot mean "off", the provider allocates at least 1024
+    against an outer budget of 512, and the companion rule that
+    max_tokens "must be strictly higher than the reasoning budget"
+    cannot hold. Sending nothing does not rescue it.
+
+    THE LIMIT, NAMED, because that is what this can honestly do. The
+    bench's judge cannot be run on a mandatory-reasoning route at this
+    budget by any request it could make. It is not measured: no live
+    capture in this repository shows that route refusing, and proving it
+    would mean paying a mandatory-reasoning judge to fail. What is
+    asserted is that the contract's own arithmetic forbids it, and the
+    consequence is written beside JUDGE_MAX_TOKENS so a future judge
+    model is chosen knowing the constraint rather than discovering it.
+    """
+    floor = 1024
+
+    for effort, ratio in EFFORT_SHARES.items():
+        if ratio == 0.0:
+            # "none" disables reasoning entirely, so the floor does not
+            # apply and such a route is fine. It is also, by definition,
+            # not a mandatory-reasoning route.
+            continue
+        allocated = max(min(int(JUDGE_MAX_TOKENS * ratio), 128000), floor)
+        assert allocated == floor, effort
+        # And the companion rule fails for every one of them.
+        assert not JUDGE_MAX_TOKENS > allocated, effort
+
+    # THE THRESHOLD, so raising the judge's budget is a decision with a
+    # number attached rather than a guess. Anything above the floor
+    # satisfies the strictly-greater rule; the floor itself does not.
+    assert JUDGE_MAX_TOKENS <= floor
+    assert not floor > floor
+
+
 def test_no_model_name_appears_in_the_reservation_logic():
     """WINDOW: bench/models.py as it sits on disk, parsed rather than
     imported, so what is checked is the source a reviewer reads.
@@ -2400,7 +2496,6 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
 
 from bench.models import (  # noqa: E402
-    EFFORT_SHARES,
     REASONING_SHARE_EXHAUSTED,
     _ingest_usage,
     empty_response_error,

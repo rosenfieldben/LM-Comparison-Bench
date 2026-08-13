@@ -731,6 +731,25 @@ or a test rather than by this list alone.
   miss: endpoints named `Google` carry the tag `google-vertex`, so a pin
   written `google` matched the display name while routing to a slug that
   does not exist.
+- **2026-08-13. The streaming contract does not say a `finish_reason`
+  ends a stream.** Read in full: every client example the page publishes
+  breaks on the sentinel (`if (event.data === '[DONE]') break;`), and
+  the only `finish_reason` it names as a terminator is the error one
+  ("a `choices` array is included with `finish_reason: \"error\"` to
+  properly terminate the stream"; "the stream is terminated after this
+  unified error event"). The bench accepts any stated `finish_reason`
+  followed by a clean close. That is **this repository's decision, not
+  the contract's**, and the tolerated case is pinned in a test: a cut
+  after the finish_reason chunk and before the usage chunk records a
+  success with no counts, which lands unpriced and reconcilable rather
+  than silently wrong.
+- **2026-08-13. A judge route must not have mandatory reasoning.** At
+  the judge's 512-token budget every ratio on the documented ladder
+  floors to 1024 under `max(min(max_tokens * {effort_ratio}, 128000),
+  1024)`, and `max_tokens` must be strictly higher than the reasoning
+  budget. Sending nothing does not rescue it: omission hands the
+  decision to the provider, and a mandatory route cannot decide zero.
+  Derived from the contract's arithmetic, not measured.
 - **2026-08-13. `is_byok` is a boolean in both documents, and the two
   were read by different rules.** The in-band usage object required a
   real boolean; the generation endpoint reached for the SQLite decoder
