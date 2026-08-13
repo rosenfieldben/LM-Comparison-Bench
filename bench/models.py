@@ -327,22 +327,18 @@ REASONING_BUDGET_SHARE = 0.5
 # this table exists for is against REASONING_BUDGET_SHARE, which is a
 # number. A future share of 0.25 would move the boundary to low without
 # anybody editing a tier list, which is the point.
-# THE SMALLEST REASONING BUDGET ANY PINNED PROVIDER WILL ACCEPT, and
-# the rule that makes a small budget unsatisfiable rather than merely
-# tight.
+# A REASONING FLOOR ONE VENDOR DOCUMENTS, APPLIED TO EVERY ROUTE ON
+# PURPOSE. The scope of the number and the scope of its application are
+# different things, and an earlier version of this comment stated the
+# first as though it were the second: it called this "the smallest
+# reasoning budget ANY pinned provider will accept", which the contract
+# does not say and this repository never measured.
 #
-# NAMED FOR WHAT IT IS RATHER THAN FOR WHO PUBLISHED IT, and that is not
-# cosmetic. A first draft called this ANTHROPIC_REASONING_MINIMUM and
-# the universality tripwire failed the moment the constant was read from
-# reasoning_reservation, correctly: a vendor's name had entered
-# executable code. The floor is applied to every request regardless of
-# route, so the name says that and the quote below says whose behaviour
-# the number was measured from. Prose about a contract may name a
-# vendor; a line that runs may not.
-#
-# Both rules quoted from
+# WHERE THE NUMBER COMES FROM. Both rules below sit under the heading
+# "Reasoning Max Tokens for Anthropic Models", in a section that opens
+# "When using Anthropic models with reasoning:", at
 # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
-# read 2026-08-12:
+# heading and scope re-read 2026-08-13:
 #
 #   "When using the reasoning.max_tokens parameter, that value is used
 #   directly with a minimum of 1024 tokens."
@@ -351,14 +347,46 @@ REASONING_BUDGET_SHARE = 0.5
 #   budget to ensure there are tokens available for the final response
 #   after thinking."
 #
-# A minimum turns a request into a demand the sender did not make. Ask
-# for 256 and the provider hears 1024, and if the outer budget is not
-# strictly above that, nothing can satisfy the pair.
+# The page states no floor for any other family. For Gemini 3 it states
+# the opposite kind of thing, that a budget is passed through as
+# thinkingBudget and then "Google internally maps this budget value to a
+# thinkingLevel, so you will not get precise token control".
+#
+# WHY IT IS APPLIED EVERYWHERE ANYWAY, and this is a choice rather than
+# a reading. Off that one family the floor is UNKNOWN, not absent, and
+# the two ways of being wrong are not symmetric. Assume no floor and a
+# route that has one turns a 600 token request into a 1024 token demand
+# against a 1200 token budget, leaving 176 visible tokens where 600 were
+# promised: the exact failure this whole workstream exists to prevent,
+# reintroduced by the guard meant to prevent it. Assume the floor and a
+# route without one merely stands down on small budgets, sending the
+# pre-feature payload it would have sent anyway. The conservative
+# reading costs a feature at the margin; the permissive one costs the
+# answer.
+#
+# NAMED FOR WHAT IT IS RATHER THAN FOR WHO PUBLISHED IT. A first draft
+# called this ANTHROPIC_REASONING_MINIMUM and the universality tripwire
+# failed the moment the constant was read from reasoning_reservation,
+# correctly: a vendor's name had entered executable code. Prose about a
+# contract may name a vendor; a line that runs may not.
 #
 # ONE NUMBER FOR THE WHOLE FILE, because the judge's 512 budget and a
 # per-model clamp reach the same wall from opposite directions and must
 # not be two rules that can drift apart.
 PROVIDER_REASONING_MINIMUM = 1024
+
+# THE STATES THE RESERVATION CAN BE IN, named because two of them used
+# to be one. "Cannot be satisfied" covered both a budget where nothing
+# fits and a budget where the FLOOR fits but the intended split does
+# not, and those are different facts about a request. A caller that
+# knows only "it stood down" cannot tell an operator which, and a test
+# that knows only "it stood down" can do no better than restate the
+# condition it is supposed to be checking.
+RESERVATION_RIDES = "rides"
+RESERVATION_NOT_VOUCHED = "not vouched"
+RESERVATION_EFFORT_DECLARED = "effort declared"
+RESERVATION_SPLIT_BELOW_FLOOR = "split below the provider floor"
+RESERVATION_NO_ROOM_ABOVE_FLOOR = "no room above the provider floor"
 
 EFFORT_SHARES = {
     "none": 0.0,
@@ -486,23 +514,43 @@ def reasoning_reservation(
     REASONING_BUDGET_SHARE for why the declaration wins over the
     default.
 
-    EMPTY WHEN THE ARITHMETIC CANNOT BE SATISFIED, which is the rule
-    that used to be a special case at the judge and is now general.
+    EMPTY IN TWO ARITHMETIC STATES, which are different from each other
+    and were one state until a review separated them. See
+    reservation_state for what distinguishes them and
+    reservation_reason for the sentence each produces.
 
-    A provider minimum turns a small request into a larger demand: ask
-    for 256 and the pinned floor makes it 1024. Two things then go
-    wrong, and both are checked, because a future share could reach
-    either one first.
+    STANDING DOWN RATHER THAN SENDING THE FLOOR, in the state where the
+    floor would be accepted. That was a real choice between two
+    defensible options and the arithmetic decided it.
 
-      The share falls BELOW the minimum. The request that arrives is
-      not the request that was sent, and the visible room this function
-      exists to reserve is not the room that will be left. At an outer
-      budget of 1200 a half share asks for 600 and the provider hears
-      1024, leaving 176 visible tokens instead of the promised 600.
+      SEND THE FLOOR. In the band where the split is too small but the
+      floor fits, name the floor explicitly. Reserves at outer budgets
+      the reservation cannot otherwise reach.
 
-      The outer budget is NOT STRICTLY GREATER than what the provider
-      will use. Nothing can satisfy that pair; the contract says so in
-      as many words.
+      STAND DOWN. Send the pre-feature payload and record why.
+
+    What the band actually looks like, at the current share and floor,
+    is 1024 < outer < 2048, and sending the floor across it reserves
+    almost nothing for the answer:
+
+      outer 1025   reasoning 1024   99.9% of the budget   1 visible token
+      outer 1200   reasoning 1024   85.3%                 176
+      outer 1536   reasoning 1024   66.7%                 512
+      outer 2047   reasoning 1024   50.0%                 1023
+
+    A function whose purpose is to reserve VISIBLE room does not reserve
+    one token of it and call that success.
+
+    AND IT WOULD BUY NOTHING, which is what makes the choice easy rather
+    than a trade. The provider's own default allocation carries the same
+    floor: the page's formula is budget_tokens = max(min(max_tokens *
+    effort_ratio, 128000), 1024). Below 2048 every effort ratio at or
+    under 0.5 lands under 1024 and is floored to it, so an explicit 1024
+    and an absent field produce the SAME provider-side allocation on the
+    family the floor was measured from. Off that family the floor is
+    unknown, and an explicit 1024 could then be more thinking than the
+    route's own default would have chosen. Standing down is never worse
+    and is sometimes better.
 
     KEYED ON THE ARITHMETIC, NEVER ON THE CALL SITE. The judge's 512
     token budget and a per-model clamp of 1024 are the same failure
@@ -519,16 +567,96 @@ def reasoning_reservation(
     above its share of the budget. At the two real tiers the division is
     exact anyway; the floor matters only if a future tier is odd.
     """
+    return (
+        {"reasoning": {"max_tokens": int(max_tokens * REASONING_BUDGET_SHARE)}}
+        if reservation_state(max_tokens, controls, may_send_reasoning_cap)
+        == RESERVATION_RIDES
+        else {}
+    )
+
+
+def reservation_state(
+    max_tokens: int,
+    controls: Mapping[str, Any] | None = None,
+    may_send_reasoning_cap: bool = False,
+) -> str:
+    """Which of the five states this request's reservation is in.
+
+    Separate from reasoning_reservation because the payload has only two
+    shapes and the request has five reasons, and collapsing them cost
+    something twice: an operator could not be told WHY nothing rode, and
+    the property test asserting the stand-down could only restate the
+    implementation's own condition back at it.
+
+    THE TWO THAT USED TO BE ONE. Both involve the provider floor and
+    they are not the same fact:
+
+      SPLIT BELOW FLOOR. The intended share is under the floor, but the
+      outer budget is above it, so a request naming the floor WOULD be
+      accepted. What cannot be honoured is the split. At an outer budget
+      of 1200 a half share asks for 600, the provider uses 1024, and 176
+      visible tokens remain where 600 were promised.
+
+      NO ROOM ABOVE FLOOR. The outer budget is not strictly greater than
+      the floor, so no pair of numbers satisfies the contract at all.
+      The judge's 512 is here.
+
+    The old single condition answered "unsatisfiable" to both, which is
+    true of the second and false of the first.
+
+    ORDER IS PART OF THE ANSWER. Vouching is asked first because an
+    unvouched route's arithmetic is irrelevant, and a declared effort is
+    asked before the arithmetic because the operator's declaration wins
+    whether or not a share would have fitted.
+    """
     if not may_send_reasoning_cap:
-        return {}
+        return RESERVATION_NOT_VOUCHED
     if controls and controls.get("effort") is not None:
-        return {}
+        return RESERVATION_EFFORT_DECLARED
     want = int(max_tokens * REASONING_BUDGET_SHARE)
-    # What the provider will actually use, after its own floor.
-    effective = max(want, PROVIDER_REASONING_MINIMUM)
-    if want < PROVIDER_REASONING_MINIMUM or max_tokens <= effective:
-        return {}
-    return {"reasoning": {"max_tokens": want}}
+    if max_tokens <= PROVIDER_REASONING_MINIMUM:
+        return RESERVATION_NO_ROOM_ABOVE_FLOOR
+    if want < PROVIDER_REASONING_MINIMUM:
+        return RESERVATION_SPLIT_BELOW_FLOOR
+    # Unreachable while the share is below 1, and checked anyway because
+    # the share is a constant somebody may change: a share of 1.0 makes
+    # every budget its own reasoning budget, which the contract's
+    # strictly-greater rule forbids.
+    if max_tokens <= want:
+        return RESERVATION_NO_ROOM_ABOVE_FLOOR
+    return RESERVATION_RIDES
+
+
+def reservation_reason(state: str, max_tokens: int) -> str | None:
+    """Why nothing rode, with the arithmetic in it, or None when
+    something did.
+
+    THE NUMBERS ARE THE POINT. "The reservation was not sent" is not a
+    reason, it is a restatement; an operator deciding whether to raise a
+    budget needs to see which number was too small and what the provider
+    would have done instead.
+    """
+    want = int(max_tokens * REASONING_BUDGET_SHARE)
+    share = int(REASONING_BUDGET_SHARE * 100)
+    if state == RESERVATION_SPLIT_BELOW_FLOOR:
+        return (
+            f"a {share}% share of {max_tokens} is {want}, below the "
+            f"{PROVIDER_REASONING_MINIMUM} a provider would use instead, so "
+            f"asking for {want} would leave "
+            f"{max_tokens - PROVIDER_REASONING_MINIMUM} visible tokens rather "
+            f"than {max_tokens - want}"
+        )
+    if state == RESERVATION_NO_ROOM_ABOVE_FLOOR:
+        return (
+            f"{max_tokens} is not above the {PROVIDER_REASONING_MINIMUM} a "
+            "provider would use, so no reasoning budget and answer budget "
+            "can both be satisfied"
+        )
+    if state == RESERVATION_NOT_VOUCHED:
+        return "the route is not vouched to already reason unprompted"
+    if state == RESERVATION_EFFORT_DECLARED:
+        return "an effort was declared, and a declaration outranks a default"
+    return None
 
 
 # ---- The underlying-model estimand.

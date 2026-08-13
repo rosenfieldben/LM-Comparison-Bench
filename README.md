@@ -731,6 +731,25 @@ or a test rather than by this list alone.
   miss: endpoints named `Google` carry the tag `google-vertex`, so a pin
   written `google` matched the display name while routing to a slug that
   does not exist.
+- **2026-08-13. The 1024 reasoning floor is one vendor's, not the
+  platform's.** Both rules the reservation obeys, the "minimum of 1024
+  tokens" and "max_tokens must be strictly higher than the reasoning
+  budget", sit under the heading **"Reasoning Max Tokens for Anthropic
+  Models"**, in a section opening "When using Anthropic models with
+  reasoning:". The page states no floor for any other family; for Gemini
+  3 it states that a budget is passed through as `thinkingBudget` and
+  "Google internally maps this budget value to a thinkingLevel, so you
+  will not get precise token control". The bench applies the floor to
+  every route anyway, as **deliberate conservatism and not as a reading
+  of the contract**: off that family the floor is unknown rather than
+  absent, and assuming none where one exists reintroduces the exact
+  failure the reservation prevents.
+- **2026-08-13. The provider's own default carries the same floor.**
+  `budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)`.
+  Below an outer budget of 2048 every effort ratio at or under 0.5 lands
+  under 1024 and is floored to it, so an explicit 1024 and an absent
+  field produce the same allocation on that family. This is why the
+  reservation stands down rather than naming the floor.
 - **2026-08-13. One provider can serve one model from several
   endpoints.** `openai/gpt-oss-120b` lists DeepInfra twice (16384 and
   131072) and Amazon Bedrock twice. A pin names a provider, not an

@@ -3434,62 +3434,132 @@ async def test_review_repro_the_generation_record_parses_the_flag_it_documents(c
 # ---- One arithmetic rule, two instances: the judge's small budget and
 # ---- a per-model clamp reach the same wall from opposite directions.
 
-from bench.models import PROVIDER_REASONING_MINIMUM  # noqa: E402
+from bench.models import (  # noqa: E402
+    PROVIDER_REASONING_MINIMUM,
+    RESERVATION_EFFORT_DECLARED,
+    RESERVATION_NO_ROOM_ABOVE_FLOOR,
+    RESERVATION_NOT_VOUCHED,
+    RESERVATION_RIDES,
+    RESERVATION_SPLIT_BELOW_FLOOR,
+    reservation_reason,
+    reservation_state,
+)
 
 # Every budget is checked against the CONTRACT, not against what a mock
 # would accept. A mock returns 200 for any cap, which is exactly how the
 # judge shipped an impossible request.
-RESERVATION_BUDGETS = [512, 1023, 1024, 1200, 2047, 2048, 4096, 16384, 65536]
+# WRITTEN OUT BY HAND, WHICH IS THE WHOLE REPAIR. The version this
+# replaces computed its expectation with
+#
+#   want < PROVIDER_REASONING_MINIMUM or budget <= max(want, MINIMUM)
+#
+# which is the implementation's own condition, character for character,
+# so the test passed by construction and would have gone on passing
+# through any change that kept the two in step. A review named it: "the
+# passing property test merely restates the implementation."
+#
+# Each state below is derived from the two pinned rules by reading them,
+# not by running the code. Both rules are quoted beside
+# PROVIDER_REASONING_MINIMUM and both sit under the heading "Reasoning
+# Max Tokens for Anthropic Models", re-read 2026-08-13.
+#
+#   at or below 1024   the outer budget is not strictly above the floor,
+#                      so no pair of numbers satisfies the contract
+#   1025 to 2047       the floor fits under the outer budget, but half
+#                      of the outer budget does not reach the floor, so
+#                      the request would be honoured and the SPLIT would
+#                      not be
+#   2048 and above     half the budget is at or above the floor and the
+#                      budget is strictly greater, so both rules hold
+RESERVATION_STATES = [
+    (1, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (512, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1023, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1024, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1025, RESERVATION_SPLIT_BELOW_FLOOR),
+    (1200, RESERVATION_SPLIT_BELOW_FLOOR),
+    (1536, RESERVATION_SPLIT_BELOW_FLOOR),
+    (2047, RESERVATION_SPLIT_BELOW_FLOOR),
+    (2048, RESERVATION_RIDES),
+    (4096, RESERVATION_RIDES),
+    (16384, RESERVATION_RIDES),
+    (65536, RESERVATION_RIDES),
+]
+RESERVATION_BUDGETS = [budget for budget, _ in RESERVATION_STATES]
 
 
-@pytest.mark.parametrize("budget", RESERVATION_BUDGETS)
-def test_review_repro_the_reservation_is_never_unsatisfiable(budget):
-    """WINDOW: the payload fragment reasoning_reservation returns, at
-    every budget a real catalog can produce.
+@pytest.mark.parametrize("budget,expected", RESERVATION_STATES)
+def test_review_repro_the_reservation_states_are_not_one_state(budget, expected):
+    """WINDOW: reservation_state and reasoning_reservation at one
+    budget, read together.
 
-    THE DEFECT, and it is the judge's defect reached through the clamp.
-    effective_budget lowers the requested tier to whatever completion
-    cap a model publishes, and fetch_catalog accepts any cap above zero,
-    so an effective budget below 2048 comes from a real catalog entry.
-    At those budgets a half share falls under the pinned provider
-    minimum, and the request that ARRIVES is not the request that was
-    SENT.
+    THE DEFECT WAS TWO DEFECTS. The code answered "cannot be satisfied"
+    to two different facts, and the test that checked it asserted the
+    code's own arithmetic back at itself.
 
-    TWO PINNED RULES DECIDE IT, quoted in the source beside the
-    constant: reasoning.max_tokens "is used directly with a minimum of
-    1024 tokens", and max_tokens "must be strictly higher than the
-    reasoning budget".
+    A budget of 1200 is the case that separates them. A half share asks
+    for 600, which is under the floor, so the intended split cannot be
+    honoured. But 1200 IS strictly above 1024, so a request naming the
+    floor would be accepted: the pair is satisfiable and the SPLIT is
+    not. Calling that "unsatisfiable" is false, and it is the word an
+    operator would have been given.
 
-    ASSERTED AGAINST THOSE RULES, which is the whole point of this test
-    existing rather than the payload-shape ones. Those assert the field
-    equals a number the code computed, which no provider ever agreed to.
-    This one recomputes what the provider would do and checks the pair
-    can be honoured.
+    ASSERTED AGAINST THE PINNED RULES, not against the implementation
+    and not against a mock, which could not refuse any of these. The
+    expected state for each budget is written out above from the two
+    quoted sentences; nothing here recomputes it.
     """
+    assert reservation_state(budget, None, True) == expected
     sent = reasoning_reservation(budget, None, True)
 
-    if not sent:
-        # Standing down is always safe. What must be true is that it
-        # only happens when it has to.
-        want = int(budget * REASONING_BUDGET_SHARE)
-        unsatisfiable = want < PROVIDER_REASONING_MINIMUM or budget <= max(
-            want, PROVIDER_REASONING_MINIMUM
-        )
-        assert unsatisfiable, (
-            f"stood down at {budget} where the arithmetic works: "
-            f"share {want}, minimum {PROVIDER_REASONING_MINIMUM}"
-        )
+    if expected is not RESERVATION_RIDES:
+        assert sent == {}
+        # A stand-down is a fact with numbers in it, not a silence.
+        reason = reservation_reason(expected, budget)
+        assert reason is not None
+        assert str(budget) in reason
+        assert str(PROVIDER_REASONING_MINIMUM) in reason
         return
 
     asked = sent["reasoning"]["max_tokens"]
-    # What the provider will actually use, after applying its floor.
-    effective = max(asked, PROVIDER_REASONING_MINIMUM)
-    # RULE ONE: the request is not silently enlarged past what was asked.
+    # RULE ONE: "used directly with a minimum of 1024 tokens", so the
+    # request must not be silently enlarged past what was asked.
     assert asked >= PROVIDER_REASONING_MINIMUM, budget
-    assert effective == asked, budget
-    # RULE TWO: the outer budget is strictly greater, so there is room
-    # for an answer after the thinking.
-    assert budget > effective, budget
+    assert max(asked, PROVIDER_REASONING_MINIMUM) == asked, budget
+    # RULE TWO: "max_tokens must be strictly higher than the reasoning
+    # budget", so there is room for an answer after the thinking.
+    assert budget > asked, budget
+    # And nothing rode with a reason attached, which is what makes the
+    # reason assertions above mean something.
+    assert reservation_reason(expected, budget) is None
+
+
+def test_the_other_two_states_are_reachable_and_named():
+    """WINDOW: reservation_state at the two entries that never look at
+    the arithmetic at all.
+
+    FIVE STATES, NOT THREE. The arithmetic table above cannot reach
+    these two, and a vocabulary with unreachable members is a
+    vocabulary nobody can trust to be complete. Both are asserted at a
+    budget where the arithmetic would otherwise have said rides, so
+    each is shown to WIN rather than merely to coincide.
+    """
+    generous = 65536
+    assert reservation_state(generous, None, True) == RESERVATION_RIDES
+
+    assert reservation_state(generous, None, False) == RESERVATION_NOT_VOUCHED
+    assert (
+        reservation_state(generous, {"effort": "low"}, True)
+        == RESERVATION_EFFORT_DECLARED
+    )
+    # Order matters and is asserted: an unvouched route with a declared
+    # effort is unvouched, because a declaration cannot authorize a
+    # field the route was never cleared for.
+    assert (
+        reservation_state(generous, {"effort": "low"}, False) == RESERVATION_NOT_VOUCHED
+    )
+    for state in (RESERVATION_NOT_VOUCHED, RESERVATION_EFFORT_DECLARED):
+        assert reservation_reason(state, generous) is not None
 
 
 def test_the_boundary_is_where_the_arithmetic_says_it_is():
@@ -3505,6 +3575,10 @@ def test_the_boundary_is_where_the_arithmetic_says_it_is():
     assert reasoning_reservation(edge, None, True) == {
         "reasoning": {"max_tokens": PROVIDER_REASONING_MINIMUM}
     }
+    # The two sides are different STATES and not merely different
+    # payloads, which is what a reader of the stand-down needs.
+    assert reservation_state(edge - 1, None, True) == RESERVATION_SPLIT_BELOW_FLOOR
+    assert reservation_state(edge, None, True) == RESERVATION_RIDES
     # And the judge's own budget is on the standing-down side, which is
     # why its stand-down needs no special case in the code.
     assert JUDGE_MAX_TOKENS < edge
