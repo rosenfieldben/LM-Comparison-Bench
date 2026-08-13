@@ -7,7 +7,8 @@
 // click/completion time, so the globals exist by then.
 (function () {
   const { shortName, fmtCost, fmtBilled, niceScale } = window.BenchLib;
-  const { reasoningAteTheOutput, reasoningShare, remedyFor } = window.BenchLib;
+  const { reasoningAteTheOutput, reasoningShare, remedyFor, exhaustionPair } =
+    window.BenchLib;
 
   // The cost cell's default explanation, restored on reset so a rerun of a
   // billed run does not keep claiming the previous attempt's charge.
@@ -601,15 +602,21 @@
     // symptom.
     const existing = ui.card.querySelector(".reasoning-warn");
     if (existing) existing.remove();
-    if (
-      !reasoningAteTheOutput(result.completion_tokens, result.reasoning_tokens)
-    ) {
-      return;
-    }
-    const share = reasoningShare(
+    // THE PAIR, not the stored completion count beside a reasoning
+    // count that may have come from a different accounting family. Both
+    // the decision and the PERCENTAGE come from it: a share computed
+    // across families is a number that describes nothing, and it would
+    // be printed on the card as though it did. See exhaustionPair, and
+    // result row 744 in the README's pinned observations.
+    const pair = exhaustionPair(
       result.completion_tokens,
       result.reasoning_tokens,
+      result.reasoning_completion_tokens,
     );
+    if (!reasoningAteTheOutput(pair[0], pair[1])) {
+      return;
+    }
+    const share = reasoningShare(pair[0], pair[1]);
     const warn = document.createElement("div");
     warn.className = "reasoning-warn";
     warn.dataset.testid = "reasoning-warning";

@@ -352,6 +352,11 @@ class ModelResult(BaseModel):
     request_json: str | None = None
     billed_cost_usd: float | None = None
     reasoning_tokens: int | None = None
+    # The completion count from the same usage block as the reasoning
+    # count. Served because the frontend's indicator computes the same
+    # share the server does, and it cannot do that from a completion
+    # count in a different accounting family. See models.exhaustion_pair.
+    reasoning_completion_tokens: int | None = None
     cached_tokens: int | None = None
     provider: str | None = None
     quantization: str | None = None
@@ -1926,6 +1931,7 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "upstream_inference_cost_usd": None,
         "is_byok": None,
         "reasoning_tokens": None,
+        "reasoning_completion_tokens": None,
         "cached_tokens": None,
         "provider": None,
         "native_finish_reason": None,

@@ -2782,6 +2782,77 @@ def test_the_pre_byok_fixture_is_the_schema_as_it_stood_before_the_column():
         assert f"CREATE TABLE IF NOT EXISTS {table} (" in PRE_BYOK_SCHEMA
 
 
+def test_review_repro_the_reasoning_basis_column_is_additive_and_null_on_legacy(
+    tmp_path,
+):
+    """WINDOW: a database created before results.is_byok existed, which
+    also predates reasoning_completion_tokens, opened by today's
+    store.connect.
+
+    THE SAME ERA FIXTURE SERVES BOTH COLUMNS, and it is the older one,
+    so a database that has never seen either migration is what this
+    walks. That is stricter than a fixture cut for this column alone.
+
+    NULL ON EVERY LEGACY ROW, WHICH IS THE FORWARD-ONLY LAW IN A CELL.
+    The basis is the completion count from the usage block that reported
+    the reasoning count, and for a row written before the column existed
+    that block is gone. It cannot be reconstructed and it is not
+    guessed: exhaustion_pair falls back to the stored completion count,
+    which is the pair those rows have always been judged on, and the
+    sentence such a row was stored with stands.
+
+    IDEMPOTENT is asserted by connecting twice, because store.connect
+    runs the migrations on every open and a second ALTER on an existing
+    column is an error rather than a no-op.
+    """
+    db_path = tmp_path / "pre_basis.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_BYOK_SCHEMA)
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, NULL, 'legacy prompt', '2026-05-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0)"""
+    )
+    legacy.commit()
+    # PRE-STATE, asserted rather than assumed: without it this could
+    # pass against a fixture that already carried the column and prove
+    # nothing about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(results)")]
+    assert "reasoning_completion_tokens" not in before
+    assert "completion_tokens" in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [r[1] for r in conn.execute("PRAGMA table_info(results)")]
+        assert "reasoning_completion_tokens" in after
+        # ADDITIVE: nothing that was there was removed or renamed.
+        assert set(before) <= set(after)
+
+        row = store.get_run(conn, 1)["results"][0]
+        assert row["reasoning_completion_tokens"] is None
+        # And the legacy row still reads exactly as it was written.
+        assert row["completion_tokens"] == 8
+        assert row["response_text"] == "legacy text"
+    finally:
+        conn.close()
+
+    # IDEMPOTENT.
+    again = store.connect(str(db_path))
+    try:
+        assert (
+            store.get_run(again, 1)["results"][0]["reasoning_completion_tokens"] is None
+        )
+    finally:
+        again.close()
+
+
 def test_migration_onto_pre_byok_database_is_additive_and_idempotent(tmp_path):
     """WINDOW: a database created before results.is_byok existed, from
     its own era's schema, opened by today's store.connect.

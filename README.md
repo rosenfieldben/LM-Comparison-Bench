@@ -679,6 +679,15 @@ select, never from the tier you clicked:
   sentence. Silence is the honest answer when no remedy can be shown to
   help.
 
+**A stored card keeps the sentence it was stored with.** The indicator
+and the label are computed at ingestion from the counts that arrived,
+and rows written before `reasoning_completion_tokens` existed carry NULL
+there, so they are judged on the stored completion count exactly as they
+always were. Result row 744, the row that produced that column, still
+reads as it did. The bench does not reach back and relabel a card after
+the fact: a record that changes its mind about a past run is a record
+nobody can cite.
+
 The same derivation runs for replayed cards, so a card in History gives
 the same advice it gave live, and the budget cap is shown on live cards
 too, since that is the surface where somebody is about to spend. **A
@@ -810,6 +819,32 @@ or a test rather than by this list alone.
   endpoints advertising 18, 12 and 17 parameters, differing in which. A
   model's `supported_parameters` is a union across hosts, so it cannot
   vouch for the one host a strict pin selects.
+- **2026-08-14. One response can report its tokens in two accounting
+  families, and a share computed across them describes nothing.**
+  Result row 744, `anthropic/claude-fable-5` served by Google. Its
+  generation record reports normalized `tokens_completion` **20863**,
+  `native_tokens_reasoning` **20863** and `native_tokens_completion`
+  **65536**. The stream reported usage twice: once with the reasoning
+  count beside its own completion count, then again restating the
+  completion count in the other family with no
+  `completion_tokens_details` at all. The second block erased the
+  reasoning count, the exhaustion predicate saw a `None`, and the card
+  rendered `empty response (finish_reason: length)` on a run that had
+  spent 20863 tokens thinking. `results.reasoning_completion_tokens`
+  now captures the reasoning count's own block-mate so the share is a
+  ratio of two commensurable numbers; had the count survived, 20863
+  against a stored 65536 would have read 31.8% and stayed silent.
+- **2026-08-14. The reasoning reservation is not honoured on this
+  Google-served route.** The same request carried
+  `reasoning: {"max_tokens": 32768}` and the response's native
+  completion count came back at **65536**, the full outer cap, with
+  reasoning consuming it. The bound was sent and the route did not
+  observe it. This is the **covered-but-unhonoured** case the round-two
+  deferral anticipated in the abstract, now with a measured instance:
+  the gate vouched for the route, the field rode the request, and the
+  ceiling did not hold. It is the reason the card's instrumentation
+  reads the counts that came back rather than the request that went
+  out, and the reason that instrumentation is not a consolation prize.
 - **2026-08-13. A model's completion cap is the most generous route's,
   not every route's.** `openai/gpt-oss-120b` publishes
   `top_provider.max_completion_tokens` 131072 while its twenty endpoints

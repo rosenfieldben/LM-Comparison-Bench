@@ -1687,11 +1687,37 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     # charged at a discount, and both live one level down in the details
     # objects.
     completion_details = usage.get("completion_tokens_details")
-    result["reasoning_tokens"] = (
+    reasoning_tokens = (
         as_token_count(completion_details.get("reasoning_tokens"))
         if isinstance(completion_details, dict)
         else None
     )
+    # A PAIR, TAKEN TOGETHER OR NOT AT ALL, and it has to be a pair
+    # because a stream can carry MORE THAN ONE usage block and the two
+    # counts can land in different accounting families.
+    #
+    # MEASURED, result row 744. anthropic/claude-fable-5 served by
+    # Google reported a block with completion_tokens 20863 beside
+    # reasoning_tokens 20863, and a later block restating the completion
+    # count as 65536, the native figure, with no
+    # completion_tokens_details at all. This assignment used to be
+    # unconditional, so the later block set reasoning_tokens to None:
+    # the run's whole reasoning count was ERASED, the exhaustion
+    # predicate saw one None and refused, and a card that had spent
+    # 20863 tokens thinking rendered "empty response (finish_reason:
+    # length)". That is the original incident's useless sentence,
+    # reappearing on the surface built to replace it.
+    #
+    # So the count is only touched when a block actually reports one,
+    # and the completion count from THAT SAME BLOCK is captured beside
+    # it. Everything that asks "how much of the completion went to
+    # thinking" reads the captured pair; see exhaustion_pair for why the
+    # stored completion count cannot answer that question on this route.
+    if reasoning_tokens is not None:
+        result["reasoning_tokens"] = reasoning_tokens
+        result["reasoning_completion_tokens"] = as_token_count(
+            usage.get("completion_tokens")
+        )
     prompt_details = usage.get("prompt_tokens_details")
     result["cached_tokens"] = (
         as_token_count(prompt_details.get("cached_tokens"))
@@ -1723,6 +1749,39 @@ REASONING_SHARE_EXHAUSTED = 0.9
 FINISH_TRUNCATED = "length"
 
 
+def exhaustion_pair(
+    completion_tokens: int | None,
+    reasoning_tokens: int | None,
+    reasoning_completion_tokens: int | None,
+) -> tuple[int | None, int | None]:
+    """The completion and reasoning counts to compare, in one accounting
+    family.
+
+    A SHARE IS A RATIO AND A RATIO NEEDS ONE UNIT. OpenRouter publishes
+    two families, native and normalized, and a stream may report in both
+    within one response. Dividing a reasoning count from one by a
+    completion count from the other produces a number that describes
+    nothing, and on result row 744 it produced a number small enough to
+    silence the indicator on a run that spent its whole visible budget
+    thinking.
+
+    reasoning_completion_tokens is the completion count from the SAME
+    usage block that reported the reasoning count, captured at ingestion
+    for this reason alone. When it is present it wins, because it is the
+    only number the reasoning count is known to be commensurable with.
+
+    THE FALLBACK IS EVERY ROW WRITTEN BEFORE THE COLUMN EXISTED, where
+    the pair is the stored completion count and the stored reasoning
+    count. That is what those rows have always been compared as, and
+    re-deriving them is not on offer: the block that would have supplied
+    the basis is long gone. See the forward-only note in
+    reasoning_ate_the_output.
+    """
+    if reasoning_completion_tokens is not None:
+        return reasoning_completion_tokens, reasoning_tokens
+    return completion_tokens, reasoning_tokens
+
+
 def reasoning_ate_the_output(
     completion_tokens: int | None, reasoning_tokens: int | None
 ) -> bool:
@@ -1739,6 +1798,20 @@ def reasoning_ate_the_output(
     Both counts degrade to None when a provider omits usage, and 0 is a
     real answer meaning "nothing was spent thinking"; either way there is
     no evidence of exhaustion here, so the falsy guard covers both.
+
+    ONE ACCOUNTING FAMILY, WHICH THIS FUNCTION TRUSTS ITS CALLER FOR.
+    The two numbers must be commensurable or the ratio means nothing;
+    exhaustion_pair is what picks them, and every caller goes through
+    it.
+
+    FORWARD ONLY, per the no-rewriting law. Rows written before
+    reasoning_completion_tokens existed are compared on the stored
+    completion count, which is the pair they have always been judged on.
+    Result row 744, the row that produced this fix, therefore keeps the
+    sentence it was stored with: the bench does not reach back and
+    relabel a card after the fact, because a record that changes its
+    mind about a past run is a record nobody can cite. What changed is
+    what happens on the NEXT run of that shape.
     """
     if not reasoning_tokens or not completion_tokens:
         return False
@@ -2026,6 +2099,9 @@ async def run_model(
         "upstream_inference_cost_usd": None,
         "is_byok": None,
         "reasoning_tokens": None,
+        # The completion count from the same usage block as the
+        # reasoning count. See exhaustion_pair.
+        "reasoning_completion_tokens": None,
         "cached_tokens": None,
         "provider": None,
         "native_finish_reason": None,
@@ -2174,10 +2250,16 @@ async def run_model(
         # a refusal that thought a little from a budget that ran out.
         # Non-str oddities land here too rather than leaking into
         # response_text.
+        # THROUGH exhaustion_pair, because the stored completion count
+        # and the reasoning count can be in different accounting
+        # families on a route that reports usage more than once.
         result["error"] = empty_response_error(
             result["finish_reason"],
-            result["completion_tokens"],
-            result["reasoning_tokens"],
+            *exhaustion_pair(
+                result["completion_tokens"],
+                result["reasoning_tokens"],
+                result["reasoning_completion_tokens"],
+            ),
         )
 
     return result
@@ -2235,6 +2317,9 @@ async def stream_model(
         "upstream_inference_cost_usd": None,
         "is_byok": None,
         "reasoning_tokens": None,
+        # The completion count from the same usage block as the
+        # reasoning count. See exhaustion_pair.
+        "reasoning_completion_tokens": None,
         "cached_tokens": None,
         "provider": None,
         "native_finish_reason": None,
@@ -2294,10 +2379,14 @@ async def stream_model(
         # ingested per chunk above, so the counts this reads are the
         # final ones by the time done() runs.
         if result["response_text"] is None and error is None:
+            # Same pair as the batch path; see exhaustion_pair.
             result["error"] = empty_response_error(
                 result["finish_reason"],
-                result["completion_tokens"],
-                result["reasoning_tokens"],
+                *exhaustion_pair(
+                    result["completion_tokens"],
+                    result["reasoning_tokens"],
+                    result["reasoning_completion_tokens"],
+                ),
             )
         return {"type": "done", "result": result}
 
@@ -2500,6 +2589,9 @@ async def fetch_generation(
         "prompt_tokens": None,
         "completion_tokens": None,
         "reasoning_tokens": None,
+        # The completion count from the same usage block as the
+        # reasoning count. See exhaustion_pair.
+        "reasoning_completion_tokens": None,
         "cached_tokens": None,
         "error": None,
     }

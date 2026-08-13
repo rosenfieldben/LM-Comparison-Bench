@@ -160,6 +160,7 @@ CREATE TABLE IF NOT EXISTS results (
     latency_ms REAL,
     prompt_tokens INTEGER,
     completion_tokens INTEGER,
+    reasoning_completion_tokens INTEGER,
     error TEXT,
     cost_usd REAL,
     ttft_ms REAL,
@@ -332,6 +333,15 @@ MIGRATIONS = [
     # for any provider that omits the flag, and it is not the same
     # answer as 0.
     ("results", "is_byok", "INTEGER"),
+    # The completion count from the same usage block that reported the
+    # reasoning count, so a share is a ratio of two numbers in one
+    # accounting family. Nullable and additive like every column here.
+    # NULL on every row written before it existed, which is the honest
+    # answer: the block that would have supplied the basis is gone, and
+    # models.exhaustion_pair falls back to the stored completion count
+    # for exactly those rows. See result row 744 in the README's pinned
+    # observations for the shape that made this necessary.
+    ("results", "reasoning_completion_tokens", "INTEGER"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
     # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
@@ -1692,11 +1702,12 @@ def save_run(
                (run_id, model, response_text, latency_ms, prompt_tokens,
                 completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                 generation_id, finish_reason, position, request_json,
-                billed_cost_usd, reasoning_tokens, cached_tokens,
+                billed_cost_usd, reasoning_tokens,
+                reasoning_completion_tokens, cached_tokens,
                 provider, quantization, native_finish_reason,
                 upstream_inference_cost_usd, is_byok)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?)""",
+                       ?, ?, ?)""",
             [
                 (
                     run_id,
@@ -1718,6 +1729,7 @@ def save_run(
                     r.get("request_json"),
                     r.get("billed_cost_usd"),
                     r.get("reasoning_tokens"),
+                    r.get("reasoning_completion_tokens"),
                     r.get("cached_tokens"),
                     r.get("provider"),
                     r.get("quantization"),
@@ -1926,6 +1938,7 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
         "completion_tokens",
         "max_tokens",
         "reasoning_tokens",
+        "reasoning_completion_tokens",
         "cached_tokens",
     ):
         row[field] = as_token_count(row[field])
@@ -1989,7 +2002,8 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
         """SELECT id, model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
-                  billed_cost_usd, reasoning_tokens, cached_tokens, is_byok,
+                  billed_cost_usd, reasoning_tokens,
+                  reasoning_completion_tokens, cached_tokens, is_byok,
                   provider, quantization, native_finish_reason,
                   upstream_inference_cost_usd
            FROM results WHERE run_id = ?

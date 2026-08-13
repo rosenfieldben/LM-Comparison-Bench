@@ -270,6 +270,28 @@
   // guard. Older history rows predate the reasoning column entirely and
   // carry null; they read as "no" rather than as "unknown", which is the
   // conservative direction for something that draws a warning.
+  // THE TWO NUMBERS A SHARE MAY BE COMPUTED FROM. Mirrors
+  // exhaustion_pair in bench/models.py, which carries the reasoning and
+  // the measured row; a cross-language test executes both against the
+  // same shapes so they cannot drift.
+  //
+  // A ratio needs one unit. OpenRouter publishes two token accounting
+  // families and a stream may report in both, so the reasoning count is
+  // only commensurable with the completion count from its OWN usage
+  // block. reasoningCompletionTokens is that number, captured at
+  // ingestion and served on the row; when it is absent, which is every
+  // row written before the column existed, the stored completion count
+  // is the fallback and the pair is what it has always been.
+  function exhaustionPair(
+    completionTokens,
+    reasoningTokens,
+    reasoningCompletionTokens,
+  ) {
+    return reasoningCompletionTokens != null
+      ? [reasoningCompletionTokens, reasoningTokens]
+      : [completionTokens, reasoningTokens];
+  }
+
   function reasoningAteTheOutput(completionTokens, reasoningTokens) {
     if (!reasoningTokens || !completionTokens) return false;
     return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;
@@ -453,6 +475,7 @@
     diffTokens,
     controlBadges,
     reasoningAteTheOutput,
+    exhaustionPair,
     reasoningShare,
     remedyFor,
     LOWEST_SELECTABLE_EFFORT,

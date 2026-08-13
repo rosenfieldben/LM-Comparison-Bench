@@ -12,6 +12,7 @@ from bench.models import (
     OPENROUTER_URL,
     control_messages,
     control_payload,
+    exhaustion_pair,
     fetch_catalog,
     judge_response,
     missing_parameters,
@@ -1159,10 +1160,30 @@ async def test_empty_provider_string_is_absent_not_blank(client):
 
 @respx.mock
 async def test_a_later_usage_object_without_cost_does_not_leave_a_stale_charge(client):
-    """Last usage object wins, entirely. A stream that reports usage twice
-    must not leave the first object's cost standing beside the second
-    object's token counts: that row would claim a charge the platform did
-    not reconfirm."""
+    """WINDOW: the done event of a stream that reports usage twice, read
+    for the money fields and the reasoning pair separately.
+
+    SUSPENSION POINT: the awaits inside collect. The result is fully
+    assembled before the last event is yielded.
+
+    THE MONEY RULE IS UNCHANGED and is what this test was written for. A
+    charge the platform did not reconfirm must not stand beside a later
+    block's counts, so the last object wins for cost, outright.
+
+    THE REASONING COUNT NO LONGER FOLLOWS IT, and that is a correction
+    this test used to assert against. It said "last usage object wins,
+    ENTIRELY", which erased a reported reasoning count whenever a later
+    block omitted the details object. Result row 744 is what that cost:
+    a run that spent 20863 tokens thinking had its reasoning count
+    deleted by a second block, the exhaustion predicate saw a None and
+    refused, and the card rendered "empty response (finish_reason:
+    length)".
+
+    The two are not the same kind of fact. An unreconfirmed CHARGE is a
+    liability nobody restated; an unrestated COUNT is a measurement that
+    was already taken. Dropping the first is caution, dropping the
+    second is forgetting.
+    """
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
@@ -1186,10 +1207,26 @@ async def test_a_later_usage_object_without_cost_does_not_leave_a_stale_charge(c
     events = await collect("hi", "deepseek/deepseek-chat", client)
 
     result = events[-1]["result"]
+    # THE MONEY HALF, exactly as before.
     assert result["billed_cost_usd"] is None
-    assert result["reasoning_tokens"] is None
-    assert result["cached_tokens"] is None
+    assert result["upstream_inference_cost_usd"] is None
+    # And the plain counts still take the last block's word.
     assert result["completion_tokens"] == 8
+    assert result["cached_tokens"] is None
+
+    # THE REASONING PAIR SURVIVES, together, from the block that
+    # reported it. FULL_USAGE carries 8 completion tokens beside 512
+    # reasoning tokens, and neither is invented by the block that
+    # followed.
+    assert result["reasoning_tokens"] == 512
+    assert result["reasoning_completion_tokens"] == 8
+    # And the pair the share is computed from is that block's, not the
+    # stored completion count beside a reasoning count from elsewhere.
+    assert exhaustion_pair(
+        result["completion_tokens"],
+        result["reasoning_tokens"],
+        result["reasoning_completion_tokens"],
+    ) == (8, 512)
 
 
 # ---- G3: the generation id survives everything, including aborts.
@@ -2811,9 +2848,180 @@ def test_the_shape_test_reads_only_the_two_counts():
     assert reasoning_ate_the_output(0, 1000) is False
 
 
+@respx.mock
+async def test_review_repro_a_share_is_never_computed_across_accounting_families(
+    client,
+):
+    """WINDOW: the done event of a stream in result row 744's wire
+    shape, read for the stored counts, the captured pair and the label.
+
+    SUSPENSION POINT: the awaits inside collect. The result is fully
+    assembled before the last event is yielded.
+
+    THE PRODUCTION ROW. anthropic/claude-fable-5 served by Google. Its
+    generation record reports normalized tokens_completion 20863,
+    native_tokens_reasoning 20863 and native_tokens_completion 65536,
+    and the request carried reasoning: {"max_tokens": 32768}. The stream
+    reported usage twice: once with the reasoning count beside its own
+    completion count, then again restating the completion count in the
+    other accounting family with no completion_tokens_details at all.
+
+    WHAT THAT DID. The second block's assignment was unconditional, so
+    it set reasoning_tokens to None. The run's entire reasoning count
+    was erased, the exhaustion predicate saw a None and refused, the
+    indicator never rendered, and the card fell all the way back to
+    "empty response (finish_reason: length)". That is the sentence this
+    whole workstream exists to have replaced, reappearing on a run that
+    spent 20863 tokens thinking.
+
+    A SHARE IS A RATIO AND A RATIO NEEDS ONE UNIT. Even had the count
+    survived, 20863 against a stored 65536 is 31.8%, comfortably under
+    the threshold, and the two numbers are not in the same family so the
+    percentage describes nothing. The pair is captured together now, and
+    the stored completion count is left exactly as the wire reported it.
+    """
+    reasoning_block = {
+        "prompt_tokens": 1265,
+        "completion_tokens": 20863,
+        "completion_tokens_details": {"reasoning_tokens": 20863},
+    }
+    native_block = {"prompt_tokens": 1265, "completion_tokens": 65536}
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [], "usage": reasoning_block}),
+                    sse({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+                    sse({"choices": [], "usage": native_block}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("a hard question", "vendor/thinker", client)
+    result = events[-1]["result"]
+
+    # THE STORED COUNT IS THE WIRE'S, unedited. The fix does not correct
+    # the provider's accounting, it stops comparing across it.
+    assert result["completion_tokens"] == 65536
+    # And the pair travels together, from the block that reported it.
+    assert result["reasoning_tokens"] == 20863
+    assert result["reasoning_completion_tokens"] == 20863
+    assert exhaustion_pair(
+        result["completion_tokens"],
+        result["reasoning_tokens"],
+        result["reasoning_completion_tokens"],
+    ) == (20863, 20863)
+
+    # PRE-STATE: the stored pair would NOT have fired, which is what
+    # makes the assertion below a fact about the captured basis rather
+    # than about these numbers being large.
+    assert not reasoning_ate_the_output(
+        result["completion_tokens"], result["reasoning_tokens"]
+    )
+
+    # THE NEW SENTENCE, with the count in it.
+    assert result["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(20863 reasoning tokens)"
+    )
+
+
+@respx.mock
+async def test_aligned_units_still_fire_on_a_single_usage_block(client):
+    """WINDOW: the done event of the ordinary shape, one usage block,
+    both counts in one family.
+
+    SUSPENSION POINT: the awaits inside collect.
+
+    THE CONTRAST THAT KEEPS THE FIX FROM BEING A SILENCER. Most routes
+    report usage once, so the captured basis simply equals the stored
+    completion count and nothing about the verdict changes. A repair
+    that fixed row 744 by making the predicate harder to satisfy would
+    pass that row's test and quietly stop firing here, which is where it
+    has always mattered.
+
+    These are the original incident's own numbers, equal completion and
+    reasoning at finish_reason "length".
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse(
+                        {
+                            "choices": [],
+                            "usage": {
+                                "prompt_tokens": 900,
+                                "completion_tokens": 21350,
+                                "completion_tokens_details": {
+                                    "reasoning_tokens": 21350
+                                },
+                            },
+                        }
+                    ),
+                    sse({"choices": [{"delta": {}, "finish_reason": "length"}]}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+
+    events = await collect("a hard question", "vendor/aligned", client)
+    result = events[-1]["result"]
+
+    # The basis is captured and is simply the same number, so the pair
+    # is the pair it always was.
+    assert result["reasoning_completion_tokens"] == 21350
+    assert exhaustion_pair(
+        result["completion_tokens"],
+        result["reasoning_tokens"],
+        result["reasoning_completion_tokens"],
+    ) == (21350, 21350)
+    assert result["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)"
+    )
+
+
+def test_the_pair_falls_back_for_every_row_written_before_the_column():
+    """WINDOW: exhaustion_pair alone, over the three states the basis
+    can be in.
+
+    FORWARD ONLY, per the no-rewriting law. A row written before
+    reasoning_completion_tokens existed carries NULL there, and the
+    block that would have supplied a basis is gone, so those rows are
+    compared exactly as they always were. Result row 744 itself keeps
+    the sentence it was stored with; what changed is the next run of
+    that shape.
+    """
+    # Present: it wins, because it is the only number the reasoning
+    # count is known to be commensurable with.
+    assert exhaustion_pair(65536, 20863, 20863) == (20863, 20863)
+    # Absent: the stored completion count, which is the historical pair.
+    assert exhaustion_pair(1000, 950, None) == (1000, 950)
+    # A zero basis is a real report, not an absence, and must not fall
+    # back to a completion count that would make the share fire.
+    assert exhaustion_pair(1000, 950, 0) == (0, 950)
+
+
 # The shapes both implementations are asked about. Boundaries on both
 # sides of the threshold, the incident, row 694, and every way a count
 # can be missing.
+# The three-number shapes both implementations must resolve to the same
+# pair: row 744's, an aligned single block, a legacy row with no basis,
+# and a reported zero basis, which is a value rather than an absence.
+CROSS_LANGUAGE_BASES = [
+    [65536, 20863, 20863],
+    [21350, 21350, 21350],
+    [1000, 950, None],
+    [1000, 950, 0],
+    [None, None, None],
+]
+
 CROSS_LANGUAGE_SHAPES = [
     [21350, 21350],
     [8500, 8000],
@@ -2878,14 +3086,23 @@ def test_review_repro_the_two_languages_agree_on_every_shape():
     script = """
 const lib = require(process.argv[1]);
 const shapes = JSON.parse(process.argv[2]);
+const bases = JSON.parse(process.argv[3]);
 process.stdout.write(JSON.stringify({
   verdicts: shapes.map(([c, r]) => lib.reasoningAteTheOutput(c, r)),
   threshold: lib.REASONING_SHARE_EXHAUSTED,
+  pairs: bases.map(([c, r, b]) => lib.exhaustionPair(c, r, b)),
 }));
 """
     lib = Path(__file__).parent.parent / "static" / "lib.js"
     proc = subprocess.run(
-        ["node", "-e", script, str(lib), json.dumps(CROSS_LANGUAGE_SHAPES)],
+        [
+            "node",
+            "-e",
+            script,
+            str(lib),
+            json.dumps(CROSS_LANGUAGE_SHAPES),
+            json.dumps(CROSS_LANGUAGE_BASES),
+        ],
         capture_output=True,
         text=True,
         check=True,
@@ -2897,6 +3114,14 @@ process.stdout.write(JSON.stringify({
         zip(CROSS_LANGUAGE_SHAPES, python_verdicts, js["verdicts"])
     )
     assert js["threshold"] == REASONING_SHARE_EXHAUSTED
+    # THE PAIR CHOICE IS ALSO ONE RULE IN TWO LANGUAGES, and it has to
+    # be: the card computes its own share from the same three numbers
+    # the server does, so a frontend that picked a different basis would
+    # print a percentage the label disagrees with, on the same card.
+    # Row 744's shape is the first row of the table.
+    assert [tuple(pair) for pair in js["pairs"]] == [
+        exhaustion_pair(*shape) for shape in CROSS_LANGUAGE_BASES
+    ]
     # And the table straddles the boundary, so agreement is a fact about
     # the rule rather than about a table that only asks easy questions.
     assert True in python_verdicts and False in python_verdicts
