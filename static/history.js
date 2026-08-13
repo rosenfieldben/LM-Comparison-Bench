@@ -670,6 +670,21 @@
         {
           extendedCap: BenchControls.effectiveCap(result.model, "extended"),
           effort: run.params?.effort,
+          // NO TIER TO PASS HERE, and that is a fact about this path
+          // rather than the omission it looks like. showGroup supplies
+          // one; a review asked why this call does not, and the answer
+          // is that it cannot. The history list emits type "run" only
+          // for a run whose group_id is NULL, and the budget tier is
+          // declared on the GROUP. An ungrouped run predates the
+          // declaration entirely, so there is no tier it could have
+          // asked for and "unknown" is the honest input: the remedy
+          // falls back to comparing the published cap against the
+          // ceiling this run received, which is the right question when
+          // nobody declared a tier.
+          //
+          // Writing `budget: run.budget` here would read a field that
+          // does not exist on RunDetail and has no column behind it,
+          // which is a silent undefined wearing the look of a fix.
         },
       );
     }

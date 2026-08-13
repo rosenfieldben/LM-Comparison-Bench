@@ -2122,13 +2122,24 @@ def results_awaiting_reconciliation(
     there is a question with an available answer: one pass fills it and
     the row leaves the list. A row complete in every other column but
     missing the flag used to be invisible to this pass and stayed
-    "unknown" in the report's three-way attribution forever, which made
-    an advertised three-way split quietly two-way plus a leak.
+    "unknown" in the report's attribution forever, which made an
+    advertised split quietly one bucket smaller plus a leak.
 
     A row the endpoint genuinely cannot fill stays listed across passes.
-    That is the honest state (the gap is real and still open), it costs one
-    lookup per pass, and it ends on its own when the generation record
-    expires and the endpoint starts 404ing.
+    That is the honest state (the gap is real and still open) and it
+    costs one lookup per pass.
+
+    IT DOES NOT END ON ITS OWN, and an earlier version of this paragraph
+    said it did: "it ends on its own when the generation record expires
+    and the endpoint starts 404ing". It does not. A 404 sets the
+    record's error, _has_writes returns False, nothing is written and
+    the row still matches this predicate on the next pass. That was
+    already true of every other clause here; adding the flag WIDENS the
+    population, because a row complete in every other column but
+    written before this one existed now lists forever once its record
+    expires. The cost is one lookup per such row per pass, --limit walks
+    the oldest first, and the alternative was leaving a fillable
+    question permanently unasked.
 
     Ordered by id so a run interrupted partway through resumes in a
     predictable place, and so a --limit run walks the oldest rows first.
@@ -2223,11 +2234,15 @@ def apply_reconciliation(
                    upstream_inference_cost_usd = COALESCE(
                        upstream_inference_cost_usd, ?
                    ),
-                   -- COALESCE, not the billed_cost_usd CASE: an absent
-                   -- flag means "the endpoint did not say", so it must
-                   -- not erase one captured in band. sqlite3 binds
-                   -- Python False as 0, and COALESCE(0, ...) keeps the
-                   -- 0, so a reported False still writes.
+                   -- COALESCE, not the billed_cost_usd CASE, and the
+                   -- STORED value first: this fills a gap and never
+                   -- corrects a value, so an endpoint answer of any
+                   -- kind loses to anything already captured in band.
+                   -- The argument order IS the rule. sqlite3 binds
+                   -- Python False as 0 and COALESCE reaches the bound
+                   -- value only when the column is NULL, so a reported
+                   -- False writes on an unknown row and is ignored on a
+                   -- known one, which is both halves of fill-only.
                    is_byok = COALESCE(is_byok, ?)
                WHERE id = ?""",
             (

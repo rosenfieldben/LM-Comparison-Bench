@@ -589,10 +589,14 @@ def reasoning_reservation(
     instances rather than two rules that can drift apart. The judge
     calls this function like everybody else and gets {} from it.
 
-    THE CLAMP IS WHY THIS IS REACHABLE at all: effective_budget lowers
-    the requested tier to any published completion cap, and the catalog
-    accepts any cap above zero, so a budget below 2048 comes from a real
-    catalog entry rather than from a hypothetical.
+    THE CLAMPS ARE WHY THIS IS REACHABLE at all, and there are two.
+    effective_budget lowers the requested tier to any completion cap the
+    MODEL publishes, and the catalog accepts any cap above zero, so a
+    budget below 2048 comes from a real catalog entry rather than from a
+    hypothetical. On a pinned trial route_budget then lowers it again to
+    what the selected ENDPOINT publishes, which is the smaller number
+    more often: one measured model's cheapest route published 8192
+    against a model level of 131072.
 
     int() truncates rather than rounds, so the cap is never a token
     above its share of the budget. At the two real tiers the division is
@@ -847,10 +851,16 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
     strict mode refuses on it, exactly as it refuses on a model the
     catalog does not list.
 
-    Only the fields a decision is made from are kept. Anything else the
-    endpoint publishes is not this function's business, and a parser that
-    carried it would invite somebody to make a second decision from a
-    field nobody checked.
+    Four fields are kept. Three are read to make a decision: the slug a
+    pin is matched against, the parameter list that vouches for sending
+    the reasoning field, and the completion ceiling the budget is
+    clamped to. The fourth, the provider's display NAME, is read by
+    nothing and is kept anyway, because a listing whose entries cannot
+    be named is one nobody can debug against; it is inert by
+    construction, since every decision above matches on the slug.
+    Anything beyond these four is not this function's business, and a
+    parser that carried it would invite somebody to make a decision from
+    a field nobody checked.
 
     max_completion_tokens JOINED THAT LIST after a review found the
     consequence of its absence. It is documented on the endpoints
@@ -981,8 +991,11 @@ def endpoint_completion_cap(
     None means "no ceiling learned here", which is not the same as "no
     ceiling". It covers a listing that never fetched, a pin nothing
     matched, and a provider that published no cap on any of its
-    endpoints. Five of one live model's twenty endpoints were that last
-    shape on 2026-08-13.
+    endpoints. On 2026-08-13 five of one live model's twenty ENDPOINTS
+    published no cap, and one provider was in the third case outright:
+    Amazon Bedrock served that model from two endpoints and neither
+    published one. The endpoint count is the measurement; the provider
+    case is what it implies for a pin.
 
     NONE IS NOT FAIL-CLOSED HERE, and that is deliberate rather than an
     oversight. The caller falls back to the model-level cap, which is
@@ -1943,9 +1956,12 @@ def _as_positive_int(value: object) -> int | None:
     value somebody guessed the meaning of.
 
     Two callers read the same field from two documents, the model
-    listing's top_provider and the endpoint listing's own entry, and
-    they used to carry two copies of this reasoning. One copy, so a
-    later correction cannot land on only one of them.
+    listing's top_provider and the endpoint listing's own entry. There
+    were never two copies of this reasoning to merge, and an earlier
+    version of this paragraph claimed there were: the endpoint reader
+    did not exist until the day this function did. It was extracted
+    ahead of the duplication rather than after it, so that a later
+    correction cannot land on only one of them.
     """
     if isinstance(value, bool) or not isinstance(value, int):
         return None

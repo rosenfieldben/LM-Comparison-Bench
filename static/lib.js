@@ -307,9 +307,16 @@
   };
 
   // The lowest reasoning effort the UI can actually select. Mirrors
-  // the option list in index.html; "unset" is NOT lower, because on a
-  // vouched model the bench then sends its own half-budget reservation
-  // rather than nothing.
+  // the option list in index.html.
+  //
+  // "UNSET" IS NOT A POSITION ON THIS LADDER, which is the correction
+  // that matters. This comment used to say unset "is NOT lower, because
+  // on a vouched model the bench then sends its own half-budget
+  // reservation rather than nothing", and used that to justify advising
+  // a reader to lower an effort they had never set. Unset means the
+  // ROUTE decides, at its catalog default, which the card cannot see
+  // and which may sit below this floor. So unset is unknown, and
+  // remedyFor advises nothing from it.
   const LOWEST_SELECTABLE_EFFORT = "low";
 
   // WHAT THE CARD SHOULD SUGGEST, given what this run actually got and
@@ -331,9 +338,14 @@
   // extended tier would clamp to for this model. A tier name cannot
   // answer either question.
   //
-  // Returns "" when nothing would help, and the caller keeps the
-  // accounting sentence alone. Silence is the honest answer when every
-  // remedy is known not to work.
+  // Returns "" when nothing can be SHOWN to help, and the caller keeps
+  // the accounting sentence alone. That is a weaker claim than the one
+  // this comment used to make ("every remedy is known not to work"),
+  // and the weaker one is the true one: since the effort clause began
+  // requiring an effort the ladder can place above the floor, silence
+  // also covers the case where the card simply does not know what the
+  // route is doing. Not knowing and knowing it will not help both
+  // produce the same honest output, which is nothing.
   function remedyFor(result, options) {
     const opts = options || {};
     const sent = result.max_tokens;

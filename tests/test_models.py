@@ -2412,10 +2412,16 @@ def test_review_repro_the_judge_budget_cannot_be_satisfied_by_a_mandatory_route(
         assert not JUDGE_MAX_TOKENS > allocated, effort
 
     # THE THRESHOLD, so raising the judge's budget is a decision with a
-    # number attached rather than a guess. Anything above the floor
-    # satisfies the strictly-greater rule; the floor itself does not.
+    # number attached rather than a guess. The previous line here was
+    # `assert not floor > floor`, which is true of every integer and
+    # proved nothing at all. What is actually wanted is the smallest
+    # budget that WOULD work, asserted as working, beside the current
+    # one asserted as not.
     assert JUDGE_MAX_TOKENS <= floor
-    assert not floor > floor
+    smallest_workable = floor + 1
+    assert smallest_workable > max(
+        min(int(smallest_workable * max(EFFORT_SHARES.values())), 128000), floor
+    )
 
 
 def test_no_model_name_appears_in_the_reservation_logic():
@@ -2458,20 +2464,41 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
     source = (Path(__file__).parent.parent / "bench" / "models.py").read_text()
     tree = ast.parse(source)
-    target = next(
+    # EVERY FUNCTION THE DECISION LIVES IN, not just the one that used
+    # to hold all of it. reasoning_reservation was a dozen lines of
+    # arithmetic when this tripwire was written; U2 reduced it to a
+    # single delegating return and moved the five states, the floor
+    # comparison and the effort check into reservation_state. The
+    # tripwire went on inspecting the husk, so a vendor name added to
+    # the function that now decides would have passed.
+    #
+    # Named explicitly rather than discovered, because a tripwire that
+    # guesses its own scope is one that can quietly lose it again. A new
+    # function in this chain has to be added here, and the assertion
+    # below that every name resolves is what makes forgetting loud.
+    wanted = {"reasoning_reservation", "reservation_state", "reservation_reason"}
+    targets = [
         node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "reasoning_reservation"
+        if isinstance(node, ast.FunctionDef) and node.name in wanted
+    ]
+    assert {t.name for t in targets} == wanted, (
+        "the tripwire names a function bench/models.py no longer has: "
+        f"{sorted(wanted - {t.name for t in targets})}"
     )
-    body = list(target.body)
-    # Drop the docstring, which is prose by definition.
-    if (
-        body
-        and isinstance(body[0], ast.Expr)
-        and isinstance(body[0].value, ast.Constant)
-        and isinstance(body[0].value.value, str)
-    ):
-        body = body[1:]
+
+    body = []
+    for target in targets:
+        statements = list(target.body)
+        # Drop the docstring, which is prose by definition.
+        if (
+            statements
+            and isinstance(statements[0], ast.Expr)
+            and isinstance(statements[0].value, ast.Constant)
+            and isinstance(statements[0].value.value, str)
+        ):
+            statements = statements[1:]
+        body.extend(statements)
     assert body, "the reservation has no executable body to check"
 
     executable = " ".join(ast.dump(node) for node in body).lower()
@@ -3169,8 +3196,12 @@ async def test_review_repro_a_pinned_endpoint_is_not_vouched_for_by_the_aggregat
     # THE WHOLE POINT: one model, two endpoints, opposite answers.
     assert endpoint_supports_reasoning(listing, "deepinfra") is True
     assert endpoint_supports_reasoning(listing, "baseten") is False
-    # Slug normalization, so a pin recorded lowercase finds a
-    # provider_name that is not.
+    # THE PIN is normalized, which is the only normalization left in
+    # this comparison. It used to say "so a pin recorded lowercase finds
+    # a provider_name that is not", and the matcher stopped reading
+    # provider_name when a pin began matching the endpoint's published
+    # tag. What this asserts now is that a pin typed with capitals still
+    # reaches the tag "deepinfra".
     assert endpoint_supports_reasoning(listing, "DeepInfra") is True
 
     # THREE-VALUED, and the None cases are the ones strict mode must not
@@ -3590,12 +3621,17 @@ def test_review_repro_a_document_with_booleans_is_not_decoded_like_a_cell():
     assert as_wire_flag(1) is None
     assert as_wire_flag(0) is None
 
-    # BOTH EXTERNAL DOORS, NOT JUST THE DECODERS. Asserting that two
-    # functions differ proves nothing about which one each caller
-    # reaches for, and that was the entire defect: fetch_generation
-    # reached for the wrong one for a whole release. A mutation swapping
-    # either call site back to as_flag has to fail here, so both are
-    # driven with the value that separates them.
+    # THE IN-BAND DOOR, exercised through the function rather than
+    # through the decoder it happens to call. Asserting that two
+    # decoders differ proves nothing about which one a caller reaches
+    # for, and reaching for the wrong one WAS the defect.
+    #
+    # ONE DOOR, NOT BOTH, and this comment used to claim both. The
+    # generation endpoint's call site is covered by
+    # test_review_repro_the_generation_record_parses_the_flag_it_documents,
+    # which drives fetch_generation with the same integers; nothing
+    # here touches it. A mutation swapping THAT site back to as_flag
+    # fails there and not in this test.
     #
     # The in-band door, exercised through the function itself rather
     # than through the decoder it happens to call.

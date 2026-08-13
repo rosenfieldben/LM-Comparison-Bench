@@ -2994,9 +2994,8 @@ def test_review_repro_reconciliation_cannot_erase_the_in_band_byok_flag(tmp_path
     The pass wrote is_byok = COALESCE(?, is_byok), which gives EVERY
     non-null endpoint answer precedence. A run that reported BYOK in
     band and false at the endpoint was rewritten to false, which is not
-    a cosmetic disagreement: report._cost_totals splits spend three ways
-    on this flag, so the row moved cost buckets and the attribution
-    changed.
+    a cosmetic disagreement: report._cost_totals buckets spend on this
+    flag, so the row moved buckets and the attribution changed.
 
     WHY THE IN-BAND VALUE WINS, by the same ruling that settled the
     figure beside it. It is taken in the same exchange as the charge;
@@ -3061,7 +3060,7 @@ def test_review_repro_a_row_missing_only_the_flag_is_offered_for_reconciling(tmp
     upstream figure, but no flag, was invisible to every pass. The
     endpoint could have classified it in one call. Instead it stayed
     "unknown" in the report's attribution indefinitely, which makes an
-    advertised three-way split two ways and a leak.
+    advertised split one bucket smaller and a leak.
 
     WHY THIS COLUMN JOINS THE PREDICATE AND THE FIGURE BESIDE IT DOES
     NOT, which is the question the old comment answered wrongly by

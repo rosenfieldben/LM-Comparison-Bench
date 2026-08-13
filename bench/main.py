@@ -3945,7 +3945,15 @@ async def resolve_routes(
     at most a handful, and this runs once before a sweep that will make
     hundreds of paid calls, so concurrency here would buy nothing and
     add a failure mode. fetch_endpoints never raises, so a listing that
-    fails resolves to the same "learned nothing" a missing pin gives.
+    fails resolves rather than propagating.
+
+    IT DOES NOT RESOLVE TO THE SAME THING A MISSING PIN DOES, and an
+    earlier version of this sentence said it did. A missing pin keeps
+    the model-level vouching, because without a pin the union is the
+    right question. A pinned model whose listing failed loses it, because
+    a parameter the pinned host may reject is not free to send. Both
+    learn no ceiling; only one of them still sends the reservation. See
+    trial_route, which draws that distinction on purpose.
 
     THE WORST CASE IS BOUNDED and worth stating, because this now sits
     between "start" and the first trial. Each listing is capped at
@@ -3972,9 +3980,15 @@ def route_budget(requested: int, completion_cap: int | None) -> int:
     No lower bound and no refusal. A route that publishes a small
     ceiling is a route that will answer briefly, which is a worse answer
     and not a failed one, and the number that was sent is recorded and
-    shown on the card. The reservation's own arithmetic then runs
-    against this clamped figure and stands down if it cannot be
-    satisfied, which is the one place a refusal belongs.
+    shown on the card.
+
+    The reservation's own arithmetic then runs against this clamped
+    figure and may stand down. Which of its states it lands in is
+    reservation_state's business and this function deliberately does not
+    summarise it: an earlier version of this paragraph said the
+    reservation "stands down if it cannot be satisfied", which is the
+    exact conflation of two different states that reservation_state
+    exists to have removed.
     """
     return min(requested, completion_cap) if completion_cap is not None else requested
 

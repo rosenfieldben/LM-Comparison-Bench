@@ -6701,13 +6701,28 @@ def wide_endpoint_listing():
 
 
 @pytest.mark.parametrize(
-    "tier,aggregate_budget",
-    (("standard", 16384), ("extended", 65536)),
-    ids=("standard: twice the route's ceiling", "extended: eight times it"),
+    "tier,aggregate_budget,route_cap,expected",
+    (
+        ("standard", 16384, PINNED_ROUTE_CAP, PINNED_ROUTE_CAP),
+        ("extended", 65536, PINNED_ROUTE_CAP, PINNED_ROUTE_CAP),
+        # THE OTHER DIRECTION, and without it the clamp was unproven.
+        # Both rows above put the route's ceiling BELOW the requested
+        # tier, so min(requested, cap) and a bare `cap` give the same
+        # answer: the whole suite passed with the min removed. A
+        # generous route must not RAISE the budget. The tier is what the
+        # operator asked to spend, and a route offering 131072 does not
+        # make a standard run cost eight times more.
+        ("standard", 16384, WIDE_AGGREGATE_CAP, 16384),
+    ),
+    ids=(
+        "standard: twice the route's ceiling",
+        "extended: eight times it",
+        "a generous route does not raise the budget",
+    ),
 )
 @respx.mock
 def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
-    client, tmp_path, tier, aggregate_budget
+    client, tmp_path, tier, aggregate_budget, route_cap, expected
 ):
     """WINDOW: the bytes of the one request a pinned trial sends, read
     against the cap the pinned endpoint publishes.
@@ -6733,6 +6748,12 @@ def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
     respx.get(ENDPOINTS_URL.format(model="model/wide-aggregate")).respond(
         json=wide_endpoint_listing()
     )
+    # The pin selects whichever host publishes the ceiling this row is
+    # about, so one listing serves both directions.
+    pinned_host = {
+        PINNED_ROUTE_CAP: "SiliconFlow",
+        WIDE_AGGREGATE_CAP: "CoreWeave",
+    }[route_cap]
     sent = []
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: (
@@ -6748,7 +6769,7 @@ def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
             path,
             budget=tier,
             lineup=["model/wide-aggregate"],
-            provider_pins={"model/wide-aggregate": "SiliconFlow"},
+            provider_pins={"model/wide-aggregate": pinned_host},
         ),
     ).json()["id"]
 
@@ -6758,7 +6779,7 @@ def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
     body = sent[0]
     # PRE-STATE, so the assertion below cannot pass by the route never
     # having been pinned or the aggregate never having been generous.
-    assert body["provider"]["order"] == ["siliconflow"]
+    assert body["provider"]["order"] == [pinned_host.lower()]
     assert body["provider"]["allow_fallbacks"] is False
     assert app.state.completion_limits["model/wide-aggregate"] == WIDE_AGGREGATE_CAP, (
         "the aggregate must really be the larger number"
@@ -6768,10 +6789,14 @@ def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
         "the test would pass without the endpoint cap ever being read"
     )
 
-    # THE OUTER BUDGET, against the route's published ceiling.
-    assert body["max_tokens"] <= PINNED_ROUTE_CAP, (
-        f"sent max_tokens {body['max_tokens']} to a route publishing {PINNED_ROUTE_CAP}"
+    # THE OUTER BUDGET: never above the route's published ceiling, and
+    # never above the tier the operator asked for either.
+    assert body["max_tokens"] == expected, (
+        f"sent max_tokens {body['max_tokens']} on a {tier} run to a route "
+        f"publishing {route_cap}"
     )
+    assert body["max_tokens"] <= route_cap
+    assert body["max_tokens"] <= aggregate_budget
     # AND THE RESERVATION, computed from the same clamped number rather
     # than from the aggregate. Half of the route's cap, not half of the
     # model's.

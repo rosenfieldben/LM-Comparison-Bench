@@ -577,8 +577,13 @@
   // before reaching the function that reads it, leaving a replayed card
   // advising the tier it had already used.
   //
-  // Reading opts rather than taking the fields apart keeps the count of
-  // hand-written lists at one.
+  // Reading opts rather than taking the fields apart takes the count of
+  // hand-written lists from four to TWO, which is what it actually
+  // does; an earlier version of this comment claimed one. The other is
+  // fillColumn's allowlist, which stays hand-written on purpose so a
+  // caller cannot reach past it into completeColumn's other switches.
+  // Two is the floor unless that allowlist becomes a spread, and it
+  // should not.
   function remedyInputs(opts) {
     return {
       extendedCap: opts.extendedCap,
@@ -619,8 +624,10 @@
     // still saying it.
     //
     // Derived from the same rule now, so the two sentences on one card
-    // cannot contradict each other. When no lower effort is selectable
-    // the accounting sentence stands alone, which is the honest answer.
+    // cannot contradict each other. When no lower effort can be shown
+    // to exist, whether because the run is already at the floor or
+    // because nothing was selected and the route's default is unknown,
+    // the accounting sentence stands alone.
     const advice = remedyFor(result, remedyInputs(opts));
     warn.title =
       "reasoning tokens are billed as completion tokens and never appear " +
@@ -743,9 +750,14 @@
       // hovers.
       note.textContent = "budget cap " + result.max_tokens;
       note.title =
-        "the completion ceiling this run was sent, after per-model " +
-        "clamping. Not a count: compare it against tok i/o, which is " +
-        "what was actually used";
+        "the completion ceiling this run was sent, after clamping to " +
+        "the model's published cap and, on a provider-pinned trial, to " +
+        "the selected endpoint's. " +
+        // Kept on one line: a tombstone in test_models.py searches this
+        // source for the phrase, and splitting it across a concatenation
+        // would fail on formatting rather than on meaning.
+        "Not a count: compare it against tok i/o, which is what was " +
+        "actually used";
       ui.tools.append(note);
     }
   }

@@ -1359,11 +1359,20 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     # twice, and NULL is a row written before the flag existed, which is
     # genuinely unknown and must not be asserted either way.
     #
-    # as_flag on the way in because this function is fed from two
-    # places: a store read, which already normalizes, and an export
-    # line, which carries whatever JSON held. An `is True` test against
-    # an unconverted 1 is False, so without this the byok bucket would
-    # be permanently empty and the report would say nothing at all.
+    # as_flag on the way in, defensively rather than because anything
+    # currently needs it. An earlier version of this comment justified
+    # the call by naming a second caller, "an export line, which carries
+    # whatever JSON held", and there is no such caller: build_report has
+    # exactly one call site and it is fed from store.get_group, which
+    # normalizes every row through _repaired. What the call buys is that
+    # an `is True` test against an unconverted 1 is False, so a future
+    # caller handing over raw rows would empty the byok bucket silently
+    # rather than loudly.
+    #
+    # as_flag and NOT as_wire_flag, and the distinction is the one U3
+    # drew: this reads values that have been through SQLite, where 1 is
+    # how a boolean survives. A document straight off the wire gets the
+    # strict reader instead.
     #
     # Kept as the strings that were stored, because the whole use for
     # them is matching a provider's own invoice line and a float would
@@ -1522,7 +1531,8 @@ def _manifest_token_note() -> str:
         "cached_tokens are counts of tokens actually used, in the "
         "model's own tokenizer, as OpenRouter reported them. "
         "max_tokens is not a count: it is the completion ceiling the "
-        "run was sent, after per-model clamping."
+        "run was sent, after clamping to the model's published cap and, "
+        "on a provider-pinned trial, to the selected endpoint's."
     )
 
 

@@ -79,7 +79,7 @@ def test_review_repro_an_exhausted_card_says_where_the_money_went(bench):
 def choose_effort(page, effort):
     """Select a reasoning effort in Experiment controls.
 
-    Four tests need one on the record now. Advice to LOWER the effort
+    Five tests need one on the record now. Advice to LOWER the effort
     requires an effort the ladder can place above the floor, and with
     nothing chosen the route runs at its catalog default, which the card
     does not know and which may be below "low": openai/gpt-5.1 publishes
@@ -136,6 +136,13 @@ def test_review_repro_an_unknown_effort_is_not_advised_downward(bench):
     """
     page = bench(["stub/exhausted"])
     check_all_chips(page)
+    # PRE-STATE: the control really is unset. Without this the test
+    # rests on a default it never checks, and a change making the UI
+    # preselect an effort would invert what it proves while leaving it
+    # green.
+    page.get_by_test_id("toggle-controls").click()
+    expect(page.get_by_test_id("ctl-effort")).to_have_value("")
+    page.get_by_test_id("toggle-controls").click()
     run(page, "unknown effort")
 
     card = cards(page).first
