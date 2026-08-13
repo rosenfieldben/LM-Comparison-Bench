@@ -164,13 +164,30 @@ because nothing computes with it. Its use is matching a provider's own
 invoice line, and a float would reformat the number being matched.
 
 The reconcile pass writes it on every row it reaches, and its work list
-does **not** select on it being absent. NULL is the affirmative "not
-BYOK", and there is no column for "asked, and the answer was no", so a
-clause on it would park every ordinary row on the list forever and the
-pass would never converge. The narrow case that leaves unreached is a
-BYOK run whose usage object arrived with `cost` and without
-`cost_details`, leaving the row otherwise complete; that gap is real and
-smaller than a work list that never empties.
+does **not** select on it being absent. NULL here means **the wire sent
+no usable figure**, which is not the same as "not BYOK" and this
+paragraph used to say it was, contradicting the accurate explanation
+above: two live captures carry `is_byok: false` beside a nonzero
+upstream figure, and `is_byok` is the column that answers the billing
+question. There is no column for "asked, and the answer was no", so a
+clause on this figure would park every ordinary row on the list forever
+and the pass would never converge. The narrow case that leaves
+unreached is a BYOK run whose usage object arrived with `cost` and
+without `cost_details`, leaving the row otherwise complete; that gap is
+real and smaller than a work list that never empties.
+
+`is_byok` itself **is** on the work list, because the endpoint answers
+it for every generation and one pass converges it. One state is
+deliberately not reachable from there: a corrupted cell holding
+something that is neither 1, 0 nor NULL, such as the text `'yes'`.
+SQLite's column affinity accepts it, `as_flag` decodes it to `None` so
+no reader is told something the wire never said, and the report counts
+the trial as unattributed. But the predicate selects on `IS NULL` and
+the cell is not null, so the pass never offers the row, and fill-only
+`COALESCE` would keep the text even if it did. **No writer in this
+repository can create that state** (every path goes through `as_flag`
+on the way in), so it is recorded here as a known limit of
+reconciliation against a database edited by hand rather than fixed.
 
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value

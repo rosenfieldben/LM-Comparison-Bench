@@ -306,6 +306,28 @@
     max: 0.95,
   };
 
+  // THE ROUTE'S OWN CEILING, DERIVED RATHER THAN FETCHED. A pinned
+  // trial is clamped twice: to the model's published cap for its tier,
+  // and then to the endpoint the pin selected. Only the first is
+  // knowable from the catalog the browser holds, so a replayed card
+  // cannot look the second one up.
+  //
+  // It does not have to. The server sends min(tierCap, routeCap), so a
+  // sent ceiling STRICTLY BELOW the model-level cap for that tier can
+  // only be the route's own number: min picked the other operand, and
+  // the other operand is the route. When sent equals the tier cap the
+  // route did not bind and nothing is learned, which is null rather
+  // than a guess.
+  //
+  // The consequence is what the remedy needs: a route that bound a
+  // standard run at 8192 bounds an extended one at 8192 too, because
+  // min(65536, 8192) is the same number. Suggesting the larger tier
+  // there is suggesting a replay of the identical request.
+  function routeCapFor(sent, tierCap) {
+    if (typeof sent !== "number" || typeof tierCap !== "number") return null;
+    return sent < tierCap ? sent : null;
+  }
+
   // The lowest reasoning effort the UI can actually select. Mirrors
   // the option list in index.html.
   //
@@ -351,19 +373,38 @@
     const sent = result.max_tokens;
     const extendedCap = opts.extendedCap;
     const parts = [];
-    // A bigger budget is only advice if a bigger budget exists AND was
-    // not already asked for. The cap comparison alone is not enough on
-    // a replayed card: extendedCap is what the catalog says TODAY while
-    // sent is what this run received, so a run that already selected
-    // extended and was clamped to 4096 starts being told to "try
-    // extended budget" the moment the published cap rises above 4096.
-    // The tier that was selected is on the stored row and only had to
-    // be passed in.
+    // A BIGGER BUDGET IS ONLY ADVICE IF A BIGGER BUDGET EXISTS, was
+    // not already asked for, and can be shown to reach this run's
+    // route. Three conditions, and each one was learned from a card
+    // that gave advice it could not support.
+    //
+    // ONE: the tier must be KNOWN. An absent tier used to be read as
+    // "not extended", so a run that selected extended and whose record
+    // does not carry the tier was told to select it. Unknown is not
+    // standard; it is unknown, and nothing can be advised from it.
+    //
+    // TWO: the tier must not already be extended. extendedCap is what
+    // the catalog publishes TODAY and sent is what this run received,
+    // possibly weeks ago, so on a replay the cap comparison alone
+    // starts recommending extended to a clamped extended run the moment
+    // the published cap rises.
+    //
+    // THREE: the ROUTE's ceiling, where one is known, bounds what
+    // extended could deliver. extendedCap is a MODEL-level number and a
+    // provider-pinned trial is clamped again to its endpoint's, so a
+    // run pinned to a route capping at 8192 was told to try a tier that
+    // clamps to the same 8192. See routeCapFor for how a caller learns
+    // that number without asking the network.
+    const reachable =
+      typeof opts.routeCap === "number"
+        ? Math.min(extendedCap, opts.routeCap)
+        : extendedCap;
     if (
+      (opts.budget === "standard" || opts.budget === "extended") &&
       opts.budget !== "extended" &&
       typeof sent === "number" &&
       typeof extendedCap === "number" &&
-      extendedCap > sent
+      reachable > sent
     ) {
       parts.push("extended budget");
     }
@@ -416,6 +457,7 @@
     remedyFor,
     LOWEST_SELECTABLE_EFFORT,
     EFFORT_SHARES,
+    routeCapFor,
     REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };

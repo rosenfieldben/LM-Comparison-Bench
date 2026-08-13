@@ -518,6 +518,62 @@ EFFORT_SHARES = {
 # tokens and charged accordingly."
 
 
+def reasoning_claims(reasoning: Mapping[str, Any]) -> tuple[bool, bool]:
+    """What a model's reasoning descriptor CLAIMS: whether it thinks
+    unprompted, and whether it contradicts itself saying so.
+
+    ONE DERIVATION, so every arm of the gate reads the same three keys
+    the same way. They were previously read inline in a shape where
+    mandatory SHORT-CIRCUITED the effort check:
+
+        already_reasons = mandatory is True or (
+            default_enabled is True and default_effort != "none")
+
+    so "none" was honoured on the default_enabled side and ignored on
+    the mandatory side. A descriptor publishing mandatory true,
+    default_enabled true, default_effort "none" and supports_max_tokens
+    true therefore cleared the ceiling arm and received an 8192 token
+    reservation: the reservation switching thinking ON for a route whose
+    own descriptor says it is off, which is this workstream's founding
+    defect reintroduced through the arm nobody checked.
+
+    "none" IS OFF, EVERYWHERE. The contract's words, quoted at
+    EFFORT_SHARES: "'effort': 'none' - Disables reasoning entirely",
+    and of the descriptor key, "If the value is 'none', treat it as
+    'reasoning off by default'".
+
+    THE INVARIANT, returned rather than raised because the caller is a
+    catalog parse that must never reject a whole catalog over one
+    entry:
+
+        for any descriptor the gate vouches for, a claim that thinking
+        is ON must not sit beside a claim that it is OFF.
+
+    Two shapes break it. Either flag saying thinking happens beside an
+    effort of "none" is one; mandatory true beside default_enabled false
+    is the other. Neither is a descriptor anybody can act on, and a
+    parser that believes whichever half is convenient can be talked into
+    anything. Neither was in the live catalog on 2026-08-12 or
+    2026-08-13, which is a reason to keep the check cheap rather than to
+    skip it: the cost of being wrong is buying thinking nobody asked
+    for, on every run, silently.
+
+    THE TWO RETURNS OVERLAP BY CONSTRUCTION, and saying so is the point
+    of returning them together. Every descriptor that is contradictory
+    on the effort-none side also fails already_reasons, so a caller
+    honouring either one alone gets the right answer for these shapes.
+    That redundancy is deliberate defence in depth and it is also why
+    neither can be mutated away on its own and observed through the
+    catalog: the test that isolates them calls this function directly.
+    """
+    mandatory = reasoning.get("mandatory") is True
+    enabled = reasoning.get("default_enabled")
+    effort_is_none = reasoning.get("default_effort") == "none"
+    claims_on = mandatory or enabled is True
+    contradictory = (claims_on and effort_is_none) or (mandatory and enabled is False)
+    return claims_on and not effort_is_none, contradictory
+
+
 def reasoning_reservation(
     max_tokens: int,
     controls: Mapping[str, Any] | None = None,
@@ -1363,41 +1419,8 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # silence.
         reasoning = entry.get("reasoning")
         if isinstance(reasoning, dict):
-            # A DESCRIPTOR THAT CONTRADICTS ITSELF VOUCHES FOR
-            # NOTHING. mandatory true means the operator may not turn
-            # thinking off; default_enabled false means it is off unless
-            # somebody turns it on. Both cannot be true of one route,
-            # and a parser that believes the convenient half of a
-            # contradiction is a parser that can be talked into
-            # anything.
-            #
-            # THE INVARIANT: for any descriptor this gate vouches for,
-            # mandatory true implies default_enabled is not false. It is
-            # enforced here rather than asserted downstream because the
-            # gate is the only place that reads both keys, and it is
-            # enforced ahead of BOTH arms because both would otherwise
-            # admit the shape. already_reasons is satisfied by mandatory
-            # alone, so the true-ceiling arm needed the guard as much as
-            # the no-harm arm did.
-            #
-            # FAIL CLOSED, which here means the reservation is not sent
-            # and the pre-feature payload rides. Not observed in the
-            # live catalog on 2026-08-12 or 2026-08-13, and that is a
-            # reason to keep the check cheap rather than a reason to
-            # skip it: the cost of being wrong is switching thinking ON
-            # for a route whose catalog entry says it is off, which is
-            # this workstream's founding defect.
-            contradictory = (
-                reasoning.get("mandatory") is True
-                and reasoning.get("default_enabled") is False
-            )
-            already_reasons = reasoning.get("mandatory") is True or (
-                reasoning.get("default_enabled") is True
-                # "none" is off, and it is checked here rather than
-                # folded into default_enabled because the catalog really
-                # does publish both together.
-                and reasoning.get("default_effort") != "none"
-            )
+            mandatory = reasoning.get("mandatory") is True
+            already_reasons, contradictory = reasoning_claims(reasoning)
             advertised = "reasoning" in (model["supported_parameters"] or ())
             # THE CEILING CASE: supports_max_tokens makes the cap a cap.
             a_true_ceiling = (
@@ -1457,7 +1480,7 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
                 else None
             )
             cannot_raise_or_enable = (
-                reasoning.get("mandatory") is True
+                mandatory
                 and default_share is not None
                 and default_share >= REASONING_BUDGET_SHARE
                 and advertised

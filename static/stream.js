@@ -189,6 +189,20 @@
             budgetBadge: true,
             extendedCap: BenchControls.effectiveCap(model, "extended"),
             effort: controls?.effort,
+            // THE TIER THIS RUN SELECTED, which a live card has known
+            // all along and never passed. It became load-bearing when
+            // remedyFor stopped reading an absent tier as "standard":
+            // without it every live card would lose its budget advice.
+            budget: budget,
+            // And what the route capped it at, if the numbers say the
+            // route capped it at all. Comparisons are never pinned
+            // today, so this is null on every live card; it is passed
+            // because the derivation belongs at every call site rather
+            // than at the ones that currently need it.
+            routeCap: BenchLib.routeCapFor(
+              result.max_tokens,
+              BenchControls.effectiveCap(model, budget),
+            ),
             // run_id null on the done event means the server spent the money
             // and streamed the response but could not persist it. A refusal
             // is run_id null too, but deliberately: it persists nothing

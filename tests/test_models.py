@@ -1813,7 +1813,7 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
 
 # ---- Phase I3: rubric judging, blind by construction.
 
-from bench.models import EFFORT_SHARES, JUDGE_MAX_TOKENS
+from bench.models import EFFORT_SHARES, JUDGE_MAX_TOKENS, reasoning_claims
 
 
 def judge_body(text):
@@ -2424,6 +2424,91 @@ def test_review_repro_the_judge_budget_cannot_be_satisfied_by_a_mandatory_route(
     )
 
 
+def test_review_repro_the_descriptor_claims_are_derived_once(client):
+    """WINDOW: reasoning_claims itself, one descriptor at a time, with
+    both returned booleans read.
+
+    THE DEFECT, and it reached production. mandatory short-circuited the
+    effort check, so "none" was honoured on the default_enabled side and
+    ignored on the mandatory side. The review's shape published all four
+    keys the live catalog publishes, cleared the ceiling arm, and drew
+    an 8192 token reservation for a route whose own descriptor says
+    reasoning is off.
+
+    WHY THIS TEST EXISTS BESIDE THE CATALOG TABLE. The two returns
+    overlap by construction: every effort-none contradiction also fails
+    already_reasons, so through fetch_catalog either one alone gives the
+    right verdict and neither can be mutated away and observed. The
+    catalog table proves the OUTCOME; this proves the two claims are
+    each computed, which is what makes the defence in depth real rather
+    than asserted.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: "none" is off because the page
+    says "'effort': 'none' - Disables reasoning entirely" and, of the
+    descriptor key, "If the value is 'none', treat it as 'reasoning off
+    by default'". Nothing here consults a mock.
+    """
+    for descriptor, expected, why in (
+        # THE REVIEW'S PRODUCTION-PATH SHAPE.
+        (
+            {
+                "mandatory": True,
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            (False, True),
+            "every key the live catalog publishes, and it says both",
+        ),
+        # Each contradictory shape on its own, so neither half of the
+        # invariant rides on the other.
+        (
+            {"mandatory": True, "default_effort": "none"},
+            (False, True),
+            "mandatory beside an effort of none",
+        ),
+        (
+            {"default_enabled": True, "default_effort": "none"},
+            (False, True),
+            "enabled beside an effort of none",
+        ),
+        (
+            {"mandatory": True, "default_enabled": False},
+            # STILL CLAIMS to reason, because mandatory says so; the
+            # contradiction is what vetoes it. The two returns answer
+            # different questions and this is the row where they differ,
+            # which is why they are returned as a pair rather than
+            # collapsed into one verdict here.
+            (True, True),
+            "mandatory beside enabled false",
+        ),
+        # AND THE CONTROLS, so "contradictory" is not simply always
+        # true and "already_reasons" not simply always false.
+        (
+            {"mandatory": True, "default_effort": "high"},
+            (True, False),
+            "mandatory at a real effort",
+        ),
+        (
+            {"default_enabled": True, "default_effort": "medium"},
+            (True, False),
+            "enabled at a real effort",
+        ),
+        (
+            {"mandatory": True},
+            (True, False),
+            "mandatory with no effort published at all",
+        ),
+        (
+            {"default_enabled": False},
+            (False, False),
+            "off, which is not a contradiction",
+        ),
+        ({}, (False, False), "a descriptor that answers nothing"),
+    ):
+        assert reasoning_claims(descriptor) == expected, why
+
+
 def test_no_model_name_appears_in_the_reservation_logic():
     """WINDOW: bench/models.py as it sits on disk, parsed rather than
     imported, so what is checked is the source a reviewer reads.
@@ -2464,32 +2549,63 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
     source = (Path(__file__).parent.parent / "bench" / "models.py").read_text()
     tree = ast.parse(source)
-    # EVERY FUNCTION THE DECISION LIVES IN, not just the one that used
-    # to hold all of it. reasoning_reservation was a dozen lines of
-    # arithmetic when this tripwire was written; U2 reduced it to a
-    # single delegating return and moved the five states, the floor
-    # comparison and the effort check into reservation_state. The
-    # tripwire went on inspecting the husk, so a vendor name added to
-    # the function that now decides would have passed.
+    # THE CALL GRAPH FROM ONE ENTRY POINT, not a list of names.
     #
-    # Named explicitly rather than discovered, because a tripwire that
-    # guesses its own scope is one that can quietly lose it again. A new
-    # function in this chain has to be added here, and the assertion
-    # below that every name resolves is what makes forgetting loud.
-    wanted = {"reasoning_reservation", "reservation_state", "reservation_reason"}
-    targets = [
-        node
+    # THIS TRIPWIRE HAS LOST ITS SCOPE TWICE. First it inspected
+    # reasoning_reservation, a dozen lines of arithmetic when it was
+    # written, which a later commit reduced to a single delegating
+    # return: every branch it guarded had moved to reservation_state and
+    # a vendor name there passed. The repair was to name three
+    # functions, and a review pointed out that the repair has the same
+    # shape as the defect: move the arithmetic into a fourth function
+    # and the husk failure mode returns, one level deeper.
+    #
+    # A NAME LIST CANNOT FIX THIS because the thing being guarded is
+    # reachability, not membership. So the scope is DERIVED: start at
+    # the entry point the payload actually calls, follow every
+    # module-level function it calls, and keep going. A helper added
+    # tomorrow is in scope the moment something in the chain calls it,
+    # and a helper nobody calls is correctly out of scope.
+    #
+    # Module-level functions only. A call to a builtin, an import or a
+    # method has no FunctionDef here to descend into, and pulling in the
+    # whole module would make this assert things about code the
+    # reservation cannot reach.
+    functions = {
+        node.name: node
         for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name in wanted
-    ]
-    assert {t.name for t in targets} == wanted, (
-        "the tripwire names a function bench/models.py no longer has: "
-        f"{sorted(wanted - {t.name for t in targets})}"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    entry = "reasoning_reservation"
+    assert entry in functions, f"bench/models.py no longer defines {entry}"
+
+    reached: dict[str, ast.AST] = {}
+    frontier = [entry]
+    while frontier:
+        name = frontier.pop()
+        if name in reached:
+            continue
+        node = functions[name]
+        reached[name] = node
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            callee = inner.func
+            # Bare calls only: an attribute call is somebody else's
+            # module and has no definition in this file to follow.
+            if isinstance(callee, ast.Name) and callee.id in functions:
+                frontier.append(callee.id)
+
+    # The chain as it stands, so a reader knows what is covered and a
+    # reviewer can see when it changes. Not an equality assertion: the
+    # point of deriving the scope is that it may legitimately grow.
+    assert {"reasoning_reservation", "reservation_state"} <= set(reached), sorted(
+        reached
     )
 
     body = []
-    for target in targets:
-        statements = list(target.body)
+    for name in sorted(reached):
+        statements = list(reached[name].body)
         # Drop the docstring, which is prose by definition.
         if (
             statements

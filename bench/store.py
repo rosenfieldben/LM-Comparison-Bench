@@ -2116,6 +2116,18 @@ def results_awaiting_reconciliation(
     `cost_details`, leaving the row otherwise complete. That gap is real
     and it is smaller than a list that never empties.
 
+    A CORRUPTED CELL IS NOT REACHED, and that is a limit rather than an
+    oversight. A value that is neither 1, 0 nor NULL, which SQLite's
+    column affinity will accept into an INTEGER column, decodes to None
+    through as_flag so no reader is misled, and the report counts the
+    trial as unattributed. This predicate selects on IS NULL and such a
+    cell is not null, so the pass never offers the row; fill-only
+    COALESCE would keep the corrupted value even if it did. Every write
+    path in this repository goes through as_flag, so no writer here can
+    create the state, and widening the clause to a typeof() test would
+    add a scan for a shape only a hand-edited database can hold. Named
+    rather than fixed.
+
     `is_byok` DOES JOIN THE PREDICATE, and the asymmetry with the figure
     beside it is the whole point of writing both down. The endpoint
     publishes the flag for every generation, true or false, so a NULL

@@ -23,6 +23,7 @@ const {
   remedyFor,
   LOWEST_SELECTABLE_EFFORT,
   EFFORT_SHARES,
+  routeCapFor,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
@@ -378,18 +379,33 @@ test("no budget advice when a larger budget does not exist", () => {
   // completion cap. stub/capped publishes 4096, so extended and
   // standard both send 4096 and "try extended budget" is an instruction
   // to spend four times as much on an identical request.
-  const clamped = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096 });
+  const standard = { budget: "standard" };
+  const clamped = remedyFor(
+    { max_tokens: 4096 },
+    { ...standard, extendedCap: 4096 },
+  );
   assert.ok(!clamped.includes("extended budget"));
 
   // Same rule, the offline case, which is the one that makes the old
   // advice impossible for EVERY model: with no catalog there are no
   // published caps, so extended falls back to the standard tier.
-  const offline = remedyFor({ max_tokens: 16384 }, { extendedCap: 16384 });
+  const offline = remedyFor(
+    { max_tokens: 16384 },
+    { ...standard, extendedCap: 16384 },
+  );
   assert.ok(!offline.includes("extended budget"));
 
   // And it IS offered when a larger budget genuinely exists.
-  const room = remedyFor({ max_tokens: 16384 }, { extendedCap: 65536 });
+  const room = remedyFor(
+    { max_tokens: 16384 },
+    { ...standard, extendedCap: 65536 },
+  );
   assert.ok(room.includes("try extended budget"));
+
+  // EVERY CASE HERE NAMES ITS TIER, and that is not decoration. The
+  // budget clause now requires a known tier, so a version of this test
+  // that omitted it would assert silence for the wrong reason and pass
+  // whatever the cap comparison did.
 });
 
 test("review repro: lower-effort advice needs a lower effort to exist", () => {
@@ -440,8 +456,8 @@ test("review repro: a replayed extended run is not told to try extended", () => 
   const sent = { max_tokens: 4096 };
   const capRose = { extendedCap: 65536, effort: "high" };
 
-  // Without the tier, the cap comparison alone still advises it, which
-  // is correct when the tier really was standard.
+  // With the tier recorded as standard, the cap comparison advises it,
+  // which is correct: standard really can be raised.
   const asStandard = remedyFor(sent, { ...capRose, budget: "standard" });
   assert.ok(asStandard.includes("try extended budget"));
 
@@ -449,17 +465,103 @@ test("review repro: a replayed extended run is not told to try extended", () => 
   // survives.
   const asExtended = remedyFor(sent, { ...capRose, budget: "extended" });
   assert.equal(asExtended, "; try a lower reasoning effort");
+});
 
-  // A row that carries no tier at all (every group written before the
-  // column existed) keeps the old reading rather than losing the
-  // advice: absent is not "extended".
-  assert.ok(remedyFor(sent, capRose).includes("try extended budget"));
+test("review repro: an unknown tier advises no tier at all", () => {
+  // THE DEFECT, and the false premise that hid it. An absent tier used
+  // to be read as "not extended", so the budget clause rode. The
+  // comment defending that said an ungrouped run "predates the
+  // declaration entirely" and therefore had no tier to lose.
+  //
+  // It does not predate anything. /compare takes group_id as OPTIONAL
+  // and budget as a current field, so a run created today can select
+  // extended and carry no group, and `runs` has no budget column to
+  // record it in. Such a run is replayed with the tier missing and was
+  // told to select the tier it had already selected.
+  //
+  // UNKNOWN IS NOT STANDARD. The record cannot say which tier ran, so
+  // the card says nothing about tiers. The effort clause is unaffected,
+  // which is what makes this a narrowing rather than the advice going
+  // dark.
+  const sent = { max_tokens: 4096 };
+  const capRose = { extendedCap: 65536, effort: "high" };
+
+  assert.equal(remedyFor(sent, capRose), "; try a lower reasoning effort");
+  assert.equal(
+    remedyFor(sent, { ...capRose, budget: undefined }),
+    "; try a lower reasoning effort",
+  );
+  // A tier this function does not recognise is unknown too, rather
+  // than "not extended".
+  assert.equal(
+    remedyFor(sent, { ...capRose, budget: "enormous" }),
+    "; try a lower reasoning effort",
+  );
+});
+
+test("review repro: a pinned route's ceiling bounds what extended can offer", () => {
+  // THE DEFECT, reproduced exactly as the review reported it:
+  //
+  //   remedyFor({max_tokens:8192},{extendedCap:65536,budget:"standard"})
+  //     -> "; try extended budget"
+  //
+  // while the server's own arithmetic gives
+  //
+  //   route_budget(16384, 8192) == route_budget(65536, 8192) == 8192
+  //
+  // extendedCap is a MODEL-level number. A provider-pinned trial is
+  // clamped again to the endpoint the pin selected, so a run pinned to
+  // a route capping at 8192 was advised to buy a tier that clamps to
+  // the same 8192: a replay of the identical request at four times the
+  // price.
+  const pinned = { max_tokens: 8192 };
+  assert.equal(
+    remedyFor(pinned, {
+      extendedCap: 65536,
+      budget: "standard",
+      routeCap: 8192,
+    }),
+    "",
+  );
+  // WITHOUT the route cap the old answer is still produced, which is
+  // what makes the line above a fact about routeCap rather than about
+  // this particular pair of numbers.
+  assert.ok(
+    remedyFor(pinned, { extendedCap: 65536, budget: "standard" }).includes(
+      "extended budget",
+    ),
+  );
+  // And a route with genuine headroom is still advised: the rule is
+  // min(extendedCap, routeCap) against what was sent, not "pinned runs
+  // get no advice".
+  assert.ok(
+    remedyFor(pinned, {
+      extendedCap: 65536,
+      budget: "standard",
+      routeCap: 32768,
+    }).includes("extended budget"),
+  );
+});
+
+test("routeCapFor learns the route's ceiling only when min picked it", () => {
+  // The server sends min(tierCap, routeCap), so a sent ceiling STRICTLY
+  // below the model-level cap for that tier can only be the route's own
+  // number. Equal means the route did not bind and nothing was learned,
+  // which must be null rather than a guess: returning tierCap there
+  // would claim a route ceiling for every unpinned run in the bench.
+  assert.equal(routeCapFor(8192, 16384), 8192);
+  assert.equal(routeCapFor(16384, 16384), null);
+  assert.equal(routeCapFor(4096, 4096), null);
+  // Absent inputs learn nothing rather than throwing or coercing.
+  assert.equal(routeCapFor(undefined, 16384), null);
+  assert.equal(routeCapFor(8192, undefined), null);
+  assert.equal(routeCapFor(null, null), null);
 });
 
 test("both clauses when both remedies exist, joined once", () => {
   const both = remedyFor(
     { max_tokens: 16384 },
-    { extendedCap: 65536, effort: "high" },
+    { extendedCap: 65536, effort: "high", budget: "standard" },
   );
   assert.equal(both, "; try extended budget or a lower reasoning effort");
 });
@@ -472,10 +574,14 @@ test("remedyFor reads the cap the run was sent, never a tier name", () => {
   // decision follows max_tokens.
   const sameCap = { max_tokens: 4096 };
   assert.ok(
-    !remedyFor(sameCap, { extendedCap: 4096 }).includes("extended budget"),
+    !remedyFor(sameCap, { extendedCap: 4096, budget: "standard" }).includes(
+      "extended budget",
+    ),
   );
   assert.ok(
-    remedyFor(sameCap, { extendedCap: 65536 }).includes("extended budget"),
+    remedyFor(sameCap, { extendedCap: 65536, budget: "standard" }).includes(
+      "extended budget",
+    ),
   );
 
   // Missing information is not an invitation to advise: a caller that

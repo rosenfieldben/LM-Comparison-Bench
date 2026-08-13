@@ -589,6 +589,7 @@
       extendedCap: opts.extendedCap,
       effort: opts.effort,
       budget: opts.budget,
+      routeCap: opts.routeCap,
     };
   }
 
@@ -784,6 +785,7 @@
       extendedCap: extra.extendedCap,
       effort: extra.effort,
       budget: extra.budget,
+      routeCap: extra.routeCap,
     });
   }
 

@@ -12952,11 +12952,41 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
             "reasoning": {"mandatory": True, "default_effort": "medium"},
             "supported_parameters": reasoning_ok,
         },
-        # ---- THE SELF-CONTRADICTING DESCRIPTOR, refused through both
-        # ---- arms. mandatory true says the operator may not turn
-        # ---- thinking off; default_enabled false says it is off unless
-        # ---- somebody turns it on. Both cannot hold, and a parser that
-        # ---- believes the convenient half can be talked into anything.
+        # ---- THE SELF-CONTRADICTING DESCRIPTORS, refused through
+        # ---- every arm. A claim that thinking is ON must not sit
+        # ---- beside a claim that it is OFF, and a parser that believes
+        # ---- whichever half is convenient can be talked into anything.
+        #
+        # THE PRODUCTION-PATH SHAPE A REVIEW FOUND, and the one that
+        # made this a merge blocker rather than a tidiness note. Every
+        # key here is one the live catalog publishes, and together they
+        # cleared the ceiling arm: mandatory short-circuited the effort
+        # check, so "none" was honoured on the default_enabled side and
+        # ignored on the mandatory side. fetch_catalog returned True and
+        # reasoning_reservation(16384) returned an 8192 token cap, which
+        # is the reservation switching thinking ON for a route whose own
+        # descriptor says it is off.
+        {
+            "id": "m/mandatory-enabled-but-effort-none",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # The same contradiction without the budget flag, so the refusal
+        # cannot be credited to the ceiling arm being unavailable. This
+        # shape used to be refused by arithmetic rather than by meaning:
+        # EFFORT_SHARES["none"] is 0.0, which fails the no-harm share
+        # comparison, so the right answer arrived for the wrong reason
+        # and moving the share would have changed it.
+        {
+            "id": "m/mandatory-but-effort-none",
+            "reasoning": {"mandatory": True, "default_effort": "none"},
+            "supported_parameters": reasoning_ok,
+        },
         #
         # Through the no-harm arm: mandatory and high would otherwise
         # admit it, exactly as m/mandatory-at-high-no-budget is admitted.
@@ -13061,9 +13091,13 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
         # makes ">= medium" different from "> medium".
         "m/mandatory-at-medium-no-budget": True,
         # A descriptor that contradicts itself vouches for nothing,
-        # through either arm.
+        # through any arm.
         "m/contradictory-no-budget": False,
         "m/contradictory-with-budget": False,
+        # The review's production-path shape, and the same shape with
+        # the ceiling flag removed.
+        "m/mandatory-enabled-but-effort-none": False,
+        "m/mandatory-but-effort-none": False,
         # Reasons with a real budget: the cap is a ceiling, so it rides.
         "m/mandatory": True,
         "m/on": True,
