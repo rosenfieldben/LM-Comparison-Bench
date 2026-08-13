@@ -1380,10 +1380,14 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     # Being unpriced is a property of the TRIAL, not of the flag, so it
     # is read from the same two fields that decide the counts above
     # rather than from anything about BYOK.
-    # BY IDENTITY, not by equality. Two trials of the same model on the
-    # same task with the same outcome are equal dicts and different
-    # rows, and `r in billed_rows` would answer for whichever came
-    # first.
+    # BY IDENTITY, and the honest reason is cost rather than
+    # correctness. An earlier version of this comment claimed equality
+    # would give a different answer for two equal rows, and that is
+    # false: billed-ness is decided by a row's own fields, so a row
+    # equal to a billed row is itself billed and `in` would agree. What
+    # equality would actually cost is a linear scan per figure, turning
+    # one pass into a quadratic one on an experiment with thousands of
+    # trials.
     priced = {id(r) for r in billed_rows} | {id(r) for r in estimated_rows}
     upstream: dict[str, list[str]] = {
         "byok": [],

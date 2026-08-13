@@ -666,6 +666,17 @@ def reservation_reason(state: str, max_tokens: int) -> str | None:
     reason, it is a restatement; an operator deciding whether to raise a
     budget needs to see which number was too small and what the provider
     would have done instead.
+
+    NO PRODUCTION CALLER TODAY, and that is stated rather than left for
+    somebody to discover. Its consumer is the property test, which is
+    not a small thing: the test it replaced computed its own expectation
+    with the implementation's own condition, character for character, so
+    it passed by construction. Asserting a NAMED state and a sentence
+    with numbers in it is what makes that impossible.
+
+    Putting the sentence on a card is a separate change with a separate
+    surface to design, and it is deliberately not in this round. What
+    exists here is the vocabulary and the arithmetic, ready for it.
     """
     want = int(max_tokens * REASONING_BUDGET_SHARE)
     share = int(REASONING_BUDGET_SHARE * 100)

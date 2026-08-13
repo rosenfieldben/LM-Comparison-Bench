@@ -3233,6 +3233,15 @@ async def test_review_repro_a_pin_names_a_provider_not_an_endpoint(client):
                     },
                     # A second provider, also twice, and this one
                     # disagrees with itself about the parameter.
+                    #
+                    # ITS TWO TAGS CARRY A VARIANT SUFFIX, which is the
+                    # ordinary live shape rather than a corner: of the
+                    # twenty endpoints measured, most tags looked like
+                    # "coreweave/fp4", "mancer/fp8" or
+                    # "amazon-bedrock/eu-west-1". Both halves of one
+                    # provider must resolve to the same slug, and until
+                    # this fixture carried a suffix the whole suite
+                    # passed with the split removed.
                     {
                         "provider_name": "Amazon Bedrock",
                         "tag": "amazon-bedrock",
@@ -3241,7 +3250,7 @@ async def test_review_repro_a_pin_names_a_provider_not_an_endpoint(client):
                     },
                     {
                         "provider_name": "Amazon Bedrock",
-                        "tag": "amazon-bedrock",
+                        "tag": "amazon-bedrock/eu-west-1",
                         "max_completion_tokens": 8192,
                         "supported_parameters": ["max_tokens"],
                     },
@@ -3266,6 +3275,18 @@ async def test_review_repro_a_pin_names_a_provider_not_an_endpoint(client):
     # land on either is False.
     assert endpoint_supports_reasoning(listing, "deepinfra") is True
     assert endpoint_supports_reasoning(listing, "amazon-bedrock") is False
+    # THE VARIANT IS NOT A DIFFERENT PROVIDER. Both Bedrock rows answer
+    # to one pin, so the disagreeing one is reachable; reading the tag
+    # whole would make "amazon-bedrock/eu-west-1" its own slug that no
+    # pin names, the cap 8192 would come from one endpoint instead of
+    # two, and the parameter answer would flip to True from the only
+    # remaining match.
+    assert [e["slug"] for e in listing["endpoints"]] == [
+        "deepinfra",
+        "deepinfra",
+        "amazon-bedrock",
+        "amazon-bedrock",
+    ]
     # Reading only the first match would have said True here, from an
     # endpoint the request may never reach.
     assert listing["endpoints"][2]["supported_parameters"] == [

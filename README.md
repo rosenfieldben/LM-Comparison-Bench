@@ -125,16 +125,36 @@ existed or a provider that did not report it.
 
 It is a **JSON boolean on every surface**: `/compare`, `GET /runs/{id}`,
 `GET /groups/{id}`, the streaming done frame, and the v4 export line.
-Reconciliation parses it from the generation record and fills it where
-the wire never said, without erasing what it did.
+Both external documents are parsed by the same strict rule, which
+accepts a boolean and nothing else; the SQLite decoder that turns `1`
+back into `True` is for cells only, and applying it to JSON is what let
+the generation endpoint answer `True` to a wire value the in-band parse
+answered `null` to.
 
-**The report reads it.** Upstream figures are split three ways, and only
-the `byok` bucket is described as a bill. A non-BYOK run that reports an
-upstream figure is shown as what it is, the same money already inside
-the credit total, and a run with no flag recorded is left unattributed
-rather than guessed at. Before this, every figure was labelled a direct
-provider charge, which on one measured route published OpenRouter's own
-charge a second time as an invoice nobody was owed.
+Reconciliation **fills the flag and never corrects it**, the same
+direction the upstream figure takes and for a stronger reason: the
+in-band value is taken in the same exchange as the charge, the
+endpoint's is a later summary of it, and the two are measured to
+disagree about the same generation. A row missing only the flag is on
+the work list, because the endpoint answers this question for every
+generation and one pass converges it.
+
+**The report reads it.** Upstream figures are split four ways, and only
+the `byok` bucket is described as a bill:
+
+| bucket | what the reader is told |
+|---|---|
+| `byok` | billed direct by the provider, not in the total |
+| `not_byok` | the same money already inside the total |
+| `not_byok_unpriced` | not added as a separate bill, and the trial has no price |
+| `unknown` | no flag recorded, so nothing is claimed |
+
+The third exists because the second's sentence could be false. A trial
+with no billed charge and no estimate contributes nothing, so on a
+report whose total is zero the old wording told a reader a figure was
+already inside a total of nothing. Before any of this, every figure was
+labelled a direct provider charge, which on one measured route published
+OpenRouter's own charge a second time as an invoice nobody was owed.
 
 It travels the whole way: served on the result, written by the reconcile
 pass from the generation record, carried on the export's trial lines, and
@@ -410,12 +430,28 @@ Where any answer is no, or the catalog is silent, nothing is sent and
 the payload is byte-identical to what it was before this feature
 existed.
 
-**A strict pin is checked against the pinned endpoint**, never the model
-aggregate. OpenRouter publishes capabilities per endpoint and a model's
-list is the union across hosts; one real model's three endpoints
+**A strict pin is checked against the pinned endpoints**, never the
+model aggregate. OpenRouter publishes capabilities per endpoint and a
+model's list is the union across hosts; one real model's three endpoints
 advertised 18, 12 and 17 parameters on 2026-08-12. A pinned run asks
-`/models/:author/:slug/endpoints` about that one host, and when the
-listing cannot answer, the field is not sent.
+`/models/:author/:slug/endpoints`, and when the listing cannot answer,
+the field is not sent.
+
+**Endpoints, plural, because a pin names a provider and a provider may
+serve one model from several.** `openai/gpt-oss-120b` lists DeepInfra
+twice and Amazon Bedrock twice, and the router picks. So every endpoint
+matching the pin must advertise a parameter before it is sent, and the
+budget is clamped to the LOWEST completion ceiling any of them
+publishes. Matching is on the endpoint's own published `tag`, not on its
+display name: see the pinned observations for the sixteen providers
+where lowercasing the name gives the wrong slug, and the one where it
+gives a different provider's.
+
+**A pinned run is also budgeted against its route.** The model-level
+completion cap is the maximum any host offers, so budgeting a pinned run
+from it budgets from the most generous host in the pool. The route is
+resolved before the budget arithmetic runs, once per run rather than
+once per trial.
 
 How binding the request is where it IS sent depends on the model, and
 the honest range is wide. See **How far the reservation actually
@@ -504,14 +540,48 @@ fivefold. The comparison is against the share constant, not the word
 With that extension the count is **56 of 410**: 8 where the cap is a
 true ceiling, 48 where it provably cannot enable or intensify.
 
-Two further cases drop it entirely. If you set a reasoning effort under
-**Experiment controls**, the reservation stands down, because the same
-page both forbids sending an effort and a cap together ("One of the
-following (not both)") and elsewhere suggests sending the cap
-"instead of (or alongside)" the effort, naming no winner for the
-collision; rather than discover the resolution in production, the bench
-sends only your declaration. And a provider that does not support the
-parameter ignores it, per the [provider-selection
+**A descriptor that contradicts itself vouches for nothing.**
+`mandatory: true` says thinking cannot be turned off; `default_enabled:
+false` says it is off unless turned on. Both cannot hold, so the pair
+fails closed through both routes above. No model in the live catalog
+published that shape on either read date; the check is cheap and the
+cost of believing the convenient half is switching thinking on for a
+route whose own entry says it is off.
+
+**Four further cases drop the reservation entirely, and they are
+different from each other.** Two are about who decided and two are
+arithmetic:
+
+| state | what it means |
+|---|---|
+| not vouched | the gate above said no |
+| effort declared | you set one under **Experiment controls**, and a declaration outranks a default |
+| split below the provider floor | half the budget is under 1024, so the request would be honoured at 1024 and the 50/50 split would not be |
+| no room above the provider floor | the budget is not strictly above 1024, so no pair of numbers satisfies the contract |
+
+The last two used to be one state called "unsatisfiable", which was
+false of the first: at an outer budget of 1200 a request naming 1024
+*would* be accepted, and only the split cannot be honoured. Each state
+now produces a sentence with the arithmetic in it.
+
+In the effort case the reservation stands down because the same page
+both forbids sending an effort and a cap together ("One of the following
+(not both)") and elsewhere suggests sending the cap "instead of (or
+alongside)" the effort, naming no winner for the collision; rather than
+discover the resolution in production, the bench sends only your
+declaration.
+
+In the two floor cases it stands down rather than naming the floor,
+because the provider's own default carries the same floor
+(`max(min(max_tokens * {effort_ratio}, 128000), 1024)`), so sending
+`1024` buys nothing where the floor is documented and could be *more*
+thinking than the route's default where it is not. And a function whose
+purpose is reserving visible room does not reserve one token of it: at
+an outer budget of 1025, naming the floor leaves exactly one visible
+token.
+
+Beyond all of that, a provider that does not support the parameter
+ignores it, per the [provider-selection
 rules](https://openrouter.ai/docs/guides/routing/provider-selection).
 
 So exhaustion stays possible on most routes, which is why the rest of
@@ -578,16 +648,28 @@ select, never from the tier you clicked:
   standard for every model on an offline boot, so extended is often
   byte-identical to standard. Suggesting it there would be telling you
   to spend four times as much on the same request.
-- a lower reasoning effort is suggested only when a lower one is
-  selectable. `low` is the floor; "unset" is not lower, because on a
-  vouched model the bench then sends its own half-budget reservation.
+- a lower reasoning effort is suggested only when the effort in force
+  is one the documented ladder places **above** `low`, the floor the UI
+  offers. "Unset" is **not** advice to lower: with nothing selected the
+  route runs at its catalog default, which the card cannot see and which
+  two measured families publish below `low` (`openai/gpt-5.1` at
+  `"none"`, the Flash-Lite variants at `"minimal"`). Suggesting `low`
+  there would raise reasoning on a card whose whole subject is that
+  reasoning consumed the budget. The comparison is against shares, so
+  exposing `minimal` in the UI moves the floor rather than silently
+  breaking the rule.
 - when neither can help, the card says nothing beyond the accounting
-  sentence. Silence is the honest answer when every remedy is known not
-  to work.
+  sentence. Silence is the honest answer when no remedy can be shown to
+  help.
 
 The same derivation runs for replayed cards, so a card in History gives
 the same advice it gave live, and the budget cap is shown on live cards
-too, since that is the surface where somebody is about to spend.
+too, since that is the surface where somebody is about to spend. **A
+replayed card is told which tier its run selected**, which a stored row
+cannot carry and the group can: without it the card compares today's
+published cap against the ceiling that run received, and starts
+suggesting the extended tier to a run that already used it the moment
+the published cap rises.
 
 **Whitespace is not an answer.** A response of spaces and newlines used
 to be stored as visible output, so a fully billed reasoning burn could
@@ -1578,7 +1660,10 @@ tier. Strict mode checks what it can check and claims exactly that.
 
 `provider_pins` is strict-mode only, normalized to the documented
 lowercase provider slugs at creation so the recorded pin and the sent pin
-are one string, and a pin travels as
+are one string. **Write the documented slug, not the display name**:
+normalization only strips and lowercases, and for sixteen of 102
+providers that does not produce the slug (`Moonshot AI` is
+`moonshotai`, `Amazon Bedrock` is `amazon-bedrock`). A pin travels as
 `order` **with `allow_fallbacks: false`**, never without it: an order that
 can be departed from is a preference, and a pinned run served by somebody
 else would record a constraint that did not hold.
@@ -2568,7 +2653,10 @@ picked up without restarts, and verify by eyeball after UI changes:
   ends with "try extended budget". A column whose budget went to
   reasoning instead says "no visible answer: completion budget
   exhausted during reasoning" with the count, and ends with "try
-  extended budget or a lower reasoning effort". A column that stopped
+  extended budget" (and "or a lower reasoning effort" as well, if you
+  set the effort to medium or high before running; with the effort left
+  unset the card cannot tell whether lowering it would help, so it does
+  not say). A column that stopped
   for any other reason says "nearly all of the completion went to reasoning"
   with the count and the stop reason, and is offered no budget remedy.
   A column that answered

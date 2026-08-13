@@ -2919,6 +2919,12 @@ def effective_budget(budget: str, model: str) -> int:
     cap: with the catalog fetched, most models simply do not publish one,
     and clamping those would quietly disable the extended tier for them.
     A fetched catalog keeps today's behavior exactly.
+
+    NOT THE ONLY CLAMP ANY MORE, on one path. A PINNED trial composes
+    route_budget on top of this, against the ceiling the selected
+    ENDPOINT publishes, because the model-level cap this function reads
+    is the maximum across every host serving the model. Everything
+    unpinned, which is every comparison, still ends here.
     """
     requested = BUDGET_TOKENS[budget]
     limit: int | None = app.state.completion_limits.get(model)
@@ -3940,6 +3946,13 @@ async def resolve_routes(
     hundreds of paid calls, so concurrency here would buy nothing and
     add a failure mode. fetch_endpoints never raises, so a listing that
     fails resolves to the same "learned nothing" a missing pin gives.
+
+    THE WORST CASE IS BOUNDED and worth stating, because this now sits
+    between "start" and the first trial. Each listing is capped at
+    PRICES_TIMEOUT_S and never raises, so an unreachable endpoint API
+    delays a pinned run by ten seconds per distinct model and then
+    proceeds with the model-level clamp. An UNPINNED experiment, which
+    is every ordinary one, makes no request here at all.
     """
     return {
         model: await trial_route(experiment, model) for model in dict.fromkeys(lineup)
