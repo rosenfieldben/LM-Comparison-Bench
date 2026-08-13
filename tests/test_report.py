@@ -346,6 +346,105 @@ def test_costs_prefer_the_billed_figure_and_show_both_counts():
     assert out["unpriced_trials"] == 1
 
 
+def test_review_repro_an_unpriced_upstream_figure_is_not_inside_the_total():
+    """WINDOW: _cost_totals' upstream block beside its own total, for a
+    trial that has an upstream figure and no price.
+
+    THE DEFECT WAS A SENTENCE THE NUMBERS COULD NOT SUPPORT. Every
+    non-BYOK figure was placed in one bucket and the UI described that
+    bucket as "already inside the total". A trial with no billed charge
+    and no local estimate contributes nothing to the total, so on the
+    shape below the report said 0.0042 was already inside a total of
+    zero.
+
+    THE FIX IS A FOURTH BUCKET, not a reworded sentence, because the
+    distinction is real and the reader needs both halves: nobody called
+    the figure a second bill, AND the trial has no price. A sentence
+    alone would have had to hedge on every row, including the majority
+    where the old wording was true.
+
+    UNPRICED IS A PROPERTY OF THE TRIAL, so the split is asserted here
+    against the same two fields that decide unpriced_trials, and the
+    conservation check below is what makes that more than a claim: the
+    four buckets partition the figures exactly.
+    """
+    rows = [
+        # The reviewer's shape: a figure, a flag, and no price at all.
+        {
+            "billed_cost_usd": None,
+            "cost_usd": None,
+            "upstream_inference_cost_usd": "0.0042",
+            "is_byok": False,
+        },
+        # Non-BYOK and BILLED, where "already inside the total" is true.
+        {
+            "billed_cost_usd": 0.01,
+            "cost_usd": None,
+            "upstream_inference_cost_usd": "0.001",
+            "is_byok": False,
+        },
+        # Non-BYOK and ESTIMATED, which also counts toward the total, so
+        # unpriced really means unpriced and not merely unbilled.
+        {
+            "billed_cost_usd": None,
+            "cost_usd": 0.02,
+            "upstream_inference_cost_usd": "0.002",
+            "is_byok": False,
+        },
+        # A real second bill, untouched by any of this.
+        {
+            "billed_cost_usd": 0.03,
+            "cost_usd": None,
+            "upstream_inference_cost_usd": "0.03",
+            "is_byok": True,
+        },
+    ]
+
+    out = _cost_totals(rows)
+
+    assert out["total_usd"] == pytest.approx(0.06)
+    assert out["unpriced_trials"] == 1
+    up = out["upstream"]
+    assert up["not_byok_unpriced"]["values"] == ["0.0042"]
+    assert up["not_byok"]["values"] == ["0.001", "0.002"]
+    assert up["byok"]["values"] == ["0.03"]
+    assert up["unknown"]["values"] == []
+    # CONSERVATION: every reported figure lands in exactly one bucket,
+    # so the split cannot lose money or count it twice.
+    assert sorted(v for b in up.values() for v in b["values"]) == sorted(
+        r["upstream_inference_cost_usd"] for r in rows
+    )
+
+
+def test_the_zero_total_shape_says_unpriced_and_nothing_about_the_total():
+    """WINDOW: the exact shape from the review, alone, so the sentence
+    the UI builds from it can be read off the numbers.
+
+    ALONE IS THE POINT. In the mixed table above the total is nonzero,
+    so a reader could believe the old wording was merely imprecise.
+    Here it was false: total_usd is 0 and a figure of 0.0042 was
+    described as being inside it.
+    """
+    out = _cost_totals(
+        [
+            {
+                "billed_cost_usd": None,
+                "cost_usd": None,
+                "upstream_inference_cost_usd": "0.0042",
+                "is_byok": False,
+            }
+        ]
+    )
+
+    assert out["total_usd"] == 0
+    assert out["unpriced_trials"] == 1
+    # The bucket the UI is allowed to call "already inside the total" is
+    # empty, which is what makes the sentence unreachable rather than
+    # merely reworded.
+    assert out["upstream"]["not_byok"]["trials"] == 0
+    assert out["upstream"]["not_byok_unpriced"]["trials"] == 1
+
+
 def test_provider_counts_are_ordered_by_frequency_then_name():
     """The routed-service estimand made visible. Under dynamic routing
     the provider is chosen per call, so it is the largest confound in any

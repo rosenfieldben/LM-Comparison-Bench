@@ -702,6 +702,14 @@
     font-size: 10.5px;
     color: var(--warn);
   }
+  /* Same shape as save-warn: both are card-level notices that sit
+     between the metrics and the body. Same warn colour, because both
+     report something the reader would otherwise have to infer. */
+  .reasoning-warn {
+    padding: 8px var(--pad-card) 0;
+    font-size: 10.5px;
+    color: var(--warn);
+  }
 
   /* ==== Diff panel ==== */
   #diff-header {

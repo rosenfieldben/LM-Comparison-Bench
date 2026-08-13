@@ -103,9 +103,58 @@ what the upstream provider billed you directly. The bench records it in
 its own column beside the credit charge and **never meters it**, because a
 direct provider bill is not money OpenRouter can decline and a ceiling
 that pretended otherwise would be describing a control it does not have.
-Off BYOK the field is absent or zero and the column is NULL, which is the
-honest record of "this run was not BYOK"; a stored zero would be
-indistinguishable from a BYOK run that genuinely cost nothing.
+The documentation says that off BYOK the field "will be 0 or null".
+**That is not always what arrives.** Both calls of the reasoning probe
+above carry `is_byok: false` together with a *nonzero*
+`upstream_inference_cost` equal to `cost` to the last digit, and two
+further fields the documentation does not mention at all
+(`upstream_inference_prompt_cost`,
+`upstream_inference_completions_cost`, both observed and neither
+stored).
+
+So the record was split rather than filtered. `upstream_inference_cost`
+is stored **exactly as the wire reported it**, including a zero;
+suppressing an observed money figure to protect a column's intended
+meaning would have fixed this paragraph by falsifying the database.
+NULL there now means one thing only: the wire sent nothing usable.
+
+The meaning moved to its own column. **`is_byok`** says whether
+OpenRouter billed the run against your own provider key, in three
+states: true, false, and null for a row written before the column
+existed or a provider that did not report it.
+
+It is a **JSON boolean on every surface**: `/compare`, `GET /runs/{id}`,
+`GET /groups/{id}`, the streaming done frame, and the v4 export line.
+Both external documents are parsed by the same strict rule, which
+accepts a boolean and nothing else; the SQLite decoder that turns `1`
+back into `True` is for cells only, and applying it to JSON is what let
+the generation endpoint answer `True` to a wire value the in-band parse
+answered `null` to.
+
+Reconciliation **fills the flag and never corrects it**, the same
+direction the upstream figure takes and for a stronger reason: the
+in-band value is taken in the same exchange as the charge, the
+endpoint's is a later summary of it, and the two are measured to
+disagree about the same generation. A row missing only the flag is on
+the work list, because the endpoint answers this question for every
+generation and one pass converges it.
+
+**The report reads it.** Upstream figures are split four ways, and only
+the `byok` bucket is described as a bill:
+
+| bucket | what the reader is told |
+|---|---|
+| `byok` | billed direct by the provider, not in the total |
+| `not_byok` | the same money already inside the total |
+| `not_byok_unpriced` | not added as a separate bill, and the trial has no price |
+| `unknown` | no flag recorded, so nothing is claimed |
+
+The third exists because the second's sentence could be false. A trial
+with no billed charge and no estimate contributes nothing, so on a
+report whose total is zero the old wording told a reader a figure was
+already inside a total of nothing. Before any of this, every figure was
+labelled a direct provider charge, which on one measured route published
+OpenRouter's own charge a second time as an invoice nobody was owed.
 
 It travels the whole way: served on the result, written by the reconcile
 pass from the generation record, carried on the export's trial lines, and
@@ -115,13 +164,30 @@ because nothing computes with it. Its use is matching a provider's own
 invoice line, and a float would reformat the number being matched.
 
 The reconcile pass writes it on every row it reaches, and its work list
-does **not** select on it being absent. NULL is the affirmative "not
-BYOK", and there is no column for "asked, and the answer was no", so a
-clause on it would park every ordinary row on the list forever and the
-pass would never converge. The narrow case that leaves unreached is a
-BYOK run whose usage object arrived with `cost` and without
-`cost_details`, leaving the row otherwise complete; that gap is real and
-smaller than a work list that never empties.
+does **not** select on it being absent. NULL here means **the wire sent
+no usable figure**, which is not the same as "not BYOK" and this
+paragraph used to say it was, contradicting the accurate explanation
+above: two live captures carry `is_byok: false` beside a nonzero
+upstream figure, and `is_byok` is the column that answers the billing
+question. There is no column for "asked, and the answer was no", so a
+clause on this figure would park every ordinary row on the list forever
+and the pass would never converge. The narrow case that leaves
+unreached is a BYOK run whose usage object arrived with `cost` and
+without `cost_details`, leaving the row otherwise complete; that gap is
+real and smaller than a work list that never empties.
+
+`is_byok` itself **is** on the work list, because the endpoint answers
+it for every generation and one pass converges it. One state is
+deliberately not reachable from there: a corrupted cell holding
+something that is neither 1, 0 nor NULL, such as the text `'yes'`.
+SQLite's column affinity accepts it, `as_flag` decodes it to `None` so
+no reader is told something the wire never said, and the report counts
+the trial as unattributed. But the predicate selects on `IS NULL` and
+the cell is not null, so the pass never offers the row, and fill-only
+`COALESCE` would keep the text even if it did. **No writer in this
+repository can create that state** (every path goes through `as_flag`
+on the way in), so it is recorded here as a known limit of
+reconciliation against a database edited by hand rather than fixed.
 
 Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
@@ -290,7 +356,7 @@ never left sitting under the banner.
 Every run carries one of two completion budgets, picked next to the
 Run button: standard (16384 tokens) or extended (65536). Reasoning
 models spend the budget on hidden thinking before any visible
-answer, so a hard problem can empty the standard budget and come
+answer, so a hard problem can run the standard budget down and come
 back as "finish_reason: length"; extended exists for exactly that
 case, and the error message says so when it applies. The choice is
 per session and resets to standard on the next visit. The requested
@@ -310,6 +376,512 @@ on replayed columns; older runs predate the field and show none),
 and reruns reuse the budget of the run they retry. The API accepts
 `"budget": "standard" | "extended"` on `/compare` and
 `/compare/stream`; anything else is a 422.
+
+### Reserving room for the answer
+
+A request to a model that **already reasons** asks for half its
+completion budget to be left for the visible answer, sending
+`reasoning: {"max_tokens": N}` beside the cap: 8192 of the standard
+tier's 16384, 32768 of extended's 65536.
+
+**The judge reserves nothing**, and the arithmetic is why. Its budget is
+512 tokens. Half of that is 256, which the contract's Anthropic minimum
+raises to 1024 (*"that value is used directly with a minimum of 1024
+tokens"*), and the contract also requires that *"`max_tokens` must be
+strictly higher than the reasoning budget"*. 512 is not higher than
+1024, so the request is unsatisfiable by the contract's own rules.
+Raising the judge's budget past 2048 to make a half share legal would
+buy reasoning headroom for a task whose entire output is a number and a
+sentence. A judge that exhausts already records the trial as unscored,
+which is the true statement and a different situation from a comparison
+card that billed for thinking and showed nothing.
+
+"Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
+request schema says of the reasoning object's `enabled` key: "Default:
+inferred from `effort` or `max_tokens`", so a cap sent on its own should
+not merely bound thinking but **switch it on**. That was tested rather
+than assumed. Two live calls to `google/gemma-4-31b-it` (served by
+DeepInfra, 2026-08-12), a model publishing `default_enabled: false`,
+differing in nothing but that one field:
+
+| | control | with `reasoning: {"max_tokens": 256}` |
+|---|---|---|
+| generation | `gen-1786546333-86V1vJMk7JsWwwPhajoN` | `gen-1786546398-Z4GhaMYohdT9FWGFiYhc` |
+| completion tokens | 35 | 338 |
+| reasoning tokens | **0** | **312** |
+| cost | $1.629e-05 | $1.3182e-04 |
+
+Both stopped normally. The cap alone enables thinking, and billed 8.1x
+for the same short question. Both usage blocks are in the repository at
+`tests/fixtures/probe_reasoning_enable.json` and a test replays them. On
+a model whose
+catalog entry says reasoning is off by default, an unprompted cap would
+start buying reasoning tokens nobody was buying, on every run, which is
+the opposite of what this exists to do.
+
+The bench therefore sends the cap only where the catalog answers yes to
+**all three** of these questions.
+
+**Does the model reason regardless?** `mandatory: true`, or
+`default_enabled: true` with a `default_effort` that is not `"none"`.
+That last clause is not a technicality: `openai/gpt-5.1` publishes
+`default_enabled: true` and `default_effort: "none"` together, and the
+contract says *"If the value is `none`, treat it as 'reasoning off by
+default'"*. Reading only the first flag would switch its reasoning on.
+
+**Is the cap actually a ceiling?** `supports_max_tokens: true`. Without
+it, the contract says the value *"will be used to determine the effort
+level"*, and half a budget determines approximately `medium`. On a model
+whose default effort is `minimal`, roughly 10%, that is a fivefold
+increase in thinking bought unprompted. The Gemini 3.1 and 3.5 Flash
+Lite variants publish exactly that shape.
+
+**Does it advertise the parameter?** `reasoning` in
+`supported_parameters`. Under **strict mode**, which sends
+`require_parameters: true`, a provider that does not support a request
+parameter is excluded rather than allowed to ignore it, so an
+unadvertised field would narrow the provider pool and change what is
+being measured.
+
+Where any answer is no, or the catalog is silent, nothing is sent and
+the payload is byte-identical to what it was before this feature
+existed.
+
+**A strict pin is checked against the pinned endpoints**, never the
+model aggregate. OpenRouter publishes capabilities per endpoint and a
+model's list is the union across hosts; one real model's three endpoints
+advertised 18, 12 and 17 parameters on 2026-08-12. A pinned run asks
+`/models/:author/:slug/endpoints`, and when the listing cannot answer,
+the field is not sent.
+
+**Endpoints, plural, because a pin names a provider and a provider may
+serve one model from several.** `openai/gpt-oss-120b` lists DeepInfra
+twice and Amazon Bedrock twice, and the router picks. So every endpoint
+matching the pin must advertise a parameter before it is sent, and the
+budget is clamped to the LOWEST completion ceiling any of them
+publishes. Matching is on the endpoint's own published `tag`, not on its
+display name: see the pinned observations for the sixteen providers
+where lowercasing the name gives the wrong slug, and the one where it
+gives a different provider's.
+
+**A pinned run is also budgeted against its route.** The model-level
+completion cap is the maximum any host offers, so budgeting a pinned run
+from it budgets from the most generous host in the pool. The route is
+resolved before the budget arithmetic runs, once per run rather than
+once per trial.
+
+How binding the request is where it IS sent depends on the model, and
+the honest range is wide. See **How far the reservation actually
+reaches** below before treating it as a guarantee.
+
+This is the one default the bench sends unprompted, and it is a
+deliberate exception to "never send a default" (see **Experiment
+controls**), narrowed by the gate above to models where the thing being
+bounded was going to happen anyway. It was taken because the
+alternative was observed in production. A
+comparison on document prompts reasoned until the completion cap closed
+on it: every card billed in full, between $3.38 and $3.50, with no
+visible answer at all. The generation records were unambiguous about
+where the money went, 21350 completion tokens against 21350 reasoning
+tokens. Nothing bounded the thinking because nothing had asked to.
+
+Exhaustion is a property of thinking hard against a completion cap, not
+of any particular model, so the reservation is a function of the budget
+and of nothing else. No model name appears anywhere in it, and a test
+parses the function to prove that.
+
+Half rather than some other share: at extended, a maximal thinker still
+leaves 32768 tokens for the answer, four times the entire standard tier;
+at standard it leaves 8192, which is a long answer by any measure. A
+smaller share would start refusing thought a hard prompt legitimately
+needs.
+
+#### How far the reservation actually reaches
+
+On a small minority of models it is a hard token budget. On most it is a
+hint that means approximately the right thing. On a few it is nothing at
+all. All three are worth knowing before you rely on it.
+
+Measured against the live catalog on 2026-08-12: of 406 models, 275
+publish `reasoning` support, and **10** advertise `supports_max_tokens`.
+Those ten get a real budget. For the rest, [the reasoning-tokens
+guide](https://openrouter.ai/docs/guides/best-practices/reasoning-tokens)
+says the cap "will be used to determine the effort level", and its own
+table puts `medium` at "approximately 50% of max_tokens", which is
+exactly the share being asked for. The intent survives; the precision
+does not. Two named routes are looser still: Anthropic floors the
+allocation at 1024 tokens, and for Gemini 3 "Google internally maps this
+budget value to a `thinkingLevel`, so you will not get precise token
+control".
+
+Before any of that, the gate. Measured against the live catalog on
+2026-08-12, of 410 models:
+
+| | count |
+|---|---|
+| the cap is a true ceiling, so it rides | **8** |
+| reasons, but no budget support: a cap would set an effort | 149 |
+| `default_effort: "none"`, so reasoning is off | 2 |
+| `default_enabled: false`, so reasoning is off | 23 |
+| does not reason unprompted, or the catalog does not say | 98 |
+| no reasoning descriptor at all | 130 |
+
+**Eight.** An earlier version of this gate vouched for 159, and the 151
+it withdrew are the finding rather than a regression: on 149 of them the
+field was never a ceiling, and on 2 it would have switched reasoning on.
+
+**A fourth route in, derived from harm rather than from the contract.**
+Eight was the count when the gate demanded `supports_max_tokens`, and
+that demand excluded the model the original incident happened on, which
+publishes `mandatory: true` and `default_effort: "high"` but no budget
+flag. Rather than pick a side in a contract that contradicts itself (see
+**Pinned observations**), the gate asks what a cap could actually DO.
+
+Where a model is `mandatory` (thinking is unconditionally on, so a cap
+cannot enable anything) and its `default_effort` is at or above the
+share the bench would request, enumerate every documented outcome:
+
+| the route | the effect of a half-budget cap |
+|---|---|
+| honours it as a budget | thinking is **bounded** |
+| translates it to an effort | lands near `medium`, at or below this model's own default, so thinking is **lowered or unchanged** |
+| ignores it | **nothing changes** |
+
+None of the three raises thinking, and none can switch it on. So the cap
+rides there too. That re-covers the incident's own model by rule and
+keeps `google/gemini-3.5-flash-lite` out, which is `mandatory` at
+`minimal`: a translation toward medium would raise its thinking
+fivefold. The comparison is against the share constant, not the word
+"medium", so it stays correct if the share moves.
+
+With that extension the count is **56 of 410**: 8 where the cap is a
+true ceiling, 48 where it provably cannot enable or intensify.
+
+**A descriptor that contradicts itself vouches for nothing.**
+`mandatory: true` says thinking cannot be turned off; `default_enabled:
+false` says it is off unless turned on. Both cannot hold, so the pair
+fails closed through both routes above. No model in the live catalog
+published that shape on either read date; the check is cheap and the
+cost of believing the convenient half is switching thinking on for a
+route whose own entry says it is off.
+
+**Four further cases drop the reservation entirely, and they are
+different from each other.** Two are about who decided and two are
+arithmetic:
+
+| state | what it means |
+|---|---|
+| not vouched | the gate above said no |
+| effort declared | you set one under **Experiment controls**, and a declaration outranks a default |
+| split below the provider floor | half the budget is under 1024, so the request would be honoured at 1024 and the 50/50 split would not be |
+| no room above the provider floor | the budget is not strictly above 1024, so no pair of numbers satisfies the contract |
+
+The last two used to be one state called "unsatisfiable", which was
+false of the first: at an outer budget of 1200 a request naming 1024
+*would* be accepted, and only the split cannot be honoured. Each state
+now produces a sentence with the arithmetic in it.
+
+In the effort case the reservation stands down because the same page
+both forbids sending an effort and a cap together ("One of the following
+(not both)") and elsewhere suggests sending the cap "instead of (or
+alongside)" the effort, naming no winner for the collision; rather than
+discover the resolution in production, the bench sends only your
+declaration.
+
+In the two floor cases it stands down rather than naming the floor,
+because the provider's own default carries the same floor
+(`max(min(max_tokens * {effort_ratio}, 128000), 1024)`), so sending
+`1024` buys nothing where the floor is documented and could be *more*
+thinking than the route's default where it is not. And a function whose
+purpose is reserving visible room does not reserve one token of it: at
+an outer budget of 1025, naming the floor leaves exactly one visible
+token.
+
+Beyond all of that, a provider that does not support the parameter
+ignores it, per the [provider-selection
+rules](https://openrouter.ai/docs/guides/routing/provider-selection).
+
+So exhaustion stays possible on most routes, which is why the rest of
+this section is about what the bench does after the fact rather than
+before it. That is not a consolation prize: the instrumentation below
+reads the tokens that came back, so it works everywhere, including on
+every route the gate and the vendor's own translation leave uncovered.
+
+### When it happens anyway, the card says so
+
+A run that produced no visible answer used to report `empty response
+(finish_reason: length)`. That is true and useless: it names the symptom,
+omits where the money went, and reads like a provider glitch, so the
+natural response is to retry and spend it again. Such a card now reads
+
+```
+no visible answer: completion budget exhausted during reasoning
+(21350 reasoning tokens)
+```
+
+with the count included as the evidence for the claim, matching the
+card's own reasoning metric.
+
+That exact wording is reserved for a card whose budget genuinely ran
+out, which OpenRouter reports as `finish_reason: length`. The reason for
+the gate is worth stating, because getting it wrong cost real money in
+an earlier draft of this very feature. A card reaches this path only
+when it produced no visible text at all, so for any reasoning model the
+reasoning count is at or near the completion count no matter WHY the
+response was empty: a refusal, a content filter and a provider abort all
+look identical to a truncation by that measure. On the shape alone, a
+content filter that spent 37 of 16384 tokens was told its completion
+budget had been exhausted, and the card then advised buying the extended
+tier and running again.
+
+A card that went to reasoning without the budget running out says so
+instead, keeping the accounting fact and dropping the claim:
+
+```
+no visible answer: nearly all of the completion went to reasoning
+(37 reasoning tokens, finish_reason: content_filter)
+```
+
+and it is offered no budget remedy, because no budget would help. The
+old wording is kept exactly for a genuinely empty response with no
+thinking behind it, which is a third failure again.
+
+The trigger is the token shape plus that one normalized field: reasoning
+tokens at or above nine tenths of the completion count (the threshold
+is `REASONING_SHARE_EXHAUSTED`, defined once in `bench/models.py` and
+checked against the browser's copy by an executing test), and whether
+generation stopped at the cap. No model name is involved, and both
+inputs are things that came BACK rather than things the bench sent,
+which is what lets this work on every route above where the reservation
+could not act: a provider that ignores a request parameter still reports
+its usage and its stop reason honestly.
+
+**The card offers only knobs that exist.** The advice is derived from
+the ceiling this run was actually sent and from what you can actually
+select, never from the tier you clicked:
+
+- a larger budget is suggested only when one exists. The requested tier
+  is clamped to a model's published completion cap, and falls back to
+  standard for every model on an offline boot, so extended is often
+  byte-identical to standard. Suggesting it there would be telling you
+  to spend four times as much on the same request.
+- a lower reasoning effort is suggested only when the effort in force
+  is one the documented ladder places **above** `low`, the floor the UI
+  offers. "Unset" is **not** advice to lower: with nothing selected the
+  route runs at its catalog default, which the card cannot see and which
+  two measured families publish below `low` (`openai/gpt-5.1` at
+  `"none"`, the Flash-Lite variants at `"minimal"`). Suggesting `low`
+  there would raise reasoning on a card whose whole subject is that
+  reasoning consumed the budget. The comparison is against shares, so
+  exposing `minimal` in the UI moves the floor rather than silently
+  breaking the rule.
+- when neither can help, the card says nothing beyond the accounting
+  sentence. Silence is the honest answer when no remedy can be shown to
+  help.
+
+The same derivation runs for replayed cards, so a card in History gives
+the same advice it gave live, and the budget cap is shown on live cards
+too, since that is the surface where somebody is about to spend. **A
+replayed card is told which tier its run selected**, which a stored row
+cannot carry and the group can: without it the card compares today's
+published cap against the ceiling that run received, and starts
+suggesting the extended tier to a run that already used it the moment
+the published cap rises.
+
+**Whitespace is not an answer.** A response of spaces and newlines used
+to be stored as visible output, so a fully billed reasoning burn could
+render as a blank card with no error, no label and no remedy. It now
+joins empty for every purpose: the exhaustion path, the judge (which is
+not paid to grade it) and the scorer (which records it as a trial that
+did not complete rather than a wrong answer). The stored text is never
+trimmed; only the question "is any of this visible" uses `strip()`.
+
+### The indicator, on cards that answered
+
+An error label can only appear on a card that produced no text. A card
+that returns 500 tokens of answer after 20000 tokens of thinking is a
+successful card by every definition, carries no error, and still put
+almost everything it was billed for somewhere you cannot see.
+
+Those cards now carry a line between the metrics and the answer:
+
+```
+94% of completion tokens went to reasoning, not to the answer
+```
+
+It appears whenever reasoning reaches the same nine-tenths threshold,
+names the actual share so the magnitude is visible rather than implied,
+and stays on the card through a history replay because a stored row
+carries both counts. It reads nothing but those two counts, which is
+what makes it the coverage for the routes where the reservation is only
+a hint: a provider that ignored the request parameter still reports its
+usage honestly.
+
+### Counts and caps are different numbers
+
+Every token count the bench stores is a count of tokens **actually
+used**, in the model's own tokenizer, as OpenRouter reported it. There is
+one source for all of them, the `usage` object on the response, described
+by [the usage-accounting
+page](https://openrouter.ai/docs/use-cases/usage-accounting) as "Prompt
+and completion token counts using the model's native tokenizer". The
+normalized figures exist only on the generation endpoint, which is a
+post-hoc reconciliation pass most rows never get, and they are
+deliberately not persisted: two counts per row would be exactly the
+ambiguity this is written to prevent.
+
+`max_tokens` is not one of those numbers. It is the completion ceiling
+the run was **sent**, after per-model clamping, and comparing it with a
+count is not an operation that means anything. That comparison is not
+hypothetical: a replay card once showed "budget 65536" beside a reasoning
+metric reading 21350, and the 44186 difference looked like output that
+had gone unaccounted for. It had not gone anywhere. The badge now reads
+"budget cap", the token metrics say in their tooltips what they count,
+and every export's manifest states the distinction once in its
+`token_counts` field.
+
+### Pinned observations
+
+Things measured against the live API that its documentation does not
+say, or says differently. Each is dated, and each is pinned by a fixture
+or a test rather than by this list alone.
+
+- **2026-08-12. A bare `reasoning.max_tokens` enables thinking.** Two
+  calls to `google/gemma-4-31b-it` on DeepInfra differing in nothing
+  else: 0 reasoning tokens without the field, 312 with it, 8.1x the
+  cost. Fixture: `tests/fixtures/probe_reasoning_enable.json`.
+- **2026-08-12. `upstream_inference_cost` is not BYOK-only.** The
+  usage-accounting page says it "will be 0 or null" for non-BYOK
+  requests; both probe calls carry `is_byok: false` with a nonzero value
+  equal to `cost`, plus `upstream_inference_prompt_cost` and
+  `upstream_inference_completions_cost`, which the page does not
+  mention. Observed, not stored.
+- **2026-08-12. Reasoning text can arrive in-band.** Some routes return
+  the thinking itself in `message.reasoning` with `reasoning_details`
+  beside it. The bench reads neither.
+- **2026-08-12. The reasoning contract contradicts itself about which
+  models take a token budget.** The prose says "Currently supported by:
+  Gemini thinking models; Anthropic reasoning models (by using the
+  `reasoning.max_tokens` parameter)", while the per-model
+  `supports_max_tokens` flag is absent on 25 of 27 Anthropic entries and
+  on every Gemini entry. The gate does not pick a side: it admits those
+  models only where a cap provably cannot enable or intensify thinking
+  (see above).
+- **2026-08-12. A cap on a mandatory route was accepted and changed
+  nothing.** Two calls to `anthropic/claude-fable-5` via Amazon Bedrock,
+  the second adding `reasoning: {"max_tokens": 1024}` (the documented
+  Anthropic minimum, with the outer budget strictly greater): accepted
+  without error, and **zero reasoning tokens on both**. Neither bound
+  nor rejected. Whether the cap would clamp real thinking is
+  **unmeasured**, because a trivial prompt provoked none. Fixture:
+  `tests/fixtures/probe_reasoning_cap_binding.json`.
+- **2026-08-12. `mandatory: true` does not mean reasoning occurs.** It
+  says the operator may not turn thinking off, not that the model will
+  think on any given request. The same mandatory model returned a direct
+  answer with no reasoning tokens, twice. Reasoning is route and prompt
+  dependent; Bedrock is the third provider observed serving this model.
+- **2026-08-12. The upstream figure is route dependent, not
+  BYOK dependent.** Two non-BYOK runs disagree: DeepInfra reported
+  `upstream_inference_cost` equal to the credit charge, Bedrock reported
+  `0`. So a populated value does not mean BYOK and a zero does not mean
+  otherwise. The value carries no information about billing mode, which
+  is why `is_byok` is its own column.
+- **2026-08-12. The in-band usage block and the generation endpoint
+  disagree about the upstream figure for the same generation.**
+  `gen-1786560251` reported `upstream_inference_cost` 0.0035 in-band and
+  `0` at the endpoint, with `is_byok: false` at both. Reconciliation
+  therefore chooses its source deliberately: the in-band figure is
+  contemporaneous with the charge and wins, and the pass fills a gap
+  there rather than correcting a value. It is also a second independent
+  proof that a nonzero upstream figure cannot imply BYOK. **The two
+  halves have unequal provenance and the fixture says so:** the
+  endpoint's `0` is captured verbatim, the in-band `0.0035` was read off
+  the response by the operator who ran the probe and reported as prose,
+  and no streamed usage block for that generation is stored anywhere
+  here. Recorded under `_in_band_disagreement` in
+  `tests/fixtures/probe_reasoning_cap_binding.json`.
+- **2026-08-12. Native and normalized token counts really do
+  diverge.** One generation record publishes both for the same
+  completion: 65 normalized against 71 native, and 62 against 66 on the
+  paired call. Everything the bench stores is the native family, which
+  is also the family OpenRouter prices on.
+- **2026-08-12. Endpoint capabilities differ from the model
+  aggregate.** `nvidia/nemotron-3-ultra-550b-a55b` published three
+  endpoints advertising 18, 12 and 17 parameters, differing in which. A
+  model's `supported_parameters` is a union across hosts, so it cannot
+  vouch for the one host a strict pin selects.
+- **2026-08-13. A model's completion cap is the most generous route's,
+  not every route's.** `openai/gpt-oss-120b` publishes
+  `top_provider.max_completion_tokens` 131072 while its twenty endpoints
+  publish 8192, 16384, 32768, 40960, 65536 and 131072, with five
+  publishing none. Budgeting a pinned run from the model-level number
+  budgets from the most generous host in the pool: the standard tier's
+  16384 is already twice the cheapest route's ceiling. 359 of 410 models
+  publish a model-level cap.
+- **2026-08-13. A provider's display name is not its slug, and
+  lowercasing it is wrong 16 times in 102.** Against
+  `/api/v1/providers`: `Moonshot AI` is `moonshotai`, `Arcee AI` is
+  `arcee-ai`, `Sakana AI` is `sakana`, `Mancer 2` is `mancer`,
+  `VoyageAI by MongoDB` is `voyageai`. The transform is not mechanical.
+  The endpoint object's own `tag` carries the slug, optionally with a
+  variant after a slash (`amazon-bedrock/eu-west-1`): across 64
+  endpoints on five models, `tag.split("/")[0]` was a documented slug
+  **64 times**, `provider_name.lower()` **52**. The worst case is not a
+  miss: endpoints named `Google` carry the tag `google-vertex`, so a pin
+  written `google` matched the display name while routing to a slug that
+  does not exist.
+- **2026-08-13. The streaming contract does not say a `finish_reason`
+  ends a stream.** Read in full: every client example the page publishes
+  breaks on the sentinel (`if (event.data === '[DONE]') break;`), and
+  the only `finish_reason` it names as a terminator is the error one
+  ("a `choices` array is included with `finish_reason: \"error\"` to
+  properly terminate the stream"; "the stream is terminated after this
+  unified error event"). The bench accepts any stated `finish_reason`
+  followed by a clean close. That is **this repository's decision, not
+  the contract's**, and the tolerated case is pinned in a test: a cut
+  after the finish_reason chunk and before the usage chunk records a
+  success with no counts, which lands unpriced and reconcilable rather
+  than silently wrong.
+- **2026-08-13. A judge route must not have mandatory reasoning.** At
+  the judge's 512-token budget every ratio on the documented ladder
+  floors to 1024 under `max(min(max_tokens * {effort_ratio}, 128000),
+  1024)`, and `max_tokens` must be strictly higher than the reasoning
+  budget. Sending nothing does not rescue it: omission hands the
+  decision to the provider, and a mandatory route cannot decide zero.
+  Derived from the contract's arithmetic, not measured.
+- **2026-08-13. `is_byok` is a boolean in both documents, and the two
+  were read by different rules.** The in-band usage object required a
+  real boolean; the generation endpoint reached for the SQLite decoder
+  and so turned a wire `1` into `True` where the same value in band
+  became `None`. Both live captures carry it as an explicit `false`, at
+  the top level of the generation record and inside `usage`. The
+  endpoint answers the question for every generation, which is why a
+  missing flag is now reconcilable while a missing upstream figure still
+  is not: the second has no answer for an ordinary run.
+- **2026-08-13. The 1024 reasoning floor is one vendor's, not the
+  platform's.** Both rules the reservation obeys, the "minimum of 1024
+  tokens" and "max_tokens must be strictly higher than the reasoning
+  budget", sit under the heading **"Reasoning Max Tokens for Anthropic
+  Models"**, in a section opening "When using Anthropic models with
+  reasoning:". The page states no floor for any other family; for Gemini
+  3 it states that a budget is passed through as `thinkingBudget` and
+  "Google internally maps this budget value to a thinkingLevel, so you
+  will not get precise token control". The bench applies the floor to
+  every route anyway, as **deliberate conservatism and not as a reading
+  of the contract**: off that family the floor is unknown rather than
+  absent, and assuming none where one exists reintroduces the exact
+  failure the reservation prevents.
+- **2026-08-13. The provider's own default carries the same floor.**
+  `budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)`.
+  Below an outer budget of 2048 every effort ratio at or under 0.5 lands
+  under 1024 and is floored to it, so an explicit 1024 and an absent
+  field produce the same allocation on that family. This is why the
+  reservation stands down rather than naming the floor.
+- **2026-08-13. One provider can serve one model from several
+  endpoints.** `openai/gpt-oss-120b` lists DeepInfra twice (16384 and
+  131072) and Amazon Bedrock twice. A pin names a provider, not an
+  endpoint, so both endpoint readers take the conservative answer across
+  every match rather than the first one.
 
 ## Reliability
 
@@ -429,6 +1001,16 @@ OpenRouter's published schema for the generation endpoint either, so the
 reconcile path reads the key opportunistically and stores whatever comes
 back. Nothing here has observed it come back: read a NULL there as "never
 reported", not as "the provider served unquantized weights".
+
+**Reasoning text is not recorded, only its token count.** Some routes
+return the thinking itself in-band, in `message.reasoning` with
+`reasoning_details` blocks beside it; `google/gemma-4-31b-it` on
+DeepInfra did so on 2026-08-12
+(`gen-1786546398-Z4GhaMYohdT9FWGFiYhc`). The bench reads
+neither field. What a card shows and a row stores is
+`reasoning_tokens` from the usage object, which is a count of thinking
+and not the thinking, so a replayed run can say how much of the budget
+went to reasoning and can never say what the reasoning was.
 
 Some of that is only knowable after the fact. A run stopped mid-stream
 never receives a usage object, and OpenRouter's `/generation` endpoint
@@ -1095,7 +1677,10 @@ tier. Strict mode checks what it can check and claims exactly that.
 
 `provider_pins` is strict-mode only, normalized to the documented
 lowercase provider slugs at creation so the recorded pin and the sent pin
-are one string, and a pin travels as
+are one string. **Write the documented slug, not the display name**:
+normalization only strips and lowercases, and for sixteen of 102
+providers that does not produce the slug (`Moonshot AI` is
+`moonshotai`, `Amazon Bedrock` is `amazon-bedrock`). A pin travels as
 `order` **with `allow_fallbacks: false`**, never without it: an order that
 can be departed from is a preference, and a pinned run served by somebody
 else would record a constraint that did not hold.
@@ -2080,8 +2665,20 @@ picked up without restarts, and verify by eyeball after UI changes:
   the other columns sit untouched, and History shows both the
   failure and the successful rerun in one group. Columns replayed
   from History must never show the control.
-- Budget: run a hard puzzle that empties the standard budget; the
-  errored column's message ends with "try extended budget". Switch
+- Budget: run a hard puzzle that empties the standard budget with a
+  long answer rather than with thinking; the errored column's message
+  ends with "try extended budget". A column whose budget went to
+  reasoning instead says "no visible answer: completion budget
+  exhausted during reasoning" with the count, and ends with "try
+  extended budget" (and "or a lower reasoning effort" as well, if you
+  set the effort to medium or high before running; with the effort left
+  unset the card cannot tell whether lowering it would help, so it does
+  not say). A column that stopped
+  for any other reason says "nearly all of the completion went to reasoning"
+  with the count and the stop reason, and is offered no budget remedy.
+  A column that answered
+  but spent nearly all its output thinking carries the share line
+  between its metrics and its text, and keeps it on replay. Switch
   the control to extended and run again: the models now answer or
   prove they need even more, and each attempt's History replay shows
   the budget badge it actually ran with. Reload the page and confirm

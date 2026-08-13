@@ -174,16 +174,43 @@ def test_stream_model_error_iff_stream_had_no_terminator(content, terminal):
 
     events = asyncio.run(drive())
     error = events[-1]["result"]["error"]
-    had_text = any(e["type"] == "delta" for e in events[:-1])
+    # VISIBLE text, not merely delta events, and the difference is now
+    # load-bearing. Whitespace-only output stopped counting as an answer:
+    # a response of spaces and newlines used to be truthy, so it was
+    # stored as response_text, no empty-response error was synthesized,
+    # and a fully billed reasoning burn rendered as a blank card with no
+    # error and therefore no remedy.
+    #
+    # Hypothesis generates whitespace strings, so the old
+    # any(type == "delta") reading would have turned that correct fix
+    # into an intermittent red here on whichever run first drew " " as
+    # its only content, in a file about the STREAM TERMINATOR contract
+    # rather than about visibility.
+    visible = "".join(e["text"] for e in events[:-1] if e["type"] == "delta").strip()
 
     if terminal == "none":
         assert error == "stream ended before completion: no [DONE] and no finish reason"
-    elif had_text:
+    elif visible:
         # A terminator plus visible text is a clean, complete success.
         assert error is None
     else:
-        # A terminator but no text is the pre-existing empty-response case.
-        assert error is not None and error.startswith("empty response")
+        # A terminator but no text is the empty-response case, and the
+        # property is that SOME honest error is set rather than that a
+        # particular sentence is.
+        #
+        # It used to assert startswith("empty response"), which coupled a
+        # property test to one branch of a function that now has two: R2
+        # added a second wording for a completion that went to reasoning.
+        # The generated usage frames carry no reasoning count, so the old
+        # sentence is what appears today and the assertion still passed;
+        # a generator that grew a reasoning frame tomorrow would have
+        # failed here and looked like a regression in the stream contract
+        # this test is actually about. Both shapes are accepted, and a
+        # third unexpected one still fails.
+        assert error is not None
+        assert error.startswith("empty response") or error.startswith(
+            "no visible answer"
+        ), error
 
 
 def _make_result():

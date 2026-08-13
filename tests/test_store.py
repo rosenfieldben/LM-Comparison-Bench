@@ -2,6 +2,7 @@ import json
 import pathlib
 import sqlite3
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -2754,3 +2755,511 @@ def test_review_repro_a_pinned_refs_character_count_is_pythons_too(tmp_path):
         assert "extracted_text" not in found
     finally:
         conn.close()
+
+
+PRE_BYOK_SCHEMA = (
+    Path(__file__).parent / "fixtures" / "pre_byok_schema.sql"
+).read_text()
+
+
+def test_the_pre_byok_fixture_is_the_schema_as_it_stood_before_the_column():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    The fixture's provenance, asserted rather than trusted.
+
+    A hand-transcribed era snapshot is a snapshot of what somebody
+    believed the schema was, and a migration proof built on one proves
+    the belief. This file was extracted from the SCHEMA string at the
+    commit before is_byok landed, so the only thing that can make it
+    wrong is an edit to the fixture itself, which is what this catches.
+    """
+    assert "is_byok" not in PRE_BYOK_SCHEMA
+    # The right era rather than merely an old one: the column this test
+    # is about lands beside upstream_inference_cost_usd, so a fixture
+    # predating THAT would be answering a different question.
+    assert "upstream_inference_cost_usd TEXT" in PRE_BYOK_SCHEMA
+    for table in ("prompts", "runs", "results", "groups"):
+        assert f"CREATE TABLE IF NOT EXISTS {table} (" in PRE_BYOK_SCHEMA
+
+
+def test_migration_onto_pre_byok_database_is_additive_and_idempotent(tmp_path):
+    """WINDOW: a database created before results.is_byok existed, from
+    its own era's schema, opened by today's store.connect.
+
+    ONE COLUMN, and the reason it is a column rather than a reading of
+    an existing one is the whole point. upstream_inference_cost_usd was
+    being asked to carry a money figure AND an implicit claim that a
+    populated cell meant BYOK. A live probe found is_byok false beside a
+    nonzero upstream cost, so the claim was never true, and the ruling
+    was to record reality and move the meaning: the figure is stored as
+    the wire sent it, and the discriminator gets its own column.
+
+    NULL ON EVERY LEGACY ROW, which is an answer and not a gap. A row
+    written before this column existed genuinely does not know whether
+    its run was BYOK, and that is different from knowing it was not.
+    The three states are the point: 1, 0 and NULL.
+
+    IDEMPOTENT is asserted by connecting twice, because store.connect
+    runs the migrations on every open and a second ALTER on an existing
+    column is an error, not a no-op.
+    """
+    db_path = tmp_path / "pre_byok.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_BYOK_SCHEMA)
+    legacy.execute(
+        """INSERT INTO runs (id, prompt_id, group_id, prompt_text, created_at)
+           VALUES (1, NULL, NULL, 'legacy prompt', '2026-05-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (id, run_id, model, response_text, latency_ms,
+                                prompt_tokens, completion_tokens, error,
+                                cost_usd, position, billed_cost_usd,
+                                upstream_inference_cost_usd)
+           VALUES (1, 1, 'legacy/a', 'legacy text', 12.5, 13, 8, NULL,
+                   2.9e-05, 0, 3.1e-05, '0.004')"""
+    )
+    legacy.commit()
+    # THE PRE-STATE, asserted rather than assumed. Without this the test
+    # could pass against a fixture that already carried the column,
+    # which would prove nothing at all about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(results)")]
+    assert "is_byok" not in before
+    assert "upstream_inference_cost_usd" in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        columns = [r["name"] for r in conn.execute("PRAGMA table_info(results)")]
+        assert "is_byok" in columns
+        row = conn.execute(
+            "SELECT upstream_inference_cost_usd, is_byok FROM results WHERE id = 1"
+        ).fetchone()
+        # The legacy money figure is untouched by the migration.
+        assert row["upstream_inference_cost_usd"] == "0.004"
+        # And the new column is NULL: this row cannot say whether it was
+        # BYOK, which is not the same as saying it was not.
+        assert row["is_byok"] is None
+    finally:
+        conn.close()
+
+    # Idempotent: a second open must not attempt the ALTER again.
+    again = store.connect(str(db_path))
+    try:
+        assert (
+            again.execute("SELECT is_byok FROM results WHERE id = 1").fetchone()[
+                "is_byok"
+            ]
+            is None
+        )
+    finally:
+        again.close()
+
+
+def test_review_repro_the_three_states_of_is_byok_survive_a_round_trip(tmp_path):
+    """WINDOW: three results saved and read back, one per state.
+
+    THE COLUMN EXISTS TO HOLD A DISTINCTION, so a round trip that only
+    proved True survives would miss the half that matters. False is a
+    reported fact and NULL is the absence of one, and sqlite stores both
+    a Python False and a Python None in ways that are easy to conflate:
+    0 and NULL are both falsy on the way back out.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(
+            conn,
+            "p",
+            [
+                make_result(model="m/byok", is_byok=True),
+                make_result(model="m/credits", is_byok=False),
+                # No key at all: the provider did not report one.
+                make_result(model="m/silent"),
+            ],
+        )
+        rows = {
+            r["model"]: r["is_byok"]
+            for r in conn.execute(
+                "SELECT model, is_byok FROM results WHERE run_id = ?", (run_id,)
+            )
+        }
+        # Stored as sqlite integers, and the three states stay distinct.
+        assert rows["m/byok"] == 1
+        assert rows["m/credits"] == 0
+        assert rows["m/silent"] is None
+        # The distinction that a falsy check would destroy.
+        assert rows["m/credits"] is not None
+    finally:
+        conn.close()
+
+
+def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tmp_path):
+    """WINDOW: one result row across a reconcile pass, with the two
+    sources disagreeing exactly as they were measured disagreeing.
+
+    THE TWO SOURCES DISAGREE, and this is not hypothetical. For
+    generation gen-1786560251-TPHWD5yYlFa5qRDnF3jf the in-band usage
+    block reported upstream_inference_cost 0.0035 while the generation
+    endpoint reported 0, for the same generation, with is_byok false at
+    both. See tests/fixtures/probe_reasoning_cap_binding.json.
+
+    THE DEFECT THIS BRANCH CREATED AND THIS FIXES. The pass wrote
+    COALESCE(new, existing), so the endpoint won. That was harmless
+    while a zero degraded to NULL, because the endpoint's zero arrived
+    as NULL and the stored value survived by accident. Storing reality,
+    which was the whole point of the earlier ruling, made the clobber
+    real: a reconcile pass began overwriting a figure an operator could
+    reconcile against an invoice with a zero that says nothing.
+
+    A pass whose purpose is to RECOVER facts must not be able to erase
+    one. The in-band figure is contemporaneous with the charge and, in
+    the one observed disagreement, carries more information.
+
+    BOTH DIRECTIONS ARE ASSERTED. Fill-only would be a bug of its own if
+    it stopped filling.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        store.save_run(
+            conn,
+            "p",
+            [make_result(model="m/in-band", upstream_inference_cost_usd="0.0035")],
+        )
+        row = conn.execute(
+            "SELECT id FROM results WHERE model = 'm/in-band'"
+        ).fetchone()
+        # PRE-STATE: the in-band figure really is stored before the pass.
+        assert (
+            conn.execute(
+                "SELECT upstream_inference_cost_usd FROM results WHERE id = ?",
+                (row["id"],),
+            ).fetchone()["upstream_inference_cost_usd"]
+            == "0.0035"
+        )
+
+        store.apply_reconciliation(
+            conn,
+            row["id"],
+            {
+                "billed_cost_usd": 0.0035,
+                "provider": "Amazon Bedrock",
+                "quantization": None,
+                "native_finish_reason": "end_turn",
+                # What the endpoint returned for this same generation.
+                "upstream_inference_cost_usd": "0",
+                "is_byok": False,
+            },
+        )
+        kept = conn.execute(
+            "SELECT upstream_inference_cost_usd, provider FROM results WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
+        assert kept["upstream_inference_cost_usd"] == "0.0035"
+        # And the columns where the endpoint IS the authority still take
+        # its answer, so this is a per-column decision rather than a
+        # blanket refusal to reconcile.
+        assert kept["provider"] == "Amazon Bedrock"
+
+        # FILL-ONLY STILL FILLS: a row with no in-band figure takes the
+        # endpoint's.
+        store.save_run(conn, "p2", [make_result(model="m/empty")])
+        gap = conn.execute("SELECT id FROM results WHERE model = 'm/empty'").fetchone()
+        store.apply_reconciliation(
+            conn,
+            gap["id"],
+            {
+                "billed_cost_usd": 1.0,
+                "provider": "X",
+                "quantization": None,
+                "native_finish_reason": None,
+                "upstream_inference_cost_usd": "0.004",
+                "is_byok": None,
+            },
+        )
+        assert (
+            conn.execute(
+                "SELECT upstream_inference_cost_usd FROM results WHERE id = ?",
+                (gap["id"],),
+            ).fetchone()["upstream_inference_cost_usd"]
+            == "0.004"
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_reconciliation_cannot_erase_the_in_band_byok_flag(tmp_path):
+    """WINDOW: one result row across a reconcile pass, at every
+    combination of what was stored and what the endpoint answered.
+
+    THE DEFECT, and it is the upstream figure's defect one column over.
+    The pass wrote is_byok = COALESCE(?, is_byok), which gives EVERY
+    non-null endpoint answer precedence. A run that reported BYOK in
+    band and false at the endpoint was rewritten to false, which is not
+    a cosmetic disagreement: report._cost_totals buckets spend on this
+    flag, so the row moved buckets and the attribution changed.
+
+    WHY THE IN-BAND VALUE WINS, by the same ruling that settled the
+    figure beside it. It is taken in the same exchange as the charge;
+    the endpoint's is a later summary of that exchange. The two are
+    MEASURED to disagree about that exchange: for generation
+    gen-1786560251 the upstream figure was 0.0035 in band and 0 at the
+    endpoint. A pass whose purpose is to recover facts must not be able
+    to overwrite one.
+
+    BOTH DIRECTIONS, AND BOTH POLARITIES. Fill-only that stopped filling
+    would be a bug of its own, and a rule that protected only True would
+    be a rule about BYOK rather than about provenance.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        record = {
+            "billed_cost_usd": 1.0,
+            "provider": "X",
+            "quantization": None,
+            "native_finish_reason": "stop",
+            "upstream_inference_cost_usd": None,
+        }
+        for stored, endpoint, expected, why in (
+            # The reviewer's shape.
+            (True, False, True, "in-band True survives an endpoint False"),
+            # The same rule, opposite polarity.
+            (False, True, False, "in-band False survives an endpoint True"),
+            # FILL-ONLY STILL FILLS, in both polarities.
+            (None, False, False, "an unknown row takes the endpoint's False"),
+            (None, True, True, "an unknown row takes the endpoint's True"),
+            # And an endpoint that says nothing cannot turn a known
+            # answer into an unknown one.
+            (True, None, True, "silence does not erase"),
+        ):
+            model = f"m/{stored}-{endpoint}"
+            store.save_run(conn, "p", [make_result(model=model, is_byok=stored)])
+            row = conn.execute(
+                "SELECT id, is_byok FROM results WHERE model = ?", (model,)
+            ).fetchone()
+            # PRE-STATE: the row really starts where the case says it
+            # does, so an assertion below cannot pass by nothing having
+            # been stored.
+            assert store.as_flag(row["is_byok"]) is stored, why
+
+            store.apply_reconciliation(conn, row["id"], {**record, "is_byok": endpoint})
+
+            after = conn.execute(
+                "SELECT is_byok FROM results WHERE id = ?", (row["id"],)
+            ).fetchone()["is_byok"]
+            assert store.as_flag(after) is expected, why
+    finally:
+        conn.close()
+
+
+def test_review_repro_a_row_missing_only_the_flag_is_offered_for_reconciling(tmp_path):
+    """WINDOW: results_awaiting_reconciliation's returned list, for a row
+    complete in every column the pass writes except one.
+
+    THE DEFECT. The predicate selected on a missing charge, provider or
+    native finish reason, and not on a missing BYOK flag. A row with a
+    generation id, a billed cost, a provider, a finish reason and an
+    upstream figure, but no flag, was invisible to every pass. The
+    endpoint could have classified it in one call. Instead it stayed
+    "unknown" in the report's attribution indefinitely, which makes an
+    advertised split one bucket smaller and a leak.
+
+    WHY THIS COLUMN JOINS THE PREDICATE AND THE FIGURE BESIDE IT DOES
+    NOT, which is the question the old comment answered wrongly by
+    borrowing the figure's reasoning. The endpoint publishes is_byok for
+    every generation, true or false, so a NULL here is a question with
+    an available answer and one pass converges it. The upstream figure
+    has no answer for an ordinary run, so a clause on it would park
+    every ordinary row on the list forever.
+
+    CONVERGENCE IS ASSERTED, not assumed. A predicate that offers a row
+    it can never satisfy is the failure the old comment feared, so the
+    row is reconciled and the list re-read.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        store.save_run(
+            conn,
+            "p",
+            [
+                make_result(
+                    model="m/flagless",
+                    generation_id="gen-y",
+                    billed_cost_usd=0.01,
+                    provider="P",
+                    native_finish_reason="stop",
+                    upstream_inference_cost_usd="0.002",
+                    is_byok=None,
+                )
+            ],
+        )
+        listed = store.results_awaiting_reconciliation(conn)
+        assert [r["model"] for r in listed] == ["m/flagless"]
+
+        store.apply_reconciliation(
+            conn,
+            listed[0]["id"],
+            {
+                "billed_cost_usd": 0.01,
+                "provider": "P",
+                "quantization": None,
+                "native_finish_reason": "stop",
+                "upstream_inference_cost_usd": None,
+                "is_byok": False,
+            },
+        )
+        # IT CONVERGES: one pass answers the question and the row leaves.
+        assert store.results_awaiting_reconciliation(conn) == []
+        assert (
+            store.as_flag(
+                conn.execute(
+                    "SELECT is_byok FROM results WHERE id = ?", (listed[0]["id"],)
+                ).fetchone()["is_byok"]
+            )
+            is False
+        )
+    finally:
+        conn.close()
+
+
+def test_review_repro_the_three_states_survive_the_read_path_by_identity(tmp_path):
+    """WINDOW: a row from save_run through get_run, which is the path
+    every in-process reader actually uses.
+
+    THE EXISTING ROUND TRIP READ WITH RAW SQL and asserted `== 1`,
+    `== 0`, `is None`. That proves SQLite's encoding, which was never in
+    doubt, and leaves untested the surface that actually goes wrong.
+
+    THE TRAP. SQLite has no boolean, so an unconverted row hands back
+    the int 1. In Python `1 == True` is True and `1 is True` is False,
+    so an equality assertion passes on a broken read path and an
+    identity assertion does not. report._cost_totals asks `is True`; a
+    silent failure here would look like a working report that quietly
+    attributed nothing to anybody.
+
+    So every assertion below is by IDENTITY, deliberately.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(
+            conn,
+            "p",
+            [
+                make_result(model="m/byok", is_byok=True),
+                make_result(model="m/credits", is_byok=False),
+                make_result(model="m/silent"),
+            ],
+        )
+        rows = {
+            r["model"]: r["is_byok"] for r in store.get_run(conn, run_id)["results"]
+        }
+
+        assert rows["m/byok"] is True
+        assert rows["m/credits"] is False
+        assert rows["m/silent"] is None
+        # Spelled out, because these are the assertions that would pass
+        # against a raw int and are the reason the test is written this
+        # way at all.
+        assert isinstance(rows["m/byok"], bool)
+        assert isinstance(rows["m/credits"], bool)
+    finally:
+        conn.close()
+
+
+def test_a_poisoned_flag_cell_degrades_rather_than_lying(tmp_path):
+    """WINDOW: a row written around the store, read back through it.
+
+    SQLite's column affinity accepts a string into an INTEGER column, so
+    a row can carry 'yes' whatever save_run does. A reader must be told
+    "not reported" rather than a confident True, and must not be handed
+    a 500 either: repair on read exists precisely so a poisoned cell
+    does not become a permanent error on an endpoint.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        run_id = store.save_run(conn, "p", [make_result(model="m/a")])
+        with conn:
+            conn.execute("UPDATE results SET is_byok = 'yes'")
+        # The poison really is in the file, so the read path is what is
+        # being tested rather than the writer.
+        raw = conn.execute("SELECT typeof(is_byok) AS t FROM results").fetchone()["t"]
+        assert raw == "text"
+
+        assert store.get_run(conn, run_id)["results"][0]["is_byok"] is None
+
+        # And save_run itself refuses to create one.
+        second = store.save_run(conn, "p2", [make_result(model="m/b", is_byok="yes")])
+        assert store.get_run(conn, second)["results"][0]["is_byok"] is None
+        stored = conn.execute(
+            "SELECT typeof(is_byok) AS t FROM results WHERE model = 'm/b'"
+        ).fetchone()["t"]
+        assert stored == "null"
+    finally:
+        conn.close()
+
+
+def test_review_repro_two_processes_first_opening_one_database_do_not_race(tmp_path):
+    """WINDOW: the ALTER inside connect()'s migration loop, at the exact
+    moment the column already exists.
+
+    THE RACE. The PRAGMA check and the ALTER are two statements. Two
+    processes first-opening the same old database can both read a
+    column as absent and both try to add it; the loser gets "duplicate
+    column name" out of connect() and the bench refuses to start,
+    because something else started it correctly a millisecond earlier.
+    That is the window a fresh checkout opens when somebody runs the app
+    and the test suite at once.
+
+    REPRODUCED DETERMINISTICALLY, and the mechanism is worth stating
+    because the obvious version of this test is vacuous. Adding the
+    column before connect() runs does NOT reproduce the race: the
+    PRAGMA then sees it, the loop skips, and the ALTER never executes.
+    That test passes whether or not the tolerance exists, which is how
+    it was first written here.
+
+    What reproduces it is a name whose case differs. Python's set
+    membership is case-sensitive and SQLite's column names are not, so
+    a migration entry spelled IS_BYOK is reported absent by the PRAGMA
+    and rejected as a duplicate by the ALTER. That is precisely the
+    loser's situation, without threads and without a timing window to
+    hope for.
+    """
+    db_path = tmp_path / "raced.db"
+    first = store.connect(str(db_path))
+    first.close()
+
+    with mock.patch.object(store, "MIGRATIONS", (("results", "IS_BYOK", "INTEGER"),)):
+        # PRE-STATE: the loop really will attempt the ALTER, because the
+        # check does not see the column under this spelling.
+        probe = sqlite3.connect(str(db_path))
+        cols = {r[1] for r in probe.execute("PRAGMA table_info(results)")}
+        assert "IS_BYOK" not in cols
+        assert "is_byok" in cols
+        probe.close()
+
+        # And connect() survives it rather than refusing to start.
+        conn = store.connect(str(db_path))
+        try:
+            run_id = store.save_run(conn, "p", [make_result(model="m/a", is_byok=True)])
+            assert store.get_run(conn, run_id)["results"][0]["is_byok"] is True
+        finally:
+            conn.close()
+
+
+def test_a_migration_failure_that_is_not_a_race_still_raises(tmp_path):
+    """WINDOW: connect()'s migration loop, pointed at a table that does
+    not exist.
+
+    The other side of the tolerance above.
+
+    Catching every OperationalError would turn a genuinely broken
+    migration into a database quietly missing a column, which is the
+    failure mode additive migrations exist to prevent. Only the
+    duplicate is tolerated, and this proves the rest are not by
+    pointing the loop at a table that does not exist.
+    """
+    db_path = tmp_path / "broken.db"
+    conn = store.connect(str(db_path))
+    conn.close()
+
+    with mock.patch.object(store, "MIGRATIONS", (("no_such_table", "c", "INTEGER"),)):
+        with pytest.raises(sqlite3.OperationalError):
+            store.connect(str(db_path))

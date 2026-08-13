@@ -7,6 +7,7 @@
 // click/completion time, so the globals exist by then.
 (function () {
   const { shortName, fmtCost, fmtBilled, niceScale } = window.BenchLib;
+  const { reasoningAteTheOutput, reasoningShare, remedyFor } = window.BenchLib;
 
   // The cost cell's default explanation, restored on reset so a rerun of a
   // billed run does not keep claiming the previous attempt's charge.
@@ -258,6 +259,15 @@
     const ttft = metricCell("ttft", "ttft");
     const total = metricCell("total", "total");
     const tok = metricCell("tok", "tok i/o");
+    // THE UNIT, SAID ONCE, on the surface that shows the number. Both
+    // figures come from OpenRouter's usage object, which the
+    // usage-accounting page describes as "Prompt and completion token
+    // counts using the model's native tokenizer"
+    // (openrouter.ai/docs/use-cases/usage-accounting, read 2026-08-12).
+    // One unit for both halves of the pair, and this says which.
+    tok.v.title =
+      "prompt/completion tokens actually used, counted by the model's " +
+      "own tokenizer as OpenRouter reported them";
     // Reasoning tokens are billed and consume the completion budget while
     // never appearing in the answer, which is the whole reason the two
     // tiers exist. A cell of its own makes that burn a number on every
@@ -265,7 +275,8 @@
     const reasoning = metricCell("reasoning", "reasoning");
     reasoning.v.title =
       "hidden reasoning tokens, billed as completion tokens and counted " +
-      "against the budget";
+      "against the budget. Same unit as tok i/o: actually used, counted " +
+      "by the model's own tokenizer";
     const cost = metricCell("cost", "cost");
     cost.v.title = COST_ESTIMATE_TITLE;
     metrics.append(ttft.cell, total.cell, tok.cell, reasoning.cell, cost.cell);
@@ -321,13 +332,21 @@
     ui.caption.hidden = true;
     ui.body.className = "body";
     ui.body.replaceChildren();
-    // The not-saved warning is a card-level sibling of the body, not a
-    // child of it, so clearing the body above leaves it behind. Drop it
-    // here or a rerun that persists cleanly would keep claiming "not
-    // saved to history", and a rerun that fails again would stack a
-    // second copy.
-    const staleWarn = ui.card.querySelector(".save-warn");
-    if (staleWarn) staleWarn.remove();
+    // Card-level warnings are siblings of the body, not children of it,
+    // so clearing the body above leaves them behind. Drop them here or a
+    // rerun that persists cleanly would keep claiming "not saved to
+    // history", and a rerun that fails again would stack a second copy.
+    //
+    // The reasoning indicator joined this list rather than getting its
+    // own removal, because it is the same kind of thing in the same
+    // position and the failure mode is identical: a card that reruns to
+    // a healthy result would otherwise keep a share line describing
+    // tokens the current attempt never spent.
+    for (const stale of ui.card.querySelectorAll(
+      ".save-warn, .reasoning-warn",
+    )) {
+      stale.remove();
+    }
   }
 
   function toolButton(label) {
@@ -526,6 +545,101 @@
     ui.tools.append(btn);
   }
 
+  // Whether the budget-and-effort advice is relevant to this card at
+  // all. Two shapes qualify and they are different failures:
+  //
+  //   the output went to reasoning AND the cap closed, which is the
+  //   exhaustion case the whole fix is about
+  //
+  //   the cap closed on a long answer with no reasoning behind it,
+  //   which a larger budget genuinely does fix
+  //
+  // Keyed on finish_reason and the counts, never on the error's prose.
+  // The old code matched the substring "finish_reason: length" in a
+  // sentence, which is the coupling that silently withdrew the remedy
+  // the first time the sentence was reworded.
+  function exhaustionRemedyApplies(result) {
+    return result.finish_reason === "length";
+  }
+
+  // Draws the reasoning indicator, or removes a previous one.
+  //
+  // The removal branch is not defensive padding: completeColumn runs
+  // again on a rerun of the same card, and an indicator left over from
+  // the previous attempt would describe tokens the current result never
+  // spent. resetColumn clears the metrics for the same reason.
+  // WHAT remedyFor NEEDS, gathered once. Three places along one call
+  // chain used to re-list these by hand (history's call to fillColumn,
+  // fillColumn's call to completeColumn, and completeColumn's two calls
+  // to remedyFor), so adding an input meant editing four lists and
+  // getting all four right. Adding the selected budget tier proved the
+  // point immediately: history passed it and it was dropped twice
+  // before reaching the function that reads it, leaving a replayed card
+  // advising the tier it had already used.
+  //
+  // Reading opts rather than taking the fields apart takes the count of
+  // hand-written lists from four to TWO, which is what it actually
+  // does; an earlier version of this comment claimed one. The other is
+  // fillColumn's allowlist, which stays hand-written on purpose so a
+  // caller cannot reach past it into completeColumn's other switches.
+  // Two is the floor unless that allowlist becomes a spread, and it
+  // should not.
+  function remedyInputs(opts) {
+    return {
+      extendedCap: opts.extendedCap,
+      effort: opts.effort,
+      budget: opts.budget,
+      routeCap: opts.routeCap,
+    };
+  }
+
+  function addReasoningIndicator(ui, result, opts) {
+    // Idempotent on its own, not only via resetColumn. completeColumn
+    // can run twice on one card without a reset: stream.js calls finish()
+    // again with a synthetic error result when the primary render throws,
+    // and a second indicator stacked under the first would be the visible
+    // symptom.
+    const existing = ui.card.querySelector(".reasoning-warn");
+    if (existing) existing.remove();
+    if (
+      !reasoningAteTheOutput(result.completion_tokens, result.reasoning_tokens)
+    ) {
+      return;
+    }
+    const share = reasoningShare(
+      result.completion_tokens,
+      result.reasoning_tokens,
+    );
+    const warn = document.createElement("div");
+    warn.className = "reasoning-warn";
+    warn.dataset.testid = "reasoning-warning";
+    // textContent, like every other user-facing string on this card. The
+    // numbers are the provider's and go through String coercion only.
+    warn.textContent =
+      share + "% of completion tokens went to reasoning, not to the answer";
+    // THE SECOND SURFACE THAT GAVE UNACTIONABLE ADVICE. This title
+    // hardcoded "Lower the reasoning effort under Experiment controls"
+    // and rendered on every card the indicator fired for, including
+    // runs already at the UI minimum, where there is nothing lower to
+    // choose. Fixing the error line alone would have left the card
+    // still saying it.
+    //
+    // Derived from the same rule now, so the two sentences on one card
+    // cannot contradict each other. When no lower effort can be shown
+    // to exist, whether because the run is already at the floor or
+    // because nothing was selected and the route's default is unknown,
+    // the accounting sentence stands alone.
+    const advice = remedyFor(result, remedyInputs(opts));
+    warn.title =
+      "reasoning tokens are billed as completion tokens and never appear " +
+      "in the answer" +
+      (advice.includes("lower reasoning effort")
+        ? ". Lower the reasoning effort under Experiment controls to " +
+          "spend less of the budget thinking"
+        : "");
+    ui.body.before(warn);
+  }
+
   // The one completion renderer. Live streams and history replay both
   // land here, so the safety rules (textContent only) and the contract
   // (text or error, possibly both) are enforced in a single place.
@@ -539,6 +653,29 @@
         result.response_text != null ? result.response_text : "";
     }
     fillMetrics(ui, result);
+    // THE INDICATOR. A card whose output went mostly to thinking says so
+    // on its face, whether or not it produced an answer and whether or
+    // not the server was able to label anything.
+    //
+    // WHY IT EXISTS SEPARATELY FROM THE ERROR LABEL. The server can only
+    // relabel a result it synthesized an error for, which means a result
+    // with NO visible text. A card that returned 500 tokens of answer
+    // after 20000 tokens of thinking is not an error by any definition,
+    // carries no error to relabel, and is still a card where nearly all
+    // the money went somewhere the reader cannot see. That card is the
+    // one this is for.
+    //
+    // KEYED ON THE TWO COUNTS AND NOTHING ELSE, which is what makes it
+    // work where R1's reservation could not: a provider that ignores an
+    // unknown request parameter still reports its usage honestly, so the
+    // numbers come back true even when the cap never applied. No model
+    // name is involved, and no request field is read.
+    //
+    // In completeColumn rather than in fillMetrics so it covers replayed
+    // history as well as live runs: a stored row carries both counts, and
+    // a warning that appeared only while you watched would be missing
+    // from every card anyone came back to.
+    addReasoningIndicator(ui, result, opts);
     if (opts.unsaved) {
       // run_id came back null: the server spent the money and streamed
       // the response but could not persist it. Saying nothing would let
@@ -552,7 +689,21 @@
         "will not appear in History";
       ui.body.before(warn);
     }
-    const error = "shownError" in opts ? opts.shownError : result.error;
+    // THE REMEDY IS DERIVED HERE, not passed in, so a replayed card
+    // and a live one cannot disagree about what to advise. fillColumn
+    // used to supply no shownError at all, so replays showed the
+    // server's bare sentence and lost the advice entirely, on the
+    // surface where somebody is deciding whether to spend again.
+    //
+    // Everything it needs is on the stored row: max_tokens is the
+    // effective post-clamp ceiling the run was SENT, and the counts and
+    // finish_reason came back with it. The caller supplies only what a
+    // row cannot carry, the extended tier's clamp for this model and
+    // the effort that was selected.
+    let error = "shownError" in opts ? opts.shownError : result.error;
+    if (error != null && exhaustionRemedyApplies(result)) {
+      error += remedyFor(result, remedyInputs(opts));
+    }
     applyError(ui, error);
     // A user Stop is neither done nor a provider failure, and a spend
     // refusal is neither of those nor a failure of any kind: the ceiling
@@ -585,16 +736,56 @@
     if (opts.budgetBadge && result.max_tokens != null) {
       const note = document.createElement("span");
       note.className = "budget-note";
-      note.textContent = "budget " + result.max_tokens;
+      note.dataset.testid = "budget-note";
+      // A CAP, LABELLED AS ONE, and the label is the fix rather than
+      // decoration. This badge read "budget 65536" beside a reasoning
+      // metric reading 21350, and a reader subtracting them got 44186
+      // tokens that never existed: one number is the ceiling the bench
+      // SENT, the other is what the provider COUNTED. Both are tokens,
+      // so nothing about the pair announced that they answer different
+      // questions, and the phantom difference misdirected a diagnosis
+      // for a full round.
+      //
+      // "cap" is the whole remedy. The two numbers now cannot be read as
+      // one arithmetic, and the title says which is which for anyone who
+      // hovers.
+      note.textContent = "budget cap " + result.max_tokens;
+      note.title =
+        "the completion ceiling this run was sent, after clamping to " +
+        "the model's published cap and, on a provider-pinned trial, to " +
+        "the selected endpoint's. " +
+        // Kept on one line: a tombstone in test_models.py searches this
+        // source for the phrase, and splitting it across a concatenation
+        // would fail on formatting rather than on meaning.
+        "Not a count: compare it against tok i/o, which is what was " +
+        "actually used";
       ui.tools.append(note);
     }
   }
 
-  function fillColumn(ui, result, sourceLabel) {
+  function fillColumn(ui, result, sourceLabel, opts) {
+    const extra = opts || {};
     completeColumn(ui, result, sourceLabel, {
       streamed: false,
       budgetBadge: true,
       retry: null,
+      // A stored row carries the cap it was SENT but not what another
+      // tier would send, not which effort was selected, and not which
+      // TIER was asked for. All three come from the caller, which is
+      // history, and all three are optional: a replay with none of them
+      // still renders, it simply advises less.
+      //
+      // THIS LIST IS AN ALLOWLIST AND HAS TO BE MAINTAINED. It is not a
+      // spread, on purpose, so a caller cannot reach past fillColumn
+      // into completeColumn's other switches. The cost is that a new
+      // option added at the call site is silently dropped here, which
+      // is exactly what happened to budget: history passed it, this
+      // function did not forward it, and the replayed card went on
+      // advising the tier it had already used.
+      extendedCap: extra.extendedCap,
+      effort: extra.effort,
+      budget: extra.budget,
+      routeCap: extra.routeCap,
     });
   }
 

@@ -251,6 +251,12 @@ def test_the_group_row_records_the_controls_the_run_declared(bench, bench_url):
     assert sent["temperature"] == 0.5
     assert sent["provider"]["sort"] == "price"
     assert "routing" not in sent
+    # reasoning briefly left this list, while the visible-output
+    # reservation rode every request, and came back when the reservation
+    # was gated on the catalog. stub/fast publishes no reasoning
+    # descriptor, so the bench does not vouch for it and sends no cap.
+    # An unset control and an unvouched reservation are both absent, and
+    # this run's payload is the pre-feature payload.
     for absent in ("top_p", "seed", "reasoning"):
         assert absent not in sent, absent
 

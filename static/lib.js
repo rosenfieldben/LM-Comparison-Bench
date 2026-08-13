@@ -228,6 +228,217 @@
     return ranks;
   }
 
+  // The share of a completion that reasoning must reach before the card
+  // says the thinking took the answer's place. This is the same 0.9 as
+  // REASONING_SHARE_EXHAUSTED in bench/models.py, and it is the same
+  // rule applied to the same two numbers.
+  //
+  // WHY IT IS DUPLICATED, stated accurately after an adversarial review
+  // found the previous answer false. That answer said the server "can
+  // only label a result it synthesized an error for". The server can do
+  // no such limited thing: _ingest_usage runs unconditionally and
+  // before the empty-text branch, so both counts are populated on every
+  // result including those that carry text, and a boolean could be
+  // attached to the result and shipped like any other field.
+  //
+  // The real reason is smaller and is a judgement rather than a
+  // constraint. Shipping the flag would touch ModelResult, the stream's
+  // done event, the store's read-time repair and three call sites, and
+  // this file has to keep reasoningShare regardless, which already
+  // reads both counts. So the duplication is one constant and one
+  // comparison against a refactor across four layers, and it was not
+  // judged worth it. Revisit that if a third consumer ever appears.
+  //
+  // The drift guard is behavioural, not textual: a Python test executes
+  // this file through node over a shared table of shapes and compares
+  // the two answer sheets. A change to either implementation that
+  // alters an answer fails it; a rename or a rewrap does not.
+  const REASONING_SHARE_EXHAUSTED = 0.9;
+
+  // Whether a result's output went to thinking rather than to an answer.
+  //
+  // NUMBERS ONLY, which is the entire design. No model name, no
+  // finish_reason, no inspection of what was requested: this reads the
+  // two counts that come back from any provider. That is what lets it
+  // fire on a route where the reservation could not act, because a
+  // provider that ignores an unknown request parameter still reports its
+  // usage honestly. It is also why nothing here needs updating when a new
+  // reasoning model appears.
+  //
+  // Absent counts are not evidence, and zero reasoning tokens are
+  // evidence of the opposite, so both fall out through the same falsy
+  // guard. Older history rows predate the reasoning column entirely and
+  // carry null; they read as "no" rather than as "unknown", which is the
+  // conservative direction for something that draws a warning.
+  function reasoningAteTheOutput(completionTokens, reasoningTokens) {
+    if (!reasoningTokens || !completionTokens) return false;
+    return reasoningTokens >= completionTokens * REASONING_SHARE_EXHAUSTED;
+  }
+
+  // The share itself, rounded to a whole percent for display. Separate
+  // from the predicate above because they answer different questions and
+  // one of them is allowed to be approximate: the predicate decides
+  // whether to say anything, this decides what the sentence reads.
+  //
+  // Rounded rather than truncated, and to a percent rather than to a
+  // decimal, because it is a magnitude for a person to react to and not
+  // an input to anything. Null when either count is missing, so a caller
+  // cannot render "null%" from a row that predates the column.
+  function reasoningShare(completionTokens, reasoningTokens) {
+    if (completionTokens == null || reasoningTokens == null) return null;
+    if (completionTokens === 0) return null;
+    return Math.round((reasoningTokens / completionTokens) * 100);
+  }
+
+  // The documented effort ladder, as SHARES of the outer budget, so
+  // "is this one lower than that one" is a comparison of numbers rather
+  // than of positions in a list somebody has to keep ordered. Mirrors
+  // EFFORT_SHARES in bench/models.py, which carries the pinned quotes
+  // and the read date; a cross-language test executes both against the
+  // same questions so the two cannot drift.
+  const EFFORT_SHARES = {
+    none: 0.0,
+    minimal: 0.1,
+    low: 0.2,
+    medium: 0.5,
+    high: 0.8,
+    xhigh: 0.95,
+    max: 0.95,
+  };
+
+  // THE ROUTE'S OWN CEILING, DERIVED RATHER THAN FETCHED. A pinned
+  // trial is clamped twice: to the model's published cap for its tier,
+  // and then to the endpoint the pin selected. Only the first is
+  // knowable from the catalog the browser holds, so a replayed card
+  // cannot look the second one up.
+  //
+  // It does not have to. The server sends min(tierCap, routeCap), so a
+  // sent ceiling STRICTLY BELOW the model-level cap for that tier can
+  // only be the route's own number: min picked the other operand, and
+  // the other operand is the route. When sent equals the tier cap the
+  // route did not bind and nothing is learned, which is null rather
+  // than a guess.
+  //
+  // The consequence is what the remedy needs: a route that bound a
+  // standard run at 8192 bounds an extended one at 8192 too, because
+  // min(65536, 8192) is the same number. Suggesting the larger tier
+  // there is suggesting a replay of the identical request.
+  function routeCapFor(sent, tierCap) {
+    if (typeof sent !== "number" || typeof tierCap !== "number") return null;
+    return sent < tierCap ? sent : null;
+  }
+
+  // The lowest reasoning effort the UI can actually select. Mirrors
+  // the option list in index.html.
+  //
+  // "UNSET" IS NOT A POSITION ON THIS LADDER, which is the correction
+  // that matters. This comment used to say unset "is NOT lower, because
+  // on a vouched model the bench then sends its own half-budget
+  // reservation rather than nothing", and used that to justify advising
+  // a reader to lower an effort they had never set. Unset means the
+  // ROUTE decides, at its catalog default, which the card cannot see
+  // and which may sit below this floor. So unset is unknown, and
+  // remedyFor advises nothing from it.
+  const LOWEST_SELECTABLE_EFFORT = "low";
+
+  // WHAT THE CARD SHOULD SUGGEST, given what this run actually got and
+  // what the reader can actually change.
+  //
+  // THE DEFECT THIS REPLACES. The advice keyed on the budget TIER the
+  // user had selected, and offered "try extended budget" whenever that
+  // tier was standard. But the server clamps the requested tier to
+  // whatever completion cap a model publishes, and falls back to the
+  // standard tier entirely when the catalog is offline, so extended can
+  // be byte-identical to standard. On those runs the card told a reader
+  // to spend four times as much to send exactly the same request. It
+  // also offered "a lower reasoning effort" without reading the effort
+  // that was set, so a run already at the UI minimum was told to lower
+  // something that cannot go lower.
+  //
+  // KEYED ON result.max_tokens, the EFFECTIVE post-clamp ceiling this
+  // run was actually sent, and on the caller's own report of what the
+  // extended tier would clamp to for this model. A tier name cannot
+  // answer either question.
+  //
+  // Returns "" when nothing can be SHOWN to help, and the caller keeps
+  // the accounting sentence alone. That is a weaker claim than the one
+  // this comment used to make ("every remedy is known not to work"),
+  // and the weaker one is the true one: since the effort clause began
+  // requiring an effort the ladder can place above the floor, silence
+  // also covers the case where the card simply does not know what the
+  // route is doing. Not knowing and knowing it will not help both
+  // produce the same honest output, which is nothing.
+  function remedyFor(result, options) {
+    const opts = options || {};
+    const sent = result.max_tokens;
+    const extendedCap = opts.extendedCap;
+    const parts = [];
+    // A BIGGER BUDGET IS ONLY ADVICE IF A BIGGER BUDGET EXISTS, was
+    // not already asked for, and can be shown to reach this run's
+    // route. Three conditions, and each one was learned from a card
+    // that gave advice it could not support.
+    //
+    // ONE: the tier must be KNOWN. An absent tier used to be read as
+    // "not extended", so a run that selected extended and whose record
+    // does not carry the tier was told to select it. Unknown is not
+    // standard; it is unknown, and nothing can be advised from it.
+    //
+    // TWO: the tier must not already be extended. extendedCap is what
+    // the catalog publishes TODAY and sent is what this run received,
+    // possibly weeks ago, so on a replay the cap comparison alone
+    // starts recommending extended to a clamped extended run the moment
+    // the published cap rises.
+    //
+    // THREE: the ROUTE's ceiling, where one is known, bounds what
+    // extended could deliver. extendedCap is a MODEL-level number and a
+    // provider-pinned trial is clamped again to its endpoint's, so a
+    // run pinned to a route capping at 8192 was told to try a tier that
+    // clamps to the same 8192. See routeCapFor for how a caller learns
+    // that number without asking the network.
+    const reachable =
+      typeof opts.routeCap === "number"
+        ? Math.min(extendedCap, opts.routeCap)
+        : extendedCap;
+    if (
+      (opts.budget === "standard" || opts.budget === "extended") &&
+      opts.budget !== "extended" &&
+      typeof sent === "number" &&
+      typeof extendedCap === "number" &&
+      reachable > sent
+    ) {
+      parts.push("extended budget");
+    }
+    // A lower effort is only advice when a LOWER one demonstrably
+    // exists, and absent is not evidence of that.
+    //
+    // THE DEFECT. Absent was read as "the operator chose nothing, which
+    // is above the minimum, so choosing low would reduce the thinking".
+    // The first half is true and the second does not follow: with
+    // nothing chosen the route runs at its CATALOG default, which the
+    // card does not know and which may be minimal (0.1) or none (0.0).
+    // Selecting low (0.2) would then RAISE reasoning, on a card whose
+    // entire subject is that reasoning consumed the budget. Two
+    // measured examples exist: openai/gpt-5.1 publishes default_effort
+    // "none", and the Flash-Lite variants publish "minimal".
+    //
+    // So the advice rides only for an effort this ladder can place
+    // strictly above the lowest selectable one. Unknown names are
+    // treated as unknown rather than as high.
+    const effort = opts.effort;
+    const current = EFFORT_SHARES[effort];
+    if (
+      typeof current === "number" &&
+      current > EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT]
+    ) {
+      parts.push("a lower reasoning effort");
+    }
+    if (!parts.length) return "";
+    // One "try" for the whole clause, so a single remedy reads "try a
+    // lower reasoning effort" rather than losing the verb, and a pair
+    // reads "try extended budget or a lower reasoning effort".
+    return "; try " + parts.join(" or ");
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -241,6 +452,13 @@
     tokenizeDiff,
     diffTokens,
     controlBadges,
+    reasoningAteTheOutput,
+    reasoningShare,
+    remedyFor,
+    LOWEST_SELECTABLE_EFFORT,
+    EFFORT_SHARES,
+    routeCapFor,
+    REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;

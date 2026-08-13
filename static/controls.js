@@ -35,6 +35,22 @@
 
   // Exported surface. Mutable fields (lineup, budgetValue) live here as
   // properties so a reassignment is visible to every reader.
+  // WHAT A TIER WOULD ACTUALLY SEND for one model, which is not the
+  // tier's nominal size. A line-for-line mirror of effective_budget in
+  // bench/main.py: clamp to the model's published completion cap where
+  // there is one, and fall back to the standard tier for EVERY model on
+  // an offline boot, because an offline catalog is also an unpriced one.
+  //
+  // Exported because the card's remedy has to know whether a larger
+  // budget exists before it suggests buying one.
+  function effectiveCap(modelId, tier) {
+    const want = BUDGET_TOKENS[tier];
+    if (!catalog.fetched) return Math.min(want, BUDGET_TOKENS.standard);
+    const entry = catalog.models.find((x) => x.id === modelId);
+    const cap = entry ? entry.max_completion_tokens : null;
+    return cap != null ? Math.min(want, cap) : want;
+  }
+
   const C = {
     lineup: loadLineup(),
     // What /compare/stream sends as the completion budget; per session on
@@ -46,6 +62,7 @@
     autosizePrompt,
     // Read by the stream client for the group POST and every stream
     // request; written by the reuse action in history.
+    effectiveCap,
     experimentParams,
     setExperimentParams,
     reuseExperiment,
@@ -394,11 +411,9 @@
           computable = false;
           break;
         }
-        const cap =
-          m.max_completion_tokens != null
-            ? Math.min(m.max_completion_tokens, BUDGET_TOKENS[C.budgetValue])
-            : BUDGET_TOKENS[C.budgetValue];
-        est += m.completion_price * cap;
+        // One clamp in the frontend, not two: the same function the
+        // card's remedy asks before it suggests a larger budget.
+        est += m.completion_price * effectiveCap(id, C.budgetValue);
       }
       if (computable) {
         text +=

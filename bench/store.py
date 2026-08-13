@@ -44,7 +44,7 @@ from typing import Any
 # get_run refuses to serve, so both ends of the pipeline enforce the
 # same field-type contract.
 from bench.extract import media_type_for
-from bench.models import as_metric, as_money, as_text, as_token_count
+from bench.models import as_flag, as_metric, as_money, as_text, as_token_count
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS results (
     provider TEXT,
     quantization TEXT,
     native_finish_reason TEXT,
-    upstream_inference_cost_usd TEXT
+    upstream_inference_cost_usd TEXT,
+    is_byok INTEGER
 );
 """
 
@@ -309,6 +310,28 @@ MIGRATIONS = [
     # population has to be able to say how it was narrowed.
     ("experiments", "quantizations_json", "TEXT"),
     ("results", "upstream_inference_cost_usd", "TEXT"),
+    # THE DISCRIMINATOR, moved out of a value's meaning and into a column
+    # of its own.
+    #
+    # upstream_inference_cost_usd was carrying two jobs: a money figure,
+    # and an implicit claim that a populated cell meant "this run was
+    # BYOK". The second job was never the wire's to keep. A live probe on
+    # 2026-08-12 (tests/fixtures/probe_reasoning_enable.json) returned
+    # is_byok false alongside a NONZERO upstream_inference_cost equal to
+    # the credit charge, which the vendor's own page says cannot happen:
+    # "For all other requests it will be 0 or null."
+    #
+    # Suppressing that figure to protect the column's intended meaning
+    # would have fixed a README paragraph by falsifying the database, so
+    # the figure is stored as received and the meaning moves here. The
+    # wire sends this discriminator on every usage block, so the record
+    # should carry it.
+    #
+    # INTEGER because SQLite has no bool; 1, 0 and NULL. NULL is the
+    # honest answer for every row written before this column existed and
+    # for any provider that omits the flag, and it is not the same
+    # answer as 0.
+    ("results", "is_byok", "INTEGER"),
     # Phase I, the evaluation layer. Four columns on groups, all nullable
     # and additive; the two new tables need no entry here because
     # CREATE TABLE IF NOT EXISTS in SCHEMA creates them on any database,
@@ -638,10 +661,33 @@ def connect(path: str) -> sqlite3.Connection:
     # checkpoint clears them; see the README's note on VACUUM.
     conn.execute("PRAGMA secure_delete = ON")
     conn.executescript(SCHEMA)
+    # ADDITIVE MIGRATIONS, and the try is not laziness.
+    #
+    # THE RACE. The PRAGMA and the ALTER are two statements, so two
+    # processes first-opening the same old database can both read a
+    # column as absent and both try to add it. The loser gets
+    # "duplicate column name" and, before this, an OperationalError out
+    # of connect(): the bench refusing to start because something else
+    # started it correctly a millisecond earlier. The window is small
+    # and real, and it is exactly the window a fresh checkout opens when
+    # a person runs the app and the test suite at once.
+    #
+    # Catching the duplicate and re-checking is the smallest fix that
+    # keeps the invariant: the column exists afterwards either way, and
+    # anything OTHER than a duplicate is still an error worth raising,
+    # so a genuinely broken migration is not swallowed.
     for table, column, decl in MIGRATIONS:
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-        if column not in cols:
+        if column in cols:
+            continue
+        try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError as exc:
+            if "duplicate column name" not in str(exc).lower():
+                raise
+            # Somebody else added it between the PRAGMA and here. That
+            # is the outcome this loop wanted, so it is not a failure.
+            logger.debug("migration raced on %s.%s, already added", table, column)
     # After the migrations, not before: runs.group_id may only exist
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
@@ -1648,9 +1694,9 @@ def save_run(
                 generation_id, finish_reason, position, request_json,
                 billed_cost_usd, reasoning_tokens, cached_tokens,
                 provider, quantization, native_finish_reason,
-                upstream_inference_cost_usd)
+                upstream_inference_cost_usd, is_byok)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?)""",
+                       ?, ?)""",
             [
                 (
                     run_id,
@@ -1680,6 +1726,15 @@ def save_run(
                     # here computes with it and a float round trip would
                     # round money on the way in. See _as_upstream_cost.
                     as_text(r.get("upstream_inference_cost_usd")),
+                    # A bool, or None when the provider did not report
+                    # one. sqlite3 adapts True and False to 1 and 0 and
+                    # leaves None as NULL, which is the three-state
+                    # record this column exists to keep.
+                    # Through the same rule the read path uses, so the
+                    # write and the read cannot disagree, and so a caller
+                    # that is not run_model cannot put a string into an
+                    # INTEGER column that would accept one.
+                    as_flag(r.get("is_byok")),
                 )
                 for r in results
             ],
@@ -1874,6 +1929,16 @@ def _repaired(row: dict[str, Any]) -> dict[str, Any]:
         "cached_tokens",
     ):
         row[field] = as_token_count(row[field])
+    # THE FLAG COLUMN, converted here so no reader has to know that
+    # SQLite has no boolean. scores_for_results already does exactly
+    # this for its own flags and says why; is_byok is the one that was
+    # left out of the rule when it landed.
+    #
+    # Identity matters downstream: report._cost_totals asks whether the
+    # flag is True, and an unconverted 1 fails that test while passing
+    # an equality test, so a bug here would look like a working report
+    # that quietly attributed nothing.
+    row["is_byok"] = as_flag(row["is_byok"])
     for field in ("latency_ms", "ttft_ms", "cost_usd"):
         row[field] = as_metric(row[field])
     # Money, so the finite rule applies on the way out too: a poisoned
@@ -1924,7 +1989,7 @@ def get_run(conn: sqlite3.Connection, run_id: int) -> dict[str, Any] | None:
         """SELECT id, model, response_text, latency_ms, prompt_tokens,
                   completion_tokens, error, cost_usd, ttft_ms, max_tokens,
                   generation_id, finish_reason, position, request_json,
-                  billed_cost_usd, reasoning_tokens, cached_tokens,
+                  billed_cost_usd, reasoning_tokens, cached_tokens, is_byok,
                   provider, quantization, native_finish_reason,
                   upstream_inference_cost_usd
            FROM results WHERE run_id = ?
@@ -2032,7 +2097,10 @@ def results_awaiting_reconciliation(
     way. The endpoint does report the figure, beside `is_byok`. But it
     "is only available for BYOK (Bring Your Own Key) requests. For all
     other requests it will be 0 or null", and NULL in that column is the
-    affirmative fact "this run was not BYOK". There is no column for
+    affirmative fact "the wire sent no usable figure", which is NOT
+    the same as "this run was not BYOK": that inference was measured
+    false on this branch, and is_byok is the column that answers it.
+    There is no column for
     "asked, and the answer was no", so a clause on it would park EVERY
     ordinary row on this list forever: the pass would never converge, and
     `python -m bench.reconcile` would report work to do on a database
@@ -2048,10 +2116,42 @@ def results_awaiting_reconciliation(
     `cost_details`, leaving the row otherwise complete. That gap is real
     and it is smaller than a list that never empties.
 
+    A CORRUPTED CELL IS NOT REACHED, and that is a limit rather than an
+    oversight. A value that is neither 1, 0 nor NULL, which SQLite's
+    column affinity will accept into an INTEGER column, decodes to None
+    through as_flag so no reader is misled, and the report counts the
+    trial as unattributed. This predicate selects on IS NULL and such a
+    cell is not null, so the pass never offers the row; fill-only
+    COALESCE would keep the corrupted value even if it did. Every write
+    path in this repository goes through as_flag, so no writer here can
+    create the state, and widening the clause to a typeof() test would
+    add a scan for a shape only a hand-edited database can hold. Named
+    rather than fixed.
+
+    `is_byok` DOES JOIN THE PREDICATE, and the asymmetry with the figure
+    beside it is the whole point of writing both down. The endpoint
+    publishes the flag for every generation, true or false, so a NULL
+    there is a question with an available answer: one pass fills it and
+    the row leaves the list. A row complete in every other column but
+    missing the flag used to be invisible to this pass and stayed
+    "unknown" in the report's attribution forever, which made an
+    advertised split quietly one bucket smaller plus a leak.
+
     A row the endpoint genuinely cannot fill stays listed across passes.
-    That is the honest state (the gap is real and still open), it costs one
-    lookup per pass, and it ends on its own when the generation record
-    expires and the endpoint starts 404ing.
+    That is the honest state (the gap is real and still open) and it
+    costs one lookup per pass.
+
+    IT DOES NOT END ON ITS OWN, and an earlier version of this paragraph
+    said it did: "it ends on its own when the generation record expires
+    and the endpoint starts 404ing". It does not. A 404 sets the
+    record's error, _has_writes returns False, nothing is written and
+    the row still matches this predicate on the next pass. That was
+    already true of every other clause here; adding the flag WIDENS the
+    population, because a row complete in every other column but
+    written before this one existed now lists forever once its record
+    expires. The cost is one lookup per such row per pass, --limit walks
+    the oldest first, and the alternative was leaving a fillable
+    question permanently unasked.
 
     Ordered by id so a run interrupted partway through resumes in a
     predictable place, and so a --limit run walks the oldest rows first.
@@ -2064,6 +2164,7 @@ def results_awaiting_reconciliation(
         "     OR typeof(r.billed_cost_usd) NOT IN ('real', 'integer') "
         "     OR r.billed_cost_usd < 0 "
         "     OR r.provider IS NULL "
+        "     OR r.is_byok IS NULL "
         "     OR r.native_finish_reason IS NULL) "
         "ORDER BY r.id"
     )
@@ -2088,6 +2189,20 @@ RECONCILABLE_COLUMNS = (
     # the value was fetched on every pass and thrown away, which is a
     # helper with no call site wearing a different hat.
     "upstream_inference_cost_usd",
+    # The BYOK discriminator. Without this entry fetch_generation would
+    # parse it on every pass and drop it, which is exactly what this
+    # tuple's comment above describes for the figure beside it.
+    #
+    # It IS in the predicate, unlike the figure beside it, and this
+    # comment used to say the opposite: that a NULL clause "would park
+    # every row written before the column existed on the work list
+    # forever". That reasoning was borrowed from
+    # upstream_inference_cost_usd and does not transfer. The endpoint
+    # publishes is_byok for every generation, true or false, so a NULL
+    # here is a question with an available answer and one pass converges
+    # it. The figure beside it has no answer for an ordinary run, which
+    # is what would never converge.
+    "is_byok",
 )
 
 
@@ -2126,9 +2241,21 @@ def apply_reconciliation(
                    provider = COALESCE(?, provider),
                    quantization = COALESCE(?, quantization),
                    native_finish_reason = COALESCE(?, native_finish_reason),
+                   -- FILL-ONLY, and the argument order is the whole
+                   -- decision. See the comment on the bound value.
                    upstream_inference_cost_usd = COALESCE(
-                       ?, upstream_inference_cost_usd
-                   )
+                       upstream_inference_cost_usd, ?
+                   ),
+                   -- COALESCE, not the billed_cost_usd CASE, and the
+                   -- STORED value first: this fills a gap and never
+                   -- corrects a value, so an endpoint answer of any
+                   -- kind loses to anything already captured in band.
+                   -- The argument order IS the rule. sqlite3 binds
+                   -- Python False as 0 and COALESCE reaches the bound
+                   -- value only when the column is NULL, so a reported
+                   -- False writes on an unknown row and is ignored on a
+                   -- known one, which is both halves of fill-only.
+                   is_byok = COALESCE(is_byok, ?)
                WHERE id = ?""",
             (
                 record["billed_cost_usd"],
@@ -2136,13 +2263,69 @@ def apply_reconciliation(
                 record["provider"],
                 record["quantization"],
                 record["native_finish_reason"],
-                # COALESCE like the text columns, not the money CASE. It
-                # is TEXT recorded verbatim for reconciliation against a
-                # provider invoice, and an unreported figure means "not
-                # reported" rather than "known to be nothing": there is
-                # no poisoned-value case to clear, because nothing
-                # computes with it.
+                # THE IN-BAND FIGURE WINS, and this is the one column
+                # where the reconcile pass fills a gap rather than
+                # correcting a value. The choice is deliberate and it is
+                # made here because the two sources are known to
+                # disagree.
+                #
+                # MEASURED, and the provenance of each half is stated
+                # separately because they do not come from the same
+                # place and an earlier version of this comment implied
+                # they did.
+                #
+                # For generation gen-1786560251-TPHWD5yYlFa5qRDnF3jf the
+                # GENERATION ENDPOINT reported upstream_inference_cost 0
+                # with is_byok false. That half is verbatim in
+                # tests/fixtures/probe_reasoning_cap_binding.json; the
+                # 0.0035 in that file is total_cost, which is a
+                # different key.
+                #
+                # The IN-BAND usage block for the same generation
+                # reported upstream_inference_cost 0.0035, and that half
+                # was reported by the operator who ran the probe rather
+                # than captured into the fixture. It is recorded as a
+                # reported observation in the fixture's
+                # _in_band_disagreement field, labelled as such, because
+                # evidence whose provenance is not stated is evidence
+                # nobody can check.
+                #
+                # WHY IN-BAND. It is contemporaneous with the charge,
+                # and in the one observed disagreement it is the source
+                # carrying MORE information: overwriting 0.0035 with 0
+                # loses a figure an operator could reconcile against an
+                # invoice, while the reverse loses nothing. A pass whose
+                # purpose is to recover facts must not be able to erase
+                # one.
+                #
+                # THIS BECAME REACHABLE WHEN ZEROS STARTED BEING STORED.
+                # While a zero degraded to NULL the endpoint's zero
+                # arrived as NULL and COALESCE kept the stored value by
+                # accident. Storing reality made the clobber real, so
+                # the ordering had to become a decision instead of a
+                # coincidence.
+                #
+                # The other columns keep the opposite order on purpose:
+                # for provider, quantization and the native finish
+                # reason the endpoint IS the authority, and a later
+                # correction there is the point of reconciling at all.
                 record["upstream_inference_cost_usd"],
+                # is_byok FILLS AND DOES NOT CORRECT, by the same
+                # ruling and for a stronger reason than the figure
+                # above. It arrived as COALESCE(?, is_byok), which gives
+                # every non-null endpoint answer precedence, so a run
+                # that reported BYOK in band and false at the endpoint
+                # was rewritten to false and moved cost buckets in the
+                # report.
+                #
+                # The in-band value is the one taken in the same
+                # exchange as the charge. The endpoint's is a later
+                # summary of that exchange, and the two are MEASURED to
+                # disagree: gen-1786560251 reported an upstream figure
+                # of 0.0035 in band and 0 at the endpoint. A pass whose
+                # purpose is to recover facts must not be able to
+                # overwrite one, and this column now has no way to.
+                record["is_byok"],
                 result_id,
             ),
         )

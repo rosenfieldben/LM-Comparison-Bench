@@ -18,6 +18,13 @@ const {
   tokenizeDiff,
   diffTokens,
   controlBadges,
+  reasoningAteTheOutput,
+  reasoningShare,
+  remedyFor,
+  LOWEST_SELECTABLE_EFFORT,
+  EFFORT_SHARES,
+  routeCapFor,
+  REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
 
@@ -259,4 +266,326 @@ test("approxTokens rounds up, so a short document never estimates zero", () => {
   assert.equal(approxTokens(5), 2);
   assert.equal(approxTokens(4000), 1000);
   assert.equal(approxTokens(null), 0);
+});
+
+// ---- The reasoning-exhaustion fix, R2 and R4: the shape test the card
+// ---- draws its remedy and its indicator from.
+
+// Every case is a token shape. None of them knows what produced it,
+// which is the property under test as much as any single answer is.
+const EXHAUSTION_SHAPES = [
+  ["the incident, exactly equal", 21350, 21350, true],
+  ["a different tier, same shape", 8192, 8100, true],
+  ["exactly at the threshold", 1000, 900, true],
+  ["one token under the threshold", 1000, 899, false],
+  ["a healthy answer, row 694's shape", 3400, 2944, false],
+  ["no thinking at all", 500, 0, false],
+  ["a provider that reported no usage", null, null, false],
+  ["a history row from before the column existed", 500, null, false],
+  ["reasoning without a completion count", null, 5000, false],
+  ["both zero", 0, 0, false],
+];
+
+test("reasoningAteTheOutput keys on the two counts and nothing else", () => {
+  for (const [shape, completion, reasoning, expected] of EXHAUSTION_SHAPES) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), expected, shape);
+  }
+});
+
+test("the threshold is the one the server uses", () => {
+  // The rule is written twice, once per language, because the server can
+  // only label a result it synthesized an error for while the card's
+  // indicator must also fire on a result that came back with text. The
+  // Python side asserts this file's text; this asserts the value.
+  assert.equal(REASONING_SHARE_EXHAUSTED, 0.9);
+});
+
+test("row 694's healthy shape is not mistaken for exhaustion", () => {
+  // The contrast case from the incident's own database: 2944 reasoning
+  // tokens, a real answer, end_turn. A rule that fired here would put a
+  // warning on every reasoning model that worked.
+  assert.equal(reasoningAteTheOutput(3400, 2944), false);
+  // And it stays false right up to the boundary.
+  assert.equal(reasoningAteTheOutput(3400, 3059), false);
+  assert.equal(reasoningAteTheOutput(3400, 3060), true);
+});
+
+// R4: the indicator names the fraction, so the card shows a magnitude
+// rather than only a warning.
+
+test("reasoningShare rounds to a whole percent and degrades to null", () => {
+  assert.equal(reasoningShare(21350, 21350), 100);
+  assert.equal(reasoningShare(8500, 8000), 94);
+  assert.equal(reasoningShare(3400, 2944), 87);
+  // Rounded, not truncated: 0.945 reads as 95, not 94.
+  assert.equal(reasoningShare(1000, 945), 95);
+  // A row that predates the reasoning column, and a divide by zero.
+  assert.equal(reasoningShare(500, null), null);
+  assert.equal(reasoningShare(null, 500), null);
+  assert.equal(reasoningShare(0, 0), null);
+  // Zero reasoning is a real answer, not an absent one, so it is 0 and
+  // not null. The predicate is what decides whether anything is shown.
+  assert.equal(reasoningShare(500, 0), 0);
+});
+
+test("the indicator's threshold and its number come from one rule", () => {
+  // Everything the predicate fires on has a share at or above the
+  // threshold, and everything it stays quiet about is below it. Two
+  // functions, one boundary; a change to either alone breaks this.
+  for (const [shape, completion, reasoning] of [
+    ["the incident", 21350, 21350],
+    ["answered but mostly thinking", 8500, 8000],
+    ["exactly at the threshold", 1000, 900],
+  ]) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), true, shape);
+    assert.ok(
+      reasoningShare(completion, reasoning) >= REASONING_SHARE_EXHAUSTED * 100,
+      shape,
+    );
+  }
+  for (const [shape, completion, reasoning] of [
+    ["one token under", 1000, 899],
+    ["row 694", 3400, 2944],
+  ]) {
+    assert.equal(reasoningAteTheOutput(completion, reasoning), false, shape);
+  }
+});
+
+test("the rounded share can read 90 on a card the rule stays quiet about", () => {
+  // 899 of 1000 is 0.899, which the predicate rejects, and which rounds
+  // to 90 for display. Recorded rather than smoothed over: the two
+  // functions answer different questions and only one of them is
+  // allowed to be approximate.
+  //
+  // It is invisible in practice, and that is the point of writing it
+  // down. The share is rendered ONLY on a card the predicate fired for,
+  // so a reader never sees "90%" beside a card that was left alone.
+  // Nothing needs to change here unless the share is ever shown
+  // unconditionally, and then this test is where the problem is already
+  // described.
+  assert.equal(reasoningAteTheOutput(1000, 899), false);
+  assert.equal(reasoningShare(1000, 899), 90);
+});
+
+// ---- T5: advice that cannot work is not offered.
+//
+// Every case below is stated against a PINNED RULE rather than against
+// what the function happens to do: the clamp comes from
+// effective_budget in bench/main.py, and the effort floor from the
+// option list in static/index.html.
+
+test("no budget advice when a larger budget does not exist", () => {
+  // effective_budget clamps the requested tier to a model's published
+  // completion cap. stub/capped publishes 4096, so extended and
+  // standard both send 4096 and "try extended budget" is an instruction
+  // to spend four times as much on an identical request.
+  const standard = { budget: "standard" };
+  const clamped = remedyFor(
+    { max_tokens: 4096 },
+    { ...standard, extendedCap: 4096 },
+  );
+  assert.ok(!clamped.includes("extended budget"));
+
+  // Same rule, the offline case, which is the one that makes the old
+  // advice impossible for EVERY model: with no catalog there are no
+  // published caps, so extended falls back to the standard tier.
+  const offline = remedyFor(
+    { max_tokens: 16384 },
+    { ...standard, extendedCap: 16384 },
+  );
+  assert.ok(!offline.includes("extended budget"));
+
+  // And it IS offered when a larger budget genuinely exists.
+  const room = remedyFor(
+    { max_tokens: 16384 },
+    { ...standard, extendedCap: 65536 },
+  );
+  assert.ok(room.includes("try extended budget"));
+
+  // EVERY CASE HERE NAMES ITS TIER, and that is not decoration. The
+  // budget clause now requires a known tier, so a version of this test
+  // that omitted it would assert silence for the wrong reason and pass
+  // whatever the cap comparison did.
+});
+
+test("review repro: lower-effort advice needs a lower effort to exist", () => {
+  // THE FLOOR, asserted against the documented ladder rather than
+  // against index.html's option list. A decision to expose "minimal"
+  // should move this test rather than pass quietly, and the ladder is
+  // what the comparison actually uses.
+  assert.equal(LOWEST_SELECTABLE_EFFORT, "low");
+  assert.equal(EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT], 0.2);
+  for (const below of ["none", "minimal"]) {
+    assert.ok(
+      EFFORT_SHARES[below] < EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT],
+      below,
+    );
+  }
+
+  // THE DEFECT THIS ROW REPLACES, and the old version of this test
+  // asserted it. undefined and "" were listed beside "medium" and
+  // "high" as efforts that can be lowered, on the reasoning that
+  // choosing nothing is "above the minimum". It is not: with nothing
+  // chosen the route runs at its CATALOG default, which the card does
+  // not know. openai/gpt-5.1 publishes default_effort "none" and the
+  // Flash-Lite variants publish "minimal", both BELOW low, so the
+  // advice would have raised reasoning on a card whose whole subject is
+  // that reasoning consumed the budget.
+  for (const effort of [undefined, "", null, "low", "minimal", "none", "??"]) {
+    assert.equal(
+      remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort }),
+      "",
+      String(effort),
+    );
+  }
+
+  // And it IS offered for the two the ladder can place above the floor.
+  for (const effort of ["medium", "high"]) {
+    const out = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort });
+    assert.ok(out.includes("a lower reasoning effort"), effort);
+  }
+});
+
+test("review repro: a replayed extended run is not told to try extended", () => {
+  // THE DEFECT. extendedCap is what the catalog publishes TODAY;
+  // result.max_tokens is what this run was SENT, possibly long ago. On
+  // a replayed card those are two different points in time, so a run
+  // that already selected extended and was clamped to 4096 begins being
+  // advised to "try extended budget" the moment the published cap rises
+  // above 4096. The advice is to do the thing that was already done.
+  const sent = { max_tokens: 4096 };
+  const capRose = { extendedCap: 65536, effort: "high" };
+
+  // With the tier recorded as standard, the cap comparison advises it,
+  // which is correct: standard really can be raised.
+  const asStandard = remedyFor(sent, { ...capRose, budget: "standard" });
+  assert.ok(asStandard.includes("try extended budget"));
+
+  // With the stored tier saying extended, only the effort clause
+  // survives.
+  const asExtended = remedyFor(sent, { ...capRose, budget: "extended" });
+  assert.equal(asExtended, "; try a lower reasoning effort");
+});
+
+test("review repro: an unknown tier advises no tier at all", () => {
+  // THE DEFECT, and the false premise that hid it. An absent tier used
+  // to be read as "not extended", so the budget clause rode. The
+  // comment defending that said an ungrouped run "predates the
+  // declaration entirely" and therefore had no tier to lose.
+  //
+  // It does not predate anything. /compare takes group_id as OPTIONAL
+  // and budget as a current field, so a run created today can select
+  // extended and carry no group, and `runs` has no budget column to
+  // record it in. Such a run is replayed with the tier missing and was
+  // told to select the tier it had already selected.
+  //
+  // UNKNOWN IS NOT STANDARD. The record cannot say which tier ran, so
+  // the card says nothing about tiers. The effort clause is unaffected,
+  // which is what makes this a narrowing rather than the advice going
+  // dark.
+  const sent = { max_tokens: 4096 };
+  const capRose = { extendedCap: 65536, effort: "high" };
+
+  assert.equal(remedyFor(sent, capRose), "; try a lower reasoning effort");
+  assert.equal(
+    remedyFor(sent, { ...capRose, budget: undefined }),
+    "; try a lower reasoning effort",
+  );
+  // A tier this function does not recognise is unknown too, rather
+  // than "not extended".
+  assert.equal(
+    remedyFor(sent, { ...capRose, budget: "enormous" }),
+    "; try a lower reasoning effort",
+  );
+});
+
+test("review repro: a pinned route's ceiling bounds what extended can offer", () => {
+  // THE DEFECT, reproduced exactly as the review reported it:
+  //
+  //   remedyFor({max_tokens:8192},{extendedCap:65536,budget:"standard"})
+  //     -> "; try extended budget"
+  //
+  // while the server's own arithmetic gives
+  //
+  //   route_budget(16384, 8192) == route_budget(65536, 8192) == 8192
+  //
+  // extendedCap is a MODEL-level number. A provider-pinned trial is
+  // clamped again to the endpoint the pin selected, so a run pinned to
+  // a route capping at 8192 was advised to buy a tier that clamps to
+  // the same 8192: a replay of the identical request at four times the
+  // price.
+  const pinned = { max_tokens: 8192 };
+  assert.equal(
+    remedyFor(pinned, {
+      extendedCap: 65536,
+      budget: "standard",
+      routeCap: 8192,
+    }),
+    "",
+  );
+  // WITHOUT the route cap the old answer is still produced, which is
+  // what makes the line above a fact about routeCap rather than about
+  // this particular pair of numbers.
+  assert.ok(
+    remedyFor(pinned, { extendedCap: 65536, budget: "standard" }).includes(
+      "extended budget",
+    ),
+  );
+  // And a route with genuine headroom is still advised: the rule is
+  // min(extendedCap, routeCap) against what was sent, not "pinned runs
+  // get no advice".
+  assert.ok(
+    remedyFor(pinned, {
+      extendedCap: 65536,
+      budget: "standard",
+      routeCap: 32768,
+    }).includes("extended budget"),
+  );
+});
+
+test("routeCapFor learns the route's ceiling only when min picked it", () => {
+  // The server sends min(tierCap, routeCap), so a sent ceiling STRICTLY
+  // below the model-level cap for that tier can only be the route's own
+  // number. Equal means the route did not bind and nothing was learned,
+  // which must be null rather than a guess: returning tierCap there
+  // would claim a route ceiling for every unpinned run in the bench.
+  assert.equal(routeCapFor(8192, 16384), 8192);
+  assert.equal(routeCapFor(16384, 16384), null);
+  assert.equal(routeCapFor(4096, 4096), null);
+  // Absent inputs learn nothing rather than throwing or coercing.
+  assert.equal(routeCapFor(undefined, 16384), null);
+  assert.equal(routeCapFor(8192, undefined), null);
+  assert.equal(routeCapFor(null, null), null);
+});
+
+test("both clauses when both remedies exist, joined once", () => {
+  const both = remedyFor(
+    { max_tokens: 16384 },
+    { extendedCap: 65536, effort: "high", budget: "standard" },
+  );
+  assert.equal(both, "; try extended budget or a lower reasoning effort");
+});
+
+test("remedyFor reads the cap the run was sent, never a tier name", () => {
+  // THE DEFECT, stated as a test. The old code branched on the selected
+  // tier, so a run at the extended tier that clamped down to 4096 was
+  // told to try extended, which is where it already was. A tier name
+  // is not on the result object at all now, and this asserts the
+  // decision follows max_tokens.
+  const sameCap = { max_tokens: 4096 };
+  assert.ok(
+    !remedyFor(sameCap, { extendedCap: 4096, budget: "standard" }).includes(
+      "extended budget",
+    ),
+  );
+  assert.ok(
+    remedyFor(sameCap, { extendedCap: 65536, budget: "standard" }).includes(
+      "extended budget",
+    ),
+  );
+
+  // Missing information is not an invitation to advise: a caller that
+  // cannot say what extended would send gets no budget clause.
+  assert.ok(!remedyFor(sameCap, {}).includes("extended budget"));
+  assert.ok(!remedyFor({}, { extendedCap: 65536 }).includes("extended budget"));
 });

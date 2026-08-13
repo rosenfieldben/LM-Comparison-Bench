@@ -35,6 +35,67 @@ def as_text(value: object) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def as_flag(value: object) -> bool | None:
+    """A three-state flag: True, False, or None for "not reported".
+
+    ONE RULE FOR THE WRITE AND THE READ, which is the reason this is a
+    function rather than an isinstance check at each site. SQLite has no
+    boolean: it stores 1, 0 and NULL, so a flag column round-trips as an
+    int unless somebody converts it back, and the conversion has to
+    happen in exactly the same way on both sides or the two disagree.
+
+    THE TRAP THIS EXISTS TO CLOSE. In Python `1 == True` is True but
+    `1 is True` is False, so a reader who checks identity gets the wrong
+    answer from an unconverted row while a reader who checks equality
+    gets the right one by luck. A truthiness check is worse again: it
+    folds 0 and None together, and those are the two states this column
+    was created to tell apart.
+
+    None for anything that is not a bool or an int in (0, 1). A poisoned
+    cell degrades to "not reported" rather than to a confident True,
+    because SQLite's column affinity will accept a string into an
+    INTEGER column and a later reader must not be told something the
+    wire never said.
+
+    FOR SQLITE CELLS ONLY, and this sentence used to say the opposite.
+    It claimed the int branch was "the same isinstance discipline
+    _ingest_usage applies at the wire", which was false in the one
+    direction that matters: the wire parse accepts a bool and nothing
+    else. The difference is not pedantry. A storage layer with no
+    boolean type MUST decode 1 back into True or nothing round-trips; a
+    JSON document has a boolean type, so a provider sending 1 where the
+    schema says true is a provider disagreeing with its own contract,
+    and reading it as True invents a fact. See as_wire_flag, which is
+    what external documents get.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def as_wire_flag(value: object) -> bool | None:
+    """A three-state flag read from a document that HAS booleans.
+
+    The counterpart to as_flag, and deliberately narrower. JSON
+    distinguishes true from 1, so an integer here is not a boolean that
+    lost its type on the way through a database, it is a value the
+    schema did not promise. Absence and disagreement both degrade to
+    None, which is "not reported", and never to a confident answer.
+
+    ONE RULE FOR BOTH EXTERNAL READERS. The in-band usage object and the
+    generation endpoint are two documents from one platform describing
+    one field, and they used to be parsed by two different rules: the
+    usage object required a bool inline, while the endpoint reached for
+    as_flag and so accepted the SQLite integer. The same wire value
+    therefore produced two different answers depending on which door it
+    came through, which is the kind of disagreement that shows up much
+    later as a row in the wrong cost bucket.
+    """
+    return value if isinstance(value, bool) else None
+
+
 def as_metric(value: object) -> float | None:
     """A finite float measurement or None; bools and junk become None.
 
@@ -74,6 +135,23 @@ OPENROUTER_URL = os.environ.get(
     "OPENROUTER_URL", "https://openrouter.ai/api/v1/chat/completions"
 )
 MODELS_URL = os.environ.get("MODELS_URL", "https://openrouter.ai/api/v1/models")
+
+# The PER-ENDPOINT capability listing, which is a different publication
+# from the model-level one MODELS_URL returns and can disagree with it.
+# Pinned against
+# https://openrouter.ai/docs/api-reference/list-endpoints-for-a-model,
+# read 2026-08-12: GET /api/v1/models/:author/:slug/endpoints, whose
+# data.endpoints[] each carry provider_name and their own
+# supported_parameters.
+#
+# MEASURED, because "can disagree" is the whole reason this exists. On
+# 2026-08-12 nvidia/nemotron-3-ultra-550b-a55b published three
+# endpoints advertising 18, 12 and 17 parameters respectively, differing
+# in which ones. A model-level aggregate is a union over hosts, so it
+# proves nothing about the ONE host a strict pin selects.
+ENDPOINTS_URL = os.environ.get(
+    "ENDPOINTS_URL", "https://openrouter.ai/api/v1/models/{model}/endpoints"
+)
 GENERATION_URL = os.environ.get(
     "GENERATION_URL", "https://openrouter.ai/api/v1/generation"
 )
@@ -239,6 +317,450 @@ def provider_preferences(
 _SAMPLING_KEYS = ("temperature", "top_p", "seed")
 
 
+# How much of a completion budget thinking may consume before the bench
+# stops it and leaves the rest for a visible answer.
+#
+# THE INCIDENT. A production comparison on document prompts reasoned
+# until the completion cap closed on it: billed in full, between $3.38
+# and $3.50 per card, with ZERO visible output. The generation record is
+# unambiguous about where the budget went, tokens_completion 21350
+# against native_tokens_reasoning 21350, and the card carried no answer
+# at all. Row 694 of the same database is the healthy contrast: 2944
+# reasoning tokens, a real answer, end_turn.
+#
+# NOT A PROPERTY OF ONE MODEL, which is why nothing here names one.
+# Exhaustion is what happens when a model thinks hard against a
+# completion cap, and any model that reasons can do it on a hard enough
+# prompt. The reservation is therefore a function of the BUDGET and of
+# nothing else; there is a test asserting no model name appears in this
+# logic.
+#
+# ONE HALF, and the arithmetic rather than the round number. The
+# extended tier is 65536, so thinking is capped at 32768 and a maximal
+# thinker still leaves 32768 for the answer, which is four times the
+# whole standard tier. The standard tier is 16384, capped at 8192, and
+# 8192 visible tokens is a long answer by any measure. Lower would start
+# refusing thought that a hard prompt legitimately needs; higher shrinks
+# the guarantee this exists to make. Half is the point where neither
+# half of the budget can starve the other.
+REASONING_BUDGET_SHARE = 0.5
+
+# THE DOCUMENTED EFFORT LADDER, as share of max_tokens. Pinned against
+# the reasoning-tokens guide's "Reasoning Effort Level" section,
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# read 2026-08-12, quoted in the order the page lists them: max
+# "approximately 95% of max_tokens", xhigh "Same allocation as max
+# (approximately 95%)", high "approximately 80%", medium "approximately
+# 50%", low "approximately 20%", minimal "approximately 10%", and
+# "'effort': 'none' - Disables reasoning entirely".
+#
+# Ratios rather than an ordered list of names, because the comparison
+# this table exists for is against REASONING_BUDGET_SHARE, which is a
+# number. A future share of 0.25 would move the boundary to low without
+# anybody editing a tier list, which is the point.
+# A REASONING FLOOR ONE VENDOR DOCUMENTS, APPLIED TO EVERY ROUTE ON
+# PURPOSE. The scope of the number and the scope of its application are
+# different things, and an earlier version of this comment stated the
+# first as though it were the second: it called this "the smallest
+# reasoning budget ANY pinned provider will accept", which the contract
+# does not say and this repository never measured.
+#
+# WHERE THE NUMBER COMES FROM. Both rules below sit under the heading
+# "Reasoning Max Tokens for Anthropic Models", in a section that opens
+# "When using Anthropic models with reasoning:", at
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# heading and scope re-read 2026-08-13:
+#
+#   "When using the reasoning.max_tokens parameter, that value is used
+#   directly with a minimum of 1024 tokens."
+#
+#   "Important: max_tokens must be strictly higher than the reasoning
+#   budget to ensure there are tokens available for the final response
+#   after thinking."
+#
+# The page states no floor for any other family. For Gemini 3 it states
+# the opposite kind of thing, that a budget is passed through as
+# thinkingBudget and then "Google internally maps this budget value to a
+# thinkingLevel, so you will not get precise token control".
+#
+# WHY IT IS APPLIED EVERYWHERE ANYWAY, and this is a choice rather than
+# a reading. Off that one family the floor is UNKNOWN, not absent, and
+# the two ways of being wrong are not symmetric. Assume no floor and a
+# route that has one turns a 600 token request into a 1024 token demand
+# against a 1200 token budget, leaving 176 visible tokens where 600 were
+# promised: the exact failure this whole workstream exists to prevent,
+# reintroduced by the guard meant to prevent it. Assume the floor and a
+# route without one merely stands down on small budgets, sending the
+# pre-feature payload it would have sent anyway. The conservative
+# reading costs a feature at the margin; the permissive one costs the
+# answer.
+#
+# NAMED FOR WHAT IT IS RATHER THAN FOR WHO PUBLISHED IT. A first draft
+# called this ANTHROPIC_REASONING_MINIMUM and the universality tripwire
+# failed the moment the constant was read from reasoning_reservation,
+# correctly: a vendor's name had entered executable code. Prose about a
+# contract may name a vendor; a line that runs may not.
+#
+# ONE NUMBER FOR THE WHOLE FILE, because the judge's 512 budget and a
+# per-model clamp reach the same wall from opposite directions and must
+# not be two rules that can drift apart.
+PROVIDER_REASONING_MINIMUM = 1024
+
+# THE STATES THE RESERVATION CAN BE IN, named because two of them used
+# to be one. "Cannot be satisfied" covered both a budget where nothing
+# fits and a budget where the FLOOR fits but the intended split does
+# not, and those are different facts about a request. A caller that
+# knows only "it stood down" cannot tell an operator which, and a test
+# that knows only "it stood down" can do no better than restate the
+# condition it is supposed to be checking.
+RESERVATION_RIDES = "rides"
+RESERVATION_NOT_VOUCHED = "not vouched"
+RESERVATION_EFFORT_DECLARED = "effort declared"
+RESERVATION_SPLIT_BELOW_FLOOR = "split below the provider floor"
+RESERVATION_NO_ROOM_ABOVE_FLOOR = "no room above the provider floor"
+
+EFFORT_SHARES = {
+    "none": 0.0,
+    "minimal": 0.1,
+    "low": 0.2,
+    "medium": 0.5,
+    "high": 0.8,
+    "xhigh": 0.95,
+    "max": 0.95,
+}
+
+# Pinned against OpenRouter's reasoning-tokens guide at
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# re-read in full 2026-08-12. This block was rewritten at R4 after that
+# re-read contradicted two things the first version asserted; both
+# corrections are below and both are the docs' fault rather than a
+# change of mind.
+#
+# THE FIELD. reasoning is a top-level object and the cap is its
+# max_tokens key: "'max_tokens': 2000, // Specific token limit
+# (Anthropic-style)".
+#
+# NOT BOTH, WHICH THE PAGE SAYS AND THEN UNSAYS. The schema comment
+# introduces the two keys as "One of the following (not both)". Thirty
+# lines later the per-model discovery section describes
+# supports_max_tokens as a reason to "send 'reasoning.max_tokens'
+# instead of (or alongside) 'reasoning.effort'". The page therefore
+# forbids the combination in one place and sanctions it in another,
+# names no winner if both arrive, and documents no error for the
+# collision.
+#
+# So the bench takes the CONSERVATIVE reading and never sends both, and
+# the reason is not the schema comment: it is that an undefined
+# resolution is not something to discover in production at $3.50 a card.
+# When the two would collide the OPERATOR'S CONTROL RIDES and the
+# reservation stands down. Effort is a declared part of the experiment,
+# this is the bench's own default, and a default that overwrote a
+# declaration is the one thing rule one forbids.
+#
+# THAT REQUEST IS THEN UNPROTECTED BY BOTH HALVES OF THIS FIX, which an
+# earlier version of this comment denied. It claimed the card's
+# indicator covers the gap "because it reads the tokens that came back
+# rather than the field that went out". Read the arithmetic: an effort
+# of high allocates approximately 80% of max_tokens per the vendor's own
+# table, and REASONING_SHARE_EXHAUSTED is 0.9, so
+# reasoning_ate_the_output(16384, 13107) is False and the indicator
+# provably never fires at the share a declared effort produces. It is a
+# comment that justified a decision by naming a safety net that is not
+# under it.
+#
+# The decision still stands, on its own merits: not sending an
+# undefined combination and letting the operator's declaration ride is
+# the defensible reading of rule one under real ambiguity, and the
+# exposure is bounded to requests where an operator deliberately set an
+# effort. But it is exposure, and it is named here rather than
+# explained away.
+#
+# HOW FEW ROUTES TAKE A REAL BUDGET, measured rather than assumed, and
+# this is the correction that matters most. GET /api/v1/models on
+# 2026-08-12 returned 406 models. 275 publish "reasoning" in
+# supported_parameters and 276 carry a reasoning descriptor object, but
+# only TEN of those set supports_max_tokens true. A comment claiming
+# this caps thinking on every route would be false on roughly 96% of
+# the reasoning models in the catalog.
+#
+# WHAT HAPPENS ON THE OTHER 266, and why the reservation is still worth
+# sending. It is TRANSLATED, not dropped: "For models that only support
+# 'reasoning.effort' (see below), the 'max_tokens' value will be used to
+# determine the effort level." The effort table puts medium at
+# "approximately 50% of max_tokens", which is this constant's share, so
+# a half-budget cap lands on the effort bucket that means the same
+# thing. The intent survives the translation. The precision does not,
+# and "approximately" is the vendor's word, not a hedge added here.
+#
+# Two named routes are looser still, both from the same page. Anthropic
+# applies "budget_tokens = max(min(max_tokens * {effort_ratio}, 128000),
+# 1024)", so a small budget floors at 1024 rather than at its share. And
+# for Gemini 3, "Google internally maps this budget value to a
+# 'thinkingLevel', so you will not get precise token control."
+#
+# Finally, a provider that does not support the parameter at all ignores
+# it outright, per the provider-selection page: providers "can still
+# receive the request, but will ignore unknown parameters".
+#
+# THE HONEST SUMMARY, which the README states in the same words: on ten
+# models this is a hard cap; on most it is a strong hint that means the
+# right thing approximately; on some it is nothing. That is why R2's
+# label and R4's indicator read the tokens that came BACK. They are not
+# a fallback for a rare case. They are the coverage for the common one.
+#
+# WHY A CAP AND NOT AN EFFORT for the bench's own default: an effort is
+# a word whose token cost is the provider's to decide, and the whole
+# defect is a token count nobody bounded. A cap is the thing that can be
+# checked against the budget it is a fraction of.
+#
+# Reasoning tokens are charged either way, which is the other half of
+# why this is worth sending: "Reasoning tokens are considered output
+# tokens and charged accordingly."
+
+
+def reasoning_claims(reasoning: Mapping[str, Any]) -> tuple[bool, bool]:
+    """What a model's reasoning descriptor CLAIMS: whether it thinks
+    unprompted, and whether it contradicts itself saying so.
+
+    ONE DERIVATION, so every arm of the gate reads the same three keys
+    the same way. They were previously read inline in a shape where
+    mandatory SHORT-CIRCUITED the effort check:
+
+        already_reasons = mandatory is True or (
+            default_enabled is True and default_effort != "none")
+
+    so "none" was honoured on the default_enabled side and ignored on
+    the mandatory side. A descriptor publishing mandatory true,
+    default_enabled true, default_effort "none" and supports_max_tokens
+    true therefore cleared the ceiling arm and received an 8192 token
+    reservation: the reservation switching thinking ON for a route whose
+    own descriptor says it is off, which is this workstream's founding
+    defect reintroduced through the arm nobody checked.
+
+    "none" IS OFF, EVERYWHERE. The contract's words, quoted at
+    EFFORT_SHARES: "'effort': 'none' - Disables reasoning entirely",
+    and of the descriptor key, "If the value is 'none', treat it as
+    'reasoning off by default'".
+
+    THE INVARIANT, returned rather than raised because the caller is a
+    catalog parse that must never reject a whole catalog over one
+    entry:
+
+        for any descriptor the gate vouches for, a claim that thinking
+        is ON must not sit beside a claim that it is OFF.
+
+    Two shapes break it. Either flag saying thinking happens beside an
+    effort of "none" is one; mandatory true beside default_enabled false
+    is the other. Neither is a descriptor anybody can act on, and a
+    parser that believes whichever half is convenient can be talked into
+    anything. Neither was in the live catalog on 2026-08-12 or
+    2026-08-13, which is a reason to keep the check cheap rather than to
+    skip it: the cost of being wrong is buying thinking nobody asked
+    for, on every run, silently.
+
+    THE TWO RETURNS OVERLAP BY CONSTRUCTION, and saying so is the point
+    of returning them together. Every descriptor that is contradictory
+    on the effort-none side also fails already_reasons, so a caller
+    honouring either one alone gets the right answer for these shapes.
+    That redundancy is deliberate defence in depth and it is also why
+    neither can be mutated away on its own and observed through the
+    catalog: the test that isolates them calls this function directly.
+    """
+    mandatory = reasoning.get("mandatory") is True
+    enabled = reasoning.get("default_enabled")
+    effort_is_none = reasoning.get("default_effort") == "none"
+    claims_on = mandatory or enabled is True
+    contradictory = (claims_on and effort_is_none) or (mandatory and enabled is False)
+    return claims_on and not effort_is_none, contradictory
+
+
+def reasoning_reservation(
+    max_tokens: int,
+    controls: Mapping[str, Any] | None = None,
+    may_send_reasoning_cap: bool = False,
+) -> dict[str, Any]:
+    """The reasoning cap for a request at this budget, or nothing.
+
+    Returns the fragment to merge into a payload, so a caller cannot
+    forget either of the two rules below by assembling the field itself.
+
+    EMPTY UNLESS THE MODEL ALREADY THINKS, which is the guard that keeps
+    this a bound rather than a purchase. A reasoning object with a cap
+    and no enabled key infers enabled true, so on a model whose catalog
+    entry says thinking is off, an unprompted cap would switch thinking
+    ON and start billing for it. may_send_reasoning_cap comes from the
+    catalog's own capability flags; see fetch_catalog for the pinned
+    wording and the measured counts.
+
+    The default is False, deliberately, so a caller that does not know
+    sends nothing. That is rule one's answer for an unknown, and it
+    makes the protective case the one that has to be asked for rather
+    than the one that happens by omission.
+
+    EMPTY WHEN THE OPERATOR DECLARED AN EFFORT, per the pinned page; see
+    REASONING_BUDGET_SHARE for why the declaration wins over the
+    default.
+
+    EMPTY IN TWO ARITHMETIC STATES, which are different from each other
+    and were one state until a review separated them. See
+    reservation_state for what distinguishes them and
+    reservation_reason for the sentence each produces.
+
+    STANDING DOWN RATHER THAN SENDING THE FLOOR, in the state where the
+    floor would be accepted. That was a real choice between two
+    defensible options and the arithmetic decided it.
+
+      SEND THE FLOOR. In the band where the split is too small but the
+      floor fits, name the floor explicitly. Reserves at outer budgets
+      the reservation cannot otherwise reach.
+
+      STAND DOWN. Send the pre-feature payload and record why.
+
+    What the band actually looks like, at the current share and floor,
+    is 1024 < outer < 2048, and sending the floor across it reserves
+    almost nothing for the answer:
+
+      outer 1025   reasoning 1024   99.9% of the budget   1 visible token
+      outer 1200   reasoning 1024   85.3%                 176
+      outer 1536   reasoning 1024   66.7%                 512
+      outer 2047   reasoning 1024   50.0%                 1023
+
+    A function whose purpose is to reserve VISIBLE room does not reserve
+    one token of it and call that success.
+
+    AND IT WOULD BUY NOTHING, which is what makes the choice easy rather
+    than a trade. The provider's own default allocation carries the same
+    floor: the page's formula is budget_tokens = max(min(max_tokens *
+    effort_ratio, 128000), 1024). Below 2048 every effort ratio at or
+    under 0.5 lands under 1024 and is floored to it, so an explicit 1024
+    and an absent field produce the SAME provider-side allocation on the
+    family the floor was measured from. Off that family the floor is
+    unknown, and an explicit 1024 could then be more thinking than the
+    route's own default would have chosen. Standing down is never worse
+    and is sometimes better.
+
+    KEYED ON THE ARITHMETIC, NEVER ON THE CALL SITE. The judge's 512
+    token budget and a per-model clamp of 1024 are the same failure
+    reached from opposite directions, so they are one rule with two
+    instances rather than two rules that can drift apart. The judge
+    calls this function like everybody else and gets {} from it.
+
+    THE CLAMPS ARE WHY THIS IS REACHABLE at all, and there are two.
+    effective_budget lowers the requested tier to any completion cap the
+    MODEL publishes, and the catalog accepts any cap above zero, so a
+    budget below 2048 comes from a real catalog entry rather than from a
+    hypothetical. On a pinned trial route_budget then lowers it again to
+    what the selected ENDPOINT publishes, which is the smaller number
+    more often: one measured model's cheapest route published 8192
+    against a model level of 131072.
+
+    int() truncates rather than rounds, so the cap is never a token
+    above its share of the budget. At the two real tiers the division is
+    exact anyway; the floor matters only if a future tier is odd.
+    """
+    return (
+        {"reasoning": {"max_tokens": int(max_tokens * REASONING_BUDGET_SHARE)}}
+        if reservation_state(max_tokens, controls, may_send_reasoning_cap)
+        == RESERVATION_RIDES
+        else {}
+    )
+
+
+def reservation_state(
+    max_tokens: int,
+    controls: Mapping[str, Any] | None = None,
+    may_send_reasoning_cap: bool = False,
+) -> str:
+    """Which of the five states this request's reservation is in.
+
+    Separate from reasoning_reservation because the payload has only two
+    shapes and the request has five reasons, and collapsing them cost
+    something twice: an operator could not be told WHY nothing rode, and
+    the property test asserting the stand-down could only restate the
+    implementation's own condition back at it.
+
+    THE TWO THAT USED TO BE ONE. Both involve the provider floor and
+    they are not the same fact:
+
+      SPLIT BELOW FLOOR. The intended share is under the floor, but the
+      outer budget is above it, so a request naming the floor WOULD be
+      accepted. What cannot be honoured is the split. At an outer budget
+      of 1200 a half share asks for 600, the provider uses 1024, and 176
+      visible tokens remain where 600 were promised.
+
+      NO ROOM ABOVE FLOOR. The outer budget is not strictly greater than
+      the floor, so no pair of numbers satisfies the contract at all.
+      The judge's 512 is here.
+
+    The old single condition answered "unsatisfiable" to both, which is
+    true of the second and false of the first.
+
+    ORDER IS PART OF THE ANSWER. Vouching is asked first because an
+    unvouched route's arithmetic is irrelevant, and a declared effort is
+    asked before the arithmetic because the operator's declaration wins
+    whether or not a share would have fitted.
+    """
+    if not may_send_reasoning_cap:
+        return RESERVATION_NOT_VOUCHED
+    if controls and controls.get("effort") is not None:
+        return RESERVATION_EFFORT_DECLARED
+    want = int(max_tokens * REASONING_BUDGET_SHARE)
+    if max_tokens <= PROVIDER_REASONING_MINIMUM:
+        return RESERVATION_NO_ROOM_ABOVE_FLOOR
+    if want < PROVIDER_REASONING_MINIMUM:
+        return RESERVATION_SPLIT_BELOW_FLOOR
+    # Unreachable while the share is below 1, and checked anyway because
+    # the share is a constant somebody may change: a share of 1.0 makes
+    # every budget its own reasoning budget, which the contract's
+    # strictly-greater rule forbids.
+    if max_tokens <= want:
+        return RESERVATION_NO_ROOM_ABOVE_FLOOR
+    return RESERVATION_RIDES
+
+
+def reservation_reason(state: str, max_tokens: int) -> str | None:
+    """Why nothing rode, with the arithmetic in it, or None when
+    something did.
+
+    THE NUMBERS ARE THE POINT. "The reservation was not sent" is not a
+    reason, it is a restatement; an operator deciding whether to raise a
+    budget needs to see which number was too small and what the provider
+    would have done instead.
+
+    NO PRODUCTION CALLER TODAY, and that is stated rather than left for
+    somebody to discover. Its consumer is the property test, which is
+    not a small thing: the test it replaced computed its own expectation
+    with the implementation's own condition, character for character, so
+    it passed by construction. Asserting a NAMED state and a sentence
+    with numbers in it is what makes that impossible.
+
+    Putting the sentence on a card is a separate change with a separate
+    surface to design, and it is deliberately not in this round. What
+    exists here is the vocabulary and the arithmetic, ready for it.
+    """
+    want = int(max_tokens * REASONING_BUDGET_SHARE)
+    share = int(REASONING_BUDGET_SHARE * 100)
+    if state == RESERVATION_SPLIT_BELOW_FLOOR:
+        return (
+            f"a {share}% share of {max_tokens} is {want}, below the "
+            f"{PROVIDER_REASONING_MINIMUM} a provider would use instead, so "
+            f"asking for {want} would leave "
+            f"{max_tokens - PROVIDER_REASONING_MINIMUM} visible tokens rather "
+            f"than {max_tokens - want}"
+        )
+    if state == RESERVATION_NO_ROOM_ABOVE_FLOOR:
+        return (
+            f"{max_tokens} is not above the {PROVIDER_REASONING_MINIMUM} a "
+            "provider would use, so no reasoning budget and answer budget "
+            "can both be satisfied"
+        )
+    if state == RESERVATION_NOT_VOUCHED:
+        return "the route is not vouched to already reason unprompted"
+    if state == RESERVATION_EFFORT_DECLARED:
+        return "an effort was declared, and a declaration outranks a default"
+    return None
+
+
 # ---- The underlying-model estimand.
 #
 # Everything in this block applies ONLY when an experiment declared
@@ -373,6 +895,184 @@ CONTROL_PARAMETERS: dict[str, str] = {
     "seed": "seed",
     "effort": "reasoning",
 }
+
+
+async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, Any]:
+    """The per-endpoint capability listing for one model, or an honest
+    failure.
+
+    Never raises, the same contract fetch_catalog carries. Returns
+    fetched False when the listing could not be obtained, which callers
+    must treat as absence of evidence rather than absence of support:
+    strict mode refuses on it, exactly as it refuses on a model the
+    catalog does not list.
+
+    Four fields are kept. Three are read to make a decision: the slug a
+    pin is matched against, the parameter list that vouches for sending
+    the reasoning field, and the completion ceiling the budget is
+    clamped to. The fourth, the provider's display NAME, is read by
+    nothing and is kept anyway, because a listing whose entries cannot
+    be named is one nobody can debug against; it is inert by
+    construction, since every decision above matches on the slug.
+    Anything beyond these four is not this function's business, and a
+    parser that carried it would invite somebody to make a decision from
+    a field nobody checked.
+
+    max_completion_tokens JOINED THAT LIST after a review found the
+    consequence of its absence. It is documented on the endpoints
+    listing, https://openrouter.ai/docs/api/api-reference/endpoints/
+    list-all-endpoints-for-a-model, read 2026-08-13, and until it was
+    kept here the only completion cap the budget arithmetic could see
+    was the model-level one. A model-level cap is the MAXIMUM across
+    every host serving the model, so a pinned run budgeted from it
+    budgeted from the most generous host in the pool and sent the answer
+    to whichever host the pin named. Measured the same day on
+    openai/gpt-oss-120b: model level 131072, endpoints 8192 through
+    131072, with the standard tier's 16384 already twice the cheapest
+    route's ceiling.
+    """
+    out: dict[str, Any] = {"fetched": False, "endpoints": []}
+    try:
+        response = await client.get(
+            ENDPOINTS_URL.format(model=model), timeout=PRICES_TIMEOUT_S
+        )
+        if response.status_code != 200:
+            return out
+        data = response.json()["data"]
+        entries = data["endpoints"]
+        if not isinstance(entries, list):
+            return out
+    except (httpx.HTTPError, ValueError, LookupError, TypeError):
+        return out
+    endpoints = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        supported = entry.get("supported_parameters")
+        endpoints.append(
+            {
+                "provider": _as_label(entry.get("provider_name")),
+                # WHAT A PIN IS MATCHED ON, and it is not the name above.
+                # See _endpoint_slug: the display name does not reliably
+                # lowercase into the documented slug, and on one measured
+                # provider it lowercases into a DIFFERENT provider's.
+                "slug": _endpoint_slug(entry.get("tag")),
+                # None when the endpoint did not publish a list, which is
+                # not the same as publishing an empty one.
+                "supported_parameters": (
+                    sorted({x for x in supported if isinstance(x, str)})
+                    if isinstance(supported, list)
+                    else None
+                ),
+                # Positive ints only. A cap of 0, a negative, a float or
+                # a string is not a ceiling anybody can budget against,
+                # and reading one as though it were would clamp every
+                # request on that route to nothing. Absent and
+                # unusable collapse to the same None here because the
+                # caller does the same thing with both: fall back to the
+                # model-level cap, which is what it used before this
+                # field was kept at all.
+                "max_completion_tokens": _as_positive_int(
+                    entry.get("max_completion_tokens")
+                ),
+            }
+        )
+    out["fetched"] = True
+    out["endpoints"] = endpoints
+    return out
+
+
+def endpoint_supports_reasoning(
+    listing: Mapping[str, Any], provider: str | None
+) -> bool | None:
+    """Whether the PINNED endpoint advertises the reasoning parameter.
+
+    Three-valued on purpose. True and False are answers; None means the
+    listing could not answer, either because it was never fetched, or
+    because no endpoint matched the pin, or because the matched endpoint
+    published no parameter list. Callers must not collapse None into
+    False silently: strict mode's rule is that absence of evidence is
+    refused rather than assumed, and the two need different sentences.
+
+    WHY THIS CANNOT READ THE MODEL AGGREGATE. A strict pin selects ONE
+    host with allow_fallbacks false. The model-level
+    supported_parameters is a union across hosts, so it can advertise a
+    parameter that the pinned host does not accept, and under
+    require_parameters an unaccepted parameter does not degrade, it
+    empties the provider pool. Vouching for a pinned endpoint with an
+    aggregate is the specific mistake this function exists to make
+    impossible.
+
+    Matching is on the slug the ENDPOINT publishes, not on its display
+    name; see _endpoint_slug for the measurement that forced that and
+    for the provider where the name matched a pin the router would have
+    rejected.
+
+    A PIN DOES NOT NAME ONE ENDPOINT. It names a provider, and a provider
+    may serve one model from several endpoints with different
+    capabilities: measured 2026-08-13 on openai/gpt-oss-120b, DeepInfra
+    published two and Amazon Bedrock published two. The router picks
+    among them and the bench does not get to say which. So every
+    matching endpoint must vouch, and one that published no list makes
+    the whole answer None. Reading only the first match would answer
+    from an endpoint the request may never reach.
+    """
+    if not listing.get("fetched") or provider is None:
+        return None
+    want = normalized_provider_slug(provider)
+    answers = []
+    for endpoint in listing.get("endpoints") or ():
+        if endpoint.get("slug") != want:
+            continue
+        supported = endpoint.get("supported_parameters")
+        if supported is None:
+            return None
+        answers.append("reasoning" in supported)
+    if not answers:
+        return None
+    return all(answers)
+
+
+def endpoint_completion_cap(
+    listing: Mapping[str, Any], provider: str | None
+) -> int | None:
+    """The completion ceiling the PINNED provider publishes, or None.
+
+    THE LOWEST ONE IT PUBLISHES, for the reason in the function above: a
+    pin names a provider, not an endpoint, and a provider may serve the
+    same model from several endpoints with different ceilings. The
+    request has to fit whichever the router picks, so the bench budgets
+    against the smallest.
+
+    None means "no ceiling learned here", which is not the same as "no
+    ceiling". It covers a listing that never fetched, a pin nothing
+    matched, and a provider that published no cap on any of its
+    endpoints. On 2026-08-13 five of one live model's twenty ENDPOINTS
+    published no cap, and one provider was in the third case outright:
+    Amazon Bedrock served that model from two endpoints and neither
+    published one. The endpoint count is the measurement; the provider
+    case is what it implies for a pin.
+
+    NONE IS NOT FAIL-CLOSED HERE, and that is deliberate rather than an
+    oversight. The caller falls back to the model-level cap, which is
+    exactly what it used before this function existed, so a listing that
+    cannot answer leaves behaviour where it already was instead of
+    disabling a tier for every route that publishes nothing. The
+    fail-closed instinct is spent where it buys something: on the
+    reasoning field, where sending an unsupported parameter to a pinned
+    host under require_parameters empties the provider pool, and where
+    NOT sending it is free.
+    """
+    if not listing.get("fetched") or provider is None:
+        return None
+    want = normalized_provider_slug(provider)
+    caps = [
+        cap
+        for endpoint in listing.get("endpoints") or ()
+        if endpoint.get("slug") == want
+        and (cap := endpoint.get("max_completion_tokens")) is not None
+    ]
+    return min(caps) if caps else None
 
 
 def missing_parameters(
@@ -536,6 +1236,8 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             "prompt_price": None,
             "completion_price": None,
             "max_completion_tokens": None,
+            # False until the catalog says otherwise; see the parse below.
+            "may_send_reasoning_cap": False,
             # What the underlying-model estimand checks against. None
             # means the catalog did not say, which strict mode treats as
             # "cannot check" rather than as "supports everything": see
@@ -582,17 +1284,218 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
             model["supported_parameters"] = sorted(
                 {x for x in supported if isinstance(x, str)}
             )
+        # WHETHER THIS MODEL THINKS WITHOUT BEING ASKED, which decides
+        # whether the visible-output reservation may ride unprompted.
+        #
+        # Pinned against the reasoning-tokens guide's "Discovering
+        # per-model reasoning options" section,
+        # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+        # read 2026-08-12: "default_enabled: Default on/off state when
+        # the user has not set reasoning.enabled" and "mandatory: When
+        # true, hide disable controls and do not send effort: 'none' --
+        # the model rejects it."
+        #
+        # THE REASON THIS FLAG HAD TO EXIST, and it is MEASURED rather
+        # than reasoned from the documentation. The request schema says
+        # of the enabled key: "Default: inferred from 'effort' or
+        # 'max_tokens'", which implies a cap sent alone does not merely
+        # BOUND thinking but turns it ON. That implication was tested
+        # against the wire before this gate was trusted.
+        #
+        # THE PROBE, two live calls to google/gemma-4-31b-it served by
+        # DeepInfra on 2026-08-12, a model whose descriptor publishes
+        # default_enabled false and mandatory false:
+        #
+        #   gen-1786546333-86V1vJMk7JsWwwPhajoN, control, no field
+        #     completion 35, reasoning_tokens 0, cost 1.629e-05
+        #
+        #   gen-1786546398-Z4GhaMYohdT9FWGFiYhc, the identical call
+        #   with ONLY reasoning: {"max_tokens": 256} added
+        #     completion 338, reasoning_tokens 312, cost 0.00013182,
+        #     plus a full visible chain of thought in message.reasoning
+        #     with reasoning_details blocks
+        #
+        # Both finish_reason stop. Zero reasoning tokens without the
+        # field, 312 with it, and 8.1 times the cost for the same short
+        # question. The cap alone enables thinking. Nothing else
+        # differed between the two calls, so this is not an inference
+        # about a schema comment; it is the observed behaviour of the
+        # one field this code decides whether to send.
+        #
+        # Both usage blocks are in the tree verbatim, at
+        # tests/fixtures/probe_reasoning_enable.json, and a test replays
+        # them through _ingest_usage rather than restating their
+        # arithmetic.
+        #
+        # WHAT THAT WOULD HAVE COST UNGATED. On a model whose default is
+        # off, an unprompted cap starts buying reasoning tokens that were
+        # never being bought, on every run, in an instrument whose
+        # product is a comparison between models. Measured against the
+        # live catalog on 2026-08-12: of 406 models, 23 publish
+        # default_enabled false without mandatory, and they are the
+        # frontier lineup.
+        #
+        # TWO MORE DIMENSIONS OF THE SAME CONTRACT, added after a review
+        # showed the gate above was reading one flag of a five-key object
+        # and calling it the answer. Both are quoted from the same page,
+        # re-read in full 2026-08-12.
+        #
+        # DEFAULT_EFFORT "none" MEANS OFF, whatever default_enabled says:
+        # "If the value is 'none', treat it as 'reasoning off by default'
+        # rather than pre-selecting disable when the user explicitly
+        # turns reasoning on." openai/gpt-5.1 publishes default_enabled
+        # true AND default_effort none, so the previous gate vouched for
+        # it and a cap would have switched its reasoning on. That is the
+        # exact failure the gate was built to prevent, surviving inside
+        # the gate.
+        #
+        # A CAP WITHOUT BUDGET SUPPORT IS NOT A CEILING, IT IS AN EFFORT:
+        # "For models that only support 'reasoning.effort' (see below),
+        # the 'max_tokens' value will be used to determine the effort
+        # level", and the table below it puts medium at "approximately
+        # 50% of max_tokens", which is this constant's share. So on a
+        # route without supports_max_tokens, sending half the budget does
+        # not bound thinking at half; it ASKS FOR MEDIUM. On a model
+        # whose default effort is minimal (approximately 10%) that is a
+        # fivefold increase in thinking, bought unprompted. The Gemini
+        # 3.1 and 3.5 Flash Lite variants publish exactly that shape:
+        # default_enabled true, default_effort minimal, no
+        # supports_max_tokens.
+        #
+        # So the reservation now rides only where it is a TRUE CEILING.
+        # Anything else is a request to think differently, which is the
+        # operator's call and not the bench's.
+        #
+        # AND THE MODEL MUST ADVERTISE THE PARAMETER, which is the third
+        # condition and it is about strict mode rather than about money.
+        # STRICT_PREFS sends require_parameters true, and under it a
+        # provider that does not support a request parameter is not
+        # allowed to ignore it, it is EXCLUDED. So an unprompted
+        # reasoning field on a model that does not advertise reasoning
+        # would either empty the provider pool outright or silently
+        # narrow it, and this file already states at STRICT_PREFS why
+        # narrowing it is the one thing that must not happen: it "changes
+        # which providers are eligible, which silently changes what is
+        # being measured".
+        #
+        # As the catalog stands the condition is redundant, because
+        # every model that clears the other two also advertises the
+        # parameter. It is here so that stays a fact about the code
+        # rather than a fact about one morning's catalog: the flag that
+        # says a model thinks and the list that says it accepts the
+        # field are different publications and nothing keeps them in
+        # step.
+        #
+        # THE PARTITION, measured against the live catalog on
+        # 2026-08-12, 410 models, counting BOTH arms of the gate below:
+        #
+        #     8  the cap is a true ceiling, so it rides
+        #    48  a cap provably cannot enable or intensify, so it rides
+        #   101  reasons, but a cap could raise the effort it reasons at
+        #     2  default_effort none, so reasoning is OFF
+        #    23  default_enabled false, so reasoning is OFF
+        #    98  does not reason unprompted, or the catalog does not say
+        #   130  no reasoning descriptor at all
+        #
+        # 56 receive a reservation. An earlier gate vouched for 159 by
+        # reading default_enabled alone; a stricter one vouched for 8 by
+        # demanding supports_max_tokens; this one is 56 because the
+        # no-harm arm below admits a model whose thinking a cap cannot
+        # move upward.
+        #
+        # THE INCIDENT'S OWN MODEL IS COVERED, by rule rather than by
+        # name. It publishes mandatory true and default_effort high and
+        # NO supports_max_tokens, so it fails the ceiling arm and clears
+        # the no-harm one. This paragraph said the opposite for three
+        # commits after the extension landed directly beneath it, which
+        # is the exact failure mode this repository treats as a defect:
+        # a comment describing an earlier version of the code it sits
+        # on top of.
+        #
+        # Four flags collapse to one derived boolean because only one
+        # question is being asked: may the bench send this model a
+        # reasoning cap it did not ask for, and will that cap be a
+        # ceiling when it arrives. Rule one's default for an unknown is
+        # silence.
+        reasoning = entry.get("reasoning")
+        if isinstance(reasoning, dict):
+            mandatory = reasoning.get("mandatory") is True
+            already_reasons, contradictory = reasoning_claims(reasoning)
+            advertised = "reasoning" in (model["supported_parameters"] or ())
+            # THE CEILING CASE: supports_max_tokens makes the cap a cap.
+            a_true_ceiling = (
+                already_reasons
+                and reasoning.get("supports_max_tokens") is True
+                and advertised
+            )
+            # THE NO-HARM CASE, and it is reasoned from consequences
+            # rather than from either side of a contract that
+            # contradicts itself. See the block above EFFORT_SHARES for
+            # the contradiction; this is what settles it without picking
+            # a winner and without naming a vendor.
+            #
+            # Take a model that is MANDATORY and whose default_effort is
+            # at or above the share this bench would ask for. Enumerate
+            # every outcome the contract documents for a cap sent to it:
+            #
+            #   the route honours it as a budget      thinking is BOUNDED
+            #   the route translates it to an effort  the translation
+            #     lands at approximately the share sent, which is at or
+            #     below this model's own default, so thinking is LOWERED
+            #     or unchanged
+            #   the provider ignores it entirely      NOTHING CHANGES
+            #
+            # None of the three raises thinking. The other harm,
+            # switching thinking ON where it was off, cannot occur
+            # either, and the reason is worth stating carefully because
+            # a first version of this comment overstated it.
+            #
+            # It said mandatory means thinking is already on. Probe two
+            # (tests/fixtures/probe_reasoning_cap_binding.json) measured
+            # a mandatory model answering a trivial prompt with ZERO
+            # reasoning tokens, twice, so mandatory describes what an
+            # operator may not turn OFF rather than what the model will
+            # do on any given request. Reasoning is route and prompt
+            # dependent.
+            #
+            # The argument survives that correction intact, because a
+            # cap cannot enable thinking that is already running and
+            # cannot enable thinking that does not happen: the same
+            # probe sent this exact cap to this exact model and the
+            # reasoning count stayed at zero on both sides. What
+            # mandatory rules out is the operator having chosen off,
+            # which is the only way an unprompted cap could turn
+            # something on. Both harms are therefore impossible, and
+            # they are the only reasons the other conditions exist.
+            #
+            # The comparison is against REASONING_BUDGET_SHARE and not
+            # against the word "medium", so it stays true if that
+            # constant moves.
+            declared_effort = reasoning.get("default_effort")
+            # A non-str default_effort is absence, not a lookup key: the
+            # catalog is somebody else's file and may publish anything.
+            default_share = (
+                EFFORT_SHARES.get(declared_effort)
+                if isinstance(declared_effort, str)
+                else None
+            )
+            cannot_raise_or_enable = (
+                mandatory
+                and default_share is not None
+                and default_share >= REASONING_BUDGET_SHARE
+                and advertised
+            )
+            model["may_send_reasoning_cap"] = not contradictory and (
+                a_true_ceiling or cannot_raise_or_enable
+            )
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.
         top = entry.get("top_provider")
         if isinstance(top, dict):
-            cap = top.get("max_completion_tokens")
-            # A non-bool int strictly above zero only. isinstance(True, int)
-            # is true in Python, so a provider sending true would otherwise
-            # become a cap of 1 that clamps every budget to a single token;
-            # zero and negatives are not real caps either.
-            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+            # See _as_positive_int for why true, 0 and -1 are not caps.
+            cap = _as_positive_int(top.get("max_completion_tokens"))
+            if cap is not None:
                 model["max_completion_tokens"] = cap
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
@@ -663,6 +1566,15 @@ def _request_record(
 def _flatten_content(content: object) -> str | None:
     """Collapse a message content value to plain text or None.
 
+    PER-FRAGMENT PRESENCE, NOT WHOLE-RESPONSE VISIBILITY, and the
+    division of labour is easy to get wrong. This runs once per
+    streaming delta, so a lone " " is a real fragment of a real
+    sentence: returning None for it would drop that delta from both the
+    accumulated text and the event yielded to the browser, and
+    "Hello world" would arrive as "Helloworld". Whether a whole response
+    is VISIBLE is a different question, asked at the two call sites that
+    assemble one, with strip().
+
     Content-parts lists (multimodal providers) flatten to their text
     parts. Anything that is not a non-empty str after that returns None:
     response_text is str or None by contract, and a raw list would crash
@@ -716,19 +1628,59 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     figure "is only available for BYOK (Bring Your Own Key) requests.
     For all other requests it will be 0 or null."
 
-    So on the ordinary credits path it is absent and the column is NULL,
-    which is the honest record of "this run was not BYOK". Under BYOK the
-    two diverge and only one of them is what the operator actually paid a
-    provider. The ceiling still meters credits and only credits: it is a
-    guard on the OpenRouter balance this process can spend, and a direct
-    provider bill is not money OpenRouter can decline.
+    THAT LAST SENTENCE IS THE CONTRACT'S, AND THE MEASUREMENTS
+    CONTRADICT IT. This docstring used to draw the obvious inference
+    from it, that an absent figure is the honest record of "this run was
+    not BYOK", and that inference is false. Two live captures in this
+    repository report is_byok false beside a nonzero upstream figure:
+    probe one (probe_reasoning_enable.json), where a DeepInfra route
+    reported the credit charge to the last digit, and probe two
+    (probe_reasoning_cap_binding.json), where the in-band block and the
+    generation endpoint disagreed with each other about the same
+    generation. So presence and absence here say nothing about billing
+    mode; is_byok is its own column precisely because this one cannot
+    stand in for it.
+
+    What the figure IS, unchanged: a number the provider reported, which
+    is not the credit charge, stored verbatim to be reconciled against a
+    provider's own invoice. The ceiling still meters credits and only
+    credits: it is a guard on the OpenRouter balance this process can
+    spend, and a direct provider bill is not money OpenRouter can
+    decline.
     """
     if not isinstance(usage, dict):
         return
+    # THE UNIT EVERY STORED COUNT IS IN, entering here and nowhere else.
+    # OpenRouter's usage-accounting page, read 2026-08-12: "Prompt and
+    # completion token counts using the model's native tokenizer". So the
+    # four counts below are NATIVE, all four of them, from one object, and
+    # the bench has exactly one unit for counts because it has exactly one
+    # source for them.
+    #
+    # The normalized figures (tokens_prompt, tokens_completion) exist only
+    # on the generation endpoint, which is a post-hoc pass most rows never
+    # get, so there is no in-band normalized count to mix these with even
+    # if something wanted to.
+    #
+    # What is NOT in this unit and must never be compared with it:
+    # max_tokens, which is a ceiling the bench sent rather than anything a
+    # tokenizer counted. Every surface that shows the two together labels
+    # the cap as a cap; see the budget note in static/render.js for what
+    # happened when one did not.
     result["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
     result["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
     result["billed_cost_usd"] = as_money(usage.get("cost"))
     result["upstream_inference_cost_usd"] = _as_upstream_cost(usage.get("cost_details"))
+    # Whether OpenRouter billed this against your own provider key. Its
+    # own field, because the upstream figure above cannot carry the
+    # meaning: a live probe found is_byok false beside a nonzero upstream
+    # cost, so the presence of that number says nothing about BYOK.
+    #
+    # Through as_wire_flag rather than inline, so this door and the
+    # generation endpoint's door cannot disagree about the same value.
+    # No coercion: a provider that omits the flag leaves None, which is
+    # "not reported" and is not the same answer as false.
+    result["is_byok"] = as_wire_flag(usage.get("is_byok"))
     # Reasoning tokens are the reason the two-tier budget exists: they are
     # billed as completion tokens and consume max_tokens, but never appear
     # in the visible answer. Cached prompt tokens are the other direction,
@@ -746,6 +1698,131 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
         if isinstance(prompt_details, dict)
         else None
     )
+
+
+# The share of a completion that reasoning must reach before "the
+# thinking took the answer's place" is a description rather than a guess.
+#
+# NOT EQUALITY, even though the incident's own numbers were exactly equal,
+# tokens_completion 21350 against native_tokens_reasoning 21350. A
+# provider that counts a dropped partial token, or a trailing whitespace
+# delta that _flatten_content discards, into completion_tokens puts the
+# ratio a hair under one; a test that fired only on exact equality would
+# fall back to the old useless wording over a rounding difference. Nine
+# tenths sits far above what an ordinary short response reaches and far
+# below anything a real exhaustion misses.
+REASONING_SHARE_EXHAUSTED = 0.9
+
+# OpenRouter's NORMALIZED word for a completion the cap cut off. Reading
+# it couples this to no vendor: run_model's own comment on the field says
+# OpenRouter "maps each provider's vocabulary onto a common set", and the
+# provider's own word arrives separately as native_finish_reason.
+#
+# It is the only field that answers "did the budget actually run out",
+# and the label needs that answer; see empty_response_error.
+FINISH_TRUNCATED = "length"
+
+
+def reasoning_ate_the_output(
+    completion_tokens: int | None, reasoning_tokens: int | None
+) -> bool:
+    """Whether a completion that produced no visible answer went to
+    thinking.
+
+    NUMBERS ONLY. No model name, no finish_reason, no request field: this
+    reads what came BACK. That is deliberate and it is what makes the
+    same judgement possible on a route where R1's reservation could not
+    act, because a provider that ignores an unknown parameter still
+    reports its token counts honestly. The frontend's indicator applies
+    the identical rule to the identical two numbers for the same reason.
+
+    Both counts degrade to None when a provider omits usage, and 0 is a
+    real answer meaning "nothing was spent thinking"; either way there is
+    no evidence of exhaustion here, so the falsy guard covers both.
+    """
+    if not reasoning_tokens or not completion_tokens:
+        return False
+    return reasoning_tokens >= completion_tokens * REASONING_SHARE_EXHAUSTED
+
+
+def empty_response_error(
+    finish_reason: str | None,
+    completion_tokens: int | None,
+    reasoning_tokens: int | None,
+) -> str:
+    """The error for a 200 that carried no visible text.
+
+    ONE FUNCTION FOR TWO SITES, the batch path and the stream's done(),
+    which previously carried the same sentence written out twice. A label
+    whose whole purpose is honesty must not be able to drift between the
+    endpoint a script uses and the endpoint the browser uses.
+
+    WHY THE OLD WORDING WAS A DEFECT AND NOT MERELY TERSE. "empty
+    response (finish_reason: length)" is true and tells the reader
+    nothing they can act on: it names the symptom, omits where the money
+    went, and reads like a provider glitch. The card it appeared on had
+    been billed between $3.38 and $3.50 for 21350 tokens of thinking. A
+    person reading it retried, at cost, because nothing in it suggested
+    the retry would do the same thing.
+
+    KEYED ON SHAPE, NOT ON A NAME, so it fires for any model that thinks
+    its budget away. The reasoning count goes in the text because it is
+    the evidence for the claim; a reader who doubts the label can check
+    it against the card's own metrics.
+
+    THREE OUTCOMES, NOT TWO, AND THE THIRD IS A CORRECTION. An
+    adversarial review found that the shape test is close to a TAUTOLOGY
+    at this call site. This function is only reached when
+    _flatten_content came back falsy, so completion minus reasoning is
+    the count of completion tokens that were neither thinking nor
+    visible text, which is around zero for any reasoning model that
+    produced nothing. The ratio is therefore at or near 1.0 whatever the
+    REASON for the emptiness: a refusal, a content filter, a provider
+    abort and a real truncation all land in the same bucket.
+
+    So the shape alone cannot carry the word "exhausted", which claims
+    the budget ran out. Measured before the fix, a content_filter
+    refusal that spent 37 of 16384 tokens, 0.2% of its budget, was told
+    its completion budget had been exhausted, and static/stream.js then
+    appended "try extended budget" because it keys its remedy on the
+    same predicate. The branch was recommending a four-times-larger
+    retry for a failure no budget can fix, which is a sharper version of
+    the very thing the old wording was replaced for.
+
+    finish_reason is what discriminates, and reading it costs nothing
+    this fix cares about: it is OpenRouter's normalized value, so it
+    names no vendor, and it is a field that came BACK, so it is as
+    available on an ignored-parameter route as the counts are.
+
+    The old wording is kept for a genuinely empty response with no
+    reasoning behind it, which is a third failure again and was always
+    described correctly by the sentence already there.
+    """
+    if reasoning_ate_the_output(completion_tokens, reasoning_tokens):
+        if finish_reason == FINISH_TRUNCATED:
+            return (
+                "no visible answer: completion budget exhausted during "
+                f"reasoning ({reasoning_tokens} reasoning tokens)"
+            )
+        # The accounting fact without the causal claim. Everything the
+        # reader can act on survives: where the money went, how much of
+        # it, and why generation stopped. Only the assertion the numbers
+        # do not support is gone.
+        #
+        # "nearly all of" rather than "the whole", because the predicate
+        # fires at nine tenths and the sentence was claiming ten. On a
+        # response of 338 completion tokens with 312 reasoning, which is
+        # a real measured shape in this repository, 26 tokens did reach
+        # the answer and the old wording denied it. A sentence written
+        # to stop a label overstating its evidence must not overstate
+        # its own.
+        return (
+            "no visible answer: nearly all of the completion went to "
+            "reasoning "
+            f"({reasoning_tokens} reasoning tokens, finish_reason: "
+            f"{finish_reason or 'unknown'})"
+        )
+    return f"empty response (finish_reason: {finish_reason or 'unknown'})"
 
 
 # OpenRouter returns the generation id in this response header on every
@@ -809,17 +1886,31 @@ def _as_upstream_cost(source: Any) -> str | None:
     exactly comparable to that invoice; converting it to a float and back
     would introduce a rounding this bench has no reason to perform.
 
-    Zero degrades to None deliberately. The documentation says the field
-    "will be 0 or null" for non-BYOK requests, so a stored 0 would be
-    indistinguishable from a BYOK run that genuinely cost nothing, and
-    the absence is the more honest record of "not a BYOK run".
+    A ZERO IS NOW STORED AS A ZERO, which reverses an earlier decision
+    and the reversal is the point. This used to degrade 0 to None on the
+    documented grounds that "For all other requests it will be 0 or
+    null", so a stored 0 could not be confused with a BYOK run that
+    genuinely cost nothing. A live probe on 2026-08-12 broke that
+    reasoning from both ends: a non-BYOK run returned a NONZERO upstream
+    figure equal to the credit charge, so a populated cell never meant
+    BYOK in the first place, and is_byok now has a column of its own to
+    say what this value was never able to say.
+
+    With the discriminator moved out, suppressing an observed money
+    figure would only make the database disagree with the wire. NULL here
+    means the wire sent nothing usable, and nothing else.
+
+    Not-a-number, infinity and negatives still degrade, because those are
+    not money figures at all; that is the same rule as_money applies to
+    every monetary field in this file and it is about validity rather
+    than about meaning.
     """
     if not isinstance(source, dict):
         return None
     value = source.get("upstream_inference_cost")
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    if not math.isfinite(value) or value <= 0:
+    if not math.isfinite(value) or value < 0:
         return None
     return repr(value)
 
@@ -835,6 +1926,71 @@ def _as_label(value: object) -> str | None:
     return text if text else None
 
 
+def _endpoint_slug(tag: object) -> str | None:
+    """The provider slug an endpoint belongs to, from its published tag.
+
+    THE DISPLAY NAME IS NOT THE SLUG, and lowercasing it is a guess that
+    is measurably wrong. Measured 2026-08-13 against
+    https://openrouter.ai/api/v1/providers (102 providers) and the
+    endpoint listings of five models (64 endpoints):
+
+      tag.split("/")[0] is a documented provider slug   64 / 64
+      provider_name.lower() is a documented slug        52 / 64
+
+    and the transform is not mechanical, so no amount of hyphenating
+    would close the gap: "Moonshot AI" is moonshotai, "Arcee AI" is
+    arcee-ai, "Sakana AI" is sakana, "Mancer 2" is mancer, "VoyageAI by
+    MongoDB" is voyageai.
+
+    THE WORST CASE IS NOT A MISS, IT IS A WRONG HIT. The endpoints whose
+    provider_name is "Google" carry the tag google-vertex. A pin written
+    "google" matched that display name, so the bench would vouch a
+    reservation for it and then send order ["google"], which is not a
+    documented slug at all: under allow_fallbacks false that empties the
+    provider pool and the run fails, having been told the route was
+    understood.
+
+    The tag carries an optional variant after a slash, "amazon-bedrock",
+    "amazon-bedrock/eu-west-1" and "mancer/fp8" all being the same
+    provider, so only the head is the slug.
+
+    None when the endpoint published no tag, which makes it match no
+    pin. That is the fail-closed reading and it costs the least: an
+    unmatched endpoint leaves the reservation unsent and the budget on
+    the model-level cap, both of which are where they were before any of
+    this. Zero of the 64 measured endpoints were missing a tag.
+    """
+    if not isinstance(tag, str):
+        return None
+    head = tag.split("/", 1)[0].strip().lower()
+    return head or None
+
+
+def _as_positive_int(value: object) -> int | None:
+    """A published token ceiling, or None when the published thing is not
+    one.
+
+    A non-bool int strictly above zero only. isinstance(True, int) is
+    true in Python, so a provider sending true would otherwise become a
+    ceiling of 1 that clamps every request on that route to a single
+    token; zero and negatives are not ceilings either. Floats and
+    numeric strings are refused rather than coerced, because a cap is
+    something a provider published and a value needing conversion is a
+    value somebody guessed the meaning of.
+
+    Two callers read the same field from two documents, the model
+    listing's top_provider and the endpoint listing's own entry. There
+    were never two copies of this reasoning to merge, and an earlier
+    version of this paragraph claimed there were: the endpoint reader
+    did not exist until the day this function did. It was extracted
+    ahead of the duplication rather than after it, so that a later
+    correction cannot land on only one of them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
+
+
 async def run_model(
     prompt: str,
     model: str,
@@ -843,6 +1999,7 @@ async def run_model(
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
     record_prompt: str | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> dict[str, Any]:
     """Send one chat completion to OpenRouter and return a flat result dict.
 
@@ -867,6 +2024,7 @@ async def run_model(
         "request_json": None,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -881,6 +2039,19 @@ async def run_model(
         # policy lives. The default keeps a direct caller on today's
         # behavior.
         "provider": PROVIDER_PREFS if provider_prefs is None else provider_prefs,
+        # THE VISIBLE-OUTPUT RESERVATION, on every request that does not
+        # already carry a declared effort. See reasoning_reservation and
+        # REASONING_BUDGET_SHARE: this is the one field the bench sends
+        # UNPROMPTED, a deliberate and documented exception to "never
+        # send a default", taken because the alternative is a comparison
+        # that bills in full and shows nothing.
+        #
+        # BEFORE control_payload rather than after, so an operator's
+        # declared effort would win a collision by overwriting this. It
+        # cannot collide in practice, because the reservation stands
+        # down when an effort is set, but the ordering means the rule
+        # holds even if that guard were ever wrong.
+        **reasoning_reservation(max_tokens, controls, may_send_reasoning_cap),
         # Last, and only the controls that were set. The merge is safe
         # because control_payload emits from a fixed key list that shares
         # nothing with the keys above; a test asserts that, so a future
@@ -964,24 +2135,51 @@ async def run_model(
     result["provider"] = _as_label(data.get("provider"))
     result["native_finish_reason"] = _as_label(choice.get("native_finish_reason"))
 
-    text = _flatten_content(content)
-    if text:
-        result["response_text"] = text
-    else:
-        # Some providers return 200 with null content on refusals. Surface
-        # that as an error so every result carries either text or an error,
-        # a contract the frontend relies on to pick a render state. Non-str
-        # oddities land here too rather than leaking into response_text.
-        result["error"] = (
-            f"empty response (finish_reason: {result['finish_reason'] or 'unknown'})"
-        )
-
     # A missing or oddly shaped usage object leaves the counts and the
     # billed cost None rather than guessed. The guard that makes that safe
     # (isinstance, not truthiness, so a value like "n/a" cannot raise on
     # .get) lives in _ingest_usage now, which is where its comment lives
     # too.
+    #
+    # BEFORE the empty-text branch below, which is a move rather than an
+    # accident of layout: that branch now reads the token counts this
+    # writes, and with the old ordering it read two Nones and could never
+    # produce the exhaustion label. The streaming path never had the
+    # problem, because usage is ingested per chunk and done() runs last.
     _ingest_usage(result, data.get("usage"))
+
+    text = _flatten_content(content)
+    # STRIP AS A PREDICATE, NEVER AS A TRANSFORM. Whitespace is not a
+    # visible answer: a response of spaces and newlines used to be
+    # truthy here, so response_text was set, the empty-response guard
+    # below never ran, and a fully billed reasoning burn rendered as a
+    # blank card with no error and therefore no remedy.
+    #
+    # What is STORED is still the text exactly as it arrived. Only the
+    # question "did this produce anything a reader can see" is asked
+    # with strip(), because trimming the stored value would edit a
+    # model's output on its way into the record.
+    if text is not None and text.strip():
+        result["response_text"] = text
+    else:
+        # Some providers return 200 with null content on refusals, and a
+        # reasoning model can spend a whole budget without ever producing
+        # visible text. Both must surface as an error so every result
+        # carries either text or an error, a contract the frontend relies
+        # on to pick a render state.
+        #
+        # empty_response_error tells the three cases apart, and it needs
+        # finish_reason to do it: at this call site there is no visible
+        # text by construction, so the token shape alone cannot separate
+        # a refusal that thought a little from a budget that ran out.
+        # Non-str oddities land here too rather than leaking into
+        # response_text.
+        result["error"] = empty_response_error(
+            result["finish_reason"],
+            result["completion_tokens"],
+            result["reasoning_tokens"],
+        )
+
     return result
 
 
@@ -994,6 +2192,7 @@ async def stream_model(
     provider_prefs: dict[str, Any] | None = None,
     controls: Mapping[str, Any] | None = None,
     record_prompt: str | None = None,
+    may_send_reasoning_cap: bool = False,
 ) -> AsyncIterator[dict[str, Any]]:
     """Stream one chat completion, yielding delta and done event dicts.
 
@@ -1034,6 +2233,7 @@ async def stream_model(
         "request_json": None,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "reasoning_tokens": None,
         "cached_tokens": None,
         "provider": None,
@@ -1055,6 +2255,11 @@ async def stream_model(
         # (read 2026-07-25). The usage block arrives because the platform
         # sends it, not because this asks.
         "stream_options": {"include_usage": True},
+        # See run_model: the reservation rides here too, and for the same
+        # reason. The streaming path is the one the browser uses, so a
+        # reservation that covered only the batch endpoint would cover
+        # almost nothing a person actually runs.
+        **reasoning_reservation(max_tokens, controls, may_send_reasoning_cap),
         # See run_model: last, and only what was set, so a blank controls
         # set leaves this payload byte for byte what it was before.
         **control_payload(controls),
@@ -1076,15 +2281,23 @@ async def stream_model(
 
     def done(error: str | None) -> dict[str, Any]:
         result["latency_ms"] = elapsed_ms()
-        if text_parts:
-            result["response_text"] = "".join(text_parts)
+        # The same predicate as run_model, on the whole response rather
+        # than on any one delta. joined is kept verbatim; only the
+        # decision uses strip(). See _flatten_content for why the strip
+        # cannot live there.
+        joined = "".join(text_parts)
+        if joined.strip():
+            result["response_text"] = joined
         result["error"] = error
-        # Same guard as run_model: a clean stream that produced no text
-        # must still carry an error so the frontend has a render state.
+        # Same guard as run_model, and the same function, so the two
+        # endpoints cannot describe one failure two ways. Usage is
+        # ingested per chunk above, so the counts this reads are the
+        # final ones by the time done() runs.
         if result["response_text"] is None and error is None:
-            result["error"] = (
-                "empty response (finish_reason: "
-                f"{result['finish_reason'] or 'unknown'})"
+            result["error"] = empty_response_error(
+                result["finish_reason"],
+                result["completion_tokens"],
+                result["reasoning_tokens"],
             )
         return {"type": "done", "result": result}
 
@@ -1192,10 +2405,52 @@ async def stream_model(
     # success: a load balancer idle-closing the connection or a provider
     # crashing with a clean close both land here, and done(None) would show
     # and persist a truncated answer as complete, corrupting the
-    # comparison. But a stream that delivered a finish_reason and then
-    # closed without [DONE] is semantically complete (the provider stated
-    # why it stopped), so flagging that would be a false alarm. done()
-    # already carries the partial text accumulated so far.
+    # comparison. done() already carries the partial text accumulated so
+    # far.
+    #
+    # ACCEPTING A finish_reason IN PLACE OF [DONE] IS THIS REPOSITORY'S
+    # DECISION AND NOT THE CONTRACT'S. A review asked for the rule to be
+    # pinned; it cannot be, because the documentation does not state it.
+    # What the streaming page DOES say, read in full 2026-08-13 at
+    # https://openrouter.ai/docs/api-reference/streaming:
+    #
+    #   Every client example it publishes treats the sentinel as the
+    #   terminator and nothing else: "if (event.data === '[DONE]')
+    #   break;".
+    #
+    #   Of the ERROR path only, it says a "choices array is included
+    #   with finish_reason: 'error' to properly terminate the stream"
+    #   and "The stream is terminated after this unified error event".
+    #
+    #   It warns that "OpenRouter occasionally sends comments to prevent
+    #   connection timeouts", which is why the connection staying open
+    #   is not evidence of anything either.
+    #
+    # So the page names exactly one finish_reason as a terminator, the
+    # error one, and says nothing about "stop" or "length" ending a
+    # stream without the sentinel. The tolerance below is wider than
+    # that.
+    #
+    # WHY IT IS STILL RIGHT. The two readings fail in opposite
+    # directions and the costs are not equal. Requiring [DONE] would
+    # fail a run that was PAID FOR, complete, and told us why it
+    # stopped, on the strength of a sentinel the provider owed us and
+    # did not send: money spent and the answer discarded. Accepting the
+    # finish_reason risks the narrow case below.
+    #
+    # THE RISK, NAMED. A connection cut AFTER the finish_reason chunk
+    # and BEFORE the usage chunk is recorded as a success with no token
+    # counts and no charge. That row is not silently wrong: it lands
+    # unpriced, which the report counts and shows, and it carries a
+    # generation id, so results_awaiting_reconciliation offers it and
+    # the generation endpoint supplies the money afterwards. The failure
+    # mode is a delay in the billing record, not a corrupted comparison.
+    #
+    # IT IS NOT MEASURED. No live capture in this repository shows a
+    # provider ending a normal stream without [DONE]. The tolerance is
+    # a judgement about which way to be wrong, and it is written down
+    # here so the next reader inherits the judgement rather than
+    # mistaking it for a documented rule.
     if not saw_done and result["finish_reason"] is None:
         yield done("stream ended before completion: no [DONE] and no finish reason")
         return
@@ -1238,6 +2493,7 @@ async def fetch_generation(
         "generation_id": generation_id,
         "billed_cost_usd": None,
         "upstream_inference_cost_usd": None,
+        "is_byok": None,
         "provider": None,
         "quantization": None,
         "native_finish_reason": None,
@@ -1276,9 +2532,49 @@ async def fetch_generation(
     # example response carries "total_cost": 0.0015 beside
     # "upstream_inference_cost": 0.0012 and "is_byok": false.
     record["upstream_inference_cost_usd"] = _as_upstream_cost(data)
+    # THE DISCRIMINATOR, at the TOP level of data here rather than
+    # nested under cost_details as the streaming usage object puts it.
+    # The comment above already quoted the pinned example as carrying
+    # "is_byok": false beside the figure, and then did not read it, which
+    # is the same fetched-and-dropped shape RECONCILABLE_COLUMNS calls
+    # out one step later.
+    # as_wire_flag, NOT as_flag. This is JSON from the platform, not a
+    # cell from SQLite, and the SQLite decoder's integer branch has no
+    # business here: it made a wire 1 into True while the identical
+    # value in the in-band usage object became None.
+    record["is_byok"] = as_wire_flag(data.get("is_byok"))
     record["provider"] = _as_label(data.get("provider_name"))
     record["quantization"] = _as_label(data.get("quantization"))
     record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))
+    # THE NATIVE FIELDS ON PURPOSE, and parsed but NOT PERSISTED, which
+    # is a deliberate pair of choices rather than an oversight in either
+    # direction.
+    #
+    # Native, because store's counts are native (see _ingest_usage) and
+    # the endpoint offers both: "native_tokens_completion - Native
+    # completion tokens as reported by provider" beside a plain
+    # "tokens_completion - Number of tokens in the completion". Reading
+    # the normalized pair here would put a second unit into a record whose
+    # whole job is to be comparable with what is already stored.
+    #
+    # Not persisted, because RECONCILABLE_COLUMNS in bench/store.py does
+    # not list them, so a reconcile pass reads these and drops them.
+    # Adding columns for them would put two counts per result in the
+    # database and reintroduce, permanently, exactly the ambiguity this
+    # workstream exists to remove.
+    #
+    # They are kept anyway, and the reason has been corrected. This
+    # comment used to call the record "the ONE PLACE the two units can
+    # be compared", which is false: only the native pair is read here,
+    # so there is no second unit in this dict to compare anything with.
+    # What the record actually offers is two SOURCES of the same unit,
+    # the counts OpenRouter reported in-band on the response and the
+    # counts its generation endpoint reports afterwards. Those can
+    # disagree, and a reader debugging a suspicious row can print this
+    # record and see whether they do. That is a smaller claim than the
+    # one it replaces and it is the true one.
+    #
+    # Pinned against the Get a Generation reference, read 2026-08-12.
     record["prompt_tokens"] = as_token_count(data.get("native_tokens_prompt"))
     record["completion_tokens"] = as_token_count(data.get("native_tokens_completion"))
     record["reasoning_tokens"] = as_token_count(data.get("native_tokens_reasoning"))
@@ -1294,7 +2590,57 @@ async def fetch_generation(
 # would buy headroom no rubric needs, once per scored trial, at the
 # judge's own price. Large enough that a reasoning model's preamble plus
 # the verdict fits; nowhere near large enough to pay for an essay.
+# A JUDGE ROUTE MUST NOT HAVE MANDATORY REASONING, which is a
+# constraint on choosing one rather than a setting. The pinned formula
+# budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)
+# floors every ratio on the ladder to 1024 at this budget, and the
+# companion rule requires the outer budget to be STRICTLY higher than
+# the reasoning budget. 512 is not. Sending nothing does not rescue it:
+# omission hands the decision to the provider, and on a mandatory route
+# the provider cannot decide zero.
+#
+# So the reservation standing down here is necessary and not
+# sufficient. Unmeasured, because proving it would mean paying a
+# mandatory-reasoning judge to fail; asserted from the contract's own
+# arithmetic instead, beside the test that does the sums.
 JUDGE_MAX_TOKENS = 512
+
+# THE JUDGE SENDS NO REASONING RESERVATION, and the arithmetic is why.
+#
+# Pinned against
+# https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+# re-read 2026-08-12. Two sentences settle it:
+#
+#   "When using the reasoning.max_tokens parameter, that value is used
+#   directly with a minimum of 1024 tokens."
+#
+#   "Important: max_tokens must be strictly higher than the reasoning
+#   budget to ensure there are tokens available for the final response
+#   after thinking."
+#
+# Put them together against this budget. A judge asking for half of 512
+# sends a reasoning budget of 256, which the minimum raises to 1024, and
+# 1024 is not strictly lower than an outer max_tokens of 512. The
+# request is unsatisfiable by the contract's own arithmetic, and it was
+# being sent to every Anthropic judge that reasons by default. An
+# earlier version of this file shipped it, and the test that was
+# supposed to guard it mocked a 200 and read only the outgoing JSON, so
+# a request no provider could honour looked correct forever.
+#
+# RAISING THE BUDGET IS NOT THE FIX. To satisfy both rules the judge
+# would need an outer budget above 1024 with the reservation below it,
+# so at least 2048 to keep a half share, which is four times what a
+# verdict costs today, once per scored trial, at the judge's price. The
+# bench would be buying reasoning headroom for a task whose entire
+# output is a number and a sentence.
+#
+# AND A JUDGE THAT EXHAUSTS IS ALREADY HONEST. When a judge reasons past
+# its cap the trial is recorded as UNSCORED rather than failed, which is
+# the true statement: nobody graded it. That is a different situation
+# from a comparison card that billed for thinking and showed nothing,
+# because no claim about a model's answer depends on it. The failure
+# mode the reservation exists to prevent does not apply here.
+JUDGE_SENDS_NO_RESERVATION = True
 
 JUDGE_TIMEOUT_S = 60.0
 
@@ -1410,7 +2756,11 @@ async def judge_response(
     data-handling promise as the run itself. There is no path here that
     can send it under a different policy.
     """
-    if response_text is None:
+    # Whitespace is not an answer, and paying a judge to grade it is
+    # money spent on a verdict nobody can use. parse_verdict at the
+    # other end of this file already applies the same test to what comes
+    # back; this applies it to what goes out.
+    if response_text is None or not response_text.strip():
         # A trial that produced no text. Scored without asking anyone,
         # because there is nothing to grade and paying a judge to say so
         # would be spending money to learn what the row already says.
@@ -1434,6 +2784,17 @@ async def judge_response(
         "model": judge_model,
         "messages": judge_messages(rubric, reference, response_text),
         "max_tokens": JUDGE_MAX_TOKENS,
+        # NO RESERVATION, and it is the GENERAL rule that says so
+        # rather than a special case here. reasoning_reservation
+        # computes half of 512, sees 256 fall below the pinned 1024
+        # minimum, and returns nothing. See JUDGE_SENDS_NO_RESERVATION
+        # beside JUDGE_MAX_TOKENS for the arithmetic in full.
+        #
+        # Called rather than omitted on purpose: if the judge's budget
+        # were ever raised past the point where the arithmetic works,
+        # this line starts reserving without anybody having to remember
+        # that it should.
+        **reasoning_reservation(JUDGE_MAX_TOKENS, None, True),
     }
     if provider_prefs:
         payload["provider"] = provider_prefs

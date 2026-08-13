@@ -147,17 +147,32 @@
         // card, so this is the only place it would be recorded.
         try {
           // Presentation only, never persisted: the stored error stays the
-          // server's exact words. The extended budget is the one knob the
-          // user can turn when reasoning burned the whole standard budget,
-          // so say so right where the failure is reported.
-          let shownError = result.error;
-          if (
-            shownError != null &&
-            budget === "standard" &&
-            shownError.includes("finish_reason: length")
-          ) {
-            shownError += "; try extended budget";
-          }
+          // server's exact words. A remedy belongs next to the failure it
+          // answers, so the card carries the knob the user can actually
+          // turn.
+          //
+          // THE EXHAUSTION CASE IS KEYED ON THE COUNTS, not on the
+          // sentence. The old branch matched the substring
+          // "finish_reason: length", and R2's honest label does not
+          // contain it, so leaving this alone would have silently
+          // withdrawn the remedy from exactly the cards it was written
+          // for. Reading the numbers instead also means the remedy
+          // appears on a route where the server could not label anything,
+          // and it survives the next rewording of the prose.
+          //
+          // LOWER EFFORT IS THE REMEDY EXTENDED CARDS GET, because
+          // extended is the top tier and there is no larger budget to
+          // suggest; setting a reasoning effort under Experiment controls
+          // is what remains. On standard both apply, and the larger
+          // budget goes first because it is one click away.
+          // NO REMEDY IS COMPUTED HERE ANY MORE. completeColumn derives
+          // it, so a live card and a replayed one say the same thing;
+          // this path used to own the logic and replays therefore had
+          // none at all. What is passed instead is the two facts a
+          // result object cannot carry: what the extended tier would
+          // actually clamp to for THIS model, and which effort the
+          // operator selected.
+          const shownError = result.error;
           // The spend ceiling refusing a run is a working control, not a
           // failure. It arrives as run_id null like a persistence failure
           // does, so the marker the server sets is what tells them apart;
@@ -167,7 +182,27 @@
           BenchRender.completeColumn(ui, result, model + " (live)", {
             streamed: textNode !== null,
             shownError: shownError,
-            budgetBadge: false,
+            // The number the advice turns on, now shown on the surface
+            // where somebody is about to spend rather than only on
+            // replays. The badge says "budget cap N" and its title
+            // distinguishes a ceiling from a count.
+            budgetBadge: true,
+            extendedCap: BenchControls.effectiveCap(model, "extended"),
+            effort: controls?.effort,
+            // THE TIER THIS RUN SELECTED, which a live card has known
+            // all along and never passed. It became load-bearing when
+            // remedyFor stopped reading an absent tier as "standard":
+            // without it every live card would lose its budget advice.
+            budget: budget,
+            // And what the route capped it at, if the numbers say the
+            // route capped it at all. Comparisons are never pinned
+            // today, so this is null on every live card; it is passed
+            // because the derivation belongs at every call site rather
+            // than at the ones that currently need it.
+            routeCap: BenchLib.routeCapFor(
+              result.max_tokens,
+              BenchControls.effectiveCap(model, budget),
+            ),
             // run_id null on the done event means the server spent the money
             // and streamed the response but could not persist it. A refusal
             // is run_id null too, but deliberately: it persists nothing

@@ -571,6 +571,32 @@
         BenchRender.makeColumn(result.model),
         result,
         result.model + ", comparison #" + group.id,
+        // WHAT A STORED ROW CANNOT CARRY. max_tokens on the row is
+        // the cap this run was SENT; whether a larger one exists is a
+        // question about the catalog today, and the effort is on the
+        // comparison rather than the result. Supplying both is what
+        // lets a replayed card derive the same advice a live one did,
+        // instead of showing the server's bare sentence.
+        {
+          extendedCap: BenchControls.effectiveCap(result.model, "extended"),
+          effort: group.params?.effort,
+          // THE TIER THIS COMPARISON ASKED FOR, which the row cannot
+          // carry and the group can. Without it a replayed card
+          // compares today's published cap against yesterday's sent
+          // ceiling and advises "try extended budget" for a run that
+          // already selected extended, purely because the catalog cap
+          // moved.
+          budget: group.budget,
+          // What the ROUTE capped this trial at, where the numbers say
+          // so. An experiment trial may be provider-pinned and clamped
+          // below the model-level cap; extendedCap above cannot see
+          // that, so without this a pinned run is told to try a tier
+          // that clamps to the same ceiling it already had.
+          routeCap: BenchLib.routeCapFor(
+            result.max_tokens,
+            BenchControls.effectiveCap(result.model, group.budget),
+          ),
+        },
       );
     }
     renderMissingMembers(group, results);
@@ -644,6 +670,38 @@
         BenchRender.makeColumn(result.model),
         result,
         result.model + ", run #" + run.id,
+        // WHAT A STORED ROW CANNOT CARRY. max_tokens on the row is
+        // the cap this run was SENT; whether a larger one exists is a
+        // question about the catalog today, and the effort is on the
+        // comparison rather than the result. Supplying both is what
+        // lets a replayed card derive the same advice a live one did,
+        // instead of showing the server's bare sentence.
+        {
+          extendedCap: BenchControls.effectiveCap(result.model, "extended"),
+          effort: run.params?.effort,
+          // NO TIER TO PASS HERE, and the previous version of this
+          // comment gave a false reason for it. It said an ungrouped
+          // run "predates the declaration entirely", so there was no
+          // tier it could have asked for. That is wrong: /compare takes
+          // group_id as OPTIONAL and budget as a current field, so a
+          // run created today can select extended and carry no group.
+          // A review found the claim and it was load-bearing, because
+          // it made a real gap look like an absence of one.
+          //
+          // The gap is real: `runs` has no budget column, so the tier a
+          // standalone run selected is not recorded anywhere and cannot
+          // be recovered here. Writing `budget: run.budget` would read
+          // a field with nothing behind it, a silent undefined wearing
+          // the look of a fix.
+          //
+          // WHAT CHANGED IS THE OTHER SIDE. remedyFor no longer reads
+          // an absent tier as "standard"; it declines to advise a
+          // budget at all. So this call passing nothing now means "this
+          // record cannot say", and the card says nothing about tiers
+          // rather than telling an extended run to select extended.
+          // Persisting the tier on runs would close the gap properly
+          // and is a migration this fix deliberately does not make.
+        },
       );
     }
     window.scrollTo({ top: 0 });

@@ -37,6 +37,7 @@ from typing import Any
 # only consumer. Importing it rather than re-deriving "the last row" is
 # the whole point of J4: a correct helper with no call sites is a rule
 # nothing obeys.
+from bench.models import as_flag
 from bench.scoring import latest_per_key
 
 # The message the disconnect path writes, shared rather than duplicated.
@@ -1330,38 +1331,109 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     streamed tokens before breaking carries a real charge, and leaving it
     out would under-report the bill by exactly what the failures cost.
     """
-    billed = [
-        r["billed_cost_usd"] for r in results if r.get("billed_cost_usd") is not None
-    ]
-    estimated = [
-        r["cost_usd"]
+    billed_rows = [r for r in results if r.get("billed_cost_usd") is not None]
+    estimated_rows = [
+        r
         for r in results
         if r.get("billed_cost_usd") is None and r.get("cost_usd") is not None
     ]
+    billed = [r["billed_cost_usd"] for r in billed_rows]
+    estimated = [r["cost_usd"] for r in estimated_rows]
     unpriced = len(results) - len(billed) - len(estimated)
-    # The BYOK figures, verbatim and NEVER SUMMED. total_usd above is what
-    # OpenRouter charged, in credits, and it is the number the spend
-    # ceiling meters. This is what an upstream provider billed directly on
-    # a bring-your-own-key run, which is a different bill in a different
-    # place that OpenRouter cannot decline; adding the two would produce a
-    # figure nobody is owed. Kept as the strings that were stored, because
-    # the whole use for them is matching a provider's own invoice line and
-    # a float would reformat the number being matched.
-    upstream = [
-        r["upstream_inference_cost_usd"]
-        for r in results
-        if r.get("upstream_inference_cost_usd") is not None
-    ]
+    # THE UPSTREAM FIGURES, verbatim and NEVER SUMMED into total_usd,
+    # and now SPLIT BY WHETHER ANYBODY SAID THEY WERE A SECOND BILL.
+    #
+    # WHAT WAS WRONG. This used to collect every non-null figure and the
+    # report called them all BYOK charges billed direct. Presence was
+    # taken as proof of billing mode, and it is not: two live captures
+    # in this repository are non-BYOK runs, one carrying an upstream
+    # figure equal to the credit charge to the last digit
+    # (probe_reasoning_enable.json) and one carrying zero
+    # (probe_reasoning_cap_binding.json). On the first route the report
+    # published OpenRouter's own charge a second time, as a separate
+    # provider invoice, for a bring-your-own-key run that never
+    # happened.
+    #
+    # is_byok is the only thing that can answer the question, and it is
+    # asked affirmatively: TRUE is a bill, FALSE is the same money seen
+    # twice, and NULL is a row written before the flag existed, which is
+    # genuinely unknown and must not be asserted either way.
+    #
+    # as_flag on the way in, defensively rather than because anything
+    # currently needs it. An earlier version of this comment justified
+    # the call by naming a second caller, "an export line, which carries
+    # whatever JSON held", and there is no such caller: build_report has
+    # exactly one call site and it is fed from store.get_group, which
+    # normalizes every row through _repaired. What the call buys is that
+    # an `is True` test against an unconverted 1 is False, so a future
+    # caller handing over raw rows would empty the byok bucket silently
+    # rather than loudly.
+    #
+    # as_flag and NOT as_wire_flag, and the distinction is the one U3
+    # drew: this reads values that have been through SQLite, where 1 is
+    # how a boolean survives. A document straight off the wire gets the
+    # strict reader instead.
+    #
+    # Kept as the strings that were stored, because the whole use for
+    # them is matching a provider's own invoice line and a float would
+    # reformat the number being matched.
+    # FOUR BUCKETS, NOT THREE, and the fourth exists because the third
+    # was described with a sentence that could be false. A non-BYOK
+    # figure was reported to the reader as "already inside the total",
+    # which is true of a trial that has a price and false of one that
+    # does not. The shape is not hypothetical: a trial with no billed
+    # charge, no local estimate and an upstream figure of 0.0042
+    # produced total_usd 0, unpriced_trials 1 and non_byok_trials 1, so
+    # the UI said 0.0042 was already inside a total of nothing.
+    #
+    # Being unpriced is a property of the TRIAL, not of the flag, so it
+    # is read from the same two fields that decide the counts above
+    # rather than from anything about BYOK.
+    # BY IDENTITY, and the honest reason is cost rather than
+    # correctness. An earlier version of this comment claimed equality
+    # would give a different answer for two equal rows, and that is
+    # false: billed-ness is decided by a row's own fields, so a row
+    # equal to a billed row is itself billed and `in` would agree. What
+    # equality would actually cost is a linear scan per figure, turning
+    # one pass into a quadratic one on an experiment with thousands of
+    # trials.
+    priced = {id(r) for r in billed_rows} | {id(r) for r in estimated_rows}
+    upstream: dict[str, list[str]] = {
+        "byok": [],
+        "not_byok": [],
+        "not_byok_unpriced": [],
+        "unknown": [],
+    }
+    for r in results:
+        figure = r.get("upstream_inference_cost_usd")
+        if figure is None:
+            continue
+        flag = as_flag(r.get("is_byok"))
+        if flag is True:
+            bucket = "byok"
+        elif flag is False:
+            bucket = "not_byok" if id(r) in priced else "not_byok_unpriced"
+        else:
+            bucket = "unknown"
+        upstream[bucket].append(figure)
+    any_upstream = any(upstream.values())
     return {
         "total_usd": sum(billed) + sum(estimated),
         "billed_trials": len(billed),
         "estimated_trials": len(estimated),
         "unpriced_trials": unpriced,
-        # None rather than an empty block when no run was BYOK, so the
-        # key being filled in means something happened rather than that
-        # the report always says this.
+        # None rather than an empty block when no run reported an
+        # upstream figure at all, so the key being filled in means
+        # something happened rather than that the report always says
+        # this. Each bucket carries its own trial count, and only the
+        # byok one may be described as a bill.
         "upstream": (
-            {"trials": len(upstream), "values": upstream} if upstream else None
+            {
+                name: {"trials": len(values), "values": values}
+                for name, values in upstream.items()
+            }
+            if any_upstream
+            else None
         ),
     }
 
@@ -1396,7 +1468,8 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 3
+EXPORT_SCHEMA_VERSION = 4
+
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
 # than in this file, because "without anyone consulting a changelog" is
@@ -1424,6 +1497,45 @@ EXPORT_SCHEMA_VERSION = 3
 # trial lines a v2 reader could not tell apart while the models had been
 # shown different things. An artifact whose whole purpose is to be
 # checkable has to carry the reading.
+#
+# Version 4 is the units-and-money boundary, and it is a bump this
+# repository first declined to make. The manifest gained token_counts,
+# one sentence naming the unit of the four counts on every trial line
+# and separating them from max_tokens, which is a ceiling that was sent
+# rather than a count. No trial field changed value, meaning or
+# presence, and the argument for staying at 3 was that a reader
+# ignoring the key reads a version 3 artifact exactly.
+#
+# That answered half the policy. The rule above is a disjunction, and
+# its first limb is a reader that will not ABSORB the change: a strict
+# parser, the kind this repository itself relies on at its own
+# boundaries, rejects an unknown key rather than ignoring it. Two files
+# both calling themselves version 3 while carrying different manifest
+# shapes is the exact ambiguity the number exists to remove, and
+# bumping is cheaper than arguing about it.
+#
+# Trial lines also gained is_byok, beside upstream_inference_cost_usd
+# and for the reason that column was split: a populated upstream figure
+# was found on a run with is_byok false, so an artifact carrying the
+# figure without the flag invites a reader to conclude BYOK from a
+# number that does not mean it.
+def _manifest_token_note() -> str:
+    """The one sentence the artifact says about its token units.
+
+    A function rather than an inline literal so a test can read it
+    without building an export, and so there is one place the wording
+    lives if a field is ever added to the trial line.
+    """
+    return (
+        "prompt_tokens, completion_tokens, reasoning_tokens and "
+        "cached_tokens are counts of tokens actually used, in the "
+        "model's own tokenizer, as OpenRouter reported them. "
+        "max_tokens is not a count: it is the completion ceiling the "
+        "run was sent, after clamping to the model's published cap and, "
+        "on a provider-pinned trial, to the selected endpoint's."
+    )
+
+
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -1439,6 +1551,17 @@ EXPORT_SCHEMA_NOTES = {
         "the bytes and the rendition names the reading of them; two "
         "trials over one digest read two ways were indistinguishable in "
         "version 2 while the models had been shown different things."
+    ),
+    4: (
+        "the manifest carries token_counts, naming the unit of the four "
+        "token counts on every trial line and separating them from "
+        "max_tokens, which is a ceiling that was sent rather than a "
+        "count; trial lines carry is_byok beside "
+        "upstream_inference_cost_usd, because that figure has been "
+        "observed on runs that were not BYOK and does not by itself say "
+        "which a run was. Version 3 carried renditions: the ordered "
+        "pins, each with digest, extractor, extractor_version and kind, "
+        "and version 4 carries them unchanged."
     ),
 }
 
@@ -1523,6 +1646,22 @@ def export_manifest(
         # self-contained", and the digests themselves are on the trial
         # lines where they belong to a particular trial.
         "attachments_referenced": attachments_referenced,
+        # THE UNIT, ONCE, FOR THE WHOLE ARTIFACT. Every trial line carries
+        # four counts and one ceiling side by side, and an export is read
+        # by people who were not here: prompt_tokens next to max_tokens
+        # invites exactly the subtraction that manufactured a phantom
+        # 44186 tokens on a card and misdirected a live diagnosis.
+        #
+        # In the manifest rather than repeated per trial, because it is a
+        # property of the format and not of any run, and a note stamped
+        # onto every line is one a reader stops seeing.
+        #
+        # This key is half of why version 4 exists; see
+        # EXPORT_SCHEMA_NOTES. It changes no field's value, meaning or
+        # presence, so a reader that ignores unknown keys is unaffected,
+        # but a reader that REJECTS them is not, and the policy above
+        # counts that reader too.
+        "token_counts": _manifest_token_note(),
         "type": "manifest",
         "export_schema_version": EXPORT_SCHEMA_VERSION,
         # The bump's reason, in the file. See EXPORT_SCHEMA_NOTES: a
@@ -1652,6 +1791,10 @@ def export_trial(
         # holding a citable artifact that cannot be reconciled against
         # the provider invoice the run was actually paid on.
         "upstream_inference_cost_usd": result.get("upstream_inference_cost_usd"),
+        # The discriminator beside the figure. An artifact that carried
+        # one without the other would invite the reading the column was
+        # split to prevent.
+        "is_byok": result.get("is_byok"),
         "app_sha": run.get("app_sha"),
         "catalog_digest": run.get("catalog_digest"),
         "data_policy": run.get("data_policy"),

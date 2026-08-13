@@ -1,5 +1,6 @@
 import hashlib
 import json
+import subprocess
 from pathlib import Path
 
 import httpx
@@ -873,12 +874,42 @@ async def test_review_repro_clean_eof_without_done_is_error(client):
 
 
 @respx.mock
-async def test_review_repro_finish_reason_without_done_not_flagged(client):
-    """External review finding 2 refinement (inverse lock): a stream that
-    delivered a finish_reason and then closed without [DONE] is
-    semantically complete (the provider stated why it stopped), so flagging
-    it aborted would be a false alarm. Guards against over-correcting the
-    fix above into treating every missing [DONE] as an error."""
+async def test_review_repro_finish_reason_without_done_is_a_labelled_tolerance(
+    client,
+):
+    """WINDOW: the done event of a stream that stated a finish_reason and
+    then closed without the sentinel.
+
+    SUSPENSION POINT: the awaits inside collect, which drains the whole
+    generator. Everything asserted is on the final result, assembled
+    before the last event is yielded.
+
+    THIS IS A DECISION, NOT A CONTRACT, and saying so is the point of
+    the rewrite. The test used to assert that such a stream "is
+    semantically complete (the provider stated why it stopped)" as
+    though the platform said so. A review checked, and it does not. The
+    streaming page, read in full 2026-08-13, names exactly ONE
+    finish_reason as a terminator:
+
+      "A choices array is included with finish_reason: 'error' to
+      properly terminate the stream"
+
+    and every client example it publishes breaks on the sentinel and
+    nothing else. Nothing on the page says "stop" or "length" ends a
+    stream without [DONE].
+
+    SO WHAT IS ASSERTED HERE is the repository's own rule, labelled as
+    such, together with the cost of the case it tolerates. Requiring
+    [DONE] would discard a PAID, complete answer over a sentinel the
+    provider owed and withheld. Accepting the finish_reason risks the
+    second half below.
+
+    THE RISK IS ASSERTED, NOT WAVED AT. A cut after the finish_reason
+    chunk and before the usage chunk succeeds with no counts and no
+    charge, and the second half of this test pins exactly what that row
+    looks like, so the tolerance's cost is a fixture rather than a
+    sentence: unpriced, and carrying an id the reconcile pass can use.
+    """
     respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(
             200,
@@ -899,6 +930,18 @@ async def test_review_repro_finish_reason_without_done_not_flagged(client):
     assert result["response_text"] == "Hello"
     assert result["error"] is None
     assert result["finish_reason"] == "stop"
+    # THE COST OF THE TOLERANCE, pinned. No usage chunk arrived, so this
+    # run is recorded with no counts and no charge. It is not silently
+    # wrong: it is UNPRICED, which the report counts and displays, and
+    # every one of these fields being absent is what makes it so.
+    assert result["completion_tokens"] is None
+    assert result["prompt_tokens"] is None
+    assert result["billed_cost_usd"] is None
+    # The local estimate is not in this dict at all: it is derived from
+    # the counts one layer up, and there are no counts. Asserted by
+    # MEMBERSHIP because "absent" and "None" are the same to .get() and
+    # only one of them is what happens here.
+    assert "cost_usd" not in result
 
 
 # ---- G2: billed truth, read in-band.
@@ -1542,6 +1585,27 @@ async def test_review_repro_blank_controls_send_the_pre_h_payload_byte_for_byte(
     On pre-fix code there are no controls to leave blank, so this test
     cannot fail there; its force is forward. It fails the moment any
     control acquires a default that reaches the wire.
+
+    RECAPTURED ONCE AND THEN PUT BACK, which is worth recording because
+    the round trip is the evidence for a claim this repo makes about
+    itself. The reasoning-exhaustion fix first sent its visible-output
+    reservation on every request, and these bytes were regenerated to
+    match by RUNNING the code against respx, never by editing the JSON.
+    An adversarial review then found that a reasoning cap with no
+    enabled key infers enabled true, so an unprompted cap does not
+    merely bound thinking on a model whose default is off, it switches
+    thinking on and bills for it. The reservation was gated on the
+    catalog's own capability flag, and with that gate a blank-controls
+    request to a model the catalog does not vouch for sends exactly what
+    it sent before the fix existed. These are main's bytes again, to the
+    character.
+
+    So rule one is not broken by default any more. It is broken only for
+    a model the catalog says already reasons, where the cap bounds
+    thinking that was going to happen regardless. That is a far narrower
+    exception than the one this docstring used to describe, and the
+    fixture reverting is how the narrowing was proved rather than
+    asserted.
     """
     for kind, controls in (
         ("run_model", None),
@@ -1738,13 +1802,18 @@ async def test_request_json_records_a_set_control_and_omits_a_blank_one(client):
 
     recorded = json.loads(result["request_json"])
     assert recorded["temperature"] == 0.2
+    # reasoning rejoined this list when the reservation was gated on the
+    # catalog. This caller passes no may_send_reasoning_cap, so the bench
+    # does not vouch for the model, so nothing is sent: an unset control
+    # and an unvouched reservation are both simply absent, which is what
+    # rule one asks for in both cases.
     for absent in ("top_p", "seed", "reasoning"):
         assert absent not in recorded, absent
 
 
 # ---- Phase I3: rubric judging, blind by construction.
 
-from bench.models import JUDGE_MAX_TOKENS
+from bench.models import EFFORT_SHARES, JUDGE_MAX_TOKENS, reasoning_claims
 
 
 def judge_body(text):
@@ -2035,14 +2104,48 @@ async def test_the_byok_upstream_charge_is_captured_beside_the_credit_cost(clien
 
 
 @respx.mock
-async def test_a_non_byok_response_records_no_upstream_charge(client):
-    """The documentation says the field "will be 0 or null" off BYOK, so
-    a stored 0 would be indistinguishable from a BYOK run that genuinely
-    cost nothing. Absence is the more honest record."""
-    for details in (
-        {},
-        {"upstream_inference_cost": 0},
-        {"upstream_inference_cost": None},
+async def test_review_repro_an_observed_upstream_figure_is_stored_as_received(client):
+    """WINDOW: run_model's returned result, over every shape cost_details
+    arrives in.
+
+    THIS TEST USED TO ASSERT THE OPPOSITE FOR A ZERO, and the reversal
+    is the record of a ruling rather than a change of taste. The old
+    rule degraded a wire-sent 0 to None, reasoning from the vendor's
+    "will be 0 or null" that a stored 0 could not be told apart from a
+    BYOK run that genuinely cost nothing.
+
+    A live probe broke that reasoning from both ends. A run with
+    is_byok FALSE came back with a NONZERO upstream figure equal to the
+    credit charge, so a populated cell never meant BYOK, and the
+    inference the suppression was protecting did not exist. is_byok now
+    has a column of its own and says the thing this value was being
+    asked to imply.
+
+    With the discriminator moved out, suppressing an observed money
+    figure would only make the database disagree with the wire. So a
+    zero is stored as a zero, and NULL in that column means the wire
+    sent nothing usable.
+
+    NOT-A-NUMBER AND NEGATIVES STILL DEGRADE, which is a different rule
+    and survives untouched: those are not money figures at all, and
+    as_money applies the same test to every monetary field here.
+
+    SUSPENSION POINT: the await on run_model, once per shape in the
+    loop. Each iteration's assertion runs after its own await resolves,
+    so the shapes cannot observe each other's results.
+    """
+    for details, expected in (
+        # Nothing reported.
+        ({}, None),
+        # Reported as zero. Stored as zero, which is the reversal.
+        ({"upstream_inference_cost": 0}, "0"),
+        # Explicitly null.
+        ({"upstream_inference_cost": None}, None),
+        # A real figure, kept verbatim as text so it stays comparable to
+        # a provider invoice.
+        ({"upstream_inference_cost": 1.629e-05}, "1.629e-05"),
+        # Not money. Still degrades.
+        ({"upstream_inference_cost": -1}, None),
     ):
         body = json.loads(json.dumps(FIXTURE))
         body["usage"] = {"cost": 0.5, "cost_details": details}
@@ -2051,7 +2154,7 @@ async def test_a_non_byok_response_records_no_upstream_charge(client):
         out = await run_model("hi", "a/b", client, max_tokens=100)
 
         assert out["billed_cost_usd"] == 0.5
-        assert out["upstream_inference_cost_usd"] is None
+        assert out["upstream_inference_cost_usd"] == expected, details
 
 
 def test_a_pin_normalizes_to_the_documented_lowercase_slug():
@@ -2065,3 +2168,1919 @@ def test_quantizations_ride_the_documented_filter_and_only_when_asked():
 
     assert pinned["quantizations"] == ["fp8"]
     assert "quantizations" not in plain
+
+
+from bench.models import (
+    BUDGET_EXTENDED,
+    REASONING_BUDGET_SHARE,
+    reasoning_reservation,
+)
+
+# ---- The reasoning-exhaustion fix, R1: visible-output room is reserved
+# ---- on every request, and the reservation is a function of the budget.
+
+
+@respx.mock
+async def test_review_repro_thinking_cannot_eat_the_whole_budget(client):
+    """WINDOW: the payload run_model puts on the wire, at both budget
+    tiers.
+
+    THE INCIDENT. A production comparison on document prompts reasoned
+    until the completion cap closed on it: billed in full, $3.38 to
+    $3.50 per card, zero visible output. The generation record showed
+    tokens_completion 21350 against native_tokens_reasoning 21350, which
+    is the whole budget spent on thinking and nothing left to say it
+    with. Nothing bounded the thinking, because nothing asked to.
+
+    THE RESERVATION IS A FUNCTION OF THE BUDGET AND OF NOTHING ELSE,
+    which is what this asserts and why it is parametrized on the tier
+    rather than on a model. 16384 reserves 8192 for the answer; 65536
+    reserves 32768, which is four times the entire standard tier. A
+    model name appears nowhere in the arithmetic and a separate test
+    proves it appears nowhere in the code.
+
+    SUSPENSION POINT: the await on run_model, once per tier. The payload
+    is read from respx's recorded call AFTER that await returns, so the
+    loop's second iteration cannot observe the first one's request; the
+    -1 index is the call the iteration just made, not whichever finished
+    last.
+    """
+    for budget, expected in ((BUDGET_STANDARD, 8192), (BUDGET_EXTENDED, 32768)):
+        respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+        await run_model(
+            "the prompt",
+            "vendor/model",
+            client,
+            max_tokens=budget,
+            # The catalog vouches for this model: it thinks whether or
+            # not it is asked to, so bounding the thinking cannot start
+            # any. See reasoning_reservation for why that is the gate.
+            may_send_reasoning_cap=True,
+        )
+
+        body = json.loads(respx.calls[-1].request.content)
+        assert body["reasoning"] == {"max_tokens": expected}, budget
+        # Half, stated as the relationship rather than as two constants,
+        # so changing the share cannot leave this test agreeing with a
+        # number nobody meant.
+        assert body["reasoning"]["max_tokens"] == int(
+            body["max_tokens"] * REASONING_BUDGET_SHARE
+        )
+
+
+@respx.mock
+async def test_the_reservation_stands_down_for_a_declared_effort(client):
+    """WINDOW: the same payload, when the operator declared a reasoning
+    effort.
+
+    NOT BOTH, and the pinned page is what decides it: OpenRouter
+    introduces effort and max_tokens as "One of the following (not
+    both)". So a request carrying a declared effort must not also carry
+    the bench's cap, and the operator's declaration is the one that
+    rides: it is part of the experiment, the reservation is the bench's
+    own default, and a default overwriting a declaration is what rule
+    one exists to forbid.
+
+    SUSPENSION POINT: the await on run_model. Only one request is made,
+    and every assertion runs after it resolves, including the two direct
+    calls to reasoning_reservation, which suspend nowhere at all.
+
+    That leaves those requests unprotected by R1, which is exactly why
+    the card's indicator keys on the tokens that came BACK rather than
+    on the field that went out.
+
+    TWO DEFENCES, AND BOTH ARE CHECKED HERE, which is a fact this test
+    learned the hard way. Mutating the guard to return the cap
+    unconditionally left this test PASSING, because control_payload
+    merges last and replaces the whole reasoning value rather than
+    merging into it, so the ordering alone produced a correct request.
+    That is the design working, but a test that only reads the payload
+    cannot tell a live guard from a dead one hiding behind the ordering.
+    So the guard is also asserted directly, on the function, where the
+    same mutation does fail.
+    """
+    respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+
+    await run_model(
+        "the prompt",
+        "vendor/model",
+        client,
+        max_tokens=BUDGET_STANDARD,
+        controls={"effort": "high"},
+        may_send_reasoning_cap=True,
+    )
+
+    body = json.loads(respx.calls[-1].request.content)
+    assert body["reasoning"] == {"effort": "high"}
+    assert "max_tokens" not in body["reasoning"]
+    # The guard itself, behind the ordering that would otherwise cover
+    # for it. See the docstring: this is the assertion the mutation
+    # kills.
+    assert reasoning_reservation(BUDGET_STANDARD, {"effort": "high"}, True) == {}
+    # And it stands down only for a declared effort, not for any
+    # controls at all, so a request with a temperature still reserves.
+    assert reasoning_reservation(BUDGET_STANDARD, {"temperature": 0.5}, True) == {
+        "reasoning": {"max_tokens": 8192}
+    }
+
+
+@respx.mock
+async def test_review_repro_the_judge_sends_no_unsatisfiable_reservation(client):
+    """WINDOW: the judge's outgoing payload, asserted against the PINNED
+    CONTRACT rather than against a mock's willingness to answer.
+
+    SUSPENSION POINT: the await on judge_response. The payload is read
+    after it resolves.
+
+    THE DEFECT, and it is arithmetic rather than judgement. The judge
+    used to reserve half of its 512 token budget, sending
+    reasoning.max_tokens 256. Two pinned rules make that request
+    impossible to honour:
+
+      "When using the reasoning.max_tokens parameter, that value is
+      used directly with a minimum of 1024 tokens."
+
+      "Important: max_tokens must be strictly higher than the reasoning
+      budget to ensure there are tokens available for the final response
+      after thinking."
+
+    256 is raised to 1024 by the first rule. The second then requires
+    the outer max_tokens to exceed 1024, and it is 512. Every Anthropic
+    judge that reasons by default was receiving a request the contract
+    forbids.
+
+    WHY NOBODY NOTICED, which is the lens this test now carries. The
+    old test mocked a 200 and asserted the outgoing JSON contained
+    {"max_tokens": 256}. A mock cannot refuse. It answered "did we send
+    what we meant to send" when the question was "could anyone honour
+    what we sent", and those come apart precisely when a contract has
+    a minimum in it. The assertions below are written against the
+    contract's numbers, so the arithmetic is checked rather than the
+    mock's manners.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={"choices": [{"message": {"content": '{"score": 1, "detail": "ok"}'}}]}
+    )
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
+
+    body = json.loads(respx.calls[-1].request.content)
+    # THE FIELD IS ABSENT. Not smaller, not conditional: absent.
+    assert "reasoning" not in body
+    assert body["max_tokens"] == JUDGE_MAX_TOKENS
+    # And the call still works, so the stand-down costs nothing here.
+    assert out["score"] == 1
+
+
+def test_the_judge_budget_could_not_satisfy_the_pinned_minimum():
+    """WINDOW: the arithmetic itself, with no request and no mock.
+
+    The shape that was being sent, checked against the two pinned rules
+    it had to satisfy. This is the test that would have caught the
+    defect on the day it was written, because it consults the contract
+    instead of a stub.
+
+    PROVIDER_REASONING_MINIMUM is not a number this repository chose.
+    It is the vendor's, quoted beside JUDGE_MAX_TOKENS, and it is
+    written down here so that raising the judge's budget later is a
+    decision somebody makes on purpose rather than one that silently
+    re-enables an impossible request.
+    """
+    anthropic_minimum = 1024
+
+    would_have_sent = int(JUDGE_MAX_TOKENS * REASONING_BUDGET_SHARE)
+    assert would_have_sent == 256
+    # Rule one raises it.
+    effective = max(would_have_sent, anthropic_minimum)
+    assert effective == 1024
+    # Rule two then cannot be satisfied: the outer budget must be
+    # STRICTLY higher than the reasoning budget.
+    assert not JUDGE_MAX_TOKENS > effective
+
+    # What it would take to make a half-share judge reservation legal,
+    # recorded so the cost of the alternative is visible: an outer
+    # budget above twice the minimum.
+    assert 2 * anthropic_minimum > JUDGE_MAX_TOKENS
+
+
+def test_review_repro_the_judge_budget_cannot_be_satisfied_by_a_mandatory_route():
+    """WINDOW: the provider's OWN default allocation at the judge's
+    budget, computed from the pinned formula. No request and no mock.
+
+    THE GAP THIS CLOSES was named by a review: standing down proves the
+    bench sends nothing impossible, and says nothing about whether the
+    route can answer once omission hands the decision back to it. Those
+    are different questions and only the first was asked. The test above
+    checks what the bench WOULD have sent; this one checks what happens
+    when it sends nothing at all.
+
+    THE FORMULA IS THE CONTRACT'S, quoted at
+    https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    re-read 2026-08-13, under the heading "Reasoning Max Tokens for
+    Anthropic Models":
+
+      budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)
+
+    Every ratio on that ladder, applied to 512, lands under 1024 and is
+    floored to it. So on a route whose reasoning is MANDATORY, where
+    omission cannot mean "off", the provider allocates at least 1024
+    against an outer budget of 512, and the companion rule that
+    max_tokens "must be strictly higher than the reasoning budget"
+    cannot hold. Sending nothing does not rescue it.
+
+    THE LIMIT, NAMED, because that is what this can honestly do. The
+    bench's judge cannot be run on a mandatory-reasoning route at this
+    budget by any request it could make. It is not measured: no live
+    capture in this repository shows that route refusing, and proving it
+    would mean paying a mandatory-reasoning judge to fail. What is
+    asserted is that the contract's own arithmetic forbids it, and the
+    consequence is written beside JUDGE_MAX_TOKENS so a future judge
+    model is chosen knowing the constraint rather than discovering it.
+    """
+    floor = 1024
+
+    for effort, ratio in EFFORT_SHARES.items():
+        if ratio == 0.0:
+            # "none" disables reasoning entirely, so the floor does not
+            # apply and such a route is fine. It is also, by definition,
+            # not a mandatory-reasoning route.
+            continue
+        allocated = max(min(int(JUDGE_MAX_TOKENS * ratio), 128000), floor)
+        assert allocated == floor, effort
+        # And the companion rule fails for every one of them.
+        assert not JUDGE_MAX_TOKENS > allocated, effort
+
+    # THE THRESHOLD, so raising the judge's budget is a decision with a
+    # number attached rather than a guess. The previous line here was
+    # `assert not floor > floor`, which is true of every integer and
+    # proved nothing at all. What is actually wanted is the smallest
+    # budget that WOULD work, asserted as working, beside the current
+    # one asserted as not.
+    assert JUDGE_MAX_TOKENS <= floor
+    smallest_workable = floor + 1
+    assert smallest_workable > max(
+        min(int(smallest_workable * max(EFFORT_SHARES.values())), 128000), floor
+    )
+
+
+def test_review_repro_the_descriptor_claims_are_derived_once(client):
+    """WINDOW: reasoning_claims itself, one descriptor at a time, with
+    both returned booleans read.
+
+    THE DEFECT, and it reached production. mandatory short-circuited the
+    effort check, so "none" was honoured on the default_enabled side and
+    ignored on the mandatory side. The review's shape published all four
+    keys the live catalog publishes, cleared the ceiling arm, and drew
+    an 8192 token reservation for a route whose own descriptor says
+    reasoning is off.
+
+    WHY THIS TEST EXISTS BESIDE THE CATALOG TABLE. The two returns
+    overlap by construction: every effort-none contradiction also fails
+    already_reasons, so through fetch_catalog either one alone gives the
+    right verdict and neither can be mutated away and observed. The
+    catalog table proves the OUTCOME; this proves the two claims are
+    each computed, which is what makes the defence in depth real rather
+    than asserted.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: "none" is off because the page
+    says "'effort': 'none' - Disables reasoning entirely" and, of the
+    descriptor key, "If the value is 'none', treat it as 'reasoning off
+    by default'". Nothing here consults a mock.
+    """
+    for descriptor, expected, why in (
+        # THE REVIEW'S PRODUCTION-PATH SHAPE.
+        (
+            {
+                "mandatory": True,
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            (False, True),
+            "every key the live catalog publishes, and it says both",
+        ),
+        # Each contradictory shape on its own, so neither half of the
+        # invariant rides on the other.
+        (
+            {"mandatory": True, "default_effort": "none"},
+            (False, True),
+            "mandatory beside an effort of none",
+        ),
+        (
+            {"default_enabled": True, "default_effort": "none"},
+            (False, True),
+            "enabled beside an effort of none",
+        ),
+        (
+            {"mandatory": True, "default_enabled": False},
+            # STILL CLAIMS to reason, because mandatory says so; the
+            # contradiction is what vetoes it. The two returns answer
+            # different questions and this is the row where they differ,
+            # which is why they are returned as a pair rather than
+            # collapsed into one verdict here.
+            (True, True),
+            "mandatory beside enabled false",
+        ),
+        # AND THE CONTROLS, so "contradictory" is not simply always
+        # true and "already_reasons" not simply always false.
+        (
+            {"mandatory": True, "default_effort": "high"},
+            (True, False),
+            "mandatory at a real effort",
+        ),
+        (
+            {"default_enabled": True, "default_effort": "medium"},
+            (True, False),
+            "enabled at a real effort",
+        ),
+        (
+            {"mandatory": True},
+            (True, False),
+            "mandatory with no effort published at all",
+        ),
+        (
+            {"default_enabled": False},
+            (False, False),
+            "off, which is not a contradiction",
+        ),
+        ({}, (False, False), "a descriptor that answers nothing"),
+    ):
+        assert reasoning_claims(descriptor) == expected, why
+
+
+def test_no_model_name_appears_in_the_reservation_logic():
+    """WINDOW: bench/models.py as it sits on disk, parsed rather than
+    imported, so what is checked is the source a reviewer reads.
+
+    THE UNIVERSALITY CONSTRAINT, asserted rather than promised.
+
+    Exhaustion is a property of thinking against a completion cap, not
+    of one vendor, and the incident was diagnosed on one model only
+    because that is the one that was running. A fix that branched on a
+    name would protect exactly the model whose failure was noticed and
+    leave every other reasoning model exposed, while looking finished.
+
+    PARSED, NOT GREPPED, and the difference is the whole reason this
+    test is written the way it is. A grep over the source fires on the
+    pinned documentation quotes beside the constant, which say
+    "(Anthropic-style)" and "(OpenAI-style)" because that is what
+    OpenRouter's page says and a pinned quote must be verbatim. Those
+    are prose about a wire format, not a branch. What must contain no
+    vendor is the CODE, so this walks the function's AST and inspects
+    every name, attribute and string literal that can actually execute.
+
+    The vendor list is not a security boundary. It is a tripwire for one
+    specific mistake, and it names the vendors this repo's own fixtures
+    and catalogs mention.
+
+    WORD BOUNDARIES, NOT SUBSTRINGS, and the closing review is what
+    taught this. The first version asked `vendor in dumped`, and running
+    the same check across the frontend flagged "fable" inside
+    registerDiffable. That is the K1.5 defect exactly, where a tombstone
+    matched `extracted_text` inside `length(extracted_text)`, and a
+    tripwire that cries wolf is one somebody eventually deletes. The
+    scope here is one small function so nothing was actually matching,
+    but a test whose passing depends on the function staying small is
+    not the test that was wanted.
+    """
+    import ast
+    import re
+
+    source = (Path(__file__).parent.parent / "bench" / "models.py").read_text()
+    tree = ast.parse(source)
+    # THE CALL GRAPH FROM ONE ENTRY POINT, not a list of names.
+    #
+    # THIS TRIPWIRE HAS LOST ITS SCOPE TWICE. First it inspected
+    # reasoning_reservation, a dozen lines of arithmetic when it was
+    # written, which a later commit reduced to a single delegating
+    # return: every branch it guarded had moved to reservation_state and
+    # a vendor name there passed. The repair was to name three
+    # functions, and a review pointed out that the repair has the same
+    # shape as the defect: move the arithmetic into a fourth function
+    # and the husk failure mode returns, one level deeper.
+    #
+    # A NAME LIST CANNOT FIX THIS because the thing being guarded is
+    # reachability, not membership. So the scope is DERIVED: start at
+    # the entry point the payload actually calls, follow every
+    # module-level function it calls, and keep going. A helper added
+    # tomorrow is in scope the moment something in the chain calls it,
+    # and a helper nobody calls is correctly out of scope.
+    #
+    # Module-level functions only. A call to a builtin, an import or a
+    # method has no FunctionDef here to descend into, and pulling in the
+    # whole module would make this assert things about code the
+    # reservation cannot reach.
+    functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    entry = "reasoning_reservation"
+    assert entry in functions, f"bench/models.py no longer defines {entry}"
+
+    reached: dict[str, ast.AST] = {}
+    frontier = [entry]
+    while frontier:
+        name = frontier.pop()
+        if name in reached:
+            continue
+        node = functions[name]
+        reached[name] = node
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            callee = inner.func
+            # Bare calls only: an attribute call is somebody else's
+            # module and has no definition in this file to follow.
+            if isinstance(callee, ast.Name) and callee.id in functions:
+                frontier.append(callee.id)
+
+    # The chain as it stands, so a reader knows what is covered and a
+    # reviewer can see when it changes. Not an equality assertion: the
+    # point of deriving the scope is that it may legitimately grow.
+    assert {"reasoning_reservation", "reservation_state"} <= set(reached), sorted(
+        reached
+    )
+
+    body = []
+    for name in sorted(reached):
+        statements = list(reached[name].body)
+        # Drop the docstring, which is prose by definition.
+        if (
+            statements
+            and isinstance(statements[0], ast.Expr)
+            and isinstance(statements[0].value, ast.Constant)
+            and isinstance(statements[0].value.value, str)
+        ):
+            statements = statements[1:]
+        body.extend(statements)
+    assert body, "the reservation has no executable body to check"
+
+    executable = " ".join(ast.dump(node) for node in body).lower()
+    for vendor in (
+        "fable",
+        "claude",
+        "anthropic",
+        "openai",
+        "gpt",
+        "gemini",
+        "google",
+        "deepseek",
+        "qwen",
+        "llama",
+        "mistral",
+        "grok",
+    ):
+        assert not re.search(rf"(?<![a-z0-9]){vendor}(?![a-z0-9])", executable), vendor
+
+    # And the constant it reads is a plain number, not a per-model table.
+    assert isinstance(REASONING_BUDGET_SHARE, float)
+
+
+from bench.models import (  # noqa: E402
+    REASONING_SHARE_EXHAUSTED,
+    _ingest_usage,
+    empty_response_error,
+    reasoning_ate_the_output,
+)
+
+# ---- The reasoning-exhaustion fix, R2: the label says where the money
+# ---- went, and it says it because of the token shape.
+
+
+# Every case is a TOKEN SHAPE with a name describing the shape, not a
+# model. Three of them are drawn from real records and are labelled with
+# which; the rest are the boundaries of the rule. The point of the table
+# is that no row needs to know what produced it.
+EMPTY_RESPONSE_SHAPES = (
+    # (label, finish_reason, completion, reasoning, expected error)
+    #
+    # THE FIRST THREE ROWS ALL CARRIED finish_reason "length", which is
+    # how this table came to certify a label that lied. Every firing case
+    # was a real truncation, so the table could not see that the shape
+    # test fires on refusals too: at this call site there is no visible
+    # text by construction, so a refusal that thought at all has
+    # reasoning at or near completion and lands in the same bucket. The
+    # rows below the truncations are the ones that were missing.
+    (
+        "the incident, exactly equal",
+        "length",
+        21350,
+        21350,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)",
+    ),
+    (
+        "a different model, a different tier, same shape",
+        "length",
+        8192,
+        8100,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(8100 reasoning tokens)",
+    ),
+    (
+        "exactly at the threshold",
+        "length",
+        1000,
+        900,
+        "no visible answer: completion budget exhausted during reasoning "
+        "(900 reasoning tokens)",
+    ),
+    (
+        "one token under the threshold",
+        "length",
+        1000,
+        899,
+        "empty response (finish_reason: length)",
+    ),
+    (
+        "empty with no reasoning at all, the old wording kept",
+        "stop",
+        40,
+        0,
+        "empty response (finish_reason: stop)",
+    ),
+    (
+        "a provider that reported no usage",
+        "length",
+        None,
+        None,
+        "empty response (finish_reason: length)",
+    ),
+    # ---- The shape fires, the budget did NOT run out. Measured before
+    # ---- the correction: each of these was told its completion budget
+    # ---- had been exhausted, and the card appended "try extended
+    # ---- budget" on top.
+    (
+        "a content filter that thought first, 0.2% of the budget spent",
+        "content_filter",
+        37,
+        37,
+        "no visible answer: nearly all of the completion went to reasoning "
+        "(37 reasoning tokens, finish_reason: content_filter)",
+    ),
+    (
+        "a refusal that stopped clean, 1% of the budget spent",
+        "stop",
+        210,
+        198,
+        "no visible answer: nearly all of the completion went to reasoning "
+        "(198 reasoning tokens, finish_reason: stop)",
+    ),
+    (
+        "a provider abort with no reason worth the name",
+        None,
+        4,
+        4,
+        "no visible answer: nearly all of the completion went to reasoning "
+        "(4 reasoning tokens, finish_reason: unknown)",
+    ),
+    (
+        "reasoning reported but no completion count",
+        None,
+        None,
+        5000,
+        "empty response (finish_reason: unknown)",
+    ),
+)
+
+
+@pytest.mark.parametrize(
+    "shape,finish,completion,reasoning,expected",
+    EMPTY_RESPONSE_SHAPES,
+    ids=[row[0] for row in EMPTY_RESPONSE_SHAPES],
+)
+def test_review_repro_the_label_says_where_the_completion_went(
+    shape, finish, completion, reasoning, expected
+):
+    """WINDOW: the synthesized error for a 200 that carried no visible
+    text, at the moment it is composed.
+
+    THE DEFECT WAS A TRUE SENTENCE THAT MISLED. "empty response
+    (finish_reason: length)" names the symptom and omits the cause. The
+    card it appeared on had been billed $3.38 to $3.50 for 21350 tokens
+    of thinking, and nothing in the message suggested that a retry would
+    spend the same money the same way. It reads like a provider glitch.
+    It was an accounting fact.
+
+    PARAMETRIZED ON SHAPE, NOT ON A MODEL, which is the constraint this
+    whole fix is under and which this table is the demonstration of. The
+    second row is a deliberately different tier and a different pair of
+    numbers from the incident's; it is not the incident's model and the
+    rule does not know or care. The threshold rows are the boundary, one
+    on each side of it, so a change to REASONING_SHARE_EXHAUSTED cannot
+    pass unnoticed.
+
+    THREE OUTCOMES, and the middle one is a correction an adversarial
+    review forced. The shape test is close to a tautology here, because
+    this function is only reached when there was no visible text at all,
+    so any reasoning model that thought and said nothing has a ratio near
+    1.0 whatever went wrong. "Exhausted" therefore needs finish_reason
+    behind it, and without that gate a content filter that spent 0.2% of
+    its budget was told the budget was gone.
+
+    THE OLD WORDING IS KEPT, not superseded, for a genuinely empty
+    response with no thinking behind it. That is a different failure, a
+    provider returning null content, and the sentence that was already
+    there describes it correctly.
+    """
+    assert empty_response_error(finish, completion, reasoning) == expected, shape
+
+
+def test_the_shape_test_reads_only_the_two_counts():
+    """WINDOW: reasoning_ate_the_output called directly, with no
+    request, no response and no I/O anywhere in the frame.
+
+    The predicate on its own, away from the sentence it produces.
+
+    Nothing here is a request field. It cannot see the budget, the
+    reservation, the effort or the model, which is exactly what lets the
+    identical rule run on a route where the reservation was ignored: a
+    provider that drops an unknown parameter still reports its usage.
+    """
+    assert reasoning_ate_the_output(21350, 21350) is True
+    assert reasoning_ate_the_output(1000, 900) is True
+    assert reasoning_ate_the_output(1000, 899) is False
+    # Absent counts are not evidence, and zero reasoning is evidence of
+    # the opposite. Both fall out through one falsy guard.
+    assert reasoning_ate_the_output(None, None) is False
+    assert reasoning_ate_the_output(1000, None) is False
+    assert reasoning_ate_the_output(None, 1000) is False
+    assert reasoning_ate_the_output(1000, 0) is False
+    assert reasoning_ate_the_output(0, 1000) is False
+
+
+# The shapes both implementations are asked about. Boundaries on both
+# sides of the threshold, the incident, row 694, and every way a count
+# can be missing.
+CROSS_LANGUAGE_SHAPES = [
+    [21350, 21350],
+    [8500, 8000],
+    [1000, 900],
+    [1000, 899],
+    [3400, 2944],
+    [3400, 3060],
+    [500, 0],
+    [0, 0],
+    [None, None],
+    [500, None],
+    [None, 500],
+    # SMALL COMPLETIONS, and they are in this table because the first
+    # version of it did not have them and was therefore blind to the
+    # exact mutation that motivated the rewrite. A guard inserted into
+    # the JavaScript reading `if (completionTokens < 200) return false`
+    # left every row above unchanged, so the two languages disagreed on
+    # every short response while this test stayed green. Writing a
+    # better test and not re-running the mutation against it would have
+    # shipped the same hole in nicer clothing.
+    #
+    # The first two are the live probe's own numbers, which is the
+    # cheapest way to be sure a row is reachable: something really did
+    # return them.
+    [37, 37],
+    [35, 0],
+    [150, 140],
+    [199, 190],
+    [4, 4],
+    [1, 1],
+]
+
+
+def test_review_repro_the_two_languages_agree_on_every_shape():
+    """WINDOW: both implementations of the exhaustion rule, executed,
+    over one shared table.
+
+    THIS TEST USED TO BE A STRING SEARCH, and an adversarial review
+    proved it was a false guard in BOTH directions. It asserted that
+    two source lines appeared verbatim in static/lib.js.
+
+      Inserting `if (completionTokens < 200) return false;` into
+      reasoningAteTheOutput left it PASSING and the node suite passing,
+      with the two languages now disagreeing on every small response. A
+      behaviour change it could not see.
+
+      Renaming a local or rewrapping the return failed it, on
+      JavaScript whitespace, with both implementations still identical.
+      A formatting change it could not tolerate.
+
+    A guard that misses what it is for and fires on what it is not is a
+    tax that teaches people to delete it. So it runs the JavaScript now:
+    node executes lib.js against the same shapes Python is asked about,
+    and the two answer sheets are compared. Text is not consulted at
+    all.
+
+    The threshold is included in the comparison rather than asserted
+    separately, because a shared constant that drifted would show up as
+    a disagreement on the boundary rows, which is the symptom that
+    matters rather than the digit that caused it.
+    """
+    script = """
+const lib = require(process.argv[1]);
+const shapes = JSON.parse(process.argv[2]);
+process.stdout.write(JSON.stringify({
+  verdicts: shapes.map(([c, r]) => lib.reasoningAteTheOutput(c, r)),
+  threshold: lib.REASONING_SHARE_EXHAUSTED,
+}));
+"""
+    lib = Path(__file__).parent.parent / "static" / "lib.js"
+    proc = subprocess.run(
+        ["node", "-e", script, str(lib), json.dumps(CROSS_LANGUAGE_SHAPES)],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    js = json.loads(proc.stdout)
+
+    python_verdicts = [reasoning_ate_the_output(c, r) for c, r in CROSS_LANGUAGE_SHAPES]
+    assert js["verdicts"] == python_verdicts, list(
+        zip(CROSS_LANGUAGE_SHAPES, python_verdicts, js["verdicts"])
+    )
+    assert js["threshold"] == REASONING_SHARE_EXHAUSTED
+    # And the table straddles the boundary, so agreement is a fact about
+    # the rule rather than about a table that only asks easy questions.
+    assert True in python_verdicts and False in python_verdicts
+
+
+def test_review_repro_the_effort_ladder_is_one_table_in_two_languages():
+    """WINDOW: EFFORT_SHARES as each language holds it, compared entry
+    for entry.
+
+    THE DEFECT THIS GUARDS. The frontend decided whether a lower effort
+    was selectable by comparing STRINGS against one constant, so
+    "unset", "minimal" and "none" were all read as above the floor. The
+    fix compares SHARES, which needs the ladder on the frontend too, and
+    a second copy of a pinned table is a second thing to forget when the
+    page changes.
+
+    EXECUTED, NOT SEARCHED FOR, exactly as the exhaustion threshold's
+    comparison is. Reading the constant out of the JavaScript by
+    regular expression would fail on formatting and pass on a renamed
+    key.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: the ratios are the ones quoted
+    beside the Python table, from
+    https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    and the page states them as the effort_ratio values in
+    budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024).
+    """
+    proc = subprocess.run(
+        [
+            "node",
+            "-e",
+            "process.stdout.write(JSON.stringify(require(process.argv[1])"
+            ".EFFORT_SHARES))",
+            str(Path(__file__).parent.parent / "static" / "lib.js"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(proc.stdout) == EFFORT_SHARES
+    # And the floor the frontend advises against is really on it, so a
+    # lookup there cannot silently return undefined and disable the
+    # advice for everybody.
+    assert EFFORT_SHARES["low"] == 0.2
+
+
+@respx.mock
+async def test_review_repro_an_exhausted_batch_result_is_labelled(client):
+    """WINDOW: run_model's returned result, end to end from a payload
+    that looks exactly like the incident's.
+
+    SUSPENSION POINT: the await on run_model. Everything asserted here
+    is on the returned result, which run_model finishes assembling
+    before it returns, so there is no window in which the error and the
+    counts could be read half-written.
+
+    THE ORDERING THIS PROTECTS. The empty-text branch used to run BEFORE
+    _ingest_usage, so it read two Nones no matter what the provider
+    reported and could never have produced this label. Moving the
+    ingest above it is the fix; this is the test that notices if it
+    moves back. That ordering is INSIDE run_model and is not a
+    suspension question: both steps run between one await and the
+    return.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "choices": [{"message": {"content": None}, "finish_reason": "length"}],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 21350,
+                "completion_tokens_details": {"reasoning_tokens": 21350},
+            },
+        }
+    )
+
+    result = await run_model("a document question", "vendor/model", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)"
+    )
+    # And the counts the label was drawn from are on the record beside
+    # it, so a reader can check the claim rather than trust it.
+    assert result["completion_tokens"] == 21350
+    assert result["reasoning_tokens"] == 21350
+
+
+@respx.mock
+async def test_review_repro_an_exhausted_stream_is_labelled_identically(client):
+    """WINDOW: the done event of a stream that emitted reasoning deltas
+    and no content, from the first chunk to iterator exhaustion.
+
+    SUSPENSION POINT: the `async for` over aiter_lines inside
+    stream_model. The result is only complete after the final usage
+    chunk has been folded in and done() has run, so the assertion is on
+    the done event rather than on anything observable mid-iteration.
+
+    ONE FAILURE MUST NOT HAVE TWO DESCRIPTIONS. The browser uses the
+    streaming endpoint and a script uses the batch one; a label whose
+    purpose is honesty is worth nothing if it depends on which door the
+    caller came through. Both now call one function, and this asserts
+    the two produce the identical sentence.
+    """
+    body = (
+        'data: {"id":"gen-x","choices":[{"delta":{"reasoning":"thinking"}}]}\n\n'
+        'data: {"id":"gen-x","choices":[{"delta":{},"finish_reason":"length"}],'
+        '"usage":{"prompt_tokens":1200,"completion_tokens":21350,'
+        '"completion_tokens_details":{"reasoning_tokens":21350}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [event async for event in stream_model("a document question", "m", client)]
+
+    done = events[-1]
+    assert done["type"] == "done"
+    assert done["result"]["response_text"] is None
+    assert done["result"]["error"] == (
+        "no visible answer: completion budget exhausted during reasoning "
+        "(21350 reasoning tokens)"
+    )
+    # The two endpoints, one sentence.
+    assert done["result"]["error"] == empty_response_error("length", 21350, 21350)
+
+
+# ---- The reasoning-exhaustion fix, R3: one unit per surface, and every
+# ---- surface says which.
+
+
+def test_review_repro_a_cap_is_never_rendered_as_a_count():
+    """WINDOW: the card's budget badge and its token metrics, read out of
+    static/render.js.
+
+    THE PHANTOM 44K. The badge said "budget 65536" and the reasoning
+    metric said 21350. Both are numbers of tokens, nothing on the card
+    distinguished them, and 65536 minus 21350 is 44186 tokens that were
+    never generated and never billed. A reader took that difference for
+    unaccounted output and the diagnosis went the wrong way for a full
+    round. The two numbers answer different questions: one is the
+    ceiling the bench SENT, the other is what the provider COUNTED.
+
+    ASSERTED ON THE SOURCE, not through a browser, because the property
+    is that the word is present in the markup the renderer emits; the
+    browser tombstone beside this one checks that it reaches the page.
+    """
+    render = (Path(__file__).parent.parent / "static" / "render.js").read_text()
+
+    assert 'note.textContent = "budget cap " + result.max_tokens;' in render
+    # The bare form is gone, which is the half a "contains cap" assertion
+    # would miss.
+    assert '"budget " + result.max_tokens' not in render
+    # And each surface that shows a count says what the count is.
+    assert "prompt/completion tokens actually used" in render
+    assert "Not a count: compare it against tok i/o" in render
+
+
+def test_the_export_manifest_states_the_unit_once():
+    """WINDOW: the manifest note as the report module composes it,
+    read from the function rather than from a built export, so the
+    wording is checked in one place and the export test checks that it
+    arrives.
+
+    The citable artifact, whose readers were not in the room.
+
+    Every trial line carries four counts and one ceiling side by side.
+    prompt_tokens next to max_tokens invites precisely the subtraction
+    that manufactured the phantom above, and an export outlives the
+    conversation that produced it.
+
+    ONCE, in the manifest, because it is a property of the format rather
+    than of any run: a note stamped on every trial line is one a reader
+    stops seeing by line three.
+    """
+    from bench.report import _manifest_token_note
+
+    # The note names every count field and singles out the one field on
+    # the trial line that is not a count.
+    for field in (
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+    ):
+        assert field in _manifest_token_note()
+    assert "max_tokens is not a count" in _manifest_token_note()
+    assert "model's own tokenizer" in _manifest_token_note()
+
+
+def test_the_stored_counts_have_exactly_one_source():
+    """WINDOW: store.RECONCILABLE_COLUMNS at import time, which is the
+    list that decides what a reconcile pass is allowed to write.
+
+    THE AUDIT'S CENTRAL FINDING, asserted so it cannot quietly stop
+    being true.
+
+    One unit per surface is only enforceable if there is one place the
+    unit is decided. Every count the bench stores enters through
+    _ingest_usage, reading OpenRouter's usage object, which the
+    usage-accounting page describes as "Prompt and completion token
+    counts using the model's native tokenizer". The generation
+    endpoint's counts are parsed by _generation_record and never
+    persisted, because RECONCILABLE_COLUMNS does not list them, so they
+    cannot become a second unit in the database by accident.
+
+    This walks the store's reconcilable list rather than trusting the
+    comment beside it: a future entry that added a token column would
+    put two counts per result on one row, and that is the shape this
+    workstream exists to prevent.
+    """
+    from bench.store import RECONCILABLE_COLUMNS
+
+    for column in RECONCILABLE_COLUMNS:
+        assert "token" not in column, column
+
+
+# ---- A1's live probe, replayed. The two usage blocks below are real
+# ---- wire bytes, not a hand-built shape, which is why they get their
+# ---- own fixture and their own test rather than a paragraph in a
+# ---- commit body nobody can execute.
+
+PROBE = json.loads(
+    (Path(__file__).parent / "fixtures" / "probe_reasoning_enable.json").read_text()
+)
+
+
+def test_review_repro_a_bare_cap_enables_thinking_on_a_model_that_had_it_off():
+    """WINDOW: the two usage objects of a matched pair of live calls,
+    fed through the bench's own ingest.
+
+    THE CLAIM THIS SETTLES. The gate in fetch_catalog refuses to send an
+    unprompted reasoning cap to a model whose catalog entry says
+    thinking is off. That gate was built on a schema comment, "Default:
+    inferred from 'effort' or 'max_tokens'", which is an inference about
+    what OpenRouter does with a field. Inferences about other people's
+    systems are exactly what this repo requires to be pinned, and a
+    pinned quote is still not a measurement.
+
+    IT IS A MEASUREMENT NOW. Two calls to google/gemma-4-31b-it on
+    DeepInfra, 2026-08-12, differing in nothing but the presence of
+    reasoning.max_tokens:
+
+      gen-1786546333-86V1vJMk7JsWwwPhajoN  no field   0 reasoning tokens
+      gen-1786546398-Z4GhaMYohdT9FWGFiYhc  cap 256  312 reasoning tokens
+
+    The model publishes mandatory false and default_enabled false. It
+    was not thinking. The cap alone made it think, and billed 8.1 times
+    as much for the same question.
+
+    REPLAYED THROUGH _ingest_usage rather than asserted as arithmetic on
+    the JSON, so this also proves the bench reads these real blocks the
+    way the fix assumes it does. A synthetic fixture cannot do that;
+    every stub in this suite was written by someone who already believed
+    the shape.
+    """
+    control: dict = {}
+    capped: dict = {}
+    _ingest_usage(control, PROBE["control"]["usage"])
+    _ingest_usage(capped, PROBE["capped"]["usage"])
+
+    # The model was not thinking.
+    assert control["reasoning_tokens"] == 0
+    # The cap alone made it think.
+    assert capped["reasoning_tokens"] == 312
+    # And it is not a rounding: 92% of the completion went to reasoning.
+    assert capped["reasoning_tokens"] / capped["completion_tokens"] > 0.9
+
+    # THE COST OF HAVING SHIPPED THIS UNGATED, on one short question.
+    ratio = capped["billed_cost_usd"] / control["billed_cost_usd"]
+    assert 8.0 < ratio < 8.2, ratio
+
+
+def test_the_probes_capped_response_clears_the_exhaustion_threshold():
+    """WINDOW: the same two blocks, read by the shape test that drives
+    the card's label and its indicator.
+
+    A REAL RESPONSE ON THE RIGHT SIDE OF THE LINE. Every other case
+    exercising REASONING_SHARE_EXHAUSTED in this suite is a number
+    somebody chose. This one came off the wire at 312 of 338, and it
+    clears nine tenths, which is the first evidence that the threshold
+    is reachable by an ordinary short answer from an ordinary model
+    rather than only by a $3.50 document prompt.
+
+    AND ITS finish_reason IS "stop", NOT "length", which is precisely
+    the distinction A2 was corrected to make. Nothing was truncated
+    here; the budget did not run out. A label built on the token shape
+    alone would have told this run its completion budget was exhausted.
+    """
+    assert reasoning_ate_the_output(338, 312) is True
+    assert PROBE["capped"]["_finish_reason"] == "stop"
+    # So the honest sentence is the one without the causal claim, and no
+    # budget remedy is offered for a run whose budget was never the
+    # constraint.
+    assert empty_response_error("stop", 338, 312) == (
+        "no visible answer: nearly all of the completion went to reasoning "
+        "(312 reasoning tokens, finish_reason: stop)"
+    )
+    # The control is nowhere near it, which is the other half.
+    assert reasoning_ate_the_output(35, 0) is False
+
+
+def test_review_repro_a_non_byok_run_reports_an_upstream_cost():
+    """WINDOW: the cost_details of both probe calls, and the column the
+    bench derives from them.
+
+    AN UNDOCUMENTED SHAPE THE PROBE CAUGHT IN PASSING. OpenRouter's
+    usage-accounting page says upstream_inference_cost "is only
+    available for BYOK (Bring Your Own Key) requests. For all other
+    requests it will be 0 or null." Both probe calls carry
+    is_byok false AND a nonzero upstream_inference_cost, equal to cost
+    to the last digit, alongside two fields the page does not mention at
+    all: upstream_inference_prompt_cost and
+    upstream_inference_completions_cost.
+
+    WHAT IT COSTS THE BENCH. _as_upstream_cost degrades only a zero or
+    absent value to None, so a value like this one is STORED, and the
+    README's claim that a NULL there is "the honest record of this run
+    was not BYOK" does not hold on this route: the column is populated
+    for a run that was not BYOK. The number is also not the separate
+    provider bill the column exists to hold; it is the credit charge
+    repeated.
+
+    NOT FIXED HERE, deliberately. Gating the column on is_byok is a
+    behaviour change to the money record and it is the reviewer's call,
+    not a thing to slip into a test-writing pass. What this test does is
+    stop the shape being rediscovered: it pins what the wire actually
+    sent, so the decision is made against evidence whenever it is made.
+    """
+    for kind in ("control", "capped"):
+        usage = PROBE[kind]["usage"]
+        assert usage["is_byok"] is False, kind
+        upstream = usage["cost_details"]["upstream_inference_cost"]
+        assert upstream > 0, kind
+        # Not a second, independent figure. The same charge again.
+        assert upstream == usage["cost"], kind
+
+    # And the bench stores it, which is the part that matters.
+    result: dict = {}
+    _ingest_usage(result, PROBE["capped"]["usage"])
+    assert result["upstream_inference_cost_usd"] is not None
+
+
+# ---- T3: a strict pin selects one endpoint, and only that endpoint's
+# ---- published capabilities may vouch for the field sent to it.
+
+from bench.models import (  # noqa: E402
+    ENDPOINTS_URL,
+    endpoint_completion_cap,
+    endpoint_supports_reasoning,
+    fetch_endpoints,
+)
+
+
+@respx.mock
+async def test_review_repro_a_pinned_endpoint_is_not_vouched_for_by_the_aggregate(
+    client,
+):
+    """WINDOW: the endpoint listing for one model, read the way a strict
+    pin reads it.
+
+    SUSPENSION POINT: the await on fetch_endpoints. Everything asserted
+    is on the returned listing, which is fully assembled before the
+    coroutine returns.
+
+    THE DEFECT. A strict pin sends order plus allow_fallbacks false plus
+    require_parameters true, which selects ONE host and forbids it from
+    ignoring a parameter it does not support. The bench decided whether
+    to send the reasoning field from the MODEL-level catalog, which is a
+    union across every host that serves the model. A union can advertise
+    what the pinned host does not accept, and under require_parameters
+    that does not degrade into a silent ignore: it empties the provider
+    pool.
+
+    MEASURED, not imagined. On 2026-08-12 one real model published three
+    endpoints advertising 18, 12 and 17 parameters, differing in which.
+    The shape below is that shape: an aggregate that lists reasoning,
+    and a pinned endpoint that does not.
+
+    ASSERTED AGAINST THE PINNED CONTRACT, not against a mock's
+    willingness to answer: the question is what the LISTING says, and a
+    200 proves only that something replied.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    # The generous host. A model-level aggregate is the
+                    # union, so it would say "reasoning supported".
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "supported_parameters": ["max_tokens", "reasoning", "seed"],
+                    },
+                    # The pinned host, which does not take the field.
+                    {
+                        "provider_name": "BaseTen",
+                        "tag": "baseten",
+                        "supported_parameters": ["max_tokens", "temperature"],
+                    },
+                    # A host that published no list at all.
+                    {"provider_name": "Together", "tag": "together"},
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is True
+
+    # THE WHOLE POINT: one model, two endpoints, opposite answers.
+    assert endpoint_supports_reasoning(listing, "deepinfra") is True
+    assert endpoint_supports_reasoning(listing, "baseten") is False
+    # THE PIN is normalized, which is the only normalization left in
+    # this comparison. It used to say "so a pin recorded lowercase finds
+    # a provider_name that is not", and the matcher stopped reading
+    # provider_name when a pin began matching the endpoint's published
+    # tag. What this asserts now is that a pin typed with capitals still
+    # reaches the tag "deepinfra".
+    assert endpoint_supports_reasoning(listing, "DeepInfra") is True
+
+    # THREE-VALUED, and the None cases are the ones strict mode must not
+    # collapse into support.
+    assert endpoint_supports_reasoning(listing, "together") is None
+    assert endpoint_supports_reasoning(listing, "novita") is None
+    assert endpoint_supports_reasoning(listing, None) is None
+
+
+@respx.mock
+async def test_review_repro_a_pin_names_a_provider_not_an_endpoint(client):
+    """WINDOW: one endpoint listing in which the pinned provider appears
+    TWICE with different capabilities, read by both endpoint readers.
+
+    SUSPENSION POINT: the await on fetch_endpoints. Both readers run on
+    the returned listing, after it is fully assembled.
+
+    THE DEFECT, and it is one defect in two functions. A pin is a
+    provider slug. A provider may serve one model from several
+    endpoints, and those endpoints may differ in what they take and in
+    how much they will write. Both readers stopped at the first match,
+    so the answer depended on listing order, which is the router's
+    business and not the bench's.
+
+    MEASURED, not imagined. On 2026-08-13 openai/gpt-oss-120b published
+    twenty endpoints, of which DeepInfra was two (16384 and 131072) and
+    Amazon Bedrock was two. The shape below is that shape.
+
+    BOTH READERS FAIL CLOSED, in the direction that costs least. The
+    parameter reader requires EVERY matching endpoint to advertise the
+    field, because sending it to the one that does not empties the
+    provider pool under require_parameters. The cap reader takes the
+    LOWEST published ceiling, because the request must fit whichever
+    endpoint the router picks.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: max_completion_tokens and
+    supported_parameters are both fields of the endpoint object
+    documented at https://openrouter.ai/docs/api/api-reference/
+    endpoints/list-all-endpoints-for-a-model, read 2026-08-13, and what
+    decides each answer is their published values, not the mock's 200.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    # The generous one, and it is FIRST so that a reader
+                    # stopping at the first match answers with it.
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 131072,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    # The same provider, one eighth the ceiling.
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 16384,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    # A second provider, also twice, and this one
+                    # disagrees with itself about the parameter.
+                    #
+                    # ITS TWO TAGS CARRY A VARIANT SUFFIX, which is the
+                    # ordinary live shape rather than a corner: of the
+                    # twenty endpoints measured, most tags looked like
+                    # "coreweave/fp4", "mancer/fp8" or
+                    # "amazon-bedrock/eu-west-1". Both halves of one
+                    # provider must resolve to the same slug, and until
+                    # this fixture carried a suffix the whole suite
+                    # passed with the split removed.
+                    {
+                        "provider_name": "Amazon Bedrock",
+                        "tag": "amazon-bedrock",
+                        "max_completion_tokens": 8192,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    {
+                        "provider_name": "Amazon Bedrock",
+                        "tag": "amazon-bedrock/eu-west-1",
+                        "max_completion_tokens": 8192,
+                        "supported_parameters": ["max_tokens"],
+                    },
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is True
+
+    # THE CAP: the lowest the provider publishes, never the first.
+    assert endpoint_completion_cap(listing, "deepinfra") == 16384
+    assert endpoint_completion_cap(listing, "amazon-bedrock") == 8192
+    # A pin nothing matches learns no ceiling, which is not a ceiling of
+    # zero and not a refusal.
+    assert endpoint_completion_cap(listing, "groq") is None
+    assert endpoint_completion_cap(listing, None) is None
+
+    # THE PARAMETER: every matching endpoint must vouch. DeepInfra's two
+    # agree, so it is True; Bedrock's two do not, so the pin that could
+    # land on either is False.
+    assert endpoint_supports_reasoning(listing, "deepinfra") is True
+    assert endpoint_supports_reasoning(listing, "amazon-bedrock") is False
+    # THE VARIANT IS NOT A DIFFERENT PROVIDER. Both Bedrock rows answer
+    # to one pin, so the disagreeing one is reachable; reading the tag
+    # whole would make "amazon-bedrock/eu-west-1" its own slug that no
+    # pin names, the cap 8192 would come from one endpoint instead of
+    # two, and the parameter answer would flip to True from the only
+    # remaining match.
+    assert [e["slug"] for e in listing["endpoints"]] == [
+        "deepinfra",
+        "deepinfra",
+        "amazon-bedrock",
+        "amazon-bedrock",
+    ]
+    # Reading only the first match would have said True here, from an
+    # endpoint the request may never reach.
+    assert listing["endpoints"][2]["supported_parameters"] == [
+        "max_tokens",
+        "reasoning",
+    ]
+
+
+@respx.mock
+async def test_an_endpoint_cap_that_is_not_a_ceiling_is_absent(client):
+    """WINDOW: fetch_endpoints' coercion of max_completion_tokens, over
+    every published value that is not a ceiling.
+
+    SUSPENSION POINT: the await on fetch_endpoints, once. The assertions
+    read the returned listing.
+
+    WHY true IS THE INTERESTING ONE. isinstance(True, int) is true in
+    Python, so a provider publishing a boolean would become a ceiling of
+    1 and clamp every request on that route to a single token: a
+    silently ruined run rather than a visible error. Zero and negatives
+    are not ceilings, and a float or a numeric string is a value
+    somebody would have to guess the meaning of.
+
+    The model-level reader has carried this rule since the catalog
+    gained a clamp; the endpoint reader now shares the same function, so
+    the two cannot drift.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {"provider_name": "A", "tag": "a", "max_completion_tokens": True},
+                    {"provider_name": "B", "tag": "b", "max_completion_tokens": 0},
+                    {"provider_name": "C", "tag": "c", "max_completion_tokens": -1},
+                    {"provider_name": "D", "tag": "d", "max_completion_tokens": 8192.0},
+                    {"provider_name": "E", "tag": "e", "max_completion_tokens": "8192"},
+                    {"provider_name": "F", "tag": "f"},
+                    {"provider_name": "G", "tag": "g", "max_completion_tokens": 8192},
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+
+    for slug in ("a", "b", "c", "d", "e", "f"):
+        assert endpoint_completion_cap(listing, slug) is None, slug
+    # And the control, so the six Nones above are not six ways of
+    # reading a parser that never returns anything.
+    assert endpoint_completion_cap(listing, "g") == 8192
+
+
+@respx.mock
+async def test_an_unfetchable_endpoint_listing_is_absence_of_evidence(client):
+    """WINDOW: fetch_endpoints against every way the listing can fail to
+    answer.
+
+    SUSPENSION POINT: the await on fetch_endpoints, once per shape.
+
+    Strict mode's rule is that absence of evidence is refused rather
+    than assumed, and the caller can only apply it if this function
+    reports the difference. fetched False is not an empty listing and
+    must never read as one.
+    """
+    url = ENDPOINTS_URL.format(model="vendor/model")
+
+    for shape, route in (
+        ("a 404, which is what an unknown model returns", lambda: httpx.Response(404)),
+        ("a 500", lambda: httpx.Response(500)),
+        ("a body that is not JSON", lambda: httpx.Response(200, text="nope")),
+        ("JSON without the data key", lambda: httpx.Response(200, json={})),
+        (
+            "data without endpoints",
+            lambda: httpx.Response(200, json={"data": {"id": "x"}}),
+        ),
+        (
+            "endpoints that is not a list",
+            lambda: httpx.Response(200, json={"data": {"endpoints": "nope"}}),
+        ),
+    ):
+        respx.get(url).mock(side_effect=lambda request, r=route: r())
+        listing = await fetch_endpoints(client, "vendor/model")
+        assert listing["fetched"] is False, shape
+        # And the decision made from it is "cannot tell", never False,
+        # so a caller that distinguishes them still can.
+        assert endpoint_supports_reasoning(listing, "deepinfra") is None, shape
+
+    # A transport failure is the same answer.
+    respx.get(url).mock(side_effect=httpx.ConnectError("down"))
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is False
+
+
+# ---- Probe two, replayed. The contract contradicts itself about which
+# ---- models take a token budget, so the contradiction was measured on
+# ---- the incident's own model rather than argued about further.
+
+CAP_PROBE = json.loads(
+    (
+        Path(__file__).parent / "fixtures" / "probe_reasoning_cap_binding.json"
+    ).read_text()
+)
+
+
+def test_review_repro_a_cap_on_a_mandatory_route_neither_enabled_nor_was_refused():
+    """WINDOW: the two generation records of a matched pair of live
+    calls, read as the gate's no-harm arithmetic reads them.
+
+    THE QUESTION. anthropic/claude-fable-5 publishes mandatory true and
+    default_effort high but no supports_max_tokens. The contract's prose
+    says its family takes reasoning.max_tokens; the per-model flag says
+    otherwise. The gate refuses to pick a side and instead admits the
+    model only because a cap provably cannot enable or intensify its
+    thinking. This is that claim, measured.
+
+    THE THIRD BRANCH. The cap was ACCEPTED, status 200, no error, and
+    NEITHER call produced a reasoning token. So on this route the field
+    is neither honoured as a binding budget nor rejected: it is simply
+    taken and nothing changes. That is precisely the "ignored outright"
+    row of the extension's table, and it is the row that makes the
+    extension safe.
+
+    WHAT THIS DELIBERATELY DOES NOT CLAIM is asserted below as well as
+    said, because an unmeasured thing recorded as measured is worse than
+    an untested one. There was no thinking to bound, so clamping is
+    UNMEASURED.
+    """
+    control = CAP_PROBE["control"]["generation_record"]
+    capped = CAP_PROBE["capped"]["generation_record"]
+
+    # ACCEPTED: a rejected request has no generation record with a
+    # normal stop in it.
+    assert capped["finish_reason"] == "stop"
+    assert capped["native_finish_reason"] == "end_turn"
+
+    # NOT ENABLED, which is the half the gate's extension rests on.
+    assert control["native_tokens_reasoning"] == 0
+    assert capped["native_tokens_reasoning"] == 0
+
+    # NOT INTENSIFIED, and not made more expensive: the capped call was
+    # very slightly cheaper, which is noise on a 70 token answer and is
+    # asserted as "no increase" rather than as a direction.
+    assert capped["total_cost"] <= control["total_cost"]
+
+    # AND THE CLAMP IS UNMEASURED. Asserted rather than merely written
+    # in prose: with zero reasoning tokens on both sides there is no
+    # observation of a bound, and a later reader must not mistake this
+    # fixture for one.
+    assert control["native_tokens_reasoning"] == capped["native_tokens_reasoning"] == 0
+    assert "UNMEASURED" in CAP_PROBE["_what_this_does_NOT_prove"]
+
+
+def test_mandatory_reasoning_does_not_mean_reasoning_happened():
+    """WINDOW: the same two records, read against the catalog flag that
+    describes the model.
+
+    A CORRECTION TO A READING THIS BRANCH RELIED ON. The gate treats
+    mandatory true as "thinking is unconditionally on", and uses that to
+    argue enable-harm is impossible. The argument survives, because a
+    cap cannot enable thinking that is already on AND cannot enable
+    thinking that does not happen. But the premise as stated was too
+    strong: this model is mandatory, and on this route with this prompt
+    it produced zero reasoning tokens, twice.
+
+    mandatory describes what the OPERATOR may not turn off, not what the
+    model will do on any given request. Reasoning is route and prompt
+    dependent, and a trivial question gets a direct answer.
+    """
+    for side in ("control", "capped"):
+        assert CAP_PROBE[side]["generation_record"]["native_tokens_reasoning"] == 0
+    # The descriptor that says mandatory is recorded beside the result
+    # that contradicts the naive reading of it.
+    assert "mandatory true" in CAP_PROBE["_descriptor"]
+
+
+def test_review_repro_the_upstream_figure_is_route_dependent_not_byok_dependent():
+    """WINDOW: the cost_details of BOTH probes, side by side.
+
+    THE STRONGEST EVIDENCE YET FOR SPLITTING is_byok INTO ITS OWN
+    COLUMN, and it arrived by accident. Two non-BYOK runs, two different
+    answers for the same field:
+
+      probe one, DeepInfra   is_byok false, upstream 1.3182e-04,
+                             equal to the credit charge
+      probe two, Bedrock     is_byok false, upstream 0
+
+    So a populated upstream_inference_cost does not mean BYOK, and an
+    upstream of zero does not mean non-BYOK either: it means this route
+    reported zero. The value is route dependent and carries no
+    information about billing mode at all.
+
+    That is why the discriminator had to stop living inside the value.
+    A reader holding one number cannot tell which of these two runs they
+    have; a reader holding the number AND is_byok can.
+    """
+    from bench.models import _as_upstream_cost
+
+    bedrock = CAP_PROBE["capped"]["generation_record"]
+    assert bedrock["is_byok"] is False
+    assert bedrock["upstream_inference_cost"] == 0
+
+    deepinfra = PROBE["capped"]["usage"]
+    assert deepinfra["is_byok"] is False
+    assert deepinfra["cost_details"]["upstream_inference_cost"] > 0
+
+    # Both are stored as received, so the database disagrees with
+    # neither wire, and the zero is a zero rather than a NULL.
+    assert _as_upstream_cost({"upstream_inference_cost": 0}) == "0"
+    assert _as_upstream_cost(deepinfra["cost_details"]) == "0.00013182"
+
+
+def test_the_native_and_normalized_counts_really_do_differ():
+    """WINDOW: one generation record, comparing the two count families
+    it publishes for the same completion.
+
+    R3 ARGUED THIS FROM DOCUMENTATION and here it is on the wire. The
+    generation endpoint returns tokens_completion beside
+    native_tokens_completion for one identical response, and they are
+    not the same number: 65 against 71 on the control, 62 against 66 on
+    the capped call, roughly a 9% and 6% divergence.
+
+    That is the whole reason the units audit insisted on one unit per
+    surface. Everything the bench stores is the NATIVE family, which is
+    also the family OpenRouter prices on, and a reader who mixed the two
+    would be out by that margin on every row.
+    """
+    for side in ("control", "capped"):
+        rec = CAP_PROBE[side]["generation_record"]
+        assert rec["native_tokens_completion"] != rec["tokens_completion"], side
+        assert rec["native_tokens_completion"] > rec["tokens_completion"], side
+    control = CAP_PROBE["control"]["generation_record"]
+    assert (control["native_tokens_completion"], control["tokens_completion"]) == (
+        71,
+        65,
+    )
+
+
+# ---- T4: the flag crosses every surface as a boolean, or as null.
+
+from bench.models import as_flag, as_wire_flag  # noqa: E402
+
+
+def test_as_flag_keeps_three_states_and_refuses_to_guess():
+    """WINDOW: the shared rule, with no database and no wire.
+
+    ONE RULE FOR THE WRITE AND THE READ. SQLite has no boolean, so a
+    flag column round-trips as an int unless something converts it, and
+    the conversion has to be identical on both sides or the two
+    disagree.
+
+    bool() would be the obvious implementation and it is wrong twice: it
+    turns None into False, collapsing "not reported" into "reported as
+    no", and it turns the string 'yes' into True, which is a claim the
+    wire never made.
+    """
+    assert as_flag(True) is True
+    assert as_flag(False) is False
+    # What SQLite hands back.
+    assert as_flag(1) is True
+    assert as_flag(0) is False
+    # Absence stays absence.
+    assert as_flag(None) is None
+    # And anything else degrades rather than being guessed at.
+    for junk in ("yes", "true", "", 2, -1, 1.0, [], {}):
+        assert as_flag(junk) is None, junk
+
+
+def test_review_repro_a_document_with_booleans_is_not_decoded_like_a_cell():
+    """WINDOW: the two flag decoders, side by side, over the one value
+    that separates them.
+
+    THE DEFECT. as_flag exists because SQLite has no boolean and a cell
+    round-trips as 1, 0 or NULL. fetch_generation reached for it to
+    parse a JSON body, which does have booleans, so the two external
+    doors disagreed about the identical wire value: the in-band usage
+    object turned {"is_byok": 1} into None while the generation endpoint
+    turned it into True.
+
+    WHY THE NARROW READING IS THE RIGHT ONE FOR A DOCUMENT. A provider
+    sending 1 where its own schema says true is a provider disagreeing
+    with its contract, and this repository's rule for that is to record
+    "not reported" rather than to guess which of the two it meant. The
+    storage layer has no such option: decode its integers or nothing
+    round-trips at all.
+
+    ASSERTED AGAINST THE PINNED CONTRACT, which types the field as a
+    boolean. usage.is_byok appears as `"is_byok": false` in the pinned
+    example at
+    https://openrouter.ai/docs/use-cases/usage-accounting, read
+    2026-08-04, and the generation record carries it at the top level of
+    data; both are booleans, neither is an integer.
+    """
+    # The two agree everywhere the contract is honoured.
+    for value in (True, False, None, "yes", 2, 1.0, [], {}):
+        assert as_flag(value) is as_wire_flag(value), value
+
+    # And they part exactly where the storage layer's necessity is not
+    # the document's.
+    assert as_flag(1) is True
+    assert as_flag(0) is False
+    assert as_wire_flag(1) is None
+    assert as_wire_flag(0) is None
+
+    # THE IN-BAND DOOR, exercised through the function rather than
+    # through the decoder it happens to call. Asserting that two
+    # decoders differ proves nothing about which one a caller reaches
+    # for, and reaching for the wrong one WAS the defect.
+    #
+    # ONE DOOR, NOT BOTH, and this comment used to claim both. The
+    # generation endpoint's call site is covered by
+    # test_review_repro_the_generation_record_parses_the_flag_it_documents,
+    # which drives fetch_generation with the same integers; nothing
+    # here touches it. A mutation swapping THAT site back to as_flag
+    # fails there and not in this test.
+    #
+    # The in-band door, exercised through the function itself rather
+    # than through the decoder it happens to call.
+    for wire, expected in ((True, True), (False, False), (1, None), (0, None)):
+        result: dict[str, object] = {}
+        _ingest_usage(result, {"is_byok": wire})
+        assert result["is_byok"] is expected, wire
+
+
+@respx.mock
+async def test_review_repro_the_generation_record_parses_the_flag_it_documents(client):
+    """WINDOW: fetch_generation's returned record, over every shape the
+    endpoint can put the flag in.
+
+    SUSPENSION POINT: the await on fetch_generation, once per shape.
+    Every assertion is on the returned record.
+
+    THE DEFECT. The record dict declared "is_byok": None and the parse
+    block never assigned it, so every reconciled row learned None
+    forever. The comment directly above the parse quoted the pinned
+    example as carrying "is_byok": false beside the figure it did read,
+    which is the fetched-and-dropped shape this repository already names
+    one step later in RECONCILABLE_COLUMNS.
+
+    THE ENDPOINT PUTS IT AT THE TOP LEVEL of data, unlike the streaming
+    usage object which nests the cost figure under cost_details. Reading
+    the wrong level would return None for every row and look exactly
+    like the defect.
+    """
+    for body, expected in (
+        ({"data": {"is_byok": True}}, True),
+        ({"data": {"is_byok": False}}, False),
+        # Absent is not false.
+        ({"data": {}}, None),
+        # And a non-bool is not a guess. The integer is the one that
+        # regressed: as_flag accepted it, so this endpoint answered True
+        # to a value the in-band parse answered None to.
+        ({"data": {"is_byok": "yes"}}, None),
+        ({"data": {"is_byok": 1}}, None),
+        ({"data": {"is_byok": 0}}, None),
+        # Nested where the usage object puts its figure, which is the
+        # wrong level: reading there must not find it.
+        ({"data": {"cost_details": {"is_byok": True}}}, None),
+    ):
+        respx.get(GENERATION_URL).respond(json=body)
+        record = await fetch_generation(client, "gen-x")
+        assert record["is_byok"] is expected, body
+
+
+# ---- One arithmetic rule, two instances: the judge's small budget and
+# ---- a per-model clamp reach the same wall from opposite directions.
+
+from bench.models import (  # noqa: E402
+    PROVIDER_REASONING_MINIMUM,
+    RESERVATION_EFFORT_DECLARED,
+    RESERVATION_NO_ROOM_ABOVE_FLOOR,
+    RESERVATION_NOT_VOUCHED,
+    RESERVATION_RIDES,
+    RESERVATION_SPLIT_BELOW_FLOOR,
+    reservation_reason,
+    reservation_state,
+)
+
+# Every budget is checked against the CONTRACT, not against what a mock
+# would accept. A mock returns 200 for any cap, which is exactly how the
+# judge shipped an impossible request.
+# WRITTEN OUT BY HAND, WHICH IS THE WHOLE REPAIR. The version this
+# replaces computed its expectation with
+#
+#   want < PROVIDER_REASONING_MINIMUM or budget <= max(want, MINIMUM)
+#
+# which is the implementation's own condition, character for character,
+# so the test passed by construction and would have gone on passing
+# through any change that kept the two in step. A review named it: "the
+# passing property test merely restates the implementation."
+#
+# Each state below is derived from the two pinned rules by reading them,
+# not by running the code. Both rules are quoted beside
+# PROVIDER_REASONING_MINIMUM and both sit under the heading "Reasoning
+# Max Tokens for Anthropic Models", re-read 2026-08-13.
+#
+#   at or below 1024   the outer budget is not strictly above the floor,
+#                      so no pair of numbers satisfies the contract
+#   1025 to 2047       the floor fits under the outer budget, but half
+#                      of the outer budget does not reach the floor, so
+#                      the request would be honoured and the SPLIT would
+#                      not be
+#   2048 and above     half the budget is at or above the floor and the
+#                      budget is strictly greater, so both rules hold
+RESERVATION_STATES = [
+    (1, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (512, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1023, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1024, RESERVATION_NO_ROOM_ABOVE_FLOOR),
+    (1025, RESERVATION_SPLIT_BELOW_FLOOR),
+    (1200, RESERVATION_SPLIT_BELOW_FLOOR),
+    (1536, RESERVATION_SPLIT_BELOW_FLOOR),
+    (2047, RESERVATION_SPLIT_BELOW_FLOOR),
+    (2048, RESERVATION_RIDES),
+    (4096, RESERVATION_RIDES),
+    (16384, RESERVATION_RIDES),
+    (65536, RESERVATION_RIDES),
+]
+RESERVATION_BUDGETS = [budget for budget, _ in RESERVATION_STATES]
+
+
+@pytest.mark.parametrize("budget,expected", RESERVATION_STATES)
+def test_review_repro_the_reservation_states_are_not_one_state(budget, expected):
+    """WINDOW: reservation_state and reasoning_reservation at one
+    budget, read together.
+
+    THE DEFECT WAS TWO DEFECTS. The code answered "cannot be satisfied"
+    to two different facts, and the test that checked it asserted the
+    code's own arithmetic back at itself.
+
+    A budget of 1200 is the case that separates them. A half share asks
+    for 600, which is under the floor, so the intended split cannot be
+    honoured. But 1200 IS strictly above 1024, so a request naming the
+    floor would be accepted: the pair is satisfiable and the SPLIT is
+    not. Calling that "unsatisfiable" is false, and it is the word an
+    operator would have been given.
+
+    ASSERTED AGAINST THE PINNED RULES, not against the implementation
+    and not against a mock, which could not refuse any of these. The
+    expected state for each budget is written out above from the two
+    quoted sentences; nothing here recomputes it.
+    """
+    assert reservation_state(budget, None, True) == expected
+    sent = reasoning_reservation(budget, None, True)
+
+    if expected is not RESERVATION_RIDES:
+        assert sent == {}
+        # A stand-down is a fact with numbers in it, not a silence.
+        reason = reservation_reason(expected, budget)
+        assert reason is not None
+        assert str(budget) in reason
+        assert str(PROVIDER_REASONING_MINIMUM) in reason
+        return
+
+    asked = sent["reasoning"]["max_tokens"]
+    # RULE ONE: "used directly with a minimum of 1024 tokens", so the
+    # request must not be silently enlarged past what was asked.
+    assert asked >= PROVIDER_REASONING_MINIMUM, budget
+    assert max(asked, PROVIDER_REASONING_MINIMUM) == asked, budget
+    # RULE TWO: "max_tokens must be strictly higher than the reasoning
+    # budget", so there is room for an answer after the thinking.
+    assert budget > asked, budget
+    # And nothing rode with a reason attached, which is what makes the
+    # reason assertions above mean something.
+    assert reservation_reason(expected, budget) is None
+
+
+def test_the_other_two_states_are_reachable_and_named():
+    """WINDOW: reservation_state at the two entries that never look at
+    the arithmetic at all.
+
+    FIVE STATES, NOT THREE. The arithmetic table above cannot reach
+    these two, and a vocabulary with unreachable members is a
+    vocabulary nobody can trust to be complete. Both are asserted at a
+    budget where the arithmetic would otherwise have said rides, so
+    each is shown to WIN rather than merely to coincide.
+    """
+    generous = 65536
+    assert reservation_state(generous, None, True) == RESERVATION_RIDES
+
+    assert reservation_state(generous, None, False) == RESERVATION_NOT_VOUCHED
+    assert (
+        reservation_state(generous, {"effort": "low"}, True)
+        == RESERVATION_EFFORT_DECLARED
+    )
+    # Order matters and is asserted: an unvouched route with a declared
+    # effort is unvouched, because a declaration cannot authorize a
+    # field the route was never cleared for.
+    assert (
+        reservation_state(generous, {"effort": "low"}, False) == RESERVATION_NOT_VOUCHED
+    )
+    for state in (RESERVATION_NOT_VOUCHED, RESERVATION_EFFORT_DECLARED):
+        assert reservation_reason(state, generous) is not None
+
+
+def test_the_boundary_is_where_the_arithmetic_says_it_is():
+    """WINDOW: the two budgets on either side of the pinned minimum.
+
+    The recon that found this named 1024 as the boundary case; the
+    arithmetic puts the actual edge at twice the minimum, because the
+    share is a half. Both sides are asserted so a change to either the
+    share or the minimum moves this test rather than passing quietly.
+    """
+    edge = 2 * PROVIDER_REASONING_MINIMUM
+    assert reasoning_reservation(edge - 1, None, True) == {}
+    assert reasoning_reservation(edge, None, True) == {
+        "reasoning": {"max_tokens": PROVIDER_REASONING_MINIMUM}
+    }
+    # The two sides are different STATES and not merely different
+    # payloads, which is what a reader of the stand-down needs.
+    assert reservation_state(edge - 1, None, True) == RESERVATION_SPLIT_BELOW_FLOOR
+    assert reservation_state(edge, None, True) == RESERVATION_RIDES
+    # And the judge's own budget is on the standing-down side, which is
+    # why its stand-down needs no special case in the code.
+    assert JUDGE_MAX_TOKENS < edge
+    assert reasoning_reservation(JUDGE_MAX_TOKENS, None, True) == {}
+
+
+# ---- T5: whitespace-only output is not a visible answer, end to end.
+
+
+@respx.mock
+async def test_review_repro_a_whitespace_only_answer_is_an_exhausted_card(client):
+    """WINDOW: run_model's returned result for a response whose entire
+    content is spaces and newlines.
+
+    SUSPENSION POINT: the await on run_model. Everything asserted is on
+    the returned result.
+
+    THE DEFECT. `if text:` is true for "   \\n\\n  ", so response_text
+    was set, the empty-response guard never ran, and a fully billed
+    reasoning burn came back as a clean card with no error at all. No
+    error means no label, no remedy and no indicator: the card renders
+    visually blank and says nothing, which is a worse version of the
+    original incident because even the useless sentence is gone.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={
+            "choices": [
+                {"message": {"content": "   \n\n  "}, "finish_reason": "length"}
+            ],
+            "usage": {
+                "prompt_tokens": 1200,
+                "completion_tokens": 21350,
+                "completion_tokens_details": {"reasoning_tokens": 21350},
+            },
+        }
+    )
+
+    result = await run_model("a document question", "vendor/model", client)
+
+    assert result["response_text"] is None
+    assert result["error"] == empty_response_error("length", 21350, 21350)
+
+
+@respx.mock
+async def test_review_repro_a_whitespace_only_stream_is_an_exhausted_card(client):
+    """WINDOW: the done event of a stream whose only content deltas are
+    whitespace.
+
+    SUSPENSION POINT: the `async for` over aiter_lines. The result is
+    complete only once done() has run.
+
+    AND THE DELTAS ARE STILL YIELDED, which is the half that stops the
+    obvious fix from being wrong. The browser renders text as it
+    arrives; suppressing a whitespace delta would make the answer
+    assemble incorrectly on screen even when the response is fine.
+    """
+    body = (
+        'data: {"choices":[{"delta":{"content":" "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"\\n\\n"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"length"}],'
+        '"usage":{"prompt_tokens":1200,"completion_tokens":21350,'
+        '"completion_tokens_details":{"reasoning_tokens":21350}}}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [e async for e in stream_model("q", "vendor/model", client)]
+
+    done = events[-1]
+    assert done["result"]["response_text"] is None
+    assert done["result"]["error"] == empty_response_error("length", 21350, 21350)
+    # The deltas reached the browser regardless.
+    assert [e["text"] for e in events[:-1] if e["type"] == "delta"] == [" ", "\n\n"]
+
+
+@respx.mock
+async def test_review_repro_interior_whitespace_is_never_swallowed(client):
+    """WINDOW: a stream whose deltas are a real sentence, split so that
+    one of them is a lone space.
+
+    THE TEST THAT STOPS THE TEMPTING WRONG FIX. Putting the strip inside
+    _flatten_content looks tidier and is silent corruption: that
+    function runs once per delta, so returning None for " " would drop
+    that fragment from both the accumulated text and the yielded event,
+    and "Hel world" would arrive and persist as "Helworld".
+
+    Visibility is a question about a whole response, so it is asked
+    where a whole response is assembled, and the stored text is never
+    trimmed.
+
+    SUSPENSION POINT: the `async for` over aiter_lines inside
+    stream_model. response_text is only final once done() has run, so
+    the assertion is on the done event rather than on anything
+    observable mid-iteration.
+    """
+    body = (
+        'data: {"choices":[{"delta":{"content":"Hel"}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":" "}}]}\n\n'
+        'data: {"choices":[{"delta":{"content":"world"}}]}\n\n'
+        'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    )
+    respx.post(OPENROUTER_URL).respond(
+        200, headers={"Content-Type": "text/event-stream"}, text=body
+    )
+
+    events = [e async for e in stream_model("q", "vendor/model", client)]
+
+    # Byte for byte, interior space intact, and no error.
+    assert events[-1]["result"]["response_text"] == "Hel world"
+    assert events[-1]["result"]["error"] is None
+
+
+@respx.mock
+async def test_the_judge_is_not_paid_to_grade_whitespace(client):
+    """WINDOW: judge_response with a blank answer, and the request log.
+
+    THE CALL COUNT IS THE LOAD-BEARING ASSERTION. Asserting only the
+    returned verdict would pass against a mocked judge that happens to
+    return a zero, and the defect is that real money was spent asking.
+
+    SUSPENSION POINT: the await on judge_response, which in the fixed
+    code suspends nowhere at all because the guard returns before any
+    request is built. That is precisely what the call count proves.
+    """
+    respx.post(OPENROUTER_URL).respond(
+        json={"choices": [{"message": {"content": "1"}}]}
+    )
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "   \n ")
+
+    assert len(respx.calls) == 0
+    # And the verdict says the trial did not complete, rather than that
+    # the model answered badly. Both would score 0.0, so the detail is
+    # what carries the distinction.
+    assert out["detail"] == "no response text: the trial did not complete"
+    assert out["passed"] is None

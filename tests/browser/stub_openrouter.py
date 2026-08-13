@@ -35,6 +35,30 @@ GENERATION_ID_HEADER = "X-Generation-Id"
 # 13e-6 + 16e-6 = 2.9e-5 USD per completed run. stub/capped publishes a
 # completion cap far below the extended budget so the clamp has
 # something to bite on.
+# WHAT IT TAKES TO CLEAR THE RESERVATION GATE, spelled out once.
+#
+# UNTIL THIS EXISTED, NO BROWSER TEST EVER EXERCISED THE GATE. No entry
+# published supported_parameters at all, and fetch_catalog requires
+# "reasoning" to be in that list, so may_send_reasoning_cap was False
+# for every stub model and app.state.reasoning_defaults booted empty in
+# every browser run. Every browser assertion about the reasoning field
+# was therefore testing the ungated path, and a mutation of the gate
+# could not have failed a single one of them.
+#
+# Three conditions, and the descriptor has to satisfy all of them:
+# mandatory (so a cap cannot switch thinking on), supports_max_tokens
+# (so the cap is a ceiling rather than an effort request), and the
+# parameter advertised (so strict mode cannot exclude every provider).
+VOUCHED = {
+    "reasoning": {"mandatory": True, "supports_max_tokens": True},
+    "supported_parameters": ["max_tokens", "reasoning", "temperature", "seed", "top_p"],
+}
+
+# The plain personalities stay UNVOUCHED on purpose. test_h.py asserts
+# that a blank-controls payload is byte-identical to the pre-feature
+# one, and that proof needs a model the bench does not vouch for.
+PLAIN = {"supported_parameters": ["max_tokens", "temperature", "seed", "top_p"]}
+
 CATALOG = {
     "data": [
         {
@@ -56,12 +80,47 @@ CATALOG = {
             **extra,
         }
         for model_id, extra in [
-            ("stub/fast", {}),
-            ("stub/slow", {}),
-            ("stub/flaky", {}),
-            ("stub/null", {}),
-            ("stub/html", {}),
-            ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}}),
+            ("stub/fast", PLAIN),
+            ("stub/slow", PLAIN),
+            ("stub/flaky", PLAIN),
+            ("stub/null", PLAIN),
+            # THE REASONING PERSONALITIES PUBLISH A DESCRIPTOR, because a
+            # model that emits reasoning deltas while advertising no
+            # reasoning support is an incoherent fixture, and because the
+            # bench now reads exactly this to decide whether it may send
+            # an unprompted cap. mandatory true is the incident's own
+            # shape: the model thinks whether or not it is asked to, so
+            # bounding the thinking cannot start any.
+            #
+            # Thinks and never speaks; see the streaming dispatch.
+            ("stub/exhausted", VOUCHED),
+            # Thinks hard AND answers: the healthy contrast, so the
+            # exhaustion rule has something to stay quiet about.
+            ("stub/thinker", VOUCHED),
+            # Answers, but spends nearly all of the output thinking.
+            # The route the reservation could not reach.
+            ("stub/mostly-thinking", VOUCHED),
+            # Exhausted on the first attempt, healthy on the second, so a
+            # rerun crosses the indicator's boundary in one card.
+            ("stub/exhausted-once", VOUCHED),
+            # Thinks a little, then refuses. Spends a fraction of the
+            # budget and produces no text, which is the shape that was
+            # being told its budget had run out.
+            ("stub/filtered", VOUCHED),
+            ("stub/html", PLAIN),
+            ("stub/capped", {"top_provider": {"max_completion_tokens": 4096}, **PLAIN}),
+            # Reasons AND publishes a cap below the standard tier, so
+            # extended and standard clamp to the same 4096. This is the
+            # shape where "try extended budget" is advice to spend four
+            # times as much on a byte-identical request, and there was
+            # no fixture for it.
+            (
+                "stub/capped-thinker",
+                {"top_provider": {"max_completion_tokens": 4096}, **VOUCHED},
+            ),
+            # Emits whitespace and nothing else, with the exhausted
+            # usage shape. Visually blank, fully billed.
+            ("stub/whitespace", VOUCHED),
             # Priced in the catalog on purpose: their billed figure is
             # poisoned, so the card must fall back to the estimate rather
             # than showing nothing.
@@ -104,6 +163,58 @@ USAGE = {
     "completion_tokens_details": {"reasoning_tokens": 5},
     "prompt_tokens_details": {"cached_tokens": 2},
 }
+
+# The usage object of a run that spent its whole budget thinking. The
+# completion count equals the reasoning count, which is what the
+# production incident's generation record showed and what the relabelled
+# error and the card indicator both key on.
+EXHAUSTED_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8192,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 8192},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
+# ROW 694, the healthy contrast from the incident's own database: 2944
+# reasoning tokens, a real answer, a clean finish. The exhaustion rule
+# has to stay silent here, and the margin is not close: 2944 of 3400 is
+# 0.87, under the 0.9 threshold but near enough that a careless widening
+# of the rule would start warning about runs that worked.
+#
+# The default USAGE above is 5 reasoning tokens of 8 completion, which is
+# healthy too but degenerate, and a rule tested only against that would
+# look far safer than it is.
+HEALTHY_REASONING_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 3400,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 2944},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
+# A RUN THAT ANSWERED AND STILL SPENT ALMOST EVERYTHING THINKING, which
+# is the shape the server cannot say anything about. There is text, so no
+# error is synthesized, so there is no message to relabel; the result is
+# a perfectly ordinary successful card that happens to have put 94% of
+# its billed output somewhere the reader cannot see.
+#
+# This is also the shape of an UNSUPPORTED ROUTE. A provider that ignores
+# the reservation reports its usage honestly either way, so a rule
+# reading these two numbers works exactly where the request-side fix does
+# not. 8000 of 8500 is 0.94, comfortably over the threshold, with a real
+# answer attached.
+MOSTLY_THINKING_USAGE = {
+    "prompt_tokens": 13,
+    "completion_tokens": 8500,
+    "cost": BILLED_COST,
+    "cost_details": {"upstream_inference_cost": 0},
+    "completion_tokens_details": {"reasoning_tokens": 8000},
+    "prompt_tokens_details": {"cached_tokens": 0},
+}
+
 
 # The host OpenRouter routed to, echoed on every chunk and on the
 # non-streaming body, the way the real API reports it.
@@ -153,6 +264,10 @@ def usage_for(model: str):
         return {**USAGE, "cost": float("nan")}
     if model == "stub/negcost":
         return {**USAGE, "cost": -1.0}
+    if model == "stub/thinker":
+        return HEALTHY_REASONING_USAGE
+    if model == "stub/mostly-thinking":
+        return MOSTLY_THINKING_USAGE
     return USAGE
 
 
@@ -181,7 +296,16 @@ def build_app() -> Starlette:
     # Closure state instead of module globals: each harness session
     # builds its own app, so flaky's fail-once behavior and the request
     # log reset with the stub process.
-    state = {"requests": [], "flaky_failed": False, "flaky_slow_failed": False}
+    state = {
+        "requests": [],
+        "flaky_failed": False,
+        "flaky_slow_failed": False,
+        # First attempt exhausts, every attempt after it answers normally.
+        # Same fail-once shape as flaky, for the same reason: a rerun has
+        # to be able to cross a boundary within ONE card, and asserting on
+        # two separate cards never proves the first one was cleaned up.
+        "exhausted_once_spent": False,
+    }
 
     async def models(request):
         return JSONResponse(CATALOG)
@@ -239,6 +363,120 @@ def build_app() -> Starlette:
 
                 return gen()
             return text_stream(model, reply_text(model), "flaky-slow", delay=2.0)
+        if model == "stub/exhausted-once" and not state["exhausted_once_spent"]:
+            state["exhausted_once_spent"] = True
+
+            async def gen():
+                await asyncio.sleep(0.01)
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {"reasoning": "thinking..."}}],
+                    }
+                )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model == "stub/filtered":
+            # A CONTENT FILTER THAT THOUGHT FIRST. No text, so the
+            # empty-response path is reached; reasoning equal to
+            # completion, so the shape test fires; and 37 of 16384
+            # tokens, so the budget plainly did not run out. Before the
+            # correction this card claimed its completion budget had
+            # been exhausted and then advised buying the extended tier.
+            async def gen():
+                await asyncio.sleep(0.01)
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {"reasoning": "considering..."}}],
+                    }
+                )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "content_filter"}],
+                    }
+                )
+                yield sse(
+                    {
+                        "choices": [],
+                        "usage": {
+                            "prompt_tokens": 13,
+                            "completion_tokens": 37,
+                            "cost": BILLED_COST,
+                            "cost_details": {"upstream_inference_cost": 0},
+                            "completion_tokens_details": {"reasoning_tokens": 37},
+                            "prompt_tokens_details": {"cached_tokens": 0},
+                        },
+                    }
+                )
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model == "stub/whitespace":
+            # WHITESPACE IS NOT AN ANSWER. Spaces and newlines used to
+            # be truthy, so this shape rendered as a clean done card
+            # that displayed nothing and said nothing, on a run billed
+            # in full for its thinking.
+            async def gen():
+                await asyncio.sleep(0.01)
+                for chunk in ("   ", "\n\n", "  "):
+                    yield sse(
+                        {
+                            "provider": PROVIDER,
+                            "choices": [{"delta": {"content": chunk}}],
+                        }
+                    )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
+        if model in ("stub/exhausted", "stub/capped-thinker"):
+            # THE INCIDENT, reproduced as a personality rather than as a
+            # model. It thinks and never speaks: reasoning deltas only,
+            # then a stop with no content, and a usage object whose
+            # completion count IS its reasoning count, which is the
+            # signature the production generation record carried
+            # (tokens_completion equal to native_tokens_reasoning).
+            #
+            # Named for the SHAPE and not for the model that produced it,
+            # because exhaustion is a property of thinking against a cap
+            # and any reasoning model can do it. A stub named after a
+            # vendor would have quietly taught every test that this is
+            # one vendor's problem.
+            async def gen():
+                for _ in range(3):
+                    await asyncio.sleep(0.01)
+                    yield sse(
+                        {
+                            "provider": PROVIDER,
+                            "choices": [{"delta": {"reasoning": "thinking..."}}],
+                        }
+                    )
+                yield sse(
+                    {
+                        "provider": PROVIDER,
+                        "choices": [{"delta": {}, "finish_reason": "length"}],
+                    }
+                )
+                yield sse({"choices": [], "usage": EXHAUSTED_USAGE})
+                yield b"data: [DONE]\n\n"
+
+            return gen()
         if model == "stub/null":
 
             async def gen():

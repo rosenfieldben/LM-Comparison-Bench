@@ -8,6 +8,66 @@
 //
 // No build step and no dependencies, like every other module here.
 (function () {
+  // What the cost cell says about upstream figures, one clause per
+  // bucket. Separated from the cell so the wording is readable and so a
+  // test can reach it without building a report.
+  //
+  // Absent entirely when no trial reported a figure at all, which is
+  // the common case and keeps the cell short.
+  function upstreamClause(upstream) {
+    if (!upstream) return "";
+    const parts = [];
+    const byok = upstream.byok?.trials;
+    const notByok = upstream.not_byok?.trials;
+    const notByokUnpriced = upstream.not_byok_unpriced?.trials;
+    const unknown = upstream.unknown?.trials;
+    // The only bucket that is a second bill: is_byok said so.
+    if (byok) {
+      parts.push(
+        byok +
+          " upstream charge" +
+          (byok === 1 ? "" : "s") +
+          " billed direct by the provider (not in the total)",
+      );
+    }
+    // The same money seen twice. Saying so is the whole point: a reader
+    // who sees a figure and no explanation assumes a second bill.
+    if (notByok) {
+      parts.push(
+        notByok +
+          " non-BYOK trial" +
+          (notByok === 1 ? "" : "s") +
+          " also reported an upstream figure, already inside the total",
+      );
+    }
+    // NON-BYOK AND UNPRICED, which the clause above must not claim. It
+    // says "already inside the total", and that is true only of a trial
+    // the total counted. A trial with no billed charge and no local
+    // estimate contributes nothing, so on a report whose total is zero
+    // the old wording told a reader a figure was inside a total of
+    // nothing. What can honestly be said is the half that is still
+    // true: nobody called it a second bill, and the trial has no price.
+    if (notByokUnpriced) {
+      parts.push(
+        notByokUnpriced +
+          " unpriced non-BYOK trial" +
+          (notByokUnpriced === 1 ? "" : "s") +
+          " reported an upstream figure, not added as a separate bill " +
+          "and not priced in the total",
+      );
+    }
+    // Written before the flag existed. Unknown is not a synonym for no.
+    if (unknown) {
+      parts.push(
+        unknown +
+          " trial" +
+          (unknown === 1 ? "" : "s") +
+          " reported an upstream figure with no BYOK flag recorded",
+      );
+    }
+    return parts.length ? ", plus " + parts.join("; ") : "";
+  }
+
   const panel = document.getElementById("report-panel");
 
   function cell(text, name) {
@@ -232,18 +292,16 @@
             c.unpriced_trials +
             " unpriced)" +
             // Beside the total and never added to it. That total is what
-            // OpenRouter charged in credits; this is what a provider
-            // billed directly on a BYOK run, which is a different bill
-            // in a different place, and one number covering both would
-            // be a figure nobody is owed. Absent entirely when no run
-            // was BYOK.
-            (c.upstream
-              ? ", plus " +
-                c.upstream.trials +
-                " upstream BYOK charge" +
-                (c.upstream.trials === 1 ? "" : "s") +
-                " billed direct"
-              : ""),
+            // OpenRouter charged in credits.
+            //
+            // ONE CLAUSE PER BUCKET, because presence of an upstream
+            // figure never proved BYOK and this cell used to say it
+            // did. Two live captures in this repository are non-BYOK
+            // runs that reported one, so calling every figure a direct
+            // provider bill published OpenRouter's own charge a second
+            // time as an invoice nobody was owed. Only the byok bucket
+            // is a bill; the others say what they actually are.
+            upstreamClause(c.upstream),
           "report-cost",
         ),
         cell(

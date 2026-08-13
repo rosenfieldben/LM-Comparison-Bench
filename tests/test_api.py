@@ -15,7 +15,12 @@ from fastapi.testclient import TestClient
 from bench import main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
-from bench.models import OPENROUTER_URL, provider_preferences
+from bench.models import (
+    ENDPOINTS_URL,
+    OPENROUTER_URL,
+    PROVIDER_REASONING_MINIMUM,
+    provider_preferences,
+)
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -82,6 +87,31 @@ TEST_CATALOG = {
             # ineligible under require_parameters.
             "supported_parameters": ["max_tokens"],
             # Text only: the model a native comparison must refuse.
+            "input_modalities": ["text"],
+        },
+        # THE WIDE AGGREGATE. Its model-level cap is enormous and its
+        # cheapest route's is not, which is the shape the U1 review
+        # measured on the live catalog (2026-08-13): one model whose
+        # top_provider published 131072 while its endpoints published
+        # 8192, 16384, 32768, 40960, 65536 and 131072, and five that
+        # published nothing. A model-level cap is the MAXIMUM any route
+        # offers, so budgeting from it is budgeting from the most
+        # generous host in the pool while pinning the request to one
+        # particular host.
+        {
+            "id": "model/wide-aggregate",
+            "name": "Wide Aggregate",
+            "context_length": 131072,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+            "max_completion_tokens": 131072,
+            "supported_parameters": [
+                "max_tokens",
+                "reasoning",
+                "seed",
+                "temperature",
+                "top_p",
+            ],
             "input_modalities": ["text"],
         },
         {
@@ -3072,6 +3102,12 @@ def test_blank_controls_leave_the_boot_provider_block_untouched(client):
     body = json.loads(respx.calls[0].request.content)
     assert body["provider"] == {"sort": "throughput"}
     assert body["messages"] == [{"role": "user", "content": "p"}]
+    # reasoning is back in this list. It briefly left, when the
+    # visible-output reservation rode every request; it returned when the
+    # reservation was gated on the catalog's capability flag, because
+    # this lineup's models publish no reasoning descriptor and the bench
+    # therefore does not vouch for them. An unset control and an
+    # unvouched reservation are both simply absent.
     for control_key in ("temperature", "top_p", "seed", "reasoning"):
         assert control_key not in body, control_key
     # The whole key set, so a control added later cannot slip in unnoticed
@@ -6246,12 +6282,27 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 3
+    assert manifest["export_schema_version"] == 4
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[3]
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[4]
+    # Version 4 is the units-and-money boundary. Its note still names
+    # renditions, deliberately: EXPORT_SCHEMA_NOTES emits only the
+    # CURRENT version's sentence, so a v4 note that dropped the v3
+    # explanation would leave a v4 artifact unable to explain a field it
+    # still carries.
+    assert "token_counts" in manifest["export_schema_change"]
+    assert "is_byok" in manifest["export_schema_change"]
     assert "renditions" in manifest["export_schema_change"]
+    # ONE UNIT, SAID ONCE, for a reader who was never in the room. Trial
+    # lines put four counts and one ceiling side by side, and the
+    # subtraction that invites is the one that manufactured a phantom
+    # 44186 tokens on a card. Not a schema bump: no field's value,
+    # meaning or presence changed, so a v3 parser ignoring this key reads
+    # exactly what it read before.
+    assert manifest["token_counts"] == report._manifest_token_note()
+    assert "max_tokens is not a count" in manifest["token_counts"]
     assert manifest["estimand_mode"] == "routed_service"
     assert manifest["dataset_digest"]
     assert manifest["bootstrap_unit"] == "task"
@@ -6576,6 +6627,12 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
             httpx.Response(200, stream=alpha_stream()),
         )[1]
     )
+    # A pinned run resolves its route, so the listing is asked for. It
+    # was not before U1, because the only question put to it was one
+    # this unvouched model already answered no to.
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": []}}
+    )
     path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
     eid = client.post(
         "/experiments",
@@ -6594,6 +6651,226 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
     # The privacy promise is written last and cannot be displaced by the
     # estimand: the boot policy's keys survive the merge.
     assert provider["sort"] == "throughput"
+
+
+# ---- U1: a pin selects one route, and one route publishes its own
+# ---- completion cap. Budgeting from the model-level aggregate budgets
+# ---- from the most generous host in the pool.
+
+# The pinned host's cap, and the aggregate the bench used to budget from.
+# Both numbers are the live ones, from the endpoint listing quoted in the
+# catalog entry above.
+PINNED_ROUTE_CAP = 8192
+WIDE_AGGREGATE_CAP = 131072
+
+
+def wide_endpoint_listing():
+    """The listing shape the live model published: several hosts, one
+    cheap one, and a host that publishes no cap at all."""
+    return {
+        "data": {
+            "endpoints": [
+                {
+                    "provider_name": "SiliconFlow",
+                    "tag": "siliconflow",
+                    "max_completion_tokens": PINNED_ROUTE_CAP,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                {
+                    "provider_name": "Groq",
+                    "tag": "groq",
+                    "max_completion_tokens": 65536,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                {
+                    "provider_name": "CoreWeave",
+                    "tag": "coreweave",
+                    "max_completion_tokens": WIDE_AGGREGATE_CAP,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                # Published no cap. Five of the live model's twenty
+                # endpoints were this shape.
+                {
+                    "provider_name": "Together",
+                    "tag": "together",
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+            ]
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "tier,aggregate_budget,route_cap,expected",
+    (
+        ("standard", 16384, PINNED_ROUTE_CAP, PINNED_ROUTE_CAP),
+        ("extended", 65536, PINNED_ROUTE_CAP, PINNED_ROUTE_CAP),
+        # THE OTHER DIRECTION, and without it the clamp was unproven.
+        # Both rows above put the route's ceiling BELOW the requested
+        # tier, so min(requested, cap) and a bare `cap` give the same
+        # answer: the whole suite passed with the min removed. A
+        # generous route must not RAISE the budget. The tier is what the
+        # operator asked to spend, and a route offering 131072 does not
+        # make a standard run cost eight times more.
+        ("standard", 16384, WIDE_AGGREGATE_CAP, 16384),
+    ),
+    ids=(
+        "standard: twice the route's ceiling",
+        "extended: eight times it",
+        "a generous route does not raise the budget",
+    ),
+)
+@respx.mock
+def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
+    client, tmp_path, tier, aggregate_budget, route_cap, expected
+):
+    """WINDOW: the bytes of the one request a pinned trial sends, read
+    against the cap the pinned endpoint publishes.
+
+    THE DEFECT, measured on the live catalog 2026-08-13. fetch_endpoints
+    kept two fields and discarded max_completion_tokens, so the only
+    completion cap the budget arithmetic could see was the model-level
+    one. A model-level cap is the maximum across every host that serves
+    the model; a pin selects exactly one host and forbids fallback. The
+    bench therefore budgeted from the most generous host in the pool and
+    sent the result to whichever host the pin named.
+
+    The live numbers: one model published a model-level cap of 131072
+    while its cheapest endpoint published 8192. The standard tier alone
+    sends 16384, twice that route's published ceiling, before the
+    extended tier is considered at all.
+
+    THE ORDER IS THE FIX. trial_may_send_reasoning_cap already fetched
+    this listing, one line below where the budget had already been
+    computed. Resolving the route first and budgeting second costs
+    nothing extra on the wire and is the whole of the repair.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/wide-aggregate")).respond(
+        json=wide_endpoint_listing()
+    )
+    # The pin selects whichever host publishes the ceiling this row is
+    # about, so one listing serves both directions.
+    pinned_host = {
+        PINNED_ROUTE_CAP: "SiliconFlow",
+        WIDE_AGGREGATE_CAP: "CoreWeave",
+    }[route_cap]
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    app.state.reasoning_defaults = {"model/wide-aggregate"}
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments",
+        json=strict_body(
+            path,
+            budget=tier,
+            lineup=["model/wide-aggregate"],
+            provider_pins={"model/wide-aggregate": pinned_host},
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1, sent
+    body = sent[0]
+    # PRE-STATE, so the assertion below cannot pass by the route never
+    # having been pinned or the aggregate never having been generous.
+    assert body["provider"]["order"] == [pinned_host.lower()]
+    assert body["provider"]["allow_fallbacks"] is False
+    assert app.state.completion_limits["model/wide-aggregate"] == WIDE_AGGREGATE_CAP, (
+        "the aggregate must really be the larger number"
+    )
+    assert aggregate_budget < WIDE_AGGREGATE_CAP, (
+        "the model-level clamp must not be what bounds this request, or "
+        "the test would pass without the endpoint cap ever being read"
+    )
+
+    # THE OUTER BUDGET: never above the route's published ceiling, and
+    # never above the tier the operator asked for either.
+    assert body["max_tokens"] == expected, (
+        f"sent max_tokens {body['max_tokens']} on a {tier} run to a route "
+        f"publishing {route_cap}"
+    )
+    assert body["max_tokens"] <= route_cap
+    assert body["max_tokens"] <= aggregate_budget
+    # AND THE RESERVATION, computed from the same clamped number rather
+    # than from the aggregate. Half of the route's cap, not half of the
+    # model's.
+    assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}
+    assert body["max_tokens"] > body["reasoning"]["max_tokens"]
+
+
+@respx.mock
+def test_a_pinned_lineup_resolves_each_route_once_for_the_whole_run(client, tmp_path):
+    """WINDOW: the endpoint listing's call count across a whole
+    experiment run, read against the number of paid calls that run made.
+
+    A ROUTE IS A FACT ABOUT A MODEL AND A PIN, and both are fixed when
+    the experiment is created. Trials are the product of tasks, repeats
+    and lineup, so resolving per trial spends one endpoint request per
+    paid call to re-learn something that cannot have changed. This run
+    is deliberately shaped to tell the two apart: two tasks and two
+    repeats over one model is four trials, so per-trial resolution
+    counts four and per-run counts one.
+
+    THE DUPLICATE IS THE SECOND HALF. The lineup names the same model
+    twice, which is the natural way to ask how much a model varies run
+    to run, and a resolver keyed on the lineup list rather than on its
+    distinct members would buy the same listing twice before the first
+    trial.
+    """
+    listing = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    }
+                ]
+            }
+        }
+    )
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    app.state.reasoning_defaults = {"model/alpha"}
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "hi"}, {"id": "t2", "prompt": "yo"}
+    )
+    eid = client.post(
+        "/experiments",
+        json=strict_body(
+            path,
+            # The same model twice, and two repeats over two tasks.
+            lineup=["model/alpha", "model/alpha"],
+            repeats=2,
+            provider_pins={"model/alpha": "together"},
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    # PRE-STATE: the run really did make many paid calls, or "one
+    # listing" would be a claim about a run that barely happened.
+    assert len(sent) == 8, len(sent)
+    assert listing.call_count == 1
+
+    # And the resolution actually reached all eight of them: every
+    # request is clamped to the route's 4096 rather than the standard
+    # tier's 16384, and carries half of that.
+    assert {body["max_tokens"] for body in sent} == {4096}
+    assert {body["reasoning"]["max_tokens"] for body in sent} == {2048}
 
 
 @respx.mock
@@ -7596,6 +7873,12 @@ def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
                         "completion_tokens": 1,
                         "cost": 0.25,
                         "cost_details": {"upstream_inference_cost": 0.0042},
+                        # THE FLAG THIS TEST ALWAYS NEEDED. It is named
+                        # for a BYOK charge and its stub never said the
+                        # run was BYOK; it inferred that from the figure
+                        # being present, which is exactly the inference
+                        # the report was corrected to stop making.
+                        "is_byok": True,
                     },
                 }
             ),
@@ -7628,7 +7911,13 @@ def test_review_repro_a_byok_charge_round_trips_to_the_export_and_the_report(
     # The report's cost section, beside the total and not inside it.
     cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
     assert cost["total_usd"] == pytest.approx(0.25)
-    assert cost["upstream"] == {"trials": 1, "values": ["0.0042"]}
+    # Bucketed by what the wire SAID, not by what was present. Only the
+    # byok bucket may be read as a second bill.
+    assert cost["upstream"]["byok"] == {"trials": 1, "values": ["0.0042"]}
+    assert cost["upstream"]["not_byok"] == {"trials": 0, "values": []}
+    assert cost["upstream"]["unknown"] == {"trials": 0, "values": []}
+    # And it is still never added to the credit total.
+    assert cost["total_usd"] == pytest.approx(0.25)
 
 
 @respx.mock
@@ -8759,6 +9048,12 @@ def test_review_repro_rule_one_holds_across_both_modes(client):
         "messages": [{"role": "user", "content": "plain question"}],
         "max_tokens": 16384,
         "provider": {"sort": "throughput"},
+        # No reasoning key, and its absence is load-bearing twice over.
+        # ATTACHMENTS add nothing, which is what this test was written
+        # for. And the visible-output reservation adds nothing either on
+        # a model the catalog does not vouch for, which is what stopped
+        # the reasoning-exhaustion fix from breaking rule one for every
+        # run in the bench.
     }
 
 
@@ -11706,7 +12001,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 3
+    assert manifest["export_schema_version"] == 4
     assert manifest["attachments_referenced"] is True
 
     cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]
@@ -12117,3 +12412,832 @@ def test_review_repro_a_groups_member_runs_carry_their_own_documents(client):
     alone = client.get(f"/runs/{member['id']}").json()
     assert member["renditions"] == alone["renditions"]
     assert member["attachments"] == alone["attachments"]
+
+
+# ---- The reasoning-exhaustion fix, R1, at the endpoint: the reservation
+# ---- rides every member of a comparison, with one arithmetic.
+
+
+@respx.mock
+def test_review_repro_every_member_of_a_comparison_reserves_the_same_room(client):
+    """WINDOW: the captured payloads of a FULL MULTI-MODEL comparison,
+    the fairness walk's shape applied to the reservation.
+
+    A GUARANTEE THAT COVERS SOME MEMBERS IS NOT A GUARANTEE. The
+    incident's comparison had several cards and every one of them billed
+    in full for nothing; a reservation that rode only the first request,
+    or that varied by member, would leave the same comparison partly
+    exposed and would do it invisibly, because the cards that worked
+    would look exactly like cards that were protected.
+
+    So this asserts across the whole lineup at once, as ONE DISTINCT
+    VALUE rather than pairwise, which is the same reason the fairness
+    tombstone counts distinct composed contents: a third member drifting
+    cannot hide behind a comparison of the first two.
+
+    THE BUDGET IS NOT ONE NUMBER FOR THE COMPARISON, and an earlier
+    version of this docstring said it was. effective_budget clamps the
+    requested tier to each model's published completion cap, so members
+    of one lineup can legitimately be sent different ceilings. The
+    original three models all publish no cap, so they happened to share
+    one, and the distinct-value assertion below was proving something
+    narrower than the sentence above it claimed.
+
+    model/capped is in the lineup now, at 32000 against the other
+    members' 65536, so the lineup really does span two budgets. What is
+    asserted is the property that actually matters: EVERY member gets a
+    reservation, and every member's reservation is half of ITS OWN
+    ceiling. A member left out entirely, or one whose reservation was
+    computed from somebody else's budget, still fails.
+
+    THE VOUCHING IS DECLARED HERE rather than baked into TEST_CATALOG,
+    and that placement is deliberate. The default lineup must stay
+    unvouched, because the rule-one tests prove that an unvouched model
+    receives the pre-feature payload byte for byte, and a catalog that
+    vouched for everything would quietly delete that proof. So a test
+    about the reservation says so, and every other test keeps testing
+    the silent path.
+    """
+    app.state.reasoning_defaults = {
+        "model/alpha",
+        "model/beta",
+        "model/vision",
+        "model/capped",
+    }
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "ok")
+        )
+    )
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "a hard question",
+            "models": [
+                "model/alpha",
+                "model/beta",
+                "model/vision",
+                # Clamped to 32000 while the others send 65536, so the
+                # lineup spans two ceilings on purpose.
+                "model/capped",
+            ],
+            "budget": "extended",
+        },
+    )
+    assert resp.status_code == 200, resp.text
+
+    sent = [json.loads(call.request.content) for call in respx.calls]
+    assert len(sent) == 4
+    # EVERY member carries one, which is the coverage half: a
+    # reservation that rode only some requests would leave the same
+    # comparison partly exposed, invisibly.
+    assert all("reasoning" in body for body in sent), [
+        b["model"] for b in sent if "reasoning" not in b
+    ]
+    # And each is half of ITS OWN ceiling, never of a constant and never
+    # of another member's. This is the assertion the clamped member
+    # makes non-trivial.
+    for body in sent:
+        assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}, body[
+            "model"
+        ]
+    # The lineup really does span two ceilings, so the check above is
+    # not quietly comparing four identical numbers.
+    assert len({body["max_tokens"] for body in sent}) == 2
+    # AND THE PAIR IS PINNED-LEGAL ON THE BYTES. The two pinned rules
+    # were asserted only over invented budgets, in
+    # test_the_reservation_obeys_the_pinned_provider_arithmetic, while
+    # the test that reads a real outgoing payload checked only that the
+    # number was half of the ceiling.
+    #
+    # A TRIPWIRE, NOT A TOMBSTONE, and the difference is stated because
+    # claiming otherwise would be a false comment. Against today's
+    # constants these two lines cannot fail on their own: the equality
+    # asserted just above is strictly stronger for this lineup, and
+    # reasoning_reservation's own guard stands the field down rather
+    # than emit an illegal pair, which is separately tombstoned at the
+    # 1024 boundary. What they catch is a future change that keeps the
+    # share honest and the wire illegal, which is a published cap
+    # between 1024 and 2048, or a share moved without the guard moving
+    # with it. Nothing on the wire side would notice either today.
+    #
+    # Both rules quoted from
+    # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    # read 2026-08-12: "that value is used directly with a minimum of
+    # 1024 tokens", and "Important: max_tokens must be strictly higher
+    # than the reasoning budget".
+    for body in sent:
+        assert body["reasoning"]["max_tokens"] >= PROVIDER_REASONING_MINIMUM, body[
+            "model"
+        ]
+        assert body["max_tokens"] > body["reasoning"]["max_tokens"], body["model"]
+
+
+@respx.mock
+def test_a_visible_answer_still_fits_in_the_reserved_room(client):
+    """WINDOW: a full /compare round trip, from the posted request to
+    the persisted result, with the sent payload read back afterwards.
+
+    The other half of the reservation, and the one that stops it from
+    being a cure worse than the disease.
+
+    Capping thinking is only correct if what remains is enough to answer
+    with. At the standard tier the reservation leaves 8192 visible
+    tokens, which is a long answer; this proves the round trip end to
+    end, that a comparison with the cap in place returns real text and
+    records it.
+    """
+    app.state.reasoning_defaults = {"model/alpha"}
+    long_answer = "the answer, at length. " * 200
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for("model/alpha", long_answer)
+        )
+    )
+
+    resp = client.post(
+        "/compare", json={"prompt": "answer at length", "models": ["model/alpha"]}
+    )
+
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["results"][0]
+    assert result["error"] is None
+    assert result["response_text"] == long_answer
+    body = json.loads(respx.calls[0].request.content)
+    assert body["reasoning"]["max_tokens"] == 8192
+
+
+@respx.mock
+def test_review_repro_the_reservation_asks_the_catalog_before_it_rides(
+    client, monkeypatch
+):
+    """WINDOW: a /compare round trip, from the boot catalog through to
+    the bytes on the wire, at both answers to the catalog's question.
+
+    THE DEFECT THIS ANSWERS was found by an adversarial review after the
+    fix had already shipped, and it inverted the fix's own purpose.
+    OpenRouter's request schema says of the reasoning object's enabled
+    key: "Default: inferred from 'effort' or 'max_tokens'". So a request
+    carrying a cap and no enabled key does not merely BOUND thinking, it
+    turns thinking ON. On a model whose catalog entry says thinking is
+    off by default, an unprompted cap starts buying reasoning tokens
+    that were never being bought.
+
+    That is the opposite of the fix. It was written to stop money
+    disappearing into invisible thinking, and unguarded it would have
+    started spending money on thinking that was not happening, on every
+    run, silently, in an instrument whose entire product is a comparison
+    between models. Measured against the live catalog on 2026-08-12: 23
+    of 406 models publish default_enabled false without mandatory.
+
+    BOTH ANSWERS ARE ASSERTED, which is the point. A test that only
+    proved the cap rides for a vouched model would pass just as well if
+    the gate were deleted.
+    """
+    seen: list[dict] = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json=response_for(json.loads(request.content)["model"], "ok")
+        )
+    )
+
+    for vouched in (False, True):
+        app.state.reasoning_defaults = {"model/alpha"} if vouched else set()
+        resp = client.post(
+            "/compare",
+            json={"prompt": "catalog gate", "models": ["model/alpha"]},
+        )
+        assert resp.status_code == 200, resp.text
+        # The call this iteration just made, by index from the end. The
+        # router accumulates across the loop and a reset here would make
+        # the two iterations indistinguishable if it ever stopped working.
+        seen.append(json.loads(respx.calls[-1].request.content))
+
+    unvouched, vouched_body = seen
+    # Silence is not a degraded reservation, it is the whole pre-feature
+    # payload: an unvouched model gets exactly what it got before any of
+    # this existed.
+    assert "reasoning" not in unvouched
+    assert set(unvouched) == {"model", "messages", "max_tokens", "provider"}
+    # And the vouched one differs in that one key and nothing else, so
+    # the gate cannot be shown to have changed anything except whether
+    # the reservation rides.
+    assert vouched_body["reasoning"] == {"max_tokens": 8192}
+    assert set(vouched_body) - set(unvouched) == {"reasoning"}
+    assert {k: v for k, v in vouched_body.items() if k != "reasoning"} == unvouched
+
+
+from bench.main import trial_route  # noqa: E402
+
+
+@respx.mock
+async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client):
+    """WINDOW: trial_route itself, called directly once per branch, with
+    the endpoint route's call count read between calls.
+
+    SUSPENSION POINT: the await on fetch_endpoints, reached on the
+    pinned branches only. Nothing asserted here is mutable across it:
+    the listing is fully assembled before the coroutine returns, and the
+    call counter is read after each await settles.
+
+    THE DEFECT THIS ANSWERS is an absence rather than a wrong answer.
+    The closing review found this function had no test at any level:
+    replacing its entire body with "return model in
+    app.state.reasoning_defaults", which is the pre-T3 behaviour it was
+    written to replace, left 885 tests passing. The strict-pin fix was
+    therefore load-bearing and unguarded at once.
+
+    ASSERTED AGAINST THE PINNED CONTRACT. The endpoint listing below is
+    the shape measured on 2026-08-12, where one model's hosts published
+    18, 12 and 17 parameters and differed in which; what decides the
+    pinned branches is the presence of "reasoning" in the PINNED host's
+    supported_parameters, not the fact that a mock answered 200. Both
+    hosts return the same 200 from the same route, and give opposite
+    answers.
+
+    THE CALL COUNTER IS HALF THE TEST, and what it counts CHANGED with
+    U1. An UNPINNED trial must still answer from the model-level catalog
+    without asking the network, and that is asserted below: a version
+    that always fetched would return the same booleans while spending a
+    request per trial of every ordinary experiment.
+
+    A PINNED trial now always fetches, including when the model is
+    unvouched, and that is the U1 repair rather than a regression. The
+    listing is no longer read only to decide whether an optional field
+    may ride; it is also read for the ceiling the budget must respect,
+    and an unvouched model's request still has a budget. The old
+    shortcut skipped the network precisely when the answer was already
+    known to be False, which was correct while the reservation was the
+    only question and is wrong now that it is not.
+    """
+    route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 32768,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    {
+                        "provider_name": "BaseTen",
+                        "tag": "baseten",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens", "temperature"],
+                    },
+                ]
+            }
+        }
+    )
+    app.state.reasoning_defaults = {"model/alpha"}
+    pinned = {"model/alpha": "baseten"}
+
+    # BRANCH ONE: not the strict estimand. The pin is present and must
+    # be ignored, because without underlying_model the request does not
+    # carry allow_fallbacks false and a host may still decline the field
+    # harmlessly.
+    first = await trial_route(
+        {"estimand_mode": "as_served", "provider_pins": pinned}, "model/alpha"
+    )
+    assert first == {
+        "pin": None,
+        "completion_cap": None,
+        "may_send_reasoning_cap": True,
+    }
+    assert route.call_count == 0
+
+    # BRANCH TWO: strict, but this model has no pin. Any eligible host
+    # may serve it, so the union is the right question and the answer
+    # is again the model-level one, with no ceiling learned from any one
+    # host because no one host was selected.
+    second = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": {}}, "model/alpha"
+    )
+    assert second == {
+        "pin": None,
+        "completion_cap": None,
+        "may_send_reasoning_cap": True,
+    }
+    assert route.call_count == 0
+
+    # BRANCH THREE: pinned, but the MODEL is not vouched. Both questions
+    # must answer yes, so the reservation stands down. The listing is
+    # fetched anyway, because this trial still has a budget and the
+    # pinned host still publishes a ceiling for it.
+    app.state.reasoning_defaults = set()
+    third = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": pinned},
+        "model/alpha",
+    )
+    assert third["may_send_reasoning_cap"] is False
+    assert third["pin"] == "baseten"
+    assert third["completion_cap"] == 4096
+    assert route.call_count == 1
+
+    # BRANCH FOUR: pinned to the host that publishes the field. This is
+    # the only branch that may vouch through the listing, and its cap is
+    # the OTHER host's, which is what proves the cap is read per pin and
+    # not once per model.
+    app.state.reasoning_defaults = {"model/alpha"}
+    fourth = await trial_route(
+        {
+            "estimand_mode": "underlying_model",
+            "provider_pins": {"model/alpha": "deepinfra"},
+        },
+        "model/alpha",
+    )
+    assert fourth == {
+        "pin": "deepinfra",
+        "completion_cap": 32768,
+        "may_send_reasoning_cap": True,
+    }
+    assert route.call_count == 2
+
+    # BRANCH FIVE, THE ONE THAT DEFEATS THE MUTATION. Same model, same
+    # vouching, same 200 from the same route: only the pin differs, and
+    # the pinned host does not publish reasoning. The pre-T3 body would
+    # say True here and empty the provider pool.
+    fifth = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": pinned},
+        "model/alpha",
+    )
+    assert fifth["may_send_reasoning_cap"] is False
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_a_pinned_trial_with_no_listing_sends_nothing(client):
+    """WINDOW: trial_route on a vouched, pinned model whose endpoint
+    listing cannot answer.
+
+    SUSPENSION POINT: the await on fetch_endpoints, which returns its
+    unfetched listing rather than raising. Nothing asserted spans it.
+
+    THE TWO UNKNOWNS ARE NOT THE SAME UNKNOWN, and this is the test that
+    says so. One listing failure produces both answers, and they differ
+    because their costs differ.
+
+    Absence of evidence is not SUPPORT: under a strict pin, sending a
+    field the host does not take empties the provider pool and the run
+    fails, while not sending an optional field is free. So the
+    reservation stands down.
+
+    Absence of evidence is not a CEILING either, and refusing there
+    would buy nothing and cost a tier: the cap comes back None and the
+    budget falls back to the model-level clamp, which is exactly what it
+    used before any of this read the endpoint listing. Five of one live
+    model's twenty endpoints published no cap on 2026-08-13, so this is
+    the common shape and not the corner.
+    """
+    route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(404)
+    app.state.reasoning_defaults = {"model/alpha"}
+
+    resolved = await trial_route(
+        {
+            "estimand_mode": "underlying_model",
+            "provider_pins": {"model/alpha": "deepinfra"},
+        },
+        "model/alpha",
+    )
+
+    assert resolved["may_send_reasoning_cap"] is False
+    assert resolved["completion_cap"] is None
+    assert route.call_count == 1
+
+
+def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
+    """WINDOW: fetch_catalog's parse of one raw catalog entry, before any
+    of it reaches app state.
+
+    The gate is only worth having if the flags it reads are the ones
+    OpenRouter published, so this walks every shape they come in. Two
+    independent questions collapse into one derived boolean, and both
+    have to be answered yes.
+
+    DOES IT THINK UNPROMPTED (mandatory, or default_enabled): if not,
+    a cap would switch thinking on rather than bound it, because the
+    request schema infers enabled from max_tokens.
+
+    DOES IT ADVERTISE THE PARAMETER (supported_parameters): if not,
+    strict mode's require_parameters would exclude every provider that
+    does not support the field, either emptying the pool or silently
+    narrowing it, and narrowing it changes what is being measured.
+
+    The second condition is redundant against the catalog as it stands,
+    where all 157 reasoning-by-default models advertise the parameter.
+    It is asserted here so that stays a property of the code.
+    """
+    from bench.models import MODELS_URL, fetch_catalog
+
+    reasoning_ok = ["max_tokens", "reasoning"]
+    entries = [
+        # THE REVIEW'S OWN EXAMPLES FIRST, verbatim from the live catalog
+        # on 2026-08-12, because a gate argued about in the abstract is a
+        # gate nobody can check. Both cleared the previous gate.
+        #
+        # openai/gpt-5.1 publishes default_enabled TRUE and
+        # default_effort "none" together. The contract says "If the
+        # value is 'none', treat it as 'reasoning off by default'", so
+        # this model does not reason and a cap would switch it on.
+        {
+            "id": "openai/gpt-5.1",
+            "reasoning": {
+                "mandatory": False,
+                "default_enabled": True,
+                "supported_efforts": ["high", "medium", "low", "none"],
+                "default_effort": "none",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # A Flash Lite variant: it DOES reason, at default_effort
+        # minimal, which is approximately 10% of max_tokens. It publishes
+        # no supports_max_tokens, so a cap is read as an effort request
+        # and half the budget determines approximately MEDIUM, which is
+        # approximately 50%. Sending it would quintuple the thinking this
+        # model was going to do, unprompted.
+        {
+            "id": "google/gemini-3.1-flash-lite",
+            "reasoning": {
+                "mandatory": False,
+                "default_enabled": True,
+                "supported_efforts": ["high", "medium", "low", "minimal"],
+                "default_effort": "minimal",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # Mandatory AND minimal, so the mandatory branch alone is not
+        # enough either: it always reasons, and a cap would still raise
+        # the effort it reasons at.
+        {
+            "id": "m/mandatory-but-minimal",
+            "reasoning": {
+                "mandatory": True,
+                "default_effort": "minimal",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # ONE DIMENSION AT A TIME, and this row exists because the first
+        # version of this table could not isolate default_effort. Both
+        # real examples above also lack supports_max_tokens, so removing
+        # the default_effort check left their verdicts unchanged and the
+        # mutation that deletes it passed. A test that cannot fail for
+        # the reason it was written proves nothing about that reason.
+        #
+        # This shape clears every other condition and is refused ONLY by
+        # default_effort "none". The live catalog contains no such model
+        # today; the rule still has to be right, because the catalog is
+        # somebody else's file and can gain one any morning.
+        {
+            "id": "m/enabled-but-effort-none",
+            "reasoning": {
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # The mirror: identical but for an effort that is not "none", so
+        # the pair differs in exactly one field and the verdicts differ.
+        {
+            "id": "m/enabled-and-effort-medium",
+            "reasoning": {
+                "default_enabled": True,
+                "default_effort": "medium",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # ---- THE NO-HARM EXTENSION, and its contrasting pair. Neither
+        # ---- publishes supports_max_tokens, so neither is a ceiling
+        # ---- case; they are separated purely by what a cap would DO to
+        # ---- the thinking they already always perform.
+        #
+        # Mandatory at HIGH, approximately 80%. Every documented outcome
+        # of a cap at half the budget bounds or lowers that: honoured is
+        # a bound, translated lands near medium which is below high, and
+        # ignored changes nothing. Enable-harm is impossible because
+        # mandatory means thinking never stopped. So the cap rides.
+        # This is the shape of the model the incident happened on.
+        {
+            "id": "m/mandatory-at-high-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "high"},
+            "supported_parameters": reasoning_ok,
+        },
+        # Mandatory at MINIMAL, approximately 10%. Identical in every
+        # other respect, and refused, because a translation toward
+        # medium would RAISE this model's thinking fivefold. The pair is
+        # the whole argument: the extension keys on the direction a cap
+        # can move the thinking, never on who made the model.
+        {
+            "id": "m/mandatory-at-minimal-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "minimal"},
+            "supported_parameters": reasoning_ok,
+        },
+        # MANDATORY AT MEDIUM, AND NOTHING ELSE, which is the exact
+        # boundary of the no-harm extension and was not isolated until a
+        # review said so. The extension admits a route whose default
+        # share is at or above REASONING_BUDGET_SHARE, and medium IS
+        # that share: 0.5 against 0.5. Every other medium row in this
+        # table also publishes supports_max_tokens, so it clears the
+        # OTHER arm and the boundary comparison is never the thing
+        # deciding it. Changing >= to > would have passed.
+        #
+        # This row publishes no budget support, so only the extension
+        # can admit it, and only the boundary comparison can let the
+        # extension do so.
+        {
+            "id": "m/mandatory-at-medium-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "medium"},
+            "supported_parameters": reasoning_ok,
+        },
+        # ---- THE SELF-CONTRADICTING DESCRIPTORS, refused through
+        # ---- every arm. A claim that thinking is ON must not sit
+        # ---- beside a claim that it is OFF, and a parser that believes
+        # ---- whichever half is convenient can be talked into anything.
+        #
+        # THE PRODUCTION-PATH SHAPE A REVIEW FOUND, and the one that
+        # made this a merge blocker rather than a tidiness note. Every
+        # key here is one the live catalog publishes, and together they
+        # cleared the ceiling arm: mandatory short-circuited the effort
+        # check, so "none" was honoured on the default_enabled side and
+        # ignored on the mandatory side. fetch_catalog returned True and
+        # reasoning_reservation(16384) returned an 8192 token cap, which
+        # is the reservation switching thinking ON for a route whose own
+        # descriptor says it is off.
+        {
+            "id": "m/mandatory-enabled-but-effort-none",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": True,
+                "default_effort": "none",
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # The same contradiction without the budget flag, so the refusal
+        # cannot be credited to the ceiling arm being unavailable. This
+        # shape used to be refused by arithmetic rather than by meaning:
+        # EFFORT_SHARES["none"] is 0.0, which fails the no-harm share
+        # comparison, so the right answer arrived for the wrong reason
+        # and moving the share would have changed it.
+        {
+            "id": "m/mandatory-but-effort-none",
+            "reasoning": {"mandatory": True, "default_effort": "none"},
+            "supported_parameters": reasoning_ok,
+        },
+        #
+        # Through the no-harm arm: mandatory and high would otherwise
+        # admit it, exactly as m/mandatory-at-high-no-budget is admitted.
+        {
+            "id": "m/contradictory-no-budget",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": False,
+                "default_effort": "high",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # And through the true-ceiling arm, which needed the guard just
+        # as much: already_reasons is satisfied by mandatory alone, so
+        # this shape cleared it before the invariant existed.
+        {
+            "id": "m/contradictory-with-budget",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": False,
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # Always reasons AND takes a real token budget, which is the
+        # only shape that may receive an unprompted cap.
+        {
+            "id": "m/mandatory",
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Reasons unless told not to, and takes a real budget.
+        {
+            "id": "m/on",
+            "reasoning": {"default_enabled": True, "supports_max_tokens": True},
+            "supported_parameters": reasoning_ok,
+        },
+        # Reasons by default at a high effort, but NOT mandatory and with
+        # no budget support. Refused, and the reason is the boundary of
+        # the no-harm extension: that extension requires mandatory,
+        # because only mandatory proves thinking is unconditionally on.
+        # default_enabled is a DEFAULT, and a default is a statement
+        # about what happens when nobody chose, not a guarantee that
+        # thinking is happening on this request.
+        {
+            "id": "m/enabled-at-high-not-mandatory",
+            "reasoning": {"default_enabled": True, "default_effort": "high"},
+            "supported_parameters": reasoning_ok,
+        },
+        # Thinking is OFF. Sending a cap here would switch it on.
+        {
+            "id": "m/off",
+            "reasoning": {"default_enabled": False},
+            "supported_parameters": reasoning_ok,
+        },
+        # A descriptor that answers neither question.
+        {
+            "id": "m/unstated",
+            "reasoning": {"supported_efforts": ["low"]},
+            "supported_parameters": reasoning_ok,
+        },
+        # Thinks unprompted but does NOT advertise the parameter. This
+        # is the strict-mode case: no such model exists in today's
+        # catalog, and the gate must still refuse it.
+        {
+            "id": "m/thinks-but-unadvertised",
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
+            "supported_parameters": ["max_tokens"],
+        },
+        # Thinks unprompted, and the catalog does not say what it takes.
+        {
+            "id": "m/thinks-no-param-list",
+            "reasoning": {"mandatory": True, "supports_max_tokens": True},
+        },
+        # No descriptor at all.
+        {"id": "m/none", "supported_parameters": reasoning_ok},
+    ]
+
+    async def go():
+        async with httpx.AsyncClient(trust_env=False) as c:
+            with respx.mock:
+                respx.get(MODELS_URL).respond(json={"data": entries})
+                return await fetch_catalog(c)
+
+    catalog = asyncio.run(go())
+    flags = {m["id"]: m["may_send_reasoning_cap"] for m in catalog["models"]}
+    assert flags == {
+        # The review's two named examples, both refused.
+        "openai/gpt-5.1": False,
+        "google/gemini-3.1-flash-lite": False,
+        "m/mandatory-but-minimal": False,
+        # The isolating pair: one field apart, opposite answers.
+        "m/enabled-but-effort-none": False,
+        "m/enabled-and-effort-medium": True,
+        # The no-harm extension's contrasting pair: same mandatory flag,
+        # same missing budget support, opposite verdicts, decided only
+        # by which way a cap could move the thinking.
+        "m/mandatory-at-high-no-budget": True,
+        "m/mandatory-at-minimal-no-budget": False,
+        # The boundary itself, at exactly REASONING_BUDGET_SHARE, and
+        # reachable only through the extension. This is the row that
+        # makes ">= medium" different from "> medium".
+        "m/mandatory-at-medium-no-budget": True,
+        # A descriptor that contradicts itself vouches for nothing,
+        # through any arm.
+        "m/contradictory-no-budget": False,
+        "m/contradictory-with-budget": False,
+        # The review's production-path shape, and the same shape with
+        # the ceiling flag removed.
+        "m/mandatory-enabled-but-effort-none": False,
+        "m/mandatory-but-effort-none": False,
+        # Reasons with a real budget: the cap is a ceiling, so it rides.
+        "m/mandatory": True,
+        "m/on": True,
+        # Reasons at high, but not mandatory: outside the extension.
+        "m/enabled-at-high-not-mandatory": False,
+        "m/off": False,
+        "m/unstated": False,
+        "m/thinks-but-unadvertised": False,
+        "m/thinks-no-param-list": False,
+        "m/none": False,
+    }
+
+
+# ---- T4: is_byok is a boolean on every surface, or an explicit null.
+
+
+@respx.mock
+@pytest.mark.parametrize(
+    "wire,expected",
+    [({"is_byok": True}, True), ({"is_byok": False}, False), ({}, None)],
+    ids=["reported true", "reported false", "not reported"],
+)
+def test_review_repro_is_byok_survives_every_surface_as_a_json_boolean(
+    client, wire, expected
+):
+    """WINDOW: one run, read back through every surface that serves it:
+    the batch response, the run detail, the group detail, and the
+    export line.
+
+    THE DEFECT. ModelResult never declared the field, and it carries
+    pydantic's default extra="ignore", so the key was DELETED from every
+    body serialized through it. That is /compare, and via
+    StoredModelResult it is GET /runs/{id} and GET /groups/{id} too. The
+    SSE done frame json.dumps the raw dict and so carried it, which left
+    the API and the stream disagreeing about the same run.
+
+    THREE STATES OR NOTHING. A consumer that cannot tell true from false
+    from absent cannot use the flag for the one thing it exists for,
+    which is deciding whether an upstream figure is a second bill. So
+    each surface is asserted to CONTAIN the key, by membership, and then
+    for its value by identity. Membership is the load-bearing half: an
+    assertion written as `body.get("is_byok") == expected` passes for
+    the not-reported case with the key entirely absent, which is exactly
+    the defect.
+    """
+    usage = {"prompt_tokens": 5, "completion_tokens": 5, "cost": 0.5, **wire}
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200, json={**response_for("model/alpha", "hi"), "usage": usage}
+        )
+    )
+
+    gid = client.post("/groups", json={"budget": "standard"}).json()["id"]
+    resp = client.post(
+        "/compare",
+        json={"prompt": "p", "models": ["model/alpha"], "group_id": gid},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()["results"][0]
+    run_id = resp.json()["run_id"]
+
+    # 1. The batch response.
+    assert "is_byok" in body
+    assert body["is_byok"] is expected
+
+    # 2. The run detail.
+    detail = client.get(f"/runs/{run_id}").json()["results"][0]
+    assert "is_byok" in detail
+    assert detail["is_byok"] is expected
+
+    # 3. The group detail, which reaches the same row by another route.
+    group = client.get(f"/groups/{gid}").json()["runs"][0]["results"][0]
+    assert "is_byok" in group
+    assert group["is_byok"] is expected
+
+
+@respx.mock
+def test_review_repro_a_non_byok_upstream_figure_is_not_reported_as_a_second_bill(
+    client, tmp_path
+):
+    """WINDOW: an experiment report's cost block, for a run whose wire
+    shape is the live probe's.
+
+    THE DEFECT, and it published money that did not exist. _cost_totals
+    collected every non-null upstream figure and the report called them
+    all BYOK charges billed direct. Presence was taken as proof of
+    billing mode. tests/fixtures/probe_reasoning_enable.json is a
+    verbatim capture of a NON-BYOK call carrying an upstream figure
+    equal to the credit charge to the last digit, so on that route the
+    report published OpenRouter's own charge a second time as a separate
+    provider invoice for a bring-your-own-key run that never happened.
+
+    THE PROBE'S OWN SHAPE IS THE FIXTURE HERE, so this cannot pass by
+    testing a number nobody has seen.
+    """
+    probe = json.loads(
+        (Path(__file__).parent / "fixtures" / "probe_reasoning_enable.json").read_text()
+    )["capped"]["usage"]
+    assert probe["is_byok"] is False
+    assert probe["cost_details"]["upstream_inference_cost"] > 0
+
+    # The experiment runner streams, so the probe's usage block is
+    # delivered the way a real trial would receive it.
+    def route(request):
+        return httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "hi"}}]}),
+                    sse({"choices": [], "usage": probe}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "p"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    cost = client.get(f"/experiments/{eid}/report").json()["models"][0]["cost"]
+
+    # The figure is recorded, because the wire reported it.
+    assert cost["upstream"]["not_byok"]["trials"] == 1
+    # And it is NOT a bill.
+    assert cost["upstream"]["byok"] == {"trials": 0, "values": []}
+    assert cost["upstream"]["unknown"] == {"trials": 0, "values": []}
+    # NOT DOUBLED, which is the assertion that actually catches the
+    # defect. The credit charge and the upstream figure are the SAME
+    # number on this route, to the last digit, which is precisely why
+    # the old report could publish it twice without anything looking
+    # odd. A test comparing the two strings could never see that; a test
+    # that pins the total to ONE copy of the charge can.
+    charge = probe["cost"]
+    assert cost["total_usd"] == pytest.approx(charge)
+    assert cost["total_usd"] != pytest.approx(charge * 2)
+    # And the figure that would have been added is recorded verbatim,
+    # unsummed, in the bucket that says what it actually is.
+    assert cost["upstream"]["not_byok"]["values"] == [
+        repr(probe["cost_details"]["upstream_inference_cost"])
+    ]
