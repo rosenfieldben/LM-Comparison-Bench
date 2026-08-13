@@ -12910,6 +12910,52 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
             "reasoning": {"mandatory": True, "default_effort": "minimal"},
             "supported_parameters": reasoning_ok,
         },
+        # MANDATORY AT MEDIUM, AND NOTHING ELSE, which is the exact
+        # boundary of the no-harm extension and was not isolated until a
+        # review said so. The extension admits a route whose default
+        # share is at or above REASONING_BUDGET_SHARE, and medium IS
+        # that share: 0.5 against 0.5. Every other medium row in this
+        # table also publishes supports_max_tokens, so it clears the
+        # OTHER arm and the boundary comparison is never the thing
+        # deciding it. Changing >= to > would have passed.
+        #
+        # This row publishes no budget support, so only the extension
+        # can admit it, and only the boundary comparison can let the
+        # extension do so.
+        {
+            "id": "m/mandatory-at-medium-no-budget",
+            "reasoning": {"mandatory": True, "default_effort": "medium"},
+            "supported_parameters": reasoning_ok,
+        },
+        # ---- THE SELF-CONTRADICTING DESCRIPTOR, refused through both
+        # ---- arms. mandatory true says the operator may not turn
+        # ---- thinking off; default_enabled false says it is off unless
+        # ---- somebody turns it on. Both cannot hold, and a parser that
+        # ---- believes the convenient half can be talked into anything.
+        #
+        # Through the no-harm arm: mandatory and high would otherwise
+        # admit it, exactly as m/mandatory-at-high-no-budget is admitted.
+        {
+            "id": "m/contradictory-no-budget",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": False,
+                "default_effort": "high",
+            },
+            "supported_parameters": reasoning_ok,
+        },
+        # And through the true-ceiling arm, which needed the guard just
+        # as much: already_reasons is satisfied by mandatory alone, so
+        # this shape cleared it before the invariant existed.
+        {
+            "id": "m/contradictory-with-budget",
+            "reasoning": {
+                "mandatory": True,
+                "default_enabled": False,
+                "supports_max_tokens": True,
+            },
+            "supported_parameters": reasoning_ok,
+        },
         # Always reasons AND takes a real token budget, which is the
         # only shape that may receive an unprompted cap.
         {
@@ -12985,6 +13031,14 @@ def test_the_boot_catalog_derives_the_flag_from_the_published_descriptor():
         # by which way a cap could move the thinking.
         "m/mandatory-at-high-no-budget": True,
         "m/mandatory-at-minimal-no-budget": False,
+        # The boundary itself, at exactly REASONING_BUDGET_SHARE, and
+        # reachable only through the extension. This is the row that
+        # makes ">= medium" different from "> medium".
+        "m/mandatory-at-medium-no-budget": True,
+        # A descriptor that contradicts itself vouches for nothing,
+        # through either arm.
+        "m/contradictory-no-budget": False,
+        "m/contradictory-with-budget": False,
         # Reasons with a real budget: the cap is a ceiling, so it rides.
         "m/mandatory": True,
         "m/on": True,

@@ -2400,6 +2400,7 @@ def test_no_model_name_appears_in_the_reservation_logic():
 
 
 from bench.models import (  # noqa: E402
+    EFFORT_SHARES,
     REASONING_SHARE_EXHAUSTED,
     _ingest_usage,
     empty_response_error,
@@ -2661,6 +2662,48 @@ process.stdout.write(JSON.stringify({
     # And the table straddles the boundary, so agreement is a fact about
     # the rule rather than about a table that only asks easy questions.
     assert True in python_verdicts and False in python_verdicts
+
+
+def test_review_repro_the_effort_ladder_is_one_table_in_two_languages():
+    """WINDOW: EFFORT_SHARES as each language holds it, compared entry
+    for entry.
+
+    THE DEFECT THIS GUARDS. The frontend decided whether a lower effort
+    was selectable by comparing STRINGS against one constant, so
+    "unset", "minimal" and "none" were all read as above the floor. The
+    fix compares SHARES, which needs the ladder on the frontend too, and
+    a second copy of a pinned table is a second thing to forget when the
+    page changes.
+
+    EXECUTED, NOT SEARCHED FOR, exactly as the exhaustion threshold's
+    comparison is. Reading the constant out of the JavaScript by
+    regular expression would fail on formatting and pass on a renamed
+    key.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: the ratios are the ones quoted
+    beside the Python table, from
+    https://openrouter.ai/docs/guides/best-practices/reasoning-tokens,
+    and the page states them as the effort_ratio values in
+    budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024).
+    """
+    proc = subprocess.run(
+        [
+            "node",
+            "-e",
+            "process.stdout.write(JSON.stringify(require(process.argv[1])"
+            ".EFFORT_SHARES))",
+            str(Path(__file__).parent.parent / "static" / "lib.js"),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    assert json.loads(proc.stdout) == EFFORT_SHARES
+    # And the floor the frontend advises against is really on it, so a
+    # lookup there cannot silently return undefined and disable the
+    # advice for everybody.
+    assert EFFORT_SHARES["low"] == 0.2
 
 
 @respx.mock

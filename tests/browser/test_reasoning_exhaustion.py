@@ -76,6 +76,22 @@ def test_review_repro_an_exhausted_card_says_where_the_money_went(bench):
     expect(card.get_by_test_id("metric-reasoning")).to_have_text("8192")
 
 
+def choose_effort(page, effort):
+    """Select a reasoning effort in Experiment controls.
+
+    Four tests need one on the record now. Advice to LOWER the effort
+    requires an effort the ladder can place above the floor, and with
+    nothing chosen the route runs at its catalog default, which the card
+    does not know and which may be below "low": openai/gpt-5.1 publishes
+    default_effort "none" and the Flash-Lite variants publish "minimal".
+    Recommending "low" there would raise reasoning on a card whose whole
+    subject is that reasoning consumed the budget.
+    """
+    page.get_by_test_id("toggle-controls").click()
+    expect(page.get_by_test_id("experiment-controls")).to_be_visible()
+    page.get_by_test_id("ctl-effort").select_option(effort)
+
+
 def test_review_repro_a_standard_card_offers_both_remedies(bench):
     """WINDOW: the same card at the standard budget, reading the remedy
     the frontend appends.
@@ -87,9 +103,16 @@ def test_review_repro_a_standard_card_offers_both_remedies(bench):
     every existing test stayed green. The branch reads the token counts
     now, which is both why it survives this rewording and why it fires
     on a route where the server could not label anything.
+
+    AN EFFORT IS SELECTED HERE and was not before. This test used to
+    assert both clauses with nothing chosen, which encoded the defect a
+    later review found: absent effort was read as "above the minimum"
+    when it means "unknown". Both clauses still ride, for a run where
+    both remedies are real.
     """
     page = bench(["stub/exhausted"])
     check_all_chips(page)
+    choose_effort(page, "high")
     run(page, "standard remedy")
 
     card = cards(page).first
@@ -97,6 +120,29 @@ def test_review_repro_a_standard_card_offers_both_remedies(bench):
     expect(card.get_by_test_id("card-error")).to_contain_text(
         "try extended budget or a lower reasoning effort"
     )
+
+
+def test_review_repro_an_unknown_effort_is_not_advised_downward(bench):
+    """WINDOW: the same exhausted card with NO effort selected.
+
+    THE OTHER HALF OF THE RULE, and the one the old tests asserted
+    backwards. With nothing chosen the run used the route's catalog
+    default. The card cannot see that default, and two measured families
+    publish one BELOW the lowest selectable effort, so "try a lower
+    reasoning effort" could be advice to raise it.
+
+    The budget clause is unaffected and still rides, which is what makes
+    this a narrowing of one clause rather than the card going quiet.
+    """
+    page = bench(["stub/exhausted"])
+    check_all_chips(page)
+    run(page, "unknown effort")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+    error = card.get_by_test_id("card-error")
+    expect(error).to_contain_text("try extended budget")
+    expect(error).not_to_contain_text("lower reasoning effort")
 
 
 def test_review_repro_an_extended_card_offers_the_only_remedy_left(bench):
@@ -114,6 +160,7 @@ def test_review_repro_an_extended_card_offers_the_only_remedy_left(bench):
     page = bench(["stub/exhausted"])
     check_all_chips(page)
     page.get_by_test_id("budget-extended").click()
+    choose_effort(page, "high")
     run(page, "extended remedy")
 
     card = cards(page).first
@@ -378,6 +425,7 @@ def test_a_real_truncation_still_gets_the_causal_label_and_the_remedy(bench):
     """
     page = bench(["stub/exhausted"])
     check_all_chips(page)
+    choose_effort(page, "high")
     run(page, "true truncation")
 
     card = cards(page).first
@@ -478,6 +526,7 @@ def test_review_repro_a_replayed_card_carries_the_same_remedy(bench, open_histor
     """
     page = bench(["stub/exhausted"])
     check_all_chips(page)
+    choose_effort(page, "high")
     run(page, "replay remedy")
     card = cards(page).first
     expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
@@ -489,6 +538,64 @@ def test_review_repro_a_replayed_card_carries_the_same_remedy(bench, open_histor
 
     replayed = cards(page).first.get_by_test_id("card-error")
     expect(replayed).to_have_text(live)
+
+
+def test_review_repro_a_replayed_extended_run_is_not_told_to_try_extended(
+    bench, open_history
+):
+    """WINDOW: one extended card replayed from History, after the
+    catalog's published cap has grown past what the run was sent.
+
+    THE DEFECT. The remedy compares two numbers from two different
+    moments: extendedCap is what the catalog publishes NOW, and
+    result.max_tokens is what this run was sent, possibly weeks ago. A
+    live card cannot notice, because both are read in the same instant.
+    A replayed one can, and does: a run that already selected extended
+    and was clamped begins advising "try extended budget" the moment the
+    published cap rises above what it received. The advice is to do the
+    thing that was already done, at four times the price.
+
+    The tier was on the group row the whole time. History simply never
+    passed it, so the replayed card could not tell "extended was asked
+    for and clamped" from "standard was asked for".
+
+    THE CATALOG GROWTH IS SIMULATED, and it has to be: a published cap
+    cannot change inside one browser session, so the condition is
+    created by overriding effectiveCap between the run and the replay.
+    What is under test is history.js supplying the stored tier, not the
+    catalog's ability to change. The override is applied AFTER the live
+    render so the live card is untouched by it.
+    """
+    page = bench(["stub/capped-thinker"])
+    check_all_chips(page)
+    page.get_by_test_id("budget-extended").click()
+    choose_effort(page, "high")
+    run(page, "clamped extended replay")
+
+    card = cards(page).first
+    expect(status_of(card)).to_have_text("error", timeout=DONE_TIMEOUT)
+
+    # The catalog now publishes far more than this run received.
+    page.evaluate(
+        "() => { window.BenchControls.effectiveCap = () => 65536; }",
+    )
+
+    open_history()
+    page.get_by_test_id("history-row").filter(
+        has_text="clamped extended replay"
+    ).first.click()
+
+    # PRE-STATE, on the replayed card itself: the run really was
+    # clamped to 4096 while the override now claims 65536, so the cap
+    # comparison alone WOULD offer the extended budget and the stored
+    # tier is the only thing that can stop it.
+    expect(page.get_by_test_id("budget-note").first).to_have_text("budget cap 4096")
+
+    replayed = cards(page).first.get_by_test_id("card-error")
+    # The clause that can still help survives, so this is the tier being
+    # read rather than the remedy being switched off.
+    expect(replayed).to_contain_text("try a lower reasoning effort")
+    expect(replayed).not_to_contain_text("extended budget")
 
 
 def test_review_repro_a_whitespace_only_answer_is_not_a_blank_success(bench):

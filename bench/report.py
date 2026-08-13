@@ -1331,14 +1331,14 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     streamed tokens before breaking carries a real charge, and leaving it
     out would under-report the bill by exactly what the failures cost.
     """
-    billed = [
-        r["billed_cost_usd"] for r in results if r.get("billed_cost_usd") is not None
-    ]
-    estimated = [
-        r["cost_usd"]
+    billed_rows = [r for r in results if r.get("billed_cost_usd") is not None]
+    estimated_rows = [
+        r
         for r in results
         if r.get("billed_cost_usd") is None and r.get("cost_usd") is not None
     ]
+    billed = [r["billed_cost_usd"] for r in billed_rows]
+    estimated = [r["cost_usd"] for r in estimated_rows]
     unpriced = len(results) - len(billed) - len(estimated)
     # THE UPSTREAM FIGURES, verbatim and NEVER SUMMED into total_usd,
     # and now SPLIT BY WHETHER ANYBODY SAID THEY WERE A SECOND BILL.
@@ -1368,13 +1368,40 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
     # Kept as the strings that were stored, because the whole use for
     # them is matching a provider's own invoice line and a float would
     # reformat the number being matched.
-    upstream: dict[str, list[str]] = {"byok": [], "not_byok": [], "unknown": []}
+    # FOUR BUCKETS, NOT THREE, and the fourth exists because the third
+    # was described with a sentence that could be false. A non-BYOK
+    # figure was reported to the reader as "already inside the total",
+    # which is true of a trial that has a price and false of one that
+    # does not. The shape is not hypothetical: a trial with no billed
+    # charge, no local estimate and an upstream figure of 0.0042
+    # produced total_usd 0, unpriced_trials 1 and non_byok_trials 1, so
+    # the UI said 0.0042 was already inside a total of nothing.
+    #
+    # Being unpriced is a property of the TRIAL, not of the flag, so it
+    # is read from the same two fields that decide the counts above
+    # rather than from anything about BYOK.
+    # BY IDENTITY, not by equality. Two trials of the same model on the
+    # same task with the same outcome are equal dicts and different
+    # rows, and `r in billed_rows` would answer for whichever came
+    # first.
+    priced = {id(r) for r in billed_rows} | {id(r) for r in estimated_rows}
+    upstream: dict[str, list[str]] = {
+        "byok": [],
+        "not_byok": [],
+        "not_byok_unpriced": [],
+        "unknown": [],
+    }
     for r in results:
         figure = r.get("upstream_inference_cost_usd")
         if figure is None:
             continue
         flag = as_flag(r.get("is_byok"))
-        bucket = "byok" if flag is True else "not_byok" if flag is False else "unknown"
+        if flag is True:
+            bucket = "byok"
+        elif flag is False:
+            bucket = "not_byok" if id(r) in priced else "not_byok_unpriced"
+        else:
+            bucket = "unknown"
         upstream[bucket].append(figure)
     any_upstream = any(upstream.values())
     return {

@@ -22,6 +22,7 @@ const {
   reasoningShare,
   remedyFor,
   LOWEST_SELECTABLE_EFFORT,
+  EFFORT_SHARES,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
 } = require("../../static/lib.js");
@@ -391,22 +392,68 @@ test("no budget advice when a larger budget does not exist", () => {
   assert.ok(room.includes("try extended budget"));
 });
 
-test("no lower-effort advice at the UI minimum", () => {
-  // index.html offers unset, low, medium, high. low is the floor.
+test("review repro: lower-effort advice needs a lower effort to exist", () => {
+  // THE FLOOR, asserted against the documented ladder rather than
+  // against index.html's option list. A decision to expose "minimal"
+  // should move this test rather than pass quietly, and the ladder is
+  // what the comparison actually uses.
   assert.equal(LOWEST_SELECTABLE_EFFORT, "low");
-
-  const atFloor = remedyFor(
-    { max_tokens: 4096 },
-    { extendedCap: 4096, effort: "low" },
-  );
-  // Nothing can help, so nothing is said: the accounting sentence
-  // stands alone.
-  assert.equal(atFloor, "");
-
-  for (const effort of ["medium", "high", undefined, ""]) {
-    const out = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort });
-    assert.ok(out.includes("a lower reasoning effort"), String(effort));
+  assert.equal(EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT], 0.2);
+  for (const below of ["none", "minimal"]) {
+    assert.ok(
+      EFFORT_SHARES[below] < EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT],
+      below,
+    );
   }
+
+  // THE DEFECT THIS ROW REPLACES, and the old version of this test
+  // asserted it. undefined and "" were listed beside "medium" and
+  // "high" as efforts that can be lowered, on the reasoning that
+  // choosing nothing is "above the minimum". It is not: with nothing
+  // chosen the route runs at its CATALOG default, which the card does
+  // not know. openai/gpt-5.1 publishes default_effort "none" and the
+  // Flash-Lite variants publish "minimal", both BELOW low, so the
+  // advice would have raised reasoning on a card whose whole subject is
+  // that reasoning consumed the budget.
+  for (const effort of [undefined, "", null, "low", "minimal", "none", "??"]) {
+    assert.equal(
+      remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort }),
+      "",
+      String(effort),
+    );
+  }
+
+  // And it IS offered for the two the ladder can place above the floor.
+  for (const effort of ["medium", "high"]) {
+    const out = remedyFor({ max_tokens: 4096 }, { extendedCap: 4096, effort });
+    assert.ok(out.includes("a lower reasoning effort"), effort);
+  }
+});
+
+test("review repro: a replayed extended run is not told to try extended", () => {
+  // THE DEFECT. extendedCap is what the catalog publishes TODAY;
+  // result.max_tokens is what this run was SENT, possibly long ago. On
+  // a replayed card those are two different points in time, so a run
+  // that already selected extended and was clamped to 4096 begins being
+  // advised to "try extended budget" the moment the published cap rises
+  // above 4096. The advice is to do the thing that was already done.
+  const sent = { max_tokens: 4096 };
+  const capRose = { extendedCap: 65536, effort: "high" };
+
+  // Without the tier, the cap comparison alone still advises it, which
+  // is correct when the tier really was standard.
+  const asStandard = remedyFor(sent, { ...capRose, budget: "standard" });
+  assert.ok(asStandard.includes("try extended budget"));
+
+  // With the stored tier saying extended, only the effort clause
+  // survives.
+  const asExtended = remedyFor(sent, { ...capRose, budget: "extended" });
+  assert.equal(asExtended, "; try a lower reasoning effort");
+
+  // A row that carries no tier at all (every group written before the
+  // column existed) keeps the old reading rather than losing the
+  // advice: absent is not "extended".
+  assert.ok(remedyFor(sent, capRose).includes("try extended budget"));
 });
 
 test("both clauses when both remedies exist, joined once", () => {

@@ -580,6 +580,13 @@
         {
           extendedCap: BenchControls.effectiveCap(result.model, "extended"),
           effort: group.params?.effort,
+          // THE TIER THIS COMPARISON ASKED FOR, which the row cannot
+          // carry and the group can. Without it a replayed card
+          // compares today's published cap against yesterday's sent
+          // ceiling and advises "try extended budget" for a run that
+          // already selected extended, purely because the catalog cap
+          // moved.
+          budget: group.budget,
         },
       );
     }

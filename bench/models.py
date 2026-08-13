@@ -1339,6 +1339,34 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # silence.
         reasoning = entry.get("reasoning")
         if isinstance(reasoning, dict):
+            # A DESCRIPTOR THAT CONTRADICTS ITSELF VOUCHES FOR
+            # NOTHING. mandatory true means the operator may not turn
+            # thinking off; default_enabled false means it is off unless
+            # somebody turns it on. Both cannot be true of one route,
+            # and a parser that believes the convenient half of a
+            # contradiction is a parser that can be talked into
+            # anything.
+            #
+            # THE INVARIANT: for any descriptor this gate vouches for,
+            # mandatory true implies default_enabled is not false. It is
+            # enforced here rather than asserted downstream because the
+            # gate is the only place that reads both keys, and it is
+            # enforced ahead of BOTH arms because both would otherwise
+            # admit the shape. already_reasons is satisfied by mandatory
+            # alone, so the true-ceiling arm needed the guard as much as
+            # the no-harm arm did.
+            #
+            # FAIL CLOSED, which here means the reservation is not sent
+            # and the pre-feature payload rides. Not observed in the
+            # live catalog on 2026-08-12 or 2026-08-13, and that is a
+            # reason to keep the check cheap rather than a reason to
+            # skip it: the cost of being wrong is switching thinking ON
+            # for a route whose catalog entry says it is off, which is
+            # this workstream's founding defect.
+            contradictory = (
+                reasoning.get("mandatory") is True
+                and reasoning.get("default_enabled") is False
+            )
             already_reasons = reasoning.get("mandatory") is True or (
                 reasoning.get("default_enabled") is True
                 # "none" is off, and it is checked here rather than
@@ -1410,7 +1438,9 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
                 and default_share >= REASONING_BUDGET_SHARE
                 and advertised
             )
-            model["may_send_reasoning_cap"] = a_true_ceiling or cannot_raise_or_enable
+            model["may_send_reasoning_cap"] = not contradictory and (
+                a_true_ceiling or cannot_raise_or_enable
+            )
         # OpenRouter publishes a per-model completion cap under
         # top_provider where known. The budget clamp needs it: sending
         # a budget above the cap is a hard 400 from some providers.

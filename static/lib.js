@@ -290,6 +290,22 @@
     return Math.round((reasoningTokens / completionTokens) * 100);
   }
 
+  // The documented effort ladder, as SHARES of the outer budget, so
+  // "is this one lower than that one" is a comparison of numbers rather
+  // than of positions in a list somebody has to keep ordered. Mirrors
+  // EFFORT_SHARES in bench/models.py, which carries the pinned quotes
+  // and the read date; a cross-language test executes both against the
+  // same questions so the two cannot drift.
+  const EFFORT_SHARES = {
+    none: 0.0,
+    minimal: 0.1,
+    low: 0.2,
+    medium: 0.5,
+    high: 0.8,
+    xhigh: 0.95,
+    max: 0.95,
+  };
+
   // The lowest reasoning effort the UI can actually select. Mirrors
   // the option list in index.html; "unset" is NOT lower, because on a
   // vouched model the bench then sends its own half-budget reservation
@@ -323,19 +339,44 @@
     const sent = result.max_tokens;
     const extendedCap = opts.extendedCap;
     const parts = [];
-    // A bigger budget is only advice if a bigger budget exists.
+    // A bigger budget is only advice if a bigger budget exists AND was
+    // not already asked for. The cap comparison alone is not enough on
+    // a replayed card: extendedCap is what the catalog says TODAY while
+    // sent is what this run received, so a run that already selected
+    // extended and was clamped to 4096 starts being told to "try
+    // extended budget" the moment the published cap rises above 4096.
+    // The tier that was selected is on the stored row and only had to
+    // be passed in.
     if (
+      opts.budget !== "extended" &&
       typeof sent === "number" &&
       typeof extendedCap === "number" &&
       extendedCap > sent
     ) {
       parts.push("extended budget");
     }
-    // A lower effort is only advice if a lower effort is selectable.
-    // Absent means the operator chose nothing, which is above the
-    // minimum: choosing "low" would genuinely reduce the thinking.
+    // A lower effort is only advice when a LOWER one demonstrably
+    // exists, and absent is not evidence of that.
+    //
+    // THE DEFECT. Absent was read as "the operator chose nothing, which
+    // is above the minimum, so choosing low would reduce the thinking".
+    // The first half is true and the second does not follow: with
+    // nothing chosen the route runs at its CATALOG default, which the
+    // card does not know and which may be minimal (0.1) or none (0.0).
+    // Selecting low (0.2) would then RAISE reasoning, on a card whose
+    // entire subject is that reasoning consumed the budget. Two
+    // measured examples exist: openai/gpt-5.1 publishes default_effort
+    // "none", and the Flash-Lite variants publish "minimal".
+    //
+    // So the advice rides only for an effort this ladder can place
+    // strictly above the lowest selectable one. Unknown names are
+    // treated as unknown rather than as high.
     const effort = opts.effort;
-    if (!effort || effort !== LOWEST_SELECTABLE_EFFORT) {
+    const current = EFFORT_SHARES[effort];
+    if (
+      typeof current === "number" &&
+      current > EFFORT_SHARES[LOWEST_SELECTABLE_EFFORT]
+    ) {
       parts.push("a lower reasoning effort");
     }
     if (!parts.length) return "";
@@ -362,6 +403,7 @@
     reasoningShare,
     remedyFor,
     LOWEST_SELECTABLE_EFFORT,
+    EFFORT_SHARES,
     REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
   };

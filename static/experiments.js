@@ -19,6 +19,7 @@
     const parts = [];
     const byok = upstream.byok?.trials;
     const notByok = upstream.not_byok?.trials;
+    const notByokUnpriced = upstream.not_byok_unpriced?.trials;
     const unknown = upstream.unknown?.trials;
     // The only bucket that is a second bill: is_byok said so.
     if (byok) {
@@ -37,6 +38,22 @@
           " non-BYOK trial" +
           (notByok === 1 ? "" : "s") +
           " also reported an upstream figure, already inside the total",
+      );
+    }
+    // NON-BYOK AND UNPRICED, which the clause above must not claim. It
+    // says "already inside the total", and that is true only of a trial
+    // the total counted. A trial with no billed charge and no local
+    // estimate contributes nothing, so on a report whose total is zero
+    // the old wording told a reader a figure was inside a total of
+    // nothing. What can honestly be said is the half that is still
+    // true: nobody called it a second bill, and the trial has no price.
+    if (notByokUnpriced) {
+      parts.push(
+        notByokUnpriced +
+          " unpriced non-BYOK trial" +
+          (notByokUnpriced === 1 ? "" : "s") +
+          " reported an upstream figure, not added as a separate bill " +
+          "and not priced in the total",
       );
     }
     // Written before the flag existed. Unknown is not a synonym for no.

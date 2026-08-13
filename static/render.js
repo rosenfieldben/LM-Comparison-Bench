@@ -568,6 +568,25 @@
   // again on a rerun of the same card, and an indicator left over from
   // the previous attempt would describe tokens the current result never
   // spent. resetColumn clears the metrics for the same reason.
+  // WHAT remedyFor NEEDS, gathered once. Three places along one call
+  // chain used to re-list these by hand (history's call to fillColumn,
+  // fillColumn's call to completeColumn, and completeColumn's two calls
+  // to remedyFor), so adding an input meant editing four lists and
+  // getting all four right. Adding the selected budget tier proved the
+  // point immediately: history passed it and it was dropped twice
+  // before reaching the function that reads it, leaving a replayed card
+  // advising the tier it had already used.
+  //
+  // Reading opts rather than taking the fields apart keeps the count of
+  // hand-written lists at one.
+  function remedyInputs(opts) {
+    return {
+      extendedCap: opts.extendedCap,
+      effort: opts.effort,
+      budget: opts.budget,
+    };
+  }
+
   function addReasoningIndicator(ui, result, opts) {
     // Idempotent on its own, not only via resetColumn. completeColumn
     // can run twice on one card without a reset: stream.js calls finish()
@@ -602,10 +621,7 @@
     // Derived from the same rule now, so the two sentences on one card
     // cannot contradict each other. When no lower effort is selectable
     // the accounting sentence stands alone, which is the honest answer.
-    const advice = remedyFor(result, {
-      extendedCap: opts.extendedCap,
-      effort: opts.effort,
-    });
+    const advice = remedyFor(result, remedyInputs(opts));
     warn.title =
       "reasoning tokens are billed as completion tokens and never appear " +
       "in the answer" +
@@ -678,10 +694,7 @@
     // the effort that was selected.
     let error = "shownError" in opts ? opts.shownError : result.error;
     if (error != null && exhaustionRemedyApplies(result)) {
-      error += remedyFor(result, {
-        extendedCap: opts.extendedCap,
-        effort: opts.effort,
-      });
+      error += remedyFor(result, remedyInputs(opts));
     }
     applyError(ui, error);
     // A user Stop is neither done nor a provider failure, and a spend
@@ -744,12 +757,21 @@
       budgetBadge: true,
       retry: null,
       // A stored row carries the cap it was SENT but not what another
-      // tier would send, and not which effort was selected. Both come
-      // from the caller, which is history, and both are optional: a
-      // replay with neither still derives the effort clause correctly
-      // and simply cannot offer the budget one.
+      // tier would send, not which effort was selected, and not which
+      // TIER was asked for. All three come from the caller, which is
+      // history, and all three are optional: a replay with none of them
+      // still renders, it simply advises less.
+      //
+      // THIS LIST IS AN ALLOWLIST AND HAS TO BE MAINTAINED. It is not a
+      // spread, on purpose, so a caller cannot reach past fillColumn
+      // into completeColumn's other switches. The cost is that a new
+      // option added at the call site is silently dropped here, which
+      // is exactly what happened to budget: history passed it, this
+      // function did not forward it, and the replayed card went on
+      // advising the tier it had already used.
       extendedCap: extra.extendedCap,
       effort: extra.effort,
+      budget: extra.budget,
     });
   }
 
