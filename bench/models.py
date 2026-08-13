@@ -677,10 +677,23 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
     strict mode refuses on it, exactly as it refuses on a model the
     catalog does not list.
 
-    Only the two fields a decision is made from are kept. Anything else
-    the endpoint publishes is not this function's business, and a parser
-    that carried it would invite somebody to make a second decision from
-    a field nobody checked.
+    Only the fields a decision is made from are kept. Anything else the
+    endpoint publishes is not this function's business, and a parser that
+    carried it would invite somebody to make a second decision from a
+    field nobody checked.
+
+    max_completion_tokens JOINED THAT LIST after a review found the
+    consequence of its absence. It is documented on the endpoints
+    listing, https://openrouter.ai/docs/api/api-reference/endpoints/
+    list-all-endpoints-for-a-model, read 2026-08-13, and until it was
+    kept here the only completion cap the budget arithmetic could see
+    was the model-level one. A model-level cap is the MAXIMUM across
+    every host serving the model, so a pinned run budgeted from it
+    budgeted from the most generous host in the pool and sent the answer
+    to whichever host the pin named. Measured the same day on
+    openai/gpt-oss-120b: model level 131072, endpoints 8192 through
+    131072, with the standard tier's 16384 already twice the cheapest
+    route's ceiling.
     """
     out: dict[str, Any] = {"fetched": False, "endpoints": []}
     try:
@@ -703,12 +716,28 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
         endpoints.append(
             {
                 "provider": _as_label(entry.get("provider_name")),
+                # WHAT A PIN IS MATCHED ON, and it is not the name above.
+                # See _endpoint_slug: the display name does not reliably
+                # lowercase into the documented slug, and on one measured
+                # provider it lowercases into a DIFFERENT provider's.
+                "slug": _endpoint_slug(entry.get("tag")),
                 # None when the endpoint did not publish a list, which is
                 # not the same as publishing an empty one.
                 "supported_parameters": (
                     sorted({x for x in supported if isinstance(x, str)})
                     if isinstance(supported, list)
                     else None
+                ),
+                # Positive ints only. A cap of 0, a negative, a float or
+                # a string is not a ceiling anybody can budget against,
+                # and reading one as though it were would clamp every
+                # request on that route to nothing. Absent and
+                # unusable collapse to the same None here because the
+                # caller does the same thing with both: fall back to the
+                # model-level cap, which is what it used before this
+                # field was kept at all.
+                "max_completion_tokens": _as_positive_int(
+                    entry.get("max_completion_tokens")
                 ),
             }
         )
@@ -738,21 +767,73 @@ def endpoint_supports_reasoning(
     aggregate is the specific mistake this function exists to make
     impossible.
 
-    Matching is on the normalized slug both sides already use, so a pin
-    recorded as "deepinfra" finds a provider_name of "DeepInfra".
+    Matching is on the slug the ENDPOINT publishes, not on its display
+    name; see _endpoint_slug for the measurement that forced that and
+    for the provider where the name matched a pin the router would have
+    rejected.
+
+    A PIN DOES NOT NAME ONE ENDPOINT. It names a provider, and a provider
+    may serve one model from several endpoints with different
+    capabilities: measured 2026-08-13 on openai/gpt-oss-120b, DeepInfra
+    published two and Amazon Bedrock published two. The router picks
+    among them and the bench does not get to say which. So every
+    matching endpoint must vouch, and one that published no list makes
+    the whole answer None. Reading only the first match would answer
+    from an endpoint the request may never reach.
     """
     if not listing.get("fetched") or provider is None:
         return None
     want = normalized_provider_slug(provider)
+    answers = []
     for endpoint in listing.get("endpoints") or ():
-        name = endpoint.get("provider")
-        if name is None or normalized_provider_slug(name) != want:
+        if endpoint.get("slug") != want:
             continue
         supported = endpoint.get("supported_parameters")
         if supported is None:
             return None
-        return "reasoning" in supported
-    return None
+        answers.append("reasoning" in supported)
+    if not answers:
+        return None
+    return all(answers)
+
+
+def endpoint_completion_cap(
+    listing: Mapping[str, Any], provider: str | None
+) -> int | None:
+    """The completion ceiling the PINNED provider publishes, or None.
+
+    THE LOWEST ONE IT PUBLISHES, for the reason in the function above: a
+    pin names a provider, not an endpoint, and a provider may serve the
+    same model from several endpoints with different ceilings. The
+    request has to fit whichever the router picks, so the bench budgets
+    against the smallest.
+
+    None means "no ceiling learned here", which is not the same as "no
+    ceiling". It covers a listing that never fetched, a pin nothing
+    matched, and a provider that published no cap on any of its
+    endpoints. Five of one live model's twenty endpoints were that last
+    shape on 2026-08-13.
+
+    NONE IS NOT FAIL-CLOSED HERE, and that is deliberate rather than an
+    oversight. The caller falls back to the model-level cap, which is
+    exactly what it used before this function existed, so a listing that
+    cannot answer leaves behaviour where it already was instead of
+    disabling a tier for every route that publishes nothing. The
+    fail-closed instinct is spent where it buys something: on the
+    reasoning field, where sending an unsupported parameter to a pinned
+    host under require_parameters empties the provider pool, and where
+    NOT sending it is free.
+    """
+    if not listing.get("fetched") or provider is None:
+        return None
+    want = normalized_provider_slug(provider)
+    caps = [
+        cap
+        for endpoint in listing.get("endpoints") or ()
+        if endpoint.get("slug") == want
+        and (cap := endpoint.get("max_completion_tokens")) is not None
+    ]
+    return min(caps) if caps else None
 
 
 def missing_parameters(
@@ -1176,12 +1257,9 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # a budget above the cap is a hard 400 from some providers.
         top = entry.get("top_provider")
         if isinstance(top, dict):
-            cap = top.get("max_completion_tokens")
-            # A non-bool int strictly above zero only. isinstance(True, int)
-            # is true in Python, so a provider sending true would otherwise
-            # become a cap of 1 that clamps every budget to a single token;
-            # zero and negatives are not real caps either.
-            if isinstance(cap, int) and not isinstance(cap, bool) and cap > 0:
+            # See _as_positive_int for why true, 0 and -1 are not caps.
+            cap = _as_positive_int(top.get("max_completion_tokens"))
+            if cap is not None:
                 model["max_completion_tokens"] = cap
         # Prices arrive as strings in USD per token. Malformed pricing
         # degrades this entry's price fields rather than dropping the
@@ -1611,6 +1689,68 @@ def _as_label(value: object) -> str | None:
     """
     text = as_text(value)
     return text if text else None
+
+
+def _endpoint_slug(tag: object) -> str | None:
+    """The provider slug an endpoint belongs to, from its published tag.
+
+    THE DISPLAY NAME IS NOT THE SLUG, and lowercasing it is a guess that
+    is measurably wrong. Measured 2026-08-13 against
+    https://openrouter.ai/api/v1/providers (102 providers) and the
+    endpoint listings of five models (64 endpoints):
+
+      tag.split("/")[0] is a documented provider slug   64 / 64
+      provider_name.lower() is a documented slug        52 / 64
+
+    and the transform is not mechanical, so no amount of hyphenating
+    would close the gap: "Moonshot AI" is moonshotai, "Arcee AI" is
+    arcee-ai, "Sakana AI" is sakana, "Mancer 2" is mancer, "VoyageAI by
+    MongoDB" is voyageai.
+
+    THE WORST CASE IS NOT A MISS, IT IS A WRONG HIT. The endpoints whose
+    provider_name is "Google" carry the tag google-vertex. A pin written
+    "google" matched that display name, so the bench would vouch a
+    reservation for it and then send order ["google"], which is not a
+    documented slug at all: under allow_fallbacks false that empties the
+    provider pool and the run fails, having been told the route was
+    understood.
+
+    The tag carries an optional variant after a slash, "amazon-bedrock",
+    "amazon-bedrock/eu-west-1" and "mancer/fp8" all being the same
+    provider, so only the head is the slug.
+
+    None when the endpoint published no tag, which makes it match no
+    pin. That is the fail-closed reading and it costs the least: an
+    unmatched endpoint leaves the reservation unsent and the budget on
+    the model-level cap, both of which are where they were before any of
+    this. Zero of the 64 measured endpoints were missing a tag.
+    """
+    if not isinstance(tag, str):
+        return None
+    head = tag.split("/", 1)[0].strip().lower()
+    return head or None
+
+
+def _as_positive_int(value: object) -> int | None:
+    """A published token ceiling, or None when the published thing is not
+    one.
+
+    A non-bool int strictly above zero only. isinstance(True, int) is
+    true in Python, so a provider sending true would otherwise become a
+    ceiling of 1 that clamps every request on that route to a single
+    token; zero and negatives are not ceilings either. Floats and
+    numeric strings are refused rather than coerced, because a cap is
+    something a provider published and a value needing conversion is a
+    value somebody guessed the meaning of.
+
+    Two callers read the same field from two documents, the model
+    listing's top_provider and the endpoint listing's own entry, and
+    they used to carry two copies of this reasoning. One copy, so a
+    later correction cannot land on only one of them.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value > 0 else None
 
 
 async def run_model(

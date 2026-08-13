@@ -54,6 +54,7 @@ from bench.models import (
     QUANTIZATION_LEVELS,
     as_money,
     as_text,
+    endpoint_completion_cap,
     endpoint_supports_reasoning,
     fetch_catalog,
     fetch_endpoints,
@@ -3852,46 +3853,117 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     return experiment
 
 
-async def trial_may_send_reasoning_cap(experiment: dict[str, Any], model: str) -> bool:
-    """Whether one trial may carry the visible-output reservation.
+async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
+    """The route one trial will actually be served by, resolved once and
+    read twice: for what may be sent to it, and for how much may be
+    asked of it.
 
-    THE MODEL AGGREGATE DOES NOT VOUCH FOR A PINNED ENDPOINT, which is
-    the whole reason this is a function rather than a dict lookup.
-    app.state.reasoning_defaults is derived from the model-level
-    catalog, which is a UNION across every host that serves the model.
-    A strict pin selects ONE host and sends allow_fallbacks false with
-    require_parameters true, under which a parameter the pinned host
-    does not accept does not degrade: it empties the provider pool.
-    Measured on 2026-08-12, one model's three endpoints advertised 18,
-    12 and 17 parameters and differed in which, so the union really does
-    over-claim.
+    Returns {"pin", "completion_cap", "may_send_reasoning_cap"}. pin is
+    None for an unpinned trial, which is most of them.
 
-    So a pinned trial asks the endpoint listing, and an unpinned one
-    keeps the model-level answer, which is correct for it: without a pin
-    the request may be served by any eligible host and the union is the
-    right question.
+    THE MODEL AGGREGATE DOES NOT SPEAK FOR A PINNED ENDPOINT, which is
+    the whole reason this is a function rather than two dict lookups.
+    Everything in app.state derived from the model-level catalog is a
+    UNION across every host that serves the model. A strict pin selects
+    ONE host and sends allow_fallbacks false with require_parameters
+    true. The union over-claims in both directions and each one costs
+    something different:
 
-    ABSENCE OF EVIDENCE IS NOT SUPPORT. When the listing cannot answer,
-    whether because it did not fetch, or no endpoint matched the pin, or
-    the matched endpoint published no parameter list, this returns False
-    and the reservation is simply not sent. That is the same instinct
-    the estimand's creation-time check carries in prose ("refuses rather
-    than assume support"), applied where a refusal would cost a run: not
-    sending an optional field is free, and sending one the pinned host
-    may reject is not.
+      supported_parameters   the union can advertise a parameter the
+                             pinned host does not take, and under
+                             require_parameters that does not degrade
+                             into a silent ignore, it empties the
+                             provider pool. Measured 2026-08-12: one
+                             model's three endpoints advertised 18, 12
+                             and 17 parameters and differed in which.
+
+      max_completion_tokens  the model-level cap is the MAXIMUM any
+                             route offers, so budgeting from it budgets
+                             from the most generous host in the pool.
+                             Measured 2026-08-13 on openai/gpt-oss-120b:
+                             model level 131072, endpoints 8192 through
+                             131072. The standard tier's 16384 is
+                             already twice the cheapest route's ceiling,
+                             and that request was being sent.
+
+    ORDER IS THE FIX for the second one. This used to be called
+    trial_may_send_reasoning_cap, one line BELOW where the budget had
+    already been computed, so the endpoint's cap could not have been
+    consulted even if it had been kept. Resolving the route first and
+    budgeting second costs no extra request: the listing was already
+    being fetched here.
+
+    ABSENCE OF EVIDENCE IS NOT SUPPORT, and it is also not a ceiling.
+    The two unknowns are treated differently on purpose, because they
+    cost differently. An unanswerable listing means the reservation is
+    not sent, since not sending an optional field is free and sending
+    one the pinned host may reject is not. An unanswerable CAP falls
+    back to the model-level one, which is what the budget used before
+    this function read the field at all: refusing there would disable a
+    tier for every route that publishes no cap, which was five of one
+    live model's twenty endpoints.
     """
-    if not (experiment.get("estimand_mode") == "underlying_model"):
-        return model in app.state.reasoning_defaults
-    pin = (experiment.get("provider_pins") or {}).get(model)
+    vouched = model in app.state.reasoning_defaults
+    pin = None
+    if experiment.get("estimand_mode") == "underlying_model":
+        pin = (experiment.get("provider_pins") or {}).get(model)
     if pin is None:
-        return model in app.state.reasoning_defaults
-    # The model-level gate still has to pass: a pinned endpoint that
-    # accepts the field says nothing about whether the MODEL reasons
-    # unprompted, and both questions must be answered yes.
-    if model not in app.state.reasoning_defaults:
-        return False
+        # No pin, so any eligible host may serve this and the union is
+        # the right question. No listing is fetched, which is also why
+        # the ordinary comparison path pays nothing for any of this.
+        return {"pin": None, "completion_cap": None, "may_send_reasoning_cap": vouched}
     listing = await fetch_endpoints(app.state.client, model)
-    return endpoint_supports_reasoning(listing, pin) is True
+    return {
+        "pin": pin,
+        "completion_cap": endpoint_completion_cap(listing, pin),
+        # The model-level gate still has to pass: a pinned endpoint that
+        # accepts the field says nothing about whether the MODEL reasons
+        # unprompted, and both questions must be answered yes.
+        "may_send_reasoning_cap": (
+            vouched and endpoint_supports_reasoning(listing, pin) is True
+        ),
+    }
+
+
+async def resolve_routes(
+    experiment: dict[str, Any], lineup: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Every model in a lineup resolved to the route its trials will use.
+
+    One entry per DISTINCT model, which matters because a lineup may
+    name the same model twice: asking "how much does this vary run to
+    run" is the natural way to write that, and the duplicate must not
+    buy a second identical listing.
+
+    Sequential rather than gathered. The listings are cheap, there are
+    at most a handful, and this runs once before a sweep that will make
+    hundreds of paid calls, so concurrency here would buy nothing and
+    add a failure mode. fetch_endpoints never raises, so a listing that
+    fails resolves to the same "learned nothing" a missing pin gives.
+    """
+    return {
+        model: await trial_route(experiment, model) for model in dict.fromkeys(lineup)
+    }
+
+
+def route_budget(requested: int, completion_cap: int | None) -> int:
+    """The outer budget, clamped to the resolved route's own ceiling.
+
+    Separate from effective_budget because it answers a different
+    question against a different document. effective_budget clamps to
+    what the MODEL publishes and knows about the offline boot;
+    this clamps to what the selected ROUTE publishes and knows nothing
+    else. Composed rather than merged so the unpinned path keeps
+    calling exactly the function it always called.
+
+    No lower bound and no refusal. A route that publishes a small
+    ceiling is a route that will answer briefly, which is a worse answer
+    and not a failed one, and the number that was sent is recorded and
+    shown on the card. The reservation's own arithmetic then runs
+    against this clamped figure and stands down if it cannot be
+    satisfied, which is the one place a refusal belongs.
+    """
+    return min(requested, completion_cap) if completion_cap is not None else requested
 
 
 def trial_provider_prefs(
@@ -3925,6 +3997,7 @@ async def run_one_trial(
     position: int,
     group_id: int,
     controls: dict[str, Any],
+    route: dict[str, Any],
 ) -> dict[str, Any]:
     """One model against one task, through the machinery every run uses.
 
@@ -3944,7 +4017,15 @@ async def run_one_trial(
     is the same contract run_model and stream_model carry, because a
     failed trial is data and must not end the experiment.
     """
-    max_tokens = effective_budget(experiment["budget"], model)
+    # RESOLVED BEFORE THE BUDGET, which is the whole of U1's repair: the
+    # pinned endpoint's published ceiling is an input to the arithmetic
+    # below, and it used to be fetched one line after that arithmetic
+    # had already run. Resolved once per run rather than here, because a
+    # route is a fact about a model and a pin, and this function is
+    # called once per trial: see resolve_routes.
+    max_tokens = route_budget(
+        effective_budget(experiment["budget"], model), route["completion_cap"]
+    )
     holder: dict[str, Any] = {}
     parts: list[str] = []
     first_delta_ms: float | None = None
@@ -3977,11 +4058,9 @@ async def run_one_trial(
                 holder=holder,
                 provider_prefs=trial_provider_prefs(experiment, model, controls),
                 controls=controls,
-                # Asks the PINNED endpoint when there is one; see
-                # trial_may_send_reasoning_cap.
-                may_send_reasoning_cap=await trial_may_send_reasoning_cap(
-                    experiment, model
-                ),
+                # Resolved above, from the same listing the budget was
+                # clamped against; see trial_route.
+                may_send_reasoning_cap=route["may_send_reasoning_cap"],
             ):
                 if event["type"] == "done":
                     result = event["result"]
@@ -4142,6 +4221,18 @@ async def run_experiment(experiment_id: int) -> None:
             experiment["repeats"],
             experiment["task_order_seed"],
         )
+        # ONCE PER RUN, NOT ONCE PER TRIAL. A route is a fact about a
+        # model and a pin, and both are fixed for the whole experiment,
+        # while trials are the product of tasks, repeats and lineup and
+        # number in the hundreds. Resolving per trial meant one endpoint
+        # GET per paid call for every pinned model, which is a request
+        # spent to re-learn something that cannot have changed.
+        #
+        # Before the loop rather than lazily inside it so the cost is
+        # bounded by the lineup and paid in one place, and so a listing
+        # that fails fails the same way for every trial of that model
+        # instead of differently depending on when it was asked.
+        routes = await resolve_routes(experiment, lineup)
         for cell in plan:
             if state["stop"].is_set():
                 status, detail = "stopped", "stopped between trials"
@@ -4218,7 +4309,15 @@ async def run_experiment(experiment_id: int) -> None:
                 # run. Bounded by the upstream timeout the client already
                 # carries, so this cannot hold shutdown open forever.
                 trial = asyncio.ensure_future(
-                    run_one_trial(experiment, task, model, position, group_id, controls)
+                    run_one_trial(
+                        experiment,
+                        task,
+                        model,
+                        position,
+                        group_id,
+                        controls,
+                        routes[model],
+                    )
                 )
                 try:
                     result = await asyncio.shield(trial)

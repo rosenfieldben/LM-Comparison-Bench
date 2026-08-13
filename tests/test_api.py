@@ -16,6 +16,7 @@ from bench import main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import (
+    ENDPOINTS_URL,
     OPENROUTER_URL,
     PROVIDER_REASONING_MINIMUM,
     provider_preferences,
@@ -86,6 +87,31 @@ TEST_CATALOG = {
             # ineligible under require_parameters.
             "supported_parameters": ["max_tokens"],
             # Text only: the model a native comparison must refuse.
+            "input_modalities": ["text"],
+        },
+        # THE WIDE AGGREGATE. Its model-level cap is enormous and its
+        # cheapest route's is not, which is the shape the U1 review
+        # measured on the live catalog (2026-08-13): one model whose
+        # top_provider published 131072 while its endpoints published
+        # 8192, 16384, 32768, 40960, 65536 and 131072, and five that
+        # published nothing. A model-level cap is the MAXIMUM any route
+        # offers, so budgeting from it is budgeting from the most
+        # generous host in the pool while pinning the request to one
+        # particular host.
+        {
+            "id": "model/wide-aggregate",
+            "name": "Wide Aggregate",
+            "context_length": 131072,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+            "max_completion_tokens": 131072,
+            "supported_parameters": [
+                "max_tokens",
+                "reasoning",
+                "seed",
+                "temperature",
+                "top_p",
+            ],
             "input_modalities": ["text"],
         },
         {
@@ -6601,6 +6627,12 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
             httpx.Response(200, stream=alpha_stream()),
         )[1]
     )
+    # A pinned run resolves its route, so the listing is asked for. It
+    # was not before U1, because the only question put to it was one
+    # this unvouched model already answered no to.
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": []}}
+    )
     path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
     eid = client.post(
         "/experiments",
@@ -6619,6 +6651,201 @@ def test_strict_mode_sends_require_parameters_and_a_hard_pin(client, tmp_path):
     # The privacy promise is written last and cannot be displaced by the
     # estimand: the boot policy's keys survive the merge.
     assert provider["sort"] == "throughput"
+
+
+# ---- U1: a pin selects one route, and one route publishes its own
+# ---- completion cap. Budgeting from the model-level aggregate budgets
+# ---- from the most generous host in the pool.
+
+# The pinned host's cap, and the aggregate the bench used to budget from.
+# Both numbers are the live ones, from the endpoint listing quoted in the
+# catalog entry above.
+PINNED_ROUTE_CAP = 8192
+WIDE_AGGREGATE_CAP = 131072
+
+
+def wide_endpoint_listing():
+    """The listing shape the live model published: several hosts, one
+    cheap one, and a host that publishes no cap at all."""
+    return {
+        "data": {
+            "endpoints": [
+                {
+                    "provider_name": "SiliconFlow",
+                    "tag": "siliconflow",
+                    "max_completion_tokens": PINNED_ROUTE_CAP,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                {
+                    "provider_name": "Groq",
+                    "tag": "groq",
+                    "max_completion_tokens": 65536,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                {
+                    "provider_name": "CoreWeave",
+                    "tag": "coreweave",
+                    "max_completion_tokens": WIDE_AGGREGATE_CAP,
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+                # Published no cap. Five of the live model's twenty
+                # endpoints were this shape.
+                {
+                    "provider_name": "Together",
+                    "tag": "together",
+                    "supported_parameters": ["max_tokens", "reasoning"],
+                },
+            ]
+        }
+    }
+
+
+@pytest.mark.parametrize(
+    "tier,aggregate_budget",
+    (("standard", 16384), ("extended", 65536)),
+    ids=("standard: twice the route's ceiling", "extended: eight times it"),
+)
+@respx.mock
+def test_review_repro_a_pinned_run_is_budgeted_against_the_route_it_selected(
+    client, tmp_path, tier, aggregate_budget
+):
+    """WINDOW: the bytes of the one request a pinned trial sends, read
+    against the cap the pinned endpoint publishes.
+
+    THE DEFECT, measured on the live catalog 2026-08-13. fetch_endpoints
+    kept two fields and discarded max_completion_tokens, so the only
+    completion cap the budget arithmetic could see was the model-level
+    one. A model-level cap is the maximum across every host that serves
+    the model; a pin selects exactly one host and forbids fallback. The
+    bench therefore budgeted from the most generous host in the pool and
+    sent the result to whichever host the pin named.
+
+    The live numbers: one model published a model-level cap of 131072
+    while its cheapest endpoint published 8192. The standard tier alone
+    sends 16384, twice that route's published ceiling, before the
+    extended tier is considered at all.
+
+    THE ORDER IS THE FIX. trial_may_send_reasoning_cap already fetched
+    this listing, one line below where the budget had already been
+    computed. Resolving the route first and budgeting second costs
+    nothing extra on the wire and is the whole of the repair.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/wide-aggregate")).respond(
+        json=wide_endpoint_listing()
+    )
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    app.state.reasoning_defaults = {"model/wide-aggregate"}
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post(
+        "/experiments",
+        json=strict_body(
+            path,
+            budget=tier,
+            lineup=["model/wide-aggregate"],
+            provider_pins={"model/wide-aggregate": "SiliconFlow"},
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 1, sent
+    body = sent[0]
+    # PRE-STATE, so the assertion below cannot pass by the route never
+    # having been pinned or the aggregate never having been generous.
+    assert body["provider"]["order"] == ["siliconflow"]
+    assert body["provider"]["allow_fallbacks"] is False
+    assert app.state.completion_limits["model/wide-aggregate"] == WIDE_AGGREGATE_CAP, (
+        "the aggregate must really be the larger number"
+    )
+    assert aggregate_budget < WIDE_AGGREGATE_CAP, (
+        "the model-level clamp must not be what bounds this request, or "
+        "the test would pass without the endpoint cap ever being read"
+    )
+
+    # THE OUTER BUDGET, against the route's published ceiling.
+    assert body["max_tokens"] <= PINNED_ROUTE_CAP, (
+        f"sent max_tokens {body['max_tokens']} to a route publishing {PINNED_ROUTE_CAP}"
+    )
+    # AND THE RESERVATION, computed from the same clamped number rather
+    # than from the aggregate. Half of the route's cap, not half of the
+    # model's.
+    assert body["reasoning"] == {"max_tokens": body["max_tokens"] // 2}
+    assert body["max_tokens"] > body["reasoning"]["max_tokens"]
+
+
+@respx.mock
+def test_a_pinned_lineup_resolves_each_route_once_for_the_whole_run(client, tmp_path):
+    """WINDOW: the endpoint listing's call count across a whole
+    experiment run, read against the number of paid calls that run made.
+
+    A ROUTE IS A FACT ABOUT A MODEL AND A PIN, and both are fixed when
+    the experiment is created. Trials are the product of tasks, repeats
+    and lineup, so resolving per trial spends one endpoint request per
+    paid call to re-learn something that cannot have changed. This run
+    is deliberately shaped to tell the two apart: two tasks and two
+    repeats over one model is four trials, so per-trial resolution
+    counts four and per-run counts one.
+
+    THE DUPLICATE IS THE SECOND HALF. The lineup names the same model
+    twice, which is the natural way to ask how much a model varies run
+    to run, and a resolver keyed on the lineup list rather than on its
+    distinct members would buy the same listing twice before the first
+    trial.
+    """
+    listing = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    }
+                ]
+            }
+        }
+    )
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    app.state.reasoning_defaults = {"model/alpha"}
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "hi"}, {"id": "t2", "prompt": "yo"}
+    )
+    eid = client.post(
+        "/experiments",
+        json=strict_body(
+            path,
+            # The same model twice, and two repeats over two tasks.
+            lineup=["model/alpha", "model/alpha"],
+            repeats=2,
+            provider_pins={"model/alpha": "together"},
+        ),
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    # PRE-STATE: the run really did make many paid calls, or "one
+    # listing" would be a claim about a run that barely happened.
+    assert len(sent) == 8, len(sent)
+    assert listing.call_count == 1
+
+    # And the resolution actually reached all eight of them: every
+    # request is clamped to the route's 4096 rather than the standard
+    # tier's 16384, and carries half of that.
+    assert {body["max_tokens"] for body in sent} == {4096}
+    assert {body["reasoning"]["max_tokens"] for body in sent} == {2048}
 
 
 @respx.mock
@@ -12376,18 +12603,17 @@ def test_review_repro_the_reservation_asks_the_catalog_before_it_rides(
     assert {k: v for k, v in vouched_body.items() if k != "reasoning"} == unvouched
 
 
-from bench.main import trial_may_send_reasoning_cap  # noqa: E402
-from bench.models import ENDPOINTS_URL  # noqa: E402
+from bench.main import trial_route  # noqa: E402
 
 
 @respx.mock
 async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client):
-    """WINDOW: trial_may_send_reasoning_cap itself, called directly once
-    per branch, with the endpoint route's call count read between calls.
+    """WINDOW: trial_route itself, called directly once per branch, with
+    the endpoint route's call count read between calls.
 
-    SUSPENSION POINT: the await on fetch_endpoints, reached on the last
-    two branches only. Nothing asserted here is mutable across it: the
-    listing is fully assembled before the coroutine returns, and the
+    SUSPENSION POINT: the await on fetch_endpoints, reached on the
+    pinned branches only. Nothing asserted here is mutable across it:
+    the listing is fully assembled before the coroutine returns, and the
     call counter is read after each await settles.
 
     THE DEFECT THIS ANSWERS is an absence rather than a wrong answer.
@@ -12400,15 +12626,25 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     ASSERTED AGAINST THE PINNED CONTRACT. The endpoint listing below is
     the shape measured on 2026-08-12, where one model's hosts published
     18, 12 and 17 parameters and differed in which; what decides the
-    last two branches is the presence of "reasoning" in the PINNED
-    host's supported_parameters, not the fact that a mock answered 200.
-    Both hosts return the same 200 from the same route, and give
-    opposite answers.
+    pinned branches is the presence of "reasoning" in the PINNED host's
+    supported_parameters, not the fact that a mock answered 200. Both
+    hosts return the same 200 from the same route, and give opposite
+    answers.
 
-    THE CALL COUNTER IS HALF THE TEST. Three of the five branches must
-    answer from the model-level catalog WITHOUT asking the network, and
-    a version that always asked would return the same booleans while
-    spending a request per trial. Only the counter can tell them apart.
+    THE CALL COUNTER IS HALF THE TEST, and what it counts CHANGED with
+    U1. An UNPINNED trial must still answer from the model-level catalog
+    without asking the network, and that is asserted below: a version
+    that always fetched would return the same booleans while spending a
+    request per trial of every ordinary experiment.
+
+    A PINNED trial now always fetches, including when the model is
+    unvouched, and that is the U1 repair rather than a regression. The
+    listing is no longer read only to decide whether an optional field
+    may ride; it is also read for the ceiling the budget must respect,
+    and an unvouched model's request still has a budget. The old
+    shortcut skipped the network precisely when the answer was already
+    known to be False, which was correct while the reservation was the
+    only question and is wrong now that it is not.
     """
     route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
         json={
@@ -12416,10 +12652,14 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
                 "endpoints": [
                     {
                         "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 32768,
                         "supported_parameters": ["max_tokens", "reasoning"],
                     },
                     {
                         "provider_name": "BaseTen",
+                        "tag": "baseten",
+                        "max_completion_tokens": 4096,
                         "supported_parameters": ["max_tokens", "temperature"],
                     },
                 ]
@@ -12433,95 +12673,112 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     # be ignored, because without underlying_model the request does not
     # carry allow_fallbacks false and a host may still decline the field
     # harmlessly.
-    assert (
-        await trial_may_send_reasoning_cap(
-            {"estimand_mode": "as_served", "provider_pins": pinned}, "model/alpha"
-        )
-        is True
+    first = await trial_route(
+        {"estimand_mode": "as_served", "provider_pins": pinned}, "model/alpha"
     )
+    assert first == {
+        "pin": None,
+        "completion_cap": None,
+        "may_send_reasoning_cap": True,
+    }
     assert route.call_count == 0
 
     # BRANCH TWO: strict, but this model has no pin. Any eligible host
     # may serve it, so the union is the right question and the answer
-    # is again the model-level one.
-    assert (
-        await trial_may_send_reasoning_cap(
-            {"estimand_mode": "underlying_model", "provider_pins": {}}, "model/alpha"
-        )
-        is True
+    # is again the model-level one, with no ceiling learned from any one
+    # host because no one host was selected.
+    second = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": {}}, "model/alpha"
     )
+    assert second == {
+        "pin": None,
+        "completion_cap": None,
+        "may_send_reasoning_cap": True,
+    }
     assert route.call_count == 0
 
     # BRANCH THREE: pinned, but the MODEL is not vouched. Both questions
-    # must answer yes, and this one shortcuts before the network: an
-    # endpoint that accepts the field says nothing about whether the
-    # model reasons unprompted.
+    # must answer yes, so the reservation stands down. The listing is
+    # fetched anyway, because this trial still has a budget and the
+    # pinned host still publishes a ceiling for it.
     app.state.reasoning_defaults = set()
-    assert (
-        await trial_may_send_reasoning_cap(
-            {"estimand_mode": "underlying_model", "provider_pins": pinned},
-            "model/alpha",
-        )
-        is False
+    third = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": pinned},
+        "model/alpha",
     )
-    assert route.call_count == 0
+    assert third["may_send_reasoning_cap"] is False
+    assert third["pin"] == "baseten"
+    assert third["completion_cap"] == 4096
+    assert route.call_count == 1
 
     # BRANCH FOUR: pinned to the host that publishes the field. This is
-    # the only branch that may return True through the listing.
+    # the only branch that may vouch through the listing, and its cap is
+    # the OTHER host's, which is what proves the cap is read per pin and
+    # not once per model.
     app.state.reasoning_defaults = {"model/alpha"}
-    assert (
-        await trial_may_send_reasoning_cap(
-            {
-                "estimand_mode": "underlying_model",
-                "provider_pins": {"model/alpha": "deepinfra"},
-            },
-            "model/alpha",
-        )
-        is True
+    fourth = await trial_route(
+        {
+            "estimand_mode": "underlying_model",
+            "provider_pins": {"model/alpha": "deepinfra"},
+        },
+        "model/alpha",
     )
-    assert route.call_count == 1
+    assert fourth == {
+        "pin": "deepinfra",
+        "completion_cap": 32768,
+        "may_send_reasoning_cap": True,
+    }
+    assert route.call_count == 2
 
     # BRANCH FIVE, THE ONE THAT DEFEATS THE MUTATION. Same model, same
     # vouching, same 200 from the same route: only the pin differs, and
     # the pinned host does not publish reasoning. The pre-T3 body would
     # say True here and empty the provider pool.
-    assert (
-        await trial_may_send_reasoning_cap(
-            {"estimand_mode": "underlying_model", "provider_pins": pinned},
-            "model/alpha",
-        )
-        is False
+    fifth = await trial_route(
+        {"estimand_mode": "underlying_model", "provider_pins": pinned},
+        "model/alpha",
     )
-    assert route.call_count == 2
+    assert fifth["may_send_reasoning_cap"] is False
+    assert route.call_count == 3
 
 
 @respx.mock
 async def test_a_pinned_trial_with_no_listing_sends_nothing(client):
-    """WINDOW: trial_may_send_reasoning_cap on a vouched, pinned model
-    whose endpoint listing cannot answer.
+    """WINDOW: trial_route on a vouched, pinned model whose endpoint
+    listing cannot answer.
 
     SUSPENSION POINT: the await on fetch_endpoints, which returns its
     unfetched listing rather than raising. Nothing asserted spans it.
 
-    ABSENCE OF EVIDENCE IS NOT SUPPORT, and this is where that costs
-    something. Under a strict pin, sending a field the host does not
-    take empties the provider pool and the run fails; not sending an
-    optional field is free. So a listing that 404s decides against the
-    field, not for it.
+    THE TWO UNKNOWNS ARE NOT THE SAME UNKNOWN, and this is the test that
+    says so. One listing failure produces both answers, and they differ
+    because their costs differ.
+
+    Absence of evidence is not SUPPORT: under a strict pin, sending a
+    field the host does not take empties the provider pool and the run
+    fails, while not sending an optional field is free. So the
+    reservation stands down.
+
+    Absence of evidence is not a CEILING either, and refusing there
+    would buy nothing and cost a tier: the cap comes back None and the
+    budget falls back to the model-level clamp, which is exactly what it
+    used before any of this read the endpoint listing. Five of one live
+    model's twenty endpoints published no cap on 2026-08-13, so this is
+    the common shape and not the corner.
     """
     route = respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(404)
     app.state.reasoning_defaults = {"model/alpha"}
 
-    assert (
-        await trial_may_send_reasoning_cap(
-            {
-                "estimand_mode": "underlying_model",
-                "provider_pins": {"model/alpha": "deepinfra"},
-            },
-            "model/alpha",
-        )
-        is False
+    resolved = await trial_route(
+        {
+            "estimand_mode": "underlying_model",
+            "provider_pins": {"model/alpha": "deepinfra"},
+        },
+        "model/alpha",
     )
+
+    assert resolved["may_send_reasoning_cap"] is False
+    assert resolved["completion_cap"] is None
     assert route.call_count == 1
 
 

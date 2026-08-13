@@ -2966,6 +2966,7 @@ def test_review_repro_a_non_byok_run_reports_an_upstream_cost():
 
 from bench.models import (  # noqa: E402
     ENDPOINTS_URL,
+    endpoint_completion_cap,
     endpoint_supports_reasoning,
     fetch_endpoints,
 )
@@ -3008,15 +3009,17 @@ async def test_review_repro_a_pinned_endpoint_is_not_vouched_for_by_the_aggregat
                     # union, so it would say "reasoning supported".
                     {
                         "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
                         "supported_parameters": ["max_tokens", "reasoning", "seed"],
                     },
                     # The pinned host, which does not take the field.
                     {
                         "provider_name": "BaseTen",
+                        "tag": "baseten",
                         "supported_parameters": ["max_tokens", "temperature"],
                     },
                     # A host that published no list at all.
-                    {"provider_name": "Together"},
+                    {"provider_name": "Together", "tag": "together"},
                 ]
             }
         }
@@ -3037,6 +3040,144 @@ async def test_review_repro_a_pinned_endpoint_is_not_vouched_for_by_the_aggregat
     assert endpoint_supports_reasoning(listing, "together") is None
     assert endpoint_supports_reasoning(listing, "novita") is None
     assert endpoint_supports_reasoning(listing, None) is None
+
+
+@respx.mock
+async def test_review_repro_a_pin_names_a_provider_not_an_endpoint(client):
+    """WINDOW: one endpoint listing in which the pinned provider appears
+    TWICE with different capabilities, read by both endpoint readers.
+
+    SUSPENSION POINT: the await on fetch_endpoints. Both readers run on
+    the returned listing, after it is fully assembled.
+
+    THE DEFECT, and it is one defect in two functions. A pin is a
+    provider slug. A provider may serve one model from several
+    endpoints, and those endpoints may differ in what they take and in
+    how much they will write. Both readers stopped at the first match,
+    so the answer depended on listing order, which is the router's
+    business and not the bench's.
+
+    MEASURED, not imagined. On 2026-08-13 openai/gpt-oss-120b published
+    twenty endpoints, of which DeepInfra was two (16384 and 131072) and
+    Amazon Bedrock was two. The shape below is that shape.
+
+    BOTH READERS FAIL CLOSED, in the direction that costs least. The
+    parameter reader requires EVERY matching endpoint to advertise the
+    field, because sending it to the one that does not empties the
+    provider pool under require_parameters. The cap reader takes the
+    LOWEST published ceiling, because the request must fit whichever
+    endpoint the router picks.
+
+    ASSERTED AGAINST THE PINNED CONTRACT: max_completion_tokens and
+    supported_parameters are both fields of the endpoint object
+    documented at https://openrouter.ai/docs/api/api-reference/
+    endpoints/list-all-endpoints-for-a-model, read 2026-08-13, and what
+    decides each answer is their published values, not the mock's 200.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    # The generous one, and it is FIRST so that a reader
+                    # stopping at the first match answers with it.
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 131072,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    # The same provider, one eighth the ceiling.
+                    {
+                        "provider_name": "DeepInfra",
+                        "tag": "deepinfra",
+                        "max_completion_tokens": 16384,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    # A second provider, also twice, and this one
+                    # disagrees with itself about the parameter.
+                    {
+                        "provider_name": "Amazon Bedrock",
+                        "tag": "amazon-bedrock",
+                        "max_completion_tokens": 8192,
+                        "supported_parameters": ["max_tokens", "reasoning"],
+                    },
+                    {
+                        "provider_name": "Amazon Bedrock",
+                        "tag": "amazon-bedrock",
+                        "max_completion_tokens": 8192,
+                        "supported_parameters": ["max_tokens"],
+                    },
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+    assert listing["fetched"] is True
+
+    # THE CAP: the lowest the provider publishes, never the first.
+    assert endpoint_completion_cap(listing, "deepinfra") == 16384
+    assert endpoint_completion_cap(listing, "amazon-bedrock") == 8192
+    # A pin nothing matches learns no ceiling, which is not a ceiling of
+    # zero and not a refusal.
+    assert endpoint_completion_cap(listing, "groq") is None
+    assert endpoint_completion_cap(listing, None) is None
+
+    # THE PARAMETER: every matching endpoint must vouch. DeepInfra's two
+    # agree, so it is True; Bedrock's two do not, so the pin that could
+    # land on either is False.
+    assert endpoint_supports_reasoning(listing, "deepinfra") is True
+    assert endpoint_supports_reasoning(listing, "amazon-bedrock") is False
+    # Reading only the first match would have said True here, from an
+    # endpoint the request may never reach.
+    assert listing["endpoints"][2]["supported_parameters"] == [
+        "max_tokens",
+        "reasoning",
+    ]
+
+
+@respx.mock
+async def test_an_endpoint_cap_that_is_not_a_ceiling_is_absent(client):
+    """WINDOW: fetch_endpoints' coercion of max_completion_tokens, over
+    every published value that is not a ceiling.
+
+    SUSPENSION POINT: the await on fetch_endpoints, once. The assertions
+    read the returned listing.
+
+    WHY true IS THE INTERESTING ONE. isinstance(True, int) is true in
+    Python, so a provider publishing a boolean would become a ceiling of
+    1 and clamp every request on that route to a single token: a
+    silently ruined run rather than a visible error. Zero and negatives
+    are not ceilings, and a float or a numeric string is a value
+    somebody would have to guess the meaning of.
+
+    The model-level reader has carried this rule since the catalog
+    gained a clamp; the endpoint reader now shares the same function, so
+    the two cannot drift.
+    """
+    respx.get(ENDPOINTS_URL.format(model="vendor/model")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {"provider_name": "A", "tag": "a", "max_completion_tokens": True},
+                    {"provider_name": "B", "tag": "b", "max_completion_tokens": 0},
+                    {"provider_name": "C", "tag": "c", "max_completion_tokens": -1},
+                    {"provider_name": "D", "tag": "d", "max_completion_tokens": 8192.0},
+                    {"provider_name": "E", "tag": "e", "max_completion_tokens": "8192"},
+                    {"provider_name": "F", "tag": "f"},
+                    {"provider_name": "G", "tag": "g", "max_completion_tokens": 8192},
+                ]
+            }
+        }
+    )
+
+    listing = await fetch_endpoints(client, "vendor/model")
+
+    for slug in ("a", "b", "c", "d", "e", "f"):
+        assert endpoint_completion_cap(listing, slug) is None, slug
+    # And the control, so the six Nones above are not six ways of
+    # reading a parser that never returns anything.
+    assert endpoint_completion_cap(listing, "g") == 8192
 
 
 @respx.mock

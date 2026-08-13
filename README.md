@@ -711,6 +711,31 @@ or a test rather than by this list alone.
   endpoints advertising 18, 12 and 17 parameters, differing in which. A
   model's `supported_parameters` is a union across hosts, so it cannot
   vouch for the one host a strict pin selects.
+- **2026-08-13. A model's completion cap is the most generous route's,
+  not every route's.** `openai/gpt-oss-120b` publishes
+  `top_provider.max_completion_tokens` 131072 while its twenty endpoints
+  publish 8192, 16384, 32768, 40960, 65536 and 131072, with five
+  publishing none. Budgeting a pinned run from the model-level number
+  budgets from the most generous host in the pool: the standard tier's
+  16384 is already twice the cheapest route's ceiling. 359 of 410 models
+  publish a model-level cap.
+- **2026-08-13. A provider's display name is not its slug, and
+  lowercasing it is wrong 16 times in 102.** Against
+  `/api/v1/providers`: `Moonshot AI` is `moonshotai`, `Arcee AI` is
+  `arcee-ai`, `Sakana AI` is `sakana`, `Mancer 2` is `mancer`,
+  `VoyageAI by MongoDB` is `voyageai`. The transform is not mechanical.
+  The endpoint object's own `tag` carries the slug, optionally with a
+  variant after a slash (`amazon-bedrock/eu-west-1`): across 64
+  endpoints on five models, `tag.split("/")[0]` was a documented slug
+  **64 times**, `provider_name.lower()` **52**. The worst case is not a
+  miss: endpoints named `Google` carry the tag `google-vertex`, so a pin
+  written `google` matched the display name while routing to a slug that
+  does not exist.
+- **2026-08-13. One provider can serve one model from several
+  endpoints.** `openai/gpt-oss-120b` lists DeepInfra twice (16384 and
+  131072) and Amazon Bedrock twice. A pin names a provider, not an
+  endpoint, so both endpoint readers take the conservative answer across
+  every match rather than the first one.
 
 ## Reliability
 
