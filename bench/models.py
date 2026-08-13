@@ -51,18 +51,49 @@ def as_flag(value: object) -> bool | None:
     folds 0 and None together, and those are the two states this column
     was created to tell apart.
 
-    None for anything that is not a bool or an int in (0, 1), which is
-    the same isinstance discipline _ingest_usage applies at the wire.
-    A poisoned cell degrades to "not reported" rather than to a
-    confident True, because SQLite's column affinity will accept a
-    string into an INTEGER column and a later reader must not be told
-    something the wire never said.
+    None for anything that is not a bool or an int in (0, 1). A poisoned
+    cell degrades to "not reported" rather than to a confident True,
+    because SQLite's column affinity will accept a string into an
+    INTEGER column and a later reader must not be told something the
+    wire never said.
+
+    FOR SQLITE CELLS ONLY, and this sentence used to say the opposite.
+    It claimed the int branch was "the same isinstance discipline
+    _ingest_usage applies at the wire", which was false in the one
+    direction that matters: the wire parse accepts a bool and nothing
+    else. The difference is not pedantry. A storage layer with no
+    boolean type MUST decode 1 back into True or nothing round-trips; a
+    JSON document has a boolean type, so a provider sending 1 where the
+    schema says true is a provider disagreeing with its own contract,
+    and reading it as True invents a fact. See as_wire_flag, which is
+    what external documents get.
     """
     if isinstance(value, bool):
         return value
     if isinstance(value, int) and value in (0, 1):
         return bool(value)
     return None
+
+
+def as_wire_flag(value: object) -> bool | None:
+    """A three-state flag read from a document that HAS booleans.
+
+    The counterpart to as_flag, and deliberately narrower. JSON
+    distinguishes true from 1, so an integer here is not a boolean that
+    lost its type on the way through a database, it is a value the
+    schema did not promise. Absence and disagreement both degrade to
+    None, which is "not reported", and never to a confident answer.
+
+    ONE RULE FOR BOTH EXTERNAL READERS. The in-band usage object and the
+    generation endpoint are two documents from one platform describing
+    one field, and they used to be parsed by two different rules: the
+    usage object required a bool inline, while the endpoint reached for
+    as_flag and so accepted the SQLite integer. The same wire value
+    therefore produced two different answers depending on which door it
+    came through, which is the kind of disagreement that shows up much
+    later as a row in the wrong cost bucket.
+    """
+    return value if isinstance(value, bool) else None
 
 
 def as_metric(value: object) -> float | None:
@@ -1568,12 +1599,11 @@ def _ingest_usage(result: dict[str, Any], usage: object) -> None:
     # meaning: a live probe found is_byok false beside a nonzero upstream
     # cost, so the presence of that number says nothing about BYOK.
     #
-    # isinstance rather than truthiness, and no coercion: a provider that
-    # omits the flag leaves None, which is "not reported" and is not the
-    # same answer as false. Anything that is not a bool is treated as
-    # absent rather than guessed at.
-    is_byok = usage.get("is_byok")
-    result["is_byok"] = is_byok if isinstance(is_byok, bool) else None
+    # Through as_wire_flag rather than inline, so this door and the
+    # generation endpoint's door cannot disagree about the same value.
+    # No coercion: a provider that omits the flag leaves None, which is
+    # "not reported" and is not the same answer as false.
+    result["is_byok"] = as_wire_flag(usage.get("is_byok"))
     # Reasoning tokens are the reason the two-tier budget exists: they are
     # billed as completion tokens and consume max_tokens, but never appear
     # in the visible answer. Cached prompt tokens are the other direction,
@@ -2386,7 +2416,11 @@ async def fetch_generation(
     # "is_byok": false beside the figure, and then did not read it, which
     # is the same fetched-and-dropped shape RECONCILABLE_COLUMNS calls
     # out one step later.
-    record["is_byok"] = as_flag(data.get("is_byok"))
+    # as_wire_flag, NOT as_flag. This is JSON from the platform, not a
+    # cell from SQLite, and the SQLite decoder's integer branch has no
+    # business here: it made a wire 1 into True while the identical
+    # value in the in-band usage object became None.
+    record["is_byok"] = as_wire_flag(data.get("is_byok"))
     record["provider"] = _as_label(data.get("provider_name"))
     record["quantization"] = _as_label(data.get("quantization"))
     record["native_finish_reason"] = _as_label(data.get("native_finish_reason"))

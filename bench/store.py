@@ -2116,6 +2116,15 @@ def results_awaiting_reconciliation(
     `cost_details`, leaving the row otherwise complete. That gap is real
     and it is smaller than a list that never empties.
 
+    `is_byok` DOES JOIN THE PREDICATE, and the asymmetry with the figure
+    beside it is the whole point of writing both down. The endpoint
+    publishes the flag for every generation, true or false, so a NULL
+    there is a question with an available answer: one pass fills it and
+    the row leaves the list. A row complete in every other column but
+    missing the flag used to be invisible to this pass and stayed
+    "unknown" in the report's three-way attribution forever, which made
+    an advertised three-way split quietly two-way plus a leak.
+
     A row the endpoint genuinely cannot fill stays listed across passes.
     That is the honest state (the gap is real and still open), it costs one
     lookup per pass, and it ends on its own when the generation record
@@ -2132,6 +2141,7 @@ def results_awaiting_reconciliation(
         "     OR typeof(r.billed_cost_usd) NOT IN ('real', 'integer') "
         "     OR r.billed_cost_usd < 0 "
         "     OR r.provider IS NULL "
+        "     OR r.is_byok IS NULL "
         "     OR r.native_finish_reason IS NULL) "
         "ORDER BY r.id"
     )
@@ -2160,9 +2170,15 @@ RECONCILABLE_COLUMNS = (
     # parse it on every pass and drop it, which is exactly what this
     # tuple's comment above describes for the figure beside it.
     #
-    # Deliberately NOT added to the predicate that chooses rows to
-    # reconcile: a NULL clause there would park every row written before
-    # the column existed on the work list forever.
+    # It IS in the predicate, unlike the figure beside it, and this
+    # comment used to say the opposite: that a NULL clause "would park
+    # every row written before the column existed on the work list
+    # forever". That reasoning was borrowed from
+    # upstream_inference_cost_usd and does not transfer. The endpoint
+    # publishes is_byok for every generation, true or false, so a NULL
+    # here is a question with an available answer and one pass converges
+    # it. The figure beside it has no answer for an ordinary run, which
+    # is what would never converge.
     "is_byok",
 )
 
@@ -2212,7 +2228,7 @@ def apply_reconciliation(
                    -- not erase one captured in band. sqlite3 binds
                    -- Python False as 0, and COALESCE(0, ...) keeps the
                    -- 0, so a reported False still writes.
-                   is_byok = COALESCE(?, is_byok)
+                   is_byok = COALESCE(is_byok, ?)
                WHERE id = ?""",
             (
                 record["billed_cost_usd"],
@@ -2267,6 +2283,21 @@ def apply_reconciliation(
                 # reason the endpoint IS the authority, and a later
                 # correction there is the point of reconciling at all.
                 record["upstream_inference_cost_usd"],
+                # is_byok FILLS AND DOES NOT CORRECT, by the same
+                # ruling and for a stronger reason than the figure
+                # above. It arrived as COALESCE(?, is_byok), which gives
+                # every non-null endpoint answer precedence, so a run
+                # that reported BYOK in band and false at the endpoint
+                # was rewritten to false and moved cost buckets in the
+                # report.
+                #
+                # The in-band value is the one taken in the same
+                # exchange as the charge. The endpoint's is a later
+                # summary of that exchange, and the two are MEASURED to
+                # disagree: gen-1786560251 reported an upstream figure
+                # of 0.0035 in band and 0 at the endpoint. A pass whose
+                # purpose is to recover facts must not be able to
+                # overwrite one, and this column now has no way to.
                 record["is_byok"],
                 result_id,
             ),

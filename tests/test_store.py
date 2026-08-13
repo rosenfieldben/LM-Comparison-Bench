@@ -2986,6 +2986,141 @@ def test_review_repro_reconciliation_cannot_erase_the_in_band_upstream_figure(tm
         conn.close()
 
 
+def test_review_repro_reconciliation_cannot_erase_the_in_band_byok_flag(tmp_path):
+    """WINDOW: one result row across a reconcile pass, at every
+    combination of what was stored and what the endpoint answered.
+
+    THE DEFECT, and it is the upstream figure's defect one column over.
+    The pass wrote is_byok = COALESCE(?, is_byok), which gives EVERY
+    non-null endpoint answer precedence. A run that reported BYOK in
+    band and false at the endpoint was rewritten to false, which is not
+    a cosmetic disagreement: report._cost_totals splits spend three ways
+    on this flag, so the row moved cost buckets and the attribution
+    changed.
+
+    WHY THE IN-BAND VALUE WINS, by the same ruling that settled the
+    figure beside it. It is taken in the same exchange as the charge;
+    the endpoint's is a later summary of that exchange. The two are
+    MEASURED to disagree about that exchange: for generation
+    gen-1786560251 the upstream figure was 0.0035 in band and 0 at the
+    endpoint. A pass whose purpose is to recover facts must not be able
+    to overwrite one.
+
+    BOTH DIRECTIONS, AND BOTH POLARITIES. Fill-only that stopped filling
+    would be a bug of its own, and a rule that protected only True would
+    be a rule about BYOK rather than about provenance.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        record = {
+            "billed_cost_usd": 1.0,
+            "provider": "X",
+            "quantization": None,
+            "native_finish_reason": "stop",
+            "upstream_inference_cost_usd": None,
+        }
+        for stored, endpoint, expected, why in (
+            # The reviewer's shape.
+            (True, False, True, "in-band True survives an endpoint False"),
+            # The same rule, opposite polarity.
+            (False, True, False, "in-band False survives an endpoint True"),
+            # FILL-ONLY STILL FILLS, in both polarities.
+            (None, False, False, "an unknown row takes the endpoint's False"),
+            (None, True, True, "an unknown row takes the endpoint's True"),
+            # And an endpoint that says nothing cannot turn a known
+            # answer into an unknown one.
+            (True, None, True, "silence does not erase"),
+        ):
+            model = f"m/{stored}-{endpoint}"
+            store.save_run(conn, "p", [make_result(model=model, is_byok=stored)])
+            row = conn.execute(
+                "SELECT id, is_byok FROM results WHERE model = ?", (model,)
+            ).fetchone()
+            # PRE-STATE: the row really starts where the case says it
+            # does, so an assertion below cannot pass by nothing having
+            # been stored.
+            assert store.as_flag(row["is_byok"]) is stored, why
+
+            store.apply_reconciliation(conn, row["id"], {**record, "is_byok": endpoint})
+
+            after = conn.execute(
+                "SELECT is_byok FROM results WHERE id = ?", (row["id"],)
+            ).fetchone()["is_byok"]
+            assert store.as_flag(after) is expected, why
+    finally:
+        conn.close()
+
+
+def test_review_repro_a_row_missing_only_the_flag_is_offered_for_reconciling(tmp_path):
+    """WINDOW: results_awaiting_reconciliation's returned list, for a row
+    complete in every column the pass writes except one.
+
+    THE DEFECT. The predicate selected on a missing charge, provider or
+    native finish reason, and not on a missing BYOK flag. A row with a
+    generation id, a billed cost, a provider, a finish reason and an
+    upstream figure, but no flag, was invisible to every pass. The
+    endpoint could have classified it in one call. Instead it stayed
+    "unknown" in the report's attribution indefinitely, which makes an
+    advertised three-way split two ways and a leak.
+
+    WHY THIS COLUMN JOINS THE PREDICATE AND THE FIGURE BESIDE IT DOES
+    NOT, which is the question the old comment answered wrongly by
+    borrowing the figure's reasoning. The endpoint publishes is_byok for
+    every generation, true or false, so a NULL here is a question with
+    an available answer and one pass converges it. The upstream figure
+    has no answer for an ordinary run, so a clause on it would park
+    every ordinary row on the list forever.
+
+    CONVERGENCE IS ASSERTED, not assumed. A predicate that offers a row
+    it can never satisfy is the failure the old comment feared, so the
+    row is reconciled and the list re-read.
+    """
+    conn = store.connect(str(tmp_path / "b.db"))
+    try:
+        store.save_run(
+            conn,
+            "p",
+            [
+                make_result(
+                    model="m/flagless",
+                    generation_id="gen-y",
+                    billed_cost_usd=0.01,
+                    provider="P",
+                    native_finish_reason="stop",
+                    upstream_inference_cost_usd="0.002",
+                    is_byok=None,
+                )
+            ],
+        )
+        listed = store.results_awaiting_reconciliation(conn)
+        assert [r["model"] for r in listed] == ["m/flagless"]
+
+        store.apply_reconciliation(
+            conn,
+            listed[0]["id"],
+            {
+                "billed_cost_usd": 0.01,
+                "provider": "P",
+                "quantization": None,
+                "native_finish_reason": "stop",
+                "upstream_inference_cost_usd": None,
+                "is_byok": False,
+            },
+        )
+        # IT CONVERGES: one pass answers the question and the row leaves.
+        assert store.results_awaiting_reconciliation(conn) == []
+        assert (
+            store.as_flag(
+                conn.execute(
+                    "SELECT is_byok FROM results WHERE id = ?", (listed[0]["id"],)
+                ).fetchone()["is_byok"]
+            )
+            is False
+        )
+    finally:
+        conn.close()
+
+
 def test_review_repro_the_three_states_survive_the_read_path_by_identity(tmp_path):
     """WINDOW: a row from save_run through get_run, which is the path
     every in-process reader actually uses.

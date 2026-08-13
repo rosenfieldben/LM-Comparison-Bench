@@ -36,16 +36,39 @@ from bench import store
 from bench.models import GENERATION_URL
 from bench.reconcile import reconcile
 
-AUDIT_COLUMNS = ("billed_cost_usd", "provider", "quantization", "native_finish_reason")
+# DERIVED, NOT COPIED, and it was copied until this line. The
+# hand-written tuple listed four columns while the store listed six, so
+# the "everything else is byte for byte what it was" assertion below was
+# checking two writable columns against a promise never to write them.
+# It went stale silently twice: once when upstream_inference_cost_usd
+# joined RECONCILABLE_COLUMNS and once when is_byok did.
+AUDIT_COLUMNS = store.RECONCILABLE_COLUMNS
 
 
 def audit_body(gen_id, **overrides):
+    """One generation record, shaped like the documented one.
+
+    Every key below is a field of the generation record documented at
+    https://openrouter.ai/docs/api-reference/overview, and the two live
+    captures in tests/fixtures carry all of them. A helper that omits a
+    field the real endpoint always publishes cannot exercise the code
+    that reads it, which is how is_byok came to be parsed on every pass
+    and written by none: the work list could not select on a column no
+    test ever filled.
+
+    is_byok defaults FALSE rather than absent because that is what both
+    live probes recorded (probe_reasoning_enable.json and
+    probe_reasoning_cap_binding.json, both non-BYOK, both explicit
+    false). Absent is the exceptional shape, so a test wanting it says
+    so by overriding.
+    """
     data = {
         "id": gen_id,
         "total_cost": 0.0015,
         "provider_name": "Infermatic",
         "quantization": "fp8",
         "native_finish_reason": "stop",
+        "is_byok": False,
         "native_tokens_prompt": 10,
         "native_tokens_completion": 25,
     }
@@ -109,14 +132,18 @@ async def test_the_work_list_is_rows_with_an_id_and_a_closable_gap(conn):
         conn,
         [
             completed_result("model/a", "gen-a"),
-            # Nothing left to ask: charge, host and the host's own finish
-            # reason are all recorded.
+            # Nothing left to ask: charge, host, the host's own finish
+            # reason and the BYOK flag are all recorded. The flag joined
+            # that list when the predicate learned to select on it, and
+            # this row has to carry one or it stops being the control
+            # this test needs and becomes a second listed row.
             completed_result(
                 "model/b",
                 "gen-b",
                 billed_cost_usd=0.002,
                 provider="Fireworks",
                 native_finish_reason="stop",
+                is_byok=False,
             ),
             # No id: nothing to ask about.
             completed_result("model/c", None),
@@ -448,9 +475,9 @@ async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
     confirmed zero is a charge, not an absence. It must stay out of the
     work list or the pass would re-ask about it forever.
 
-    The row is seeded with its labels too, so money is the only predicate
-    that could put it on the list and the assertion still tests exactly
-    what it names.
+    The row is seeded with its labels AND its BYOK flag, so money is the
+    only predicate that could put it on the list and the assertion still
+    tests exactly what it names.
     """
     respx.get(GENERATION_URL).respond(json=audit_body("gen-free"))
     seed(
@@ -462,6 +489,7 @@ async def test_a_real_zero_charge_is_not_mistaken_for_a_poisoned_one(conn):
                 billed_cost_usd=0.0,
                 provider="Together",
                 native_finish_reason="stop",
+                is_byok=False,
             )
         ],
     )

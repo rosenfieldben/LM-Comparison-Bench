@@ -3367,7 +3367,7 @@ def test_the_native_and_normalized_counts_really_do_differ():
 
 # ---- T4: the flag crosses every surface as a boolean, or as null.
 
-from bench.models import as_flag  # noqa: E402
+from bench.models import as_flag, as_wire_flag  # noqa: E402
 
 
 def test_as_flag_keeps_three_states_and_refuses_to_guess():
@@ -3395,6 +3395,57 @@ def test_as_flag_keeps_three_states_and_refuses_to_guess():
         assert as_flag(junk) is None, junk
 
 
+def test_review_repro_a_document_with_booleans_is_not_decoded_like_a_cell():
+    """WINDOW: the two flag decoders, side by side, over the one value
+    that separates them.
+
+    THE DEFECT. as_flag exists because SQLite has no boolean and a cell
+    round-trips as 1, 0 or NULL. fetch_generation reached for it to
+    parse a JSON body, which does have booleans, so the two external
+    doors disagreed about the identical wire value: the in-band usage
+    object turned {"is_byok": 1} into None while the generation endpoint
+    turned it into True.
+
+    WHY THE NARROW READING IS THE RIGHT ONE FOR A DOCUMENT. A provider
+    sending 1 where its own schema says true is a provider disagreeing
+    with its contract, and this repository's rule for that is to record
+    "not reported" rather than to guess which of the two it meant. The
+    storage layer has no such option: decode its integers or nothing
+    round-trips at all.
+
+    ASSERTED AGAINST THE PINNED CONTRACT, which types the field as a
+    boolean. usage.is_byok appears as `"is_byok": false` in the pinned
+    example at
+    https://openrouter.ai/docs/use-cases/usage-accounting, read
+    2026-08-04, and the generation record carries it at the top level of
+    data; both are booleans, neither is an integer.
+    """
+    # The two agree everywhere the contract is honoured.
+    for value in (True, False, None, "yes", 2, 1.0, [], {}):
+        assert as_flag(value) is as_wire_flag(value), value
+
+    # And they part exactly where the storage layer's necessity is not
+    # the document's.
+    assert as_flag(1) is True
+    assert as_flag(0) is False
+    assert as_wire_flag(1) is None
+    assert as_wire_flag(0) is None
+
+    # BOTH EXTERNAL DOORS, NOT JUST THE DECODERS. Asserting that two
+    # functions differ proves nothing about which one each caller
+    # reaches for, and that was the entire defect: fetch_generation
+    # reached for the wrong one for a whole release. A mutation swapping
+    # either call site back to as_flag has to fail here, so both are
+    # driven with the value that separates them.
+    #
+    # The in-band door, exercised through the function itself rather
+    # than through the decoder it happens to call.
+    for wire, expected in ((True, True), (False, False), (1, None), (0, None)):
+        result: dict[str, object] = {}
+        _ingest_usage(result, {"is_byok": wire})
+        assert result["is_byok"] is expected, wire
+
+
 @respx.mock
 async def test_review_repro_the_generation_record_parses_the_flag_it_documents(client):
     """WINDOW: fetch_generation's returned record, over every shape the
@@ -3420,8 +3471,12 @@ async def test_review_repro_the_generation_record_parses_the_flag_it_documents(c
         ({"data": {"is_byok": False}}, False),
         # Absent is not false.
         ({"data": {}}, None),
-        # And a non-bool is not a guess.
+        # And a non-bool is not a guess. The integer is the one that
+        # regressed: as_flag accepted it, so this endpoint answered True
+        # to a value the in-band parse answered None to.
         ({"data": {"is_byok": "yes"}}, None),
+        ({"data": {"is_byok": 1}}, None),
+        ({"data": {"is_byok": 0}}, None),
         # Nested where the usage object puts its figure, which is the
         # wrong level: reading there must not find it.
         ({"data": {"cost_details": {"is_byok": True}}}, None),

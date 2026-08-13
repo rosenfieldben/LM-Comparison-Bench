@@ -731,6 +731,15 @@ or a test rather than by this list alone.
   miss: endpoints named `Google` carry the tag `google-vertex`, so a pin
   written `google` matched the display name while routing to a slug that
   does not exist.
+- **2026-08-13. `is_byok` is a boolean in both documents, and the two
+  were read by different rules.** The in-band usage object required a
+  real boolean; the generation endpoint reached for the SQLite decoder
+  and so turned a wire `1` into `True` where the same value in band
+  became `None`. Both live captures carry it as an explicit `false`, at
+  the top level of the generation record and inside `usage`. The
+  endpoint answers the question for every generation, which is why a
+  missing flag is now reconcilable while a missing upstream figure still
+  is not: the second has no answer for an ordinary run.
 - **2026-08-13. The 1024 reasoning floor is one vendor's, not the
   platform's.** Both rules the reservation obeys, the "minimum of 1024
   tokens" and "max_tokens must be strictly higher than the reasoning
