@@ -814,9 +814,9 @@ pytest-base-url==2.1.0 \
     --hash=sha256:02748589a54f9e63fcbe62301d6b0496da0d10231b753e950c63e03aee745d45 \
     --hash=sha256:3ad15611778764d451927b2a53240c1a7a591b521ea44cebfe45849d2d2812e6
     # via pytest-playwright
-pytest-playwright==0.8.0 \
-    --hash=sha256:7888d4a2443160c82e0c506c437076679f86b36d1910427250d90fbf1843a981 \
-    --hash=sha256:856aae6efd4bc055f2ef229c647768760bcaad5cd3a5983c314ac260a974a933
+pytest-playwright==0.9.0 \
+    --hash=sha256:9d9dc74e335c647944cecfffa706cc9e6e4bf4c25e84592c128b584d494d4471 \
+    --hash=sha256:bd44daa852b0fb8b0e55a2f88b727507dedda0e350bea5d09420647252f2454b
     # via -r requirements-dev.in
 python-slugify==8.0.4 \
     --hash=sha256:276540b79961052b66b7d116620b36518847f52d5fd9e3a70164fc8c50faa6b8 \
