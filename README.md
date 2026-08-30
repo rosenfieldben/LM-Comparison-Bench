@@ -1388,10 +1388,17 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 3**: each trial line carries the ordered
+An **export is schema version 5**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
-document was sent and not merely which bytes. The manifest states the
-reason for the bump in the file itself.
+document was sent and not merely which bytes; that arrived in version 3.
+Version 4 added the manifest's `token_counts` sentence and each trial's
+`is_byok`. Version 5 adds `task_attachments` and `attachments_mode` to
+the manifest: trial lines describe the cells that *ran*, and a task that
+never ran leaves no line, so a halted experiment's un-run tasks had their
+declaration nowhere in the file. The manifest states the reason for the
+current bump in the file itself, and it names every field the earlier
+versions added, because a reader holding a v5 artifact and a v2 parser
+needs the whole list from the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1405,7 +1412,20 @@ and the chip titles show it. Exports carry each trial's digests and mode
 and never any content, and the export manifest carries
 `attachments_referenced` so an artifact says at line one whether it
 references bytes it does not embed, exactly as `thresholds_included` says
-whether it embeds the threshold slice.
+whether it embeds the threshold slice. That flag counts the manifest's
+own citations too: an export taken before an experiment has run carries
+no trial lines and still names documents whose bytes live only in the
+`bench.db` that produced it.
+
+The report carries the same provenance twice, on two axes. `attachments`
+is the distinct set of documents the run touched, deduped by digest,
+mode and reading; `task_attachments` is the same thing keyed by task id,
+because a reader looking at one task's score wants the document *that
+task* read and the flat list cannot say. Both are present and empty when
+no cell declared a document, so "no documents" is distinguishable from
+"this report predates the field". Neither carries a filename: the name
+is what a person picked on their own machine and is not a property of
+the bytes.
 
 The token figure on a chip is labeled approximate and is characters over
 four. The bench does not tokenize: every model runs its own tokenizer and
@@ -1415,9 +1435,10 @@ provider decides, because an image's token cost depends on tiling and
 resolution handling that this bench cannot see and a fabricated number
 beside a real byte count would be believed.
 
-**Deliberately out of scope:** per-task attachments in datasets, OCR for
-scanned PDFs, native parts for non-image documents, audio and video, and
-multi-file diffing.
+**Deliberately out of scope:** OCR for scanned PDFs, native parts for
+non-image documents, audio and video, and multi-file diffing. Per-task
+attachments in datasets are no longer among them; see the dataset
+section below.
 
 ## Experiment controls
 

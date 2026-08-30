@@ -6095,6 +6095,11 @@ def rebuild_from_export(lines, tasks_by_id):
                     # the reader does not have.
                     "attachments": trial["attachments"],
                     "attachments_mode": trial["attachments_mode"],
+                    # The READING, not only the bytes. Without it the
+                    # rebuilt report can say which documents a task ran
+                    # over and not which reading of them, and the two are
+                    # different claims; see _report_attachments.
+                    "renditions": trial["renditions"],
                 }
             )
             runs_by_group[gid] = []
@@ -6282,19 +6287,26 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 4
+    assert manifest["export_schema_version"] == 5
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[4]
-    # Version 4 is the units-and-money boundary. Its note still names
-    # renditions, deliberately: EXPORT_SCHEMA_NOTES emits only the
-    # CURRENT version's sentence, so a v4 note that dropped the v3
-    # explanation would leave a v4 artifact unable to explain a field it
-    # still carries.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[5]
+    # Version 5 is Phase M's manifest change. Its note still names what
+    # earlier versions added, deliberately: EXPORT_SCHEMA_NOTES emits
+    # only the CURRENT version's sentence, so a v5 note that dropped the
+    # earlier explanations would leave a v5 artifact unable to explain
+    # fields it still carries.
+    assert "task_attachments" in manifest["export_schema_change"]
     assert "token_counts" in manifest["export_schema_change"]
     assert "is_byok" in manifest["export_schema_change"]
     assert "renditions" in manifest["export_schema_change"]
+    # THE TWO NULLS AT LINE ONE. This experiment's dataset cited no
+    # document, so both keys are present and null rather than absent:
+    # a reader must be able to tell "no documents" from "this artifact
+    # predates the field", and only a present null says the first.
+    assert manifest["task_attachments"] is None
+    assert manifest["attachments_mode"] is None
     # ONE UNIT, SAID ONCE, for a reader who was never in the room. Trial
     # lines put four counts and one ceiling side by side, and the
     # subtraction that invites is the one that manufactured a phantom
@@ -8753,6 +8765,123 @@ def test_native_mode_prices_the_output_and_declines_to_price_the_images(
     assert cost["unpriced"] == []
 
 
+# ---- Phase M3: the pins travel, through the report, the export and
+# ---- the whole declaration-transport walk.
+
+
+@respx.mock
+def test_the_report_names_the_documents_each_task_read(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/report over a two-task dataset where
+    each task cites a different document.
+
+    THE FLAT LIST CANNOT ANSWER THE PER-TASK QUESTION, which is the whole
+    reason the mapping exists beside it. A reader looking at a task's
+    score wants to know which document that task read; the
+    experiment-wide list says only which documents the run touched, and
+    on a dataset where every task attaches something different it is
+    useless for exactly the question its name suggests it answers.
+
+    Deduped per task, which repeats make load-bearing: three repeats of
+    one task read one document, not three.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    first = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    second = upload(client, "notes.txt", b"the notes say seventeen").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "read the spec", "attachments": [first]},
+        {"id": "t2", "prompt": "read the notes", "attachments": [second]},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], repeats=3),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    per_task = report_body["task_attachments"]
+    assert sorted(per_task) == ["t1", "t2"]
+    # ONE ENTRY PER TASK, not one per repeat: six cells ran and each task
+    # read one document.
+    assert len(per_task["t1"]) == 1
+    assert len(per_task["t2"]) == 1
+    assert per_task["t1"][0]["digest"] == first
+    assert per_task["t2"][0]["digest"] == second
+    # THE READING RIDES WITH THE DIGEST, because a reader asking what the
+    # models saw needs both.
+    assert per_task["t1"][0]["kind"] == "document"
+    assert per_task["t1"][0]["extractor"] == "text"
+    assert per_task["t1"][0]["mode"] == "inline"
+    # And the flat list still holds both, which is what makes the two
+    # views different questions rather than one repeated.
+    assert sorted(entry["digest"] for entry in report_body["attachments"]) == sorted(
+        [first, second]
+    )
+    # NEVER A FILENAME, anywhere in the report: the name is what a person
+    # picked on their own machine and is not a property of the bytes.
+    whole = json.dumps(report_body)
+    assert "spec.txt" not in whole
+    assert "notes.txt" not in whole
+
+
+def test_the_report_over_a_plain_dataset_says_no_documents_rather_than_nothing(
+    client, tmp_path
+):
+    """WINDOW: the same two keys on a report over a dataset with no
+    documents.
+
+    Both present and empty, for thresholds_included's reason one subject
+    over: a reader has to be able to tell "no documents" from "this
+    report predates the field", and an absent key cannot say the first.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    assert report_body["attachments"] == []
+    assert report_body["task_attachments"] == {}
+
+
+def test_the_manifest_carries_the_declaration_of_a_task_that_never_ran(
+    client, tmp_path
+):
+    """WINDOW: the manifest line of an export taken over an experiment
+    that has been created and not started, so the artifact holds zero
+    trial lines.
+
+    THE CASE THE BUMP EXISTS FOR. Trial lines carry the pins of the cells
+    that RAN, and a task that never ran leaves no line, so before version
+    5 an interrupted or halted experiment's un-run tasks had their
+    declaration nowhere in the file: the artifact could say a task was
+    owed and not what it was owed OVER. The un-started experiment is the
+    limiting case of that and needs no ceiling machinery to reach.
+
+    AND THE FLAG FOLLOWS THE MANIFEST. attachments_referenced used to be
+    read from the emitted trial lines alone, which was right while the
+    lines were the only thing citing digests. Line one cites them now, so
+    an export with no trials still references bytes it does not carry,
+    and a false here would label that file self-contained.
+    """
+    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    lines = export_lines(client, eid)
+
+    manifest = lines[0]
+    # PRE-STATE: nothing ran, so nothing but the manifest can speak.
+    assert [line["type"] for line in lines] == ["manifest", "digest"]
+    assert manifest["task_attachments"]["t1"][0]["digest"] == digest
+    assert manifest["attachments_mode"] == "inline"
+    assert manifest["attachments_referenced"] is True
+    # Still never content, even at line one.
+    assert "the spec says forty two" not in json.dumps(lines)
+
+
 @respx.mock
 def test_a_native_experiment_sends_the_image_to_every_arm_of_the_cell(client, tmp_path):
     """WINDOW: the two upstream payloads of one native task-cell, across
@@ -10204,29 +10333,35 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
     THE CLAIM: an export is self-sufficient about WHAT WAS READ, not just
     about what was answered. Content is never in the artifact, so the
     export cannot make the prompt reproducible on its own and does not
-    pretend to; what it must do is name the documents by digest, say
-    which mode they reached the models in, and label itself at line one
-    as an artifact that references bytes it does not carry.
+    pretend to; what it must do is name the documents by digest and by
+    reading, say which mode they reached the models in, and label itself
+    at line one as an artifact that references bytes it does not carry.
 
-    HOW THE STATE IS BUILT, said plainly because it is not the runner's
-    doing: the experiment runner does not attach documents, since
-    per-task attachments in datasets are deliberately deferred. The
-    declaration is written onto the cells directly here. That is real
-    state in the real schema (create_group takes both an experiment and
-    attachments) and it is exactly the state the export must survive, so
-    the alternative is shipping an export path over a shape no test ever
-    hands it.
+    ON THE RUNNER'S OWN PATH since Phase M, and the change is worth
+    recording. This test used to write the declaration onto the cells
+    with an UPDATE, because the runner did not attach documents and the
+    alternative was shipping an export path over a shape no test ever
+    handed it. A dataset now declares per task, so the state under test
+    is built the way a person builds it: upload, cite the digest, create,
+    run.
+
+    TWO TASKS, TWO DIFFERENT DOCUMENTS, so the per-task provenance is a
+    claim about tasks rather than one document seen twice.
     """
-    eid, path = two_axes_experiment(client, tmp_path)
-    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
-    # Every cell of this experiment read the same document, which is what
-    # a corpus-wide attachment would mean.
-    client.app.state.db.execute(
-        "UPDATE groups SET attachments_json = ?, attachments_mode = ?"
-        " WHERE experiment_id = ?",
-        (json.dumps([digest]), "inline", eid),
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
-    client.app.state.db.commit()
+    first = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    second = upload(client, "notes.txt", b"the notes say seventeen").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "read the spec", "attachments": [first]},
+        {"id": "t2", "prompt": "read the notes", "attachments": [second]},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
 
     lines = export_lines(client, eid)
 
@@ -10235,42 +10370,72 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
     # Line one labels the artifact's own incompleteness, the way
     # thresholds_included does one subject over.
     assert manifest["attachments_referenced"] is True
+    assert manifest["attachments_mode"] == "inline"
+    # THE FROZEN DECLARATION, at line one, keyed by task.
+    assert sorted(manifest["task_attachments"]) == ["t1", "t2"]
+    assert [pin["digest"] for pin in manifest["task_attachments"]["t1"]] == [first]
+    assert [pin["digest"] for pin in manifest["task_attachments"]["t2"]] == [second]
+
     trials = [line for line in lines if line["type"] == "trial"]
-    assert trials
-    for trial in trials:
-        assert trial["attachments"] == [digest]
-        assert trial["attachments_mode"] == "inline"
+    assert len(trials) == 2, trials
+    by_task = {trial["task_id"]: trial for trial in trials}
+    for task_id, digest in (("t1", first), ("t2", second)):
+        assert by_task[task_id]["attachments"] == [digest]
+        assert by_task[task_id]["attachments_mode"] == "inline"
+        assert [pin["digest"] for pin in by_task[task_id]["renditions"]] == [digest]
 
     # NEVER CONTENT, in the whole artifact and not only in the fields
-    # that were checked above. The document's text is short and
+    # that were checked above. Both documents' text is short and
     # distinctive precisely so this scan can be exact.
     whole = json.dumps(lines)
     assert "the spec says forty two" not in whole
+    assert "the notes say seventeen" not in whole
     assert "content" not in manifest
 
-    # And the report's provenance comes back out of the artifact alone.
+    # And the report's provenance comes back out of the artifact alone,
+    # per task, with no database in reach of the rebuild.
     rebuilt = rebuild_from_export(lines, None)
-    assert rebuilt["attachments"] == [{"digest": digest, "mode": "inline"}]
+    assert [entry["digest"] for entry in rebuilt["attachments"]] == [first, second]
+    # THE READING COMES BACK OUT TOO, not only the bytes. A rebuild that
+    # recovered digests and dropped the pin would let a reader say which
+    # documents a task ran over and not which reading of them, which is
+    # the distinction version 3 of this format exists to carry.
+    assert rebuilt["task_attachments"]["t1"] == [
+        {
+            "digest": first,
+            "mode": "inline",
+            "extractor": "text",
+            "extractor_version": "1",
+            "kind": "document",
+        }
+    ]
+    assert [entry["digest"] for entry in rebuilt["task_attachments"]["t2"]] == [second]
 
 
 @respx.mock
 def test_an_export_over_no_documents_says_so_at_line_one(client, tmp_path):
-    """WINDOW: the manifest line of an export over an ordinary
-    experiment, which is every experiment the runner produces today.
+    """WINDOW: the manifest line of an export over an experiment whose
+    dataset cited no document, which is what an ordinary sweep is.
 
     The mirror, and the reason the flag is a flag rather than an omitted
     key: a reader has to be able to tell "this artifact references no
     documents" from "this artifact predates the field", and only a
-    present false says the first."""
+    present false says the first. The same argument covers the two
+    manifest keys Phase M added, asserted here as present nulls."""
     eid, path = two_axes_experiment(client, tmp_path)
 
     lines = export_lines(client, eid)
 
     assert lines[0]["attachments_referenced"] is False
+    assert lines[0]["task_attachments"] is None
+    assert lines[0]["attachments_mode"] is None
     for trial in (line for line in lines if line["type"] == "trial"):
         assert trial["attachments"] is None
         assert trial["attachments_mode"] is None
-    assert rebuild_from_export(lines, None)["attachments"] == []
+        assert trial["renditions"] is None
+    rebuilt = rebuild_from_export(lines, None)
+    assert rebuilt["attachments"] == []
+    assert rebuilt["task_attachments"] == {}
 
 
 @respx.mock
@@ -12789,7 +12954,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 4
+    assert manifest["export_schema_version"] == 5
     assert manifest["attachments_referenced"] is True
 
     cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]
@@ -12877,7 +13042,7 @@ def test_review_repro_the_history_list_shows_the_pinned_reading(client):
 
 
 @respx.mock
-def test_the_pin_reaches_every_layer_that_carries_it(client):
+def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     """THE DECLARATION-TRANSPORT WALK, as a test rather than as a report.
 
     One digest the bench holds under two readings, the IMAGE one pinned
@@ -12892,10 +13057,31 @@ def test_the_pin_reaches_every_layer_that_carries_it(client):
     path. Every defect this phase fixed was a single layer behaving
     reasonably on its own, and a suite of per-layer tests is exactly what
     was in place while the pin was being dropped at six of them.
+
+    PHASE M ADDED FOUR HOPS AT THE FRONT and one at the back, and they
+    are walked here rather than in a second test because a second walk
+    would prove the property twice over two paths and never over the
+    join. The declaration now starts in a FILE: a dataset line pins a
+    reading, creation freezes it onto the experiment, the runner composes
+    the cell from that freeze, and the group it writes is where the
+    original eleven hops pick the pin up. Where the walk used to stub the
+    experiment layer out with an empty-list assertion, it goes through
+    it.
+
+    Each hop is quoted below on the value it carries, and the trap is
+    unchanged: the base row is the TEXT reading, so any layer answering
+    "walked.txt", "text/plain" or kind "document" is substituting.
     """
-    respx.post(OPENROUTER_URL).mock(
-        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
-    )
+
+    def route(request):
+        # One mock, two shapes. /compare takes the batch JSON response
+        # and the runner streams, so the discriminator is the request's
+        # own stream flag rather than a second route on one URL.
+        if json.loads(request.content).get("stream"):
+            return httpx.Response(200, stream=alpha_stream())
+        return httpx.Response(200, json=response_for("model/vision", "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
     digest, pin = _two_renditions(client, "walked")
     db = client.app.state.db
 
@@ -12956,14 +13142,75 @@ def test_the_pin_reaches_every_layer_that_carries_it(client):
     listed = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
     assert listed["attachments"][0]["kind"] == "image"
 
-    groups = store.experiment_groups(db, 0)
-    assert groups == [], "no experiment here; the export hop is proven above"
+    # ---- The Phase M hops, on the same digest and the same pin.
+
+    # HOP: THE DATASET FILE. The declaration starts as bytes on disk, and
+    # a loader that dropped the three pin fields and kept the digest
+    # would leave every later hop honoring a reading nobody chose.
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "describe", "attachments": [pin]}
+    )
+    assert main.read_dataset(path)["tasks"][0]["attachments"] == [pin]
+
+    # HOP: THE CREATION FREEZE. The experiment record is the declaration
+    # from here on, and it holds the full pin rather than the digest it
+    # was given.
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/vision"], attachments_mode="native"),
+    ).json()["id"]
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {"t1": [pin]}
+
+    # HOP: THE RUNNER. What actually went upstream, read off the mock.
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+    wire = json.dumps(sent)
+    assert "image/png" in wire
+    assert "text/plain" not in wire
+
+    # HOP: THE GROUP THE RUNNER WROTE, which is where the eleven hops
+    # above pick the declaration up. Same value, written from the freeze.
+    cell = store.experiment_groups(db, eid)[0]
+    assert store.group_renditions(db, cell["id"]) == [pin]
+    trial_run = store.get_group(db, cell["id"])["runs"][0]
+    assert store.run_renditions(db, trial_run["id"]) == [pin]
+    assert client.get(f"/groups/{cell['id']}").json()["attachments"][0]["kind"] == (
+        "image"
+    )
+
+    # HOP: THE REPORT, per task.
+    per_task = client.get(f"/experiments/{eid}/report").json()["task_attachments"]
+    assert per_task["t1"][0]["kind"] == "image"
+    assert per_task["t1"][0]["extractor"] == "none"
+
+    # HOP: THE EXPORT, at line one and on the trial line.
+    lines = export_lines(client, eid)
+    assert lines[0]["task_attachments"] == {"t1": [pin]}
+    assert lines[0]["attachments_mode"] == "native"
+    exported = [line for line in lines if line["type"] == "trial"]
+    assert [line["renditions"] for line in exported] == [[pin]]
 
     # And nowhere on the way out does the base row's reading appear.
-    for payload in (detail, run_detail, listed):
+    for payload in (detail, run_detail, listed, per_task):
         blob = json.dumps(payload)
         assert "walked.txt" not in blob, blob
         assert '"text"' not in blob.replace('"text/plain"', ""), blob
+    # The export gets its own scan rather than joining the loop above,
+    # and the difference is not cosmetic. Trial lines carry request_json
+    # as an embedded STRING, so every quote inside it is escaped and the
+    # bare '"text"' probe cannot see through it: the loop's clause would
+    # pass over a substituted extractor without ever looking at it. What
+    # the file must not contain either way is the base row's own two
+    # facts, and the pin equalities above are what pin the extractor.
+    artifact = json.dumps(lines)
+    assert "walked.txt" not in artifact
+    assert "text/plain" not in artifact
 
 
 def test_review_repro_two_suffixes_with_one_reading_are_one_rendition(client):

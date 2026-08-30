@@ -692,8 +692,9 @@ class GroupCreate(BaseModel):
     # way round are a different prompt.
     #
     # Bounded at a handful. This is a side-by-side comparison tool, not
-    # a corpus loader; per-task attachments in datasets are a later
-    # phase with its own shape.
+    # a corpus loader. Phase M gave a dataset TASK the same field under
+    # the same bound, enforced from bench.extract's constant so the two
+    # doors cannot drift; see bench/datasets.py.
     attachments: list[str] | None = Field(
         default=None, min_length=1, max_length=MAX_ATTACHMENTS
     )
@@ -6381,11 +6382,24 @@ def _export_lines(
                 out.append(
                     export_trial(group, run, result, score_rows.get(result["id"], []))
                 )
-        # Read from the emitted lines rather than from the groups, so the
-        # flag cannot claim a reference no trial line actually carries: a
-        # group with a declaration but no recorded result contributes no
-        # line, and an artifact is described by what is in it.
-        referenced = any(line.get("attachments") for line in out)
+        # AN ARTIFACT IS DESCRIBED BY WHAT IS IN IT, which is why the
+        # trial half is read from the emitted LINES rather than from the
+        # groups: a group with a declaration but no recorded result
+        # contributes no line, and the flag must not claim a reference
+        # the file does not carry.
+        #
+        # THE MANIFEST HALF JOINED IT IN PHASE M, and it is the same
+        # rule rather than an exception to it. Since version 5 the
+        # manifest itself cites digests, through task_attachments, so an
+        # export of an experiment that has not run yet carries zero
+        # trial lines and still names documents whose bytes live only in
+        # the bench.db that produced it. Reading only the lines there
+        # would label that file self-contained while it references
+        # content it does not hold, which is the exact claim this flag
+        # exists to make honestly.
+        referenced = any(line.get("attachments") for line in out) or bool(
+            experiment.get("task_attachments")
+        )
         out.insert(0, export_manifest(experiment, REPORT_SEED, thresholds, referenced))
     return out
 

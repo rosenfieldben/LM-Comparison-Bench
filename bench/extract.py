@@ -219,8 +219,8 @@ MAX_COMPOSED_CHARS = 200_000
 #
 # IT LIVES HERE NOW, and the move is what made Phase M possible rather
 # than a stylistic tidy. The constant sat in bench/main.py, whose
-# comment said "per-task attachments in datasets are a later phase with
-# their own shape"; this is that phase, and bench/datasets.py must
+# comment said per-task attachments in datasets were a later phase with
+# their own shape; this is that phase, and bench/datasets.py must
 # enforce the same bound without importing the API boundary that imports
 # IT. One definition, two doors, and no second number to drift.
 MAX_ATTACHMENTS = 4
