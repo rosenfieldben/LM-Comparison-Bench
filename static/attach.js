@@ -645,6 +645,83 @@
     return epoch !== window.BenchState.viewEpoch || staging !== stagingEpoch;
   }
 
+  // ---- The read-only chip a STORED declaration renders as, wherever
+  // ---- it is shown. The composer's chipFor above is a different
+  // ---- object: it carries a remove button and a live token estimate,
+  // ---- because a staged document can still be taken back out. Nothing
+  // ---- in history or in a report can be, so those views get this.
+
+  // The chip body both callers share, so a document described in
+  // history and the same document described in a report cannot drift
+  // into two shapes. The two differ only in what they may put on the
+  // face of the chip, which is the whole of the argument below.
+  function readOnlyChip(label, bits, testid, missing) {
+    const chip = document.createElement("span");
+    chip.className = "attach-chip ref";
+    chip.dataset.testid = testid;
+    // textContent throughout: a filename is user text and gets the
+    // same treatment model output does.
+    chip.textContent = label;
+    if (missing) chip.classList.add("attach-missing");
+    chip.title = bits.join("\n");
+    return chip;
+  }
+
+  // A document a comparison declared, as the history views describe it:
+  // by the name it was uploaded under.
+  //
+  // A ref whose row is gone carries only a digest (see AttachmentRef);
+  // it renders as such rather than being skipped, so a comparison that
+  // declared three documents never reads as having declared two.
+  A.refChip = function (ref, mode, where) {
+    const missing = isMissing(ref);
+    const bits = [];
+    if (!missing && Number.isFinite(ref.byte_size)) {
+      bits.push(fmtBytes(ref.byte_size));
+    }
+    bits.push("sha256 " + shortDigest(ref.digest));
+    if (mode) bits.push(mode);
+    // The extractor and its version, because a pypdf upgrade changes the
+    // text a model read and a replay that could not say which parser
+    // produced it would be a replay of a prompt nobody can reconstruct.
+    if (!missing && ref.extractor && ref.extractor !== "none") {
+      bits.push("read by " + ref.extractor + " " + ref.extractor_version);
+    }
+    return readOnlyChip(
+      missing ? "(no longer stored)" : ref.filename,
+      bits,
+      where + "-attachment",
+      missing,
+    );
+  };
+
+  // The same document as a REPORT describes it, which is by digest and
+  // reading and never by name.
+  //
+  // TWO DIFFERENT ABSENCES, and collapsing them is the reason this is
+  // its own entry point rather than refChip called with a null
+  // filename. refChip's blank face means "the bench no longer holds
+  // these bytes", which is a fact about the store. A report has no name
+  // to show because a filename is what a person picked on their own
+  // machine and is not a property of the bytes, so naming one would be
+  // citing a fact about a filesystem in an artifact about an
+  // experiment. The document is stored and the chip must not say
+  // otherwise.
+  A.pinChip = function (entry, where) {
+    const bits = ["sha256 " + entry.digest];
+    if (entry.mode) bits.push(entry.mode);
+    if (entry.kind) bits.push("read as " + entry.kind);
+    if (entry.extractor && entry.extractor !== "none") {
+      bits.push("read by " + entry.extractor + " " + entry.extractor_version);
+    }
+    return readOnlyChip(
+      "sha256 " + shortDigest(entry.digest),
+      bits,
+      where + "-attachment",
+      false,
+    );
+  };
+
   A.busy = busy;
   A.blockingReason = blockingReason;
   // Repaint on new facts from outside, currently the data policy landing

@@ -517,3 +517,74 @@ def test_a_pattern_on_a_non_regex_scorer_is_refused():
         )
 
     assert "unknown keys: pattern" in str(exc.value)
+
+
+# ---- Phase M4: the README's worked example is a contract, not prose.
+
+
+def test_the_readme_dataset_example_is_one_the_loader_accepts():
+    """WINDOW: the fenced JSONL block in the README's "Documents on a
+    task" section, parsed by the loader itself.
+
+    A WORKED EXAMPLE IS A PROMISE. Someone reading it will paste it,
+    change the digest, and expect the bench to take it; an example the
+    loader refuses is worse than none, because the reader spends their
+    debugging on the documentation rather than on their file. This reads
+    the block out of the README rather than restating it, so the two
+    cannot drift.
+
+    The block is found by its content rather than by a line number: a
+    test anchored to an offset in a two-thousand-line document is a test
+    that breaks on every unrelated edit.
+    """
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    blocks = [
+        block
+        for block in text.split("```")
+        if block.startswith("json\n") and '"clause-1"' in block
+    ]
+    assert len(blocks) == 1, "the README's attachment example moved or was renamed"
+    body = blocks[0][len("json\n") :]
+
+    parsed = parse_dataset(body.encode("utf-8"), name="readme.jsonl")
+
+    assert [task["id"] for task in parsed["tasks"]] == ["clause-1", "clause-2"]
+    # TWO SPELLINGS, TWO DECLARATIONS, both surviving the loader as
+    # written. A bare digest normalizes to a digest and nothing else,
+    # which is what "resolve this at creation" looks like once parsed; a
+    # four-part object keeps all four, which is what "honor exactly this
+    # reading or refuse" looks like. A loader that completed the first
+    # into the second would turn every bare citation into a pin nobody
+    # wrote.
+    digest = "6ff1c0a0f8b34d2e5c7190ab3d4e6f8172533c9be0a4d61f8c2b7e390d5a4c18"
+    assert parsed["tasks"][0]["attachments"] == [{"digest": digest}]
+    assert parsed["tasks"][1]["attachments"] == [
+        {
+            "digest": digest,
+            "extractor": "pypdf",
+            "extractor_version": "6.15.0",
+            "kind": "document",
+        }
+    ]
+
+
+def test_the_readme_names_the_extractors_the_bench_actually_records():
+    """WINDOW: the sentence under the example that lists extractor names,
+    against bench.extract's own registry.
+
+    THE PIN IS HONORED VERBATIM OR REFUSED, so an extractor name in the
+    documentation that the bench never writes is a name that produces a
+    refusal at creation for a reader who followed the instructions. The
+    first draft of that sentence said "pdf", which is the suffix and not
+    the extractor.
+    """
+    from bench.extract import _READERS, _VERSIONS
+
+    text = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    named = {name for _reader, name in _READERS.values()}
+    assert named == set(_VERSIONS), "the registry disagrees with itself"
+    for extractor in named:
+        assert f"`{extractor}`" in text, extractor
+    # And the one an image gets, which has no suffix entry because it is
+    # not parsed at all.
+    assert "`none`" in text

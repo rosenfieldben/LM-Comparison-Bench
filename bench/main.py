@@ -561,6 +561,17 @@ class Attachment(BaseModel):
     created_at: str
 
 
+class AttachmentList(BaseModel):
+    """The documents the bench holds, as metadata and nothing else.
+
+    THE SAME Attachment SHAPE the detail endpoint serves, so a caller
+    that can read one can read a page of them. No content field on
+    either, for the reason Attachment gives.
+    """
+
+    attachments: list[Attachment]
+
+
 class AttachmentRef(BaseModel):
     """A document a comparison declared, as the history views describe it.
 
@@ -5747,6 +5758,36 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
         },
     )
     return _attachment_view(stored)
+
+
+@app.get("/attachments", response_model=AttachmentList)
+async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    """Every stored document, newest first. Never any content.
+
+    THE WORKFLOW NEEDS THIS TO BE READABLE. A dataset references
+    documents and never carries them, so authoring one means writing a
+    digest into a JSONL line; without a list form the only way to learn
+    a digest was to keep the upload response, and a digest nobody can
+    look up is a citation nobody can check. Upload, list, cite, create.
+
+    Bounded like the history list and for the same reason, and flat in
+    the number of rows: one query, no body columns, so a page of a
+    thousand documents costs a page of metadata rather than a page of
+    documents.
+
+    THE BASE ROW'S OWN READING, exactly as GET /attachments/{digest}
+    answers it. This endpoint says what is STORED under these bytes; it
+    does not enumerate every rendition of them, and a dataset author who
+    wants to pin a reading other than the first upload's still has to
+    know it from elsewhere. That is a real gap and a named one: closing
+    it means a batched per-digest rendition reader with its own bound,
+    and this phase does not build it.
+    """
+    return {
+        "attachments": [
+            _attachment_view(row) for row in store.list_attachments(app.state.db, limit)
+        ]
+    }
 
 
 @app.get("/attachments/{digest}", response_model=Attachment)

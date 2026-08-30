@@ -199,32 +199,13 @@
   // two must agree: a document shown one way in the list and another way
   // after the click would read as two different documents.
   //
-  // A ref whose row is gone carries only a digest (see AttachmentRef);
-  // it renders as such rather than being skipped, so a comparison that
-  // declared three documents never reads as having declared two.
+  // Built where the composer's chips are built, so a document described
+  // in history and the same document described in a report cannot drift
+  // into two shapes. See BenchAttach.refChip for the body and for why
+  // the report gets a different entry point rather than this one with a
+  // null filename.
   function attachmentChip(ref, mode, where) {
-    const { fmtBytes, shortDigest } = window.BenchLib;
-    const chip = document.createElement("span");
-    chip.className = "attach-chip ref";
-    chip.dataset.testid = where + "-attachment";
-    const missing = ref.filename === null || ref.filename === undefined;
-    // textContent throughout: a filename is user text.
-    chip.textContent = missing ? "(no longer stored)" : ref.filename;
-    if (missing) chip.classList.add("attach-missing");
-    const bits = [];
-    if (!missing && Number.isFinite(ref.byte_size)) {
-      bits.push(fmtBytes(ref.byte_size));
-    }
-    bits.push("sha256 " + shortDigest(ref.digest));
-    if (mode) bits.push(mode);
-    // The extractor and its version, because a pypdf upgrade changes the
-    // text a model read and a replay that could not say which parser
-    // produced it would be a replay of a prompt nobody can reconstruct.
-    if (!missing && ref.extractor && ref.extractor !== "none") {
-      bits.push("read by " + ref.extractor + " " + ref.extractor_version);
-    }
-    chip.title = bits.join("\n");
-    return chip;
+    return window.BenchAttach.refChip(ref, mode, where);
   }
 
   // Whether routing is recoverable from this source. A group stores its

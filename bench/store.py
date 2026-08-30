@@ -1412,6 +1412,29 @@ def get_attachment(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | No
     return dict(row) if row is not None else None
 
 
+def list_attachments(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+    """Every stored document's metadata, newest first, bounded.
+
+    THE SAME COLUMNS get_attachment SELECTS, which is what makes the
+    list and the detail one shape rather than two. Neither body is
+    selected: not the BLOB, for the reason attachment_content is the
+    single exception in this module, and not the extracted text, because
+    a page of documents is exactly the caller that must not load a page
+    of documents' worth of text to show their lengths. K1.5 measured
+    that mistake at 15114 characters for three chips.
+
+    Newest first, because the reason to list is usually to find what was
+    just uploaded and cite it. Bounded by the caller, for the reason the
+    history list is: this stays cheap as bench.db grows.
+    """
+    rows = conn.execute(
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments"
+        " ORDER BY id DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def attachment_content(conn: sqlite3.Connection, digest: str) -> bytes | None:
     """The stored bytes for one attachment. The ONLY reader that returns them.
 

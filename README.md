@@ -1585,7 +1585,62 @@ is sent as that task's system message. `reference` is the expected answer
 for the comparing scorers. `rubric` is the scoring instruction for the
 judge. `scorer` names how the task is scored: `exact`,
 `normalized_exact`, `contains`, `regex` (with a `pattern`), or `judge`.
-Task ids must be unique within a file.
+`attachments` cites the documents that task reads. Task ids must be
+unique within a file.
+
+### Documents on a task
+
+**Datasets reference documents; they never carry them.** A task cites a
+sha256 the bench already holds, so the file stays a small text artifact
+whatever it points at, the bytes are stored once however many tasks cite
+them, and a dataset can never smuggle a path on somebody's disk into a
+comparison. The workflow is upload, look up, cite, create.
+
+```sh
+# 1. Upload. The response carries the digest, the parser that read the
+#    bytes, and how many characters came out of it.
+curl -s -X POST localhost:8000/attachments \
+  -H "Content-Type: application/json" \
+  -d "{\"filename\": \"contract.pdf\",
+       \"content_base64\": \"$(base64 -w0 contract.pdf)\"}"
+
+# 2. Or look one up later. Metadata only, newest first, never content.
+curl -s localhost:8000/attachments
+```
+
+```json
+{"id": "clause-1", "prompt": "What is the delivery window?", "attachments": ["6ff1c0a0f8b34d2e5c7190ab3d4e6f8172533c9be0a4d61f8c2b7e390d5a4c18"], "reference": "42 days", "scorer": {"kind": "contains"}}
+{"id": "clause-2", "prompt": "Who bears the shipping cost?", "attachments": [{"digest": "6ff1c0a0f8b34d2e5c7190ab3d4e6f8172533c9be0a4d61f8c2b7e390d5a4c18", "extractor": "pypdf", "extractor_version": "6.15.0", "kind": "document"}]}
+```
+
+Both lines above are parsed by the loader's own test, so this example
+cannot rot into one the bench would refuse. The extractor names are the
+ones the bench records: `text` for `.txt` and `.md`, `pypdf` for `.pdf`,
+`stdlib-zipfile-xml` for `.docx`, and `none` for an image, which is read
+as pixels rather than parsed.
+
+**Two spellings, one meaning, and the difference is who chooses the
+reading.** A bare digest means "whichever reading the bench stored for
+these bytes", resolved once at creation. A four-part object PINS a
+reading, and the bench then honors it verbatim or refuses: a pin naming
+a parser version the bench never ran is a refusal at creation, not a
+silent substitution. Both are frozen onto the experiment record the
+moment it is created, so a parser upgrade between creation and start
+changes nothing about the run. At most four documents per task, the same
+bound a hand comparison has.
+
+`attachments_mode` sits on the EXPERIMENT, not on the task: `inline`
+(the default) extracts the text and gives every model the same reading
+of it, `native` sends images as content parts. One mode for the whole
+sweep, because an experiment where some arms see pixels and others see
+extracted text is two experiments wearing one name. Native is checked
+against every model in the lineup at creation and the whole experiment
+is refused if any of them cannot take images.
+
+A digest the bench does not hold is a 422 naming the task and the
+digest. Deleting the bytes afterwards does not rewrite the record: the
+experiment and its export keep their pins, and anything that needs the
+content again refuses naming what is missing.
 
 **A dataset's version is its content.** There is no version field to keep
 in sync and no way to edit a file and leave a stale label behind: the

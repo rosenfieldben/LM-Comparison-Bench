@@ -316,6 +316,63 @@
     return table;
   }
 
+  // Which documents each TASK read, as chips built by the same function
+  // the history views use.
+  //
+  // PER TASK AND NOT PER EXPERIMENT, because the flat list the report
+  // also carries says which documents the run touched and a reader
+  // looking at one task's numbers wants the document THAT task read. On
+  // a dataset where every task attaches something different the flat
+  // list is useless for exactly the question its name suggests.
+  //
+  // NEVER A FILENAME, and the report has none to show: a name is what a
+  // person picked on their own machine and is not a property of the
+  // bytes. See BenchAttach.pinChip for why that absence gets its own
+  // entry point rather than reusing the one that means "no longer
+  // stored".
+  //
+  // Null when no task declared a document, so the caller appends
+  // nothing rather than an empty box. An experiment with no documents
+  // should look like every experiment did before this phase.
+  function taskDocuments(report) {
+    const perTask = report.task_attachments || {};
+    // Sorted, and the sort is this view's own. Object key order is
+    // insertion order for ordinary strings and NUMERIC order for keys
+    // that look like integers, so a dataset whose task ids are "1" and
+    // "10" would be reordered by the engine and not by anything the
+    // report said. One stated order beats one that depends on how the
+    // ids were spelled.
+    const ids = Object.keys(perTask).sort();
+    if (ids.length === 0) return null;
+    const el = document.createElement("div");
+    el.className = "report-docs";
+    el.dataset.testid = "report-documents";
+    const label = document.createElement("span");
+    label.className = "report-note";
+    label.textContent =
+      "documents each task read, by digest and reading; the bench does " +
+      "not record a filename here because a name is a fact about " +
+      "somebody's filesystem rather than about the bytes";
+    el.append(label);
+    for (const id of ids) {
+      const row = document.createElement("div");
+      row.className = "attach-strip";
+      row.dataset.testid = "report-task-documents";
+      row.dataset.task = id;
+      const name = document.createElement("span");
+      name.className = "attach-strip-label";
+      // textContent: a task id comes out of the operator's own dataset
+      // file and is user text like any other.
+      name.textContent = id;
+      row.append(name);
+      for (const entry of perTask[id]) {
+        row.append(window.BenchAttach.pinChip(entry, "task"));
+      }
+      el.append(row);
+    }
+    return el;
+  }
+
   function banner(report) {
     const el = document.createElement("div");
     el.className = "report-banner";
@@ -503,8 +560,13 @@
       return;
     }
     note.remove();
+    panel.append(banner(report));
+    // Above the tables, because the documents changed what every model
+    // READ and the tables only report how each one answered. Appended
+    // only when there are any: see taskDocuments.
+    const documents = taskDocuments(report);
+    if (documents) panel.append(documents);
     panel.append(
-      banner(report),
       outcomesTable(report),
       scorerTable(report),
       providerTable(report),

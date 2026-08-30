@@ -8882,6 +8882,96 @@ def test_the_manifest_carries_the_declaration_of_a_task_that_never_ran(
     assert "the spec says forty two" not in json.dumps(lines)
 
 
+# ---- Phase M4: the seams a person touches. Upload, list, cite, create.
+
+
+def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client):
+    """WINDOW: GET /attachments over three stored documents.
+
+    THE WORKFLOW NEEDS A LOOKUP. A dataset references documents and never
+    carries them, so authoring one means writing a digest into a JSONL
+    line; without this the only way to learn a digest was to have kept
+    the upload response, and a citation nobody can look up is a citation
+    nobody can check.
+
+    Newest first, because the reason to list is usually to find what was
+    just uploaded and cite it.
+    """
+    first = upload(client, "one.txt", b"first document").json()["digest"]
+    second = upload(client, "two.txt", b"second document").json()["digest"]
+    third = upload(client, "three.txt", b"third document").json()["digest"]
+
+    resp = client.get("/attachments")
+
+    assert resp.status_code == 200
+    listed = resp.json()["attachments"]
+    assert [entry["digest"] for entry in listed] == [third, second, first]
+    # THE SAME SHAPE the detail endpoint serves, field for field, so a
+    # caller that can read one can read a page of them.
+    assert listed[0] == client.get(f"/attachments/{third}").json()
+    # NEVER CONTENT, on this endpoint as on every other. The bodies are
+    # short and distinctive precisely so this scan can be exact.
+    whole = resp.text
+    assert "third document" not in whole
+    assert "content" not in whole
+    # Private like every other dynamic body: this one names every
+    # document the operator has ever attached.
+    assert resp.headers.get("cache-control") == "private, no-store"
+
+
+def test_the_attachment_list_is_bounded_and_refuses_an_unbounded_limit(client):
+    """WINDOW: the limit query parameter, at its ceiling and past it.
+
+    Bounded for the reason the history list is: this endpoint has to stay
+    cheap as bench.db grows, and an unbounded page is the shape that
+    stops being cheap silently.
+    """
+    for index in range(3):
+        upload(client, f"doc{index}.txt", f"body {index}".encode())
+
+    assert len(client.get("/attachments?limit=2").json()["attachments"]) == 2
+    assert client.get("/attachments?limit=0").status_code == 422
+    assert client.get("/attachments?limit=501").status_code == 422
+
+
+@respx.mock
+def test_the_blind_view_of_a_document_cell_still_names_no_document(client, tmp_path):
+    """WINDOW: POST /groups/{id}/blind over a cell the RUNNER created
+    from a dataset that cited a document.
+
+    THE BLIND VIEW'S RULE IS UNCHANGED AND IS NOW REACHABLE A NEW WAY.
+    Before this phase a runner cell carried no documents, so the blind
+    response could not have leaked one; the runner writes the
+    declaration onto its groups now, and this is the assertion that the
+    anonymized view still hands back label, id and answer and nothing
+    else. A filename in a blind card would identify the comparison to a
+    rater as surely as a model id would, and a digest would let one be
+    looked up.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = upload(client, "secret-contract.txt", b"forty two days").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    group_id = client.get("/runs").json()["runs"][0]["id"]
+    # PRE-STATE: this really is a cell that declared a document, or the
+    # absence below would be an absence of nothing.
+    assert store.group_renditions(app.state.db, group_id) is not None
+
+    blind = client.post(f"/groups/{group_id}/blind", json={})
+
+    assert blind.status_code == 201, blind.text
+    body = blind.text
+    assert "secret-contract.txt" not in body
+    assert digest not in body
+    assert "forty two days" not in body
+    # Label, id and answer, and nothing else on any card.
+    for card in blind.json()["cards"]:
+        assert set(card) == {"label", "result_id", "response_text", "error"}
+
+
 @respx.mock
 def test_a_native_experiment_sends_the_image_to_every_arm_of_the_cell(client, tmp_path):
     """WINDOW: the two upstream payloads of one native task-cell, across
