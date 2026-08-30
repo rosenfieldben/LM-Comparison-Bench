@@ -380,7 +380,7 @@ def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     pre-K.1 group, where the answer is genuinely unknown rather than
     absent.
     """
-    seen: set[tuple[str, str | None, str | None, str | None]] = set()
+    seen: set[tuple[str | None, ...]] = set()
     out: list[dict[str, Any]] = []
     for group in groups:
         for key, entry in _declared_documents(group):
@@ -393,25 +393,56 @@ def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _declared_documents(
     group: dict[str, Any],
-) -> list[tuple[tuple[str, str | None, str | None, str | None], dict[str, Any]]]:
+) -> list[tuple[tuple[str | None, ...], dict[str, Any]]]:
     """One group's documents, each as its dedup key and its entry.
 
-    Written once because two readers now walk the same declaration: the
+    Written once because two readers walk the same declaration: the
     experiment-wide list and the per-task mapping. Two copies of this
     loop would be two chances for one of them to key on digest alone,
     which is the collapse _report_attachments' docstring spends four
     paragraphs explaining.
+
+    IT KEYED ON THE DIGEST ITSELF, and that is the thirteenth review's
+    F5. The pins were indexed into a mapping keyed by digest, so a
+    comparison declaring ONE digest under TWO readings kept whichever
+    pin came last and handed it to both positions. Everything else on
+    the branch carried the pair correctly (the dataset parse, the
+    creation freeze, the composed payload, the group row and the v5
+    export manifest all preserved both); the report alone published one,
+    and published the WRONG one for the first position. Its provenance
+    was therefore false about a case pins_for goes out of its way to
+    allow, and documents_for spends a paragraph saying it iterates the
+    pins rather than a digest-keyed mapping for exactly this reason.
+
+    PAIRED BY POSITION, because that is how they were written.
+    create_group derives attachments_json FROM renditions_json, one for
+    one and in order, so index i of each names the same declaration. A
+    length disagreement is a group from an era with no pins at all (or a
+    row nothing in this application writes), and those fall back to
+    digest-only, which is the honest answer for a comparison that
+    pinned nothing.
+
+    THE KEY IS THE WHOLE PIN, all four fields plus the mode. The old one
+    omitted kind, which was harmless only because two readings that
+    differ in kind also differ in extractor today; a key that is the
+    declaration cannot be wrong tomorrow for a reason nobody wrote down.
     """
     mode = group.get("attachments_mode")
-    pins = {pin["digest"]: pin for pin in group.get("renditions") or []}
-    rows = []
-    for digest in group.get("attachments") or []:
-        pin = pins.get(digest)
+    digests = group.get("attachments") or []
+    pins = group.get("renditions") or []
+    paired: list[tuple[str, dict[str, Any] | None]] = (
+        list(zip(digests, pins, strict=True))
+        if len(pins) == len(digests)
+        else [(digest, None) for digest in digests]
+    )
+    rows: list[tuple[tuple[str | None, ...], dict[str, Any]]] = []
+    for digest, pin in paired:
         key = (
             digest,
             mode,
             pin["extractor"] if pin else None,
             pin["extractor_version"] if pin else None,
+            pin["kind"] if pin else None,
         )
         entry: dict[str, Any] = {"digest": digest, "mode": mode}
         if pin is not None:
@@ -451,7 +482,7 @@ def _report_task_attachments(
     export_manifest.
     """
     out: dict[str, list[dict[str, Any]]] = {}
-    seen: dict[str, set[tuple[str, str | None, str | None, str | None]]] = {}
+    seen: dict[str, set[tuple[str | None, ...]]] = {}
     for group in groups:
         task_id = group["task_id"]
         for key, entry in _declared_documents(group):

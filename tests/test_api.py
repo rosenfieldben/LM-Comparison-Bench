@@ -9321,6 +9321,151 @@ def test_a_dimension_published_at_zero_is_a_zero_and_not_an_unknown(client, tmp_
     assert cost["total_usd"] is not None
 
 
+# ---- Thirteenth review, F5: one digest under two readings is two
+# ---- documents, in the report as everywhere else.
+
+
+@respx.mock
+def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
+    client, tmp_path
+):
+    """WINDOW: GET /experiments/{id}/report over a task that cites one
+    digest twice, with a complete pin for text version 1 and another for
+    text version 2.
+
+    THE CALL-SITE-KEYS LENS, and this is what it is for. Two lists that
+    describe one declaration position by position were joined through a
+    mapping keyed on ONE of their fields, so the key was not the
+    declaration: the last pin for a digest won and both positions were
+    described by it. Everything else on the branch iterates the pins in
+    order (documents_for says so in a paragraph, for precisely this
+    case), and the report alone indexed them.
+
+    MEASURED BEFORE THE FIX, at d680e9d: the dataset parse, the creation
+    freeze, the composed payload, the group row and the v5 export
+    manifest all carried both readings; report.attachments and
+    report.task_attachments carried one, and it was version 2 in both
+    positions. The report's provenance was false about the first
+    document, which is worse than incomplete.
+
+    THE WHOLE JOURNEY IS ASSERTED, not just the report, because the
+    finding is that one hop disagreed with the rest and a test of the
+    report alone could not show that.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = upload(client, "contract.txt", b"reading one").json()["digest"]
+    parser_upgrade(digest, "2", "reading two")
+    pins = [
+        {
+            "digest": digest,
+            "extractor": "text",
+            "extractor_version": version,
+            "kind": "document",
+        }
+        for version in ("1", "2")
+    ]
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "compare the readings", "attachments": pins}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    # HOP: the creation freeze keeps both, in order.
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == pins
+    final = run_experiment_to_completion(client, eid, path)
+    assert final["status"] == "done", final
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    # THE HOP THAT COLLAPSED THEM. Two entries, in declaration order,
+    # each naming its own reading.
+    assert [entry["extractor_version"] for entry in report_body["attachments"]] == [
+        "1",
+        "2",
+    ]
+    assert [
+        entry["extractor_version"] for entry in report_body["task_attachments"]["t1"]
+    ] == ["1", "2"]
+    # And the payload really did carry both readings, so the report is
+    # describing something that happened.
+    group = client.get("/runs").json()["runs"][0]
+    assert store.group_renditions(app.state.db, group["id"]) == pins
+    lines = export_lines(client, eid)
+    assert lines[0]["task_attachments"]["t1"] == pins
+    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [pins]
+
+
+def test_the_dedup_key_is_the_whole_pin_and_not_three_quarters_of_it(client):
+    """WINDOW: _declared_documents over two pins differing only in kind.
+
+    ASSERTED AT THE FUNCTION rather than through an experiment, because
+    the store cannot currently produce this pair: attachment_extractions
+    is unique on (digest, extractor, extractor_version), so two readings
+    that differ in kind differ in extractor as well, and every door
+    resolves a pin by those three. That makes kind's absence from the
+    key harmless TODAY and only today.
+
+    A key that is not the declaration is a key that becomes wrong for a
+    reason nobody wrote down, which is what the digest-only version of
+    this key already did once. The function's contract is that a
+    declaration keys itself, and the cheapest place to hold it to that
+    is here.
+    """
+    digest = "c" * 64
+    group = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": [digest, digest],
+        "renditions": [
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": kind,
+            }
+            for kind in ("document", "image")
+        ],
+    }
+
+    keys = [key for key, _entry in report._declared_documents(group)]
+
+    assert len(set(keys)) == 2, keys
+    assert [entry["kind"] for _key, entry in report._declared_documents(group)] == [
+        "document",
+        "image",
+    ]
+
+
+def test_a_group_that_pinned_nothing_still_lists_the_documents_it_declared(client):
+    """WINDOW: _declared_documents over a pre-K.1 shape, digests with no
+    renditions.
+
+    THE FALLBACK THE PAIRING NEEDS. attachments and renditions are
+    written one for one and in order, so pairing them by position is
+    correct wherever both exist; a group from the era that declared
+    digests and no reading has a length disagreement rather than a
+    shorter list, and its documents are still facts about it. Dropping
+    them would shrink a declaration silently, which is the failure
+    AttachmentRef exists to prevent one table over.
+    """
+    legacy = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": ["a" * 64, "b" * 64],
+        "renditions": None,
+    }
+
+    entries = [entry for _key, entry in report._declared_documents(legacy)]
+
+    assert entries == [
+        {"digest": "a" * 64, "mode": "inline"},
+        {"digest": "b" * 64, "mode": "inline"},
+    ]
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 
