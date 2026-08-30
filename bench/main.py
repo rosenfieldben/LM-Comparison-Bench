@@ -55,6 +55,7 @@ from bench.models import (
     QUANTIZATION_LEVELS,
     as_money,
     as_text,
+    context_shortfalls,
     endpoint_completion_cap,
     endpoint_supports_reasoning,
     fetch_catalog,
@@ -63,6 +64,7 @@ from bench.models import (
     keepalive_socket_options,
     missing_parameters,
     normalized_provider_slug,
+    projected_cost,
     provider_preferences,
     run_model,
     stream_model,
@@ -830,8 +832,36 @@ class ExperimentCreate(BaseModel):
     halt_on_refusal: bool = True
 
 
+class CostProjection(BaseModel):
+    """What an experiment would cost at most, priced at creation.
+
+    A CEILING ON THE OUTPUT SIDE and an estimate on the input side, and
+    the two halves are reported apart because they are wrong in
+    different directions. output_usd prices every trial at the full
+    budget it reserved, which is the most it can be billed and usually
+    well above what it will be. input_usd counts characters over the
+    same heuristic the composer and the refusals use, which can be out
+    either way for any given tokenizer.
+
+    Every figure is None when any lineup member publishes no price, and
+    unpriced then names the members: a total missing one arm of a
+    comparison reads as the comparison's total. input_usd and total_usd
+    are also None in native mode, where the input is images and nothing
+    here converts pixels to tokens; output_usd still stands there,
+    because the output side is measured the same way in both modes.
+
+    Not stored on the experiment. See create_experiment.
+    """
+
+    input_usd: float | None
+    output_usd: float | None
+    total_usd: float | None
+    unpriced: list[str]
+
+
 class ExperimentCreated(BaseModel):
     id: int
+    projected_cost: CostProjection
 
 
 class ExperimentStart(BaseModel):
@@ -2506,6 +2536,64 @@ CHARS_PER_TOKEN = 4
 # which is ordinary for code, CJK text and heavy markup.
 CONTEXT_HEADROOM = 0.1
 
+# How many task-and-model shortfalls a dataset-wide refusal spells out.
+#
+# A dataset holds up to MAX_TASKS tasks and a lineup up to MAX_POSITION
+# models, so an unbounded enumeration is an error body measured in
+# megabytes for the one input that produces it: a dataset where nothing
+# fits. Five is enough to see the shape (which task, which model, by how
+# much) and the count of what is not shown keeps the message honest
+# about being an excerpt rather than the whole answer.
+SHORTFALLS_SHOWN = 5
+
+
+# The sentence both window refusals end on, before their remedies.
+#
+# ONE WORDING FOR ONE ARITHMETIC. The comparison door and the
+# experiment door run the same division through context_shortfalls, and
+# a person who met the refusal at one door and then at the other has to
+# be reading the same admission about the same heuristic. Two spellings
+# would read as two rules.
+CONTEXT_ESTIMATE_NOTE = (
+    f"The prompt figure is an estimate, characters over {CHARS_PER_TOKEN}, "
+    "because the bench does not tokenize and every model's tokenizer "
+    "disagrees."
+)
+
+
+def catalog_windows() -> dict[str, Any] | None:
+    """Every model's published context window, or None when there is no
+    catalog to read one from.
+
+    None is "the bench cannot answer this question", which is not the
+    same as "no model publishes a window" and must not collapse into it:
+    an unfetched catalog would otherwise present as a lineup of models
+    that all happen to publish nothing, and every window check would
+    silently pass rather than being skipped for a stated reason.
+    """
+    catalog = getattr(app.state, "catalog", None) or {}
+    if not catalog.get("fetched"):
+        return None
+    return {
+        entry["id"]: entry.get("context_length") for entry in catalog.get("models", [])
+    }
+
+
+def shortfall_clause(short: dict[str, Any]) -> str:
+    """One model's half of a window refusal, with both numbers shown.
+
+    THE ARITHMETIC IS SHOWN PER MODEL because the remedy differs by
+    model: drop this one, shorten the document, or pick the other
+    budget. A bare "too long" tells nobody which. Written once because
+    the two doors that raise it must not drift into two formats for one
+    fact.
+    """
+    return (
+        f"{short['model']} holds {short['window']} tokens and this needs "
+        f"about {short['needed']} ({short['prompt_tokens']} for the prompt "
+        f"plus {short['reserved']} reserved for the answer)"
+    )
+
 
 def enforce_context_window(
     composed: str, models: list[str] | None, budget: str
@@ -2548,38 +2636,31 @@ def enforce_context_window(
     """
     if not models:
         return
-    catalog = getattr(app.state, "catalog", None) or {}
-    if not catalog.get("fetched"):
+    windows = catalog_windows()
+    if windows is None:
         return
-    windows = {
-        entry["id"]: entry.get("context_length") for entry in catalog.get("models", [])
-    }
-    # Ceiling division: a prompt is never fewer tokens than this rounds
-    # to, and rounding down at the boundary would admit the one case the
-    # check exists for.
-    prompt_tokens = -(-len(composed) // CHARS_PER_TOKEN)
-    too_small = []
-    for model in models:
-        window = windows.get(model)
-        if not isinstance(window, int):
-            continue
-        needed = prompt_tokens + effective_budget(budget, model)
-        usable = int(window * (1 - CONTEXT_HEADROOM))
-        if needed > usable:
-            too_small.append(
-                f"{model} holds {window} tokens and this needs about "
-                f"{needed} ({prompt_tokens} for the prompt plus "
-                f"{effective_budget(budget, model)} reserved for the answer)"
-            )
-    if too_small:
+    short = context_shortfalls(
+        len(composed),
+        models,
+        windows,
+        # A comparison budgets from the model-level cap because it is
+        # unpinned by construction: /compare and /compare/stream name no
+        # provider, so the union across hosts is the right question.
+        # The experiment door budgets from the RESOLVED ROUTE instead,
+        # and the difference is deliberate; see enforce_task_windows.
+        {model: effective_budget(budget, model) for model in models},
+        chars_per_token=CHARS_PER_TOKEN,
+        headroom=CONTEXT_HEADROOM,
+    )
+    if short:
         raise HTTPException(
             422,
             "this comparison does not fit every model in the lineup: "
-            + "; ".join(too_small)
-            + ". The prompt figure is an estimate, characters over "
-            f"{CHARS_PER_TOKEN}, because the bench does not tokenize and "
-            "every model's tokenizer disagrees. Drop the model, attach a "
-            "shorter document, or use the standard budget.",
+            + "; ".join(shortfall_clause(entry) for entry in short)
+            + ". "
+            + CONTEXT_ESTIMATE_NOTE
+            + " Drop the model, attach a shorter document, or use the "
+            "standard budget.",
         )
 
 
@@ -2759,7 +2840,31 @@ def composed_for(
     """
     if not digests:
         return prompt, None
-    pins = pins_for(digests, group_id, renditions)
+    return compose_from_pins(
+        prompt, pins_for(digests, group_id, renditions), mode, defer_native
+    )
+
+
+def compose_from_pins(
+    prompt: str, pins: list[dict[str, Any]], mode: str, defer_native: bool = False
+) -> tuple[Any, Any]:
+    """The same two contents, built from a pin the caller already holds.
+
+    THE SECOND ENTRY POINT, not a second composer. composed_for RESOLVES
+    a declaration (digests, plus whatever the group or the member
+    pinned) and then calls this; a caller whose pin is already a decided
+    fact calls this directly. The body is shared because the fairness
+    law and rule two are one law in every mode and at every door, and
+    two bodies would be two chances for one of them to compose per model
+    or to record the content.
+
+    THE RUNNER IS THAT CALLER. An experiment's renditions were resolved
+    and frozen at creation, so resolving them again per cell would be
+    asking a question the manifest has already answered, and asking it
+    of a table a parser upgrade can move: K.3's law says a pin is
+    honored verbatim or refused, and honoring it means not looking it up
+    again.
+    """
     if mode == "native":
         # VALIDATE NOW, ENCODE LATER, when the caller says it can wait.
         # Everything that could refuse this comparison has already run at
@@ -3833,6 +3938,164 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
     return frozen
 
 
+def experiment_reserved(
+    budget: str, lineup: list[str], routes: dict[str, dict[str, Any]]
+) -> dict[str, int]:
+    """How many completion tokens each lineup member will actually reserve.
+
+    THE NUMBER THE RUNNER WILL SEND, not the tier the person asked for.
+    run_one_trial composes route_budget over effective_budget, so a
+    pinned endpoint that publishes a small ceiling reserves less than
+    the tier names. An arithmetic budgeting from the tier would refuse
+    experiments that fit and would price answers nobody can be charged
+    for, both in the same direction and both invisible.
+
+    One expression, derived the way the trial derives it, read by the
+    window check and by the estimate. Keyed by model, so a lineup naming
+    one model twice collapses here and is re-expanded by whoever
+    iterates the lineup: the reservation is a fact about a model, and
+    the two trials of a duplicate reserve the same amount.
+    """
+    return {
+        model: route_budget(
+            effective_budget(budget, model), routes[model]["completion_cap"]
+        )
+        for model in lineup
+    }
+
+
+def weigh_tasks(
+    dataset: dict[str, Any], task_attachments: dict[str, list[dict[str, Any]]]
+) -> dict[str, int]:
+    """Every task's composed size in characters, measured once at creation.
+
+    THE INPUT SIDE STOPPED BEING UNIFORM the moment a task could carry a
+    document. Before this phase every task of an experiment weighed
+    about what its prompt weighed, so one representative number priced
+    the sweep; a dataset where one task attaches a hundred pages and the
+    rest ask a line prices nothing like its own average. This is where
+    that per-task weight is taken, once, from the same composition the
+    runner will send.
+
+    THE GLOBAL CEILING RIDES ALONG, per task, and it refuses here rather
+    than at trial 300. MAX_COMPOSED_CHARS is the question "will the
+    bench send this at all", and a dataset that answers no for one task
+    is a dataset that cannot be run to completion; discovering that
+    after 299 paid calls is discovering it too late to matter.
+
+    ONLY ATTACHMENT-CARRYING TASKS ARE MEASURED AGAINST IT. A bare
+    prompt cannot approach that ceiling the way a document can, and
+    applying it to every task would be a new rule wearing this phase's
+    clothes: a 300,000 character prompt is accepted by /compare today
+    and this workstream is not the place to change that. The weight is
+    still recorded for those tasks, because the estimate prices the
+    prompt too.
+
+    The read is the expensive part and it is bounded on purpose: each
+    composition is at most MAX_COMPOSED_CHARS and is discarded as soon
+    as it is measured, so peak memory is one task's worth however long
+    the dataset is.
+    """
+    chars: dict[str, int] = {}
+    for task in dataset["tasks"]:
+        pins = task_attachments.get(task["id"])
+        if not pins:
+            chars[task["id"]] = len(task["prompt"])
+            continue
+        composed = compose(task["prompt"], documents_for(pins), redacted=False)
+        try:
+            enforce_composed_size(composed)
+        except CompositionError as exc:
+            # The task names itself. A dataset-wide refusal carrying only
+            # the arithmetic would leave the author to find which of two
+            # thousand lines it was about.
+            raise HTTPException(422, f"task {task['id']!r}: {exc}") from None
+        chars[task["id"]] = len(composed)
+    return chars
+
+
+def plural(count: int) -> str:
+    """The "s" a count needs, or nothing. Written once so a message that
+    counts does not have to choose between wrong grammar and a branch."""
+    return "" if count == 1 else "s"
+
+
+def enforce_task_windows(
+    dataset: dict[str, Any],
+    task_attachments: dict[str, list[dict[str, Any]]],
+    task_chars: dict[str, int],
+    lineup: list[str],
+    reserved: dict[str, int],
+) -> None:
+    """Refuse an experiment whose documents no model in the lineup could
+    hold, naming every coordinate of the refusal.
+
+    THE COMPARISON DOOR'S CHECK, RUN PER TASK. enforce_context_window
+    asks whether ONE composed prompt fits a lineup; a dataset asks it
+    once per task against the same lineup, and the answer can differ by
+    task because the documents do. The arithmetic is
+    context_shortfalls in both places, so the two doors cannot drift.
+
+    BUDGETED FROM THE RESOLVED ROUTE, which is the one thing this does
+    that the comparison door does not. A comparison names no provider,
+    so the model-level union is the right question there. An experiment
+    may pin one, and route_budget then clamps what the trial reserves;
+    budgeting from the unclamped tier here would refuse datasets that
+    would in fact have fitted, which is a false refusal and the worst
+    kind because nothing about it looks wrong.
+
+    ATTACHMENT-CARRYING TASKS ONLY, for the reason /compare applies its
+    own window check only to attachment-carrying requests: the
+    budget-versus-window check for every run is a named deferral and
+    stays one.
+
+    A missing catalog SKIPS the check rather than refusing it, exactly
+    as the comparison door does; see enforce_context_window for why
+    absence is answered that way here and not for a capability claim.
+    """
+    windows = catalog_windows()
+    if windows is None:
+        return
+    clauses: list[str] = []
+    offenders = 0
+    for task in dataset["tasks"]:
+        if not task_attachments.get(task["id"]):
+            continue
+        short = context_shortfalls(
+            task_chars[task["id"]],
+            lineup,
+            windows,
+            reserved,
+            chars_per_token=CHARS_PER_TOKEN,
+            headroom=CONTEXT_HEADROOM,
+        )
+        if not short:
+            continue
+        offenders += 1
+        if offenders <= SHORTFALLS_SHOWN:
+            clauses.extend(
+                f"task {task['id']!r}: {shortfall_clause(entry)}" for entry in short
+            )
+    if not offenders:
+        return
+    hidden = offenders - min(offenders, SHORTFALLS_SHOWN)
+    subject = (
+        "1 task in this dataset does not fit"
+        if offenders == 1
+        else f"{offenders} tasks in this dataset do not fit"
+    )
+    raise HTTPException(
+        422,
+        f"{subject} every model in the lineup: "
+        + "; ".join(clauses)
+        + (f"; and {hidden} further task{plural(hidden)} not shown" if hidden else "")
+        + ". "
+        + CONTEXT_ESTIMATE_NOTE
+        + " Shorten the named task's document, drop the model, or use the "
+        "standard budget.",
+    )
+
+
 @app.post("/experiments", response_model=ExperimentCreated, status_code=201)
 async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     """Write the experiment manifest, after validating everything about it.
@@ -3846,6 +4109,18 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     and (in strict mode) every control is capability-checked against the
     catalog now, so an experiment that cannot run does not get created and
     then discovered at trial 300.
+
+    THE SIZE CHECKS JOINED THAT LIST when a task could carry a document.
+    Each task's composition is measured here against the global ceiling
+    and against every lineup member's window, both naming the task, for
+    the same reason: a dataset with one line nothing can hold is a sweep
+    that cannot finish, and finding that out at trial 300 is finding it
+    out after 299 paid calls.
+
+    IT ALSO ANSWERS "WHAT WILL THIS COST", which is the question a
+    person actually has at this moment and the only moment the answer
+    can change what they do. The projection rides on the 201 and is not
+    stored; see CostProjection and the comment at the call.
     """
     dataset = read_dataset(body.dataset_path)
     controls = request_controls(body.params)
@@ -3934,7 +4209,66 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 enforce_native_mode(pins, body.lineup)
             except HTTPException as exc:
                 raise HTTPException(422, f"task {task_id!r}: {exc.detail}") from None
+    # NORMALIZED ONCE, READ TWICE. The slug the record stores is the slug
+    # the route is resolved against on the next line, and a report citing
+    # a pin is only worth reading if the pin it names is the pin that
+    # rode the payload. Two spellings of one pin would check and price
+    # one endpoint and send to another.
+    provider_pins = (
+        {
+            model: normalized_provider_slug(name)
+            for model, name in body.provider_pins.items()
+        }
+        if body.provider_pins
+        else None
+    )
+    # THE ROUTE IS RESOLVED HERE TOO, and this is the second place rather
+    # than a move of the first. run_experiment resolves again at start,
+    # because a route is what the RUN will use and minutes may have
+    # passed; this resolution is what the ARITHMETIC below uses, and an
+    # arithmetic that ran against the model-level union would refuse
+    # datasets that fit and price answers nobody can be charged for.
+    #
+    # It costs nothing for an ordinary experiment: trial_route fetches a
+    # listing only for a pinned model, so an unpinned lineup makes no
+    # request at all here. A pinned one buys one listing per distinct
+    # pinned model, once, before any money is spent, which is the
+    # cheapest question this endpoint asks.
+    routes = await resolve_routes(
+        {"estimand_mode": body.estimand_mode, "provider_pins": provider_pins},
+        body.lineup,
+    )
+    reserved = experiment_reserved(body.budget, body.lineup, routes)
+    # NOT WEIGHED IN NATIVE MODE, and None says so rather than zero. A
+    # document sent as an image part is billed in image tokens, and
+    # composing it inline to count characters would measure a string
+    # that will never be sent. The window check is skipped for the same
+    # reason both endpoints skip it there.
+    task_chars = (
+        None
+        if task_attachments and body.attachments_mode == "native"
+        else weigh_tasks(dataset, task_attachments)
+    )
+    if task_chars is not None:
+        enforce_task_windows(
+            dataset, task_attachments, task_chars, body.lineup, reserved
+        )
+    # Priced before the row is written, so a projection that could not be
+    # computed is still a created experiment and never a half-written
+    # one. It is deliberately NOT stored: it is a statement about the
+    # catalog at this instant, not a fact about the experiment, and a
+    # column holding it would go stale while looking like a record.
+    cost = projected_cost(
+        len(dataset["tasks"]),
+        task_chars,
+        body.lineup,
+        body.repeats,
+        reserved,
+        app.state.prices,
+        chars_per_token=CHARS_PER_TOKEN,
+    )
     return {
+        "projected_cost": cost,
         "id": store.create_experiment(
             app.state.db,
             {
@@ -3952,14 +4286,7 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 # sent pin are one string. A report citing a pin is only
                 # worth reading if the pin it names is the pin that rode
                 # the payload.
-                "provider_pins": (
-                    {
-                        model: normalized_provider_slug(name)
-                        for model, name in body.provider_pins.items()
-                    }
-                    if body.provider_pins
-                    else None
-                ),
+                "provider_pins": provider_pins,
                 "quantizations": body.quantizations,
                 "task_attachments": task_attachments,
                 "attachments_mode": body.attachments_mode,
@@ -3973,7 +4300,7 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 "tasks_total": len(dataset["tasks"]),
                 "trials_total": trials,
             },
-        )
+        ),
     }
 
 
@@ -4157,8 +4484,23 @@ async def run_one_trial(
     group_id: int,
     controls: dict[str, Any],
     route: dict[str, Any],
+    content: dict[str, Any],
 ) -> dict[str, Any]:
     """One model against one task, through the machinery every run uses.
+
+    content is the CELL'S composition, built once by the caller and
+    handed to every member: the string (or content-part list) that goes
+    on the wire, the redacted form the record keeps, and the pins both
+    were built from. It arrives rather than being built here, and that
+    is the fairness law made structural at the cell level exactly as
+    POST /compare makes it structural at the batch level: there is one
+    composition and N sends of it, so identical bytes across the arms of
+    a task is a property of the code and not a promise about it.
+
+    The three parts travel together because they are meaningless apart.
+    A wire form without its redacted twin is a payload the record
+    cannot describe; a redacted form without the pins is a reference to
+    documents nothing names.
 
     The same semaphore, the same post-admission ceiling recheck, the same
     settlement inside the held slot, the same never-raises client. The
@@ -4210,13 +4552,19 @@ async def run_one_trial(
         else:
             start = time.perf_counter()
             async for event in stream_model(
-                task["prompt"],
+                content["composed"],
                 model,
                 app.state.client,
                 max_tokens=max_tokens,
                 holder=holder,
                 provider_prefs=trial_provider_prefs(experiment, model, controls),
                 controls=controls,
+                # Rule two, exactly as both endpoints keep it: the record
+                # carries the composed STRUCTURE with a digest reference
+                # where each document sat, never a second copy of the
+                # content. None when nothing is attached, and the payload
+                # is then byte for byte what it was before this phase.
+                record_prompt=content["recorded"],
                 # Resolved above, from the same listing the budget was
                 # clamped against; see trial_route.
                 may_send_reasoning_cap=route["may_send_reasoning_cap"],
@@ -4289,6 +4637,13 @@ async def run_one_trial(
             None,
             group_id,
             run_provenance(),
+            # What THIS trial actually sent. Redundant with the group's
+            # pin here, since the runner writes both from one frozen
+            # declaration, and recorded anyway because every other
+            # writer records it and a row that answered differently
+            # depending on who wrote it would be a worse record than one
+            # that repeats itself.
+            renditions=content["pins"] or None,
         )
     except Exception:
         # Same rule as both endpoints: the money is already spent, and
@@ -4337,6 +4692,18 @@ async def run_experiment(experiment_id: int) -> None:
     state = app.state.experiment_run
     lineup = experiment["lineup"]
     controls_base = experiment["params"] or {}
+    # THE MANIFEST IS THE DECLARATION, and the runner reads it rather
+    # than the dataset file. The dataset says which digests a task
+    # cites; the experiment record says which READING of each was
+    # frozen at creation, and a parser upgrade between creation and
+    # start moves the first and cannot move the second. Absent on a
+    # pre-M experiment and on one whose dataset declared no document,
+    # which are the two eras that share the NULL.
+    task_pins = experiment["task_attachments"] or {}
+    # "inline" rather than None, because that is the mode a comparison
+    # with no documents has always been checked under and rule one says
+    # this phase changes nothing for those runs.
+    attachments_mode = experiment["attachments_mode"] or "inline"
     status, detail = "done", None
     # Set by the cancellation handler around each trial, and read once
     # that trial has been counted. Declared out here rather than per cell
@@ -4409,6 +4776,37 @@ async def run_experiment(experiment_id: int) -> None:
             # like any other control, so the record says what was sent.
             if task["system"] is not None:
                 controls["system"] = task["system"]
+            pins = task_pins.get(task["id"]) or []
+            # COMPOSED ONCE FOR THE CELL, ahead of the group row so a
+            # composition that cannot be built leaves no empty group
+            # behind. Every member below is handed this same object, so
+            # identical bytes across a task's arms is structural here in
+            # the way it is structural on POST /compare: one string, N
+            # sends of it.
+            #
+            # FROM THE FROZEN PIN, not from a resolution. compose_from_pins
+            # is given the manifest's renditions directly, so an
+            # extraction row written between trial one and trial two is
+            # invisible to both, which is what K.3's law requires of a
+            # pin and what the two-layer declaration exists to buy.
+            #
+            # The native payload is the one thing here measured in
+            # megabytes, and holding it per CELL rather than per trial is
+            # the same arithmetic /compare makes for a batch: one copy
+            # for however wide the lineup is, released when the cell
+            # ends, and cells run one at a time.
+            try:
+                composed, recorded = compose_from_pins(
+                    task["prompt"], pins, attachments_mode
+                )
+            except HTTPException as exc:
+                # The bytes went away between creation and start. The
+                # record keeps its pins, forward-only, and the run
+                # refuses naming what is missing rather than sending a
+                # comparison with a document silently absent from it.
+                status, detail = "failed", f"task {task['id']!r}: {exc.detail}"
+                break
+            content = {"composed": composed, "recorded": recorded, "pins": pins}
             group_id = store.create_group(
                 db,
                 task["prompt"],
@@ -4421,6 +4819,14 @@ async def run_experiment(experiment_id: int) -> None:
                     "repeat_index": cell["repeat_index"],
                     "rotation_index": cell["rotation_index"],
                 },
+                # The group declares this cell's documents exactly as a
+                # hand comparison declares its own, and from the same
+                # frozen pin the composition above was built from. One
+                # source, two writes: a group whose renditions came from
+                # anywhere else could describe a comparison the runner
+                # did not send.
+                attachments_mode=attachments_mode if pins else None,
+                renditions=pins or None,
             )
             halted = False
             for position, model in cell["order"]:
@@ -4453,6 +4859,13 @@ async def run_experiment(experiment_id: int) -> None:
                     experiment["budget"],
                     model=model,
                     position=position,
+                    # The documents join the manifest check on the
+                    # runner's own trials, exactly as they do on a
+                    # client's request. Force a mismatch and this 409s
+                    # the runner too, which is the point of there being
+                    # no bypass.
+                    attachments=[pin["digest"] for pin in pins] or None,
+                    attachments_mode=attachments_mode,
                 )
                 # SHIELDED, then awaited again. Shutdown cancels this
                 # task, and without the shield the CancelledError landed
@@ -4476,6 +4889,7 @@ async def run_experiment(experiment_id: int) -> None:
                         group_id,
                         controls,
                         routes[model],
+                        content,
                     )
                 )
                 try:

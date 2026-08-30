@@ -1663,6 +1663,40 @@ at creation. An experiment over that bound is refused with the arithmetic
 shown, because the caller has three levers and needs to know which one to
 pull.
 
+The 201 carries a `projected_cost` beside the new id: what the sweep
+would cost at most, priced before a call is made.
+
+```json
+{"id": 4,
+ "projected_cost": {"input_usd": 0.0021, "output_usd": 0.131072,
+                    "total_usd": 0.133172, "unpriced": []}}
+```
+
+The two halves are reported apart because they are wrong in different
+directions. `output_usd` is a ceiling: it prices every trial at the full
+budget it reserved, clamped to the completion cap of the route the trial
+will actually be served by, which is the most it can be billed and
+usually well above what it will be. `input_usd` is an estimate in the
+other direction, characters over four, summed per task so a dataset
+where one task attaches a hundred pages and the rest ask a line prices
+like itself rather than like its average.
+
+Every figure is `null` when any model in the lineup publishes no price,
+and `unpriced` then names them: a total missing one arm of a comparison
+reads as the comparison's total. `input_usd` and `total_usd` are also
+`null` in native mode, where the input is images and nothing here
+converts pixels to tokens; `output_usd` still stands, because the output
+side is measured the same way in both modes. The projection is not
+stored on the experiment: it is a statement about the catalog at that
+instant rather than a fact about the run.
+
+Creation also runs the two size checks per task, before anything is
+written. A task whose prompt and documents compose past the global
+composed ceiling is refused naming that task, and a task that no model
+in the lineup could hold alongside the answer it reserved is refused
+naming the task, the model and both numbers. Tasks that fit are not
+mentioned, so the refusal says which line of the dataset to shorten.
+
 ## Estimands
 
 Every experiment declares which of two questions it is answering, and

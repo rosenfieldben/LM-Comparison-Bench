@@ -1075,6 +1075,162 @@ def endpoint_completion_cap(
     return min(caps) if caps else None
 
 
+def context_shortfalls(
+    prompt_chars: int,
+    models: list[str],
+    windows: Mapping[str, Any],
+    reserved: Mapping[str, int],
+    *,
+    chars_per_token: int,
+    headroom: float,
+) -> list[dict[str, Any]]:
+    """Which lineup members cannot hold this prompt plus the answer it
+    reserved, each with the arithmetic a refusal has to show.
+
+    ONE ARITHMETIC, TWO DOORS, which is the whole reason this is a
+    function rather than a loop inside each caller. A comparison checks
+    one composed prompt against one lineup; an experiment checks one per
+    TASK against the same lineup, and the two refusals have to agree
+    down to the digit or a person reconciling them finds no answer. The
+    comment on the boundary's CHARS_PER_TOKEN already says why two
+    estimates would be worse than either; this is that rule applied one
+    level up, to the comparison the estimate feeds.
+
+    Pure, and given everything. The window per model, the tokens each
+    model reserved for its answer, the heuristic and the margin all
+    arrive as arguments: the boundary owns the catalog and the policy,
+    and this owns only the division.
+
+    THE ORDER IS THE LINEUP'S, and models is iterated rather than
+    windows, because a lineup may legitimately name one model twice
+    (asking how much it varies run to run) and a refusal built by
+    walking a keyed mapping would name fewer models than the run has.
+
+    A model with no published window is SKIPPED rather than refused; see
+    enforce_context_window for why an absent window is answered
+    differently here than an absent capability is.
+
+    reserved is indexed rather than got: a model in the lineup with no
+    entry is a caller that built two different lineups, and returning a
+    quiet zero for it would under-report the very number the refusal
+    exists to show.
+    """
+    # Ceiling division: a prompt is never fewer tokens than this rounds
+    # to, and rounding down at the boundary would admit the one case the
+    # check exists for.
+    prompt_tokens = -(-prompt_chars // chars_per_token)
+    short = []
+    for model in models:
+        window = windows.get(model)
+        if not isinstance(window, int):
+            continue
+        answer = reserved[model]
+        needed = prompt_tokens + answer
+        if needed > int(window * (1 - headroom)):
+            short.append(
+                {
+                    "model": model,
+                    "window": window,
+                    "needed": needed,
+                    "prompt_tokens": prompt_tokens,
+                    "reserved": answer,
+                }
+            )
+    return short
+
+
+def projected_cost(
+    tasks_total: int,
+    task_chars: Mapping[str, int] | None,
+    lineup: list[str],
+    repeats: int,
+    reserved: Mapping[str, int],
+    prices: Mapping[str, Any],
+    *,
+    chars_per_token: int,
+) -> dict[str, Any]:
+    """What an experiment would cost at most, priced before it runs.
+
+    THE INPUT HALF IS PER TASK, and that is the point of the function.
+    Every trial of an experiment reserves the same completion budget, so
+    the output half is one multiplication over the lineup; the INPUT
+    half was uniform too until a task could carry a document, and a
+    dataset where one task attaches a hundred pages and the rest ask one
+    line prices nothing like its own average. So task_chars is summed
+    per task rather than multiplied from a representative one.
+
+    task_chars is None when the caller cannot measure the input at all,
+    which is native mode: a document sent as an image part is billed in
+    image tokens, and nothing this bench holds converts pixels to them.
+    The input and total figures are then None while the output figure
+    stands, because the output side is measured the same way in both
+    modes and an honest half is better than a whole number that quietly
+    counted images as free.
+
+    AN INCOMPLETE PRICE IS NOT A SMALL PRICE. One unpriced model in the
+    lineup makes every figure None and names the model, rather than
+    summing the models that do publish prices: a total missing one
+    member of a comparison reads as the comparison's total and would be
+    wrong by however much that member costs. This is the rule the
+    browser's own estimate already follows, and two estimators
+    disagreeing about what an unpriced model means would be worse than
+    either.
+
+    A CEILING, NOT A FORECAST, on the output side: it prices every trial
+    at its full reserved budget, which is the most it can be billed and
+    is usually well above what it will be. The input side is an estimate
+    in the other direction, characters over the heuristic, and the
+    caller is expected to say so where it shows the figure.
+
+    tasks_total is passed rather than derived from task_chars because
+    the OUTPUT half is measured in both modes and task_chars is absent
+    in one of them. In inline mode the two agree by construction, and
+    the caller builds both from the same dataset.
+
+    Pure and given its prices, its reservations and its heuristic, so
+    the catalog stays the boundary's business.
+    """
+    unpriced = sorted({model for model in lineup if prices.get(model) is None})
+    if unpriced:
+        return {
+            "input_usd": None,
+            "output_usd": None,
+            "total_usd": None,
+            "unpriced": unpriced,
+        }
+    output = (
+        repeats
+        * tasks_total
+        * sum(reserved[model] * prices[model]["completion"] for model in lineup)
+    )
+    input_usd: float | None = None
+    if task_chars is not None:
+        prompt_price = sum(prices[model]["prompt"] for model in lineup)
+        input_usd = (
+            repeats
+            * prompt_price
+            * sum(-(-chars // chars_per_token) for chars in task_chars.values())
+        )
+    total = None if input_usd is None else input_usd + output
+    # The same belt cost_usd wears, for the same reason: fetch_catalog
+    # rejects non-finite prices at ingestion, so a NaN can only arrive
+    # from a price set past that path, and a NaN presented as a dollar
+    # figure is worse than no figure.
+    if not all(math.isfinite(v) for v in (output, input_usd or 0.0)):
+        return {
+            "input_usd": None,
+            "output_usd": None,
+            "total_usd": None,
+            "unpriced": unpriced,
+        }
+    return {
+        "input_usd": input_usd,
+        "output_usd": float(output),
+        "total_usd": None if total is None else float(total),
+        "unpriced": unpriced,
+    }
+
+
 def missing_parameters(
     supported: list[str] | None, controls: Mapping[str, Any] | None
 ) -> list[str]:
