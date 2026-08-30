@@ -4008,11 +4008,22 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
     caller stores as NULL rather than as an empty object; see
     store.create_experiment for why absence gets one spelling.
     """
-    # ONE QUERY FOR THE WHOLE DATASET, not one per task. A two thousand
-    # task file citing four documents each is eight thousand lookups the
-    # naive way, in a request that is meant to be instant, and the
-    # duplicates are the common case: a dataset usually cites the same
-    # handful of contracts across many questions.
+    # ONE QUERY FOR EVERY ROW THE DATASET CITES, not one per task. A two
+    # thousand task file citing four documents each is eight thousand
+    # row lookups the naive way, in a request that is meant to be
+    # instant, and the duplicates are the common case: a dataset usually
+    # cites the same handful of contracts across many questions.
+    #
+    # IT IS NOT ONE QUERY FOR THE WHOLE FUNCTION, and the M1 commit body
+    # said it was. A task that declares a FULL PIN is resolved through
+    # resolve_rendition below, which reads the extractions table once
+    # per pin, so a dataset of two thousand fully pinned citations makes
+    # two thousand of those on top of this one. Batching them would need
+    # a reader keyed on all three pin components and would trade the
+    # honest refusal resolve_rendition raises, naming the pin it could
+    # not honor, for a set difference somebody has to turn back into a
+    # message. The bare-digest spelling, which is the documented
+    # workflow, needs no such lookup at all.
     wanted = sorted(
         {
             entry["digest"]

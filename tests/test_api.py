@@ -9466,6 +9466,133 @@ def test_a_group_that_pinned_nothing_still_lists_the_documents_it_declared(clien
     ]
 
 
+# ---- Thirteenth review, F6: the served report and the rebuild
+# ---- classify an interrupted empty cell the same way.
+
+
+def test_review_repro_an_empty_cell_reads_the_same_served_and_rebuilt(client, tmp_path):
+    """WINDOW: the served report and the report rebuilt from the export,
+    over an experiment holding one attachment-bearing group that
+    recorded no result. That is what interruption between the group
+    write and the first trial leaves behind.
+
+    MEASURED BEFORE THE FIX, at 54c53ec:
+
+      served    cells_recorded 1, missing 1, not_run 0, with the
+                cell's document provenance
+      rebuilt   cells_recorded 0, missing 0, not_run 1, with none
+
+    M3's claim is that the report stays rebuildable from the artifact,
+    and it did not hold: the export emits a line per RESULT, so an empty
+    group contributes nothing to the file, while the report counted
+    every group it was handed.
+
+    THE CHOICE, and it is one. Either the export carries empty-group
+    declarations, or both surfaces classify the state identically. This
+    branch takes the second: "an artifact is described by what is in it"
+    is the export's own rule and has its own tombstone, since a flag
+    claiming a reference the file does not carry sends a reader looking
+    for a digest that is not there. Making the report agree with the
+    artifact keeps that argument; making the artifact agree with the
+    report would have spent it. What the cell was owed is not lost:
+    the v5 manifest carries the frozen per-task declaration for every
+    task, run or not, which this test also asserts.
+
+    THE RULE LIVES IN build_report, not in the boundary's reader, so the
+    two paths agree BY CONSTRUCTION rather than by both happening to do
+    the same thing.
+    """
+    digest = upload(client, "ghost.txt", b"declared but never run").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    # THE ONLY CELL OF THE PLAN, written as the runner writes it and
+    # then left without a trial, which is what interruption between the
+    # group row and the first result leaves behind.
+    store.create_group(
+        app.state.db,
+        "what does it say?",
+        ["model/alpha"],
+        None,
+        "standard",
+        experiment={
+            "experiment_id": eid,
+            "task_id": "t1",
+            "repeat_index": 0,
+            "rotation_index": 0,
+        },
+        renditions=[
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ],
+        attachments_mode="inline",
+    )
+
+    served = client.get(f"/experiments/{eid}/report").json()
+    lines = export_lines(client, eid)
+    rebuilt = rebuild_from_export(lines, None)
+
+    # PRE-STATE: the empty group really is there, and it is the plan's
+    # only cell, or the equality below would be an equality over
+    # nothing.
+    assert (
+        app.state.db.execute(
+            "SELECT COUNT(*) AS n FROM groups WHERE experiment_id = ?", (eid,)
+        ).fetchone()["n"]
+        == 1
+    )
+    assert served["plan"]["cells"] == 1
+    assert [line["type"] for line in lines] == ["manifest", "digest"]
+
+    # THE EQUALITY THE REBUILD CLAIM NEEDS, on every count the empty
+    # cell moved and on the provenance it published.
+    assert served["plan"] == rebuilt["plan"]
+    assert served["plan"]["cells_recorded"] == 0
+    assert served["attachments"] == rebuilt["attachments"] == []
+    assert served["task_attachments"] == rebuilt["task_attachments"] == {}
+    assert digest not in json.dumps(served)
+    assert [row["trials"] for row in served["models"]] == [
+        row["trials"] for row in rebuilt["models"]
+    ]
+    # not_run on both, which is what it is: no cell at all from the
+    # point of view of a report about what ran.
+    assert served["models"][0]["trials"]["not_run"] == 1
+
+    # WHAT IT WAS OWED IS STILL IN THE FILE, at line one, which is the
+    # half of the answer the report is not the place for.
+    assert lines[0]["type"] == "manifest"
+    assert lines[0]["task_attachments"]["t1"][0]["digest"] == digest
+    assert lines[0]["attachments_referenced"] is True
+
+
+def test_a_cell_with_one_arm_recorded_is_still_a_cell(client, tmp_path):
+    """WINDOW: build_report's own filter, over a group with a result and
+    a group without one.
+
+    THE FILTER IS ABOUT EMPTY CELLS, not about incomplete ones. A cell
+    where one model answered and another never ran is exactly what
+    "missing" is for: the group exists, its neighbours ran, and the
+    absence is attributable to an arm. Dropping it would erase a real
+    comparison and would move its missing arms into not_run, which
+    counts them as never reached instead of as reached and unanswered.
+    """
+    groups = [{"id": 1, "task_id": "t1"}, {"id": 2, "task_id": "t2"}]
+    runs = {
+        1: [{"id": 10, "results": [{"id": 100}]}],
+        # A run row with no results at all, which is what a group written
+        # before its first trial holds.
+        2: [{"id": 11, "results": []}],
+    }
+
+    assert report.recorded_groups(groups, runs) == [groups[0]]
+    assert report.recorded_groups(groups, {}) == []
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 

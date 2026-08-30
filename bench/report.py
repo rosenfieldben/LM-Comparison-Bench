@@ -493,6 +493,52 @@ def _report_task_attachments(
     return out
 
 
+def recorded_groups(
+    groups: list[dict[str, Any]], runs_by_group: dict[int, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """The cells this report can describe: the ones that recorded a
+    result.
+
+    A CELL WITH NO RESULT IS NOT A CELL THIS REPORT HAS ANYTHING TO SAY
+    ABOUT. The runner writes the group row before the first trial, so an
+    experiment interrupted between the two leaves a group with a
+    declaration and nothing else. Counting it as recorded put a cell in
+    the denominator that contributed no outcome, and published the
+    documents it would have read as provenance for numbers that do not
+    exist.
+
+    IT ALSO BROKE THE REBUILD, which is the thirteenth review's F6 and
+    the reason this rule is here rather than in the boundary's reader.
+    The export emits a line per RESULT, so an empty group contributes
+    nothing to the artifact, and rebuilding the report from the artifact
+    therefore disagreed with the served one: cells_recorded 1 against 0,
+    not_run 0 against 1, and document provenance present against absent.
+    M3 claims the report stays rebuildable from an export; a rule that
+    lived where only one of the two paths could apply it would leave
+    that claim resting on the two paths happening to agree.
+
+    So the served report and the rebuild now classify the state the same
+    way BY CONSTRUCTION: both call build_report, build_report calls
+    this, and an empty group is not_run on both. What the cell was owed
+    is not lost by that: the export's v5 manifest carries the frozen
+    per-task declaration for every task, run or not, which is where a
+    reader looks for what a cell that never happened was going to read.
+
+    THE OTHER CHOICE WAS TO EMIT EMPTY GROUPS AS EXPORT LINES, and it is
+    the wrong one. "An artifact is described by what is in it" is the
+    export's rule and has its own tombstone: a flag that claimed a
+    document reference the file does not carry sends a reader looking
+    through it for a digest that is not there. Making the report agree
+    with the artifact keeps that argument; making the artifact agree
+    with the report would have spent it.
+    """
+    return [
+        group
+        for group in groups
+        if any(run["results"] for run in runs_by_group.get(group["id"], []))
+    ]
+
+
 def build_report(
     experiment: dict[str, Any],
     groups: list[dict[str, Any]],
@@ -521,6 +567,11 @@ def build_report(
     coverage figure and the scoring-failure rate. A judge that could not
     answer never touches a model's failure count.
     """
+    # EVERY COUNT AND EVERY PROVENANCE BELOW READS THIS LIST, so the
+    # filter is here at the top rather than at each reader: a cell with
+    # no result is outside this report's subject entirely, not merely
+    # absent from one of its tables. See recorded_groups.
+    groups = recorded_groups(groups, runs_by_group)
     lineup = experiment["lineup"]
     # An ARM is a lineup slot: (position, model). A lineup may list the
     # same model twice, which is how anyone asks "how much does this vary
