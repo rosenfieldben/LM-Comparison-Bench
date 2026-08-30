@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS experiments (
     app_sha TEXT,
     catalog_digest TEXT,
     data_policy TEXT,
+    task_attachments_json TEXT,
+    attachments_mode TEXT,
     tasks_total INTEGER NOT NULL,
     trials_total INTEGER NOT NULL,
     trials_done INTEGER NOT NULL,
@@ -517,6 +519,33 @@ MIGRATIONS = [
     #
     # NULL is the pre-K.1 era on this table, exactly as on groups.
     ("runs", "renditions_json", "TEXT"),
+    # Phase M, documents on a dataset task. Two columns, both nullable
+    # and additive, and the pair is what makes one experiment one
+    # experiment.
+    #
+    # THE FROZEN PINS, keyed by task id: {task_id: [pin, ...]}. Written
+    # at creation from the dataset's declaration resolved against the
+    # store, in the same moment lineup, params and budget freeze,
+    # because a rendition that resolved per trial would let a parser
+    # upgrade change what half a sweep was asked. That is K.3's law
+    # inherited whole, one layer up.
+    #
+    # THE TWO NULLS, and they say different things exactly as the group
+    # columns do. NULL here is an experiment created before Phase M, or
+    # one whose dataset declared no documents at all: in both, no task
+    # carried one and there is nothing a pin could describe. A present
+    # value is Phase M with documents, and every task id in it is a task
+    # the runner must compose for.
+    ("experiments", "task_attachments_json", "TEXT"),
+    # HOW the documents are read, for the whole experiment rather than
+    # per task. An experiment where some arms see pixels and others see
+    # extracted text is two experiments wearing one name, and the same
+    # is true across tasks: a report that averaged an inline task and a
+    # native one would be averaging two modalities.
+    #
+    # NULL is the same pair of eras as the column above, and for the
+    # same reason: pre-M, or no documents to have a mode about.
+    ("experiments", "attachments_mode", "TEXT"),
 ]
 
 
@@ -2403,10 +2432,11 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
                 primary_metric, quantizations_json, provider_pins_json,
                 halt_on_refusal, status,
                 status_detail, app_sha, catalog_digest, data_policy,
+                task_attachments_json, attachments_mode,
                 tasks_total, trials_total, trials_done, trials_refused,
                 trials_failed)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                       ?, ?, ?, 0, 0, 0)""",
+                       ?, ?, ?, ?, ?, 0, 0, 0)""",
             (
                 spec["name"],
                 _now(),
@@ -2435,6 +2465,18 @@ def create_experiment(conn: sqlite3.Connection, spec: dict[str, Any]) -> int:
                 spec.get("app_sha"),
                 spec.get("catalog_digest"),
                 spec.get("data_policy"),
+                # sort_keys so two creations of one dataset produce the
+                # same bytes, the same rule params and provider_pins
+                # follow: a manifest that differs only in dict ordering
+                # is a manifest whose digest cannot be compared.
+                json.dumps(spec["task_attachments"], sort_keys=True)
+                if spec.get("task_attachments")
+                else None,
+                # NULL rather than "inline" when nothing is attached, so
+                # the column's two NULLs stay the two eras above and a
+                # mode is never recorded for an experiment that had no
+                # documents to read.
+                spec.get("attachments_mode") if spec.get("task_attachments") else None,
                 spec["tasks_total"],
                 spec["trials_total"],
             ),
@@ -2457,6 +2499,11 @@ def _experiment_row(row: sqlite3.Row) -> dict[str, Any]:
     out["provider_pins"] = _decoded_params(pins) or None
     quant = out.pop("quantizations_json")
     out["quantizations"] = json.loads(quant) if quant else None
+    # The frozen per-task pins, decoded here for the same reason the
+    # lineup is: this module owns how they are serialized. None on both
+    # NULL eras; see MIGRATIONS for which two.
+    frozen = out.pop("task_attachments_json")
+    out["task_attachments"] = json.loads(frozen) if frozen else None
     # Stored 0/1 because SQLite has no boolean; handed back as bool so no
     # reader has to remember which spelling this column uses.
     out["halt_on_refusal"] = bool(out["halt_on_refusal"])

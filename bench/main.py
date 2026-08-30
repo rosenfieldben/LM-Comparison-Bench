@@ -38,6 +38,7 @@ from bench.extract import (
     DOCUMENT_KIND,
     IMAGE_KIND,
     IMAGE_MODALITY,
+    MAX_ATTACHMENTS,
     CompositionError,
     ExtractionError,
     compose,
@@ -136,13 +137,6 @@ FORBID_UNKNOWN = ConfigDict(extra="forbid")
 # what reaches a provider. Three different questions, three bounds.
 MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024
 
-# How many documents one comparison may carry. This is a side-by-side
-# comparison tool, not a corpus loader: attaching a folder is a question
-# about a dataset, and per-task attachments in datasets are a later
-# phase with their own shape. Four is past every real use of "compare
-# these models on this contract and its two appendices" and keeps the
-# composed prompt somewhere a person can still read.
-MAX_ATTACHMENTS = 4
 
 # The same limit expressed in base64 characters, which is what actually
 # arrives, and it is the one the request model enforces.
@@ -815,6 +809,24 @@ class ExperimentCreate(BaseModel):
     # rather than sent unchecked, because a filter that matches nothing
     # is, under allow_fallbacks false, a run that fails.
     quantizations: list[str] | None = Field(default=None, min_length=1, max_length=12)
+    # HOW every document in this dataset is read, for the whole
+    # experiment. Inline extracts the text and gives every model the same
+    # reading of it; native sends images as content parts and claims
+    # every model saw the file itself.
+    #
+    # ONE MODE PER EXPERIMENT, not per task, and this is the field that
+    # makes that structural rather than a convention. An experiment where
+    # some arms see pixels and others see extracted text is two
+    # experiments wearing one name, and a report that averaged across
+    # them would be averaging two modalities. Native is checked against
+    # every lineup member at creation, in strict mode's language, and the
+    # WHOLE experiment refuses if any member cannot take images.
+    #
+    # Accepted on a dataset with no documents and then not recorded, the
+    # same way GroupCreate accepts a mode with no attachments: the field
+    # is a statement about documents, and with none there is nothing for
+    # it to be a statement about. See store.create_experiment.
+    attachments_mode: Literal["inline", "native"] = "inline"
     halt_on_refusal: bool = True
 
 
@@ -874,6 +886,12 @@ class ExperimentDetail(BaseModel):
     primary_metric: str | None
     provider_pins: dict[str, Any] | None
     quantizations: list[str] | None
+    # The pins frozen at creation, keyed by task id, and the mode they
+    # are read under. Both None on a pre-M experiment and on one whose
+    # dataset declared no documents; see store.MIGRATIONS for why those
+    # two eras share a spelling here and are told apart by the dataset.
+    task_attachments: dict[str, list[RenditionPin]] | None = None
+    attachments_mode: str | None = None
     halt_on_refusal: bool
     status: str
     status_detail: str | None
@@ -3725,6 +3743,96 @@ def enforce_strict_mode(
             )
 
 
+def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Every task's declared documents resolved to full pins, once, now.
+
+    THE EXPERIMENT DECLARES RENDITIONS; THE DATASET DECLARES CONTENT.
+    That two-layer split is the whole design. A dataset cites digests
+    because content is what a task is about and a reading is not; the
+    experiment resolves those digests against the store at CREATION and
+    freezes the answers, in the same moment lineup, params and budget
+    freeze.
+
+    K.3'S LAW, INHERITED WHOLE, one layer up. A group pins its
+    renditions so a parser upgrade between member one and member two
+    cannot change what the two models were asked. An experiment runs for
+    hours across hundreds of trials, so the same upgrade has far more
+    room to land mid-sweep; resolving per trial would let task 40's
+    reading differ from task 4's with nothing in the record saying so.
+    After this function returns, resolution is a lookup of a frozen pin
+    and never a question about today's parser.
+
+    TWO DECLARATIONS, TWO TREATMENTS, told apart by whether the entry
+    carries an extractor:
+
+      A BARE DIGEST leaves the reading to this moment. It resolves to
+      the attachments row's own rendition, which is what an ungrouped
+      /compare member gets and is stable for the same reason: it is a
+      fact about the row rather than about the running parser.
+
+      A FULL PIN states the reading, and is honored VERBATIM or refused.
+      resolve_rendition does the refusing, checking all four components
+      against the extractions table, so a dataset cannot name a reading
+      the bench does not hold and cannot relabel one it does.
+
+    THE MISSING-DIGEST REFUSAL NAMES ITS COORDINATES, because the
+    author's next action is to find that file and upload it, and a
+    message naming only the digest makes them search a dataset of two
+    thousand lines for which task cited it. Datasets reference and never
+    carry: there are no paths in a dataset and the bench fetches
+    nothing, so "upload first, then cite" is the whole workflow and the
+    refusal is where it is taught.
+
+    Returns {} for a dataset whose tasks declare nothing, which the
+    caller stores as NULL rather than as an empty object; see
+    store.create_experiment for why absence gets one spelling.
+    """
+    # ONE QUERY FOR THE WHOLE DATASET, not one per task. A two thousand
+    # task file citing four documents each is eight thousand lookups the
+    # naive way, in a request that is meant to be instant, and the
+    # duplicates are the common case: a dataset usually cites the same
+    # handful of contracts across many questions.
+    wanted = sorted(
+        {
+            entry["digest"]
+            for task in dataset["tasks"]
+            for entry in (task.get("attachments") or [])
+        }
+    )
+    if not wanted:
+        return {}
+    rows = store.attachments_for(app.state.db, wanted)
+
+    frozen: dict[str, list[dict[str, Any]]] = {}
+    for task in dataset["tasks"]:
+        declared = task.get("attachments")
+        if not declared:
+            continue
+        pins = []
+        for entry in declared:
+            digest = entry["digest"]
+            row = rows.get(digest)
+            if row is None:
+                raise HTTPException(
+                    422,
+                    f"task {task['id']!r} cites sha256 {digest[:12]}, which "
+                    "the bench does not hold. Datasets reference documents "
+                    "rather than carrying them: upload the file first, then "
+                    "cite the digest the upload returns.",
+                )
+            if "extractor" not in entry:
+                pins.append(row_rendition(row))
+                continue
+            # Declared in full: honored exactly or refused. The call is
+            # for its refusal; the pin that gets frozen is the one the
+            # dataset wrote, unchanged, because a pin the bench edited
+            # on the way in is not the pin the author declared.
+            resolve_rendition(entry)
+            pins.append(dict(entry))
+        frozen[task["id"]] = pins
+    return frozen
+
+
 @app.post("/experiments", response_model=ExperimentCreated, status_code=201)
 async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     """Write the experiment manifest, after validating everything about it.
@@ -3810,6 +3918,22 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
         enforce_primary_metric(body.primary_metric, dataset)
     if body.estimand_mode == "underlying_model":
         enforce_strict_mode(body.lineup, body.provider_pins, controls)
+    # RESOLVED AND FROZEN HERE, with everything else the manifest fixes.
+    # After this line the experiment's documents are a decided fact; see
+    # freeze_task_attachments for the law that makes that necessary.
+    task_attachments = freeze_task_attachments(dataset)
+    if task_attachments and body.attachments_mode == "native":
+        # THE WHOLE EXPERIMENT, not one task. enforce_native_mode is the
+        # comparison door's check and asks two questions: are these
+        # renditions images, and does every model take images. Both have
+        # to hold for every task here, because one task that cannot run
+        # native is an experiment that cannot run native, and discovering
+        # it at trial 300 is discovering it after 299 paid calls.
+        for task_id, pins in sorted(task_attachments.items()):
+            try:
+                enforce_native_mode(pins, body.lineup)
+            except HTTPException as exc:
+                raise HTTPException(422, f"task {task_id!r}: {exc.detail}") from None
     return {
         "id": store.create_experiment(
             app.state.db,
@@ -3837,6 +3961,8 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                     else None
                 ),
                 "quantizations": body.quantizations,
+                "task_attachments": task_attachments,
+                "attachments_mode": body.attachments_mode,
                 "halt_on_refusal": body.halt_on_refusal,
                 # The same provenance every run row carries, recorded once
                 # on the experiment because it is fixed for the whole of

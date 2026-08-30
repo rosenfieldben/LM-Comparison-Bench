@@ -2757,6 +2757,106 @@ def test_review_repro_a_pinned_refs_character_count_is_pythons_too(tmp_path):
         conn.close()
 
 
+PRE_M_SCHEMA = (Path(__file__).parent / "fixtures" / "pre_m_schema.sql").read_text()
+
+
+def test_the_pre_m_fixture_is_the_schema_as_it_stood_before_phase_m():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    The fixture's provenance, asserted rather than trusted, exactly as
+    the pre-BYOK one is. A hand-transcribed era snapshot is a snapshot
+    of what somebody believed the schema was, and a migration proof
+    built on one proves the belief. This file was extracted from the
+    SCHEMA string at dacabb8, the commit before Phase M.
+
+    THE RIGHT ERA, not merely an old one. It must already have the
+    experiments table (or it would be answering a question about a table
+    that did not exist) and must not have either Phase M column.
+    """
+    assert "CREATE TABLE IF NOT EXISTS experiments (" in PRE_M_SCHEMA
+    # SCOPED TO THE EXPERIMENTS BLOCK, because attachments_mode is a
+    # name Phase K already used on GROUPS. Asserting its absence over
+    # the whole file would fail on a column that has nothing to do with
+    # this migration, and asserting its presence would pass on one.
+    experiments = PRE_M_SCHEMA.split("CREATE TABLE IF NOT EXISTS experiments (")[1]
+    experiments = experiments.split(");")[0]
+    assert "task_attachments_json" not in experiments
+    assert "attachments_mode" not in experiments
+    # The era's own landmarks, so a fixture regenerated from the wrong
+    # commit fails here rather than passing quietly.
+    assert "is_byok INTEGER" in PRE_M_SCHEMA
+    assert "reasoning_completion_tokens INTEGER" in PRE_M_SCHEMA
+
+
+def test_review_repro_the_phase_m_columns_are_additive_and_null_on_legacy(tmp_path):
+    """WINDOW: an experiments row created before Phase M existed, from
+    its own era's schema, opened by today's store.connect.
+
+    TWO COLUMNS, BOTH NULLABLE, AND THE NULLS MEAN SOMETHING. An
+    experiment created before Phase M declared no documents because it
+    could not, so both columns are NULL and the pair reads "no task
+    carried one". That is the same spelling a post-M experiment over a
+    plain dataset gets, deliberately: what tells them apart is the
+    dataset, and neither is a gap.
+
+    NOT BACKFILLED, and could not be. The pins are a resolution taken at
+    a moment against a store, and for a legacy experiment that moment is
+    gone. Inventing today's reading for a run that happened months ago
+    would be the exact substitution K.3 refuses one layer down.
+
+    IDEMPOTENT is asserted by connecting twice, because store.connect
+    runs the migrations on every open and a second ALTER on an existing
+    column is an error rather than a no-op.
+    """
+    db_path = tmp_path / "pre_m.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_M_SCHEMA)
+    legacy.execute(
+        """INSERT INTO experiments
+           (id, name, created_at, dataset_name, dataset_digest, lineup_json,
+            budget, repeats, estimand_mode, halt_on_refusal, status,
+            tasks_total, trials_total, trials_done, trials_refused,
+            trials_failed)
+           VALUES (1, 'legacy sweep', '2026-05-01T00:00:00+00:00', 'd.jsonl',
+                   'dd', '["legacy/a"]', 'standard', 1, 'routed_service', 1,
+                   'done', 3, 3, 3, 0, 0)"""
+    )
+    legacy.commit()
+    # PRE-STATE, asserted rather than assumed: without it this could pass
+    # against a fixture that already carried the columns and would prove
+    # nothing about the migration.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(experiments)")]
+    assert "task_attachments_json" not in before
+    assert "attachments_mode" not in before
+    assert "dataset_digest" in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [r[1] for r in conn.execute("PRAGMA table_info(experiments)")]
+        assert "task_attachments_json" in after
+        assert "attachments_mode" in after
+        # ADDITIVE: nothing that was there was removed or renamed.
+        assert set(before) <= set(after)
+
+        row = store.get_experiment(conn, 1)
+        assert row["task_attachments"] is None
+        assert row["attachments_mode"] is None
+        # And the legacy row still reads exactly as it was written.
+        assert row["name"] == "legacy sweep"
+        assert row["lineup"] == ["legacy/a"]
+        assert row["tasks_total"] == 3
+    finally:
+        conn.close()
+
+    # IDEMPOTENT.
+    again = store.connect(str(db_path))
+    try:
+        assert store.get_experiment(again, 1)["task_attachments"] is None
+    finally:
+        again.close()
+
+
 PRE_BYOK_SCHEMA = (
     Path(__file__).parent / "fixtures" / "pre_byok_schema.sql"
 ).read_text()

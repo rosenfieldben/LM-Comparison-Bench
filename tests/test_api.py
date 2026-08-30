@@ -8058,6 +8058,259 @@ def upload(client, filename, content):
     )
 
 
+# ---- Phase M: the dataset declares content, creation freezes the
+# ---- reading. Every test below uploads first, because that IS the
+# ---- workflow: datasets reference documents and never carry them.
+
+
+def m_dataset(tmp_path, digest, **task_overrides):
+    """A one-task dataset citing one document by digest."""
+    task = {"id": "t1", "prompt": "what does it say?", "attachments": [digest]}
+    task.update(task_overrides)
+    return write_dataset(tmp_path, task)
+
+
+def parser_upgrade(digest, version, text):
+    """A second reading of bytes the bench already holds.
+
+    WHAT AN UPGRADE ACTUALLY LEAVES BEHIND, which is why this writes the
+    row rather than re-uploading. The bench deduplicates on the digest,
+    so the same file through a newer parser is exactly one new row in
+    attachment_extractions for a digest that already exists; a second
+    upload would be a no-op and would prove nothing.
+    """
+    with app.state.db as conn:
+        conn.execute(
+            """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename, mime, extracted_chars)
+               VALUES (?, 'text', ?, ?, '2026-08-14T00:00:00+00:00',
+                       'document', 'contract.txt', 'text/plain', ?)""",
+            (digest, version, text, len(text)),
+        )
+
+
+def test_review_repro_creation_freezes_the_reading_a_digest_resolved_to(
+    client, tmp_path
+):
+    """WINDOW: the experiment record's task_attachments, read back
+    through GET /experiments/{id} after creation.
+
+    THE TWO-LAYER DECLARATION, asserted at the seam. The dataset cited a
+    DIGEST and nothing else; what the record holds is a full four-part
+    pin, resolved once against the store at creation. Nothing later
+    resolves anything: the runner reads this.
+
+    WHY IT MUST BE FROZEN AND NOT LOOKED UP is the next test. This one
+    establishes that a lookup happened at all and that its answer is
+    complete, because a record holding the digest it was given would
+    look identical to a working freeze until a parser changed.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    assert detail["task_attachments"] == {
+        "t1": [
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ]
+    }
+    # The mode is recorded beside the pins, because a reading without a
+    # modality is half a declaration.
+    assert detail["attachments_mode"] == "inline"
+
+
+def test_review_repro_a_parser_change_after_creation_is_invisible_to_it(
+    client, tmp_path
+):
+    """WINDOW: one experiment's frozen pins, read before and after the
+    store gains a NEWER reading of the very bytes it cited.
+
+    K.3'S LAW, INHERITED WHOLE, one layer up. A group pins its
+    renditions so an upgrade between member one and member two cannot
+    change what two models were asked. An experiment runs for hours over
+    hundreds of trials, so the same upgrade has far more room to land
+    mid-sweep: task 40 would be asked a different document from task 4,
+    with nothing in the record saying so.
+
+    THE UPGRADE IS SIMULATED BY WRITING AN EXTRACTION ROW, which is what
+    a parser upgrade leaves behind. Re-uploading would not do it: the
+    bench deduplicates on the digest, so the same bytes under a new
+    parser is exactly a new row in the extractions table for a digest
+    that already exists.
+
+    PRE-STATE ASSERTED: the frozen pin is read BEFORE the new rendition
+    exists, so the assertion after it is a fact about the freeze rather
+    than about nothing having happened.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    before = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    assert before["t1"][0]["extractor_version"] == "1"
+
+    # The upgrade lands: a second reading of the same bytes.
+    parser_upgrade(digest, "2", "the contract says forty three")
+
+    after = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    assert after == before, "the freeze moved under a parser upgrade"
+
+
+def test_review_repro_a_missing_digest_refusal_names_task_and_digest(client, tmp_path):
+    """WINDOW: the 422 body from POST /experiments for a dataset citing
+    bytes the bench does not hold.
+
+    THE COORDINATES ARE THE MESSAGE. The author's next action is to find
+    that file and upload it, and a refusal naming only the digest makes
+    them search a two thousand line dataset for which task cited it. So
+    the task id is in the message and so is the digest, and the workflow
+    the refusal is teaching (upload first, then cite) is stated rather
+    than implied.
+
+    NOTHING IS CREATED, which is the half that makes the refusal worth
+    having: an experiment that exists but cannot run is the state this
+    whole check exists to prevent.
+    """
+    missing = "b" * 64
+    path = m_dataset(tmp_path, missing)
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert missing[:12] in detail, detail
+    assert "upload the file first" in detail.lower(), detail
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_a_dataset_declaring_a_full_pin_is_honored_verbatim(client, tmp_path):
+    """WINDOW: the frozen pins for a dataset that named the reading
+    itself, beside the store's own newer one.
+
+    HONORED VERBATIM OR REFUSED, and this is the honored half. A dataset
+    that states all four fields has chosen among the readings the bench
+    holds, and creation freezes THAT choice rather than the row's own.
+
+    THE PIN NAMES THE NEWER READING ON PURPOSE, and the first version of
+    this test did not. It pinned version 1, which is also what
+    row_rendition returns for this row, so substituting the row's
+    rendition for the dataset's pin produced the same answer and the
+    test passed against the mutation it was written to catch. Pinning
+    version 2 against a row that still reads version 1 is what makes the
+    two answers different, and the assertion a fact about which one was
+    honored.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    parser_upgrade(digest, "2", "the contract says forty three")
+    # PRE-STATE: the row itself still reads version 1, so "2" below can
+    # only have come from the dataset.
+    assert (
+        main.row_rendition(main.store.attachments_for(app.state.db, [digest])[digest])[
+            "extractor_version"
+        ]
+        == "1"
+    )
+    pin = {
+        "digest": digest,
+        "extractor": "text",
+        "extractor_version": "2",
+        "kind": "document",
+    }
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a", "attachments": [pin]})
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    frozen = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    # The DATASET's pin, not the row's newer reading.
+    assert frozen == {"t1": [pin]}
+
+
+def test_a_dataset_declaring_a_reading_the_bench_lacks_is_refused(client, tmp_path):
+    """WINDOW: the 422 for a full pin naming a rendition nothing holds.
+
+    THE REFUSED HALF. Substituting the reading the bench does have would
+    give the author a comparison over a document they did not choose,
+    and re-extracting here would produce text the dataset never declared
+    while putting a second of CPU in a request path.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    pin = {
+        "digest": digest,
+        "extractor": "text",
+        "extractor_version": "99",
+        "kind": "document",
+    }
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a", "attachments": [pin]})
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_native_mode_refuses_the_whole_experiment_and_names_the_task(client, tmp_path):
+    """WINDOW: the 422 for a native experiment over a document that is
+    not an image.
+
+    ONE MODE PER EXPERIMENT, and the refusal is the whole experiment
+    rather than the task. An experiment where some arms see pixels and
+    others see extracted text is two experiments wearing one name, and
+    the same holds across tasks: a report averaging an inline task and a
+    native one would be averaging two modalities.
+
+    THE TASK IS NAMED because with two thousand tasks the mode is
+    declared once and the offending document is one line, and the
+    comparison door's message alone would say only which digest.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, attachments_mode="native")
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert "inline mode" in detail, detail
+
+
+def test_an_attachment_free_dataset_records_no_mode_at_all(client, tmp_path):
+    """WINDOW: the experiment record for a dataset with no documents,
+    created with the mode field left at its default.
+
+    THE TWO NULLS. task_attachments NULL and attachments_mode NULL is
+    "no task carried a document", which covers both a pre-M experiment
+    and a post-M one over a plain dataset. Recording "inline" for an
+    experiment with nothing to read would put a modality claim on a run
+    that had no modality, and a later reader could not tell it from one
+    that chose inline over real documents.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["task_attachments"] is None
+    assert detail["attachments_mode"] is None
+
+
 def test_an_uploaded_document_is_stored_with_its_extraction_and_provenance(client):
     """The upload's whole job: keep the bytes once, keep what was read
     out of them, and keep which parser did the reading.

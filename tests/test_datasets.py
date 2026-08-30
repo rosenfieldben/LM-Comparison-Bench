@@ -28,6 +28,19 @@ def dataset(*rows: str) -> bytes:
 
 
 def test_a_minimal_task_loads():
+    """WINDOW: parse_dataset's returned task list, compared whole.
+
+    WHOLE-DICT EQUALITY ON PURPOSE. A key added to the parsed shape
+    without anybody deciding to add it fails here, which is the only
+    reason this assertion is written as an equality rather than a set of
+    field checks. Phase M's attachments key is the first thing it caught.
+
+    RULE ONE AT THE DATASET LAYER. A task that declares no documents
+    parses to exactly what it parsed to before attachments existed, with
+    the new field explicitly absent rather than defaulted to an empty
+    list. None and [] are different claims: none is "this task is not
+    about a document", and the loader refuses [] on those grounds.
+    """
     out = parse_dataset(dataset(line(id="t1", prompt="hi")))
 
     assert out["tasks"] == [
@@ -38,8 +51,138 @@ def test_a_minimal_task_loads():
             "reference": None,
             "rubric": None,
             "scorer": None,
+            "attachments": None,
         }
     ]
+
+
+# ---- Phase M: a task may cite documents. Two spellings, one meaning,
+# ---- and every way of getting either wrong.
+
+DIGEST = "a" * 64
+FULL_PIN = {
+    "digest": DIGEST,
+    "extractor": "pypdf",
+    "extractor_version": "5.1.0",
+    "kind": "document",
+}
+
+
+def test_review_repro_a_task_may_cite_a_digest_or_a_full_rendition():
+    """WINDOW: the parsed attachments of two tasks, one citing content
+    and one citing a reading.
+
+    TWO DECLARATIONS, TOLD APART BY ONE KEY. A bare digest says what the
+    task is about and leaves the reading to experiment creation; a full
+    pin says both, and creation then honors it verbatim or refuses.
+    Downstream needs to tell them apart, and the shape it uses is
+    whether "extractor" is present, so that is what this asserts rather
+    than a flag the parser could have invented.
+
+    NORMALIZED, NOT REWRITTEN. The digest-only entry becomes a one-key
+    dict rather than a pin with three Nones: a partial pin is a
+    different thing from a deferred reading, and spelling them the same
+    would make a reader downstream guess which they had.
+    """
+    out = parse_dataset(
+        dataset(
+            line(id="t1", prompt="a", attachments=[DIGEST]),
+            line(id="t2", prompt="b", attachments=[FULL_PIN]),
+        )
+    )
+
+    assert out["tasks"][0]["attachments"] == [{"digest": DIGEST}]
+    assert "extractor" not in out["tasks"][0]["attachments"][0]
+    assert out["tasks"][1]["attachments"] == [FULL_PIN]
+
+
+def test_the_pin_shape_is_one_shape_in_three_files():
+    """WINDOW: the four field names, as each of the three modules that
+    must agree about them spells them.
+
+    THE COMMENT BESIDE PIN_FIELDS PROMISES THIS TEST, so the test has to
+    exist or the comment is a claim nobody checks. bench.datasets cannot
+    import the API boundary (which imports it), so a pin's shape is
+    written out twice on purpose; what stops the two from drifting is
+    this assertion rather than an import.
+
+    THE THIRD SPELLING is row_rendition, which builds a pin from an
+    attachments row and is what a bare digest resolves to. If it grew a
+    fifth key, a dataset could not declare what creation would freeze.
+    """
+    from bench.datasets import PIN_FIELDS, PIN_KINDS
+    from bench.main import RenditionPin, row_rendition
+
+    assert set(PIN_FIELDS) == set(RenditionPin.model_fields)
+    built = row_rendition(
+        {"digest": DIGEST, "extractor": "pypdf", "extractor_version": "5.1.0"}
+    )
+    assert set(built) == set(PIN_FIELDS)
+    # And the two kinds are the two the boundary accepts, so a dataset
+    # cannot name a third that the API would refuse one door later.
+    assert set(PIN_KINDS) == set(RenditionPin.model_fields["kind"].annotation.__args__)
+
+
+def test_a_task_without_attachments_parses_exactly_as_before():
+    """WINDOW: the attachments field of a task that declares none.
+
+    RULE ONE, and the reason it is asserted as None rather than as
+    falsy: an empty list would also be falsy and would be a DIFFERENT
+    claim, one the loader refuses on its own. Absence gets one spelling.
+    """
+    out = parse_dataset(dataset(line(id="t1", prompt="a")))
+
+    assert out["tasks"][0]["attachments"] is None
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ([], "is empty"),
+        ([DIGEST] * 5, "limit is 4"),
+        (["nope"], "not a sha256 digest"),
+        ([{"digest": DIGEST, "extractor": "pypdf"}], "missing extractor_version, kind"),
+        ([{**FULL_PIN, "extra": 1}], "unknown keys: extra"),
+        ([{**FULL_PIN, "kind": "spreadsheet"}], "not one of document, image"),
+        ([{**FULL_PIN, "digest": "short"}], "not a sha256 digest"),
+        ([{**FULL_PIN, "extractor": ""}], "must not be empty"),
+        (DIGEST, "must be a list, got str"),
+        ([42], "must be a digest string or a rendition object, got int"),
+    ],
+    ids=[
+        "an empty list is a second spelling of absence",
+        "over the per-task limit",
+        "a digest that is not one",
+        "a partial pin is refused, not completed",
+        "an unknown key inside a pin",
+        "a kind the boundary would not accept",
+        "a malformed digest inside a full pin",
+        "an empty extractor",
+        "a bare string where a list belongs",
+        "a number where a document belongs",
+    ],
+)
+def test_every_malformed_attachment_names_the_task_and_the_defect(value, expected):
+    """WINDOW: the DatasetError message for one malformed declaration.
+
+    THE TASK ID IS IN EVERY MESSAGE, which no other field in this file
+    does. A person fixes a bad reference by reading the line; they fix a
+    bad digest by finding that file and uploading it, and the id is what
+    they search their notes for. The line number stays too, because the
+    two answer different questions.
+
+    A PARTIAL PIN IS REFUSED RATHER THAN COMPLETED, which is the row
+    worth reading twice. Filling the missing fields from the store would
+    make the dataset's declaration depend on when it was read, which is
+    the exact thing pinning exists to prevent.
+    """
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(id="t1", prompt="a", attachments=value)))
+
+    message = str(exc.value)
+    assert expected in message, message
+    assert "task 't1'" in message, message
+    assert "line 1" in message, message
 
 
 def test_the_digest_is_the_sha256_of_the_bytes():

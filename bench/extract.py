@@ -211,6 +211,20 @@ MAX_DOCX_DEPTH = 256
 # earlier phases deferred.
 MAX_COMPOSED_CHARS = 200_000
 
+# How many documents one COMPARISON OR TASK may carry. This is a
+# side-by-side comparison tool, not a corpus loader: attaching a folder
+# is a question about a dataset. Four is past every real use of "compare
+# these models on this contract and its two appendices" and keeps the
+# composed prompt somewhere a person can still read.
+#
+# IT LIVES HERE NOW, and the move is what made Phase M possible rather
+# than a stylistic tidy. The constant sat in bench/main.py, whose
+# comment said "per-task attachments in datasets are a later phase with
+# their own shape"; this is that phase, and bench/datasets.py must
+# enforce the same bound without importing the API boundary that imports
+# IT. One definition, two doors, and no second number to drift.
+MAX_ATTACHMENTS = 4
+
 # The delimiters around each document in the composed prompt.
 #
 # VISIBLE AND UNAMBIGUOUS, because the model has to be able to tell the
