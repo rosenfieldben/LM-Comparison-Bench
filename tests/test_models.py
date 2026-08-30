@@ -4314,7 +4314,11 @@ async def test_the_judge_is_not_paid_to_grade_whitespace(client):
 # ---- Phase M2: the arithmetic every window refusal and every estimate
 # ---- runs, as a pure function of what it is given.
 
-from bench.models import context_shortfalls, projected_cost  # noqa: E402
+from bench.models import (  # noqa: E402
+    context_shortfalls,
+    input_tokens,
+    projected_cost,
+)
 
 WINDOWS = {"a": 10_000, "b": 200_000, "silent": None}
 PRICES = {
@@ -4333,6 +4337,7 @@ def test_a_shortfall_shows_both_halves_of_the_window_it_could_not_fit():
     """
     short = context_shortfalls(
         40_000,
+        0,
         ["a", "b"],
         WINDOWS,
         {"a": 4_000, "b": 4_000},
@@ -4347,9 +4352,41 @@ def test_a_shortfall_shows_both_halves_of_the_window_it_could_not_fit():
         "window": 10_000,
         # Ceiling division: 40000 characters over four is 10000 tokens.
         "prompt_tokens": 10_000,
+        "system_tokens": 0,
         "reserved": 4_000,
         "needed": 14_000,
     }
+
+
+def test_review_repro_the_system_message_counts_against_the_window():
+    """WINDOW: one lineup member checked with and without a system
+    message of the same size the request will carry.
+
+    THE OTHER MESSAGE. A window holds everything the request carries and
+    control_messages prepends a system turn whenever one is set, so a
+    check that weighed the user turn alone was answering a question
+    about a payload the bench does not send. The reviewer's shape, in
+    the pure function: 20,000 characters of system is 5,000 tokens, and
+    the same exchange fits without them and does not fit with them.
+
+    THE TWO MESSAGES ROUND APART, which is what input_tokens exists for:
+    a tokenizer is applied per message, and summing the characters first
+    would be a different number and would leave the refusal unable to
+    say which message the weight came from.
+    """
+    without = context_shortfalls(
+        4, 0, ["a"], {"a": 20_000}, {"a": 16_384}, chars_per_token=4, headroom=0.1
+    )
+    with_system = context_shortfalls(
+        4, 20_000, ["a"], {"a": 20_000}, {"a": 16_384}, chars_per_token=4, headroom=0.1
+    )
+
+    assert without == []
+    assert with_system[0]["system_tokens"] == 5_000
+    assert with_system[0]["prompt_tokens"] == 1
+    assert with_system[0]["needed"] == 1 + 5_000 + 16_384
+    # Rounded apart: two one-character messages are two tokens, not one.
+    assert input_tokens(1, 1, chars_per_token=4) == (1, 1)
 
 
 def test_the_headroom_is_what_decides_the_boundary_case():
@@ -4364,10 +4401,10 @@ def test_the_headroom_is_what_decides_the_boundary_case():
     the right side.
     """
     fits = context_shortfalls(
-        32_000, ["a"], WINDOWS, {"a": 1_000}, chars_per_token=4, headroom=0.1
+        32_000, 0, ["a"], WINDOWS, {"a": 1_000}, chars_per_token=4, headroom=0.1
     )
     over = context_shortfalls(
-        32_004, ["a"], WINDOWS, {"a": 1_000}, chars_per_token=4, headroom=0.1
+        32_004, 0, ["a"], WINDOWS, {"a": 1_000}, chars_per_token=4, headroom=0.1
     )
 
     assert fits == []
@@ -4388,6 +4425,7 @@ def test_a_lineup_naming_one_model_twice_is_refused_twice():
     """
     short = context_shortfalls(
         40_000,
+        0,
         ["a", "a", "silent"],
         WINDOWS,
         {"a": 4_000, "silent": 4_000},
@@ -4407,7 +4445,12 @@ def test_the_projection_sums_each_task_weight_and_not_a_representative_one():
     """
     cost = projected_cost(
         2,
-        {"t1": 8, "t2": 4_000},
+        {
+            "t1": {"prompt": 8, "system": 0},
+            # A task-level system message, weighed with the rest of what
+            # its trials send.
+            "t2": {"prompt": 4_000, "system": 40},
+        },
         ["a", "b"],
         1,
         {"a": 100, "b": 100},
@@ -4415,8 +4458,9 @@ def test_the_projection_sums_each_task_weight_and_not_a_representative_one():
         chars_per_token=4,
     )
 
-    # 2 tokens for t1 and 1000 for t2, against the two prompt prices.
-    assert cost["input_usd"] == pytest.approx(1002 * (1e-06 + 3e-06))
+    # 2 tokens for t1, and 1000 plus 10 for t2, against the two prompt
+    # prices.
+    assert cost["input_usd"] == pytest.approx(1012 * (1e-06 + 3e-06))
     # One repeat, two tasks, 100 tokens reserved by each of two models.
     assert cost["output_usd"] == pytest.approx(2 * 100 * (2e-06 + 4e-06))
     assert cost["total_usd"] == pytest.approx(cost["input_usd"] + cost["output_usd"])
@@ -4430,12 +4474,9 @@ def test_repeats_multiply_both_halves():
     estimate that scaled only the completions would understate a
     repeated run by its entire input cost.
     """
-    once = projected_cost(
-        1, {"t1": 4_000}, ["a"], 1, {"a": 100}, PRICES, chars_per_token=4
-    )
-    thrice = projected_cost(
-        1, {"t1": 4_000}, ["a"], 3, {"a": 100}, PRICES, chars_per_token=4
-    )
+    weights = {"t1": {"prompt": 4_000, "system": 0}}
+    once = projected_cost(1, weights, ["a"], 1, {"a": 100}, PRICES, chars_per_token=4)
+    thrice = projected_cost(1, weights, ["a"], 3, {"a": 100}, PRICES, chars_per_token=4)
 
     assert thrice["input_usd"] == pytest.approx(3 * once["input_usd"])
     assert thrice["output_usd"] == pytest.approx(3 * once["output_usd"])
@@ -4449,7 +4490,13 @@ def test_an_unpriced_member_empties_every_figure_and_names_itself():
     is absent instead of showing a smaller one.
     """
     cost = projected_cost(
-        1, {"t1": 4_000}, ["a", "z"], 1, {"a": 100, "z": 100}, PRICES, chars_per_token=4
+        1,
+        {"t1": {"prompt": 4_000, "system": 0}},
+        ["a", "z"],
+        1,
+        {"a": 100, "z": 100},
+        PRICES,
+        chars_per_token=4,
     )
 
     assert cost == {
@@ -4488,7 +4535,13 @@ def test_a_non_finite_price_degrades_to_no_figure_rather_than_to_a_nan():
     poisoned = {"a": {"prompt": float("nan"), "completion": 2e-06}}
 
     cost = projected_cost(
-        1, {"t1": 4_000}, ["a"], 1, {"a": 100}, poisoned, chars_per_token=4
+        1,
+        {"t1": {"prompt": 4_000, "system": 0}},
+        ["a"],
+        1,
+        {"a": 100},
+        poisoned,
+        chars_per_token=4,
     )
 
     assert cost["input_usd"] is None

@@ -17,7 +17,7 @@ import secrets
 import sqlite3
 import subprocess
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -2620,16 +2620,27 @@ def shortfall_clause(short: dict[str, Any]) -> str:
     budget. A bare "too long" tells nobody which. Written once because
     the two doors that raise it must not drift into two formats for one
     fact.
+
+    THE SYSTEM MESSAGE APPEARS ONLY WHEN THERE IS ONE, and the omission
+    is not tidiness. Its remedy is a third one (shorten the system
+    prompt), so naming it matters exactly when it weighs something; and
+    a comparison that sets no system prompt reads the sentence it has
+    always read, which is rule one applied to a refusal.
     """
+    system = (
+        f"{short['system_tokens']} for the system message, "
+        if short["system_tokens"]
+        else ""
+    )
     return (
         f"{short['model']} holds {short['window']} tokens and this needs "
-        f"about {short['needed']} ({short['prompt_tokens']} for the prompt "
-        f"plus {short['reserved']} reserved for the answer)"
+        f"about {short['needed']} ({short['prompt_tokens']} for the prompt, "
+        f"{system}plus {short['reserved']} reserved for the answer)"
     )
 
 
 def enforce_context_window(
-    composed: str, models: list[str] | None, budget: str
+    composed: str, models: list[str] | None, budget: str, system: str | None = None
 ) -> None:
     """Refuse a comparison no model in the lineup could actually hold.
 
@@ -2651,10 +2662,13 @@ def enforce_context_window(
     model: drop this one, shorten the document, or pick the other
     budget. A bare "too long" tells nobody which.
 
-    BOTH HALVES OF THE WINDOW. A context window holds the prompt AND the
-    completion, so the budget the comparison declared has to be counted:
-    a prompt that fits with 16k of headroom does not fit with 64k, and
-    the extended tier is exactly when somebody attaches a long document.
+    BOTH HALVES OF THE WINDOW, AND BOTH MESSAGES OF THE PROMPT. A
+    context window holds the prompt AND the completion, so the budget
+    the comparison declared has to be counted: a prompt that fits with
+    16k of headroom does not fit with 64k, and the extended tier is
+    exactly when somebody attaches a long document. The system message
+    is counted for the same reason and was not until the thirteenth
+    review; see context_shortfalls.
 
     ABSENT context_length IS SKIPPED, and this is the one place this
     codebase does NOT apply "absence of evidence is not support". That
@@ -2674,6 +2688,14 @@ def enforce_context_window(
         return
     short = context_shortfalls(
         len(composed),
+        # THE OTHER MESSAGE. control_messages prepends a system turn
+        # whenever one is set, so a window check that weighed the
+        # composed user content alone was measuring a payload the bench
+        # does not send; see context_shortfalls for the measurement.
+        # None and "" both weigh nothing, which is what rule one means
+        # here: a comparison that set no system prompt is checked
+        # exactly as it always was.
+        len(system or ""),
         models,
         windows,
         # A comparison budgets from the model-level cap because it is
@@ -3259,7 +3281,9 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
     # for the reason group creation skips it, which is that image tokens
     # are not a function of character count.
     if request.attachments and isinstance(composed, str):
-        enforce_context_window(composed, request.models, request.budget)
+        enforce_context_window(
+            composed, request.models, request.budget, controls.get("system")
+        )
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -3413,7 +3437,9 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
     # composed as None on the native path, which isinstance rejects, so
     # the same skip applies here for the same reason.
     if request.attachments and isinstance(composed, str):
-        enforce_context_window(composed, [request.model], request.budget)
+        enforce_context_window(
+            composed, [request.model], request.budget, controls.get("system")
+        )
     max_tokens = effective_budget(request.budget, request.model)
 
     async def events() -> AsyncIterator[str]:
@@ -3694,7 +3720,12 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
             composed = enforce_composed(body.prompt or "", pins)
             # And then per model, because the global ceiling is one
             # number for everybody and a context window is not.
-            enforce_context_window(composed, body.models, body.budget)
+            enforce_context_window(
+                composed,
+                body.models,
+                body.budget,
+                request_controls(body.params).get("system"),
+            )
     elif body.attachments_mode != "inline":
         raise HTTPException(
             422,
@@ -4048,9 +4079,28 @@ def experiment_reserved(
     }
 
 
+def task_system(task: dict[str, Any], controls: Mapping[str, Any]) -> str | None:
+    """The system message this task's trials will actually send.
+
+    A TASK'S OWN OVERRIDES THE EXPERIMENT'S, since it is the more
+    specific declaration, and an absent task system leaves the
+    experiment's in place rather than clearing it. That rule lived in
+    one line of run_experiment and nowhere else, so the creation-time
+    arithmetic weighed a message the runner would replace or add.
+    Written once here and read by both, which is the only arrangement in
+    which the two cannot drift.
+    """
+    if task["system"] is not None:
+        return str(task["system"])
+    system = (controls or {}).get("system")
+    return None if system is None else str(system)
+
+
 def weigh_tasks(
-    dataset: dict[str, Any], task_attachments: dict[str, list[dict[str, Any]]]
-) -> dict[str, int]:
+    dataset: dict[str, Any],
+    task_attachments: dict[str, list[dict[str, Any]]],
+    controls: Mapping[str, Any],
+) -> dict[str, dict[str, int]]:
     """Every task's composed size in characters, measured once at creation.
 
     THE INPUT SIDE STOPPED BEING UNIFORM the moment a task could carry a
@@ -4095,11 +4145,18 @@ def weigh_tasks(
     size, and a size computed two ways is a size that can disagree with
     the refusal that quotes it.
     """
-    chars: dict[str, int] = {}
+    chars: dict[str, dict[str, int]] = {}
     for task in dataset["tasks"]:
+        # BOTH MESSAGES, keyed, because a request carries a system turn
+        # and a user turn and the window holds both. The system half was
+        # missing until the thirteenth review; see context_shortfalls.
+        weight = {"prompt": len(task["prompt"]), "system": 0}
+        system = task_system(task, controls)
+        if system is not None:
+            weight["system"] = len(system)
         pins = task_attachments.get(task["id"])
         if not pins:
-            chars[task["id"]] = len(task["prompt"])
+            chars[task["id"]] = weight
             continue
         composed = compose(task["prompt"], documents_for(pins), redacted=False)
         try:
@@ -4109,7 +4166,8 @@ def weigh_tasks(
             # the arithmetic would leave the author to find which of two
             # thousand lines it was about.
             raise HTTPException(422, f"task {task['id']!r}: {exc}") from None
-        chars[task["id"]] = len(composed)
+        weight["prompt"] = len(composed)
+        chars[task["id"]] = weight
     return chars
 
 
@@ -4122,7 +4180,7 @@ def plural(count: int) -> str:
 def enforce_task_windows(
     dataset: dict[str, Any],
     task_attachments: dict[str, list[dict[str, Any]]],
-    task_chars: dict[str, int],
+    task_chars: dict[str, dict[str, int]],
     lineup: list[str],
     reserved: dict[str, int],
 ) -> None:
@@ -4175,7 +4233,8 @@ def enforce_task_windows(
         if not task_attachments.get(task["id"]):
             continue
         short = context_shortfalls(
-            task_chars[task["id"]],
+            task_chars[task["id"]]["prompt"],
+            task_chars[task["id"]]["system"],
             lineup,
             windows,
             reserved,
@@ -4369,7 +4428,7 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     task_chars = (
         None
         if task_attachments and body.attachments_mode == "native"
-        else weigh_tasks(dataset, task_attachments)
+        else weigh_tasks(dataset, task_attachments, controls)
     )
     if task_chars is not None:
         enforce_task_windows(
@@ -4896,8 +4955,9 @@ async def run_experiment(experiment_id: int) -> None:
             # A task's own system prompt overrides the experiment's, since
             # it is the more specific declaration. Recorded on the group
             # like any other control, so the record says what was sent.
-            if task["system"] is not None:
-                controls["system"] = task["system"]
+            system = task_system(task, controls_base)
+            if system is not None:
+                controls["system"] = system
             pins = task_pins.get(task["id"]) or []
             if pins:
                 # THE DOOR THAT SPENDS, checked before the group row and

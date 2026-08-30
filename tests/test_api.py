@@ -31,6 +31,7 @@ FIXTURE = json.loads(
 # 13 * 1e-6 + 8 * 2e-6 = 2.9e-5 USD.
 TEST_PRICES = {
     "model/alpha": {"prompt": 1e-06, "completion": 2e-06},
+    "model/narrow": {"prompt": 1e-06, "completion": 2e-06},
 }
 TEST_CATALOG = {
     "fetched": True,
@@ -112,6 +113,23 @@ TEST_CATALOG = {
                 "temperature",
                 "top_p",
             ],
+            "input_modalities": ["text"],
+        },
+        {
+            # A NARROW WINDOW WITH ORDINARY PRICES, and it exists for the
+            # thirteenth review's F2: a model whose window is small
+            # enough that a 20,000 character system message decides
+            # whether an exchange fits, and large enough that the same
+            # exchange without one does. model/vision is narrower still
+            # and refuses everything attached, which cannot tell the two
+            # cases apart.
+            "id": "model/narrow",
+            "name": "Narrow",
+            "context_length": 20000,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+            "max_completion_tokens": None,
+            "supported_parameters": ["max_tokens"],
             "input_modalities": ["text"],
         },
         {
@@ -8970,6 +8988,139 @@ def test_review_repro_the_runner_refuses_an_inline_image_before_it_spends(
     # And no group was written for the cell that refused: the check runs
     # ahead of the row exactly as the composition does.
     assert client.get("/runs").json()["runs"] == []
+
+
+# ---- Thirteenth review, F2: the arithmetic weighs what the runner
+# ---- sends, which is two messages and not one.
+
+
+def test_review_repro_a_task_system_message_counts_against_the_window(client, tmp_path):
+    """WINDOW: POST /experiments over the reviewer's shape, a
+    one-character prompt and a tiny attachment against a 20,000 token
+    model, with and without a 20,000 character task system message.
+
+    MEASURED BEFORE THE FIX, at 01e3f90: creation returned 201, having
+    measured 221 characters and 16,440 needed tokens against 18,000
+    usable. The request the runner then sent carried 20,224 characters
+    across two messages, 5,056 input tokens, and needed 21,440, which
+    does not fit. The experiment ran to done.
+
+    THE CONTROL IS THE SAME DATASET WITHOUT THE SYSTEM MESSAGE, so the
+    refusal is attributable to the message rather than to the document:
+    the arithmetic has to admit one and refuse the other.
+
+    ALL THREE COMPONENTS ARE NAMED because the remedy differs by
+    component. Shorten the document, shorten the system prompt, or lower
+    the budget: a refusal that showed one number would leave the author
+    to guess which of the three to touch.
+    """
+    digest = upload(client, "d.txt", b"tiny").json()["digest"]
+    fits = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "x", "attachments": [digest]},
+        name="fits.jsonl",
+    )
+    over = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "x",
+            "system": "S" * 20_000,
+            "attachments": [digest],
+        },
+        name="over.jsonl",
+    )
+
+    admitted = client.post(
+        "/experiments", json=experiment_body(fits, lineup=["model/narrow"])
+    )
+    refused = client.post(
+        "/experiments", json=experiment_body(over, lineup=["model/narrow"])
+    )
+
+    # THE CONTROL: without the system message the same exchange fits.
+    assert admitted.status_code == 201, admitted.text
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert "model/narrow holds 20000 tokens" in detail, detail
+    # 56 for the prompt and its document, 5000 for the system message,
+    # 16384 reserved: 21440 against 18000 usable.
+    assert "this needs about 21440" in detail, detail
+    assert "56 for the prompt" in detail, detail
+    assert "5000 for the system message" in detail, detail
+    assert "16384 reserved for the answer" in detail, detail
+
+
+@respx.mock
+def test_review_repro_the_projection_prices_the_system_message_it_will_send(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost on the 201, against the characters the
+    runner's own payload carries, read off the mock.
+
+    MEASURED BEFORE THE FIX: the same task quoted $0.000056 of input
+    where the branch's own heuristic over what was actually sent gives
+    $0.005056, a hundredfold understatement of the half of the bill the
+    person was being shown before spending.
+
+    THE PAYLOAD IS THE ORACLE, deliberately. Asserting the projection
+    against a number this test computed would be asserting that two
+    tests agree; asserting it against the characters the mock received
+    is asserting that the estimate describes the request.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "x", "system": "S" * 8_000})
+
+    created = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/narrow"])
+    )
+
+    assert created.status_code == 201, created.text
+    quoted = created.json()["projected_cost"]["input_usd"]
+    run_experiment_to_completion(client, created.json()["id"], path)
+
+    assert [message["role"] for message in sent[0]["messages"]] == ["system", "user"]
+    # The heuristic, applied per message exactly as input_tokens applies
+    # it, over the two strings the provider actually received.
+    tokens = sum(-(-len(message["content"]) // 4) for message in sent[0]["messages"])
+    assert quoted == pytest.approx(tokens * 1e-06)
+    # And the defect's own number is not what came back.
+    assert quoted != pytest.approx(-(-len("x") // 4) * 1e-06)
+
+
+def test_an_experiment_system_prompt_is_weighed_when_the_task_sets_none(
+    client, tmp_path
+):
+    """WINDOW: the projection for a dataset whose task declares no
+    system message, run under an experiment that does.
+
+    A TASK'S OWN OVERRIDES THE EXPERIMENT'S and an absent one leaves the
+    experiment's in place, which is the runner's rule and is now
+    task_system's. An arithmetic that read only the task's field would
+    weigh nothing here and would be wrong by the whole global prompt on
+    every task of the sweep.
+    """
+    plain = write_dataset(tmp_path, {"id": "t1", "prompt": "x"}, name="a.jsonl")
+
+    bare = client.post(
+        "/experiments", json=experiment_body(plain, lineup=["model/narrow"])
+    ).json()["projected_cost"]["input_usd"]
+    global_system = client.post(
+        "/experiments",
+        json=experiment_body(
+            plain, lineup=["model/narrow"], params={"system": "S" * 4_000}
+        ),
+    ).json()["projected_cost"]["input_usd"]
+
+    assert bare == pytest.approx(1 * 1e-06)
+    assert global_system == pytest.approx((1 + 1_000) * 1e-06)
 
 
 # ---- Phase M3: the pins travel, through the report, the export and

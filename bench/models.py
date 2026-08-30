@@ -1075,8 +1075,37 @@ def endpoint_completion_cap(
     return min(caps) if caps else None
 
 
+def input_tokens(
+    prompt_chars: int, system_chars: int, *, chars_per_token: int
+) -> tuple[int, int]:
+    """One exchange's input, as the two messages that carry it.
+
+    COUNTED APART AND ROUNDED APART. A request carries a system message
+    and a user message, each its own string, and a tokenizer is applied
+    to each; summing the characters first and dividing once would be a
+    different number and would also leave the caller unable to say which
+    message the weight came from. Every refusal this feeds has to name
+    the components, because the remedy differs by component: shorten the
+    document, shorten the system prompt, or lower the budget.
+
+    Ceiling division: a message is never fewer tokens than this rounds
+    to, and rounding down at the boundary would admit the one case the
+    checks exist for.
+
+    Pure and given its heuristic, so the boundary owns the policy and
+    this owns the division. The heuristic itself is the bench's oldest
+    admission, characters over four, and it is wrong for every model by
+    some amount; see the boundary's CHARS_PER_TOKEN.
+    """
+    return (
+        -(-prompt_chars // chars_per_token),
+        -(-system_chars // chars_per_token),
+    )
+
+
 def context_shortfalls(
     prompt_chars: int,
+    system_chars: int,
     models: list[str],
     windows: Mapping[str, Any],
     reserved: Mapping[str, int],
@@ -1106,6 +1135,16 @@ def context_shortfalls(
     (asking how much it varies run to run) and a refusal built by
     walking a keyed mapping would name fewer models than the run has.
 
+    THE SYSTEM MESSAGE IS HALF THE INPUT and was not counted until the
+    thirteenth review. A window holds everything the request carries,
+    and control_messages prepends a system message whenever one is set,
+    so a check that weighed the user turn alone was answering a question
+    about a payload the bench does not send. Measured on this branch at
+    01e3f90: a 20,000 character task system against a 20,000 token
+    window was created (201) with 56 prompt tokens and 16,440 needed
+    against 18,000 usable; the request actually sent 5,056 input tokens
+    and needed 21,440, which does not fit.
+
     A model with no published window is SKIPPED rather than refused; see
     enforce_context_window for why an absent window is answered
     differently here than an absent capability is.
@@ -1115,17 +1154,16 @@ def context_shortfalls(
     quiet zero for it would under-report the very number the refusal
     exists to show.
     """
-    # Ceiling division: a prompt is never fewer tokens than this rounds
-    # to, and rounding down at the boundary would admit the one case the
-    # check exists for.
-    prompt_tokens = -(-prompt_chars // chars_per_token)
+    prompt_tokens, system_tokens = input_tokens(
+        prompt_chars, system_chars, chars_per_token=chars_per_token
+    )
     short = []
     for model in models:
         window = windows.get(model)
         if not isinstance(window, int):
             continue
         answer = reserved[model]
-        needed = prompt_tokens + answer
+        needed = prompt_tokens + system_tokens + answer
         if needed > int(window * (1 - headroom)):
             short.append(
                 {
@@ -1133,6 +1171,7 @@ def context_shortfalls(
                     "window": window,
                     "needed": needed,
                     "prompt_tokens": prompt_tokens,
+                    "system_tokens": system_tokens,
                     "reserved": answer,
                 }
             )
@@ -1141,7 +1180,7 @@ def context_shortfalls(
 
 def projected_cost(
     tasks_total: int,
-    task_chars: Mapping[str, int] | None,
+    task_chars: Mapping[str, Mapping[str, int]] | None,
     lineup: list[str],
     repeats: int,
     reserved: Mapping[str, int],
@@ -1158,6 +1197,13 @@ def projected_cost(
     dataset where one task attaches a hundred pages and the rest ask one
     line prices nothing like its own average. So task_chars is summed
     per task rather than multiplied from a representative one.
+
+    EACH TASK WEIGHS BOTH MESSAGES, keyed "prompt" and "system", because
+    a task may carry its own system prompt and the request sends both.
+    Pricing the user turn alone understated a 20,000 character system by
+    5,000 tokens per trial: measured at 01e3f90, one such task quoted
+    $0.000056 where the branch's own heuristic over what was actually
+    sent gives $0.005056.
 
     task_chars is None when the caller cannot measure the input at all,
     which is native mode: a document sent as an image part is billed in
@@ -1209,7 +1255,16 @@ def projected_cost(
         input_usd = (
             repeats
             * prompt_price
-            * sum(-(-chars // chars_per_token) for chars in task_chars.values())
+            * sum(
+                sum(
+                    input_tokens(
+                        weight["prompt"],
+                        weight["system"],
+                        chars_per_token=chars_per_token,
+                    )
+                )
+                for weight in task_chars.values()
+            )
         )
     total = None if input_usd is None else input_usd + output
     # The same belt cost_usd wears, for the same reason: fetch_catalog
