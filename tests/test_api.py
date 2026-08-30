@@ -8873,6 +8873,105 @@ def test_native_mode_prices_the_output_and_declines_to_price_the_images(
     assert cost["unpriced"] == []
 
 
+# ---- Thirteenth review, F1: inline mode has a door at the experiment
+# ---- boundary and one at the runner, and both call the same check.
+
+
+def test_review_repro_an_image_cited_by_an_inline_task_is_refused_at_creation(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments over a dataset citing a PNG, created
+    with the default attachments_mode.
+
+    MEASURED BEFORE THE FIX, at 00752aa: creation returned 201, the run
+    finished done, one upstream call was made, and every model received
+
+        ----- attachment 1 of 1: image, read by none 0, sha256 6e0fc8 -----
+
+        ----- end attachment 1 of 1 -----
+
+    an empty delimited block, which is enforce_inline_mode's own
+    sentence come true. The experiment boundary checked native mode and
+    only native mode, so the modality that HAS no text to compose was
+    the one nothing stopped.
+
+    THE REMEDY IS NAMED because switching mode is a one-word fix, and a
+    refusal that says only what is wrong leaves the author guessing
+    which of two modes they wanted.
+    """
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert digest[:12] in detail, detail
+    assert "is an image" in detail, detail
+    assert "Use native mode" in detail, detail
+    # Nothing was created: the refusal costs nothing and leaves nothing.
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+@respx.mock
+def test_review_repro_the_runner_refuses_an_inline_image_before_it_spends(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments/{id}/start over a stored experiment row
+    whose mode says inline and whose frozen pin is an image, drained to
+    a terminal status, with the upstream mock counting calls.
+
+    THE ROW AN EARLIER BUILD WROTE. Creation refuses this now, so the
+    only way to reach the runner with it is to hold a row created before
+    the check existed, which is exactly the state a person upgrading
+    this bench has: an experiment sitting at status "created" that would
+    make the paid calls the finding is about. A door that trusts a row
+    another build wrote is a door with no check.
+
+    Built here by creating the experiment under NATIVE mode, which the
+    boundary accepts, and then writing the mode the older build would
+    have stored. That is real state in the real schema rather than a
+    monkeypatched check.
+
+    ZERO UPSTREAM CALLS is the assertion that matters. A refusal that
+    arrived after the first trial would have already spent the money the
+    check exists to protect.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], attachments_mode="native"),
+    ).json()["id"]
+    with app.state.db as conn:
+        conn.execute(
+            "UPDATE experiments SET attachments_mode = 'inline' WHERE id = ?", (eid,)
+        )
+    # PRE-STATE: the row really says inline over an image pin, or the
+    # refusal below would be a refusal of nothing.
+    stored = client.get(f"/experiments/{eid}").json()
+    assert stored["attachments_mode"] == "inline"
+    assert stored["task_attachments"]["t1"][0]["kind"] == "image"
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "failed", final
+    assert "task 't1'" in final["status_detail"], final
+    assert "Use native mode" in final["status_detail"], final
+    assert sent == []
+    # And no group was written for the cell that refused: the check runs
+    # ahead of the row exactly as the composition does.
+    assert client.get("/runs").json()["runs"] == []
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 
