@@ -1757,14 +1757,36 @@ other direction, characters over four, summed per task so a dataset
 where one task attaches a hundred pages and the rest ask a line prices
 like itself rather than like its average.
 
+Both halves count **both messages**: a task's own system prompt, or the
+experiment's when the task sets none, is part of what the request
+carries and is weighed with the rest of it. The window refusal names the
+components apart, because the remedy differs by component.
+
+**A pinned run is priced by the endpoint it is pinned to.** OpenRouter's
+model listing publishes one pricing object per model and the endpoint
+listing publishes one per endpoint, and they are not the same question:
+measured 2026-08-30, `openai/gpt-oss-120b` published prompt
+`0.000000037` at the model level while its twenty endpoints published
+thirteen distinct rate pairs, from `0.00000003` to `0.00000035` on the
+input side. An unpinned model is routed dynamically, so the model-level
+listing is the only thing that can speak for it and is used. A pinned
+model whose listing cannot answer is **unpriced**, never priced from the
+model level: borrowing the aggregate is the substitution the pin exists
+to prevent.
+
 Every figure is `null` when any model in the lineup publishes no price,
 and `unpriced` then names them: a total missing one arm of a comparison
-reads as the comparison's total. `input_usd` and `total_usd` are also
-`null` in native mode, where the input is images and nothing here
-converts pixels to tokens; `output_usd` still stands, because the output
-side is measured the same way in both modes. The projection is not
-stored on the experiment: it is a statement about the catalog at that
-instant rather than a fact about the run.
+reads as the comparison's total. A model whose pricing map charges
+something beyond the two token dimensions is unpriced too, with the
+dimension named, because this bench has no arithmetic for a fixed
+per-request charge or a cache-read rate and a figure that silently
+omitted one would be a confident understatement. A dimension published
+*at* zero is a zero and disqualifies nothing. `input_usd` and
+`total_usd` are also `null` in native mode, where the input is images
+and nothing here converts pixels to tokens; `output_usd` still stands,
+because the output side is measured the same way in both modes. The
+projection is not stored on the experiment: it is a statement about the
+catalog at that instant rather than a fact about the run.
 
 Creation also runs the two size checks per task, before anything is
 written. A task whose prompt and documents compose past the global

@@ -20,6 +20,7 @@ from bench.models import (
     OPENROUTER_URL,
     PROVIDER_REASONING_MINIMUM,
     provider_preferences,
+    token_rates,
 )
 
 FIXTURE = json.loads(
@@ -8816,6 +8817,12 @@ def test_the_estimate_budgets_from_the_resolved_route_not_the_tier(client, tmp_p
                         "tag": "together",
                         "max_completion_tokens": 4096,
                         "supported_parameters": ["max_tokens"],
+                        # The endpoint's OWN rates, which the projection
+                        # uses for a pinned model; the same numbers the
+                        # catalog publishes here so this test keeps
+                        # measuring the budget clamp and not the price.
+                        # F3's test measures the price.
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"},
                     }
                 ]
             }
@@ -9121,6 +9128,197 @@ def test_an_experiment_system_prompt_is_weighed_when_the_task_sets_none(
 
     assert bare == pytest.approx(1 * 1e-06)
     assert global_system == pytest.approx((1 + 1_000) * 1e-06)
+
+
+# ---- Thirteenth review, F3 and F4: a projection is priced by the
+# ---- publication that speaks for the route, and refuses what it
+# ---- cannot count.
+
+
+@respx.mock
+def test_review_repro_a_pinned_experiment_prices_from_its_own_endpoint(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost on the 201 for a strict experiment
+    pinned to an endpoint whose published rates are a thousand times the
+    catalog's.
+
+    MEASURED BEFORE THE FIX, at ca72742, in the reviewer's shape:
+    catalog rates 0.000001 and 0.000002, pinned endpoint rates 0.001 and
+    0.002 with a cap of 100, one task. The projection returned
+    $0.000201; the resolved endpoint's own rates give $0.201, a
+    thousandfold understatement under a label that says "at most".
+
+    THE MODEL LEVEL IS ONE ROUTE'S PRICE. Measured live on 2026-08-30,
+    openai/gpt-oss-120b published prompt 0.000000037 at the model level
+    and thirteen distinct rate pairs across its twenty endpoints, from
+    0.00000003 to 0.00000035 on the prompt side. The listing this test
+    stubs is that shape with the numbers made loud.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 100,
+                        "supported_parameters": ["max_tokens"],
+                        "pricing": {"prompt": "0.001", "completion": "0.002"},
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    created = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    )
+
+    assert created.status_code == 201, created.text
+    cost = created.json()["projected_cost"]
+    # One task, one model, one repeat: one prompt token at the
+    # endpoint's input rate, 100 reserved at its output rate.
+    assert cost["input_usd"] == pytest.approx(1 * 0.001)
+    assert cost["output_usd"] == pytest.approx(100 * 0.002)
+    assert cost["total_usd"] == pytest.approx(0.201)
+    # And emphatically not the catalog's figure, which is what the
+    # branch quoted before this commit.
+    assert cost["total_usd"] != pytest.approx(0.000201)
+
+
+@respx.mock
+def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
+    client, tmp_path
+):
+    """WINDOW: the projection for a pinned model whose endpoint listing
+    carries no pricing object, with the model-level map fully populated.
+
+    FALLING BACK IS THE SUBSTITUTION THE PIN EXISTS TO PREVENT. The
+    catalog can answer, and its answer is about a different route, so
+    borrowing it would put a confident figure on a question nobody
+    asked. This is the same asymmetry trial_route already draws for the
+    reasoning field: an unanswerable listing is an absence, not a
+    licence to use the aggregate.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    cost = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    # PRE-STATE: the model-level map does know this model's price, so
+    # the null below is a refusal and not an absence of data.
+    assert app.state.prices["model/alpha"]["prompt"] == 1e-06
+    assert cost["total_usd"] is None
+    assert cost["unpriced"] == ["model/alpha"]
+
+
+def test_review_repro_a_request_charge_makes_the_projection_null_not_zero(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: the projection for a model whose pricing map publishes a
+    nonzero dimension this bench has no arithmetic for.
+
+    MEASURED BEFORE THE FIX, in the reviewer's shape: pricing
+    {prompt: 0, completion: 0, request: 0.25} parsed into a fully
+    "priced" map of two zeroes, and two tasks over three repeats
+    returned every figure as 0.0 with unpriced empty, against six fixed
+    request charges totalling $1.50. A zero that is wrong is worse than
+    a null that is honest, because only one of them is read as an
+    answer.
+
+    THE DIMENSION IS NAMED, because a model with two published rates
+    coming back unpriced would otherwise send a reader to the catalog to
+    work out why.
+
+    PINNED AGAINST THE LIVE PUBLICATION rather than a guess: no model in
+    the 2026-08-30 snapshot of all 396 entries published a request
+    charge, which is exactly why the rule is about UNKNOWN keys and not
+    about a list of known ones. The dimensions that snapshot does carry
+    are named in TOKEN_PRICE_DIMENSIONS.
+    """
+    monkeypatch.setitem(
+        app.state.prices,
+        "model/alpha",
+        {"prompt": 0.0, "completion": 0.0, "beyond": ["request"]},
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+
+    cost = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], repeats=3),
+    ).json()["projected_cost"]
+
+    assert cost["input_usd"] is None
+    assert cost["output_usd"] is None
+    assert cost["total_usd"] is None
+    assert cost["unpriced"] == ["model/alpha (charges request)"]
+
+
+def test_a_dimension_published_at_zero_is_a_zero_and_not_an_unknown(client, tmp_path):
+    """WINDOW: the catalog parse and the projection for a pricing map
+    whose extra dimensions are all published at 0.
+
+    THE OTHER HALF OF THE RULE, and without it the fix would take most
+    of the live catalog offline for no reason: 235 of the 396 models in
+    the 2026-08-30 snapshot publish input_cache_read, and a rule that
+    refused on the KEY rather than on a nonzero charge would refuse
+    every one of them whether or not it costs anything. A dimension the
+    publisher priced at zero is priced.
+    """
+    rates, beyond = token_rates(
+        {
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "input_cache_read": "0",
+            "web_search": "0",
+        }
+    )
+
+    assert rates == {"prompt": 1e-06, "completion": 2e-06}
+    assert beyond == []
+    # And the same map with one of them charging is refused, naming it.
+    _, charged = token_rates(
+        {"prompt": "0.000001", "completion": "0.000002", "web_search": "0.004"}
+    )
+    assert charged == ["web_search"]
+    # An overrides OBJECT is not a number to compare against zero, and
+    # counts as charged rather than as absent: it describes conditional
+    # pricing, and reading it as nothing would read "prices vary" as
+    # "prices do not".
+    _, conditional = token_rates(
+        {"prompt": "0.000001", "completion": "0.000002", "overrides": {"a": 1}}
+    )
+    assert conditional == ["overrides"]
+    # And end to end, over the running catalog: model/alpha publishes
+    # only the two dimensions, so it is priceable and the projection
+    # answers with a figure.
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    cost = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["projected_cost"]
+    assert cost["unpriced"] == []
+    assert cost["total_usd"] is not None
 
 
 # ---- Phase M3: the pins travel, through the report, the export and
@@ -14192,6 +14390,11 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert first == {
         "pin": None,
         "completion_cap": None,
+        # No pin, so no listing was fetched and the endpoint publication
+        # said nothing; the projection reads the model-level map for
+        # this model instead. See experiment_prices.
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 0
@@ -14206,6 +14409,8 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert second == {
         "pin": None,
         "completion_cap": None,
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 0
@@ -14239,6 +14444,13 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert fourth == {
         "pin": "deepinfra",
         "completion_cap": 32768,
+        # This listing publishes no pricing at all, so the pinned route
+        # cannot say what it charges. rates None makes the model
+        # unpriced for the projection rather than borrowing the
+        # model-level figure, which is the substitution the pin exists
+        # to prevent; see experiment_prices.
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 2

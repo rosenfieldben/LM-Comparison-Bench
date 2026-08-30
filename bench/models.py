@@ -975,6 +975,15 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
                 "max_completion_tokens": _as_positive_int(
                     entry.get("max_completion_tokens")
                 ),
+                # KEPT, NOT DISCARDED, since the thirteenth review. This
+                # parser dropped pricing entirely, so a strict pin that
+                # selected one endpoint was still priced from the
+                # model-level aggregate: see endpoint_rates for the
+                # measurement. Split into what can be priced and what
+                # else is charged, by the same function the model-level
+                # parse uses, so the two publications cannot be read by
+                # two rules.
+                **_priced(entry.get("pricing")),
             }
         )
     out["fetched"] = True
@@ -1031,6 +1040,143 @@ def endpoint_supports_reasoning(
     if not answers:
         return None
     return all(answers)
+
+
+# The two dimensions this bench can price, and the reason the others
+# are named rather than ignored.
+#
+# PINNED AGAINST THE LIVE PUBLICATION, https://openrouter.ai/api/v1/models
+# read 2026-08-30 over all 396 entries, and the per-endpoint listing at
+# https://openrouter.ai/api/v1/models/{model}/endpoints read the same
+# day. Every entry carries pricing.prompt and pricing.completion; the
+# object also carries, in descending order of how many models publish
+# them, input_cache_read (235), web_search (123), input_cache_write
+# (74), overrides (51, an OBJECT rather than a rate), audio (32),
+# input_cache_write_1h (32), internal_reasoning (30), image (29),
+# input_audio_cache (27), image_output (9) and audio_output (2). The
+# endpoint listing adds discount, published as 0 on every endpoint of
+# the model sampled. The documentation also describes a fixed per
+# request charge; no model in the snapshot published one, which is
+# exactly why this is a rule about UNKNOWN keys rather than a list of
+# known ones.
+#
+# A DIMENSION PUBLISHED AT ZERO IS A ZERO, not an unknown, so it does
+# not disqualify anything: that is what the publisher said it costs.
+# A NONZERO one does, because this bench does not model what triggers
+# it and a projection that ignored it would be a confident understatement
+# wearing a total's clothes. 131 of the 396 models carry no nonzero
+# dimension beyond these two and can be projected; the rest are named
+# and refused, which is the honest answer to "what will this cost".
+TOKEN_PRICE_DIMENSIONS = ("prompt", "completion")
+
+
+def token_rates(pricing: Any) -> tuple[dict[str, float] | None, list[str]]:
+    """One pricing object as (the two token rates, what else it charges).
+
+    Returns (None, []) for a pricing object this cannot read at all, and
+    (rates, names) otherwise, where names is every dimension beyond the
+    two that publishes a nonzero charge, sorted. A caller that can only
+    price tokens must treat a non-empty names as "cannot price this".
+
+    Prices arrive as strings in USD per token. Non-finite and negative
+    are malformed: a NaN price yields a NaN cost, and a NaN summed into
+    accumulated spend makes the ceiling comparison permanently false,
+    silently disabling it.
+
+    AN UNPARSEABLE EXTRA DIMENSION COUNTS AS CHARGED, which is the
+    conservative direction and the one the overrides key needs: it is an
+    object describing conditional pricing, and an object is not a number
+    this can compare to zero. Reading it as absent would be reading a
+    statement that prices vary as a statement that they do not.
+    """
+    if not isinstance(pricing, Mapping):
+        return None, []
+    beyond = []
+    for key, value in pricing.items():
+        if key in TOKEN_PRICE_DIMENSIONS:
+            continue
+        try:
+            if float(value) != 0.0:
+                beyond.append(key)
+        except (TypeError, ValueError):
+            beyond.append(key)
+    try:
+        rates = {name: float(pricing[name]) for name in TOKEN_PRICE_DIMENSIONS}
+    except (KeyError, TypeError, ValueError):
+        return None, sorted(beyond)
+    if not all(math.isfinite(rate) and rate >= 0 for rate in rates.values()):
+        return None, sorted(beyond)
+    return rates, sorted(beyond)
+
+
+def _priced(pricing: Any) -> dict[str, Any]:
+    """token_rates as the two keys an endpoint entry carries.
+
+    A named helper rather than a zip at the call site, because the two
+    keys are read by endpoint_rates and a positional pairing is a
+    call-site key nobody can grep for.
+    """
+    rates, beyond = token_rates(pricing)
+    return {"rates": rates, "beyond": beyond}
+
+
+def endpoint_rates(
+    listing: Mapping[str, Any], provider: str | None
+) -> tuple[dict[str, float] | None, list[str]]:
+    """What the PINNED provider publishes per token, or why it cannot say.
+
+    THE MODEL-LEVEL PRICE IS ONE ROUTE'S PRICE. OpenRouter's model
+    listing publishes a single pricing object per model and the endpoint
+    listing publishes one per endpoint, and they are not the same
+    question. Measured 2026-08-30 on openai/gpt-oss-120b: the model
+    level published prompt 0.000000037 and completion 0.00000017, which
+    is exactly one of its twenty endpoints; those twenty published 13
+    DISTINCT rate pairs, from 0.00000003 to 0.00000035 on the prompt
+    side and 0.00000017 to 0.00000095 on the completion side. Pricing a
+    pinned sweep from the model level is therefore wrong by up to
+    elevenfold in one direction or fivefold in the other, and a figure
+    labelled "at most" that can be an eighth of the bill is not a
+    ceiling.
+
+    THE HIGHEST MATCHING RATE WINS, which is the mirror of
+    endpoint_completion_cap taking the lowest cap and has the same
+    reason: a pin names a PROVIDER, that provider may serve the model
+    from several endpoints, the request has to survive whichever the
+    router picks, and this figure is a ceiling. The two are compared
+    dimension by dimension rather than by total, because there is no
+    total until a caller supplies token counts.
+
+    (None, names) when the listing never fetched, when no endpoint
+    matched the pin, when a matched endpoint's rates cannot be read, or
+    when one charges a dimension this cannot price. The caller must not
+    fall back to the model level on any of them: falling back is exactly
+    the substitution this function exists to stop.
+    """
+    if not listing.get("fetched") or provider is None:
+        return None, []
+    want = normalized_provider_slug(provider)
+    matched = [
+        endpoint
+        for endpoint in listing.get("endpoints") or ()
+        if endpoint.get("slug") == want
+    ]
+    if not matched:
+        return None, []
+    beyond: set[str] = set()
+    best: dict[str, float] | None = None
+    for endpoint in matched:
+        rates, names = endpoint.get("rates"), endpoint.get("beyond") or []
+        beyond.update(names)
+        if rates is None:
+            return None, sorted(beyond)
+        best = (
+            rates
+            if best is None
+            else {name: max(best[name], rates[name]) for name in TOKEN_PRICE_DIMENSIONS}
+        )
+    if beyond:
+        return None, sorted(beyond)
+    return best, []
 
 
 def endpoint_completion_cap(
@@ -1178,6 +1324,16 @@ def context_shortfalls(
     return short
 
 
+def _named(model: str, beyond: list[str]) -> str:
+    """One unpriceable model, with the dimensions that made it one.
+
+    The name alone would send a reader to the catalog to work out why a
+    model with two published rates came back unpriced. Sorted by
+    token_rates, so two runs over one catalog produce one string.
+    """
+    return f"{model} (charges {', '.join(beyond)})"
+
+
 def projected_cost(
     tasks_total: int,
     task_chars: Mapping[str, Mapping[str, int]] | None,
@@ -1222,6 +1378,17 @@ def projected_cost(
     disagreeing about what an unpriced model means would be worse than
     either.
 
+    A MODEL THAT CHARGES SOMETHING THIS CANNOT COUNT IS UNPRICED TOO,
+    and the entry says which dimension. A pricing map publishing a
+    nonzero request charge, or a cache-read rate, or an overrides
+    object, describes a bill this function has no arithmetic for; the
+    reviewer's shape was prompt 0, completion 0 and request 0.25, which
+    returned every figure as a confident zero over six trials that
+    would have cost $1.50. A zero that is wrong is worse than a null
+    that is honest, because only one of them is read as an answer. See
+    TOKEN_PRICE_DIMENSIONS for the measurement and for why a dimension
+    published AT zero is not one of these.
+
     A CEILING, NOT A FORECAST, on the output side: it prices every trial
     at its full reserved budget, which is the most it can be billed and
     is usually well above what it will be. The input side is an estimate
@@ -1236,7 +1403,15 @@ def projected_cost(
     Pure and given its prices, its reservations and its heuristic, so
     the catalog stays the boundary's business.
     """
-    unpriced = sorted({model for model in lineup if prices.get(model) is None})
+    unpriced = sorted(
+        {
+            model
+            if not (prices.get(model) or {}).get("beyond")
+            else _named(model, prices[model]["beyond"])
+            for model in lineup
+            if prices.get(model) is None or prices[model].get("beyond")
+        }
+    )
     if unpriced:
         return {
             "input_usd": None,
@@ -1715,22 +1890,25 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # into accumulated spend makes the ceiling comparison permanently
         # false, silently disabling it. Raising inside the try reuses the
         # single degrade path, matching as_metric's finiteness contract.
-        try:
-            prompt_price = float(entry["pricing"]["prompt"])
-            completion_price = float(entry["pricing"]["completion"])
-            if not (math.isfinite(prompt_price) and math.isfinite(completion_price)):
-                raise ValueError("non-finite price")
-            if prompt_price < 0 or completion_price < 0:
-                raise ValueError("negative price")
-            model["prompt_price"] = prompt_price
-            model["completion_price"] = completion_price
-            prices[entry["id"]] = {
-                "prompt": prompt_price,
-                "completion": completion_price,
-            }
-        except (KeyError, TypeError, ValueError):
+        rates, beyond = token_rates(entry.get("pricing"))
+        if rates is None:
             model["prompt_price"] = None
             model["completion_price"] = None
+        else:
+            model["prompt_price"] = rates["prompt"]
+            model["completion_price"] = rates["completion"]
+            prices[entry["id"]] = {
+                **rates,
+                # WHAT ELSE THIS MODEL CHARGES, carried rather than
+                # dropped. cost_usd ignores it and must: it prices the
+                # tokens a finished run actually reported, and its own
+                # contract is an estimate beside a billed figure. The
+                # PROJECTION reads it and refuses, because a ceiling
+                # quoted before spend that silently omitted a real
+                # charge would be a confident understatement. See
+                # TOKEN_PRICE_DIMENSIONS.
+                "beyond": beyond,
+            }
         models.append(model)
     return {"fetched": True, "models": models, "prices": prices, "digest": digest}
 

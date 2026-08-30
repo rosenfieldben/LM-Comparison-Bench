@@ -57,6 +57,7 @@ from bench.models import (
     as_text,
     context_shortfalls,
     endpoint_completion_cap,
+    endpoint_rates,
     endpoint_supports_reasoning,
     fetch_catalog,
     fetch_endpoints,
@@ -4445,7 +4446,9 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
         body.lineup,
         body.repeats,
         reserved,
-        app.state.prices,
+        # FROM THE ROUTE EACH TRIAL WILL TAKE, which for a pinned model
+        # is not the model-level map; see experiment_prices.
+        experiment_prices(body.lineup, routes, app.state.prices),
         chars_per_token=CHARS_PER_TOKEN,
     )
     return {
@@ -4497,6 +4500,47 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     if experiment is None:
         raise HTTPException(404, "no such experiment")
     return experiment
+
+
+def experiment_prices(
+    lineup: list[str],
+    routes: dict[str, dict[str, Any]],
+    catalog_prices: Mapping[str, Any],
+) -> dict[str, Any]:
+    """What each lineup member charges per token, from the publication
+    that speaks for the route its trials will take.
+
+    TWO PUBLICATIONS, AND WHICH ONE IS RIGHT DEPENDS ON THE PIN. An
+    UNPINNED model is routed dynamically, so the model-level listing is
+    the only thing that can speak for it and the catalog map is used.
+    A PINNED model has one host selected with allow_fallbacks false, and
+    the endpoint listing publishes that host's own rates: measured
+    2026-08-30 on openai/gpt-oss-120b, whose model level published
+    prompt 0.000000037 while its twenty endpoints published thirteen
+    distinct rate pairs from 0.00000003 to 0.00000035. Pricing a pinned
+    sweep from the model level quoted the wrong route by up to
+    elevenfold, in either direction, under a label that said "at most".
+
+    A PINNED MODEL DOES NOT FALL BACK to the catalog when its listing
+    cannot answer. Falling back is the substitution the pin exists to
+    prevent, and it is the same asymmetry trial_route already draws for
+    the reasoning field: absence of evidence is not evidence, and a
+    projection nobody can stand behind is stated as absent rather than
+    borrowed from a different route. Absent here means the model is
+    unpriced, which makes every figure null and names it.
+
+    beyond rides along untouched, so a route that charges something this
+    bench cannot count refuses the projection exactly as a model-level
+    map with the same dimension does; see projected_cost.
+    """
+    out: dict[str, Any] = {}
+    for model in lineup:
+        if routes[model]["pin"] is None:
+            out[model] = catalog_prices.get(model)
+            continue
+        rates, beyond = routes[model]["rates"], routes[model]["beyond"]
+        out[model] = None if rates is None else {**rates, "beyond": beyond}
+    return out
 
 
 async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
@@ -4557,11 +4601,27 @@ async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
         # No pin, so any eligible host may serve this and the union is
         # the right question. No listing is fetched, which is also why
         # the ordinary comparison path pays nothing for any of this.
-        return {"pin": None, "completion_cap": None, "may_send_reasoning_cap": vouched}
+        # rates stays None for the same reason and the caller reads the
+        # model-level map instead; see experiment_prices.
+        return {
+            "pin": None,
+            "completion_cap": None,
+            "rates": None,
+            "beyond": [],
+            "may_send_reasoning_cap": vouched,
+        }
     listing = await fetch_endpoints(app.state.client, model)
+    rates, beyond = endpoint_rates(listing, pin)
     return {
         "pin": pin,
         "completion_cap": endpoint_completion_cap(listing, pin),
+        # THE SELECTED HOST'S OWN RATES, read from the same listing the
+        # cap came from and in the same request. The projection uses
+        # these for a pinned model and the catalog's for an unpinned
+        # one; see experiment_prices for why there is no fallback
+        # between them.
+        "rates": rates,
+        "beyond": beyond,
         # The model-level gate still has to pass: a pinned endpoint that
         # accepts the field says nothing about whether the MODEL reasons
         # unprompted, and both questions must be answered yes.

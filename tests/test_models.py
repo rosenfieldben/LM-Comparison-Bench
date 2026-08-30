@@ -192,7 +192,13 @@ async def test_catalog_price_map_skips_malformed_entries(client):
 
     catalog = await fetch_catalog(client)
 
-    assert catalog["prices"] == {"a/one": {"prompt": 1e-06, "completion": 2e-06}}
+    assert catalog["prices"] == {
+        # beyond is what else this model charges, empty here because the
+        # entry publishes only the two token dimensions. Carried rather
+        # than dropped so the projection can refuse a model whose bill
+        # it cannot bound; see TOKEN_PRICE_DIMENSIONS.
+        "a/one": {"prompt": 1e-06, "completion": 2e-06, "beyond": []}
+    }
 
 
 @respx.mock
