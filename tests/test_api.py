@@ -8475,6 +8475,66 @@ def test_review_repro_deleting_the_bytes_mid_cell_cannot_split_a_comparison(
 
 
 @respx.mock
+def test_review_repro_every_repeat_of_a_task_composes_the_same_bytes(client, tmp_path):
+    """WINDOW: the four payloads of a one-task, one-model experiment over
+    two repeats, captured at the mock, with an extraction row written
+    between the first repeat and the second.
+
+    THE FAIRNESS LAW IS STATED AT CELL LEVEL AND USED ACROSS REPEATS.
+    Every tombstone this workstream wrote asserts identical bytes to
+    every ARM of one cell, which is the comparison a card makes. But
+    repeats exist to measure how much a MODEL varies run to run, and the
+    report pools them: two repeats of one task that sent different
+    documents would be pooled as variation in the answer when the
+    question had changed. Nothing proved that until this test, because
+    repeats are separate cells and each composes for itself.
+
+    THE MUTATION IT MOTIVATES is a runner that resolves each cell's
+    documents instead of reading the frozen pin. The upgrade below is a
+    real one, written between cells exactly as a redeploy would write
+    it, and a resolver that asked the store "what is the newest reading
+    of these bytes" would hand repeat two a different document while
+    every field in both records still said the same digest.
+    """
+    sent = []
+
+    def route(request):
+        sent.append(json.loads(request.content))
+        if len(sent) == 2:
+            # Between the two cells of task t1: repeat 0 has sent both
+            # of its arms and repeat 1 has sent none.
+            parser_upgrade(digest, "2", "THE UPGRADED READING")
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done", final
+    # PRE-STATE: two cells of two arms each, and the upgrade landed.
+    assert len(sent) == 4, sent
+    assert (
+        app.state.db.execute(
+            "SELECT COUNT(*) AS n FROM attachment_extractions WHERE digest = ?",
+            (digest,),
+        ).fetchone()["n"]
+        == 2
+    )
+    # ONE COMPOSITION ACROSS ALL FOUR, not one per cell that happened to
+    # agree: the frozen pin names version 1, and version 2 exists.
+    assert len(set(captured(sent))) == 1
+    assert "the contract says forty two" in captured(sent)[0]
+    assert "THE UPGRADED READING" not in json.dumps(sent)
+
+
+@respx.mock
 def test_two_tasks_compose_apart_and_neither_carries_the_others_document(
     client, tmp_path
 ):
@@ -8601,6 +8661,54 @@ def test_review_repro_one_oversized_task_names_itself_while_the_rest_stand(
     assert "an estimate, characters over 4" in detail, detail
     # Nothing was created: the refusal costs nothing and leaves nothing.
     assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_review_repro_a_dataset_where_nothing_fits_is_an_excerpt_not_a_dump(
+    client, tmp_path
+):
+    """WINDOW: the 422 body for three oversized tasks against a two-model
+    lineup, which is six shortfalls against a cap of five.
+
+    THE CAP WAS ON THE WRONG AXIS, and the comment beside it claimed the
+    body was bounded. A shortfall is one task against one MODEL, so the
+    cap counted tasks and the enumeration grew with the lineup: five
+    tasks against a thousand-model lineup emitted five thousand clauses
+    while SHORTFALLS_SHOWN sat there reading like a bound.
+
+    Three tasks cite ONE document deliberately: the defect is about the
+    message and not about the arithmetic, and a single upload is enough
+    to produce it.
+
+    Both halves are asserted. The task COUNT still leads, because how
+    many lines of the dataset are affected is the first thing the author
+    needs; the enumeration under it is an excerpt and says how much it
+    left out.
+    """
+    digest = upload(client, "big.txt", b"x" * 170_000).json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        *(
+            {"id": f"t{n}", "prompt": "does not fit", "attachments": [digest]}
+            for n in range(3)
+        ),
+    )
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/capped", "model/vision"]),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "3 tasks in this dataset do not fit" in detail, detail
+    # PRE-STATE: there really are more shortfalls than the cap, or the
+    # excerpt below would be the whole answer.
+    assert detail.count("holds") == main.SHORTFALLS_SHOWN, detail
+    assert "and 1 further model-and-task pair not shown" in detail, detail
+    # And an excerpt is still actionable: the first task named carries
+    # both of its models and both numbers.
+    assert "task 't0': model/capped holds 64000 tokens" in detail, detail
+    assert "task 't0': model/vision holds 8192 tokens" in detail, detail
 
 
 def test_the_composed_ceiling_refuses_a_task_by_name(client, tmp_path):
@@ -8798,8 +8906,13 @@ def test_the_report_names_the_documents_each_task_read(client, tmp_path):
         "/experiments",
         json=experiment_body(path, lineup=["model/alpha"], repeats=3),
     ).json()["id"]
-    run_experiment_to_completion(client, eid, path)
 
+    final = run_experiment_to_completion(client, eid, path)
+
+    # PRE-STATE: six cells really ran, or "one entry per task" would be
+    # a claim about a dedup nothing exercised.
+    assert final["status"] == "done", final
+    assert final["trials_done"] == 6, final
     report_body = client.get(f"/experiments/{eid}/report").json()
 
     per_task = report_body["task_attachments"]

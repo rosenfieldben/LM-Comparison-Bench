@@ -2348,7 +2348,9 @@ def enforce_composed(prompt: str, pins: list[dict[str, Any]]) -> str:
 
     On POST /compare the composition happens once for the batch and
     every member is handed the same string, so identical composed
-    content is structural: there is one string and N sends of it.
+    content is structural: there is one string and N sends of it. The
+    experiment runner takes that same arrangement one level up, once per
+    task-cell; see run_experiment.
 
     On POST /compare/stream there is one request per model, so each
     member composes for itself and "composed once" is simply false. What
@@ -2371,6 +2373,17 @@ def enforce_composed(prompt: str, pins: list[dict[str, Any]]) -> str:
     streaming path is the one the browser actually uses and an argument
     that covered only the batch endpoint would be a proof of the wrong
     window.
+
+    THE RUNNER IS A THIRD PATH and takes the first argument one level
+    up: it composes once per task-CELL, ahead of the group row, and
+    hands the same object to every arm, so identical bytes across a
+    task's arms is again structural. Across REPEATS of one task it is
+    the second argument that holds, purely: each repeat is its own cell
+    and composes for itself, from a pin the experiment record froze at
+    creation, so the composition is a pure function of inputs nothing
+    between the cells can move. Both halves are tombstoned there too,
+    and the second needed its own test because pooling repeats is what
+    the report does with them.
     """
     documents = documents_for(pins)
     composed = compose(prompt, documents, redacted=False)
@@ -2556,6 +2569,14 @@ CONTEXT_HEADROOM = 0.1
 # fits. Five is enough to see the shape (which task, which model, by how
 # much) and the count of what is not shown keeps the message honest
 # about being an excerpt rather than the whole answer.
+#
+# IT COUNTS CLAUSES, NOT TASKS, and the closing review found it counting
+# tasks. A shortfall is one task against one MODEL, so five tasks
+# against a thousand-model lineup emitted five thousand clauses while
+# this comment said the body was bounded: the cap was real and it was
+# applied to the wrong axis. The task count still leads the sentence,
+# because how many lines of the dataset are affected is the first thing
+# the author needs; the enumeration below it is the excerpt.
 SHORTFALLS_SHOWN = 5
 
 
@@ -2802,11 +2823,16 @@ def composed_for(
 ) -> tuple[Any, Any]:
     """The user content to send and the user content to record.
 
-    ONE FUNCTION FOR BOTH MODES AND BOTH ENDPOINTS, because the fairness
-    law and rule two are the same law in each: composed from the pin,
-    recorded by reference. Four call sites building this themselves
-    would be four chances for one of them to compose per model or to
-    record the content.
+    ONE BODY FOR BOTH MODES AND EVERY DOOR, because the fairness law and
+    rule two are the same law in each: composed from the pin, recorded
+    by reference. Call sites building this themselves would each be a
+    chance to compose per model or to record the content.
+
+    THE BODY MOVED TO compose_from_pins in Phase M and this function
+    became the entry point that RESOLVES a declaration before calling
+    it. The runner holds a pin that was frozen at creation, so it calls
+    the other entry point directly rather than resolving a fact the
+    manifest has already decided.
 
     Returns plain strings in inline mode and content-part lists in
     native mode, which is the shape difference the payload itself has.
@@ -2825,7 +2851,7 @@ def composed_for(
     WHERE THE NATIVE BYTES LIVE, AND FOR HOW LONG. A native payload is
     the only thing this bench builds that is measured in megabytes: four
     attachments at the 8 MiB cap, base64'd, is about 42.7 MiB of string
-    per composition. The two endpoints hold that differently and each
+    per composition. The three doors hold that differently and each
     holds it deliberately.
 
     POST /compare composes ONCE for the batch and hands every member the
@@ -2842,6 +2868,16 @@ def composed_for(
     inside the held slot instead, which bounds the retained total at
     MAX_CONCURRENT_UPSTREAM copies, ~213 MiB at the caps, no matter how
     many members are waiting.
+
+    THE RUNNER is the third, and it takes /compare's arrangement one
+    level up: it composes once per CELL, ahead of the group row, and
+    hands the same object to every arm. Its trials run one at a time and
+    a cell's composition is dropped when the cell ends, so peak is one
+    copy for the whole sweep however wide the lineup and however long
+    the dataset. It does hold that copy while a trial waits on the
+    semaphore, which the stream path deliberately avoids; the difference
+    is that the runner has ONE composition in flight and the stream path
+    would have one per queued member.
 
     A group-keyed cache would let the stream path share by reference
     too, and is deliberately not built: a cache of megabyte payloads
@@ -4003,10 +4039,25 @@ def weigh_tasks(
     still recorded for those tasks, because the estimate prices the
     prompt too.
 
-    The read is the expensive part and it is bounded on purpose: each
-    composition is at most MAX_COMPOSED_CHARS and is discarded as soon
-    as it is measured, so peak memory is one task's worth however long
-    the dataset is.
+    THE READ IS THE EXPENSIVE PART and the bound is measured rather than
+    asserted. Each composition is at most MAX_COMPOSED_CHARS and is
+    discarded as soon as it is measured, so peak memory is one task's
+    worth however long the dataset is; the TIME is the whole corpus off
+    disk, one task at a time. Measured on this machine: 300 tasks each
+    citing a distinct 100,000 character document, 30 MB of text, made
+    POST /experiments take 94 ms end to end. The ceilings put the worst
+    case around 2000 tasks at 200,000 characters, which extrapolates to
+    a little over a second, paid once, to avoid discovering at trial 300
+    that the dataset cannot be run.
+
+    IT IS A QUERY PER TASK, deliberately, where freeze_task_attachments
+    one function up is a single batched query for the whole dataset.
+    The freeze needs only the rows and can ask for them all at once;
+    this needs the composed STRING, and the composer takes one task's
+    documents at a time. Batching the reads would buy back part of the
+    measurement above at the cost of a second way to compute a composed
+    size, and a size computed two ways is a size that can disagree with
+    the refusal that quotes it.
     """
     chars: dict[str, int] = {}
     for task in dataset["tasks"]:
@@ -4064,11 +4115,25 @@ def enforce_task_windows(
     A missing catalog SKIPS the check rather than refusing it, exactly
     as the comparison door does; see enforce_context_window for why
     absence is answered that way here and not for a capability claim.
+
+    IT IS A PRE-FLIGHT AND NOT A GUARANTEE, said here because the phrase
+    "the resolved route" invites the stronger reading. The route read
+    here is the one resolved at CREATION; run_experiment resolves again
+    at start, because a route is what the RUN will use and minutes or
+    days may have passed. A pinned endpoint that published a larger
+    completion ceiling in between will reserve more than this check
+    allowed for, and nothing re-runs the arithmetic at start. That is
+    the same shape every door check in this codebase has (a comparison
+    is checked at entry and sent afterwards) and the same shape the
+    dataset digest does NOT have, which is why the digest is re-checked
+    at start and this is not: a changed dataset makes the record false,
+    while a grown ceiling makes an estimate stale.
     """
     windows = catalog_windows()
     if windows is None:
         return
     clauses: list[str] = []
+    total = 0
     offenders = 0
     for task in dataset["tasks"]:
         if not task_attachments.get(task["id"]):
@@ -4084,13 +4149,14 @@ def enforce_task_windows(
         if not short:
             continue
         offenders += 1
-        if offenders <= SHORTFALLS_SHOWN:
-            clauses.extend(
-                f"task {task['id']!r}: {shortfall_clause(entry)}" for entry in short
-            )
+        total += len(short)
+        clauses.extend(
+            f"task {task['id']!r}: {shortfall_clause(entry)}"
+            for entry in short[: max(0, SHORTFALLS_SHOWN - len(clauses))]
+        )
     if not offenders:
         return
-    hidden = offenders - min(offenders, SHORTFALLS_SHOWN)
+    hidden = total - len(clauses)
     subject = (
         "1 task in this dataset does not fit"
         if offenders == 1
@@ -4100,7 +4166,11 @@ def enforce_task_windows(
         422,
         f"{subject} every model in the lineup: "
         + "; ".join(clauses)
-        + (f"; and {hidden} further task{plural(hidden)} not shown" if hidden else "")
+        + (
+            f"; and {hidden} further model-and-task pair{plural(hidden)} not shown"
+            if hidden
+            else ""
+        )
         + ". "
         + CONTEXT_ESTIMATE_NOTE
         + " Shorten the named task's document, drop the model, or use the "
