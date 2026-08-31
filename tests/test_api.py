@@ -9978,6 +9978,120 @@ def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
     assert beyond == ["request"]
 
 
+# ---- Thirteenth review panel, D: F2 is enforced at four doors, so it
+# ---- is tested at four doors.
+
+
+def narrow_body(digest, system=None):
+    """One attachment-carrying request against the narrow model.
+
+    The window check applies only to attachment-carrying requests, at
+    every door and by a named deferral, so the document is what makes
+    the check run at all and the system message is what decides the
+    answer.
+    """
+    body = {
+        "prompt": "x",
+        "budget": "standard",
+        "attachments": [digest],
+        "attachments_mode": "inline",
+    }
+    if system is not None:
+        body["params"] = {"system": system}
+    return body
+
+
+@respx.mock
+def test_review_repro_the_system_message_counts_at_every_door_not_only_at_creation(
+    client, tmp_path
+):
+    """WINDOW: the four doors that run enforce_context_window, each with
+    and without a system message of the size that decides the answer.
+
+    MEASURED BEFORE THIS TEST EXISTED, at 38bf72d: F2 wired the system
+    message into all four doors and argued in its own commit body that
+    doing otherwise "would have built the divergence this branch spent a
+    commit removing". Reverting the argument at POST /compare, POST
+    /compare/stream and POST /groups together left the suite at 976
+    passed. Three of the four doors were unheld.
+
+    THE CONTROL IS THE SAME REQUEST WITHOUT THE SYSTEM MESSAGE at every
+    door, so each refusal is attributable to the message rather than to
+    the document, and a door that refused everything would fail here
+    too.
+
+    model/narrow holds 20000 tokens: 18000 usable after the headroom,
+    16384 reserved for the answer, so about 1616 are left for the input
+    and 8000 characters of system prompt is 2000 tokens.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=alpha_stream()
+            if json.loads(request.content).get("stream")
+            else None,
+            json=None
+            if json.loads(request.content).get("stream")
+            else response_for("model/narrow", "ok"),
+        )
+    )
+    digest = upload(client, "d.txt", b"tiny").json()["digest"]
+    system = "S" * 8_000
+
+    fits = {
+        "compare": client.post(
+            "/compare", json={**narrow_body(digest), "models": ["model/narrow"]}
+        ),
+        "stream": client.post(
+            "/compare/stream", json={**narrow_body(digest), "model": "model/narrow"}
+        ),
+        "groups": client.post(
+            "/groups", json={**narrow_body(digest), "models": ["model/narrow"]}
+        ),
+    }
+    over = {
+        "compare": client.post(
+            "/compare",
+            json={**narrow_body(digest, system), "models": ["model/narrow"]},
+        ),
+        "stream": client.post(
+            "/compare/stream",
+            json={**narrow_body(digest, system), "model": "model/narrow"},
+        ),
+        "groups": client.post(
+            "/groups", json={**narrow_body(digest, system), "models": ["model/narrow"]}
+        ),
+    }
+
+    # THE CONTROL: without the system message every door admits it, and
+    # admits it with the status it admits anything with, so a door that
+    # started refusing everything fails here too.
+    assert {door: resp.status_code for door, resp in fits.items()} == {
+        "compare": 200,
+        "stream": 200,
+        "groups": 201,
+    }
+    # AND EACH DOOR REFUSES IT WITH THE MESSAGE COUNTED.
+    for door, resp in over.items():
+        assert resp.status_code == 422, (door, resp.status_code, resp.text)
+        detail = resp.json()["detail"]
+        assert "model/narrow holds 20000 tokens" in detail, (door, detail)
+        assert "2000 for the system message" in detail, (door, detail)
+        assert "16384 reserved for the answer" in detail, (door, detail)
+
+    # The fourth door, for completeness of the set rather than of the
+    # arithmetic, which its own tombstone already pins.
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "x", "system": system, "attachments": [digest]},
+    )
+    experiment = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/narrow"])
+    )
+    assert experiment.status_code == 422, experiment.text
+    assert "2000 for the system message" in experiment.json()["detail"]
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 
