@@ -588,3 +588,54 @@ def test_the_readme_names_the_extractors_the_bench_actually_records():
     # And the one an image gets, which has no suffix entry because it is
     # not parsed at all.
     assert "`none`" in text
+
+
+# ---- Thirteenth review panel, F: the anchor that let a newline
+# ---- through.
+
+
+def test_review_repro_a_digest_with_a_trailing_newline_is_refused_by_the_loader():
+    """WINDOW: parse_dataset over a task citing a 64-hex digest with a
+    newline glued to the end of it.
+
+    MEASURED BEFORE THE FIX, at e5a0ae5: the loader ACCEPTED it, because
+    Python's `$` also matches immediately before a trailing newline. The
+    citation then travelled to the API boundary and was refused there by
+    RenditionPin's min_length/max_length of 64, which is exactly the
+    deferral the comment above DIGEST_PATTERN says the check exists to
+    prevent: "should be refused while the author is still looking at the
+    file, not at experiment creation with a lookup miss that reads like
+    a missing upload."
+
+    The clean digest is asserted alongside, so the fix is a narrowing
+    rather than a break.
+    """
+    clean = "a" * 64
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(id="t1", prompt="a", attachments=[clean + "\n"])))
+
+    assert "line 1" in str(exc.value)
+    assert "task 't1'" in str(exc.value)
+    parsed = parse_dataset(dataset(line(id="t1", prompt="a", attachments=[clean])))
+    assert parsed["tasks"][0]["attachments"] == [{"digest": clean}]
+
+
+def test_the_same_anchor_holds_inside_a_full_pin():
+    """WINDOW: the four-part spelling, whose digest goes through the same
+    pattern.
+
+    Two spellings, one check. A narrowing applied to one of them would
+    leave the other admitting what the first refuses, which is the
+    one-door shape this repository keeps finding.
+    """
+    clean = "b" * 64
+    pin = {
+        "digest": clean + "\n",
+        "extractor": "text",
+        "extractor_version": "1",
+        "kind": "document",
+    }
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(id="t1", prompt="a", attachments=[pin])))
+
+    assert "task 't1'" in str(exc.value)

@@ -4091,7 +4091,23 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
             # for its refusal; the pin that gets frozen is the one the
             # dataset wrote, unchanged, because a pin the bench edited
             # on the way in is not the pin the author declared.
-            resolve_rendition(entry)
+            #
+            # THE TASK NAMES ITSELF, exactly as the missing-digest
+            # refusal twelve lines above does. resolve_rendition speaks
+            # for a COMPARISON, which is the caller it was written for,
+            # and its message says so; an author holding a two thousand
+            # line dataset was told a reading was missing and not which
+            # line asked for it, and was told their file was a
+            # comparison. The re-raise puts the coordinates back and
+            # keeps the reason verbatim.
+            try:
+                resolve_rendition(entry)
+            except HTTPException as exc:
+                raise HTTPException(
+                    422,
+                    f"task {task['id']!r} pins a reading the bench does "
+                    f"not hold. {exc.detail}",
+                ) from None
             pins.append(dict(entry))
         frozen[task["id"]] = pins
     return frozen

@@ -10092,6 +10092,58 @@ def test_review_repro_the_system_message_counts_at_every_door_not_only_at_creati
     assert "2000 for the system message" in experiment.json()["detail"]
 
 
+# ---- Thirteenth review panel, G: the full-pin refusal names its task.
+
+
+def test_review_repro_a_pin_the_bench_lacks_names_the_task_that_wrote_it(
+    client, tmp_path
+):
+    """WINDOW: the 422 from POST /experiments over a task whose full pin
+    names a reading the bench does not hold, on a dataset with more than
+    one task.
+
+    MEASURED BEFORE THE FIX, at e5a0ae5: the refusal came straight from
+    resolve_rendition, which speaks for a COMPARISON because that is the
+    caller it was written for, so an author holding a dataset was told
+    "this comparison pinned sha256 ... and no such reading is stored"
+    with no line to look at and their file called a comparison. Its
+    sibling refusal twelve lines above, for a digest the bench does not
+    hold, has named the task since M1.
+
+    THE REASON IS KEPT VERBATIM, because it is the part that says what
+    to do; what the re-raise adds is where.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "fine", "prompt": "a"},
+        {
+            "id": "wrong-pin",
+            "prompt": "b",
+            "attachments": [
+                {
+                    "digest": digest,
+                    "extractor": "text",
+                    "extractor_version": "99",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail.startswith("task 'wrong-pin' pins a reading"), detail
+    # The task that is fine is not accused of anything.
+    assert "'fine'" not in detail, detail
+    # And the reason survives intact, including the remedy.
+    assert f"sha256 {digest[:12]} as read by text 99" in detail, detail
+    assert "will not substitute a different" in detail, detail
+    assert client.get("/experiments").json()["experiments"] == []
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 

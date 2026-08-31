@@ -60,7 +60,14 @@ PIN_KINDS = ("document", "image")
 # should be refused while the author is still looking at the file, not
 # at experiment creation with a lookup miss that reads like a missing
 # upload.
-DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+#
+# \Z AND NOT $, which is the whole of the thirteenth review panel's F.
+# Python's $ also matches immediately before a trailing newline, so
+# "a"*64 + "\n" passed this check, reached RenditionPin (min_length 64,
+# max_length 64) at the API boundary and was refused there instead: the
+# deferral this constant exists to prevent, arriving through the
+# constant itself. \Z matches only at the end of the string.
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 class DatasetError(RuntimeError):
