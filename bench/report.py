@@ -1665,7 +1665,15 @@ EXPORT_SCHEMA_VERSION = 5
 # number that does not mean it.
 #
 # Version 5 is Phase M, and it is a manifest change for the reason
-# version 4 was: the manifest gained task_attachments (the renditions
+# version 4 was. Its note says "with its meaning intact" rather than
+# "carried unchanged", and names the one thing that did move:
+# attachments_referenced is now raised by the manifest's own
+# task_attachments as well as by the trial lines, so it is true on an
+# artifact whose trial lines cite nothing. The field's key, place, type
+# and question are the same and a reader acts on it the same way, but a
+# note whose whole job is to tell a reader with an older parser what
+# moved cannot leave that out.
+# the manifest gained task_attachments (the renditions
 # frozen onto the experiment at creation, keyed by task id) and
 # attachments_mode (the one mode the whole experiment ran under). No
 # trial field changed value, meaning or presence, and a reader that
@@ -1732,8 +1740,11 @@ EXPORT_SCHEMA_NOTES = {
         "are null on an experiment whose dataset cited no document and "
         "on one created before this field existed. No trial field "
         "changed, and every field the earlier versions added is carried "
-        "unchanged: attachments and attachments_mode on each trial line "
-        "and attachments_referenced in the manifest from version 2; "
+        "with its meaning intact: attachments and attachments_mode on "
+        "each trial line and attachments_referenced in the manifest "
+        "from version 2, though that flag's truth conditions widened, "
+        "because the manifest itself now cites digests and an export "
+        "taken before a run has none on any trial line; "
         "renditions, the ordered pins each with digest, extractor, "
         "extractor_version and kind, from version 3; token_counts in "
         "the manifest, naming the unit of the four token counts on "

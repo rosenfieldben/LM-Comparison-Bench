@@ -6147,6 +6147,14 @@ def rebuild_from_export(lines, tasks_by_id):
                 "cost_usd": trial["cost_usd"],
                 "billed_cost_usd": trial["billed_cost_usd"],
                 "provider": trial["provider"],
+                # BOTH HALVES OF THE BYOK SPLIT, which _cost_totals
+                # reads and this helper dropped until the panel found
+                # it. Without them the rebuilt report's cost block is
+                # null wherever the served one has an upstream figure,
+                # and the "rebuild the report from the artifact" check
+                # could not see the difference.
+                "is_byok": trial["is_byok"],
+                "upstream_inference_cost_usd": trial["upstream_inference_cost_usd"],
             }
         )
         scores_by_result[trial["result_id"]] = trial["scores"]
@@ -6155,6 +6163,11 @@ def rebuild_from_export(lines, tasks_by_id):
             "id": manifest["experiment_id"],
             "name": manifest["name"],
             "estimand_mode": manifest["estimand_mode"],
+            # The metric any ranking is computed on. Dropped here until
+            # the panel found it, so a rebuilt report silently lost the
+            # whole ranking block: metric None, reason "more than one
+            # scorer and no primary_metric declared", every rank null.
+            "primary_metric": manifest["primary_metric"],
             "dataset_name": manifest["dataset_name"],
             "dataset_digest": manifest["dataset_digest"],
             "repeats": manifest["repeats"],
@@ -6318,6 +6331,10 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
     # earlier explanations would leave a v5 artifact unable to explain
     # fields it still carries.
     assert "task_attachments" in manifest["export_schema_change"]
+    # And the one earlier field whose truth conditions v5 widened is
+    # named as widened rather than as carried unchanged: the note is a
+    # reader's only changelog, and something moved.
+    assert "truth conditions widened" in manifest["export_schema_change"]
     assert "token_counts" in manifest["export_schema_change"]
     assert "is_byok" in manifest["export_schema_change"]
     assert "renditions" in manifest["export_schema_change"]
@@ -10142,6 +10159,181 @@ def test_review_repro_a_pin_the_bench_lacks_names_the_task_that_wrote_it(
     assert f"sha256 {digest[:12]} as read by text 99" in detail, detail
     assert "will not substitute a different" in detail, detail
     assert client.get("/experiments").json()["experiments"] == []
+
+
+# ---- Thirteenth review panel, C2: the rebuild helper is held to the
+# ---- artifact it claims to rebuild from.
+
+
+def test_review_repro_the_rebuild_helper_reads_every_field_the_export_emits():
+    """WINDOW: the key set export_trial produces, against the key set
+    rebuild_from_export forwards into build_report.
+
+    THE CHECK THAT WAS MISSING. rebuild_from_export is the branch's only
+    executable statement of "the report can be rebuilt from the export
+    alone", and F6 rests its whole argument on that claim. It is a
+    hand-written translation, so every field the artifact gains has to
+    be added to it by hand, and nothing forced that: Phase M added
+    renditions and the helper was extended by hand; version 4 added
+    is_byok and upstream_inference_cost_usd and version 2's
+    primary_metric predates both, and none of the three was ever added.
+    The panel found the consequence, and it is not small: a rebuilt
+    report lost the entire ranking block and the BYOK cost split.
+
+    WHEN THIS TEST FAILS, the artifact grew. Put the new field into
+    rebuild_from_export, or add it to the structural set below with a
+    note saying why the rebuild does not need it. Either way the
+    decision is made once, deliberately, rather than not made at all.
+
+    IT HOLDS ONE DIRECTION ONLY, deliberately, and the other is held by
+    the equality tombstone beneath it: this notices a field the artifact
+    gained and the placement lists have not, and it cannot notice the
+    helper quietly dropping one it already places. A fixture that
+    actually sets the field is the only thing that can, which is exactly
+    what was missing.
+    """
+    emitted = set(
+        report.export_trial(
+            {
+                "id": 1,
+                "task_id": "t1",
+                "repeat_index": 0,
+                "rotation_index": 0,
+                "attachments": None,
+                "attachments_mode": None,
+                "renditions": None,
+            },
+            {"id": 2, "prompt_text": "p"},
+            {"id": 3, "model": "m"},
+            [],
+        )
+    )
+    # Fields the rebuild consumes to BUILD the shape rather than to fill
+    # a value: they become dict keys, list membership or the group and
+    # run identity themselves.
+    structural = {
+        "type",
+        "group_id",
+        "run_id",
+        "result_id",
+        "task_id",
+        "repeat_index",
+        "rotation_index",
+        "scores",
+        # Recorded on the trial line for a reader; build_report takes
+        # the outcome from the result's own error and response_text, so
+        # forwarding it would be handing the function its own answer.
+        "outcome",
+    }
+    forwarded = {
+        "attachments",
+        "attachments_mode",
+        "renditions",
+        "prompt_text",
+        "app_sha",
+        "catalog_digest",
+        "data_policy",
+        "model",
+        "error",
+        "request_json",
+        "response_text",
+        "position",
+        "latency_ms",
+        "ttft_ms",
+        "cost_usd",
+        "billed_cost_usd",
+        "provider",
+        "is_byok",
+        "upstream_inference_cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "max_tokens",
+        "finish_reason",
+        "native_finish_reason",
+        "generation_id",
+    }
+
+    assert emitted == structural | forwarded, {
+        "emitted but unplaced": sorted(emitted - structural - forwarded),
+        "placed but not emitted": sorted((structural | forwarded) - emitted),
+    }
+
+
+@respx.mock
+def test_review_repro_the_rebuilt_report_keeps_the_ranking_and_the_byok_split(
+    client, tmp_path
+):
+    """WINDOW: the served report and the report rebuilt from the export,
+    over an experiment that actually declares a primary metric and
+    actually carries a BYOK charge.
+
+    MEASURED BEFORE THE FIX, by the panel: served and rebuilt disagreed
+    on ranking.metric ('regex' against None), on ranking.reason, on
+    every model's rank and score mean, and on the whole upstream cost
+    block. No test caught it because every fixture that called the
+    helper left all three fields unset, so served and rebuilt genuinely
+    agreed on nothing.
+
+    THE FIXTURE IS THE POINT. This one sets them, which is what makes
+    the equality below a claim rather than a coincidence.
+    """
+    probe = {
+        "prompt_tokens": 13,
+        "completion_tokens": 8,
+        "cost": 0.5,
+        "is_byok": True,
+        "cost_details": {"upstream_inference_cost": 0.004},
+    }
+
+    def route(request):
+        return httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "Hello"}}]}),
+                    sse({"choices": [], "usage": probe}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "regex", "pattern": "Hello"},
+        },
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], primary_metric="regex"),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+
+    served = client.get(f"/experiments/{eid}/report?dataset_path={path}").json()
+    rebuilt = rebuild_from_export(export_lines(client, eid, path), None)
+
+    # PRE-STATE: the three fields the helper used to drop are actually
+    # set, or the equality would be an equality over absence.
+    assert served["ranking"]["metric"] == "regex"
+    assert served["models"][0]["cost"]["upstream"]["byok"]["trials"] == 1
+    # THE EQUALITY. thresholds_source differs by construction (the
+    # rebuild is handed no dataset file), which is the one thing the
+    # artifact cannot carry and says so at line one.
+    assert rebuilt["ranking"]["metric"] == served["ranking"]["metric"]
+    assert rebuilt["ranking"]["reason"] == served["ranking"]["reason"]
+    assert [m["cost"]["upstream"] for m in rebuilt["models"]] == [
+        m["cost"]["upstream"] for m in served["models"]
+    ]
+    assert [m["rank"] for m in rebuilt["models"]] == [
+        m["rank"] for m in served["models"]
+    ]
 
 
 # ---- Phase M3: the pins travel, through the report, the export and
