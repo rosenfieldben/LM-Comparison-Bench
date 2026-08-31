@@ -2802,12 +2802,19 @@ def enforce_mode(
     caller already holds.
 
     THE DISPATCH, AND EVERY DOOR CALLS THIS ONE. enforce_mode_entry
-    resolves a comparison's digests and then calls it; the experiment
-    boundary and the experiment runner hold a pin frozen at creation and
-    call it directly. Three doors, one answer to "what does this mode
-    promise", which is the arrangement enforce_mode_entry's own
-    docstring argues for one level down and which this branch broke by
-    checking only native at the experiment door.
+    resolves a comparison's digests and then calls it, for POST /compare
+    and POST /compare/stream; POST /groups calls it on the pins it just
+    declared; the experiment boundary and the experiment runner hold a
+    pin frozen at creation and call it directly. Five call sites, four
+    doors, one answer to "what does this mode promise", which is the
+    arrangement enforce_mode_entry's own docstring argues for one level
+    down and which this branch broke by checking only native at the
+    experiment door.
+
+    POST /groups WAS THE FOURTH DOOR WRITING ITS OWN IF-ELSE while the
+    paragraph below said a fourth door could not, which the thirteenth
+    review's panel pointed out. It calls this now, so the sentence is
+    true by construction rather than by assertion.
 
     THE INLINE HALF WAS THE MISSING ONE, again. K4 fixed native at the
     comparison doors and left inline behind; the closing review found
@@ -2827,7 +2834,8 @@ def enforce_mode(
 
     which is enforce_inline_mode's own sentence come true for the third
     time. The dispatch is a function now rather than an if-else each
-    door writes for itself, so a fourth door cannot check one mode.
+    door writes for itself, so a door that checks one mode has to
+    deliberately not call this.
     """
     if mode == "native":
         enforce_native_mode(pins, models)
@@ -2939,13 +2947,19 @@ def composed_for(
 
     THE RUNNER is the third, and it takes /compare's arrangement one
     level up: it composes once per CELL, ahead of the group row, and
-    hands the same object to every arm. Its trials run one at a time and
-    a cell's composition is dropped when the cell ends, so peak is one
-    copy for the whole sweep however wide the lineup and however long
-    the dataset. It does hold that copy while a trial waits on the
-    semaphore, which the stream path deliberately avoids; the difference
-    is that the runner has ONE composition in flight and the stream path
-    would have one per queued member.
+    hands the same object to every arm. It does hold that copy while a
+    trial waits on the semaphore, which the stream path deliberately
+    avoids; the difference is that the runner has one composition per
+    CELL and the stream path would have one per queued member.
+
+    ITS PEAK IS TWO CELLS, not one, which the thirteenth review's panel
+    corrected. run_experiment binds the previous cell's composition to
+    content, composed and recorded, and those bindings are live until
+    the next cell's compose_from_pins has RETURNED, so both are
+    allocated across every cell transition: about 85.4 MiB at the caps
+    rather than 42.7. Bounded and independent of dataset length either
+    way, which is what the arrangement buys; the figure was simply
+    wrong.
 
     A group-keyed cache would let the stream path share by reference
     too, and is deliberately not built: a cache of megabyte payloads
@@ -3740,16 +3754,19 @@ async def create_group(body: GroupCreate) -> dict[str, Any]:
         # pinned is the bench's own record of how those bytes were read,
         # never a claim the caller gets to make about them.
         pins = declared_pins(body.attachments, body.renditions)
-        if body.attachments_mode == "native":
-            # Every promise native mode makes, checked here rather than
-            # at the first paid call: the files must be images and every
-            # declared model must accept them.
-            enforce_native_mode(pins, body.models)
-        else:
-            enforce_inline_mode(pins)
+        # THROUGH THE SHARED DISPATCH, like the other three doors. This
+        # wrote its own if-else until the thirteenth review's panel, so
+        # enforce_mode's docstring claimed a fourth door could not do
+        # exactly what this door was doing. Whichever mode is declared,
+        # every promise it makes is checked here rather than at the first
+        # paid call.
+        enforce_mode(pins, body.attachments_mode, body.models)
+        if body.attachments_mode != "native":
             # Composed once at declaration, against the longest prompt
             # this group can hold, so the ceiling is a refusal at
             # creation rather than a surprise on the first paid member.
+            # Inline only, because a native payload is content parts and
+            # its size is not a character count.
             composed = enforce_composed(body.prompt or "", pins)
             # And then per model, because the global ceiling is one
             # number for everybody and a context window is not.
@@ -4186,24 +4203,40 @@ def weigh_tasks(
     prompt too.
 
     THE READ IS THE EXPENSIVE PART and the bound is measured rather than
-    asserted. Each composition is at most MAX_COMPOSED_CHARS and is
-    discarded as soon as it is measured, so peak memory is one task's
-    worth however long the dataset is; the TIME is the whole corpus off
-    disk, one task at a time. Measured on this machine: 300 tasks each
-    citing a distinct 100,000 character document, 30 MB of text, made
+    asserted. Each composition is discarded as soon as it is measured,
+    so peak memory is one task's worth however long the dataset is; the
+    TIME is the whole corpus off disk, one task at a time. Measured on
+    this machine: 300 tasks each citing a distinct 100,000 character
+    document, 30 MB of text, made
     POST /experiments take 94 ms end to end. The ceilings put the worst
     case around 2000 tasks at 200,000 characters, which extrapolates to
     a little over a second, paid once, to avoid discovering at trial 300
     that the dataset cannot be run.
 
-    IT IS A QUERY PER TASK, deliberately, where freeze_task_attachments
-    one function up is a single batched query for the whole dataset.
-    The freeze needs only the rows and can ask for them all at once;
-    this needs the composed STRING, and the composer takes one task's
-    documents at a time. Batching the reads would buy back part of the
-    measurement above at the cost of a second way to compute a composed
-    size, and a size computed two ways is a size that can disagree with
-    the refusal that quotes it.
+    IT IS SEVERAL QUERIES PER TASK, deliberately: one attachments_for
+    for the task's rows, plus one extraction lookup per pinned document
+    through resolve_rendition, each of which pulls that document's full
+    extracted text. freeze_task_attachments one function up batches only
+    the ROW half, and only for the whole dataset's digests; the F6
+    commit corrected that same "single batched query" overstatement 130
+    lines above this and left this copy of it standing, which the
+    thirteenth review's panel found.
+
+    Batching the reads would buy back part of the measurement above at
+    the cost of a second way to compute a composed size, and a size
+    computed two ways is a size that can disagree with the refusal that
+    quotes it.
+
+    THE PEAK IS NOT MAX_COMPOSED_CHARS EITHER, and the sentence above
+    that said each composition is at most that figure had the order
+    backwards: the string is BUILT in full and measured afterwards, so
+    the ceiling is a refusal and never a bound on the allocation. What
+    bounds it is the extracted text the pins carry, at most
+    MAX_ATTACHMENTS documents of at most MAX_INFLATED_BYTES each, about
+    33.5 million characters, which is roughly 168 times the figure it is
+    then compared against. Checking the stored extracted_chars first
+    would avoid that, and is not done for the reason in the paragraph
+    above: it is the second arithmetic.
     """
     chars: dict[str, dict[str, int]] = {}
     for task in dataset["tasks"]:
@@ -4649,8 +4682,12 @@ async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
     read twice: for what may be sent to it, and for how much may be
     asked of it.
 
-    Returns {"pin", "completion_cap", "may_send_reasoning_cap"}. pin is
-    None for an unpinned trial, which is most of them.
+    Returns {"pin", "completion_cap", "rates", "beyond",
+    "may_send_reasoning_cap"}. pin is None for an unpinned trial, which
+    is most of them, and rates is None there too because no listing is
+    fetched; see experiment_prices for what reads which. This
+    enumeration said three keys until the thirteenth review's panel, and
+    the two it omitted are exactly the ones the cost projection reads.
 
     THE MODEL AGGREGATE DOES NOT SPEAK FOR A PINNED ENDPOINT, which is
     the whole reason this is a function rather than two dict lookups.

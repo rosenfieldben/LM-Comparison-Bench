@@ -331,9 +331,19 @@
   // entry point rather than reusing the one that means "no longer
   // stored".
   //
-  // Null when no task declared a document, so the caller appends
-  // nothing rather than an empty box. An experiment with no documents
-  // should look like every experiment did before this phase.
+  // Null when no RECORDED CELL declared a document, so the caller
+  // appends nothing rather than an empty box. An experiment with no
+  // documents should look like every experiment did before this phase.
+  //
+  // RECORDED, NOT DECLARED, and the two differ in a case a reader of
+  // this panel will meet: the report is built from cells that produced
+  // a result, so an experiment created and not yet started renders with
+  // no documents block even though every one of its tasks cites one,
+  // and a halted experiment shows only the tasks whose cells ran. That
+  // is the server's deliberate rule (see recorded_groups: a report is
+  // about what ran) and this comment said "declared" for it until the
+  // thirteenth review's panel. What an un-run cell was OWED lives in
+  // the experiment record and in the export's manifest, not here.
   function taskDocuments(report) {
     const perTask = report.task_attachments || {};
     // Sorted, and the sort is this view's own. Object key order is

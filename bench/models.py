@@ -907,16 +907,21 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
     strict mode refuses on it, exactly as it refuses on a model the
     catalog does not list.
 
-    Four fields are kept. Three are read to make a decision: the slug a
-    pin is matched against, the parameter list that vouches for sending
-    the reasoning field, and the completion ceiling the budget is
-    clamped to. The fourth, the provider's display NAME, is read by
-    nothing and is kept anyway, because a listing whose entries cannot
-    be named is one nobody can debug against; it is inert by
-    construction, since every decision above matches on the slug.
-    Anything beyond these four is not this function's business, and a
-    parser that carried it would invite somebody to make a decision from
-    a field nobody checked.
+    Six fields are kept, and five are read to make a decision: the slug
+    a pin is matched against, the parameter list that vouches for
+    sending the reasoning field, the completion ceiling the budget is
+    clamped to, and the pair endpoint_rates prices a pinned sweep from
+    (rates, and beyond for what this bench cannot count). The sixth, the
+    provider's display NAME, is read by nothing and is kept anyway,
+    because a listing whose entries cannot be named is one nobody can
+    debug against; it is inert by construction, since every decision
+    above matches on the slug.
+
+    THE COUNT SAID FOUR until the thirteenth review's panel, and had
+    said four since before F3 made this parser keep pricing. Anything
+    beyond what is listed here is still not this function's business: a
+    parser that carried a field nobody checked would invite somebody to
+    make a decision from it.
 
     max_completion_tokens JOINED THAT LIST after a review found the
     consequence of its absence. It is documented on the endpoints

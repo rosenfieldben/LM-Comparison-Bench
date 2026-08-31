@@ -1835,11 +1835,16 @@ def export_manifest(
         # declared none from an export nobody handed the file to, and
         # those licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
-        # Whether any trial in this artifact cites a document. False says
-        # the file is complete on its own; true says the trials name
-        # digests whose bytes live in the bench.db that produced this
-        # export and nowhere else, so reproducing those prompts needs
-        # that database and not just this file.
+        # Whether ANYTHING in this artifact cites a document, which
+        # since version 5 means the trial lines or the manifest's own
+        # task_attachments. False says the file is complete on its own;
+        # true says something in it names digests whose bytes live in
+        # the bench.db that produced this export and nowhere else, so
+        # reproducing those prompts needs that database and not just
+        # this file. It said "any trial" until the thirteenth review's
+        # panel, which was the reading before the manifest could cite a
+        # digest and is why an export taken before a run reads true with
+        # no trial line in it.
         #
         # A BOOLEAN AND NOT A COUNT, matching thresholds_included above:
         # the question a reader asks at line one is "is this

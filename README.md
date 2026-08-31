@@ -1614,10 +1614,14 @@ curl -s localhost:8000/attachments
 ```
 
 Both lines above are parsed by the loader's own test, so this example
-cannot rot into one the bench would refuse. The extractor names are the
-ones the bench records: `text` for `.txt` and `.md`, `pypdf` for `.pdf`,
-`stdlib-zipfile-xml` for `.docx`, and `none` for an image, which is read
-as pixels rather than parsed.
+cannot rot into one the loader would refuse, and the extractor names are
+checked against the bench's own registry: `text` for `.txt` and `.md`,
+`pypdf` for `.pdf`, `stdlib-zipfile-xml` for `.docx`, and `none` for an
+image, which is read as pixels rather than parsed. The `extractor_version`
+in the second line is illustrative and is guarded by nothing: `pypdf`
+reports its own version, so the value that resolves is whatever the
+installed release says, and pinning a version the bench has not run is
+refused at creation naming the task.
 
 **Two spellings, one meaning, and the difference is who chooses the
 reading.** A bare digest means "whichever reading the bench stored for
@@ -1740,7 +1744,7 @@ shown, because the caller has three levers and needs to know which one to
 pull.
 
 The 201 carries a `projected_cost` beside the new id: what the sweep
-would cost at most, priced before a call is made.
+would cost, priced before a call is made.
 
 ```json
 {"id": 4,
@@ -1749,18 +1753,31 @@ would cost at most, priced before a call is made.
 ```
 
 The two halves are reported apart because they are wrong in different
-directions. `output_usd` is a ceiling: it prices every trial at the full
-budget it reserved, clamped to the completion cap of the route the trial
-will actually be served by, which is the most it can be billed and
-usually well above what it will be. `input_usd` is an estimate in the
-other direction, characters over four, summed per task so a dataset
-where one task attaches a hundred pages and the rest ask a line prices
-like itself rather than like its average.
+directions. `output_usd` counts no message at all: it is the completion
+budget each trial reserved, clamped to the completion cap of the route
+it will be served by, times that route's completion rate. It is a
+ceiling **on tokens** and usually well above what a trial will actually
+produce. `input_usd` is an estimate in the other direction, characters
+over four, summed per task so a dataset where one task attaches a
+hundred pages and the rest ask a line prices like itself rather than
+like its average; it counts **both messages**, since a task's own system
+prompt, or the experiment's when the task sets none, is part of what the
+request carries. The window refusal names the components apart, because
+the remedy differs by component.
 
-Both halves count **both messages**: a task's own system prompt, or the
-experiment's when the task sets none, is part of what the request
-carries and is weighed with the rest of it. The window refusal names the
-components apart, because the remedy differs by component.
+**Neither half is a ceiling on the BILL for an unpinned run**, and the
+distinction is worth stating because "at most" invites the stronger
+reading. A pinned run is priced from the endpoint it is pinned to, so
+its rate is the rate that will be charged. An unpinned run is routed per
+call, and the model-level listing is the only publication that can speak
+for it: measured 2026-08-30 across four models with several priced
+endpoints each, the model-level completion rate was the cheapest
+endpoint's on one, the dearest on another, and between on two, with the
+dearest endpoint charging up to 2.0x the model-level figure (and 5.6x on
+`openai/gpt-oss-120b`). A sweep served by a costlier endpoint than the
+model-level publication bills above the projection. Bounding that would
+mean fetching an endpoint listing for every model in every lineup, which
+is the cost the unpinned path exists to avoid.
 
 **A pinned run is priced by the endpoint it is pinned to.** OpenRouter's
 model listing publishes one pricing object per model and the endpoint
@@ -1788,12 +1805,23 @@ because the output side is measured the same way in both modes. The
 projection is not stored on the experiment: it is a statement about the
 catalog at that instant rather than a fact about the run.
 
-Creation also runs the two size checks per task, before anything is
-written. A task whose prompt and documents compose past the global
-composed ceiling is refused naming that task, and a task that no model
-in the lineup could hold alongside the answer it reserved is refused
-naming the task, the model and both numbers. Tasks that fit are not
-mentioned, so the refusal says which line of the dataset to shorten.
+Creation also runs the two size checks, before anything is written, on
+**the tasks that carry documents and in inline mode**. A task whose
+prompt and documents compose past the global composed ceiling is refused
+naming that task, and a task that no model in the lineup could hold
+alongside the answer it reserved is refused naming the task, the model
+and both numbers. Tasks that fit are not mentioned, so the refusal says
+which line of the dataset to shorten.
+
+Both qualifiers are deliberate and both are deferrals rather than
+oversights, stated here because the unqualified sentence that stood
+before read as a guarantee. A task carrying no document is not measured,
+for the reason `/compare` does not measure an unattached comparison: the
+budget-versus-window check for every run is a named deferral. And in
+native mode neither check runs at all, because an image's cost is not a
+character count. So a 100,000 character prompt against a 20,000 token
+model is created and run, exactly as the same prompt through `/compare`
+is sent.
 
 ## Estimands
 
