@@ -837,10 +837,19 @@ class ExperimentCreate(BaseModel):
     # every lineup member at creation, in strict mode's language, and the
     # WHOLE experiment refuses if any member cannot take images.
     #
-    # Accepted on a dataset with no documents and then not recorded, the
-    # same way GroupCreate accepts a mode with no attachments: the field
-    # is a statement about documents, and with none there is nothing for
-    # it to be a statement about. See store.create_experiment.
+    # REFUSED on a dataset whose tasks cite no document, the same way
+    # POST /groups refuses a mode declared with no attachment and both
+    # compare doors refuse it through enforce_mode_entry. The field is a
+    # statement about documents, and with none there is nothing for it
+    # to be a statement about, so accepting it records a declaration the
+    # caller believed was made and was not.
+    #
+    # This comment said the OPPOSITE until the thirteenth review's
+    # panel: it justified silently accepting the field by citing
+    # GroupCreate as doing the same, and GroupCreate refuses it with a
+    # 422 whose message argues the other way. That left POST
+    # /experiments as the one door of four that took a mode about
+    # nothing, with its own comment as the evidence it was deliberate.
     attachments_mode: Literal["inline", "native"] = "inline"
     halt_on_refusal: bool = True
 
@@ -3025,18 +3034,41 @@ def _attachments_conflict(
                 "member cannot add one. Start a new comparison and declare "
                 "the document on it."
             )
-        return None
+        # FALLS THROUGH TO THE MODE CHECK rather than returning here, and
+        # the short-circuit it replaces is the thirteenth review's F1
+        # twin one layer down. A group that declared no document has no
+        # mode, so a member claiming one is claiming something about
+        # nothing, which is the refusal enforce_mode_entry makes at both
+        # comparison doors and POST /groups makes at its own. This door
+        # accepted it, so the runner's own trials were never checked for
+        # it either. A legacy group with NULL attachments still admits a
+        # member sending the default, since "inline" is what the absence
+        # spells.
+        return _mode_conflict(declared_mode, requested_mode)
     if declared != wanted:
         return (
             f"attachments do not match this comparison's declaration "
             f"({len(declared)} declared, {len(wanted)} sent); a group holds "
             "one set of documents, in one order, across its runs"
         )
-    # The MODE is half the declaration, because it decides what is being
-    # measured. A member that thought it was sending inline text while
-    # the group declared native would be running a different experiment
-    # against the same digests, and the record would name only one of
-    # them.
+    return _mode_conflict(declared_mode, requested_mode)
+
+
+def _mode_conflict(declared_mode: str | None, requested_mode: str) -> str | None:
+    """Why this member's mode does not match the group's, or None.
+
+    The MODE is half the declaration, because it decides what is being
+    measured. A member that thought it was sending inline text while the
+    group declared native would be running a different experiment
+    against the same digests, and the record would name only one of
+    them.
+
+    Written once because both branches of _attachments_conflict reach
+    it now: a group that declared documents must agree on how they are
+    read, and a group that declared none must agree that there is no
+    mode to declare. NULL spells "inline" in both, which is the same
+    two-nulls discipline the digest half follows.
+    """
     if (declared_mode or "inline") != requested_mode:
         return (
             f"this comparison declared attachments_mode "
@@ -4402,6 +4434,18 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
                 enforce_mode(pins, body.attachments_mode, body.lineup)
             except HTTPException as exc:
                 raise HTTPException(422, f"task {task_id!r}: {exc.detail}") from None
+    elif body.attachments_mode != "inline":
+        # THE FOURTH DOOR, and it was the only one not making this
+        # refusal. Same words as POST /groups and as enforce_mode_entry,
+        # because it is the same refusal and a person who has met one
+        # should recognize the others.
+        raise HTTPException(
+            422,
+            "attachments_mode was declared without any attachment. A mode "
+            "is a statement about how documents reach the models, and no "
+            "task in this dataset cites one, so the declaration would "
+            "record a fact about nothing.",
+        )
     # NORMALIZED ONCE, READ TWICE. The slug the record stores is the slug
     # the route is resolved against on the next line, and a report citing
     # a pin is only worth reading if the pin it names is the pin that
@@ -5030,6 +5074,15 @@ async def run_experiment(experiment_id: int) -> None:
             if system is not None:
                 controls["system"] = system
             pins = task_pins.get(task["id"]) or []
+            # THE CELL'S OWN MODE, not the experiment's. One mode per
+            # experiment governs the tasks that carry documents; a task
+            # that carries none has no mode at all, which is why
+            # create_group stores NULL for it below. Sending the
+            # experiment's mode to the entry check for such a cell would
+            # be claiming a reading of nothing, and since that check now
+            # compares modes on a NULL declaration it would 409 the
+            # runner's own trial. "inline" is what the absence spells.
+            cell_mode = attachments_mode if pins else "inline"
             if pins:
                 # THE DOOR THAT SPENDS, checked before the group row and
                 # before any upstream call, exactly as enforce_mode_entry
@@ -5044,7 +5097,7 @@ async def run_experiment(experiment_id: int) -> None:
                 # calls this finding is about. A door that trusts a row
                 # another build wrote is a door with no check.
                 try:
-                    enforce_mode(pins, attachments_mode, lineup)
+                    enforce_mode(pins, cell_mode, lineup)
                 except HTTPException as exc:
                     status, detail = "failed", f"task {task['id']!r}: {exc.detail}"
                     break
@@ -5067,9 +5120,7 @@ async def run_experiment(experiment_id: int) -> None:
             # for however wide the lineup is, released when the cell
             # ends, and cells run one at a time.
             try:
-                composed, recorded = compose_from_pins(
-                    task["prompt"], pins, attachments_mode
-                )
+                composed, recorded = compose_from_pins(task["prompt"], pins, cell_mode)
             except HTTPException as exc:
                 # The bytes went away between creation and start. The
                 # record keeps its pins, forward-only, and the run
@@ -5096,7 +5147,7 @@ async def run_experiment(experiment_id: int) -> None:
                 # source, two writes: a group whose renditions came from
                 # anywhere else could describe a comparison the runner
                 # did not send.
-                attachments_mode=attachments_mode if pins else None,
+                attachments_mode=cell_mode if pins else None,
                 renditions=pins or None,
             )
             halted = False
@@ -5136,7 +5187,7 @@ async def run_experiment(experiment_id: int) -> None:
                     # the runner too, which is the point of there being
                     # no bypass.
                     attachments=[pin["digest"] for pin in pins] or None,
-                    attachments_mode=attachments_mode,
+                    attachments_mode=cell_mode,
                 )
                 # SHIELDED, then awaited again. Shutdown cancels this
                 # task, and without the shield the CancelledError landed

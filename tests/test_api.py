@@ -9593,6 +9593,206 @@ def test_a_cell_with_one_arm_recorded_is_still_a_cell(client, tmp_path):
     assert report.recorded_groups(groups, {}) == []
 
 
+# ---- Thirteenth review panel, A and C: a declaration about no
+# ---- document is refused at the fourth door, and composed as nothing
+# ---- at the composer.
+
+
+@respx.mock
+def test_review_repro_a_document_free_task_keeps_its_bare_prompt_in_native_mode(
+    client, tmp_path
+):
+    """WINDOW: the two upstream payloads of a native experiment over a
+    MIXED dataset, t1 citing an image and t2 citing nothing, read off
+    the mock; and the same task t2 through an inline experiment and
+    through POST /compare, for comparison.
+
+    MEASURED BEFORE THE FIX, at 38bf72d, by the adversarial panel. The
+    native experiment was created 201, ran to done, and put this on the
+    wire for the task that declared nothing:
+
+        [{"type": "text", "text": "no document here"}]
+
+    where the same task in an inline experiment and through both
+    comparison doors sends the bare string. A task's payload was
+    restructured because a SIBLING task in the same dataset attached an
+    image, so its results were not comparable with the same task run
+    anywhere else. compose() has carried the matching guard since Phase
+    K ("a comparison with no attachment sends exactly the prompt it
+    always did, with no delimiter, no preamble"); compose_native never
+    had one, and the runner is the only caller that can reach it empty
+    because composed_for short-circuits at both comparison doors.
+
+    THE THREE SPELLINGS ARE ASSERTED EQUAL, which is the point: rule one
+    is a claim about what a payload looks like when nothing is attached,
+    and it has to hold at every door or the runs are not comparable.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    mixed = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "look at this", "attachments": [digest]},
+        {"id": "t2", "prompt": "no document here"},
+        name="mixed.jsonl",
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(mixed, lineup=["model/alpha"], attachments_mode="native"),
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, mixed)
+
+    assert final["status"] == "done", final
+    assert len(sent) == 2, sent
+    by_task = {}
+    for payload in sent:
+        content = payload["messages"][-1]["content"]
+        by_task["t1" if isinstance(content, list) else "t2"] = content
+    # The attachment-carrying task still sends parts, images and all.
+    assert [part["type"] for part in by_task["t1"]] == ["text", "image_url"]
+    # THE REPAIR: the task that declared nothing sends the bare string,
+    # not a one-element content array wrapping it.
+    assert by_task["t2"] == "no document here"
+
+    # And the same task through the other two doors, byte for byte.
+    plain = write_dataset(
+        tmp_path, {"id": "t2", "prompt": "no document here"}, name="plain.jsonl"
+    )
+    sent.clear()
+    inline_eid = client.post(
+        "/experiments", json=experiment_body(plain, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, inline_eid, plain)
+    client.post(
+        "/compare", json={"prompt": "no document here", "models": ["model/alpha"]}
+    )
+    assert [p["messages"][-1]["content"] for p in sent] == [
+        "no document here",
+        "no document here",
+    ]
+
+
+def test_the_native_composer_returns_the_prompt_when_it_is_given_nothing(client):
+    """WINDOW: compose_native itself, with an empty document list.
+
+    ASSERTED AT THE COMPOSER as well as through the runner, because the
+    runner is only today's reachable caller. A guard held in place by
+    which callers happen to exist is a guard that comes off when
+    somebody adds a caller, which is exactly how this one arrived.
+    """
+    from bench.extract import compose_native
+
+    assert compose_native("ask", [], redacted=False) == "ask"
+    assert compose_native("ask", [], redacted=True) == "ask"
+
+
+def test_review_repro_the_experiment_door_refuses_a_mode_about_nothing(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments with attachments_mode "native" over a
+    dataset whose tasks cite no document, beside the same body at the
+    three doors that already refused it.
+
+    THE FOURTH DOOR. POST /groups refuses a mode declared with no
+    attachment, and enforce_mode_entry refuses it at both compare doors;
+    POST /experiments accepted it, recorded nothing, and its own comment
+    cited GroupCreate as doing the same. GroupCreate does the opposite.
+    A caller who believed they had asked for a reading had asked for
+    nothing, which is the failure the other three doors spend a
+    paragraph each on.
+
+    ALL FOUR ARE ASSERTED HERE, so the parity is the test's subject
+    rather than a claim in its docstring.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    experiment = client.post(
+        "/experiments", json=experiment_body(path, attachments_mode="native")
+    )
+    group = client.post(
+        "/groups",
+        json={
+            "prompt": "a",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments_mode": "native",
+        },
+    )
+    compare = client.post(
+        "/compare",
+        json={"prompt": "a", "models": ["model/alpha"], "attachments_mode": "native"},
+    )
+    stream = client.post(
+        "/compare/stream",
+        json={"prompt": "a", "model": "model/alpha", "attachments_mode": "native"},
+    )
+
+    assert experiment.status_code == 422, experiment.text
+    assert "declared without any attachment" in experiment.json()["detail"]
+    assert [group.status_code, compare.status_code, stream.status_code] == [
+        422,
+        422,
+        422,
+    ]
+    # Nothing was created: the refusal costs nothing and leaves nothing.
+    assert client.get("/experiments").json()["experiments"] == []
+    # And the default is still accepted over a plain dataset.
+    assert client.post("/experiments", json=experiment_body(path)).status_code == 201
+
+
+@respx.mock
+def test_a_group_that_declared_no_document_refuses_a_member_claiming_a_mode(
+    client, tmp_path
+):
+    """WINDOW: enforce_group_experiment against a group whose
+    attachments_json is NULL, with a member sending attachments_mode
+    "native".
+
+    THE SHORT-CIRCUIT THIS REPLACES. _attachments_conflict returned None
+    as soon as it saw a NULL declaration and no requested digests, so
+    the mode halves were never compared and a member could claim a
+    reading of a comparison that holds no documents. A legacy group
+    sending the default still passes, because "inline" is what the
+    absence spells.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    group_id = client.post(
+        "/groups",
+        json={"prompt": "a", "models": ["model/alpha"], "budget": "standard"},
+    ).json()["id"]
+
+    claimed = client.post(
+        "/compare",
+        json={
+            "prompt": "a",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments_mode": "native",
+        },
+    )
+    default = client.post(
+        "/compare",
+        json={"prompt": "a", "models": ["model/alpha"], "group_id": group_id},
+    )
+
+    # 409 and not 422: a group manifest conflict is what this is, and
+    # enforce_group_experiment runs ahead of enforce_mode_entry at this
+    # door, so the more specific refusal wins. The message names both
+    # modes.
+    assert claimed.status_code == 409, claimed.text
+    assert "declared attachments_mode 'inline'" in claimed.json()["detail"]
+    assert "sent 'native'" in claimed.json()["detail"]
+    assert default.status_code == 200, default.text
+
+
 # ---- Phase M3: the pins travel, through the report, the export and
 # ---- the whole declaration-transport walk.
 
