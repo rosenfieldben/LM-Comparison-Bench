@@ -4584,9 +4584,34 @@ def experiment_prices(
     borrowed from a different route. Absent here means the model is
     unpriced, which makes every figure null and names it.
 
-    beyond rides along untouched, so a route that charges something this
-    bench cannot count refuses the projection exactly as a model-level
-    map with the same dimension does; see projected_cost.
+    beyond rides along, so a route that charges something this bench
+    cannot count refuses the projection exactly as a model-level map
+    with the same dimension does, NAMING THE DIMENSION; see
+    projected_cost.
+
+    THAT LAST CLAUSE WAS FALSE UNTIL THE PANEL FOUND IT, and five lenses
+    found it. endpoint_rates returns rates None whenever the route
+    charges an uncountable dimension, which is precisely when beyond is
+    non-empty, and this function collapsed rates None to a bare None and
+    threw the names away. So the pinned path produced the same bare
+    model id as a route whose listing could not answer at all, the two
+    causes were indistinguishable, and the README's unqualified promise
+    that the dimension is named was true only of unpinned models.
+
+    THREE ANSWERS, NOT TWO, which is what the entry shapes below mean:
+
+      a mapping with rates      priceable, and beyond is empty
+      a mapping with only
+      beyond                    the route charges something this cannot
+                                count, and here is what
+      None                      nothing is known about this route's
+                                price at all
+
+    The third stays None rather than borrowing the catalog, for the
+    reason above: falling back is the substitution the pin exists to
+    prevent. This mapping is built for projected_cost and read by
+    nothing else, which is why the middle shape may omit the rate keys:
+    projected_cost's unpriced pass returns before any reader of them.
     """
     out: dict[str, Any] = {}
     for model in lineup:
@@ -4594,7 +4619,12 @@ def experiment_prices(
             out[model] = catalog_prices.get(model)
             continue
         rates, beyond = routes[model]["rates"], routes[model]["beyond"]
-        out[model] = None if rates is None else {**rates, "beyond": beyond}
+        if rates is not None:
+            out[model] = {**rates, "beyond": beyond}
+        elif beyond:
+            out[model] = {"beyond": beyond}
+        else:
+            out[model] = None
     return out
 
 

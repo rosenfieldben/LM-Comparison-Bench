@@ -19,6 +19,7 @@ from bench.models import (
     ENDPOINTS_URL,
     OPENROUTER_URL,
     PROVIDER_REASONING_MINIMUM,
+    endpoint_rates,
     provider_preferences,
     token_rates,
 )
@@ -9791,6 +9792,190 @@ def test_a_group_that_declared_no_document_refuses_a_member_claiming_a_mode(
     assert "declared attachments_mode 'inline'" in claimed.json()["detail"]
     assert "sent 'native'" in claimed.json()["detail"]
     assert default.status_code == 200, default.text
+
+
+# ---- Thirteenth review panel, B: the pinned path names the dimension
+# ---- it cannot count, and E: endpoint_rates' two rules are tested.
+
+
+@respx.mock
+def test_review_repro_a_pinned_route_names_the_dimension_it_charges(client, tmp_path):
+    """WINDOW: the projected_cost on the 201 for a strict experiment
+    pinned to an endpoint whose pricing carries a nonzero dimension the
+    bench cannot count, beside the same refusal on the model-level path.
+
+    MEASURED BEFORE THE FIX, at a9f3675, by five of the panel's ten
+    lenses. endpoint_rates returns rates None exactly when the route
+    charges an uncountable dimension, and experiment_prices collapsed
+    that to a bare None, so the projection reported "model/alpha" with
+    no reason. That is the same string a route whose listing could not
+    answer at all produces, so the two causes were indistinguishable,
+    and both experiment_prices' own docstring and the README promised
+    the dimension would be named.
+
+    THE TWO PATHS ARE ASSERTED TOGETHER, because "exactly as a
+    model-level map with the same dimension does" is the claim, and a
+    test of one path cannot check a claim about both agreeing.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                        "pricing": {
+                            "prompt": "0.000001",
+                            "completion": "0.000002",
+                            "request": "0.25",
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    pinned = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    assert pinned["total_usd"] is None
+    assert pinned["unpriced"] == ["model/alpha (charges request)"]
+
+    # THE MODEL-LEVEL PATH, same shape of answer, which is what the
+    # docstring's "exactly as" is asserting.
+    app.state.prices["model/alpha"] = {
+        "prompt": 1e-06,
+        "completion": 2e-06,
+        "beyond": ["request"],
+    }
+    unpinned = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["projected_cost"]
+
+    assert unpinned["unpriced"] == pinned["unpriced"]
+
+
+@respx.mock
+def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_path):
+    """WINDOW: the projection for a pinned route whose listing publishes
+    no pricing at all, against the one above.
+
+    THREE ANSWERS, NOT TWO. "This route charges something I cannot
+    count" and "I know nothing about this route's price" are different
+    facts with different remedies, and collapsing them was half of what
+    the finding was about. The bare name is the honest answer to the
+    second and only to the second.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    cost = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    assert cost["unpriced"] == ["model/alpha"]
+    assert "charges" not in cost["unpriced"][0]
+
+
+def test_review_repro_the_highest_matching_endpoint_rate_is_the_one_used():
+    """WINDOW: endpoint_rates over one pin matching two endpoints with
+    different rates.
+
+    MEASURED BEFORE THIS TEST EXISTED: `max` could be changed to `min`
+    and the entire suite stayed green at 976 passed. The rule is stated
+    in the function's own docstring ("THE HIGHEST MATCHING RATE WINS,
+    which is the mirror of endpoint_completion_cap taking the lowest cap
+    and has the same reason: a pin names a PROVIDER, that provider may
+    serve the model from several endpoints, the request has to survive
+    whichever the router picks, and this figure is a ceiling") and
+    nothing held it.
+
+    COMPARED DIMENSION BY DIMENSION, not by total, which is the other
+    half of the stated rule: the cheaper prompt rate and the dearer
+    completion rate come from different endpoints here, so a
+    whole-endpoint pick would return one of the two pairs and this
+    returns neither.
+    """
+    listing = {
+        "fetched": True,
+        "endpoints": [
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 9.0},
+                "beyond": [],
+            },
+            {
+                "slug": "together",
+                "rates": {"prompt": 5.0, "completion": 2.0},
+                "beyond": [],
+            },
+            {
+                "slug": "elsewhere",
+                "rates": {"prompt": 99.0, "completion": 99.0},
+                "beyond": [],
+            },
+        ],
+    }
+
+    rates, beyond = endpoint_rates(listing, "Together")
+
+    assert rates == {"prompt": 5.0, "completion": 9.0}
+    assert beyond == []
+    # The pin decides which endpoints are looked at at all.
+    assert endpoint_rates(listing, "nobody") == (None, [])
+    assert endpoint_rates({"fetched": False, "endpoints": []}, "together") == (None, [])
+
+
+def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
+    """WINDOW: endpoint_rates over one pin matching two endpoints, one of
+    which charges a dimension this bench cannot count.
+
+    MEASURED BEFORE THIS TEST EXISTED: the refusal could be deleted
+    outright and the suite stayed green at 976 passed.
+
+    ANY MATCHING ENDPOINT POISONS THE PIN, because the router may pick
+    it. Returning the other endpoint's clean rates would be quoting the
+    one route the pin does not guarantee.
+    """
+    listing = {
+        "fetched": True,
+        "endpoints": [
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 2.0},
+                "beyond": [],
+            },
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 2.0},
+                "beyond": ["request"],
+            },
+        ],
+    }
+
+    rates, beyond = endpoint_rates(listing, "together")
+
+    assert rates is None
+    assert beyond == ["request"]
 
 
 # ---- Phase M3: the pins travel, through the report, the export and
