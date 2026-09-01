@@ -6539,6 +6539,14 @@ def _snapshot_members(root: str, paths: list[str]) -> list[tuple[str, bytes]]:
     before asking. The running total is bounded by MAX_READ_BYTES, which
     is four times the composed ceiling precisely so that stopping here
     can never refuse a snapshot the composition would have accepted.
+
+    follow_symlinks=False ON THE STAT AND THE READ FOLLOWS THEM, which
+    is deliberate rather than an oversight. walk never returns a link, so
+    on a still tree the flag changes nothing; on a tree edited between
+    the walk and the read it is the whole guard. A file replaced by a
+    symlink in that window fails the regular-file check and is refused,
+    where a following stat would have reported the TARGET as a regular
+    file and the read would then have followed the link out of the root.
     """
     members: list[tuple[str, bytes]] = []
     running = 0

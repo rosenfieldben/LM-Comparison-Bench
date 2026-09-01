@@ -651,10 +651,10 @@
   function refusalText(detail) {
     if (typeof detail === "string") return detail;
     if (Array.isArray(detail)) {
-      const said = detail
+      const messages = detail
         .map((item) => (item && typeof item.msg === "string" ? item.msg : ""))
         .filter((msg) => msg !== "");
-      if (said.length > 0) return said.join("; ");
+      if (messages.length > 0) return messages.join("; ");
     }
     return "the snapshot was refused and the reason could not be read";
   }
@@ -675,7 +675,17 @@
         "said whether repository snapshots are configured."
       );
     }
-    if (!posture.enabled) return posture.reason;
+    if (!posture.enabled) {
+      // THE EMPTY STRING IS THIS FUNCTION'S "NOT BLOCKED", so a reason
+      // that arrived empty would switch the control back on for a bench
+      // that had just said it is off. The server never sends one, and a
+      // sentinel doing double duty is exactly the shape that gets one
+      // sent eventually.
+      return (
+        posture.reason ||
+        "Repository snapshots are not configured on this bench."
+      );
+    }
     if (staged.length >= MAX_ATTACHMENTS) {
       return (
         "Already at " +
@@ -722,6 +732,10 @@
 
   async function composeSnapshot() {
     const root = snapRootEl.value.trim();
+    // Comma-separated, which is safe because the pattern syntax has no
+    // comma in it: the walker supports *, ?, ** and character classes,
+    // and deliberately not brace expansion, so there is nothing a person
+    // could write here that a comma would cut in half.
     const patterns = snapPatternsEl.value
       .split(",")
       .map((pattern) => pattern.trim())
@@ -766,6 +780,20 @@
           body
             ? refusalText(body.detail)
             : "the snapshot was refused (HTTP " + resp.status + ")",
+        );
+        return;
+      }
+      if (body === null) {
+        // A success whose body did not parse. Said plainly rather than
+        // walked into, because the next line reads body.digest and
+        // would have reported a null dereference as "the request could
+        // not be sent", which is the one thing that did happen fine.
+        said(
+          "the bench answered " +
+            resp.status +
+            " with a body this page could not read, so nothing was " +
+            "attached. The snapshot itself is stored; look it up under " +
+            "Documents.",
         );
         return;
       }

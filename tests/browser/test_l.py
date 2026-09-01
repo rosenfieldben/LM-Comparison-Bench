@@ -10,6 +10,8 @@ rendered by the same function from two different postures, and a proof
 about one of them reads as coverage while leaving the other unguarded.
 """
 
+import json
+
 import pytest
 from playwright.sync_api import expect
 
@@ -162,3 +164,64 @@ def test_a_catalog_that_never_answered_is_not_evidence_the_feature_is_off(
     # Not the server's off sentence, because that is a different fact
     # and this page has not learned it.
     assert "BENCH_REPO_ROOTS" not in message.inner_text()
+
+
+def test_an_empty_off_reason_still_reads_as_off(page, bench_url):
+    """WINDOW: the control against a catalog that says off and gives no
+    reason.
+
+    THE EMPTY STRING IS THE BLOCKER FUNCTION'S "NOT BLOCKED", so a
+    reason that arrived empty would switch the control back ON for a
+    bench that had just said it is off. This server never sends one, and
+    a sentinel doing double duty is exactly the shape that gets one sent
+    eventually: a proxy that strips long fields, a future server that
+    reports the flag without the paragraph, a partial deploy.
+    """
+    page.route(
+        "**/models",
+        lambda route: route.fulfill(
+            status=200,
+            content_type="application/json",
+            body=json.dumps(
+                {
+                    "models": [],
+                    "fetched": False,
+                    "data_policy": "standard",
+                    "snapshots_enabled": False,
+                    "snapshots_off_reason": "",
+                }
+            ),
+        ),
+    )
+    page.add_init_script("localStorage.setItem('bench-lineup', '[\"model/alpha\"]')")
+    page.goto(bench_url)
+
+    expect(page.get_by_test_id("snapshot-open")).to_be_disabled()
+    expect(page.get_by_test_id("snapshot-msg")).to_contain_text("not configured")
+
+
+def test_a_success_whose_body_cannot_be_read_says_so(snapshot_bench, snapshot_root):
+    """WINDOW: the control after a 201 whose body is not JSON.
+
+    SAID PLAINLY RATHER THAN WALKED INTO. The next thing the success
+    path does is read body.digest, so a null body would have surfaced as
+    "the snapshot request could not be sent", which is the one thing
+    that demonstrably did work. The bytes are stored either way, which is
+    what the message tells the person to do about it.
+    """
+    page = snapshot_bench(["model/alpha"])
+    page.route(
+        "**/snapshots",
+        lambda route: route.fulfill(
+            status=201, content_type="text/plain", body="not json at all"
+        ),
+    )
+    page.get_by_test_id("snapshot-open").click()
+    page.get_by_test_id("snapshot-root").fill(str(snapshot_root))
+    page.get_by_test_id("snapshot-patterns").fill("pkg/*.py")
+    page.get_by_test_id("snapshot-compose").click()
+
+    message = page.get_by_test_id("snapshot-msg")
+    expect(message).to_contain_text("could not read")
+    assert "could not be sent" not in message.inner_text()
+    expect(page.get_by_test_id("attachment-chip")).to_have_count(0)
