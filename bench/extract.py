@@ -1000,11 +1000,22 @@ NATIVE_IMAGE_TYPES = {
 # strings and a vision model carries "image" among them.
 IMAGE_MODALITY = "image"
 
-# The two kinds a rendition can have. Named rather than spelled inline
+# The kinds a rendition can have. Named rather than spelled inline
 # because they are compared across four modules and a typo in one of
 # them would read as "some other kind" rather than as a mistake.
+#
+# THE THIRD IS NOT PRODUCED HERE. An upload is a document or an image,
+# and the two lines below are the whole of what ingest can return. A
+# snapshot is composed by bench.snapshot out of a repository tree, which
+# is a reading of many files rather than of one upload, so nothing in
+# this module makes one. The constant lives here anyway because the
+# vocabulary is what must not have two homes: a kind spelled in the
+# module that happens to produce it is a kind the other producers have
+# to import from somewhere else, and the reason the two above are named
+# at all is that they are compared far from where they are made.
 IMAGE_KIND = "image"
 DOCUMENT_KIND = "document"
+SNAPSHOT_KIND = "snapshot"
 
 
 # What the first bytes of each accepted image format look like.

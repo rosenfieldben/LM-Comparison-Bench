@@ -3879,6 +3879,16 @@ def read_dataset(path: str) -> dict[str, Any]:
     "reads any path the caller names" looks like a hole until you have the
     threat model beside it.
 
+    AND THE SNAPSHOT DOOR IS ALLOWLISTED ANYWAY, which is not a reversal
+    of the paragraph above but the place where its reasoning stops. This
+    function reads ONE file the caller named, and a mistyped path here
+    fails: it does not parse as a dataset, and the caller gets a 422
+    naming the line. A snapshot walks a TREE, and a mistyped root there
+    does not fail. It succeeds, gathers whatever it finds, and composes
+    the contents into a prompt sent to a provider. BENCH_REPO_ROOTS
+    bounds what one typo can gather, not what the user may name, which
+    is why it is on that door and not on this one.
+
     Every failure is a 422 naming the file and the line, because the
     caller's next action is to fix the file and a 500 would tell them
     nothing about which line to open.
