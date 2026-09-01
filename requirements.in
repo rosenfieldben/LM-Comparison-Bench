@@ -23,4 +23,4 @@ pydantic==2.13.4
 # The extractor and this version are recorded on every attachment row.
 # An upgrade changes the text a model reads, so provenance has to say
 # which parser produced what was read; see bench/extract.py.
-pypdf==6.15.0
+pypdf==6.16.2
