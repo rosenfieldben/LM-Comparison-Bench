@@ -36,10 +36,12 @@ from bench import snapshot, store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
 from bench.extract import (
+    DOCUMENT_KIND,
     IMAGE_KIND,
     IMAGE_MODALITY,
     MAX_ATTACHMENTS,
     MAX_COMPOSED_CHARS,
+    SNAPSHOT_KIND,
     CompositionError,
     ExtractionError,
     compose,
@@ -261,7 +263,7 @@ class RenditionPin(BaseModel):
     digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     extractor: str = Field(min_length=1, max_length=64)
     extractor_version: str = Field(min_length=1, max_length=64)
-    kind: Literal["document", "image"]
+    kind: Literal["document", "image", "snapshot"]
 
 
 class CompareRequest(BaseModel):
@@ -1085,6 +1087,23 @@ class CatalogResponse(BaseModel):
     # fetches this once at boot, and one more round trip to learn one word
     # is not worth an endpoint.
     data_policy: str = "standard"
+    # Whether POST /snapshots will answer at all, and the sentence it
+    # refuses with when it will not. Riding the catalog response for
+    # exactly the reason data_policy does, one field up.
+    #
+    # THE SENTENCE TRAVELS RATHER THAN BEING RESTATED IN THE PAGE. The
+    # composer's snapshot control shows this text verbatim when the
+    # feature is off, so the UI never offers a door the server would
+    # refuse, and a person reading the control and a person reading a
+    # 403 read the same words. A copy in JavaScript would be a second
+    # explanation of one fact, and which one somebody got would depend
+    # on where they happened to look.
+    #
+    # Empty when the feature IS on, because there is then nothing to
+    # explain and shipping the paragraph on every boot to be discarded
+    # is waste.
+    snapshots_enabled: bool = False
+    snapshots_off_reason: str = ""
 
 
 class StoredModelResult(ModelResult):
@@ -2679,15 +2698,33 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
     # first uploaded under a document suffix used to be refused from
     # native mode forever, by a message naming a filename the caller had
     # never sent.
-    wrong = [p["digest"][:12] for p in pins if p["kind"] != IMAGE_KIND]
+    #
+    # THE REMEDY IS OFFERED ONLY WHERE IT EXISTS, which is Phase L's
+    # correction rather than a rewording. "Re-upload under an image
+    # extension" is a real fix for a document, because a document has a
+    # file behind it that the person still has. A snapshot has no
+    # upload: it was composed from a tree, and telling somebody to
+    # re-upload one is instructing them to do something impossible,
+    # which is the false-remedy family that this codebase treats as a
+    # defect rather than as a wording preference.
+    wrong = [p for p in pins if p["kind"] != IMAGE_KIND]
     if wrong:
+        named = ", ".join(
+            f"sha256 {p['digest'][:12]} read as a {p['kind']}" for p in wrong
+        )
+        remedy = (
+            "Use inline mode, which extracts the text and gives every model "
+            "the same reading of it"
+        )
+        if any(p["kind"] == DOCUMENT_KIND for p in wrong):
+            remedy += (
+                ", or re-upload the file under an image extension so the "
+                "bench reads it as an image"
+            )
         raise HTTPException(
             422,
-            f"native mode sends images as content parts, and sha256 "
-            f"{', '.join(wrong)} was not read as one. Use inline mode, "
-            "which extracts the text and gives every model the same "
-            "reading of it, or re-upload the file under an image "
-            "extension so the bench reads it as an image.",
+            f"native mode sends images as content parts, and these were "
+            f"not read as images: {named}. {remedy}.",
         )
     if not lineup:
         return
@@ -5902,10 +5939,15 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
 
 @app.get("/models", response_model=CatalogResponse)
 async def get_models() -> dict[str, Any]:
+    enabled = bool(getattr(app.state, "repo_roots", ()))
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
         "data_policy": app.state.data_policy,
+        "snapshots_enabled": enabled,
+        # The door's own sentence, not a second one. See
+        # CatalogResponse for why it travels rather than being restated.
+        "snapshots_off_reason": "" if enabled else SNAPSHOTS_OFF,
     }
 
 
@@ -5981,14 +6023,24 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
         app.state.db, pin["digest"], pin["extractor"], pin["extractor_version"]
     )
     if found is None:
+        # THE REMEDY DEPENDS ON WHERE THE READING CAME FROM. A document
+        # or an image is re-uploaded; a snapshot has no upload to redo
+        # and is re-composed from the root and patterns its manifest
+        # recorded. One sentence for both would have to be vague enough
+        # to be useless to either.
+        restore = (
+            "Compose the snapshot again from the root and patterns its manifest names"
+            if pin["kind"] == SNAPSHOT_KIND
+            else "Re-upload the file to store this reading again"
+        )
         raise HTTPException(
             422,
             f"this comparison pinned sha256 {pin['digest'][:12]} as read by "
             f"{pin['extractor']} {pin['extractor_version']}, and no such "
             "reading is stored. The bench will not substitute a different "
             "parser's reading, because the other members of this comparison "
-            "were given the pinned one. Re-upload the file to store this "
-            "reading again, or start a new comparison.",
+            f"were given the pinned one. {restore}, or start a new "
+            "comparison.",
         )
     stored_kind = found.get("kind") or kind_of(found["extractor"])
     if pin["kind"] != stored_kind:
@@ -6384,7 +6436,9 @@ def _snapshot_filename(digest: str) -> str:
     return f"snapshot-{digest[:12]}{SNAPSHOT_SUFFIX}"
 
 
-def enforce_snapshot_root(named: str, roots: Sequence[str], *, real: str | None) -> str:
+def enforce_snapshot_root(
+    named: str, roots: Sequence[str], *, resolve: Callable[[str], str | None]
+) -> str:
     """The resolved root a request may walk, or a refusal saying why not.
 
     THREE REFUSALS AND TWO CODES. No allowlist at all and a root outside
@@ -6398,11 +6452,19 @@ def enforce_snapshot_root(named: str, roots: Sequence[str], *, real: str | None)
     listing them is the difference between "no" and "no, and here is
     what you meant to type".
 
-    resolution ARRIVES AS AN ARGUMENT so this stays a value-in-value-out
-    decision. The caller does the realpath; this decides.
+    THE RESOLVER IS INJECTED RATHER THAN THE RESOLUTION, and the
+    difference is an ordering rather than a style. A resolved path passed
+    in as a value has already been resolved, which means a realpath and
+    an isdir ran against a caller's string before this function decided
+    whether the feature is switched on at all. Nothing leaked: the 403
+    still fired first and the caller learned nothing either way. But "no
+    filesystem call on a request's path until the allowlist says there is
+    one" is a posture worth being able to state without a footnote, and
+    with the callable here the off case touches no disk.
     """
     if not roots:
         raise HTTPException(403, SNAPSHOTS_OFF)
+    real = resolve(named)
     if real is None:
         raise HTTPException(
             422,
@@ -6599,9 +6661,21 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     the worst case is twenty thousand stat calls and eight hundred
     kilobytes, which is the same order as the base64 decode and
     extraction create_attachment already does inline.
+
+    THREE MOMENTS AND NOT ONE, said here because a manifest reads like a
+    photograph and is not. The walk, the reads and the git query happen
+    in that order and nothing locks the tree between them, so a file
+    edited mid-request can be selected and then read in its new state,
+    and a commit made mid-request can move under the flag. WHAT IS
+    ACTUALLY IDENTIFIED IS THE BYTES: every member's digest is computed
+    from the bytes that were read and the snapshot's own digest is over
+    the text those produced, so the record is exact about what the models
+    saw. The head and the dirty flag are the softer half of the
+    provenance and are recorded as read locally rather than as a
+    guarantee about the instant of the walk.
     """
     root = enforce_snapshot_root(
-        body.root, app.state.repo_roots, real=_resolved_directory(body.root)
+        body.root, app.state.repo_roots, resolve=_resolved_directory
     )
     entries, resolve = _snapshot_filesystem(root)
     try:

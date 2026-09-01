@@ -1309,6 +1309,21 @@ the composition can do about it: a document's own text can try to
 instruct the model, and marking the boundary clearly is a mitigation, not
 a guarantee.
 
+**A repository snapshot is the same input with more seams**, and it gets
+the same treatment one level in: every file sits between a header line
+naming its path, byte size and short digest, and a closing marker saying
+the file ended. The closing marker is there because a file in a
+repository may contain a line that looks like the next file's header, so
+without one a file could annex its successor. It is a **mitigation and
+not a guarantee**, in exactly the sense the paragraph above means:
+nothing stops a file from containing a convincing forgery of a header
+and a footer together, and the bench does not escape or rewrite file
+contents to prevent it, because a snapshot whose text differed from the
+repository would be a snapshot of nothing. What the header buys instead
+is checkability after the fact: the manifest records every member's path,
+size and digest, so a claim made inside the composed text can be weighed
+against the record rather than believed.
+
 The inflated bound is there because the 8 MiB upload cap says nothing
 about what comes out of the upload: deflate reaches ratios past 1000:1 on
 repetitive XML, so a small, perfectly valid `.docx` can ask the process to
@@ -1687,6 +1702,20 @@ composed ceiling is refused naming its largest files. Nothing is silently
 dropped and nothing is shortened: a snapshot that quietly omitted a file
 would be a comparison over a repository you think you sent.
 
+**The ceiling is the same one a set of attachments has, and there is no
+snapshot exception.** It exists because of what a model can receive and
+what the fairness law can promise, and neither of those cares where the
+bytes came from; raising it here would only move the refusal to the
+provider's context window and to your money. A repository that does not
+fit is a repository you select from, and the refusal names the largest
+files so the selection is made from fact rather than from guessing.
+
+This bench is its own worked example. `bench/main.py` is past the
+per-file bound on its own, so `bench/*.py` is refused naming that file,
+and `static/*.js` composes past the total. Snapshotting this repository
+means naming modules rather than directories, which is what the rule
+says and not a defect in it.
+
 **It fetches nothing.** The single-outbound-destination posture is
 untouched. The bench reads the local filesystem and the local git, and
 the only thing that leaves the machine is the composed prompt, through
@@ -1700,6 +1729,16 @@ version control and dependency trees (`.git`, `node_modules`, `.venv`,
 `*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`). The last group is not
 overridable by a request, because an exclusion list a request could
 replace would make it opt-out, and an opt-out default is not a default.
+
+**In the composer**, `+ Snapshot` opens a root and a pattern box beside
+`+ Attach`, and a composed snapshot becomes one chip like any other
+document, reading `repository snapshot` with the number of files it
+selected. When `BENCH_REPO_ROOTS` is unset the button is disabled and the
+server's own refusal is printed beside it, so the page never offers a
+door the server would refuse and the sentence you read there is the
+sentence a `403` would carry. No view ever shows the clone root: the
+stored name is derived from the digest, which is the filename rule
+extended from a file to a tree.
 
 `GET /attachments/{digest}` serves the snapshot's **manifest**: every
 member's path, byte size and digest, the patterns and exclusions that

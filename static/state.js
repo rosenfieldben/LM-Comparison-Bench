@@ -66,6 +66,20 @@
     // policy, so a reader parsing it could not tell "standard" from "the
     // catalog has not loaded yet". Null until the catalog answers.
     dataPolicy: null,
+    // Whether the server will answer POST /snapshots, and the sentence
+    // it refuses with when it will not. Both arrive on the catalog
+    // response beside dataPolicy and are held here for the same reason:
+    // the composer's snapshot control is presentation, and a fact stored
+    // only in the DOM is a fact that vanishes with the element that held
+    // it.
+    //
+    // THE REASON IS THE SERVER'S OWN WORDS, never a copy written here. A
+    // second wording would be a second explanation of one fact, and
+    // which one somebody read would depend on where they looked. Null
+    // until the catalog answers, which the control renders as "not yet
+    // known" rather than as off: a fetch that has not resolved is not
+    // evidence that a feature is disabled.
+    snapshots: null,
     sessionStats: {
       runs: 0,
       spend: 0,
@@ -78,6 +92,7 @@
     newViewEpoch,
     renderStats,
     setDataPolicy,
+    setSnapshots,
   };
 
   // What each mode asks OpenRouter for, in the operator's terms. The
@@ -100,6 +115,26 @@
         "application's",
     },
   };
+
+  // The snapshot posture off the catalog response. A failed catalog
+  // fetch leaves this null, which is the honest answer: the page does
+  // not know whether snapshots are configured, and claiming either would
+  // be a claim from no evidence. The control disables itself in that
+  // case and says the catalog did not load, which is a different
+  // sentence from the server's refusal because it is a different fact.
+  function setSnapshots(catalog) {
+    if (!catalog || typeof catalog.snapshots_enabled !== "boolean") {
+      state.snapshots = null;
+      return;
+    }
+    state.snapshots = {
+      enabled: catalog.snapshots_enabled,
+      reason:
+        typeof catalog.snapshots_off_reason === "string"
+          ? catalog.snapshots_off_reason
+          : "",
+    };
+  }
 
   function setDataPolicy(policy) {
     // Recorded before the badge is touched, and deliberately before the

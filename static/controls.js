@@ -469,6 +469,11 @@
     // undefined, which setDataPolicy treats as standard: a badge is a claim
     // about where prompts go, and a failed fetch is not evidence for one.
     BS.setDataPolicy(catalog.data_policy);
+    // The snapshot posture rides the same response. Set before the
+    // attach refresh below, because that repaint is what renders the
+    // control, and a repaint that ran first would paint the boot-time
+    // "not yet known" state over an answer that had already arrived.
+    BS.setSnapshots(catalog);
     // The attach control states the policy in words, and it painted its
     // first note before this fetch resolved: the deck is drawn
     // synchronously at boot and the catalog arrives a round trip later.

@@ -32,6 +32,12 @@
   const modeEl = document.getElementById("attach-mode");
   const msgEl = document.getElementById("attach-msg");
   const noteEl = document.getElementById("attach-note");
+  const snapOpenEl = document.getElementById("snapshot-open");
+  const snapPanelEl = document.getElementById("snapshot-panel");
+  const snapRootEl = document.getElementById("snapshot-root");
+  const snapPatternsEl = document.getElementById("snapshot-patterns");
+  const snapComposeEl = document.getElementById("snapshot-compose");
+  const snapMsgEl = document.getElementById("snapshot-msg");
 
   // Mirrors MAX_ATTACHMENTS in bench/main.py. A client-side cap is a
   // convenience over the server's and never an authority: the refusal
@@ -65,9 +71,25 @@
   // Still only an explanation of a refusal the server owns; see
   // enforce_native_mode, which checks the pin's kind server-side.
   const IMAGE_KIND = "image";
+  const SNAPSHOT_KIND = "snapshot";
+  // What a snapshot chip says on its face, INSTEAD of the stored name.
+  // The stored name is snapshot-<twelve hex>.txt, a pure function of the
+  // digest, so showing it would print the digest twice and imply a file
+  // that never existed. The blind view's rule is satisfied either way:
+  // no path can appear in a name the server derives from a digest.
+  const SNAPSHOT_LABEL = "repository snapshot";
 
   function usableInNative(doc) {
     return doc.kind === IMAGE_KIND;
+  }
+
+  // What to call one staged document in a sentence. The stored name for
+  // everything but a snapshot, and the snapshot's label for a snapshot,
+  // so a refusal written here names the same thing the chip beside it
+  // does. Written once because the alternative is a message that calls a
+  // document one thing and its own chip another.
+  function docLabel(doc) {
+    return doc.kind === SNAPSHOT_KIND ? SNAPSHOT_LABEL : doc.filename;
   }
 
   // Staged documents, in attachment order, which IS the order they are
@@ -202,6 +224,9 @@
     // source did not declare, the composer must not declare either.
     modeEl.value = mode === "native" ? "native" : "inline";
     msgEl.textContent = "";
+    // The snapshot control's last answer described a staging set that no
+    // longer exists, so it stops outranking the blocker.
+    snapMsgEl.dataset.said = "";
     render();
   }
 
@@ -210,6 +235,7 @@
     staged = [];
     modeEl.value = "inline";
     msgEl.textContent = "";
+    snapMsgEl.dataset.said = "";
     render();
   }
 
@@ -234,7 +260,7 @@
     name.dataset.testid = "attachment-name";
     // textContent, never innerHTML: a filename is user-supplied text and
     // gets the same treatment model output does.
-    name.textContent = isMissing(doc) ? "(no longer stored)" : doc.filename;
+    name.textContent = isMissing(doc) ? "(no longer stored)" : docLabel(doc);
 
     const meta = document.createElement("span");
     meta.className = "attach-meta";
@@ -243,6 +269,14 @@
     // identify the document and the third describes what it will cost.
     const bits = [];
     if (Number.isFinite(doc.byte_size)) bits.push(fmtBytes(doc.byte_size));
+    // How many files the tree contributed, which is the one fact about a
+    // snapshot a person actually wants on the chip and the one thing its
+    // byte count does not say. Absent for anything that is not a
+    // snapshot and for a snapshot whose manifest did not travel.
+    const members = doc.manifest?.files;
+    if (Array.isArray(members)) {
+      bits.push(members.length + (members.length === 1 ? " file" : " files"));
+    }
     bits.push("sha256 " + shortDigest(doc.digest));
     const estimate = estimateFor(doc);
     if (estimate) bits.push(estimate);
@@ -260,7 +294,7 @@
         "document it cannot read";
     } else {
       chip.title =
-        doc.filename +
+        docLabel(doc) +
         "\nsha256 " +
         doc.digest +
         "\nread by " +
@@ -276,7 +310,7 @@
     remove.textContent = "×";
     remove.setAttribute(
       "aria-label",
-      "remove " + (isMissing(doc) ? doc.digest : doc.filename),
+      "remove " + (isMissing(doc) ? doc.digest : docLabel(doc)),
     );
     remove.addEventListener("click", () => {
       staged.splice(index, 1);
@@ -389,10 +423,11 @@
     if (wrongForNative.length > 0 && modeEl.value === "native") {
       msgEl.textContent =
         "native mode sends images as content parts, and " +
-        wrongForNative.map((d) => d.filename).join(", ") +
+        wrongForNative.map(docLabel).join(", ") +
         " is not one. Switch to inline, which extracts the text and gives " +
         "every model the same reading of it.";
     }
+    renderSnapshotControl();
     rowEl.dataset.count = String(staged.length);
     window.BenchControls.updateRunState();
   }
@@ -599,6 +634,171 @@
     render();
   }
 
+  // ---- The snapshot control.
+  // ----
+  // ---- A repository snapshot is an attachment the bench COMPOSES
+  // ---- rather than one the person uploads, so it produces the same
+  // ---- chip, rides the same declaration and is bounded by the same
+  // ---- MAX_ATTACHMENTS. Two things are different and both are visible
+  // ---- here: it can be switched off at the server, and its refusals
+  // ---- are about a root and a pattern rather than about a file.
+
+  // A refusal body as text. FastAPI answers a model violation with a
+  // LIST of error objects and this application's own refusals with a
+  // string, and a control that assigned the list to textContent printed
+  // "[object Object]" at the person: the server said exactly what was
+  // wrong and the page threw it away.
+  function refusalText(detail) {
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      const said = detail
+        .map((item) => (item && typeof item.msg === "string" ? item.msg : ""))
+        .filter((msg) => msg !== "");
+      if (said.length > 0) return said.join("; ");
+    }
+    return "the snapshot was refused and the reason could not be read";
+  }
+
+  // Why the control cannot be used, or "" when it can.
+  //
+  // THREE DIFFERENT FACTS, and they are three sentences rather than one
+  // because they call for three different actions. A catalog that has
+  // not answered is not evidence that the feature is off; a feature that
+  // IS off is the server's own sentence, verbatim, never a second
+  // wording written here; a full staging set is the composer's own
+  // bound and has nothing to do with either.
+  function snapshotBlocker() {
+    const posture = window.BenchState.snapshots;
+    if (posture === null || posture === undefined) {
+      return (
+        "The model catalog has not answered yet, so the bench has not " +
+        "said whether repository snapshots are configured."
+      );
+    }
+    if (!posture.enabled) return posture.reason;
+    if (staged.length >= MAX_ATTACHMENTS) {
+      return (
+        "Already at " +
+        MAX_ATTACHMENTS +
+        " documents, which is the whole bound: a snapshot is one of them."
+      );
+    }
+    return "";
+  }
+
+  function closeSnapshotPanel() {
+    snapPanelEl.hidden = true;
+    snapOpenEl.setAttribute("aria-expanded", "false");
+  }
+
+  // A message this control produced in ANSWER to something the person
+  // did, as opposed to one it is merely restating. Set by every path in
+  // composeSnapshot, cleared when a snapshot lands or the staged set is
+  // replaced.
+  function said(text) {
+    snapMsgEl.textContent = text;
+    snapMsgEl.dataset.said = text === "" ? "" : "1";
+  }
+
+  function renderSnapshotControl() {
+    const blocker = snapshotBlocker();
+    snapOpenEl.disabled = blocker !== "";
+    snapComposeEl.disabled = blocker !== "" || busy();
+    if (blocker !== "") closeSnapshotPanel();
+    // AN ANSWER OUTRANKS A RESTATEMENT. render() runs on every staging
+    // change, so without this rule the specific thing a person just
+    // earned ("the snapshot was composed and stored, and there was no
+    // room left to attach it") is overwritten on the very next repaint
+    // by the generic blocker ("already at four documents"), which is the
+    // same fact said less usefully. A refusal the server issued
+    // vanishing as the chip list redrew is the same bug one step worse.
+    if (snapMsgEl.dataset.said === "1") return;
+    // The sentence is SHOWN and not merely hovered. A disabled button
+    // whose reason lives in a title is a reason no keyboard user ever
+    // reads, which is the same finding that put the run blocker into a
+    // line of text rather than into a tooltip.
+    snapMsgEl.textContent = blocker;
+  }
+
+  async function composeSnapshot() {
+    const root = snapRootEl.value.trim();
+    const patterns = snapPatternsEl.value
+      .split(",")
+      .map((pattern) => pattern.trim())
+      .filter((pattern) => pattern !== "");
+    if (root === "") {
+      said(
+        "Name the clone root to walk: an absolute path under one of the " +
+          "server's BENCH_REPO_ROOTS entries.",
+      );
+      return;
+    }
+    if (patterns.length === 0) {
+      said(
+        "Name at least one include pattern. Patterns are repo-relative " +
+          "and do not recurse unless they say so, so '*.py' is the top " +
+          "level and '**/*.py' is every depth.",
+      );
+      return;
+    }
+    // Both epochs, the same discipline addFiles follows: a snapshot that
+    // was still composing when the person opened a history entry or hit
+    // reuse belongs to a declaration nobody is composing any more.
+    const epoch = window.BenchState.viewEpoch;
+    const staging = stagingEpoch;
+    inFlight += 1;
+    render();
+    try {
+      const resp = await fetch("/snapshots", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root: root, patterns: patterns }),
+      });
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (err) {
+        body = null;
+      }
+      if (stale(epoch, staging)) return;
+      if (!resp.ok) {
+        said(
+          body
+            ? refusalText(body.detail)
+            : "the snapshot was refused (HTTP " + resp.status + ")",
+        );
+        return;
+      }
+      if (staged.length >= MAX_ATTACHMENTS) {
+        said(
+          "The snapshot was composed and stored, and there was no room " +
+            "left to attach it: the bound is " +
+            MAX_ATTACHMENTS +
+            " documents. Remove one and compose it again; the bytes are " +
+            "already here, so nothing is recomputed.",
+        );
+        return;
+      }
+      if (staged.some((doc) => doc.digest === body.digest)) {
+        said(
+          "That snapshot is already attached: the same tree under the " +
+            "same patterns composes the same bytes, so it is the same " +
+            "document.",
+        );
+        return;
+      }
+      staged.push(body);
+      said("");
+      closeSnapshotPanel();
+    } catch (err) {
+      if (stale(epoch, staging)) return;
+      said("the snapshot request could not be sent: " + err.message);
+    } finally {
+      inFlight -= 1;
+      render();
+    }
+  }
+
   function init() {
     inputEl.addEventListener("change", async () => {
       // COPIED, and the copy is the whole point rather than a style
@@ -616,6 +816,15 @@
     modeEl.addEventListener("change", () => {
       msgEl.textContent = "";
       render();
+    });
+    snapOpenEl.addEventListener("click", () => {
+      const opening = snapPanelEl.hidden;
+      snapPanelEl.hidden = !opening;
+      snapOpenEl.setAttribute("aria-expanded", String(opening));
+      if (opening) snapRootEl.focus();
+    });
+    snapComposeEl.addEventListener("click", () => {
+      void composeSnapshot();
     });
     render();
   }
@@ -688,7 +897,7 @@
       bits.push("read by " + ref.extractor + " " + ref.extractor_version);
     }
     return readOnlyChip(
-      missing ? "(no longer stored)" : ref.filename,
+      missing ? "(no longer stored)" : docLabel(ref),
       bits,
       where + "-attachment",
       missing,

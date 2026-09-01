@@ -419,10 +419,13 @@ MIGRATIONS = [
     # cannot widen UNIQUE (digest, extractor, extractor_version) and
     # cannot ADD COLUMN UNIQUE, so a four-column key would be
     # unreachable on any existing database. It is not needed: kind is a
-    # FUNCTION of the extractor ("none" is the image reader and nothing
-    # else is), so the three-column constraint already enforces the
-    # four-part key and the fourth part is recorded rather than
-    # constrained. If a future extractor ever produced two kinds, this
+    # FUNCTION of the extractor, so the three-column constraint already
+    # enforces the four-part key and the fourth part is recorded rather
+    # than constrained. Each extractor maps to exactly one kind, and
+    # Phase L adding a third kind did not weaken that: "none" is the
+    # image reader and nothing else is, "repo-walk" is the tree walker
+    # and nothing else is, and every remaining extractor reads one file
+    # into text. If a future extractor ever produced two kinds, this
     # comment is the thing that would have to change first.
     ("attachment_extractions", "kind", "TEXT"),
     ("attachment_extractions", "filename", "TEXT"),

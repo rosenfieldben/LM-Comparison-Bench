@@ -244,3 +244,50 @@ def zdr_bench(page, zdr_bench_url):
         return page
 
     return open_bench
+
+
+@pytest.fixture(scope="session")
+def snapshot_root(tmp_path_factory):
+    """A tiny clone the snapshot bench is allowed to walk.
+
+    Session-scoped because the bench that may walk it is: the allowlist
+    is read once at boot, so the tree has to exist before the process
+    starts and must not move under it afterwards.
+    """
+    root = tmp_path_factory.mktemp("snapshot-clone")
+    (root / "pkg").mkdir()
+    (root / "pkg" / "a.py").write_text("ANSWER = 42\n", encoding="utf-8")
+    (root / "pkg" / "b.py").write_text("HELPER = 'ok'\n", encoding="utf-8")
+    # Not selected by the patterns the test writes, so the manifest's
+    # count is a claim about the SELECTION rather than about the tree.
+    (root / "notes.md").write_text("not selected\n", encoding="utf-8")
+    return root
+
+
+@pytest.fixture(scope="session")
+def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root):
+    """A third bench, the only one with BENCH_REPO_ROOTS set.
+
+    Its own process for the reason the zdr bench has one: the allowlist
+    is boot-scoped by design, so "snapshots are off" and "snapshots are
+    on" are two servers rather than two requests, and the default bench
+    stays the one that proves the off state.
+    """
+    with boot_bench(
+        stub_url, tmp_path_factory, {"BENCH_REPO_ROOTS": str(snapshot_root)}
+    ) as url:
+        yield url
+
+
+@pytest.fixture
+def snapshot_bench(page, snapshot_bench_url):
+    """The same page factory, pointed at the bench that may walk a tree."""
+
+    def open_bench(lineup):
+        page.add_init_script(
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
+        )
+        page.goto(snapshot_bench_url)
+        return page
+
+    return open_bench

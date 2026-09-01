@@ -1612,7 +1612,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 5
+EXPORT_SCHEMA_VERSION = 6
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1703,6 +1703,21 @@ def _manifest_token_note() -> str:
     )
 
 
+# Version 6 is Phase L, and it is a VALUE-DOMAIN bump rather than a
+# field one, which is the case version 4's reasoning covers without
+# having met it. No key is added, removed or renamed: renditions still
+# carry digest, extractor, extractor_version and kind, and every trial
+# field means exactly what it meant. What changed is that kind may now
+# be "snapshot", a reading of a repository tree rather than of one file.
+#
+# THAT IS THE FIRST LIMB OF THE RULE, not the second. A reader that
+# ignores unknown things absorbs this perfectly; a STRICT reader, the
+# kind this repository relies on at its own boundaries, validates kind
+# against the set it knows and rejects the artifact. RenditionPin's own
+# Literal held exactly two values until this phase, so the bench would
+# have refused its own new export. Two files both calling themselves
+# version 5 while one carries a kind the other's readers reject is the
+# ambiguity the number exists to remove.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -1752,6 +1767,29 @@ EXPORT_SCHEMA_NOTES = {
         "a ceiling that was sent rather than a count, and is_byok on "
         "each trial line beside upstream_inference_cost_usd, from "
         "version 4."
+    ),
+    6: (
+        "the kind on every rendition pin may now be snapshot, a reading "
+        "of a repository tree composed into one attachment, beside "
+        "document and image. No key was added, removed or renamed and no "
+        "field changed meaning: this is a widened value domain, and it "
+        "is a version because a reader that validates kind against the "
+        "two earlier values rejects the artifact rather than ignoring "
+        "the difference. Every field the earlier versions added is "
+        "carried with its meaning intact: attachments and "
+        "attachments_mode on each trial line and attachments_referenced "
+        "in the manifest from version 2, whose truth conditions widened "
+        "at version 5 because the manifest itself now cites digests; "
+        "renditions, the ordered pins each with digest, extractor, "
+        "extractor_version and kind, from version 3; token_counts in "
+        "the manifest, naming the unit of the four token counts on "
+        "every trial line and separating them from max_tokens, which is "
+        "a ceiling that was sent rather than a count, and is_byok on "
+        "each trial line beside upstream_inference_cost_usd, from "
+        "version 4; task_attachments in the manifest, the renditions "
+        "frozen onto the experiment at creation keyed by task id, and "
+        "attachments_mode, the one mode the whole experiment ran under, "
+        "from version 5."
     ),
 }
 

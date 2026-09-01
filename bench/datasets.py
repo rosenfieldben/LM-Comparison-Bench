@@ -46,14 +46,23 @@ SCORERS = (*DETERMINISTIC_SCORERS, JUDGE_SCORER)
 # bounds the subject string separately.
 MAX_PATTERN_CHARS = 500
 
-# The four fields a rendition pin has, and the two kinds it may name.
+# The four fields a rendition pin has, and the three kinds it may name.
 # Duplicated from neither RenditionPin nor row_rendition but agreeing
 # with both: this module cannot import the API boundary (which imports
 # it), and a pin's shape is part of the DATASET's contract, so the check
 # belongs to the file format. A cross-module test asserts the three
 # spellings name the same four fields.
+#
+# THE THIRD KIND IS PHASE L'S, and it is here because a snapshot is an
+# attachment like any other once it is stored: a task cites its digest
+# or pins its reading, and a vocabulary that stopped at two would refuse
+# the citation one door before the resolution that would have honored
+# it. bench.extract.kind_of is what decides a kind; this is what a
+# dataset is allowed to CLAIM, and the cross-module test holds the two
+# in agreement rather than an import, since this module cannot reach
+# extract without reaching the boundary that imports it.
 PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind")
-PIN_KINDS = ("document", "image")
+PIN_KINDS = ("document", "image", "snapshot")
 
 # sha256, lowercase hex. The same shape RenditionPin enforces at the API
 # boundary, checked here because a dataset that cites a malformed digest
