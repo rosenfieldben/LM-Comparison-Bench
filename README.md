@@ -1388,10 +1388,17 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 3**: each trial line carries the ordered
+An **export is schema version 5**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
-document was sent and not merely which bytes. The manifest states the
-reason for the bump in the file itself.
+document was sent and not merely which bytes; that arrived in version 3.
+Version 4 added the manifest's `token_counts` sentence and each trial's
+`is_byok`. Version 5 adds `task_attachments` and `attachments_mode` to
+the manifest: trial lines describe the cells that *ran*, and a task that
+never ran leaves no line, so a halted experiment's un-run tasks had their
+declaration nowhere in the file. The manifest states the reason for the
+current bump in the file itself, and it names every field the earlier
+versions added, because a reader holding a v5 artifact and a v2 parser
+needs the whole list from the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1405,7 +1412,20 @@ and the chip titles show it. Exports carry each trial's digests and mode
 and never any content, and the export manifest carries
 `attachments_referenced` so an artifact says at line one whether it
 references bytes it does not embed, exactly as `thresholds_included` says
-whether it embeds the threshold slice.
+whether it embeds the threshold slice. That flag counts the manifest's
+own citations too: an export taken before an experiment has run carries
+no trial lines and still names documents whose bytes live only in the
+`bench.db` that produced it.
+
+The report carries the same provenance twice, on two axes. `attachments`
+is the distinct set of documents the run touched, deduped by digest,
+mode and reading; `task_attachments` is the same thing keyed by task id,
+because a reader looking at one task's score wants the document *that
+task* read and the flat list cannot say. Both are present and empty when
+no cell declared a document, so "no documents" is distinguishable from
+"this report predates the field". Neither carries a filename: the name
+is what a person picked on their own machine and is not a property of
+the bytes.
 
 The token figure on a chip is labeled approximate and is characters over
 four. The bench does not tokenize: every model runs its own tokenizer and
@@ -1415,9 +1435,10 @@ provider decides, because an image's token cost depends on tiling and
 resolution handling that this bench cannot see and a fabricated number
 beside a real byte count would be believed.
 
-**Deliberately out of scope:** per-task attachments in datasets, OCR for
-scanned PDFs, native parts for non-image documents, audio and video, and
-multi-file diffing.
+**Deliberately out of scope:** OCR for scanned PDFs, native parts for
+non-image documents, audio and video, and multi-file diffing. Per-task
+attachments in datasets are no longer among them; see the dataset
+section below.
 
 ## Experiment controls
 
@@ -1564,7 +1585,66 @@ is sent as that task's system message. `reference` is the expected answer
 for the comparing scorers. `rubric` is the scoring instruction for the
 judge. `scorer` names how the task is scored: `exact`,
 `normalized_exact`, `contains`, `regex` (with a `pattern`), or `judge`.
-Task ids must be unique within a file.
+`attachments` cites the documents that task reads. Task ids must be
+unique within a file.
+
+### Documents on a task
+
+**Datasets reference documents; they never carry them.** A task cites a
+sha256 the bench already holds, so the file stays a small text artifact
+whatever it points at, the bytes are stored once however many tasks cite
+them, and a dataset can never smuggle a path on somebody's disk into a
+comparison. The workflow is upload, look up, cite, create.
+
+```sh
+# 1. Upload. The response carries the digest, the parser that read the
+#    bytes, and how many characters came out of it.
+curl -s -X POST localhost:8000/attachments \
+  -H "Content-Type: application/json" \
+  -d "{\"filename\": \"contract.pdf\",
+       \"content_base64\": \"$(base64 -w0 contract.pdf)\"}"
+
+# 2. Or look one up later. Metadata only, newest first, never content.
+curl -s localhost:8000/attachments
+```
+
+```json
+{"id": "clause-1", "prompt": "What is the delivery window?", "attachments": ["6ff1c0a0f8b34d2e5c7190ab3d4e6f8172533c9be0a4d61f8c2b7e390d5a4c18"], "reference": "42 days", "scorer": {"kind": "contains"}}
+{"id": "clause-2", "prompt": "Who bears the shipping cost?", "attachments": [{"digest": "6ff1c0a0f8b34d2e5c7190ab3d4e6f8172533c9be0a4d61f8c2b7e390d5a4c18", "extractor": "pypdf", "extractor_version": "6.15.0", "kind": "document"}]}
+```
+
+Both lines above are parsed by the loader's own test, so this example
+cannot rot into one the loader would refuse, and the extractor names are
+checked against the bench's own registry: `text` for `.txt` and `.md`,
+`pypdf` for `.pdf`, `stdlib-zipfile-xml` for `.docx`, and `none` for an
+image, which is read as pixels rather than parsed. The `extractor_version`
+in the second line is illustrative and is guarded by nothing: `pypdf`
+reports its own version, so the value that resolves is whatever the
+installed release says, and pinning a version the bench has not run is
+refused at creation naming the task.
+
+**Two spellings, one meaning, and the difference is who chooses the
+reading.** A bare digest means "whichever reading the bench stored for
+these bytes", resolved once at creation. A four-part object PINS a
+reading, and the bench then honors it verbatim or refuses: a pin naming
+a parser version the bench never ran is a refusal at creation, not a
+silent substitution. Both are frozen onto the experiment record the
+moment it is created, so a parser upgrade between creation and start
+changes nothing about the run. At most four documents per task, the same
+bound a hand comparison has.
+
+`attachments_mode` sits on the EXPERIMENT, not on the task: `inline`
+(the default) extracts the text and gives every model the same reading
+of it, `native` sends images as content parts. One mode for the whole
+sweep, because an experiment where some arms see pixels and others see
+extracted text is two experiments wearing one name. Native is checked
+against every model in the lineup at creation and the whole experiment
+is refused if any of them cannot take images.
+
+A digest the bench does not hold is a 422 naming the task and the
+digest. Deleting the bytes afterwards does not rewrite the record: the
+experiment and its export keep their pins, and anything that needs the
+content again refuses naming what is missing.
 
 **A dataset's version is its content.** There is no version field to keep
 in sync and no way to edit a file and leave a stale label behind: the
@@ -1662,6 +1742,86 @@ existing rows would make a halt look like a completed run.
 at creation. An experiment over that bound is refused with the arithmetic
 shown, because the caller has three levers and needs to know which one to
 pull.
+
+The 201 carries a `projected_cost` beside the new id: what the sweep
+would cost, priced before a call is made.
+
+```json
+{"id": 4,
+ "projected_cost": {"input_usd": 0.0021, "output_usd": 0.131072,
+                    "total_usd": 0.133172, "unpriced": []}}
+```
+
+The two halves are reported apart because they are wrong in different
+directions. `output_usd` counts no message at all: it is the completion
+budget each trial reserved, clamped to the completion cap of the route
+it will be served by, times that route's completion rate. It is a
+ceiling **on tokens** and usually well above what a trial will actually
+produce. `input_usd` is an estimate in the other direction, characters
+over four, summed per task so a dataset where one task attaches a
+hundred pages and the rest ask a line prices like itself rather than
+like its average; it counts **both messages**, since a task's own system
+prompt, or the experiment's when the task sets none, is part of what the
+request carries. The window refusal names the components apart, because
+the remedy differs by component.
+
+**Neither half is a ceiling on the BILL for an unpinned run**, and the
+distinction is worth stating because "at most" invites the stronger
+reading. A pinned run is priced from the endpoint it is pinned to, so
+its rate is the rate that will be charged. An unpinned run is routed per
+call, and the model-level listing is the only publication that can speak
+for it: measured 2026-08-30 across four models with several priced
+endpoints each, the model-level completion rate was the cheapest
+endpoint's on one, the dearest on another, and between on two, with the
+dearest endpoint charging up to 2.0x the model-level figure (and 5.6x on
+`openai/gpt-oss-120b`). A sweep served by a costlier endpoint than the
+model-level publication bills above the projection. Bounding that would
+mean fetching an endpoint listing for every model in every lineup, which
+is the cost the unpinned path exists to avoid.
+
+**A pinned run is priced by the endpoint it is pinned to.** OpenRouter's
+model listing publishes one pricing object per model and the endpoint
+listing publishes one per endpoint, and they are not the same question:
+measured 2026-08-30, `openai/gpt-oss-120b` published prompt
+`0.000000037` at the model level while its twenty endpoints published
+thirteen distinct rate pairs, from `0.00000003` to `0.00000035` on the
+input side. An unpinned model is routed dynamically, so the model-level
+listing is the only thing that can speak for it and is used. A pinned
+model whose listing cannot answer is **unpriced**, never priced from the
+model level: borrowing the aggregate is the substitution the pin exists
+to prevent.
+
+Every figure is `null` when any model in the lineup publishes no price,
+and `unpriced` then names them: a total missing one arm of a comparison
+reads as the comparison's total. A model whose pricing map charges
+something beyond the two token dimensions is unpriced too, with the
+dimension named, because this bench has no arithmetic for a fixed
+per-request charge or a cache-read rate and a figure that silently
+omitted one would be a confident understatement. A dimension published
+*at* zero is a zero and disqualifies nothing. `input_usd` and
+`total_usd` are also `null` in native mode, where the input is images
+and nothing here converts pixels to tokens; `output_usd` still stands,
+because the output side is measured the same way in both modes. The
+projection is not stored on the experiment: it is a statement about the
+catalog at that instant rather than a fact about the run.
+
+Creation also runs the two size checks, before anything is written, on
+**the tasks that carry documents and in inline mode**. A task whose
+prompt and documents compose past the global composed ceiling is refused
+naming that task, and a task that no model in the lineup could hold
+alongside the answer it reserved is refused naming the task, the model
+and both numbers. Tasks that fit are not mentioned, so the refusal says
+which line of the dataset to shorten.
+
+Both qualifiers are deliberate and both are deferrals rather than
+oversights, stated here because the unqualified sentence that stood
+before read as a guarantee. A task carrying no document is not measured,
+for the reason `/compare` does not measure an unattached comparison: the
+budget-versus-window check for every run is a named deferral. And in
+native mode neither check runs at all, because an image's cost is not a
+character count. So a 100,000 character prompt against a 20,000 token
+model is created and run, exactly as the same prompt through `/compare`
+is sent.
 
 ## Estimands
 

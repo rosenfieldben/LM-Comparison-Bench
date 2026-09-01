@@ -380,29 +380,163 @@ def _report_attachments(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
     pre-K.1 group, where the answer is genuinely unknown rather than
     absent.
     """
-    seen: set[tuple[str, str | None, str | None, str | None]] = set()
+    seen: set[tuple[str | None, ...]] = set()
     out: list[dict[str, Any]] = []
     for group in groups:
-        mode = group.get("attachments_mode")
-        pins = {pin["digest"]: pin for pin in group.get("renditions") or []}
-        for digest in group.get("attachments") or []:
-            pin = pins.get(digest)
-            key = (
-                digest,
-                mode,
-                pin["extractor"] if pin else None,
-                pin["extractor_version"] if pin else None,
-            )
+        for key, entry in _declared_documents(group):
             if key in seen:
                 continue
             seen.add(key)
-            entry: dict[str, Any] = {"digest": digest, "mode": mode}
-            if pin is not None:
-                entry["extractor"] = pin["extractor"]
-                entry["extractor_version"] = pin["extractor_version"]
-                entry["kind"] = pin["kind"]
             out.append(entry)
     return out
+
+
+def _declared_documents(
+    group: dict[str, Any],
+) -> list[tuple[tuple[str | None, ...], dict[str, Any]]]:
+    """One group's documents, each as its dedup key and its entry.
+
+    Written once because two readers walk the same declaration: the
+    experiment-wide list and the per-task mapping. Two copies of this
+    loop would be two chances for one of them to key on digest alone,
+    which is the collapse _report_attachments' docstring spends four
+    paragraphs explaining.
+
+    IT KEYED ON THE DIGEST ITSELF, and that is the thirteenth review's
+    F5. The pins were indexed into a mapping keyed by digest, so a
+    comparison declaring ONE digest under TWO readings kept whichever
+    pin came last and handed it to both positions. Everything else on
+    the branch carried the pair correctly (the dataset parse, the
+    creation freeze, the composed payload, the group row and the v5
+    export manifest all preserved both); the report alone published one,
+    and published the WRONG one for the first position. Its provenance
+    was therefore false about a case pins_for goes out of its way to
+    allow, and documents_for spends a paragraph saying it iterates the
+    pins rather than a digest-keyed mapping for exactly this reason.
+
+    PAIRED BY POSITION, because that is how they were written.
+    create_group derives attachments_json FROM renditions_json, one for
+    one and in order, so index i of each names the same declaration. A
+    length disagreement is a group from an era with no pins at all (or a
+    row nothing in this application writes), and those fall back to
+    digest-only, which is the honest answer for a comparison that
+    pinned nothing.
+
+    THE KEY IS THE WHOLE PIN, all four fields plus the mode. The old one
+    omitted kind, which was harmless only because two readings that
+    differ in kind also differ in extractor today; a key that is the
+    declaration cannot be wrong tomorrow for a reason nobody wrote down.
+    """
+    mode = group.get("attachments_mode")
+    digests = group.get("attachments") or []
+    pins = group.get("renditions") or []
+    paired: list[tuple[str, dict[str, Any] | None]] = (
+        list(zip(digests, pins, strict=True))
+        if len(pins) == len(digests)
+        else [(digest, None) for digest in digests]
+    )
+    rows: list[tuple[tuple[str | None, ...], dict[str, Any]]] = []
+    for digest, pin in paired:
+        key = (
+            digest,
+            mode,
+            pin["extractor"] if pin else None,
+            pin["extractor_version"] if pin else None,
+            pin["kind"] if pin else None,
+        )
+        entry: dict[str, Any] = {"digest": digest, "mode": mode}
+        if pin is not None:
+            entry["extractor"] = pin["extractor"]
+            entry["extractor_version"] = pin["extractor_version"]
+            entry["kind"] = pin["kind"]
+        rows.append((key, entry))
+    return rows
+
+
+def _report_task_attachments(
+    groups: list[dict[str, Any]],
+) -> dict[str, list[dict[str, Any]]]:
+    """Which documents each TASK ran over, keyed by task id.
+
+    THE EXPERIMENT-WIDE LIST CANNOT ANSWER THIS. It says which documents
+    the run touched; a reader looking at a per-task score wants to know
+    which document that particular task read, and a dataset where every
+    task attaches something different makes the flat list useless for
+    exactly the question it looks like it answers.
+
+    Deduped per task with the same key the flat list uses, because
+    repeats and rotations put one task in many groups and a task read
+    over three repeats read one document, not three.
+
+    A TASK THAT DECLARED NOTHING IS ABSENT rather than present with an
+    empty list, and the whole mapping is empty for an experiment with no
+    documents. That is the same spelling of absence the group columns
+    use: one way to say nothing was declared.
+
+    Built from the GROUPS, so it stays derivable from an export and the
+    report stays rebuildable without a database. The experiment record's
+    frozen pin is the other possible source and is deliberately not used
+    here: this is a report about what ran, and a task whose trials never
+    ran has no numbers for its provenance to be about. The manifest
+    carries the frozen declaration for the halted case; see
+    export_manifest.
+    """
+    out: dict[str, list[dict[str, Any]]] = {}
+    seen: dict[str, set[tuple[str | None, ...]]] = {}
+    for group in groups:
+        task_id = group["task_id"]
+        for key, entry in _declared_documents(group):
+            if key in seen.setdefault(task_id, set()):
+                continue
+            seen[task_id].add(key)
+            out.setdefault(task_id, []).append(entry)
+    return out
+
+
+def recorded_groups(
+    groups: list[dict[str, Any]], runs_by_group: dict[int, list[dict[str, Any]]]
+) -> list[dict[str, Any]]:
+    """The cells this report can describe: the ones that recorded a
+    result.
+
+    A CELL WITH NO RESULT IS NOT A CELL THIS REPORT HAS ANYTHING TO SAY
+    ABOUT. The runner writes the group row before the first trial, so an
+    experiment interrupted between the two leaves a group with a
+    declaration and nothing else. Counting it as recorded put a cell in
+    the denominator that contributed no outcome, and published the
+    documents it would have read as provenance for numbers that do not
+    exist.
+
+    IT ALSO BROKE THE REBUILD, which is the thirteenth review's F6 and
+    the reason this rule is here rather than in the boundary's reader.
+    The export emits a line per RESULT, so an empty group contributes
+    nothing to the artifact, and rebuilding the report from the artifact
+    therefore disagreed with the served one: cells_recorded 1 against 0,
+    not_run 0 against 1, and document provenance present against absent.
+    M3 claims the report stays rebuildable from an export; a rule that
+    lived where only one of the two paths could apply it would leave
+    that claim resting on the two paths happening to agree.
+
+    So the served report and the rebuild now classify the state the same
+    way BY CONSTRUCTION: both call build_report, build_report calls
+    this, and an empty group is not_run on both. What the cell was owed
+    is not lost by that: the export's v5 manifest carries the frozen
+    per-task declaration for every task, run or not, which is where a
+    reader looks for what a cell that never happened was going to read.
+
+    THE OTHER CHOICE WAS TO EMIT EMPTY GROUPS AS EXPORT LINES, and it is
+    the wrong one. "An artifact is described by what is in it" is the
+    export's rule and has its own tombstone: a flag that claimed a
+    document reference the file does not carry sends a reader looking
+    through it for a digest that is not there. Making the report agree
+    with the artifact keeps that argument; making the artifact agree
+    with the report would have spent it.
+    """
+    return [
+        group
+        for group in groups
+        if any(run["results"] for run in runs_by_group.get(group["id"], []))
+    ]
 
 
 def build_report(
@@ -433,6 +567,11 @@ def build_report(
     coverage figure and the scoring-failure rate. A judge that could not
     answer never touches a model's failure count.
     """
+    # EVERY COUNT AND EVERY PROVENANCE BELOW READS THIS LIST, so the
+    # filter is here at the top rather than at each reader: a cell with
+    # no result is outside this report's subject entirely, not merely
+    # absent from one of its tables. See recorded_groups.
+    groups = recorded_groups(groups, runs_by_group)
     lineup = experiment["lineup"]
     # An ARM is a lineup slot: (position, model). A lineup may list the
     # same model twice, which is how anyone asks "how much does this vary
@@ -591,13 +730,18 @@ def build_report(
         # documents, so this is a property of the experiment rather than
         # of any arm, which is why it sits here and not on a model row.
         #
-        # Empty on every experiment the runner produces today, because
-        # per-task attachments in datasets are deferred. Published anyway
-        # rather than omitted when empty, for thresholds_included's
-        # reason: a reader must be able to tell "no documents" from "this
-        # report predates the field", and an absent key cannot say the
-        # first.
+        # Empty when no cell declared a document, which since Phase M is
+        # a fact about the DATASET rather than about the runner: a
+        # dataset whose tasks cite digests produces cells that declare
+        # them. Published anyway rather than omitted when empty, for
+        # thresholds_included's reason: a reader must be able to tell
+        # "no documents" from "this report predates the field", and an
+        # absent key cannot say the first.
         "attachments": _report_attachments(groups),
+        # The same provenance keyed by task, because a per-task number
+        # and a corpus-wide document list cannot be joined by a reader
+        # holding only the report. Empty exactly when the list above is.
+        "task_attachments": _report_task_attachments(groups),
         # The caveat, in the payload, as one sentence a page can print.
         # None when nothing was reconstructed, so a reader who sees the
         # key filled in knows it was earned rather than boilerplate.
@@ -1468,7 +1612,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 4
+EXPORT_SCHEMA_VERSION = 5
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1519,6 +1663,29 @@ EXPORT_SCHEMA_VERSION = 4
 # was found on a run with is_byok false, so an artifact carrying the
 # figure without the flag invites a reader to conclude BYOK from a
 # number that does not mean it.
+#
+# Version 5 is Phase M, and it is a manifest change for the reason
+# version 4 was. Its note says "with its meaning intact" rather than
+# "carried unchanged", and names the one thing that did move:
+# attachments_referenced is now raised by the manifest's own
+# task_attachments as well as by the trial lines, so it is true on an
+# artifact whose trial lines cite nothing. The field's key, place, type
+# and question are the same and a reader acts on it the same way, but a
+# note whose whole job is to tell a reader with an older parser what
+# moved cannot leave that out.
+# the manifest gained task_attachments (the renditions
+# frozen onto the experiment at creation, keyed by task id) and
+# attachments_mode (the one mode the whole experiment ran under). No
+# trial field changed value, meaning or presence, and a reader that
+# ignores unknown keys reads a version 4 artifact exactly; a reader that
+# REJECTS them does not, and the policy above counts that reader.
+#
+# WHAT IT BUYS is a case the trial lines cannot cover. Trial lines carry
+# the group's pins and there is no line for a task that never ran, so a
+# halted or interrupted experiment's un-run tasks had their declaration
+# nowhere in the artifact: the file could say a task was owed and not
+# what it was owed OVER. The frozen pin is the experiment's declaration
+# and belongs where the rest of the declaration already is.
 def _manifest_token_note() -> str:
     """The one sentence the artifact says about its token units.
 
@@ -1562,6 +1729,29 @@ EXPORT_SCHEMA_NOTES = {
         "which a run was. Version 3 carried renditions: the ordered "
         "pins, each with digest, extractor, extractor_version and kind, "
         "and version 4 carries them unchanged."
+    ),
+    5: (
+        "the manifest carries task_attachments, the renditions frozen "
+        "onto the experiment at creation keyed by task id, and "
+        "attachments_mode, the one mode the whole experiment ran under. "
+        "Trial lines carry the pins of the cells that RAN; a task that "
+        "never ran has no trial line, so a halted experiment's un-run "
+        "tasks had their declaration nowhere in the artifact. Both keys "
+        "are null on an experiment whose dataset cited no document and "
+        "on one created before this field existed. No trial field "
+        "changed, and every field the earlier versions added is carried "
+        "with its meaning intact: attachments and attachments_mode on "
+        "each trial line and attachments_referenced in the manifest "
+        "from version 2, though that flag's truth conditions widened, "
+        "because the manifest itself now cites digests and an export "
+        "taken before a run has none on any trial line; "
+        "renditions, the ordered pins each with digest, extractor, "
+        "extractor_version and kind, from version 3; token_counts in "
+        "the manifest, naming the unit of the four token counts on "
+        "every trial line and separating them from max_tokens, which is "
+        "a ceiling that was sent rather than a count, and is_byok on "
+        "each trial line beside upstream_inference_cost_usd, from "
+        "version 4."
     ),
 }
 
@@ -1620,6 +1810,16 @@ def export_manifest(
     moved from the file in their hand rather than from a changelog they
     may not have; see EXPORT_SCHEMA_NOTES.
 
+    task_attachments and attachments_mode are the experiment's own
+    declaration, frozen at creation: which reading of which document
+    each task was to be given, and the single mode all of them ran
+    under. They are here rather than only on the trial lines because a
+    trial line exists only for a cell that ran, and a halted experiment
+    is precisely the artifact whose un-run tasks a reader needs
+    described. Both null when the dataset cited no document, which is
+    also what a pre-Phase-M experiment reads as; the two eras are told
+    apart by the dataset, exactly as they are on the experiment row.
+
     attachments_referenced is the same kind of label one subject over:
     the artifact saying what it does NOT embed. Document bytes are never
     in an export, so a reader holding one whose trials cite digests needs
@@ -1635,17 +1835,32 @@ def export_manifest(
         # declared none from an export nobody handed the file to, and
         # those licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
-        # Whether any trial in this artifact cites a document. False says
-        # the file is complete on its own; true says the trials name
-        # digests whose bytes live in the bench.db that produced this
-        # export and nowhere else, so reproducing those prompts needs
-        # that database and not just this file.
+        # Whether ANYTHING in this artifact cites a document, which
+        # since version 5 means the trial lines or the manifest's own
+        # task_attachments. False says the file is complete on its own;
+        # true says something in it names digests whose bytes live in
+        # the bench.db that produced this export and nowhere else, so
+        # reproducing those prompts needs that database and not just
+        # this file. It said "any trial" until the thirteenth review's
+        # panel, which was the reading before the manifest could cite a
+        # digest and is why an export taken before a run reads true with
+        # no trial line in it.
         #
         # A BOOLEAN AND NOT A COUNT, matching thresholds_included above:
         # the question a reader asks at line one is "is this
         # self-contained", and the digests themselves are on the trial
         # lines where they belong to a particular trial.
         "attachments_referenced": attachments_referenced,
+        # THE DECLARATION, not the record of what ran. See the docstring:
+        # the trial lines cover the cells that produced results, and this
+        # covers the ones that did not.
+        "task_attachments": experiment.get("task_attachments"),
+        # ONE MODE PER EXPERIMENT is a law of this bench, and the
+        # artifact states it once rather than leaving a reader to infer
+        # it from every trial line agreeing. A file whose trial lines
+        # disagreed with this key would be evidence of a defect, which is
+        # exactly what a citable artifact should make visible.
+        "attachments_mode": experiment.get("attachments_mode"),
         # THE UNIT, ONCE, FOR THE WHOLE ARTIFACT. Every trial line carries
         # four counts and one ceiling side by side, and an export is read
         # by people who were not here: prompt_tokens next to max_tokens
@@ -1759,9 +1974,11 @@ def export_trial(
         # line that named the document without the mode would describe
         # two possible runs.
         #
-        # None on every group that declared none, which includes every
-        # experiment the runner produces today; see the manifest's
-        # attachments_referenced.
+        # None on every group that declared none, which since Phase M is
+        # a fact about the dataset rather than about the door the
+        # comparison came through: a runner cell over a task citing
+        # digests carries them here exactly as a hand comparison does.
+        # See the manifest's attachments_referenced.
         "attachments": group.get("attachments"),
         "attachments_mode": group.get("attachments_mode"),
         # THE READING, not only the bytes. Structured rather than

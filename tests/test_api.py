@@ -19,7 +19,9 @@ from bench.models import (
     ENDPOINTS_URL,
     OPENROUTER_URL,
     PROVIDER_REASONING_MINIMUM,
+    endpoint_rates,
     provider_preferences,
+    token_rates,
 )
 
 FIXTURE = json.loads(
@@ -31,6 +33,7 @@ FIXTURE = json.loads(
 # 13 * 1e-6 + 8 * 2e-6 = 2.9e-5 USD.
 TEST_PRICES = {
     "model/alpha": {"prompt": 1e-06, "completion": 2e-06},
+    "model/narrow": {"prompt": 1e-06, "completion": 2e-06},
 }
 TEST_CATALOG = {
     "fetched": True,
@@ -112,6 +115,23 @@ TEST_CATALOG = {
                 "temperature",
                 "top_p",
             ],
+            "input_modalities": ["text"],
+        },
+        {
+            # A NARROW WINDOW WITH ORDINARY PRICES, and it exists for the
+            # thirteenth review's F2: a model whose window is small
+            # enough that a 20,000 character system message decides
+            # whether an exchange fits, and large enough that the same
+            # exchange without one does. model/vision is narrower still
+            # and refuses everything attached, which cannot tell the two
+            # cases apart.
+            "id": "model/narrow",
+            "name": "Narrow",
+            "context_length": 20000,
+            "prompt_price": 1e-06,
+            "completion_price": 2e-06,
+            "max_completion_tokens": None,
+            "supported_parameters": ["max_tokens"],
             "input_modalities": ["text"],
         },
         {
@@ -6095,6 +6115,11 @@ def rebuild_from_export(lines, tasks_by_id):
                     # the reader does not have.
                     "attachments": trial["attachments"],
                     "attachments_mode": trial["attachments_mode"],
+                    # The READING, not only the bytes. Without it the
+                    # rebuilt report can say which documents a task ran
+                    # over and not which reading of them, and the two are
+                    # different claims; see _report_attachments.
+                    "renditions": trial["renditions"],
                 }
             )
             runs_by_group[gid] = []
@@ -6122,6 +6147,14 @@ def rebuild_from_export(lines, tasks_by_id):
                 "cost_usd": trial["cost_usd"],
                 "billed_cost_usd": trial["billed_cost_usd"],
                 "provider": trial["provider"],
+                # BOTH HALVES OF THE BYOK SPLIT, which _cost_totals
+                # reads and this helper dropped until the panel found
+                # it. Without them the rebuilt report's cost block is
+                # null wherever the served one has an upstream figure,
+                # and the "rebuild the report from the artifact" check
+                # could not see the difference.
+                "is_byok": trial["is_byok"],
+                "upstream_inference_cost_usd": trial["upstream_inference_cost_usd"],
             }
         )
         scores_by_result[trial["result_id"]] = trial["scores"]
@@ -6130,6 +6163,11 @@ def rebuild_from_export(lines, tasks_by_id):
             "id": manifest["experiment_id"],
             "name": manifest["name"],
             "estimand_mode": manifest["estimand_mode"],
+            # The metric any ranking is computed on. Dropped here until
+            # the panel found it, so a rebuilt report silently lost the
+            # whole ranking block: metric None, reason "more than one
+            # scorer and no primary_metric declared", every rank null.
+            "primary_metric": manifest["primary_metric"],
             "dataset_name": manifest["dataset_name"],
             "dataset_digest": manifest["dataset_digest"],
             "repeats": manifest["repeats"],
@@ -6282,19 +6320,30 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 4
+    assert manifest["export_schema_version"] == 5
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[4]
-    # Version 4 is the units-and-money boundary. Its note still names
-    # renditions, deliberately: EXPORT_SCHEMA_NOTES emits only the
-    # CURRENT version's sentence, so a v4 note that dropped the v3
-    # explanation would leave a v4 artifact unable to explain a field it
-    # still carries.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[5]
+    # Version 5 is Phase M's manifest change. Its note still names what
+    # earlier versions added, deliberately: EXPORT_SCHEMA_NOTES emits
+    # only the CURRENT version's sentence, so a v5 note that dropped the
+    # earlier explanations would leave a v5 artifact unable to explain
+    # fields it still carries.
+    assert "task_attachments" in manifest["export_schema_change"]
+    # And the one earlier field whose truth conditions v5 widened is
+    # named as widened rather than as carried unchanged: the note is a
+    # reader's only changelog, and something moved.
+    assert "truth conditions widened" in manifest["export_schema_change"]
     assert "token_counts" in manifest["export_schema_change"]
     assert "is_byok" in manifest["export_schema_change"]
     assert "renditions" in manifest["export_schema_change"]
+    # THE TWO NULLS AT LINE ONE. This experiment's dataset cited no
+    # document, so both keys are present and null rather than absent:
+    # a reader must be able to tell "no documents" from "this artifact
+    # predates the field", and only a present null says the first.
+    assert manifest["task_attachments"] is None
+    assert manifest["attachments_mode"] is None
     # ONE UNIT, SAID ONCE, for a reader who was never in the room. Trial
     # lines put four counts and one ceiling side by side, and the
     # subtraction that invites is the one that manufactured a phantom
@@ -6815,7 +6864,15 @@ def test_a_pinned_lineup_resolves_each_route_once_for_the_whole_run(client, tmp_
     paid call to re-learn something that cannot have changed. This run
     is deliberately shaped to tell the two apart: two tasks and two
     repeats over one model is four trials, so per-trial resolution
-    counts four and per-run counts one.
+    counts four against the run and per-run counts one.
+
+    TWO RESOLUTIONS, NOT ONE, and the second one is M2's. Creation
+    resolves the route to price the sweep and to check each task's
+    documents against the window the trial will actually have; the
+    runner resolves again at start because minutes may have passed and
+    the route is what the RUN will use. So the honest count is 1 + 1,
+    and the defect this test exists for still shows plainly: per-trial
+    resolution would count 1 + 4.
 
     THE DUPLICATE IS THE SECOND HALF. The lineup names the same model
     twice, which is the natural way to ask how much a model varies run
@@ -6864,7 +6921,7 @@ def test_a_pinned_lineup_resolves_each_route_once_for_the_whole_run(client, tmp_
     # PRE-STATE: the run really did make many paid calls, or "one
     # listing" would be a claim about a run that barely happened.
     assert len(sent) == 8, len(sent)
-    assert listing.call_count == 1
+    assert listing.call_count == 2
 
     # And the resolution actually reached all eight of them: every
     # request is clamped to the route's 4096 rather than the standard
@@ -7362,6 +7419,12 @@ def test_a_provider_pin_is_normalized_to_the_documented_slug(client, tmp_path):
     somebody else. Normalized at the boundary so the recorded pin and the
     sent pin are one string.
     """
+    # Creation resolves a pinned route now, to price the sweep and to
+    # check each task against the window the trial will really have, so
+    # the listing is asked for before anything runs.
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": []}}
+    )
     path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
 
     eid = client.post(
@@ -8056,6 +8119,2526 @@ def upload(client, filename, content):
         "/attachments",
         json={"filename": filename, "content_base64": b64(content)},
     )
+
+
+# ---- Phase M: the dataset declares content, creation freezes the
+# ---- reading. Every test below uploads first, because that IS the
+# ---- workflow: datasets reference documents and never carry them.
+
+
+def m_dataset(tmp_path, digest, **task_overrides):
+    """A one-task dataset citing one document by digest."""
+    task = {"id": "t1", "prompt": "what does it say?", "attachments": [digest]}
+    task.update(task_overrides)
+    return write_dataset(tmp_path, task)
+
+
+def parser_upgrade(digest, version, text):
+    """A second reading of bytes the bench already holds.
+
+    WHAT AN UPGRADE ACTUALLY LEAVES BEHIND, which is why this writes the
+    row rather than re-uploading. The bench deduplicates on the digest,
+    so the same file through a newer parser is exactly one new row in
+    attachment_extractions for a digest that already exists; a second
+    upload would be a no-op and would prove nothing.
+    """
+    with app.state.db as conn:
+        conn.execute(
+            """INSERT INTO attachment_extractions
+               (digest, extractor, extractor_version, extracted_text,
+                created_at, kind, filename, mime, extracted_chars)
+               VALUES (?, 'text', ?, ?, '2026-08-14T00:00:00+00:00',
+                       'document', 'contract.txt', 'text/plain', ?)""",
+            (digest, version, text, len(text)),
+        )
+
+
+def test_review_repro_creation_freezes_the_reading_a_digest_resolved_to(
+    client, tmp_path
+):
+    """WINDOW: the experiment record's task_attachments, read back
+    through GET /experiments/{id} after creation.
+
+    THE TWO-LAYER DECLARATION, asserted at the seam. The dataset cited a
+    DIGEST and nothing else; what the record holds is a full four-part
+    pin, resolved once against the store at creation. Nothing later
+    resolves anything: the runner reads this.
+
+    WHY IT MUST BE FROZEN AND NOT LOOKED UP is the next test. This one
+    establishes that a lookup happened at all and that its answer is
+    complete, because a record holding the digest it was given would
+    look identical to a working freeze until a parser changed.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    assert detail["task_attachments"] == {
+        "t1": [
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ]
+    }
+    # The mode is recorded beside the pins, because a reading without a
+    # modality is half a declaration.
+    assert detail["attachments_mode"] == "inline"
+
+
+def test_review_repro_a_parser_change_after_creation_is_invisible_to_it(
+    client, tmp_path
+):
+    """WINDOW: one experiment's frozen pins, read before and after the
+    store gains a NEWER reading of the very bytes it cited.
+
+    K.3'S LAW, INHERITED WHOLE, one layer up. A group pins its
+    renditions so an upgrade between member one and member two cannot
+    change what two models were asked. An experiment runs for hours over
+    hundreds of trials, so the same upgrade has far more room to land
+    mid-sweep: task 40 would be asked a different document from task 4,
+    with nothing in the record saying so.
+
+    THE UPGRADE IS SIMULATED BY WRITING AN EXTRACTION ROW, which is what
+    a parser upgrade leaves behind. Re-uploading would not do it: the
+    bench deduplicates on the digest, so the same bytes under a new
+    parser is exactly a new row in the extractions table for a digest
+    that already exists.
+
+    PRE-STATE ASSERTED: the frozen pin is read BEFORE the new rendition
+    exists, so the assertion after it is a fact about the freeze rather
+    than about nothing having happened.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    before = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    assert before["t1"][0]["extractor_version"] == "1"
+
+    # The upgrade lands: a second reading of the same bytes.
+    parser_upgrade(digest, "2", "the contract says forty three")
+
+    after = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    assert after == before, "the freeze moved under a parser upgrade"
+
+
+def test_review_repro_a_missing_digest_refusal_names_task_and_digest(client, tmp_path):
+    """WINDOW: the 422 body from POST /experiments for a dataset citing
+    bytes the bench does not hold.
+
+    THE COORDINATES ARE THE MESSAGE. The author's next action is to find
+    that file and upload it, and a refusal naming only the digest makes
+    them search a two thousand line dataset for which task cited it. So
+    the task id is in the message and so is the digest, and the workflow
+    the refusal is teaching (upload first, then cite) is stated rather
+    than implied.
+
+    NOTHING IS CREATED, which is the half that makes the refusal worth
+    having: an experiment that exists but cannot run is the state this
+    whole check exists to prevent.
+    """
+    missing = "b" * 64
+    path = m_dataset(tmp_path, missing)
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert missing[:12] in detail, detail
+    assert "upload the file first" in detail.lower(), detail
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_a_dataset_declaring_a_full_pin_is_honored_verbatim(client, tmp_path):
+    """WINDOW: the frozen pins for a dataset that named the reading
+    itself, beside the store's own newer one.
+
+    HONORED VERBATIM OR REFUSED, and this is the honored half. A dataset
+    that states all four fields has chosen among the readings the bench
+    holds, and creation freezes THAT choice rather than the row's own.
+
+    THE PIN NAMES THE NEWER READING ON PURPOSE, and the first version of
+    this test did not. It pinned version 1, which is also what
+    row_rendition returns for this row, so substituting the row's
+    rendition for the dataset's pin produced the same answer and the
+    test passed against the mutation it was written to catch. Pinning
+    version 2 against a row that still reads version 1 is what makes the
+    two answers different, and the assertion a fact about which one was
+    honored.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    parser_upgrade(digest, "2", "the contract says forty three")
+    # PRE-STATE: the row itself still reads version 1, so "2" below can
+    # only have come from the dataset.
+    assert (
+        main.row_rendition(main.store.attachments_for(app.state.db, [digest])[digest])[
+            "extractor_version"
+        ]
+        == "1"
+    )
+    pin = {
+        "digest": digest,
+        "extractor": "text",
+        "extractor_version": "2",
+        "kind": "document",
+    }
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a", "attachments": [pin]})
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    frozen = client.get(f"/experiments/{eid}").json()["task_attachments"]
+    # The DATASET's pin, not the row's newer reading.
+    assert frozen == {"t1": [pin]}
+
+
+def test_a_dataset_declaring_a_reading_the_bench_lacks_is_refused(client, tmp_path):
+    """WINDOW: the 422 for a full pin naming a rendition nothing holds.
+
+    THE REFUSED HALF. Substituting the reading the bench does have would
+    give the author a comparison over a document they did not choose,
+    and re-extracting here would produce text the dataset never declared
+    while putting a second of CPU in a request path.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    pin = {
+        "digest": digest,
+        "extractor": "text",
+        "extractor_version": "99",
+        "kind": "document",
+    }
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a", "attachments": [pin]})
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_native_mode_refuses_the_whole_experiment_and_names_the_task(client, tmp_path):
+    """WINDOW: the 422 for a native experiment over a document that is
+    not an image.
+
+    ONE MODE PER EXPERIMENT, and the refusal is the whole experiment
+    rather than the task. An experiment where some arms see pixels and
+    others see extracted text is two experiments wearing one name, and
+    the same holds across tasks: a report averaging an inline task and a
+    native one would be averaging two modalities.
+
+    THE TASK IS NAMED because with two thousand tasks the mode is
+    declared once and the offending document is one line, and the
+    comparison door's message alone would say only which digest.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, attachments_mode="native")
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert "inline mode" in detail, detail
+
+
+def test_an_attachment_free_dataset_records_no_mode_at_all(client, tmp_path):
+    """WINDOW: the experiment record for a dataset with no documents,
+    created with the mode field left at its default.
+
+    THE TWO NULLS. task_attachments NULL and attachments_mode NULL is
+    "no task carried a document", which covers both a pre-M experiment
+    and a post-M one over a plain dataset. Recording "inline" for an
+    experiment with nothing to read would put a modality claim on a run
+    that had no modality, and a later reader could not tell it from one
+    that chose inline over real documents.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["task_attachments"] is None
+    assert detail["attachments_mode"] is None
+
+
+# ---- Phase M2: the runner composes per task, the arithmetic scales.
+
+
+def composed_chars(prompt, digest):
+    """How long the bench's own composition of this task is.
+
+    Built with the production composer over the rendition the store
+    actually holds, rather than with a second implementation of the
+    format: a test that re-derived the header would be asserting that
+    two spellings agree, and would go on passing when both were wrong.
+    """
+    row = app.state.db.execute(
+        "SELECT extractor, extractor_version, kind, extracted_text"
+        " FROM attachment_extractions WHERE digest = ?",
+        (digest,),
+    ).fetchone()
+    return len(compose(prompt, [{"digest": digest, **dict(row)}], redacted=False))
+
+
+def captured(sent):
+    """The user message of every payload the mock received, in order."""
+    return [payload["messages"][-1]["content"] for payload in sent]
+
+
+@respx.mock
+def test_review_repro_a_task_cell_composes_once_and_every_arm_gets_it(client, tmp_path):
+    """WINDOW: the two upstream payloads of one task-cell, captured at
+    the mock, across a two-model lineup over one attachment-carrying
+    task.
+
+    THE DEFECT THIS REPRODUCES is not a divergence, it is an absence.
+    The runner sent task["prompt"] straight to stream_model, so an
+    experiment over a dataset citing documents ran every trial with no
+    document in it: the manifest froze renditions nobody read, the
+    report would have named them, and every cell measured the bare
+    question. So the assertion that matters here is that the document is
+    ON THE WIRE, and the distinct count is the K2-style guard beside it.
+
+    THE COUNT IS THE FAIRNESS LAW at cell level, in the shape K2 uses
+    one level down: one composed string, N sends of it, so identical
+    bytes across a task's arms is a property of the code rather than a
+    promise about it.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done", final
+    # PRE-STATE: both arms really ran, or "identical" would be a claim
+    # about a comparison that barely happened.
+    assert len(sent) == 2, sent
+    # THE REPAIR: the document reached the wire at all.
+    assert "the contract says forty two" in captured(sent)[0]
+    # THE GUARD: and both arms were given the same bytes.
+    assert len(set(captured(sent))) == 1
+    # Rule two: the record references the document by digest and never
+    # carries a second copy of its content.
+    recorded = json.loads(
+        client.app.state.db.execute(
+            "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+        ).fetchone()["request_json"]
+    )["messages"][-1]["content"]
+    assert digest in recorded
+    assert "the contract says forty two" not in recorded
+
+
+@respx.mock
+def test_review_repro_deleting_the_bytes_mid_cell_cannot_split_a_comparison(
+    client, tmp_path
+):
+    """WINDOW: between the first arm's upstream request and the second
+    arm's, inside one task-cell. The deletion is performed from the
+    mock's side effect, which is the only moment in the run where
+    exactly one arm has been sent.
+
+    WHY A CELL COMPOSES ONCE rather than per arm, stated as the thing
+    that goes wrong when it does not. documents_for reads the
+    attachments table, so an arm composing for itself after the row was
+    deleted is refused, and the cell then holds one trial that saw the
+    document beside one that saw an error. That is not one comparison,
+    and no field on either row would say so.
+
+    Composed once, the bytes are already in hand when the row goes away,
+    so both arms send the same string and the deletion changes nothing
+    about this run. It is the next run that refuses, which is the
+    honest-refusal half of the deletion ruling and is asserted at the
+    end.
+    """
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+
+    def route(request):
+        sent.append(json.loads(request.content))
+        if len(sent) == 1:
+            with app.state.db as conn:
+                conn.execute("DELETE FROM attachments WHERE digest = ?", (digest,))
+        return httpx.Response(200, stream=alpha_stream())
+
+    sent = []
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done", final
+    assert final["trials_failed"] == 0, final
+    assert len(sent) == 2, sent
+    assert len(set(captured(sent))) == 1
+    assert "the contract says forty two" in captured(sent)[0]
+    # PRE-STATE FOR THE NEXT SENTENCE: the row really is gone.
+    assert (
+        app.state.db.execute(
+            "SELECT COUNT(*) AS n FROM attachments WHERE digest = ?", (digest,)
+        ).fetchone()["n"]
+        == 0
+    )
+    # And a NEW experiment over the same dataset refuses at creation,
+    # naming the digest, rather than running a comparison with a
+    # document silently missing from it.
+    again = client.post("/experiments", json=experiment_body(path))
+    assert again.status_code == 422
+    assert digest[:12] in again.json()["detail"]
+
+
+@respx.mock
+def test_review_repro_every_repeat_of_a_task_composes_the_same_bytes(client, tmp_path):
+    """WINDOW: the four payloads of a one-task, one-model experiment over
+    two repeats, captured at the mock, with an extraction row written
+    between the first repeat and the second.
+
+    THE FAIRNESS LAW IS STATED AT CELL LEVEL AND USED ACROSS REPEATS.
+    Every tombstone this workstream wrote asserts identical bytes to
+    every ARM of one cell, which is the comparison a card makes. But
+    repeats exist to measure how much a MODEL varies run to run, and the
+    report pools them: two repeats of one task that sent different
+    documents would be pooled as variation in the answer when the
+    question had changed. Nothing proved that until this test, because
+    repeats are separate cells and each composes for itself.
+
+    THE MUTATION IT MOTIVATES is a runner that resolves each cell's
+    documents instead of reading the frozen pin. The upgrade below is a
+    real one, written between cells exactly as a redeploy would write
+    it, and a resolver that asked the store "what is the newest reading
+    of these bytes" would hand repeat two a different document while
+    every field in both records still said the same digest.
+    """
+    sent = []
+
+    def route(request):
+        sent.append(json.loads(request.content))
+        if len(sent) == 2:
+            # Between the two cells of task t1: repeat 0 has sent both
+            # of its arms and repeat 1 has sent none.
+            parser_upgrade(digest, "2", "THE UPGRADED READING")
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path, repeats=2)).json()[
+        "id"
+    ]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done", final
+    # PRE-STATE: two cells of two arms each, and the upgrade landed.
+    assert len(sent) == 4, sent
+    assert (
+        app.state.db.execute(
+            "SELECT COUNT(*) AS n FROM attachment_extractions WHERE digest = ?",
+            (digest,),
+        ).fetchone()["n"]
+        == 2
+    )
+    # ONE COMPOSITION ACROSS ALL FOUR, not one per cell that happened to
+    # agree: the frozen pin names version 1, and version 2 exists.
+    assert len(set(captured(sent))) == 1
+    assert "the contract says forty two" in captured(sent)[0]
+    assert "THE UPGRADED READING" not in json.dumps(sent)
+
+
+@respx.mock
+def test_two_tasks_compose_apart_and_neither_carries_the_others_document(
+    client, tmp_path
+):
+    """WINDOW: the four payloads of a two-task, two-model run, grouped
+    by task.
+
+    PER TASK, NOT PER EXPERIMENT. A composition hoisted out of the cell
+    loop would be built once for the whole sweep and every task would
+    send the first task's document, which is a comparison that measures
+    one question and labels it with another. Two distinct payloads
+    across four sends, one per task, is the shape that says otherwise.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    first = upload(client, "a.txt", b"alpha document body").json()["digest"]
+    second = upload(client, "b.txt", b"beta document body").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "read the first", "attachments": [first]},
+        {"id": "t2", "prompt": "read the second", "attachments": [second]},
+    )
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert len(sent) == 4, sent
+    bodies = captured(sent)
+    assert len(set(bodies)) == 2, bodies
+    for body in bodies:
+        carries_first = "alpha document body" in body
+        assert carries_first != ("beta document body" in body)
+        assert ("read the first" in body) == carries_first
+
+
+@respx.mock
+def test_an_attachment_free_experiment_sends_exactly_the_task_prompt(client, tmp_path):
+    """WINDOW: the upstream payload of a one-task, one-model run over a
+    dataset that declares no document.
+
+    RULE ONE AT THE RUNNER. Every experiment that ran before this phase
+    declared no attachment, so every one of them must still send the
+    bare prompt: no wrapper, no preamble, no trailing newline, and
+    request_json unchanged. A payload that gained a delimiter the day
+    this workstream shipped would make every pre-M experiment
+    incomparable with every later one, and nothing in either record
+    would say why.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "plain question"})
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    assert sent[0]["messages"] == [{"role": "user", "content": "plain question"}]
+    row = app.state.db.execute(
+        "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    assert json.loads(row["request_json"])["messages"] == [
+        {"role": "user", "content": "plain question"}
+    ]
+    # And the group records no documents, which is what the two NULLs
+    # mean one level up.
+    group = client.get("/runs").json()["runs"][0]
+    assert client.get(f"/groups/{group['id']}").json()["attachments"] == []
+
+
+def test_review_repro_one_oversized_task_names_itself_while_the_rest_stand(
+    client, tmp_path
+):
+    """WINDOW: the 422 from POST /experiments, before any row is written.
+
+    THE COMPARISON DOOR'S CHECK, RUN PER TASK. enforce_context_window
+    refuses one prompt against one lineup; a dataset asks that question
+    once per task, and the answer differs by task because the documents
+    do. Without it the refusal arrived as an error card on trial N,
+    after N-1 paid calls, once per narrow model, saying nothing about
+    which task or which document.
+
+    THE COORDINATES ARE THE POINT. A dataset holds up to MAX_TASKS
+    lines, so a refusal naming only the arithmetic leaves the author to
+    find which line it was about; and a refusal that named EVERY task
+    would be false about the ones that fit. Both halves are asserted.
+
+    model/capped publishes a 64000 token window and a 32000 token
+    completion cap, so the standard tier reserves 16384 and about 41216
+    tokens are left for the prompt. The document below is over that and
+    under MAX_COMPOSED_CHARS, which is what puts this check rather than
+    the global ceiling in the refusal.
+    """
+    small = upload(client, "small.txt", b"forty two").json()["digest"]
+    big = upload(client, "big.txt", b"x" * 170_000).json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "fits", "attachments": [small]},
+        {"id": "t2", "prompt": "does not", "attachments": [big]},
+    )
+
+    resp = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/capped"])
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "1 task in this dataset does not fit" in detail, detail
+    assert "task 't2'" in detail, detail
+    # The task that fits is not accused of anything.
+    assert "task 't1'" not in detail, detail
+    # Both numbers, and the model they belong to.
+    assert "model/capped holds 64000 tokens" in detail, detail
+    assert "16384 reserved for the answer" in detail, detail
+    assert "an estimate, characters over 4" in detail, detail
+    # Nothing was created: the refusal costs nothing and leaves nothing.
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+def test_review_repro_a_dataset_where_nothing_fits_is_an_excerpt_not_a_dump(
+    client, tmp_path
+):
+    """WINDOW: the 422 body for three oversized tasks against a two-model
+    lineup, which is six shortfalls against a cap of five.
+
+    THE CAP WAS ON THE WRONG AXIS, and the comment beside it claimed the
+    body was bounded. A shortfall is one task against one MODEL, so the
+    cap counted tasks and the enumeration grew with the lineup: five
+    tasks against a thousand-model lineup emitted five thousand clauses
+    while SHORTFALLS_SHOWN sat there reading like a bound.
+
+    Three tasks cite ONE document deliberately: the defect is about the
+    message and not about the arithmetic, and a single upload is enough
+    to produce it.
+
+    Both halves are asserted. The task COUNT still leads, because how
+    many lines of the dataset are affected is the first thing the author
+    needs; the enumeration under it is an excerpt and says how much it
+    left out.
+    """
+    digest = upload(client, "big.txt", b"x" * 170_000).json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        *(
+            {"id": f"t{n}", "prompt": "does not fit", "attachments": [digest]}
+            for n in range(3)
+        ),
+    )
+
+    resp = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/capped", "model/vision"]),
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "3 tasks in this dataset do not fit" in detail, detail
+    # PRE-STATE: there really are more shortfalls than the cap, or the
+    # excerpt below would be the whole answer.
+    assert detail.count("holds") == main.SHORTFALLS_SHOWN, detail
+    assert "and 1 further model-and-task pair not shown" in detail, detail
+    # And an excerpt is still actionable: the first task named carries
+    # both of its models and both numbers.
+    assert "task 't0': model/capped holds 64000 tokens" in detail, detail
+    assert "task 't0': model/vision holds 8192 tokens" in detail, detail
+
+
+def test_the_composed_ceiling_refuses_a_task_by_name(client, tmp_path):
+    """WINDOW: the 422 from POST /experiments over a task whose
+    composition passes MAX_COMPOSED_CHARS.
+
+    THE GLOBAL CEILING IS A DIFFERENT QUESTION from the window check
+    above: it asks whether the bench will send this at all, for
+    everybody, and it is answered before any lineup is consulted. Per
+    task and named, for the same reason: the author has to know which
+    line to shorten.
+    """
+    digest = upload(client, "huge.txt", b"x" * 210_000).json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "fine"},
+        {"id": "t2", "prompt": "too long", "attachments": [digest]},
+    )
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail.startswith("task 't2':"), detail
+    assert f"over the {MAX_COMPOSED_CHARS} limit" in detail, detail
+
+
+def test_the_estimate_sums_per_task_input_weights(client, tmp_path):
+    """WINDOW: the projected_cost on the 201 from POST /experiments,
+    over a two-task dataset where exactly one task carries a document.
+
+    THE INPUT SIDE STOPPED BEING UNIFORM the moment a task could attach
+    a hundred pages. An estimate that priced every task at one
+    representative weight would under-price a document-heavy dataset by
+    however much the documents weigh, and would do it before the money
+    was spent, which is the one moment the figure exists to inform.
+
+    Asserted against the production composer rather than a second
+    implementation of the format; see composed_chars.
+    """
+    digest = upload(client, "doc.txt", b"y" * 4_000).json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "ask"},
+        {"id": "t2", "prompt": "ask", "attachments": [digest]},
+    )
+
+    created = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    )
+
+    assert created.status_code == 201, created.text
+    cost = created.json()["projected_cost"]
+    bare = -(-len("ask") // 4)
+    attached = -(-composed_chars("ask", digest) // 4)
+    assert cost["input_usd"] == pytest.approx(1e-06 * (bare + attached))
+    # THE MUTATION THIS KILLS: pricing both tasks at the first task's
+    # weight. The two numbers are three orders of magnitude apart, so
+    # the difference is not a rounding argument.
+    assert cost["input_usd"] != pytest.approx(1e-06 * bare * 2)
+    # The output side is per trial and unchanged by the document: two
+    # tasks, one model, one repeat, 16384 tokens reserved each.
+    assert cost["output_usd"] == pytest.approx(2 * 16384 * 2e-06)
+    assert cost["total_usd"] == pytest.approx(cost["input_usd"] + cost["output_usd"])
+    assert cost["unpriced"] == []
+
+
+@respx.mock
+def test_the_estimate_budgets_from_the_resolved_route_not_the_tier(client, tmp_path):
+    """WINDOW: the projected_cost on the 201, for a pinned experiment
+    whose endpoint listing publishes a completion cap below the tier.
+
+    A MODEL-LEVEL CAP IS THE MAXIMUM ANY ROUTE OFFERS, so pricing a
+    pinned sweep from it prices the most generous host in the pool while
+    the pin sends every trial to one particular host. run_one_trial
+    composes route_budget over effective_budget and sends 4096 here;
+    an estimate built from the tier would quote four times the ceiling
+    the run can actually reach, and the window check beside it would
+    refuse datasets that fit.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                        # The endpoint's OWN rates, which the projection
+                        # uses for a pinned model; the same numbers the
+                        # catalog publishes here so this test keeps
+                        # measuring the budget clamp and not the price.
+                        # F3's test measures the price.
+                        "pricing": {"prompt": "0.000001", "completion": "0.000002"},
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    created = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    )
+
+    assert created.status_code == 201, created.text
+    cost = created.json()["projected_cost"]
+    assert cost["output_usd"] == pytest.approx(4096 * 2e-06)
+    assert cost["output_usd"] != pytest.approx(16384 * 2e-06)
+
+
+def test_an_unpriced_lineup_member_makes_every_figure_none_and_names_it(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost for a lineup with one priced model and
+    one the catalog says nothing about.
+
+    AN INCOMPLETE PRICE IS NOT A SMALL PRICE. Summing the members that
+    publish prices would return a figure that reads as the sweep's cost
+    and is wrong by however much the silent member charges. The browser
+    already omits its own estimate on this condition, and two estimators
+    disagreeing about what an unpriced model means would be worse than
+    either.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    cost = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta"]),
+    ).json()["projected_cost"]
+
+    assert cost == {
+        "input_usd": None,
+        "output_usd": None,
+        "total_usd": None,
+        "unpriced": ["model/beta"],
+    }
+
+
+def test_native_mode_prices_the_output_and_declines_to_price_the_images(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost for an experiment whose documents ride
+    as native image parts.
+
+    HALF A FIGURE, HONESTLY. A native payload is billed in image tokens
+    and nothing this bench holds converts pixels to them, so the input
+    side is None rather than a character count of a string that will
+    never be sent. The output side is measured the same way in both
+    modes and stands, because dropping it too would withhold a number
+    the bench does know.
+    """
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+
+    created = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], attachments_mode="native"),
+    )
+
+    assert created.status_code == 201, created.text
+    cost = created.json()["projected_cost"]
+    assert cost["input_usd"] is None
+    assert cost["total_usd"] is None
+    assert cost["output_usd"] == pytest.approx(16384 * 2e-06)
+    assert cost["unpriced"] == []
+
+
+# ---- Thirteenth review, F1: inline mode has a door at the experiment
+# ---- boundary and one at the runner, and both call the same check.
+
+
+def test_review_repro_an_image_cited_by_an_inline_task_is_refused_at_creation(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments over a dataset citing a PNG, created
+    with the default attachments_mode.
+
+    MEASURED BEFORE THE FIX, at 00752aa: creation returned 201, the run
+    finished done, one upstream call was made, and every model received
+
+        ----- attachment 1 of 1: image, read by none 0, sha256 6e0fc8 -----
+
+        ----- end attachment 1 of 1 -----
+
+    an empty delimited block, which is enforce_inline_mode's own
+    sentence come true. The experiment boundary checked native mode and
+    only native mode, so the modality that HAS no text to compose was
+    the one nothing stopped.
+
+    THE REMEDY IS NAMED because switching mode is a one-word fix, and a
+    refusal that says only what is wrong leaves the author guessing
+    which of two modes they wanted.
+    """
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert digest[:12] in detail, detail
+    assert "is an image" in detail, detail
+    assert "Use native mode" in detail, detail
+    # Nothing was created: the refusal costs nothing and leaves nothing.
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+@respx.mock
+def test_review_repro_the_runner_refuses_an_inline_image_before_it_spends(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments/{id}/start over a stored experiment row
+    whose mode says inline and whose frozen pin is an image, drained to
+    a terminal status, with the upstream mock counting calls.
+
+    THE ROW AN EARLIER BUILD WROTE. Creation refuses this now, so the
+    only way to reach the runner with it is to hold a row created before
+    the check existed, which is exactly the state a person upgrading
+    this bench has: an experiment sitting at status "created" that would
+    make the paid calls the finding is about. A door that trusts a row
+    another build wrote is a door with no check.
+
+    Built here by creating the experiment under NATIVE mode, which the
+    boundary accepts, and then writing the mode the older build would
+    have stored. That is real state in the real schema rather than a
+    monkeypatched check.
+
+    ZERO UPSTREAM CALLS is the assertion that matters. A refusal that
+    arrived after the first trial would have already spent the money the
+    check exists to protect.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], attachments_mode="native"),
+    ).json()["id"]
+    with app.state.db as conn:
+        conn.execute(
+            "UPDATE experiments SET attachments_mode = 'inline' WHERE id = ?", (eid,)
+        )
+    # PRE-STATE: the row really says inline over an image pin, or the
+    # refusal below would be a refusal of nothing.
+    stored = client.get(f"/experiments/{eid}").json()
+    assert stored["attachments_mode"] == "inline"
+    assert stored["task_attachments"]["t1"][0]["kind"] == "image"
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "failed", final
+    assert "task 't1'" in final["status_detail"], final
+    assert "Use native mode" in final["status_detail"], final
+    assert sent == []
+    # And no group was written for the cell that refused: the check runs
+    # ahead of the row exactly as the composition does.
+    assert client.get("/runs").json()["runs"] == []
+
+
+# ---- Thirteenth review, F2: the arithmetic weighs what the runner
+# ---- sends, which is two messages and not one.
+
+
+def test_review_repro_a_task_system_message_counts_against_the_window(client, tmp_path):
+    """WINDOW: POST /experiments over the reviewer's shape, a
+    one-character prompt and a tiny attachment against a 20,000 token
+    model, with and without a 20,000 character task system message.
+
+    MEASURED BEFORE THE FIX, at 01e3f90: creation returned 201, having
+    measured 221 characters and 16,440 needed tokens against 18,000
+    usable. The request the runner then sent carried 20,224 characters
+    across two messages, 5,056 input tokens, and needed 21,440, which
+    does not fit. The experiment ran to done.
+
+    THE CONTROL IS THE SAME DATASET WITHOUT THE SYSTEM MESSAGE, so the
+    refusal is attributable to the message rather than to the document:
+    the arithmetic has to admit one and refuse the other.
+
+    ALL THREE COMPONENTS ARE NAMED because the remedy differs by
+    component. Shorten the document, shorten the system prompt, or lower
+    the budget: a refusal that showed one number would leave the author
+    to guess which of the three to touch.
+    """
+    digest = upload(client, "d.txt", b"tiny").json()["digest"]
+    fits = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "x", "attachments": [digest]},
+        name="fits.jsonl",
+    )
+    over = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "x",
+            "system": "S" * 20_000,
+            "attachments": [digest],
+        },
+        name="over.jsonl",
+    )
+
+    admitted = client.post(
+        "/experiments", json=experiment_body(fits, lineup=["model/narrow"])
+    )
+    refused = client.post(
+        "/experiments", json=experiment_body(over, lineup=["model/narrow"])
+    )
+
+    # THE CONTROL: without the system message the same exchange fits.
+    assert admitted.status_code == 201, admitted.text
+    assert refused.status_code == 422, refused.text
+    detail = refused.json()["detail"]
+    assert "task 't1'" in detail, detail
+    assert "model/narrow holds 20000 tokens" in detail, detail
+    # 56 for the prompt and its document, 5000 for the system message,
+    # 16384 reserved: 21440 against 18000 usable.
+    assert "this needs about 21440" in detail, detail
+    assert "56 for the prompt" in detail, detail
+    assert "5000 for the system message" in detail, detail
+    assert "16384 reserved for the answer" in detail, detail
+
+
+@respx.mock
+def test_review_repro_the_projection_prices_the_system_message_it_will_send(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost on the 201, against the characters the
+    runner's own payload carries, read off the mock.
+
+    MEASURED BEFORE THE FIX: the same task quoted $0.000056 of input
+    where the branch's own heuristic over what was actually sent gives
+    $0.005056, a hundredfold understatement of the half of the bill the
+    person was being shown before spending.
+
+    THE PAYLOAD IS THE ORACLE, deliberately. Asserting the projection
+    against a number this test computed would be asserting that two
+    tests agree; asserting it against the characters the mock received
+    is asserting that the estimate describes the request.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "x", "system": "S" * 8_000})
+
+    created = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/narrow"])
+    )
+
+    assert created.status_code == 201, created.text
+    quoted = created.json()["projected_cost"]["input_usd"]
+    run_experiment_to_completion(client, created.json()["id"], path)
+
+    assert [message["role"] for message in sent[0]["messages"]] == ["system", "user"]
+    # The heuristic, applied per message exactly as input_tokens applies
+    # it, over the two strings the provider actually received.
+    tokens = sum(-(-len(message["content"]) // 4) for message in sent[0]["messages"])
+    assert quoted == pytest.approx(tokens * 1e-06)
+    # And the defect's own number is not what came back.
+    assert quoted != pytest.approx(-(-len("x") // 4) * 1e-06)
+
+
+def test_an_experiment_system_prompt_is_weighed_when_the_task_sets_none(
+    client, tmp_path
+):
+    """WINDOW: the projection for a dataset whose task declares no
+    system message, run under an experiment that does.
+
+    A TASK'S OWN OVERRIDES THE EXPERIMENT'S and an absent one leaves the
+    experiment's in place, which is the runner's rule and is now
+    task_system's. An arithmetic that read only the task's field would
+    weigh nothing here and would be wrong by the whole global prompt on
+    every task of the sweep.
+    """
+    plain = write_dataset(tmp_path, {"id": "t1", "prompt": "x"}, name="a.jsonl")
+
+    bare = client.post(
+        "/experiments", json=experiment_body(plain, lineup=["model/narrow"])
+    ).json()["projected_cost"]["input_usd"]
+    global_system = client.post(
+        "/experiments",
+        json=experiment_body(
+            plain, lineup=["model/narrow"], params={"system": "S" * 4_000}
+        ),
+    ).json()["projected_cost"]["input_usd"]
+
+    assert bare == pytest.approx(1 * 1e-06)
+    assert global_system == pytest.approx((1 + 1_000) * 1e-06)
+
+
+# ---- Thirteenth review, F3 and F4: a projection is priced by the
+# ---- publication that speaks for the route, and refuses what it
+# ---- cannot count.
+
+
+@respx.mock
+def test_review_repro_a_pinned_experiment_prices_from_its_own_endpoint(
+    client, tmp_path
+):
+    """WINDOW: the projected_cost on the 201 for a strict experiment
+    pinned to an endpoint whose published rates are a thousand times the
+    catalog's.
+
+    MEASURED BEFORE THE FIX, at ca72742, in the reviewer's shape:
+    catalog rates 0.000001 and 0.000002, pinned endpoint rates 0.001 and
+    0.002 with a cap of 100, one task. The projection returned
+    $0.000201; the resolved endpoint's own rates give $0.201, a
+    thousandfold understatement under a label that says "at most".
+
+    THE MODEL LEVEL IS ONE ROUTE'S PRICE. Measured live on 2026-08-30,
+    openai/gpt-oss-120b published prompt 0.000000037 at the model level
+    and thirteen distinct rate pairs across its twenty endpoints, from
+    0.00000003 to 0.00000035 on the prompt side. The listing this test
+    stubs is that shape with the numbers made loud.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 100,
+                        "supported_parameters": ["max_tokens"],
+                        "pricing": {"prompt": "0.001", "completion": "0.002"},
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    created = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    )
+
+    assert created.status_code == 201, created.text
+    cost = created.json()["projected_cost"]
+    # One task, one model, one repeat: one prompt token at the
+    # endpoint's input rate, 100 reserved at its output rate.
+    assert cost["input_usd"] == pytest.approx(1 * 0.001)
+    assert cost["output_usd"] == pytest.approx(100 * 0.002)
+    assert cost["total_usd"] == pytest.approx(0.201)
+    # And emphatically not the catalog's figure, which is what the
+    # branch quoted before this commit.
+    assert cost["total_usd"] != pytest.approx(0.000201)
+
+
+@respx.mock
+def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
+    client, tmp_path
+):
+    """WINDOW: the projection for a pinned model whose endpoint listing
+    carries no pricing object, with the model-level map fully populated.
+
+    FALLING BACK IS THE SUBSTITUTION THE PIN EXISTS TO PREVENT. The
+    catalog can answer, and its answer is about a different route, so
+    borrowing it would put a confident figure on a question nobody
+    asked. This is the same asymmetry trial_route already draws for the
+    reasoning field: an unanswerable listing is an absence, not a
+    licence to use the aggregate.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    cost = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    # PRE-STATE: the model-level map does know this model's price, so
+    # the null below is a refusal and not an absence of data.
+    assert app.state.prices["model/alpha"]["prompt"] == 1e-06
+    assert cost["total_usd"] is None
+    assert cost["unpriced"] == ["model/alpha"]
+
+
+def test_review_repro_a_request_charge_makes_the_projection_null_not_zero(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: the projection for a model whose pricing map publishes a
+    nonzero dimension this bench has no arithmetic for.
+
+    MEASURED BEFORE THE FIX, in the reviewer's shape: pricing
+    {prompt: 0, completion: 0, request: 0.25} parsed into a fully
+    "priced" map of two zeroes, and two tasks over three repeats
+    returned every figure as 0.0 with unpriced empty, against six fixed
+    request charges totalling $1.50. A zero that is wrong is worse than
+    a null that is honest, because only one of them is read as an
+    answer.
+
+    THE DIMENSION IS NAMED, because a model with two published rates
+    coming back unpriced would otherwise send a reader to the catalog to
+    work out why.
+
+    PINNED AGAINST THE LIVE PUBLICATION rather than a guess: no model in
+    the 2026-08-30 snapshot of all 396 entries published a request
+    charge, which is exactly why the rule is about UNKNOWN keys and not
+    about a list of known ones. The dimensions that snapshot does carry
+    are named in TOKEN_PRICE_DIMENSIONS.
+    """
+    monkeypatch.setitem(
+        app.state.prices,
+        "model/alpha",
+        {"prompt": 0.0, "completion": 0.0, "beyond": ["request"]},
+    )
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "a"}, {"id": "t2", "prompt": "b"}
+    )
+
+    cost = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], repeats=3),
+    ).json()["projected_cost"]
+
+    assert cost["input_usd"] is None
+    assert cost["output_usd"] is None
+    assert cost["total_usd"] is None
+    assert cost["unpriced"] == ["model/alpha (charges request)"]
+
+
+def test_a_dimension_published_at_zero_is_a_zero_and_not_an_unknown(client, tmp_path):
+    """WINDOW: the catalog parse and the projection for a pricing map
+    whose extra dimensions are all published at 0.
+
+    THE OTHER HALF OF THE RULE, and without it the fix would take most
+    of the live catalog offline for no reason: 235 of the 396 models in
+    the 2026-08-30 snapshot publish input_cache_read, and a rule that
+    refused on the KEY rather than on a nonzero charge would refuse
+    every one of them whether or not it costs anything. A dimension the
+    publisher priced at zero is priced.
+    """
+    rates, beyond = token_rates(
+        {
+            "prompt": "0.000001",
+            "completion": "0.000002",
+            "input_cache_read": "0",
+            "web_search": "0",
+        }
+    )
+
+    assert rates == {"prompt": 1e-06, "completion": 2e-06}
+    assert beyond == []
+    # And the same map with one of them charging is refused, naming it.
+    _, charged = token_rates(
+        {"prompt": "0.000001", "completion": "0.000002", "web_search": "0.004"}
+    )
+    assert charged == ["web_search"]
+    # An overrides OBJECT is not a number to compare against zero, and
+    # counts as charged rather than as absent: it describes conditional
+    # pricing, and reading it as nothing would read "prices vary" as
+    # "prices do not".
+    _, conditional = token_rates(
+        {"prompt": "0.000001", "completion": "0.000002", "overrides": {"a": 1}}
+    )
+    assert conditional == ["overrides"]
+    # And end to end, over the running catalog: model/alpha publishes
+    # only the two dimensions, so it is priceable and the projection
+    # answers with a figure.
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    cost = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["projected_cost"]
+    assert cost["unpriced"] == []
+    assert cost["total_usd"] is not None
+
+
+# ---- Thirteenth review, F5: one digest under two readings is two
+# ---- documents, in the report as everywhere else.
+
+
+@respx.mock
+def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
+    client, tmp_path
+):
+    """WINDOW: GET /experiments/{id}/report over a task that cites one
+    digest twice, with a complete pin for text version 1 and another for
+    text version 2.
+
+    THE CALL-SITE-KEYS LENS, and this is what it is for. Two lists that
+    describe one declaration position by position were joined through a
+    mapping keyed on ONE of their fields, so the key was not the
+    declaration: the last pin for a digest won and both positions were
+    described by it. Everything else on the branch iterates the pins in
+    order (documents_for says so in a paragraph, for precisely this
+    case), and the report alone indexed them.
+
+    MEASURED BEFORE THE FIX, at d680e9d: the dataset parse, the creation
+    freeze, the composed payload, the group row and the v5 export
+    manifest all carried both readings; report.attachments and
+    report.task_attachments carried one, and it was version 2 in both
+    positions. The report's provenance was false about the first
+    document, which is worse than incomplete.
+
+    THE WHOLE JOURNEY IS ASSERTED, not just the report, because the
+    finding is that one hop disagreed with the rest and a test of the
+    report alone could not show that.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = upload(client, "contract.txt", b"reading one").json()["digest"]
+    parser_upgrade(digest, "2", "reading two")
+    pins = [
+        {
+            "digest": digest,
+            "extractor": "text",
+            "extractor_version": version,
+            "kind": "document",
+        }
+        for version in ("1", "2")
+    ]
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "compare the readings", "attachments": pins}
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+
+    # HOP: the creation freeze keeps both, in order.
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == pins
+    final = run_experiment_to_completion(client, eid, path)
+    assert final["status"] == "done", final
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    # THE HOP THAT COLLAPSED THEM. Two entries, in declaration order,
+    # each naming its own reading.
+    assert [entry["extractor_version"] for entry in report_body["attachments"]] == [
+        "1",
+        "2",
+    ]
+    assert [
+        entry["extractor_version"] for entry in report_body["task_attachments"]["t1"]
+    ] == ["1", "2"]
+    # And the payload really did carry both readings, so the report is
+    # describing something that happened.
+    group = client.get("/runs").json()["runs"][0]
+    assert store.group_renditions(app.state.db, group["id"]) == pins
+    lines = export_lines(client, eid)
+    assert lines[0]["task_attachments"]["t1"] == pins
+    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [pins]
+
+
+def test_the_dedup_key_is_the_whole_pin_and_not_three_quarters_of_it(client):
+    """WINDOW: _declared_documents over two pins differing only in kind.
+
+    ASSERTED AT THE FUNCTION rather than through an experiment, because
+    the store cannot currently produce this pair: attachment_extractions
+    is unique on (digest, extractor, extractor_version), so two readings
+    that differ in kind differ in extractor as well, and every door
+    resolves a pin by those three. That makes kind's absence from the
+    key harmless TODAY and only today.
+
+    A key that is not the declaration is a key that becomes wrong for a
+    reason nobody wrote down, which is what the digest-only version of
+    this key already did once. The function's contract is that a
+    declaration keys itself, and the cheapest place to hold it to that
+    is here.
+    """
+    digest = "c" * 64
+    group = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": [digest, digest],
+        "renditions": [
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": kind,
+            }
+            for kind in ("document", "image")
+        ],
+    }
+
+    keys = [key for key, _entry in report._declared_documents(group)]
+
+    assert len(set(keys)) == 2, keys
+    assert [entry["kind"] for _key, entry in report._declared_documents(group)] == [
+        "document",
+        "image",
+    ]
+
+
+def test_a_group_that_pinned_nothing_still_lists_the_documents_it_declared(client):
+    """WINDOW: _declared_documents over a pre-K.1 shape, digests with no
+    renditions.
+
+    THE FALLBACK THE PAIRING NEEDS. attachments and renditions are
+    written one for one and in order, so pairing them by position is
+    correct wherever both exist; a group from the era that declared
+    digests and no reading has a length disagreement rather than a
+    shorter list, and its documents are still facts about it. Dropping
+    them would shrink a declaration silently, which is the failure
+    AttachmentRef exists to prevent one table over.
+    """
+    legacy = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": ["a" * 64, "b" * 64],
+        "renditions": None,
+    }
+
+    entries = [entry for _key, entry in report._declared_documents(legacy)]
+
+    assert entries == [
+        {"digest": "a" * 64, "mode": "inline"},
+        {"digest": "b" * 64, "mode": "inline"},
+    ]
+
+
+# ---- Thirteenth review, F6: the served report and the rebuild
+# ---- classify an interrupted empty cell the same way.
+
+
+def test_review_repro_an_empty_cell_reads_the_same_served_and_rebuilt(client, tmp_path):
+    """WINDOW: the served report and the report rebuilt from the export,
+    over an experiment holding one attachment-bearing group that
+    recorded no result. That is what interruption between the group
+    write and the first trial leaves behind.
+
+    MEASURED BEFORE THE FIX, at 54c53ec:
+
+      served    cells_recorded 1, missing 1, not_run 0, with the
+                cell's document provenance
+      rebuilt   cells_recorded 0, missing 0, not_run 1, with none
+
+    M3's claim is that the report stays rebuildable from the artifact,
+    and it did not hold: the export emits a line per RESULT, so an empty
+    group contributes nothing to the file, while the report counted
+    every group it was handed.
+
+    THE CHOICE, and it is one. Either the export carries empty-group
+    declarations, or both surfaces classify the state identically. This
+    branch takes the second: "an artifact is described by what is in it"
+    is the export's own rule and has its own tombstone, since a flag
+    claiming a reference the file does not carry sends a reader looking
+    for a digest that is not there. Making the report agree with the
+    artifact keeps that argument; making the artifact agree with the
+    report would have spent it. What the cell was owed is not lost:
+    the v5 manifest carries the frozen per-task declaration for every
+    task, run or not, which this test also asserts.
+
+    THE RULE LIVES IN build_report, not in the boundary's reader, so the
+    two paths agree BY CONSTRUCTION rather than by both happening to do
+    the same thing.
+    """
+    digest = upload(client, "ghost.txt", b"declared but never run").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    # THE ONLY CELL OF THE PLAN, written as the runner writes it and
+    # then left without a trial, which is what interruption between the
+    # group row and the first result leaves behind.
+    store.create_group(
+        app.state.db,
+        "what does it say?",
+        ["model/alpha"],
+        None,
+        "standard",
+        experiment={
+            "experiment_id": eid,
+            "task_id": "t1",
+            "repeat_index": 0,
+            "rotation_index": 0,
+        },
+        renditions=[
+            {
+                "digest": digest,
+                "extractor": "text",
+                "extractor_version": "1",
+                "kind": "document",
+            }
+        ],
+        attachments_mode="inline",
+    )
+
+    served = client.get(f"/experiments/{eid}/report").json()
+    lines = export_lines(client, eid)
+    rebuilt = rebuild_from_export(lines, None)
+
+    # PRE-STATE: the empty group really is there, and it is the plan's
+    # only cell, or the equality below would be an equality over
+    # nothing.
+    assert (
+        app.state.db.execute(
+            "SELECT COUNT(*) AS n FROM groups WHERE experiment_id = ?", (eid,)
+        ).fetchone()["n"]
+        == 1
+    )
+    assert served["plan"]["cells"] == 1
+    assert [line["type"] for line in lines] == ["manifest", "digest"]
+
+    # THE EQUALITY THE REBUILD CLAIM NEEDS, on every count the empty
+    # cell moved and on the provenance it published.
+    assert served["plan"] == rebuilt["plan"]
+    assert served["plan"]["cells_recorded"] == 0
+    assert served["attachments"] == rebuilt["attachments"] == []
+    assert served["task_attachments"] == rebuilt["task_attachments"] == {}
+    assert digest not in json.dumps(served)
+    assert [row["trials"] for row in served["models"]] == [
+        row["trials"] for row in rebuilt["models"]
+    ]
+    # not_run on both, which is what it is: no cell at all from the
+    # point of view of a report about what ran.
+    assert served["models"][0]["trials"]["not_run"] == 1
+
+    # WHAT IT WAS OWED IS STILL IN THE FILE, at line one, which is the
+    # half of the answer the report is not the place for.
+    assert lines[0]["type"] == "manifest"
+    assert lines[0]["task_attachments"]["t1"][0]["digest"] == digest
+    assert lines[0]["attachments_referenced"] is True
+
+
+def test_a_cell_with_one_arm_recorded_is_still_a_cell(client, tmp_path):
+    """WINDOW: build_report's own filter, over a group with a result and
+    a group without one.
+
+    THE FILTER IS ABOUT EMPTY CELLS, not about incomplete ones. A cell
+    where one model answered and another never ran is exactly what
+    "missing" is for: the group exists, its neighbours ran, and the
+    absence is attributable to an arm. Dropping it would erase a real
+    comparison and would move its missing arms into not_run, which
+    counts them as never reached instead of as reached and unanswered.
+    """
+    groups = [{"id": 1, "task_id": "t1"}, {"id": 2, "task_id": "t2"}]
+    runs = {
+        1: [{"id": 10, "results": [{"id": 100}]}],
+        # A run row with no results at all, which is what a group written
+        # before its first trial holds.
+        2: [{"id": 11, "results": []}],
+    }
+
+    assert report.recorded_groups(groups, runs) == [groups[0]]
+    assert report.recorded_groups(groups, {}) == []
+
+
+# ---- Thirteenth review panel, A and C: a declaration about no
+# ---- document is refused at the fourth door, and composed as nothing
+# ---- at the composer.
+
+
+@respx.mock
+def test_review_repro_a_document_free_task_keeps_its_bare_prompt_in_native_mode(
+    client, tmp_path
+):
+    """WINDOW: the two upstream payloads of a native experiment over a
+    MIXED dataset, t1 citing an image and t2 citing nothing, read off
+    the mock; and the same task t2 through an inline experiment and
+    through POST /compare, for comparison.
+
+    MEASURED BEFORE THE FIX, at 38bf72d, by the adversarial panel. The
+    native experiment was created 201, ran to done, and put this on the
+    wire for the task that declared nothing:
+
+        [{"type": "text", "text": "no document here"}]
+
+    where the same task in an inline experiment and through both
+    comparison doors sends the bare string. A task's payload was
+    restructured because a SIBLING task in the same dataset attached an
+    image, so its results were not comparable with the same task run
+    anywhere else. compose() has carried the matching guard since Phase
+    K ("a comparison with no attachment sends exactly the prompt it
+    always did, with no delimiter, no preamble"); compose_native never
+    had one, and the runner is the only caller that can reach it empty
+    because composed_for short-circuits at both comparison doors.
+
+    THE THREE SPELLINGS ARE ASSERTED EQUAL, which is the point: rule one
+    is a claim about what a payload looks like when nothing is attached,
+    and it has to hold at every door or the runs are not comparable.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    mixed = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "look at this", "attachments": [digest]},
+        {"id": "t2", "prompt": "no document here"},
+        name="mixed.jsonl",
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(mixed, lineup=["model/alpha"], attachments_mode="native"),
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, mixed)
+
+    assert final["status"] == "done", final
+    assert len(sent) == 2, sent
+    by_task = {}
+    for payload in sent:
+        content = payload["messages"][-1]["content"]
+        by_task["t1" if isinstance(content, list) else "t2"] = content
+    # The attachment-carrying task still sends parts, images and all.
+    assert [part["type"] for part in by_task["t1"]] == ["text", "image_url"]
+    # THE REPAIR: the task that declared nothing sends the bare string,
+    # not a one-element content array wrapping it.
+    assert by_task["t2"] == "no document here"
+
+    # And the same task through the other two doors, byte for byte.
+    plain = write_dataset(
+        tmp_path, {"id": "t2", "prompt": "no document here"}, name="plain.jsonl"
+    )
+    sent.clear()
+    inline_eid = client.post(
+        "/experiments", json=experiment_body(plain, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, inline_eid, plain)
+    client.post(
+        "/compare", json={"prompt": "no document here", "models": ["model/alpha"]}
+    )
+    assert [p["messages"][-1]["content"] for p in sent] == [
+        "no document here",
+        "no document here",
+    ]
+
+
+def test_the_native_composer_returns_the_prompt_when_it_is_given_nothing(client):
+    """WINDOW: compose_native itself, with an empty document list.
+
+    ASSERTED AT THE COMPOSER as well as through the runner, because the
+    runner is only today's reachable caller. A guard held in place by
+    which callers happen to exist is a guard that comes off when
+    somebody adds a caller, which is exactly how this one arrived.
+    """
+    from bench.extract import compose_native
+
+    assert compose_native("ask", [], redacted=False) == "ask"
+    assert compose_native("ask", [], redacted=True) == "ask"
+
+
+def test_review_repro_the_experiment_door_refuses_a_mode_about_nothing(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments with attachments_mode "native" over a
+    dataset whose tasks cite no document, beside the same body at the
+    three doors that already refused it.
+
+    THE FOURTH DOOR. POST /groups refuses a mode declared with no
+    attachment, and enforce_mode_entry refuses it at both compare doors;
+    POST /experiments accepted it, recorded nothing, and its own comment
+    cited GroupCreate as doing the same. GroupCreate does the opposite.
+    A caller who believed they had asked for a reading had asked for
+    nothing, which is the failure the other three doors spend a
+    paragraph each on.
+
+    ALL FOUR ARE ASSERTED HERE, so the parity is the test's subject
+    rather than a claim in its docstring.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+
+    experiment = client.post(
+        "/experiments", json=experiment_body(path, attachments_mode="native")
+    )
+    group = client.post(
+        "/groups",
+        json={
+            "prompt": "a",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments_mode": "native",
+        },
+    )
+    compare = client.post(
+        "/compare",
+        json={"prompt": "a", "models": ["model/alpha"], "attachments_mode": "native"},
+    )
+    stream = client.post(
+        "/compare/stream",
+        json={"prompt": "a", "model": "model/alpha", "attachments_mode": "native"},
+    )
+
+    assert experiment.status_code == 422, experiment.text
+    assert "declared without any attachment" in experiment.json()["detail"]
+    assert [group.status_code, compare.status_code, stream.status_code] == [
+        422,
+        422,
+        422,
+    ]
+    # Nothing was created: the refusal costs nothing and leaves nothing.
+    assert client.get("/experiments").json()["experiments"] == []
+    # And the default is still accepted over a plain dataset.
+    assert client.post("/experiments", json=experiment_body(path)).status_code == 201
+
+
+@respx.mock
+def test_a_group_that_declared_no_document_refuses_a_member_claiming_a_mode(
+    client, tmp_path
+):
+    """WINDOW: enforce_group_experiment against a group whose
+    attachments_json is NULL, with a member sending attachments_mode
+    "native".
+
+    THE SHORT-CIRCUIT THIS REPLACES. _attachments_conflict returned None
+    as soon as it saw a NULL declaration and no requested digests, so
+    the mode halves were never compared and a member could claim a
+    reading of a comparison that holds no documents. A legacy group
+    sending the default still passes, because "inline" is what the
+    absence spells.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    group_id = client.post(
+        "/groups",
+        json={"prompt": "a", "models": ["model/alpha"], "budget": "standard"},
+    ).json()["id"]
+
+    claimed = client.post(
+        "/compare",
+        json={
+            "prompt": "a",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments_mode": "native",
+        },
+    )
+    default = client.post(
+        "/compare",
+        json={"prompt": "a", "models": ["model/alpha"], "group_id": group_id},
+    )
+
+    # 409 and not 422: a group manifest conflict is what this is, and
+    # enforce_group_experiment runs ahead of enforce_mode_entry at this
+    # door, so the more specific refusal wins. The message names both
+    # modes.
+    assert claimed.status_code == 409, claimed.text
+    assert "declared attachments_mode 'inline'" in claimed.json()["detail"]
+    assert "sent 'native'" in claimed.json()["detail"]
+    assert default.status_code == 200, default.text
+
+
+# ---- Thirteenth review panel, B: the pinned path names the dimension
+# ---- it cannot count, and E: endpoint_rates' two rules are tested.
+
+
+@respx.mock
+def test_review_repro_a_pinned_route_names_the_dimension_it_charges(client, tmp_path):
+    """WINDOW: the projected_cost on the 201 for a strict experiment
+    pinned to an endpoint whose pricing carries a nonzero dimension the
+    bench cannot count, beside the same refusal on the model-level path.
+
+    MEASURED BEFORE THE FIX, at a9f3675, by five of the panel's ten
+    lenses. endpoint_rates returns rates None exactly when the route
+    charges an uncountable dimension, and experiment_prices collapsed
+    that to a bare None, so the projection reported "model/alpha" with
+    no reason. That is the same string a route whose listing could not
+    answer at all produces, so the two causes were indistinguishable,
+    and both experiment_prices' own docstring and the README promised
+    the dimension would be named.
+
+    THE TWO PATHS ARE ASSERTED TOGETHER, because "exactly as a
+    model-level map with the same dimension does" is the claim, and a
+    test of one path cannot check a claim about both agreeing.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                        "pricing": {
+                            "prompt": "0.000001",
+                            "completion": "0.000002",
+                            "request": "0.25",
+                        },
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    pinned = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    assert pinned["total_usd"] is None
+    assert pinned["unpriced"] == ["model/alpha (charges request)"]
+
+    # THE MODEL-LEVEL PATH, same shape of answer, which is what the
+    # docstring's "exactly as" is asserting.
+    app.state.prices["model/alpha"] = {
+        "prompt": 1e-06,
+        "completion": 2e-06,
+        "beyond": ["request"],
+    }
+    unpinned = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["projected_cost"]
+
+    assert unpinned["unpriced"] == pinned["unpriced"]
+
+
+@respx.mock
+def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_path):
+    """WINDOW: the projection for a pinned route whose listing publishes
+    no pricing at all, against the one above.
+
+    THREE ANSWERS, NOT TWO. "This route charges something I cannot
+    count" and "I know nothing about this route's price" are different
+    facts with different remedies, and collapsing them was half of what
+    the finding was about. The bare name is the honest answer to the
+    second and only to the second.
+    """
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 4096,
+                        "supported_parameters": ["max_tokens"],
+                    }
+                ]
+            }
+        }
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+
+    cost = client.post(
+        "/experiments",
+        json=strict_body(path, provider_pins={"model/alpha": "together"}),
+    ).json()["projected_cost"]
+
+    assert cost["unpriced"] == ["model/alpha"]
+    assert "charges" not in cost["unpriced"][0]
+
+
+def test_review_repro_the_highest_matching_endpoint_rate_is_the_one_used():
+    """WINDOW: endpoint_rates over one pin matching two endpoints with
+    different rates.
+
+    MEASURED BEFORE THIS TEST EXISTED: `max` could be changed to `min`
+    and the entire suite stayed green at 976 passed. The rule is stated
+    in the function's own docstring ("THE HIGHEST MATCHING RATE WINS,
+    which is the mirror of endpoint_completion_cap taking the lowest cap
+    and has the same reason: a pin names a PROVIDER, that provider may
+    serve the model from several endpoints, the request has to survive
+    whichever the router picks, and this figure is a ceiling") and
+    nothing held it.
+
+    COMPARED DIMENSION BY DIMENSION, not by total, which is the other
+    half of the stated rule: the cheaper prompt rate and the dearer
+    completion rate come from different endpoints here, so a
+    whole-endpoint pick would return one of the two pairs and this
+    returns neither.
+    """
+    listing = {
+        "fetched": True,
+        "endpoints": [
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 9.0},
+                "beyond": [],
+            },
+            {
+                "slug": "together",
+                "rates": {"prompt": 5.0, "completion": 2.0},
+                "beyond": [],
+            },
+            {
+                "slug": "elsewhere",
+                "rates": {"prompt": 99.0, "completion": 99.0},
+                "beyond": [],
+            },
+        ],
+    }
+
+    rates, beyond = endpoint_rates(listing, "Together")
+
+    assert rates == {"prompt": 5.0, "completion": 9.0}
+    assert beyond == []
+    # The pin decides which endpoints are looked at at all.
+    assert endpoint_rates(listing, "nobody") == (None, [])
+    assert endpoint_rates({"fetched": False, "endpoints": []}, "together") == (None, [])
+
+
+def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
+    """WINDOW: endpoint_rates over one pin matching two endpoints, one of
+    which charges a dimension this bench cannot count.
+
+    MEASURED BEFORE THIS TEST EXISTED: the refusal could be deleted
+    outright and the suite stayed green at 976 passed.
+
+    ANY MATCHING ENDPOINT POISONS THE PIN, because the router may pick
+    it. Returning the other endpoint's clean rates would be quoting the
+    one route the pin does not guarantee.
+    """
+    listing = {
+        "fetched": True,
+        "endpoints": [
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 2.0},
+                "beyond": [],
+            },
+            {
+                "slug": "together",
+                "rates": {"prompt": 1.0, "completion": 2.0},
+                "beyond": ["request"],
+            },
+        ],
+    }
+
+    rates, beyond = endpoint_rates(listing, "together")
+
+    assert rates is None
+    assert beyond == ["request"]
+
+
+# ---- Thirteenth review panel, D: F2 is enforced at four doors, so it
+# ---- is tested at four doors.
+
+
+def narrow_body(digest, system=None):
+    """One attachment-carrying request against the narrow model.
+
+    The window check applies only to attachment-carrying requests, at
+    every door and by a named deferral, so the document is what makes
+    the check run at all and the system message is what decides the
+    answer.
+    """
+    body = {
+        "prompt": "x",
+        "budget": "standard",
+        "attachments": [digest],
+        "attachments_mode": "inline",
+    }
+    if system is not None:
+        body["params"] = {"system": system}
+    return body
+
+
+@respx.mock
+def test_review_repro_the_system_message_counts_at_every_door_not_only_at_creation(
+    client, tmp_path
+):
+    """WINDOW: the four doors that run enforce_context_window, each with
+    and without a system message of the size that decides the answer.
+
+    MEASURED BEFORE THIS TEST EXISTED, at 38bf72d: F2 wired the system
+    message into all four doors and argued in its own commit body that
+    doing otherwise "would have built the divergence this branch spent a
+    commit removing". Reverting the argument at POST /compare, POST
+    /compare/stream and POST /groups together left the suite at 976
+    passed. Three of the four doors were unheld.
+
+    THE CONTROL IS THE SAME REQUEST WITHOUT THE SYSTEM MESSAGE at every
+    door, so each refusal is attributable to the message rather than to
+    the document, and a door that refused everything would fail here
+    too.
+
+    model/narrow holds 20000 tokens: 18000 usable after the headroom,
+    16384 reserved for the answer, so about 1616 are left for the input
+    and 8000 characters of system prompt is 2000 tokens.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=alpha_stream()
+            if json.loads(request.content).get("stream")
+            else None,
+            json=None
+            if json.loads(request.content).get("stream")
+            else response_for("model/narrow", "ok"),
+        )
+    )
+    digest = upload(client, "d.txt", b"tiny").json()["digest"]
+    system = "S" * 8_000
+
+    fits = {
+        "compare": client.post(
+            "/compare", json={**narrow_body(digest), "models": ["model/narrow"]}
+        ),
+        "stream": client.post(
+            "/compare/stream", json={**narrow_body(digest), "model": "model/narrow"}
+        ),
+        "groups": client.post(
+            "/groups", json={**narrow_body(digest), "models": ["model/narrow"]}
+        ),
+    }
+    over = {
+        "compare": client.post(
+            "/compare",
+            json={**narrow_body(digest, system), "models": ["model/narrow"]},
+        ),
+        "stream": client.post(
+            "/compare/stream",
+            json={**narrow_body(digest, system), "model": "model/narrow"},
+        ),
+        "groups": client.post(
+            "/groups", json={**narrow_body(digest, system), "models": ["model/narrow"]}
+        ),
+    }
+
+    # THE CONTROL: without the system message every door admits it, and
+    # admits it with the status it admits anything with, so a door that
+    # started refusing everything fails here too.
+    assert {door: resp.status_code for door, resp in fits.items()} == {
+        "compare": 200,
+        "stream": 200,
+        "groups": 201,
+    }
+    # AND EACH DOOR REFUSES IT WITH THE MESSAGE COUNTED.
+    for door, resp in over.items():
+        assert resp.status_code == 422, (door, resp.status_code, resp.text)
+        detail = resp.json()["detail"]
+        assert "model/narrow holds 20000 tokens" in detail, (door, detail)
+        assert "2000 for the system message" in detail, (door, detail)
+        assert "16384 reserved for the answer" in detail, (door, detail)
+
+    # The fourth door, for completeness of the set rather than of the
+    # arithmetic, which its own tombstone already pins.
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "x", "system": system, "attachments": [digest]},
+    )
+    experiment = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/narrow"])
+    )
+    assert experiment.status_code == 422, experiment.text
+    assert "2000 for the system message" in experiment.json()["detail"]
+
+
+# ---- Thirteenth review panel, G: the full-pin refusal names its task.
+
+
+def test_review_repro_a_pin_the_bench_lacks_names_the_task_that_wrote_it(
+    client, tmp_path
+):
+    """WINDOW: the 422 from POST /experiments over a task whose full pin
+    names a reading the bench does not hold, on a dataset with more than
+    one task.
+
+    MEASURED BEFORE THE FIX, at e5a0ae5: the refusal came straight from
+    resolve_rendition, which speaks for a COMPARISON because that is the
+    caller it was written for, so an author holding a dataset was told
+    "this comparison pinned sha256 ... and no such reading is stored"
+    with no line to look at and their file called a comparison. Its
+    sibling refusal twelve lines above, for a digest the bench does not
+    hold, has named the task since M1.
+
+    THE REASON IS KEPT VERBATIM, because it is the part that says what
+    to do; what the re-raise adds is where.
+    """
+    digest = upload(client, "contract.txt", b"forty two").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "fine", "prompt": "a"},
+        {
+            "id": "wrong-pin",
+            "prompt": "b",
+            "attachments": [
+                {
+                    "digest": digest,
+                    "extractor": "text",
+                    "extractor_version": "99",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+
+    resp = client.post("/experiments", json=experiment_body(path))
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert detail.startswith("task 'wrong-pin' pins a reading"), detail
+    # The task that is fine is not accused of anything.
+    assert "'fine'" not in detail, detail
+    # And the reason survives intact, including the remedy.
+    assert f"sha256 {digest[:12]} as read by text 99" in detail, detail
+    assert "will not substitute a different" in detail, detail
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+# ---- Thirteenth review panel, C2: the rebuild helper is held to the
+# ---- artifact it claims to rebuild from.
+
+
+def test_review_repro_the_rebuild_helper_reads_every_field_the_export_emits():
+    """WINDOW: the key set export_trial produces, against the key set
+    rebuild_from_export forwards into build_report.
+
+    THE CHECK THAT WAS MISSING. rebuild_from_export is the branch's only
+    executable statement of "the report can be rebuilt from the export
+    alone", and F6 rests its whole argument on that claim. It is a
+    hand-written translation, so every field the artifact gains has to
+    be added to it by hand, and nothing forced that: Phase M added
+    renditions and the helper was extended by hand; version 4 added
+    is_byok and upstream_inference_cost_usd and version 2's
+    primary_metric predates both, and none of the three was ever added.
+    The panel found the consequence, and it is not small: a rebuilt
+    report lost the entire ranking block and the BYOK cost split.
+
+    WHEN THIS TEST FAILS, the artifact grew. Put the new field into
+    rebuild_from_export, or add it to the structural set below with a
+    note saying why the rebuild does not need it. Either way the
+    decision is made once, deliberately, rather than not made at all.
+
+    IT HOLDS ONE DIRECTION ONLY, deliberately, and the other is held by
+    the equality tombstone beneath it: this notices a field the artifact
+    gained and the placement lists have not, and it cannot notice the
+    helper quietly dropping one it already places. A fixture that
+    actually sets the field is the only thing that can, which is exactly
+    what was missing.
+    """
+    emitted = set(
+        report.export_trial(
+            {
+                "id": 1,
+                "task_id": "t1",
+                "repeat_index": 0,
+                "rotation_index": 0,
+                "attachments": None,
+                "attachments_mode": None,
+                "renditions": None,
+            },
+            {"id": 2, "prompt_text": "p"},
+            {"id": 3, "model": "m"},
+            [],
+        )
+    )
+    # Fields the rebuild consumes to BUILD the shape rather than to fill
+    # a value: they become dict keys, list membership or the group and
+    # run identity themselves.
+    structural = {
+        "type",
+        "group_id",
+        "run_id",
+        "result_id",
+        "task_id",
+        "repeat_index",
+        "rotation_index",
+        "scores",
+        # Recorded on the trial line for a reader; build_report takes
+        # the outcome from the result's own error and response_text, so
+        # forwarding it would be handing the function its own answer.
+        "outcome",
+    }
+    forwarded = {
+        "attachments",
+        "attachments_mode",
+        "renditions",
+        "prompt_text",
+        "app_sha",
+        "catalog_digest",
+        "data_policy",
+        "model",
+        "error",
+        "request_json",
+        "response_text",
+        "position",
+        "latency_ms",
+        "ttft_ms",
+        "cost_usd",
+        "billed_cost_usd",
+        "provider",
+        "is_byok",
+        "upstream_inference_cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+        "reasoning_tokens",
+        "cached_tokens",
+        "max_tokens",
+        "finish_reason",
+        "native_finish_reason",
+        "generation_id",
+    }
+
+    assert emitted == structural | forwarded, {
+        "emitted but unplaced": sorted(emitted - structural - forwarded),
+        "placed but not emitted": sorted((structural | forwarded) - emitted),
+    }
+
+
+@respx.mock
+def test_review_repro_the_rebuilt_report_keeps_the_ranking_and_the_byok_split(
+    client, tmp_path
+):
+    """WINDOW: the served report and the report rebuilt from the export,
+    over an experiment that actually declares a primary metric and
+    actually carries a BYOK charge.
+
+    MEASURED BEFORE THE FIX, by the panel: served and rebuilt disagreed
+    on ranking.metric ('regex' against None), on ranking.reason, on
+    every model's rank and score mean, and on the whole upstream cost
+    block. No test caught it because every fixture that called the
+    helper left all three fields unset, so served and rebuilt genuinely
+    agreed on nothing.
+
+    THE FIXTURE IS THE POINT. This one sets them, which is what makes
+    the equality below a claim rather than a coincidence.
+    """
+    probe = {
+        "prompt_tokens": 13,
+        "completion_tokens": 8,
+        "cost": 0.5,
+        "is_byok": True,
+        "cost_details": {"upstream_inference_cost": 0.004},
+    }
+
+    def route(request):
+        return httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {"content": "Hello"}}]}),
+                    sse({"choices": [], "usage": probe}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {
+            "id": "t1",
+            "prompt": "a",
+            "reference": "Hello",
+            "scorer": {"kind": "regex", "pattern": "Hello"},
+        },
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], primary_metric="regex"),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    score_experiment_to_completion(client, eid, path)
+
+    served = client.get(f"/experiments/{eid}/report?dataset_path={path}").json()
+    rebuilt = rebuild_from_export(export_lines(client, eid, path), None)
+
+    # PRE-STATE: the three fields the helper used to drop are actually
+    # set, or the equality would be an equality over absence.
+    assert served["ranking"]["metric"] == "regex"
+    assert served["models"][0]["cost"]["upstream"]["byok"]["trials"] == 1
+    # THE EQUALITY. thresholds_source differs by construction (the
+    # rebuild is handed no dataset file), which is the one thing the
+    # artifact cannot carry and says so at line one.
+    assert rebuilt["ranking"]["metric"] == served["ranking"]["metric"]
+    assert rebuilt["ranking"]["reason"] == served["ranking"]["reason"]
+    assert [m["cost"]["upstream"] for m in rebuilt["models"]] == [
+        m["cost"]["upstream"] for m in served["models"]
+    ]
+    assert [m["rank"] for m in rebuilt["models"]] == [
+        m["rank"] for m in served["models"]
+    ]
+
+
+# ---- Phase M3: the pins travel, through the report, the export and
+# ---- the whole declaration-transport walk.
+
+
+@respx.mock
+def test_the_report_names_the_documents_each_task_read(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/report over a two-task dataset where
+    each task cites a different document.
+
+    THE FLAT LIST CANNOT ANSWER THE PER-TASK QUESTION, which is the whole
+    reason the mapping exists beside it. A reader looking at a task's
+    score wants to know which document that task read; the
+    experiment-wide list says only which documents the run touched, and
+    on a dataset where every task attaches something different it is
+    useless for exactly the question its name suggests it answers.
+
+    Deduped per task, which repeats make load-bearing: three repeats of
+    one task read one document, not three.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    first = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    second = upload(client, "notes.txt", b"the notes say seventeen").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "read the spec", "attachments": [first]},
+        {"id": "t2", "prompt": "read the notes", "attachments": [second]},
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha"], repeats=3),
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    # PRE-STATE: six cells really ran, or "one entry per task" would be
+    # a claim about a dedup nothing exercised.
+    assert final["status"] == "done", final
+    assert final["trials_done"] == 6, final
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    per_task = report_body["task_attachments"]
+    assert sorted(per_task) == ["t1", "t2"]
+    # ONE ENTRY PER TASK, not one per repeat: six cells ran and each task
+    # read one document.
+    assert len(per_task["t1"]) == 1
+    assert len(per_task["t2"]) == 1
+    assert per_task["t1"][0]["digest"] == first
+    assert per_task["t2"][0]["digest"] == second
+    # THE READING RIDES WITH THE DIGEST, because a reader asking what the
+    # models saw needs both.
+    assert per_task["t1"][0]["kind"] == "document"
+    assert per_task["t1"][0]["extractor"] == "text"
+    assert per_task["t1"][0]["mode"] == "inline"
+    # And the flat list still holds both, which is what makes the two
+    # views different questions rather than one repeated.
+    assert sorted(entry["digest"] for entry in report_body["attachments"]) == sorted(
+        [first, second]
+    )
+    # NEVER A FILENAME, anywhere in the report: the name is what a person
+    # picked on their own machine and is not a property of the bytes.
+    whole = json.dumps(report_body)
+    assert "spec.txt" not in whole
+    assert "notes.txt" not in whole
+
+
+def test_the_report_over_a_plain_dataset_says_no_documents_rather_than_nothing(
+    client, tmp_path
+):
+    """WINDOW: the same two keys on a report over a dataset with no
+    documents.
+
+    Both present and empty, for thresholds_included's reason one subject
+    over: a reader has to be able to tell "no documents" from "this
+    report predates the field", and an absent key cannot say the first.
+    """
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "a"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+
+    assert report_body["attachments"] == []
+    assert report_body["task_attachments"] == {}
+
+
+def test_the_manifest_carries_the_declaration_of_a_task_that_never_ran(
+    client, tmp_path
+):
+    """WINDOW: the manifest line of an export taken over an experiment
+    that has been created and not started, so the artifact holds zero
+    trial lines.
+
+    THE CASE THE BUMP EXISTS FOR. Trial lines carry the pins of the cells
+    that RAN, and a task that never ran leaves no line, so before version
+    5 an interrupted or halted experiment's un-run tasks had their
+    declaration nowhere in the file: the artifact could say a task was
+    owed and not what it was owed OVER. The un-started experiment is the
+    limiting case of that and needs no ceiling machinery to reach.
+
+    AND THE FLAG FOLLOWS THE MANIFEST. attachments_referenced used to be
+    read from the emitted trial lines alone, which was right while the
+    lines were the only thing citing digests. Line one cites them now, so
+    an export with no trials still references bytes it does not carry,
+    and a false here would label that file self-contained.
+    """
+    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    lines = export_lines(client, eid)
+
+    manifest = lines[0]
+    # PRE-STATE: nothing ran, so nothing but the manifest can speak.
+    assert [line["type"] for line in lines] == ["manifest", "digest"]
+    assert manifest["task_attachments"]["t1"][0]["digest"] == digest
+    assert manifest["attachments_mode"] == "inline"
+    assert manifest["attachments_referenced"] is True
+    # Still never content, even at line one.
+    assert "the spec says forty two" not in json.dumps(lines)
+
+
+# ---- Phase M4: the seams a person touches. Upload, list, cite, create.
+
+
+def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client):
+    """WINDOW: GET /attachments over three stored documents.
+
+    THE WORKFLOW NEEDS A LOOKUP. A dataset references documents and never
+    carries them, so authoring one means writing a digest into a JSONL
+    line; without this the only way to learn a digest was to have kept
+    the upload response, and a citation nobody can look up is a citation
+    nobody can check.
+
+    Newest first, because the reason to list is usually to find what was
+    just uploaded and cite it.
+    """
+    first = upload(client, "one.txt", b"first document").json()["digest"]
+    second = upload(client, "two.txt", b"second document").json()["digest"]
+    third = upload(client, "three.txt", b"third document").json()["digest"]
+
+    resp = client.get("/attachments")
+
+    assert resp.status_code == 200
+    listed = resp.json()["attachments"]
+    assert [entry["digest"] for entry in listed] == [third, second, first]
+    # THE SAME SHAPE the detail endpoint serves, field for field, so a
+    # caller that can read one can read a page of them.
+    assert listed[0] == client.get(f"/attachments/{third}").json()
+    # NEVER CONTENT, on this endpoint as on every other. The bodies are
+    # short and distinctive precisely so this scan can be exact.
+    whole = resp.text
+    assert "third document" not in whole
+    assert "content" not in whole
+    # Private like every other dynamic body: this one names every
+    # document the operator has ever attached.
+    assert resp.headers.get("cache-control") == "private, no-store"
+
+
+def test_the_attachment_list_is_bounded_and_refuses_an_unbounded_limit(client):
+    """WINDOW: the limit query parameter, at its ceiling and past it.
+
+    Bounded for the reason the history list is: this endpoint has to stay
+    cheap as bench.db grows, and an unbounded page is the shape that
+    stops being cheap silently.
+    """
+    for index in range(3):
+        upload(client, f"doc{index}.txt", f"body {index}".encode())
+
+    assert len(client.get("/attachments?limit=2").json()["attachments"]) == 2
+    assert client.get("/attachments?limit=0").status_code == 422
+    assert client.get("/attachments?limit=501").status_code == 422
+
+
+@respx.mock
+def test_the_blind_view_of_a_document_cell_still_names_no_document(client, tmp_path):
+    """WINDOW: POST /groups/{id}/blind over a cell the RUNNER created
+    from a dataset that cited a document.
+
+    THE BLIND VIEW'S RULE IS UNCHANGED AND IS NOW REACHABLE A NEW WAY.
+    Before this phase a runner cell carried no documents, so the blind
+    response could not have leaked one; the runner writes the
+    declaration onto its groups now, and this is the assertion that the
+    anonymized view still hands back label, id and answer and nothing
+    else. A filename in a blind card would identify the comparison to a
+    rater as surely as a model id would, and a digest would let one be
+    looked up.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = upload(client, "secret-contract.txt", b"forty two days").json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+    group_id = client.get("/runs").json()["runs"][0]["id"]
+    # PRE-STATE: this really is a cell that declared a document, or the
+    # absence below would be an absence of nothing.
+    assert store.group_renditions(app.state.db, group_id) is not None
+
+    blind = client.post(f"/groups/{group_id}/blind", json={})
+
+    assert blind.status_code == 201, blind.text
+    body = blind.text
+    assert "secret-contract.txt" not in body
+    assert digest not in body
+    assert "forty two days" not in body
+    # Label, id and answer, and nothing else on any card.
+    for card in blind.json()["cards"]:
+        assert set(card) == {"label", "result_id", "response_text", "error"}
+
+
+@respx.mock
+def test_a_native_experiment_sends_the_image_to_every_arm_of_the_cell(client, tmp_path):
+    """WINDOW: the two upstream payloads of one native task-cell, across
+    two image-capable models.
+
+    THE MODE TRAVELS TO THE RUNNER, which is the half of one-mode-per-
+    experiment that creation cannot prove. Creation refuses a lineup
+    that cannot take images and records the mode; if the runner then
+    read that field as anything but native, every arm would receive the
+    extracted text of a PNG, which is nothing, and the record would
+    still claim the models had seen the file.
+
+    TWO DIFFERENT MODELS, deliberately: identical payloads to one model
+    is a payload identical to itself, and the fairness law is a claim
+    about what different models received.
+    """
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    digest = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(
+            path,
+            lineup=["model/alpha", "model/vision"],
+            attachments_mode="native",
+        ),
+    ).json()["id"]
+
+    final = run_experiment_to_completion(client, eid, path)
+
+    assert final["status"] == "done", final
+    assert len(sent) == 2, sent
+    content = sent[0]["messages"][-1]["content"]
+    # A content-part list, not a string: the shape native mode has.
+    assert isinstance(content, list)
+    assert [part["type"] for part in content] == ["text", "image_url"]
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    # Identical bytes to both arms, which is the cell-level fairness law
+    # in the mode where the payload is measured in megabytes.
+    assert (
+        len({json.dumps(payload["messages"], sort_keys=True) for payload in sent}) == 1
+    )
+    # Rule two: the record names the digest and carries no base64.
+    recorded = json.loads(
+        app.state.db.execute(
+            "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
+        ).fetchone()["request_json"]
+    )["messages"][-1]["content"]
+    assert digest in json.dumps(recorded)
+    assert "base64," not in json.dumps(recorded)
+
+
+@respx.mock
+def test_the_runner_records_the_pins_on_both_the_group_and_the_run(client, tmp_path):
+    """WINDOW: the group and its member run, read back through
+    GET /groups/{id} after a one-task, two-model experiment.
+
+    THE RECORD SAYS WHAT WAS SENT, which is the half of composing that
+    is not about the wire. A cell that composed a document and wrote a
+    group declaring none would be a comparison whose history denied its
+    own payload, and the reuse action in the history view would restage
+    it without the document.
+
+    From the SAME frozen pin the composition was built from, so the two
+    cannot disagree: one source, two writes.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = upload(client, "contract.txt", b"the contract says forty two").json()[
+        "digest"
+    ]
+    path = m_dataset(tmp_path, digest)
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    run_experiment_to_completion(client, eid, path)
+
+    pinned = client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"]
+    entry = client.get("/runs").json()["runs"][0]
+    group = client.get(f"/groups/{entry['id']}").json()
+    assert group["renditions"] == pinned
+    assert [ref["digest"] for ref in group["attachments"]] == [digest]
+    # Every member run says it too, because an ungrouped reader of a run
+    # row has no group to inherit from.
+    assert [member["renditions"] for member in group["runs"]] == [pinned, pinned]
 
 
 def test_an_uploaded_document_is_stored_with_its_extraction_and_provenance(client):
@@ -9416,29 +11999,35 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
     THE CLAIM: an export is self-sufficient about WHAT WAS READ, not just
     about what was answered. Content is never in the artifact, so the
     export cannot make the prompt reproducible on its own and does not
-    pretend to; what it must do is name the documents by digest, say
-    which mode they reached the models in, and label itself at line one
-    as an artifact that references bytes it does not carry.
+    pretend to; what it must do is name the documents by digest and by
+    reading, say which mode they reached the models in, and label itself
+    at line one as an artifact that references bytes it does not carry.
 
-    HOW THE STATE IS BUILT, said plainly because it is not the runner's
-    doing: the experiment runner does not attach documents, since
-    per-task attachments in datasets are deliberately deferred. The
-    declaration is written onto the cells directly here. That is real
-    state in the real schema (create_group takes both an experiment and
-    attachments) and it is exactly the state the export must survive, so
-    the alternative is shipping an export path over a shape no test ever
-    hands it.
+    ON THE RUNNER'S OWN PATH since Phase M, and the change is worth
+    recording. This test used to write the declaration onto the cells
+    with an UPDATE, because the runner did not attach documents and the
+    alternative was shipping an export path over a shape no test ever
+    handed it. A dataset now declares per task, so the state under test
+    is built the way a person builds it: upload, cite the digest, create,
+    run.
+
+    TWO TASKS, TWO DIFFERENT DOCUMENTS, so the per-task provenance is a
+    claim about tasks rather than one document seen twice.
     """
-    eid, path = two_axes_experiment(client, tmp_path)
-    digest = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
-    # Every cell of this experiment read the same document, which is what
-    # a corpus-wide attachment would mean.
-    client.app.state.db.execute(
-        "UPDATE groups SET attachments_json = ?, attachments_mode = ?"
-        " WHERE experiment_id = ?",
-        (json.dumps([digest]), "inline", eid),
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
-    client.app.state.db.commit()
+    first = upload(client, "spec.txt", b"the spec says forty two").json()["digest"]
+    second = upload(client, "notes.txt", b"the notes say seventeen").json()["digest"]
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "read the spec", "attachments": [first]},
+        {"id": "t2", "prompt": "read the notes", "attachments": [second]},
+    )
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
 
     lines = export_lines(client, eid)
 
@@ -9447,42 +12036,72 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
     # Line one labels the artifact's own incompleteness, the way
     # thresholds_included does one subject over.
     assert manifest["attachments_referenced"] is True
+    assert manifest["attachments_mode"] == "inline"
+    # THE FROZEN DECLARATION, at line one, keyed by task.
+    assert sorted(manifest["task_attachments"]) == ["t1", "t2"]
+    assert [pin["digest"] for pin in manifest["task_attachments"]["t1"]] == [first]
+    assert [pin["digest"] for pin in manifest["task_attachments"]["t2"]] == [second]
+
     trials = [line for line in lines if line["type"] == "trial"]
-    assert trials
-    for trial in trials:
-        assert trial["attachments"] == [digest]
-        assert trial["attachments_mode"] == "inline"
+    assert len(trials) == 2, trials
+    by_task = {trial["task_id"]: trial for trial in trials}
+    for task_id, digest in (("t1", first), ("t2", second)):
+        assert by_task[task_id]["attachments"] == [digest]
+        assert by_task[task_id]["attachments_mode"] == "inline"
+        assert [pin["digest"] for pin in by_task[task_id]["renditions"]] == [digest]
 
     # NEVER CONTENT, in the whole artifact and not only in the fields
-    # that were checked above. The document's text is short and
+    # that were checked above. Both documents' text is short and
     # distinctive precisely so this scan can be exact.
     whole = json.dumps(lines)
     assert "the spec says forty two" not in whole
+    assert "the notes say seventeen" not in whole
     assert "content" not in manifest
 
-    # And the report's provenance comes back out of the artifact alone.
+    # And the report's provenance comes back out of the artifact alone,
+    # per task, with no database in reach of the rebuild.
     rebuilt = rebuild_from_export(lines, None)
-    assert rebuilt["attachments"] == [{"digest": digest, "mode": "inline"}]
+    assert [entry["digest"] for entry in rebuilt["attachments"]] == [first, second]
+    # THE READING COMES BACK OUT TOO, not only the bytes. A rebuild that
+    # recovered digests and dropped the pin would let a reader say which
+    # documents a task ran over and not which reading of them, which is
+    # the distinction version 3 of this format exists to carry.
+    assert rebuilt["task_attachments"]["t1"] == [
+        {
+            "digest": first,
+            "mode": "inline",
+            "extractor": "text",
+            "extractor_version": "1",
+            "kind": "document",
+        }
+    ]
+    assert [entry["digest"] for entry in rebuilt["task_attachments"]["t2"]] == [second]
 
 
 @respx.mock
 def test_an_export_over_no_documents_says_so_at_line_one(client, tmp_path):
-    """WINDOW: the manifest line of an export over an ordinary
-    experiment, which is every experiment the runner produces today.
+    """WINDOW: the manifest line of an export over an experiment whose
+    dataset cited no document, which is what an ordinary sweep is.
 
     The mirror, and the reason the flag is a flag rather than an omitted
     key: a reader has to be able to tell "this artifact references no
     documents" from "this artifact predates the field", and only a
-    present false says the first."""
+    present false says the first. The same argument covers the two
+    manifest keys Phase M added, asserted here as present nulls."""
     eid, path = two_axes_experiment(client, tmp_path)
 
     lines = export_lines(client, eid)
 
     assert lines[0]["attachments_referenced"] is False
+    assert lines[0]["task_attachments"] is None
+    assert lines[0]["attachments_mode"] is None
     for trial in (line for line in lines if line["type"] == "trial"):
         assert trial["attachments"] is None
         assert trial["attachments_mode"] is None
-    assert rebuild_from_export(lines, None)["attachments"] == []
+        assert trial["renditions"] is None
+    rebuilt = rebuild_from_export(lines, None)
+    assert rebuilt["attachments"] == []
+    assert rebuilt["task_attachments"] == {}
 
 
 @respx.mock
@@ -12001,7 +14620,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 4
+    assert manifest["export_schema_version"] == 5
     assert manifest["attachments_referenced"] is True
 
     cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]
@@ -12089,7 +14708,7 @@ def test_review_repro_the_history_list_shows_the_pinned_reading(client):
 
 
 @respx.mock
-def test_the_pin_reaches_every_layer_that_carries_it(client):
+def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     """THE DECLARATION-TRANSPORT WALK, as a test rather than as a report.
 
     One digest the bench holds under two readings, the IMAGE one pinned
@@ -12104,10 +14723,31 @@ def test_the_pin_reaches_every_layer_that_carries_it(client):
     path. Every defect this phase fixed was a single layer behaving
     reasonably on its own, and a suite of per-layer tests is exactly what
     was in place while the pin was being dropped at six of them.
+
+    PHASE M ADDED FOUR HOPS AT THE FRONT and one at the back, and they
+    are walked here rather than in a second test because a second walk
+    would prove the property twice over two paths and never over the
+    join. The declaration now starts in a FILE: a dataset line pins a
+    reading, creation freezes it onto the experiment, the runner composes
+    the cell from that freeze, and the group it writes is where the
+    original eleven hops pick the pin up. Where the walk used to stub the
+    experiment layer out with an empty-list assertion, it goes through
+    it.
+
+    Each hop is quoted below on the value it carries, and the trap is
+    unchanged: the base row is the TEXT reading, so any layer answering
+    "walked.txt", "text/plain" or kind "document" is substituting.
     """
-    respx.post(OPENROUTER_URL).mock(
-        return_value=httpx.Response(200, json=response_for("model/vision", "ok"))
-    )
+
+    def route(request):
+        # One mock, two shapes. /compare takes the batch JSON response
+        # and the runner streams, so the discriminator is the request's
+        # own stream flag rather than a second route on one URL.
+        if json.loads(request.content).get("stream"):
+            return httpx.Response(200, stream=alpha_stream())
+        return httpx.Response(200, json=response_for("model/vision", "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
     digest, pin = _two_renditions(client, "walked")
     db = client.app.state.db
 
@@ -12168,14 +14808,75 @@ def test_the_pin_reaches_every_layer_that_carries_it(client):
     listed = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
     assert listed["attachments"][0]["kind"] == "image"
 
-    groups = store.experiment_groups(db, 0)
-    assert groups == [], "no experiment here; the export hop is proven above"
+    # ---- The Phase M hops, on the same digest and the same pin.
+
+    # HOP: THE DATASET FILE. The declaration starts as bytes on disk, and
+    # a loader that dropped the three pin fields and kept the digest
+    # would leave every later hop honoring a reading nobody chose.
+    path = write_dataset(
+        tmp_path, {"id": "t1", "prompt": "describe", "attachments": [pin]}
+    )
+    assert main.read_dataset(path)["tasks"][0]["attachments"] == [pin]
+
+    # HOP: THE CREATION FREEZE. The experiment record is the declaration
+    # from here on, and it holds the full pin rather than the digest it
+    # was given.
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/vision"], attachments_mode="native"),
+    ).json()["id"]
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {"t1": [pin]}
+
+    # HOP: THE RUNNER. What actually went upstream, read off the mock.
+    sent = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            sent.append(json.loads(request.content)),
+            httpx.Response(200, stream=alpha_stream()),
+        )[1]
+    )
+    assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+    wire = json.dumps(sent)
+    assert "image/png" in wire
+    assert "text/plain" not in wire
+
+    # HOP: THE GROUP THE RUNNER WROTE, which is where the eleven hops
+    # above pick the declaration up. Same value, written from the freeze.
+    cell = store.experiment_groups(db, eid)[0]
+    assert store.group_renditions(db, cell["id"]) == [pin]
+    trial_run = store.get_group(db, cell["id"])["runs"][0]
+    assert store.run_renditions(db, trial_run["id"]) == [pin]
+    assert client.get(f"/groups/{cell['id']}").json()["attachments"][0]["kind"] == (
+        "image"
+    )
+
+    # HOP: THE REPORT, per task.
+    per_task = client.get(f"/experiments/{eid}/report").json()["task_attachments"]
+    assert per_task["t1"][0]["kind"] == "image"
+    assert per_task["t1"][0]["extractor"] == "none"
+
+    # HOP: THE EXPORT, at line one and on the trial line.
+    lines = export_lines(client, eid)
+    assert lines[0]["task_attachments"] == {"t1": [pin]}
+    assert lines[0]["attachments_mode"] == "native"
+    exported = [line for line in lines if line["type"] == "trial"]
+    assert [line["renditions"] for line in exported] == [[pin]]
 
     # And nowhere on the way out does the base row's reading appear.
-    for payload in (detail, run_detail, listed):
+    for payload in (detail, run_detail, listed, per_task):
         blob = json.dumps(payload)
         assert "walked.txt" not in blob, blob
         assert '"text"' not in blob.replace('"text/plain"', ""), blob
+    # The export gets its own scan rather than joining the loop above,
+    # and the difference is not cosmetic. Trial lines carry request_json
+    # as an embedded STRING, so every quote inside it is escaped and the
+    # bare '"text"' probe cannot see through it: the loop's clause would
+    # pass over a substituted extractor without ever looking at it. What
+    # the file must not contain either way is the base row's own two
+    # facts, and the pin equalities above are what pin the extractor.
+    artifact = json.dumps(lines)
+    assert "walked.txt" not in artifact
+    assert "text/plain" not in artifact
 
 
 def test_review_repro_two_suffixes_with_one_reading_are_one_rendition(client):
@@ -12704,6 +15405,11 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert first == {
         "pin": None,
         "completion_cap": None,
+        # No pin, so no listing was fetched and the endpoint publication
+        # said nothing; the projection reads the model-level map for
+        # this model instead. See experiment_prices.
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 0
@@ -12718,6 +15424,8 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert second == {
         "pin": None,
         "completion_cap": None,
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 0
@@ -12751,6 +15459,13 @@ async def test_review_repro_the_pinned_gate_is_exercised_at_every_branch(client)
     assert fourth == {
         "pin": "deepinfra",
         "completion_cap": 32768,
+        # This listing publishes no pricing at all, so the pinned route
+        # cannot say what it charges. rates None makes the model
+        # unpriced for the projection rather than borrowing the
+        # model-level figure, which is the substitution the pin exists
+        # to prevent; see experiment_prices.
+        "rates": None,
+        "beyond": [],
         "may_send_reasoning_cap": True,
     }
     assert route.call_count == 2

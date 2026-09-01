@@ -17,6 +17,7 @@ import json
 import re
 from typing import Any
 
+from bench.extract import MAX_ATTACHMENTS
 from bench.models import as_text
 
 # Bounds, not preferences. A dataset is user-supplied input that the
@@ -44,6 +45,29 @@ SCORERS = (*DETERMINISTIC_SCORERS, JUDGE_SCORER)
 # patterns long enough to hide catastrophic backtracking, and scoring
 # bounds the subject string separately.
 MAX_PATTERN_CHARS = 500
+
+# The four fields a rendition pin has, and the two kinds it may name.
+# Duplicated from neither RenditionPin nor row_rendition but agreeing
+# with both: this module cannot import the API boundary (which imports
+# it), and a pin's shape is part of the DATASET's contract, so the check
+# belongs to the file format. A cross-module test asserts the three
+# spellings name the same four fields.
+PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind")
+PIN_KINDS = ("document", "image")
+
+# sha256, lowercase hex. The same shape RenditionPin enforces at the API
+# boundary, checked here because a dataset that cites a malformed digest
+# should be refused while the author is still looking at the file, not
+# at experiment creation with a lookup miss that reads like a missing
+# upload.
+#
+# \Z AND NOT $, which is the whole of the thirteenth review panel's F.
+# Python's $ also matches immediately before a trailing newline, so
+# "a"*64 + "\n" passed this check, reached RenditionPin (min_length 64,
+# max_length 64) at the API boundary and was refused there instead: the
+# deferral this constant exists to prevent, arriving through the
+# constant itself. \Z matches only at the end of the string.
+DIGEST_PATTERN = re.compile(r"^[0-9a-f]{64}\Z")
 
 
 class DatasetError(RuntimeError):
@@ -148,6 +172,110 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
     return out
 
 
+def _checked_attachments(
+    value: object, line_no: int, task_id: str
+) -> list[dict[str, Any]] | None:
+    """A task's declared documents, as pin dicts, or None.
+
+    TWO SPELLINGS, ONE MEANING, and the difference is who chooses the
+    reading. A bare DIGEST cites content and leaves the reading to
+    experiment creation, which resolves it to whatever the bench holds
+    for those bytes at that moment and freezes the result. A full
+    four-part PIN states the reading too, and creation then honors it
+    verbatim or refuses; nothing in between, because a pin that gets
+    quietly substituted is worse than one that gets rejected.
+
+    Both are normalized to dicts here so the caller has one shape to
+    walk. A digest-only entry is a dict with one key, which is not a
+    partial pin but a different declaration, and creation can tell them
+    apart by asking whether "extractor" is present.
+
+    NAMES THE TASK, NOT ONLY THE LINE. Every other field in this file
+    fails with a line number, which is right for a field a person reads
+    in place. Attachments are cited by digest and fixed by looking one
+    up, so the message has to carry the id the author will search their
+    notes for.
+    """
+    if value is None:
+        return None
+    where = f"task {task_id!r}: attachments"
+    if not isinstance(value, list):
+        _fail(line_no, f"{where} must be a list, got {type(value).__name__}")
+        return None
+    if not value:
+        # An empty list is a declaration of no documents, which is what
+        # omitting the key already says, spelled a second way. The API
+        # boundary refuses it with min_length=1 for the same reason:
+        # absence gets exactly one spelling or two readers will
+        # eventually disagree about what it meant.
+        _fail(
+            line_no,
+            f"{where} is empty. Omit the key entirely for a task with no "
+            "documents; an empty list is a second spelling of absence.",
+        )
+    if len(value) > MAX_ATTACHMENTS:
+        _fail(
+            line_no,
+            f"{where} lists {len(value)} documents, limit is {MAX_ATTACHMENTS}",
+        )
+    out: list[dict[str, Any]] = []
+    for index, entry in enumerate(value):
+        at = f"{where}[{index}]"
+        if isinstance(entry, str):
+            if not DIGEST_PATTERN.match(entry):
+                _fail(
+                    line_no,
+                    f"{at} is not a sha256 digest: it must be 64 lowercase "
+                    "hex characters. Upload the file and cite the digest "
+                    "the bench returns.",
+                )
+            out.append({"digest": entry})
+            continue
+        if not isinstance(entry, dict):
+            _fail(
+                line_no,
+                f"{at} must be a digest string or a rendition object, got "
+                f"{type(entry).__name__}",
+            )
+            return None
+        missing = [field for field in PIN_FIELDS if field not in entry]
+        if missing:
+            # A PARTIAL PIN IS REFUSED RATHER THAN COMPLETED. Filling the
+            # gaps from the current store would make the dataset's
+            # declaration depend on when it was read, which is exactly
+            # what pinning exists to stop; and a three-field pin is
+            # indistinguishable from a typo in the fourth.
+            _fail(
+                line_no,
+                f"{at} is missing {', '.join(missing)}. A rendition names "
+                f"all four of {', '.join(PIN_FIELDS)}, or cite the digest "
+                "alone and let the experiment freeze the reading.",
+            )
+        unknown = sorted(set(entry) - set(PIN_FIELDS))
+        if unknown:
+            _fail(line_no, f"{at} has unknown keys: {', '.join(unknown)}")
+        digest = entry.get("digest")
+        if not isinstance(digest, str) or not DIGEST_PATTERN.match(digest):
+            _fail(
+                line_no,
+                f"{at}.digest is not a sha256 digest: it must be 64 "
+                "lowercase hex characters.",
+            )
+        pin: dict[str, Any] = {"digest": digest}
+        for field in ("extractor", "extractor_version"):
+            text = _checked_text(entry.get(field), line_no, f"{at}.{field}", 64, True)
+            pin[field] = text
+        kind = entry.get("kind")
+        if kind not in PIN_KINDS:
+            _fail(
+                line_no,
+                f"{at}.kind is {kind!r}, not one of {', '.join(PIN_KINDS)}",
+            )
+        pin["kind"] = kind
+        out.append(pin)
+    return out
+
+
 def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
     """Tasks plus the digest of the bytes they came from.
 
@@ -201,8 +329,24 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
                 row.get("rubric"), line_no, "rubric", MAX_FIELD_CHARS, False
             ),
             "scorer": scorer,
+            # The documents this task carries, by digest or by full pin.
+            # None when the task declares none, which is every task in
+            # every dataset written before Phase M: rule one holds at
+            # the dataset layer too, and such a file parses to exactly
+            # what it parsed to before.
+            "attachments": _checked_attachments(
+                row.get("attachments"), line_no, task_id
+            ),
         }
-        known = {"id", "prompt", "system", "reference", "rubric", "scorer"}
+        known = {
+            "id",
+            "prompt",
+            "system",
+            "reference",
+            "rubric",
+            "scorer",
+            "attachments",
+        }
         unknown = sorted(set(row) - known)
         if unknown:
             _fail(line_no, f"unknown keys: {', '.join(unknown)}")

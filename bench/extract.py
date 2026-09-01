@@ -211,6 +211,20 @@ MAX_DOCX_DEPTH = 256
 # earlier phases deferred.
 MAX_COMPOSED_CHARS = 200_000
 
+# How many documents one COMPARISON OR TASK may carry. This is a
+# side-by-side comparison tool, not a corpus loader: attaching a folder
+# is a question about a dataset. Four is past every real use of "compare
+# these models on this contract and its two appendices" and keeps the
+# composed prompt somewhere a person can still read.
+#
+# IT LIVES HERE NOW, and the move is what made Phase M possible rather
+# than a stylistic tidy. The constant sat in bench/main.py, whose
+# comment said per-task attachments in datasets were a later phase with
+# their own shape; this is that phase, and bench/datasets.py must
+# enforce the same bound without importing the API boundary that imports
+# IT. One definition, two doors, and no second number to drift.
+MAX_ATTACHMENTS = 4
+
 # The delimiters around each document in the composed prompt.
 #
 # VISIBLE AND UNAMBIGUOUS, because the model has to be able to tell the
@@ -1190,7 +1204,7 @@ def ingest(filename: str, content: bytes) -> dict[str, Any]:
 
 def compose_native(
     prompt: str, documents: list[dict[str, Any]], *, redacted: bool
-) -> list[dict[str, Any]]:
+) -> str | list[dict[str, Any]]:
     """The user message as content parts: the text, then the images.
 
     Pinned against OpenRouter's image-understanding guide at
@@ -1208,7 +1222,32 @@ def compose_native(
     keeps the structure and a digest reference where the base64 sat, so
     the payload is reconstructible from the record plus the stored bytes
     without every result row carrying a copy of the image.
+
+    RULE ONE, AND IT IS THE SAME RULE compose() states thirty lines up:
+    with nothing attached this returns the bare prompt STRING, not a
+    one-element content array wrapping it. The return type widens for
+    that, deliberately, because the alternative is a payload whose SHAPE
+    changed for a comparison that attached nothing.
+
+    It had no such guard until the thirteenth review's panel, and the
+    runner is the caller that reached it empty. In a native experiment
+    over a mixed dataset, a task citing no document was sent
+
+        [{"type": "text", "text": "no document here"}]
+
+    while the same task in an inline experiment, and through both
+    comparison doors, sent
+
+        "no document here"
+
+    so a task's payload was restructured because a SIBLING task in the
+    same dataset attached an image, and its results were not comparable
+    with the same task run anywhere else. The two comparison doors never
+    reached it because composed_for short-circuits first; this is the
+    guard that makes the composer itself safe rather than its callers.
     """
+    if not documents:
+        return prompt
     parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
     for document in documents:
         url = (

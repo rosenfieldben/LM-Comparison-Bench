@@ -907,16 +907,21 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
     strict mode refuses on it, exactly as it refuses on a model the
     catalog does not list.
 
-    Four fields are kept. Three are read to make a decision: the slug a
-    pin is matched against, the parameter list that vouches for sending
-    the reasoning field, and the completion ceiling the budget is
-    clamped to. The fourth, the provider's display NAME, is read by
-    nothing and is kept anyway, because a listing whose entries cannot
-    be named is one nobody can debug against; it is inert by
-    construction, since every decision above matches on the slug.
-    Anything beyond these four is not this function's business, and a
-    parser that carried it would invite somebody to make a decision from
-    a field nobody checked.
+    Six fields are kept, and five are read to make a decision: the slug
+    a pin is matched against, the parameter list that vouches for
+    sending the reasoning field, the completion ceiling the budget is
+    clamped to, and the pair endpoint_rates prices a pinned sweep from
+    (rates, and beyond for what this bench cannot count). The sixth, the
+    provider's display NAME, is read by nothing and is kept anyway,
+    because a listing whose entries cannot be named is one nobody can
+    debug against; it is inert by construction, since every decision
+    above matches on the slug.
+
+    THE COUNT SAID FOUR until the thirteenth review's panel, and had
+    said four since before F3 made this parser keep pricing. Anything
+    beyond what is listed here is still not this function's business: a
+    parser that carried a field nobody checked would invite somebody to
+    make a decision from it.
 
     max_completion_tokens JOINED THAT LIST after a review found the
     consequence of its absence. It is documented on the endpoints
@@ -975,6 +980,15 @@ async def fetch_endpoints(client: httpx.AsyncClient, model: str) -> dict[str, An
                 "max_completion_tokens": _as_positive_int(
                     entry.get("max_completion_tokens")
                 ),
+                # KEPT, NOT DISCARDED, since the thirteenth review. This
+                # parser dropped pricing entirely, so a strict pin that
+                # selected one endpoint was still priced from the
+                # model-level aggregate: see endpoint_rates for the
+                # measurement. Split into what can be priced and what
+                # else is charged, by the same function the model-level
+                # parse uses, so the two publications cannot be read by
+                # two rules.
+                **_priced(entry.get("pricing")),
             }
         )
     out["fetched"] = True
@@ -1033,6 +1047,143 @@ def endpoint_supports_reasoning(
     return all(answers)
 
 
+# The two dimensions this bench can price, and the reason the others
+# are named rather than ignored.
+#
+# PINNED AGAINST THE LIVE PUBLICATION, https://openrouter.ai/api/v1/models
+# read 2026-08-30 over all 396 entries, and the per-endpoint listing at
+# https://openrouter.ai/api/v1/models/{model}/endpoints read the same
+# day. Every entry carries pricing.prompt and pricing.completion; the
+# object also carries, in descending order of how many models publish
+# them, input_cache_read (235), web_search (123), input_cache_write
+# (74), overrides (51, an OBJECT rather than a rate), audio (32),
+# input_cache_write_1h (32), internal_reasoning (30), image (29),
+# input_audio_cache (27), image_output (9) and audio_output (2). The
+# endpoint listing adds discount, published as 0 on every endpoint of
+# the model sampled. The documentation also describes a fixed per
+# request charge; no model in the snapshot published one, which is
+# exactly why this is a rule about UNKNOWN keys rather than a list of
+# known ones.
+#
+# A DIMENSION PUBLISHED AT ZERO IS A ZERO, not an unknown, so it does
+# not disqualify anything: that is what the publisher said it costs.
+# A NONZERO one does, because this bench does not model what triggers
+# it and a projection that ignored it would be a confident understatement
+# wearing a total's clothes. 131 of the 396 models carry no nonzero
+# dimension beyond these two and can be projected; the rest are named
+# and refused, which is the honest answer to "what will this cost".
+TOKEN_PRICE_DIMENSIONS = ("prompt", "completion")
+
+
+def token_rates(pricing: Any) -> tuple[dict[str, float] | None, list[str]]:
+    """One pricing object as (the two token rates, what else it charges).
+
+    Returns (None, []) for a pricing object this cannot read at all, and
+    (rates, names) otherwise, where names is every dimension beyond the
+    two that publishes a nonzero charge, sorted. A caller that can only
+    price tokens must treat a non-empty names as "cannot price this".
+
+    Prices arrive as strings in USD per token. Non-finite and negative
+    are malformed: a NaN price yields a NaN cost, and a NaN summed into
+    accumulated spend makes the ceiling comparison permanently false,
+    silently disabling it.
+
+    AN UNPARSEABLE EXTRA DIMENSION COUNTS AS CHARGED, which is the
+    conservative direction and the one the overrides key needs: it is an
+    object describing conditional pricing, and an object is not a number
+    this can compare to zero. Reading it as absent would be reading a
+    statement that prices vary as a statement that they do not.
+    """
+    if not isinstance(pricing, Mapping):
+        return None, []
+    beyond = []
+    for key, value in pricing.items():
+        if key in TOKEN_PRICE_DIMENSIONS:
+            continue
+        try:
+            if float(value) != 0.0:
+                beyond.append(key)
+        except (TypeError, ValueError):
+            beyond.append(key)
+    try:
+        rates = {name: float(pricing[name]) for name in TOKEN_PRICE_DIMENSIONS}
+    except (KeyError, TypeError, ValueError):
+        return None, sorted(beyond)
+    if not all(math.isfinite(rate) and rate >= 0 for rate in rates.values()):
+        return None, sorted(beyond)
+    return rates, sorted(beyond)
+
+
+def _priced(pricing: Any) -> dict[str, Any]:
+    """token_rates as the two keys an endpoint entry carries.
+
+    A named helper rather than a zip at the call site, because the two
+    keys are read by endpoint_rates and a positional pairing is a
+    call-site key nobody can grep for.
+    """
+    rates, beyond = token_rates(pricing)
+    return {"rates": rates, "beyond": beyond}
+
+
+def endpoint_rates(
+    listing: Mapping[str, Any], provider: str | None
+) -> tuple[dict[str, float] | None, list[str]]:
+    """What the PINNED provider publishes per token, or why it cannot say.
+
+    THE MODEL-LEVEL PRICE IS ONE ROUTE'S PRICE. OpenRouter's model
+    listing publishes a single pricing object per model and the endpoint
+    listing publishes one per endpoint, and they are not the same
+    question. Measured 2026-08-30 on openai/gpt-oss-120b: the model
+    level published prompt 0.000000037 and completion 0.00000017, which
+    is exactly one of its twenty endpoints; those twenty published 13
+    DISTINCT rate pairs, from 0.00000003 to 0.00000035 on the prompt
+    side and 0.00000017 to 0.00000095 on the completion side. Pricing a
+    pinned sweep from the model level is therefore wrong by up to
+    elevenfold in one direction or fivefold in the other, and a figure
+    labelled "at most" that can be an eighth of the bill is not a
+    ceiling.
+
+    THE HIGHEST MATCHING RATE WINS, which is the mirror of
+    endpoint_completion_cap taking the lowest cap and has the same
+    reason: a pin names a PROVIDER, that provider may serve the model
+    from several endpoints, the request has to survive whichever the
+    router picks, and this figure is a ceiling. The two are compared
+    dimension by dimension rather than by total, because there is no
+    total until a caller supplies token counts.
+
+    (None, names) when the listing never fetched, when no endpoint
+    matched the pin, when a matched endpoint's rates cannot be read, or
+    when one charges a dimension this cannot price. The caller must not
+    fall back to the model level on any of them: falling back is exactly
+    the substitution this function exists to stop.
+    """
+    if not listing.get("fetched") or provider is None:
+        return None, []
+    want = normalized_provider_slug(provider)
+    matched = [
+        endpoint
+        for endpoint in listing.get("endpoints") or ()
+        if endpoint.get("slug") == want
+    ]
+    if not matched:
+        return None, []
+    beyond: set[str] = set()
+    best: dict[str, float] | None = None
+    for endpoint in matched:
+        rates, names = endpoint.get("rates"), endpoint.get("beyond") or []
+        beyond.update(names)
+        if rates is None:
+            return None, sorted(beyond)
+        best = (
+            rates
+            if best is None
+            else {name: max(best[name], rates[name]) for name in TOKEN_PRICE_DIMENSIONS}
+        )
+    if beyond:
+        return None, sorted(beyond)
+    return best, []
+
+
 def endpoint_completion_cap(
     listing: Mapping[str, Any], provider: str | None
 ) -> int | None:
@@ -1073,6 +1224,246 @@ def endpoint_completion_cap(
         and (cap := endpoint.get("max_completion_tokens")) is not None
     ]
     return min(caps) if caps else None
+
+
+def input_tokens(
+    prompt_chars: int, system_chars: int, *, chars_per_token: int
+) -> tuple[int, int]:
+    """One exchange's input, as the two messages that carry it.
+
+    COUNTED APART AND ROUNDED APART. A request carries a system message
+    and a user message, each its own string, and a tokenizer is applied
+    to each; summing the characters first and dividing once would be a
+    different number and would also leave the caller unable to say which
+    message the weight came from. Every refusal this feeds has to name
+    the components, because the remedy differs by component: shorten the
+    document, shorten the system prompt, or lower the budget.
+
+    Ceiling division: a message is never fewer tokens than this rounds
+    to, and rounding down at the boundary would admit the one case the
+    checks exist for.
+
+    Pure and given its heuristic, so the boundary owns the policy and
+    this owns the division. The heuristic itself is the bench's oldest
+    admission, characters over four, and it is wrong for every model by
+    some amount; see the boundary's CHARS_PER_TOKEN.
+    """
+    return (
+        -(-prompt_chars // chars_per_token),
+        -(-system_chars // chars_per_token),
+    )
+
+
+def context_shortfalls(
+    prompt_chars: int,
+    system_chars: int,
+    models: list[str],
+    windows: Mapping[str, Any],
+    reserved: Mapping[str, int],
+    *,
+    chars_per_token: int,
+    headroom: float,
+) -> list[dict[str, Any]]:
+    """Which lineup members cannot hold this prompt plus the answer it
+    reserved, each with the arithmetic a refusal has to show.
+
+    ONE ARITHMETIC, TWO DOORS, which is the whole reason this is a
+    function rather than a loop inside each caller. A comparison checks
+    one composed prompt against one lineup; an experiment checks one per
+    TASK against the same lineup, and the two refusals have to agree
+    down to the digit or a person reconciling them finds no answer. The
+    comment on the boundary's CHARS_PER_TOKEN already says why two
+    estimates would be worse than either; this is that rule applied one
+    level up, to the comparison the estimate feeds.
+
+    Pure, and given everything. The window per model, the tokens each
+    model reserved for its answer, the heuristic and the margin all
+    arrive as arguments: the boundary owns the catalog and the policy,
+    and this owns only the division.
+
+    THE ORDER IS THE LINEUP'S, and models is iterated rather than
+    windows, because a lineup may legitimately name one model twice
+    (asking how much it varies run to run) and a refusal built by
+    walking a keyed mapping would name fewer models than the run has.
+
+    THE SYSTEM MESSAGE IS HALF THE INPUT and was not counted until the
+    thirteenth review. A window holds everything the request carries,
+    and control_messages prepends a system message whenever one is set,
+    so a check that weighed the user turn alone was answering a question
+    about a payload the bench does not send. Measured on this branch at
+    01e3f90: a 20,000 character task system against a 20,000 token
+    window was created (201) with 56 prompt tokens and 16,440 needed
+    against 18,000 usable; the request actually sent 5,056 input tokens
+    and needed 21,440, which does not fit.
+
+    A model with no published window is SKIPPED rather than refused; see
+    enforce_context_window for why an absent window is answered
+    differently here than an absent capability is.
+
+    reserved is indexed rather than got: a model in the lineup with no
+    entry is a caller that built two different lineups, and returning a
+    quiet zero for it would under-report the very number the refusal
+    exists to show.
+    """
+    prompt_tokens, system_tokens = input_tokens(
+        prompt_chars, system_chars, chars_per_token=chars_per_token
+    )
+    short = []
+    for model in models:
+        window = windows.get(model)
+        if not isinstance(window, int):
+            continue
+        answer = reserved[model]
+        needed = prompt_tokens + system_tokens + answer
+        if needed > int(window * (1 - headroom)):
+            short.append(
+                {
+                    "model": model,
+                    "window": window,
+                    "needed": needed,
+                    "prompt_tokens": prompt_tokens,
+                    "system_tokens": system_tokens,
+                    "reserved": answer,
+                }
+            )
+    return short
+
+
+def _named(model: str, beyond: list[str]) -> str:
+    """One unpriceable model, with the dimensions that made it one.
+
+    The name alone would send a reader to the catalog to work out why a
+    model with two published rates came back unpriced. Sorted by
+    token_rates, so two runs over one catalog produce one string.
+    """
+    return f"{model} (charges {', '.join(beyond)})"
+
+
+def projected_cost(
+    tasks_total: int,
+    task_chars: Mapping[str, Mapping[str, int]] | None,
+    lineup: list[str],
+    repeats: int,
+    reserved: Mapping[str, int],
+    prices: Mapping[str, Any],
+    *,
+    chars_per_token: int,
+) -> dict[str, Any]:
+    """What an experiment would cost at most, priced before it runs.
+
+    THE INPUT HALF IS PER TASK, and that is the point of the function.
+    Every trial of an experiment reserves the same completion budget, so
+    the output half is one multiplication over the lineup; the INPUT
+    half was uniform too until a task could carry a document, and a
+    dataset where one task attaches a hundred pages and the rest ask one
+    line prices nothing like its own average. So task_chars is summed
+    per task rather than multiplied from a representative one.
+
+    EACH TASK WEIGHS BOTH MESSAGES, keyed "prompt" and "system", because
+    a task may carry its own system prompt and the request sends both.
+    Pricing the user turn alone understated a 20,000 character system by
+    5,000 tokens per trial: measured at 01e3f90, one such task quoted
+    $0.000056 where the branch's own heuristic over what was actually
+    sent gives $0.005056.
+
+    task_chars is None when the caller cannot measure the input at all,
+    which is native mode: a document sent as an image part is billed in
+    image tokens, and nothing this bench holds converts pixels to them.
+    The input and total figures are then None while the output figure
+    stands, because the output side is measured the same way in both
+    modes and an honest half is better than a whole number that quietly
+    counted images as free.
+
+    AN INCOMPLETE PRICE IS NOT A SMALL PRICE. One unpriced model in the
+    lineup makes every figure None and names the model, rather than
+    summing the models that do publish prices: a total missing one
+    member of a comparison reads as the comparison's total and would be
+    wrong by however much that member costs. This is the rule the
+    browser's own estimate already follows, and two estimators
+    disagreeing about what an unpriced model means would be worse than
+    either.
+
+    A MODEL THAT CHARGES SOMETHING THIS CANNOT COUNT IS UNPRICED TOO,
+    and the entry says which dimension. A pricing map publishing a
+    nonzero request charge, or a cache-read rate, or an overrides
+    object, describes a bill this function has no arithmetic for; the
+    reviewer's shape was prompt 0, completion 0 and request 0.25, which
+    returned every figure as a confident zero over six trials that
+    would have cost $1.50. A zero that is wrong is worse than a null
+    that is honest, because only one of them is read as an answer. See
+    TOKEN_PRICE_DIMENSIONS for the measurement and for why a dimension
+    published AT zero is not one of these.
+
+    A CEILING, NOT A FORECAST, on the output side: it prices every trial
+    at its full reserved budget, which is the most it can be billed and
+    is usually well above what it will be. The input side is an estimate
+    in the other direction, characters over the heuristic, and the
+    caller is expected to say so where it shows the figure.
+
+    tasks_total is passed rather than derived from task_chars because
+    the OUTPUT half is measured in both modes and task_chars is absent
+    in one of them. In inline mode the two agree by construction, and
+    the caller builds both from the same dataset.
+
+    Pure and given its prices, its reservations and its heuristic, so
+    the catalog stays the boundary's business.
+    """
+    unpriced = sorted(
+        {
+            model
+            if not (prices.get(model) or {}).get("beyond")
+            else _named(model, prices[model]["beyond"])
+            for model in lineup
+            if prices.get(model) is None or prices[model].get("beyond")
+        }
+    )
+    if unpriced:
+        return {
+            "input_usd": None,
+            "output_usd": None,
+            "total_usd": None,
+            "unpriced": unpriced,
+        }
+    output = (
+        repeats
+        * tasks_total
+        * sum(reserved[model] * prices[model]["completion"] for model in lineup)
+    )
+    input_usd: float | None = None
+    if task_chars is not None:
+        prompt_price = sum(prices[model]["prompt"] for model in lineup)
+        input_usd = (
+            repeats
+            * prompt_price
+            * sum(
+                sum(
+                    input_tokens(
+                        weight["prompt"],
+                        weight["system"],
+                        chars_per_token=chars_per_token,
+                    )
+                )
+                for weight in task_chars.values()
+            )
+        )
+    total = None if input_usd is None else input_usd + output
+    # The same belt cost_usd wears, for the same reason: fetch_catalog
+    # rejects non-finite prices at ingestion, so a NaN can only arrive
+    # from a price set past that path, and a NaN presented as a dollar
+    # figure is worse than no figure.
+    if not all(math.isfinite(v) for v in (output, input_usd or 0.0)):
+        return {
+            "input_usd": None,
+            "output_usd": None,
+            "total_usd": None,
+            "unpriced": unpriced,
+        }
+    return {
+        "input_usd": input_usd,
+        "output_usd": float(output),
+        "total_usd": None if total is None else float(total),
+        "unpriced": unpriced,
+    }
 
 
 def missing_parameters(
@@ -1504,22 +1895,25 @@ async def fetch_catalog(client: httpx.AsyncClient) -> dict[str, Any]:
         # into accumulated spend makes the ceiling comparison permanently
         # false, silently disabling it. Raising inside the try reuses the
         # single degrade path, matching as_metric's finiteness contract.
-        try:
-            prompt_price = float(entry["pricing"]["prompt"])
-            completion_price = float(entry["pricing"]["completion"])
-            if not (math.isfinite(prompt_price) and math.isfinite(completion_price)):
-                raise ValueError("non-finite price")
-            if prompt_price < 0 or completion_price < 0:
-                raise ValueError("negative price")
-            model["prompt_price"] = prompt_price
-            model["completion_price"] = completion_price
-            prices[entry["id"]] = {
-                "prompt": prompt_price,
-                "completion": completion_price,
-            }
-        except (KeyError, TypeError, ValueError):
+        rates, beyond = token_rates(entry.get("pricing"))
+        if rates is None:
             model["prompt_price"] = None
             model["completion_price"] = None
+        else:
+            model["prompt_price"] = rates["prompt"]
+            model["completion_price"] = rates["completion"]
+            prices[entry["id"]] = {
+                **rates,
+                # WHAT ELSE THIS MODEL CHARGES, carried rather than
+                # dropped. cost_usd ignores it and must: it prices the
+                # tokens a finished run actually reported, and its own
+                # contract is an estimate beside a billed figure. The
+                # PROJECTION reads it and refuses, because a ceiling
+                # quoted before spend that silently omitted a real
+                # charge would be a confident understatement. See
+                # TOKEN_PRICE_DIMENSIONS.
+                "beyond": beyond,
+            }
         models.append(model)
     return {"fetched": True, "models": models, "prices": prices, "digest": digest}
 

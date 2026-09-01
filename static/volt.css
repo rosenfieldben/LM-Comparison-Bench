@@ -1000,6 +1000,17 @@
 }
 .report-banner strong { color: var(--accent); font-size: 12px; }
 .report-note { color: var(--text-ghost); }
+/* Which documents each task read, between the banner and the tables:
+   the documents decided what every model READ and the tables only say
+   how each one answered. One row per task, each a plain .attach-strip,
+   so a chip here is the same object a chip in history is. */
+.report-docs {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  margin-bottom: 8px;
+}
 /* Above the banner and above the tables, because it decides what the
    tables can say. The input grows and the button does not. */
 .report-dataset {
