@@ -10482,9 +10482,21 @@ def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client)
     assert resp.status_code == 200
     listed = resp.json()["attachments"]
     assert [entry["digest"] for entry in listed] == [third, second, first]
-    # THE SAME SHAPE the detail endpoint serves, field for field, so a
-    # caller that can read one can read a page of them.
-    assert listed[0] == client.get(f"/attachments/{third}").json()
+    # THE SAME SHAPE the detail endpoint serves, field for field, EXCEPT
+    # the member manifest, and the exception is Phase L's deliberate
+    # split rather than a drift. A snapshot's manifest is body-sized: a
+    # snapshot of two thousand files carries two thousand rows, and a
+    # page of five hundred attachments carrying those would undo what
+    # K1.5 bought when it stopped this reader loading bodies. The list
+    # answers Attachment, the two single-attachment doors answer
+    # AttachmentDetail, and neither shape has to be read as "sometimes
+    # populated".
+    detail = client.get(f"/attachments/{third}").json()
+    assert listed[0] == {
+        key: value for key, value in detail.items() if key != "manifest"
+    }
+    assert detail["manifest"] is None
+    assert "manifest" not in listed[0]
     # NEVER CONTENT, on this endpoint as on every other. The bodies are
     # short and distinctive precisely so this scan can be exact.
     whole = resp.text
@@ -10841,6 +10853,13 @@ def test_review_repro_no_attachment_response_ever_carries_the_content(client):
         "extractor",
         "extractor_version",
         "created_at",
+        # Phase L. None for a document and for an image, and the member
+        # manifest for a snapshot: paths, sizes and digests, the
+        # exclusions in force, and the clone's commit. It is metadata by
+        # construction and this test is the one that says so, since a
+        # manifest that carried a member's TEXT would be exactly the
+        # content leak the rest of the test is about.
+        "manifest",
     }
 
 
@@ -15956,3 +15975,540 @@ def test_review_repro_a_non_byok_upstream_figure_is_not_reported_as_a_second_bil
     assert cost["upstream"]["not_byok"]["values"] == [
         repr(probe["cost_details"]["upstream_inference_cost"])
     ]
+
+
+# ===================================================================
+# Phase L: a repository snapshot rides the comparison.
+#
+# The walk and the composition are pure and are proven in
+# tests/test_snapshot.py against injected callables. What is asserted
+# here is the DOOR: which trees may be walked at all, what the refusals
+# say, what the record keeps, and that the snapshot is one attachment
+# like any other once it is stored.
+# ===================================================================
+
+import os
+import stat as stat_module
+
+from bench import snapshot as bench_snapshot
+from bench.main import SNAPSHOTS_OFF, _parse_repo_roots
+
+
+def clone(root: Path, files: dict[str, bytes]) -> Path:
+    """A tree on disk, made from a mapping of repo-relative path to bytes."""
+    for name, body in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    return root
+
+
+def snapshot_of(client, root, patterns=("**/*.py",)):
+    """POST /snapshots against an allowlisted root."""
+    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    return client.post(
+        "/snapshots", json={"root": str(root), "patterns": list(patterns)}
+    )
+
+
+# ----- the allowlist ------------------------------------------------
+
+
+def test_the_snapshot_door_is_off_when_no_allowlist_is_set(client, tmp_path):
+    """WINDOW: POST /snapshots with app.state.repo_roots empty.
+
+    ABSENT IS THE FEATURE OFF, NOT A BOOT FAILURE, which is the ruling
+    this asserts at the only place it is visible. A missing
+    OPENROUTER_API_KEY fails at boot because a bench without one reports
+    every model as errored and looks like an outage; snapshots are
+    optional, so the process starts and the door refuses. That is the
+    unfetchable catalog's shape: degrade with honesty, refuse at the
+    door that needs the thing.
+    """
+    clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = ()
+
+    resp = client.post(
+        "/snapshots", json={"root": str(tmp_path), "patterns": ["**/*.py"]}
+    )
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail == SNAPSHOTS_OFF
+    assert "BENCH_REPO_ROOTS" in detail
+    # And it says WHY the allowlist exists, not merely that it is
+    # missing: the person's next action is to decide which trees may be
+    # walked, and "unset" alone does not tell them what they are
+    # deciding.
+    assert "composes its files into a prompt sent to a provider" in detail
+
+
+def test_a_root_outside_the_allowlist_is_refused_and_both_are_named(client, tmp_path):
+    """WINDOW: POST /snapshots naming a real directory off the allowlist.
+
+    403 rather than 422 because the request is well formed and the
+    bench's policy says no, which is the answer LocalOnlyGuard gives a
+    non-loopback client. The allowed roots are named back: they are the
+    operator's own configuration and the caller is that operator on
+    loopback, so listing them is the difference between "no" and "no,
+    and here is what you meant to type".
+    """
+    allowed = clone(tmp_path / "allowed", {"a.py": b"x = 1\n"})
+    other = clone(tmp_path / "elsewhere", {"b.py": b"y = 2\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post("/snapshots", json={"root": str(other), "patterns": ["**/*.py"]})
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert str(other) in detail
+    assert str(allowed.resolve()) in detail
+    assert "BENCH_REPO_ROOTS" in detail
+
+
+def test_a_directory_under_an_allowed_root_is_allowed(client, tmp_path):
+    """WINDOW: POST /snapshots naming a subdirectory of an allowlist entry.
+
+    "not under BENCH_REPO_ROOTS" is the refusal, so under it is the
+    permission: an operator who allowlists their work directory can
+    snapshot any clone inside it without listing each one.
+    """
+    allowed = clone(tmp_path / "work", {"proj/a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post(
+        "/snapshots", json={"root": str(allowed / "proj"), "patterns": ["*.py"]}
+    )
+
+    assert resp.status_code == 201
+
+
+def test_a_sibling_root_sharing_a_prefix_is_not_under_the_allowlist(client, tmp_path):
+    """WINDOW: POST /snapshots with a root whose path prefixes an entry.
+
+    "/work-old" starts with "/work" and is not under it. The oldest bug
+    in path containment, refused by the same helper the walk uses for
+    symlink targets, which is why there is one separator to get right
+    rather than two.
+    """
+    allowed = clone(tmp_path / "work", {"a.py": b"x = 1\n"})
+    sibling = clone(tmp_path / "work-old", {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post("/snapshots", json={"root": str(sibling), "patterns": ["*.py"]})
+
+    assert resp.status_code == 403
+
+
+def test_a_root_that_is_not_a_directory_is_a_422(client, tmp_path):
+    """WINDOW: POST /snapshots naming a file, and naming nothing.
+
+    422 rather than 403 for this one, because it is about what the
+    caller wrote rather than about what the bench permits. The order
+    matters: the allowlist is consulted first, so a nonexistent path
+    outside the allowlist is still refused as a policy matter and never
+    tells an outside caller whether it exists.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+
+    resp = client.post(
+        "/snapshots", json={"root": str(root / "a.py"), "patterns": ["*"]}
+    )
+    assert resp.status_code == 422
+    assert "not a directory" in resp.json()["detail"]
+
+    resp = client.post(
+        "/snapshots", json={"root": str(root / "gone"), "patterns": ["*"]}
+    )
+    assert resp.status_code == 422
+
+
+def test_parse_repo_roots_takes_absent_and_refuses_wrong(tmp_path):
+    """WINDOW: _parse_repo_roots, over each shape the variable can have.
+
+    SET AND WRONG IS A BOOT FAILURE and unset is not, which is the pair
+    that makes the feature optional without making it sloppy. Setting
+    the variable is a person saying "these trees"; a relative entry or a
+    directory that does not exist means the sentence they wrote does not
+    name what they meant, and failing at boot beats a refusal later
+    whose cause they would have to go looking for.
+    """
+    real = {str(tmp_path): str(tmp_path)}
+
+    def resolved(path):
+        return real.get(path)
+
+    assert _parse_repo_roots(None, resolved=resolved) == ()
+    assert _parse_repo_roots("   ", resolved=resolved) == ()
+    assert _parse_repo_roots(str(tmp_path), resolved=resolved) == (str(tmp_path),)
+    # Duplicates collapse: one root named twice is one root.
+    doubled = os.pathsep.join([str(tmp_path), str(tmp_path)])
+    assert _parse_repo_roots(doubled, resolved=resolved) == (str(tmp_path),)
+
+    # A stray separator is the ordinary typo, and in a PATH-shaped
+    # variable an empty entry has historically meant the working
+    # directory, which is exactly the accident an allowlist prevents.
+    with pytest.raises(RuntimeError, match="empty entry"):
+        _parse_repo_roots(f"{tmp_path}{os.pathsep}", resolved=resolved)
+    with pytest.raises(RuntimeError, match="not an absolute path"):
+        _parse_repo_roots("relative/path", resolved=resolved)
+    with pytest.raises(RuntimeError, match="not a directory"):
+        _parse_repo_roots("/nope/not/here", resolved=resolved)
+
+
+# ----- what the door composes and records ---------------------------
+
+
+def test_a_snapshot_is_one_attachment_carrying_its_whole_manifest(client, tmp_path):
+    """WINDOW: POST /snapshots over a two-file clone, response and record.
+
+    THE WHOLE SNAPSHOT IS ONE ATTACHMENT, which is what keeps the
+    fairness law intact for free: one digest, one rendition, one
+    composed text, delivered byte-identically to every model exactly as
+    a document is.
+    """
+    root = clone(
+        tmp_path,
+        {
+            "pkg/a.py": b"x = 1\n",
+            "pkg/b.py": b"y = 2\n",
+            "README.md": b"not selected\n",
+            ".git/config": b"[core]\n",
+        },
+    )
+
+    resp = snapshot_of(client, root, ["**/*.py"])
+
+    assert resp.status_code == 201
+    got = resp.json()
+    assert got["kind"] == "snapshot"
+    assert got["extractor"] == bench_snapshot.SNAPSHOT_EXTRACTOR
+    assert got["extractor_version"] == bench_snapshot.SNAPSHOT_VERSION
+    # The stored name is a pure function of the digest and carries no
+    # path: K.3's filename rule extended to a tree, and the reason the
+    # blind view can show a snapshot without showing where it came from.
+    assert got["filename"] == f"snapshot-{got['digest'][:12]}.txt"
+    assert str(tmp_path) not in json.dumps(got)
+
+    manifest = got["manifest"]
+    assert [member["path"] for member in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
+    assert manifest["files"][0]["size"] == 6
+    assert manifest["patterns"] == ["**/*.py"]
+    assert ".git" in manifest["excludes"]
+    assert manifest["encoding"] == bench_snapshot.ENCODING_RULE
+    # No repository here, so git answers nothing and both fields degrade
+    # together rather than one of them asserting a clean tree.
+    assert manifest["head"] is None
+    assert manifest["dirty"] is None
+    # The excluded and unselected files are absent from the reading.
+    assert [m["path"] for m in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
+
+
+def test_the_snapshot_records_the_clone_commit_and_whether_it_was_dirty(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots over a real git clone, manifest head and dirty.
+
+    Provenance of the same kind extractor_version is: that field says
+    which walker produced the text, this says which tree it walked at
+    which commit. Read locally with the same two-second timeout and
+    degrade discipline _app_sha uses, because it is the same runner.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "t"],
+        ["add", "-A"],
+        ["commit", "-qm", "one"],
+    ):
+        # None is a non-zero exit, so this asserts each step of the
+        # setup actually worked rather than that git was present.
+        assert main._git(args, cwd=str(root)) is not None
+
+    clean = snapshot_of(client, root, ["*.py"]).json()
+    assert clean["manifest"]["head"] is not None
+    assert len(clean["manifest"]["head"]) == 40
+    assert clean["manifest"]["dirty"] is False
+
+    # An untracked file counts as modified, which is _app_sha's rule
+    # inherited: an untracked file under the root is a file the walk may
+    # well have just composed.
+    (root / "b.py").write_bytes(b"z = 3\n")
+    dirty = snapshot_of(client, root, ["*.py"]).json()
+    assert dirty["manifest"]["dirty"] is True
+    assert dirty["digest"] != clean["digest"]
+
+
+def test_composing_one_tree_twice_returns_the_first_row(client, tmp_path):
+    """WINDOW: two identical POST /snapshots calls over one unchanged tree.
+
+    THE DEDUPE TOMBSTONE. A tree that has not changed composes
+    byte-identical text, so the digest is the same and the
+    content-addressed store returns the existing row rather than a
+    second copy: ten comparisons over one snapshot cost one copy of it,
+    which is the promise the whole attachments table rests on.
+
+    The MANIFEST is the first walk's, and that is the interesting half.
+    It is not a function of the rendition key, so two walks a commit
+    apart whose selected files did not change are one row, and the head
+    recorded is the earlier one. That is a true statement about these
+    bytes rather than a stale one, and rewriting it would relabel a
+    record every existing comparison already cites.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+
+    first = snapshot_of(client, root, ["*.py"]).json()
+    second = snapshot_of(client, root, ["*.py"]).json()
+
+    assert first["digest"] == second["digest"]
+    assert first["created_at"] == second["created_at"]
+    assert first["manifest"] == second["manifest"]
+    listed = client.get("/attachments").json()["attachments"]
+    assert [entry["digest"] for entry in listed] == [first["digest"]]
+
+
+def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
+    client, tmp_path
+):
+    """WINDOW: GET /attachments/{digest} and GET /attachments, for a snapshot.
+
+    POST AND GET AGREE ABOUT ONE DIGEST, which is the failure K.3 spent
+    a phase removing from the upload path and which the manifest could
+    reintroduce, since the manifest is not part of the rendition key.
+    Both doors read the STORED row.
+
+    The LIST does not carry it, and the split is deliberate: a snapshot
+    of two thousand files carries two thousand manifest rows, and a page
+    of five hundred attachments carrying those would undo what K1.5
+    bought when it stopped this reader loading bodies.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    created = snapshot_of(client, root, ["*.py"]).json()
+
+    fetched = client.get(f"/attachments/{created['digest']}").json()
+    assert fetched["manifest"] == created["manifest"]
+
+    listed = client.get("/attachments").json()["attachments"]
+    assert "manifest" not in listed[0]
+    # And never the content, on either door, which is the promise every
+    # attachment response makes.
+    assert "x = 1" not in json.dumps(fetched)
+    assert "x = 1" not in json.dumps(listed)
+
+
+# ----- what the door refuses ----------------------------------------
+
+
+def test_a_binary_in_the_selection_refuses_the_whole_snapshot(client, tmp_path):
+    """WINDOW: POST /snapshots where a pattern selects an object file.
+
+    Never a silent drop. The caller wrote a pattern, not a list, so the
+    difference between "your pattern matched a PNG" and a snapshot
+    quietly missing it is the difference between a person fixing their
+    selection and a person comparing models on a repository they think
+    they sent.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "blob.py": b"ELF\x00\x01\x02"})
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "blob.py" in resp.json()["detail"]
+    assert "NUL byte" in resp.json()["detail"]
+
+
+def test_a_symlink_leaving_the_root_refuses_at_the_door(client, tmp_path):
+    """WINDOW: POST /snapshots over a tree holding an escaping symlink.
+
+    The containment law reaching the boundary. BENCH_REPO_ROOTS bounds
+    which roots may be walked at all, and a link is exactly the
+    construct that would let a walk of an allowed root read a file in a
+    disallowed one.
+    """
+    outside = clone(tmp_path / "outside", {"secret.py": b"KEY = 'x'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    (root / "escape.py").symlink_to(outside / "secret.py")
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "escape.py" in detail
+    assert "outside the snapshot root" in detail
+    # And nothing from the file it pointed at reached the response.
+    assert "KEY" not in detail
+
+
+def test_a_named_pipe_in_the_selection_is_refused_rather_than_opened(client, tmp_path):
+    """WINDOW: POST /snapshots where a pattern selects a fifo.
+
+    THE OBLIGATION bench.snapshot's walk DOCSTRING NAMES. That module
+    does no I/O and cannot tell a regular file from a socket, a device
+    or a named pipe, so it says the door must. Opening a fifo with no
+    writer blocks forever, which is the one failure here that no timeout
+    in this process would end.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    os.mkfifo(root / "pipe.py")
+    assert stat_module.S_ISFIFO(os.stat(root / "pipe.py").st_mode)
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "pipe.py" in resp.json()["detail"]
+    assert "not a regular file" in resp.json()["detail"]
+
+
+def test_a_file_over_the_member_ceiling_is_refused_before_it_is_read(client, tmp_path):
+    """WINDOW: POST /snapshots where one selected file is over the ceiling.
+
+    The size is checked from the stat, before the read, because a pure
+    function handed bytes cannot un-read them and a boundary that read
+    first would have spent the memory before asking. compose holds the
+    same bound for a caller that did not check.
+    """
+    root = clone(
+        tmp_path,
+        {
+            "a.py": b"x = 1\n",
+            "huge.py": b"z" * (bench_snapshot.MAX_MEMBER_BYTES + 1),
+        },
+    )
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "huge.py" in detail
+    assert "before it is read" in detail
+
+
+def test_a_selection_matching_nothing_names_the_patterns(client, tmp_path):
+    """WINDOW: POST /snapshots with a pattern that selects no file.
+
+    An empty snapshot would compose to an intro line and nothing else,
+    and every model would be asked about a repository none of them
+    received. The refusal names the patterns because the ordinary cause
+    is a person who wrote "*.py" expecting recursion.
+    """
+    root = clone(tmp_path, {"pkg/a.py": b"x = 1\n"})
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "'*.py'" in resp.json()["detail"]
+
+
+def test_the_snapshot_door_refuses_a_body_it_cannot_read(client, tmp_path):
+    """WINDOW: POST /snapshots with a malformed body and a non-JSON POST.
+
+    extra="forbid" and the JSON content-type guard, on the newest door,
+    because a door that took an unknown field would take a typo for a
+    setting and a door that took a form body would be the CORS hole the
+    whole boundary is built to close.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+
+    unknown = client.post(
+        "/snapshots",
+        json={"root": str(root), "patterns": ["*.py"], "excludes": ["a.py"]},
+    )
+    assert unknown.status_code == 422
+
+    empty = client.post("/snapshots", json={"root": str(root), "patterns": []})
+    assert empty.status_code == 422
+
+    too_many = client.post(
+        "/snapshots",
+        json={
+            "root": str(root),
+            "patterns": ["*.py"] * (bench_snapshot.MAX_PATTERNS + 1),
+        },
+    )
+    assert too_many.status_code == 422
+    # REFUSED BY THE MODEL AND NOT BY THE WALK, which is what the bound
+    # on the field buys: enforce_patterns holds the same number and
+    # would refuse this too, so without checking WHICH layer answered,
+    # the field's bound could be deleted and the door would still say
+    # 422. FastAPI renders a model violation as a list of error objects
+    # and the bench's own refusals as a string, so the shape is the
+    # proof that the body never reached the filesystem.
+    assert isinstance(too_many.json()["detail"], list)
+
+    form = client.post(
+        "/snapshots",
+        content=b"root=/tmp",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert form.status_code == 415
+
+
+# ----- the vocabulary holds across modules --------------------------
+
+
+def test_the_sql_kind_derivation_agrees_with_the_modules_that_name_it():
+    """WINDOW: the two CASE expressions in bench/store.py, read as text.
+
+    bench/store.py imports nothing from bench and is the persistence
+    layer rather than a participant in the vocabulary, so 'none',
+    'image', 'document', 'repo-walk' and 'snapshot' are SQL literals
+    there. What stops them drifting from the constants is this
+    assertion rather than an import, which is the same arrangement
+    PIN_FIELDS and RenditionPin live under one module over.
+    """
+    source = Path("bench/store.py").read_text()
+    for literal in (
+        bench_extract.IMAGE_KIND,
+        bench_extract.DOCUMENT_KIND,
+        bench_extract.SNAPSHOT_KIND,
+        bench_extract.SNAPSHOT_EXTRACTOR,
+    ):
+        assert f"'{literal}'" in source, literal
+    # Both derivations learned the third kind, not just the one a test
+    # happened to reach: the backfill that inserts from attachments and
+    # the update that fills a NULL on a row already there.
+    assert source.count("THEN 'snapshot'") == 2
+
+
+def test_kind_is_derived_in_exactly_one_place():
+    """WINDOW: every Python site that decides a rendition's kind.
+
+    ONE PLACE DECIDES KIND. It was three ternaries in three modules
+    while there were two kinds, which was survivable because a two-way
+    conditional reads at a glance; a third turns each into a chain, and
+    three chains that must agree is the shape this codebase has already
+    paid for twice. This asserts the ternaries did not come back.
+    """
+    # EXACTLY ONE comparison against the image extractor's name in the
+    # whole package, and it is kind_of's own. Counting rather than
+    # forbidding is what makes this catch the case a bare "not in"
+    # cannot: extract.py has to contain one, so a second one there,
+    # inside rendition_of where it used to live, would read as allowed.
+    #
+    # That second one is behaviourally inert today, since rendition_of
+    # derives its extractor from a suffix and no suffix routes to the
+    # walker, and inert is exactly why it needs a structural assertion.
+    # A door with no behaviour to prove is a door that comes back.
+    package = {
+        path: Path(path).read_text()
+        for path in (
+            "bench/main.py",
+            "bench/extract.py",
+            "bench/report.py",
+            "bench/store.py",
+        )
+    }
+    assert sum(source.count('== "none"') for source in package.values()) == 1
+    assert package["bench/extract.py"].count('extractor == "none"') == 1
+    assert 'row["extractor"] == "none"' not in package["bench/main.py"]
+    assert 'found["extractor"] == "none"' not in package["bench/main.py"]
+    assert bench_extract.kind_of("none") == bench_extract.IMAGE_KIND
+    assert bench_extract.kind_of("pypdf") == bench_extract.DOCUMENT_KIND
+    assert bench_extract.kind_of("text") == bench_extract.DOCUMENT_KIND
+    assert (
+        bench_extract.kind_of(bench_extract.SNAPSHOT_EXTRACTOR)
+        == bench_extract.SNAPSHOT_KIND
+    )

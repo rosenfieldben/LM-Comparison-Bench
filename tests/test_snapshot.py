@@ -14,6 +14,7 @@ a repository is a comparison over this module's reading of it.
 
 import ast
 import hashlib
+import re
 from pathlib import Path
 
 import pytest
@@ -713,3 +714,31 @@ def test_snapshot_imports_nothing_from_bench_but_extract():
         elif isinstance(node, ast.Import):
             reached.update(alias.name for alias in node.names)
     assert {name for name in reached if name.startswith("bench")} == {"bench.extract"}
+
+
+def test_the_readme_names_exclusions_the_walker_actually_applies():
+    """WINDOW: the README's default-exclusions sentence, against
+    DEFAULT_EXCLUDES.
+
+    A WORKED LIST IS A PROMISE, the same argument the dataset example
+    lives under one module over. Someone reading it will believe their
+    .env is excluded, and an entry named in the documentation that the
+    walker does not hold is a person shipping a credential to a provider
+    because they read the README. Extracted from the text rather than
+    restated, so the two cannot drift.
+    """
+    text = Path("README.md").read_text(encoding="utf-8")
+    paragraphs = [
+        block
+        for block in text.split("\n\n")
+        if block.startswith("Default exclusions apply")
+    ]
+    assert len(paragraphs) == 1, "the README's exclusion paragraph moved"
+    named = set(re.findall(r"`([^`]+)`", paragraphs[0]))
+    assert named, "the paragraph names no exclusions at all"
+    for pattern in named:
+        assert pattern in DEFAULT_EXCLUDES, pattern
+    # And the secrets group specifically, because it is the one the
+    # commission did not ask for and the one a reader most needs to be
+    # able to trust.
+    assert {".env", "*.pem", "*.key", "id_rsa*", ".netrc", ".npmrc"} <= named

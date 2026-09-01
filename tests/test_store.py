@@ -3434,3 +3434,110 @@ def test_a_migration_failure_that_is_not_a_race_still_raises(tmp_path):
     with mock.patch.object(store, "MIGRATIONS", (("no_such_table", "c", "INTEGER"),)):
         with pytest.raises(sqlite3.OperationalError):
             store.connect(str(db_path))
+
+
+PRE_L_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_l_schema.sql"
+).read_text()
+
+
+def test_migration_onto_pre_l_database_is_additive_and_idempotent(tmp_path):
+    """WINDOW: a database whose schema is exactly 7cbe668's, through
+    connect(), from the pre-state to the post-state and a second boot.
+
+    ONE ADDITIVE COLUMN: manifest_json onto attachment_extractions. The
+    fixture is the schema string taken out of git rather than
+    transcribed, because a hand-copied era snapshot proves what somebody
+    believed the schema was.
+
+    NOTHING BACKFILLS IT, and asserting that is the point of this test
+    rather than an omission from it. Every rendition written before
+    Phase L is a reading of ONE FILE, and a reading of one file has no
+    member manifest and never will, so NULL here is the affirmative fact
+    that this row is not a snapshot. A backfill would have to invent
+    one. Contrast kind and filename two eras back, where the attachments
+    row genuinely held the answer and the migration copied it across.
+
+    THE EXISTING ROW SURVIVES UNCHANGED, which is the additive
+    invariant: an old extraction keeps its text, its rendition and its
+    counts, and gains one NULL.
+    """
+    db_path = tmp_path / "pre_l.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_L_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at,
+                                    extracted_chars)
+           VALUES ('cd', 'old.txt', 'text/plain', 6, X'6f6c6465', 'old text',
+                   'text', '1', '2026-08-01T00:00:00+00:00', 8)"""
+    )
+    legacy.execute(
+        """INSERT INTO attachment_extractions (digest, extractor,
+                                               extractor_version,
+                                               extracted_text, created_at,
+                                               kind, filename, mime,
+                                               extracted_chars)
+           VALUES ('cd', 'text', '1', 'old text',
+                   '2026-08-01T00:00:00+00:00', 'document', 'old.txt',
+                   'text/plain', 8)"""
+    )
+    legacy.commit()
+
+    # The pre-state, asserted. Without it this could pass against a
+    # fixture that already had the column, proving nothing.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")]
+    assert "manifest_json" not in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [
+            r["name"] for r in conn.execute("PRAGMA table_info(attachment_extractions)")
+        ]
+        assert "manifest_json" in after
+
+        # The old reading is intact and its manifest is NULL, which is
+        # the fact rather than a gap: it read one file.
+        found = store.extraction_for(conn, "cd", "text", "1")
+        assert found is not None
+        assert found["extracted_text"] == "old text"
+        assert found["kind"] == "document"
+        assert found["manifest_json"] is None
+
+        # And a snapshot written onto the migrated database keeps its
+        # manifest, so the column is not merely present but wired.
+        store.save_attachment(
+            conn,
+            {
+                "digest": "ef",
+                "filename": "snapshot-ef.txt",
+                "mime": "text/plain",
+                "byte_size": 4,
+                "content": b"tree",
+                "extracted_text": "tree",
+                "extractor": "repo-walk",
+                "extractor_version": "1",
+                "kind": "snapshot",
+                "manifest_json": '{"files": []}',
+            },
+        )
+        walked = store.extraction_for(conn, "ef", "repo-walk", "1")
+        assert walked is not None
+        assert walked["manifest_json"] == '{"files": []}'
+        assert walked["kind"] == "snapshot"
+    finally:
+        conn.close()
+
+    # Idempotent: a second connect must not fail and must not disturb
+    # what the first one wrote.
+    again = store.connect(str(db_path))
+    try:
+        assert store.extraction_for(again, "cd", "text", "1")["manifest_json"] is None
+        assert (
+            store.extraction_for(again, "ef", "repo-walk", "1")["manifest_json"]
+            == '{"files": []}'
+        )
+    finally:
+        again.close()

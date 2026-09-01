@@ -1017,6 +1017,55 @@ IMAGE_KIND = "image"
 DOCUMENT_KIND = "document"
 SNAPSHOT_KIND = "snapshot"
 
+# The walker's identity, beside the readers' in _READERS and _VERSIONS
+# and here for the same reason the kinds are here: this module owns the
+# vocabulary a rendition is spoken in, and kind_of below has to be able
+# to name the walker without importing the module that runs it, which
+# imports this one.
+#
+# THE VERSION IS BUMPED BY HAND WHEN THE COMPOSED SNAPSHOT WOULD CHANGE
+# for the same tree, which is the rule "stdlib-zipfile-xml" follows two
+# constants up and for the same reason: renditions are keyed on (digest,
+# extractor, extractor_version), so a changed reading served under an
+# unchanged version is false provenance arriving through the one door
+# the key cannot see. Changing a header's wording, the ordering rule,
+# the encoding rule or the default exclusions in bench/snapshot.py all
+# qualify. Widening what that module REFUSES does not, because a refusal
+# produces no rendition.
+#
+# "repo-walk" rather than a library name because no library does it: the
+# selection, the ordering and the delimiters are written in this repo,
+# and the honest label for that is the code's own name, exactly as
+# "stdlib-zipfile-xml" is.
+SNAPSHOT_EXTRACTOR = "repo-walk"
+SNAPSHOT_VERSION = "1"
+
+
+def kind_of(extractor: str) -> str:
+    """The kind a rendition has, decided by the extractor that made it.
+
+    ONE PLACE DECIDES KIND. It was three ternaries in three modules
+    while there were two kinds, which was survivable because a two-way
+    conditional reads at a glance; a third kind turns each of them into
+    a chain, and three chains that must agree is the shape this
+    codebase has already paid for twice.
+
+    FROM THE EXTRACTOR AND NOT FROM A FILENAME, which is the K.1 ruling
+    this function inherits whole. kind re-derived from whichever name
+    the first upload of some bytes happened to carry is how PNG bytes
+    first sent as shot.txt stayed "a document" forever.
+
+    "none" is the image path: not a parser that produced nothing, which
+    is what a scanned PDF is, but no parser at all. Everything that is
+    not the image path and not the walker read one file and produced
+    text, which is a document.
+    """
+    if extractor == "none":
+        return IMAGE_KIND
+    if extractor == SNAPSHOT_EXTRACTOR:
+        return SNAPSHOT_KIND
+    return DOCUMENT_KIND
+
 
 # What the first bytes of each accepted image format look like.
 #
@@ -1153,7 +1202,7 @@ def rendition_of(filename: str, digest: str) -> dict[str, str]:
         "digest": digest,
         "extractor": extractor,
         "extractor_version": version,
-        "kind": IMAGE_KIND if extractor == "none" else DOCUMENT_KIND,
+        "kind": kind_of(extractor),
     }
 
 

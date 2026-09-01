@@ -546,6 +546,31 @@ MIGRATIONS = [
     # NULL is the same pair of eras as the column above, and for the
     # same reason: pre-M, or no documents to have a mode about.
     ("experiments", "attachments_mode", "TEXT"),
+    # Phase L, the snapshot's MEMBER MANIFEST. One column, nullable and
+    # additive, on the RENDITION rather than on the attachment.
+    #
+    # A snapshot's attachment is one text and one digest, and that text
+    # is the reading. What the reading COVERED is a different fact:
+    # which files at which sizes with which digests, which exclusions
+    # were in force, which patterns selected, and which commit the clone
+    # was at with whether its tree was dirty. That is provenance of
+    # exactly the kind extractor_version is, so it belongs beside it.
+    #
+    # ON THE EXTRACTION AND NOT ON attachments, for the reason kind and
+    # mime moved here in K.1 and K.3: the base row belongs to whichever
+    # write arrived first, and the manifest is a property of the
+    # reading. Two walks of one clone a commit apart compose different
+    # text, so they are different renditions with different manifests,
+    # and a manifest on the base row could only describe one of them.
+    #
+    # NULL IS EVERY OTHER RENDITION AND IS NOT A GAP. A document and an
+    # image have no member manifest and never will, so NULL here is the
+    # affirmative fact that this reading was of one file rather than of
+    # a tree. Nothing backfills it, which is what makes this the rare
+    # additive column with nothing to derive: there is no earlier era
+    # whose snapshots lost their manifests, because there were no
+    # snapshots.
+    ("attachment_extractions", "manifest_json", "TEXT"),
 ]
 
 
@@ -749,13 +774,23 @@ def connect(path: str) -> sqlite3.Connection:
     # rather than from the filename, because the extractor is what
     # actually did the reading and the filename is the thing K.1 stopped
     # trusting.
+    #
+    # THE THREE SPELLINGS ARE LITERALS AND THAT IS DELIBERATE. This
+    # module imports nothing from bench and is the persistence layer
+    # rather than a participant in the vocabulary, so 'none',
+    # 'image', 'document', 'repo-walk' and 'snapshot' are written out
+    # here instead of interpolated from extract and snapshot. What stops
+    # them drifting is an assertion rather than an import; see
+    # test_the_sql_kind_derivation_agrees_with_the_modules_that_name_it.
     conn.execute(
         """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
                 created_at, kind, filename, mime)
            SELECT digest, extractor, extractor_version, extracted_text,
                   created_at,
-                  CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
+                  CASE WHEN extractor = 'none' THEN 'image'
+                       WHEN extractor = 'repo-walk' THEN 'snapshot'
+                       ELSE 'document' END,
                   filename, mime
            FROM attachments"""
     )
@@ -785,6 +820,7 @@ def connect(path: str) -> sqlite3.Connection:
               SET kind = COALESCE(
                       e.kind,
                       CASE WHEN e.extractor = 'none' THEN 'image'
+                           WHEN e.extractor = 'repo-walk' THEN 'snapshot'
                            ELSE 'document' END),
                   filename = COALESCE(
                       e.filename,
@@ -1189,8 +1225,9 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         conn.execute(
             """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
-                created_at, kind, filename, mime, extracted_chars)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, kind, filename, mime, extracted_chars,
+                manifest_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["extractor"],
@@ -1214,6 +1251,13 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 # migration entry for what sqlite's length() does to a
                 # document containing a NUL.
                 chars,
+                # What this reading COVERED, for a reading of a tree.
+                # .get rather than [] because every caller before Phase
+                # L reads one file and has no manifest to give, and a
+                # required key would make this function refuse the
+                # records it has always taken. See the migration entry
+                # for why NULL here is a fact rather than a gap.
+                record.get("manifest_json"),
             ),
         )
     out = dict(row)
@@ -1270,10 +1314,15 @@ def extraction_for(
     base row for it. Backfilled at boot from the rendition's own
     filename by the same function the boundary uses, so it is None only
     on a row that has neither, which connect() cannot produce.
+
+    manifest_json is None on every reading of a single file, which is
+    every rendition but a snapshot's. Nothing backfills it, because a
+    NULL there is the affirmative fact that this reading was of one file
+    rather than of a tree; see the migration entry.
     """
     row = conn.execute(
         """SELECT digest, extractor, extractor_version, extracted_text,
-                  kind, filename, mime
+                  kind, filename, mime, manifest_json
            FROM attachment_extractions
            WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
         (digest, extractor, version),

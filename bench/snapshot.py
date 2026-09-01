@@ -35,26 +35,39 @@ from typing import Any
 from bench.extract import (
     IMAGE_SIGNATURES,
     MAX_COMPOSED_CHARS,
+    SNAPSHOT_EXTRACTOR,
     SNAPSHOT_KIND,
+    SNAPSHOT_VERSION,
 )
 
-# The extractor name and version that land on the attachment row.
-#
-# "repo-walk" rather than a library name because no library did this:
-# the selection, the ordering and the delimiters are written here, and
-# the honest label for that is the code's own name, matching
-# "stdlib-zipfile-xml" next door.
-#
-# THE VERSION IS BUMPED BY HAND WHEN THE COMPOSED TEXT WOULD CHANGE for
-# the same tree, which is the same rule the docx reader's version
-# follows and for the same reason: renditions are keyed on (digest,
-# extractor, extractor_version), so a changed reading served under an
-# unchanged version is false provenance arriving through the one door
-# the key cannot see. Changing a header's wording, the ordering rule,
-# the encoding rule or the default exclusions all qualify. Widening what
-# is REFUSED does not, because a refusal produces no rendition.
-SNAPSHOT_EXTRACTOR = "repo-walk"
-SNAPSHOT_VERSION = "1"
+# Re-exported rather than defined, and the direction is the one thing
+# worth reading twice: this module PRODUCES the rendition whose identity
+# those two name, and extract HOLDS the vocabulary, because extract.
+# kind_of has to be able to name the walker and cannot import the module
+# that runs it. The rule for bumping SNAPSHOT_VERSION is written beside
+# the constant there and it is about the code in HERE: change a header's
+# wording, the ordering rule, the encoding rule or DEFAULT_EXCLUDES and
+# the version moves with it.
+__all__ = [
+    "DEFAULT_EXCLUDES",
+    "ENCODING_RULE",
+    "MAX_MEMBER_BYTES",
+    "MAX_READ_BYTES",
+    "MAX_PATTERNS",
+    "MAX_WALKED_ENTRIES",
+    "SNAPSHOT_EXTRACTOR",
+    "SNAPSHOT_KIND",
+    "SNAPSHOT_VERSION",
+    "SnapshotError",
+    "compose",
+    "contained",
+    "digest_of",
+    "enforce_patterns",
+    "enforce_text",
+    "excluded",
+    "matches",
+    "walk",
+]
 
 # How every file in a snapshot is turned into text, stated once and
 # recorded in the manifest so a reader of the record never has to guess.
@@ -184,6 +197,25 @@ MAX_WALKED_ENTRIES = 20_000
 # asking. The door applies this bound before reading, and compose
 # applies it again because a pure function does not assume its caller.
 MAX_MEMBER_BYTES = MAX_COMPOSED_CHARS
+
+# The largest total a door may READ into memory before composing, and
+# the one number here that is derived rather than chosen.
+#
+# UTF-8 ENCODES ONE CHARACTER IN AT MOST FOUR BYTES, so a selection
+# whose bytes exceed four times the composed ceiling cannot possibly
+# compose to fewer characters than that ceiling, whatever it encodes.
+# The door can therefore stop reading at this point and be certain it
+# has not refused a snapshot the composition would have accepted, which
+# is the property a cheaper bound would not have: refusing at
+# MAX_COMPOSED_CHARS BYTES would refuse a perfectly composable snapshot
+# of CJK source, and the person would have no way to tell that from a
+# real over-ceiling refusal.
+#
+# WHAT IT BUYS is the memory. The per-file bound alone permits a
+# selection of two thousand files at 200 KB each, and the door reads
+# every one of them before compose sees a byte. This bounds what is held
+# to 800 KB plus one file, and the composition still owns the refusal.
+MAX_READ_BYTES = MAX_COMPOSED_CHARS * 4
 
 # The delimiters around each file in the composed snapshot.
 #
@@ -363,7 +395,7 @@ def enforce_patterns(patterns: Sequence[str]) -> None:
             )
 
 
-def _contained(real: str, root: str) -> bool:
+def contained(real: str, root: str) -> bool:
     """Whether a resolved path is the root or sits under it.
 
     String containment rather than a walk up the tree because both
@@ -371,6 +403,11 @@ def _contained(real: str, root: str) -> bool:
     symlink and no ".." survives resolution, so a prefix comparison is
     the whole question. The separator is appended so that "/repo-old"
     does not read as being under "/repo".
+
+    PUBLIC BECAUSE THE ALLOWLIST ASKS THE SAME QUESTION. The walk asks
+    whether a symlink's target left the root; the door asks whether the
+    root a request named sits under one of BENCH_REPO_ROOTS. One rule,
+    one separator bug to not have twice.
     """
     return real == root or real.startswith(root.rstrip("/") + "/")
 
@@ -449,7 +486,7 @@ def walk(
                 continue
             if is_symlink:
                 target = resolve(path)
-                if not _contained(target, root):
+                if not contained(target, root):
                     raise SnapshotError(
                         f"{path} is a symbolic link to {target}, which is "
                         "outside the snapshot root. A snapshot reads one "

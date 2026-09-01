@@ -1646,6 +1646,75 @@ digest. Deleting the bytes afterwards does not rewrite the record: the
 experiment and its export keep their pins, and anything that needs the
 content again refuses naming what is missing.
 
+### A repository snapshot
+
+**One clone, one attachment.** `POST /snapshots` walks a directory tree
+you name, composes the files it selects into one text, and stores that
+as a single attachment with its own digest. From there it is an
+attachment like any other: cite the digest from a dataset task, pin the
+reading, attach it to a hand comparison. Every model receives the same
+composed bytes, which is the fairness law getting the property for free.
+
+**It is off until you allowlist a root.** `BENCH_REPO_ROOTS` is a list
+of absolute directory paths separated by the platform's path separator,
+and nothing is walkable until it is set. Unset is not a boot failure:
+the bench starts normally and the door refuses, naming the variable and
+saying why the allowlist exists. This is the localhost posture applied
+to the filesystem. A snapshot composes file contents into a prompt sent
+to a provider, and one mistyped root is the difference between sharing a
+module and sharing whatever happened to be under a parent directory. The
+allowlist bounds what a typo can gather.
+
+```sh
+BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
+
+curl -s -X POST localhost:8000/snapshots \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/home/you/code/myproject",
+       "patterns": ["bench/**/*.py", "README.md"]}'
+```
+
+Patterns are repo-relative globs and **do not recurse unless they say
+so**: `*.py` is the top level, `**/*.py` is every depth, `src/**` is
+everything under `src`. A selection that matches nothing is refused
+naming the patterns, rather than composing an empty snapshot every model
+would be asked about.
+
+**Text or refused, and never truncated.** A binary file in the selection
+refuses the whole snapshot naming it, a file that is not valid UTF-8 is
+refused by name and byte offset, and a selection too large for the
+composed ceiling is refused naming its largest files. Nothing is silently
+dropped and nothing is shortened: a snapshot that quietly omitted a file
+would be a comparison over a repository you think you sent.
+
+**It fetches nothing.** The single-outbound-destination posture is
+untouched. The bench reads the local filesystem and the local git, and
+the only thing that leaves the machine is the composed prompt, through
+the door every other comparison uses. Remote repositories, diffs between
+snapshots and agentic file browsing are all deliberately out.
+
+Default exclusions apply and are recorded in every snapshot's manifest:
+version control and dependency trees (`.git`, `node_modules`, `.venv`,
+`vendor`), build output and caches (`__pycache__`, `dist`, `*.pyc`,
+`*.so`, `*.db`, `.hypothesis`), and **secrets** (`.env`, `.env.*`,
+`*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`). The last group is not
+overridable by a request, because an exclusion list a request could
+replace would make it opt-out, and an opt-out default is not a default.
+
+`GET /attachments/{digest}` serves the snapshot's **manifest**: every
+member's path, byte size and digest, the patterns and exclusions that
+were in force, the encoding rule, and the clone's HEAD commit with
+whether its tree was modified. Never any content, which is the promise
+every attachment response makes. The list endpoint omits the manifest
+deliberately, since a page of snapshots carrying theirs would be a page
+of bodies.
+
+Composing the same unchanged tree twice returns the first row: identical
+files compose identical text, so the digest matches and the
+content-addressed store does the rest. The manifest kept is the first
+walk's, including its commit, which stays a true statement about those
+bytes rather than becoming a stale one.
+
 **A dataset's version is its content.** There is no version field to keep
 in sync and no way to edit a file and leave a stale label behind: the
 identity is the sha256 of the raw bytes, recorded on every experiment that

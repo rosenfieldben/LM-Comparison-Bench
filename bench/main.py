@@ -15,9 +15,10 @@ import random
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,20 +32,21 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from bench import store
+from bench import snapshot, store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
 from bench.extract import (
-    DOCUMENT_KIND,
     IMAGE_KIND,
     IMAGE_MODALITY,
     MAX_ATTACHMENTS,
+    MAX_COMPOSED_CHARS,
     CompositionError,
     ExtractionError,
     compose,
     compose_native,
     enforce_composed_size,
     ingest,
+    kind_of,
     media_type_for,
     rendition_of,
 )
@@ -555,9 +557,10 @@ class Attachment(BaseModel):
     extracted_chars: int
     extractor: str
     extractor_version: str
-    # Which reader actually read these bytes: "document" or "image".
-    # Part of the rendition and therefore part of what the caller is
-    # told, since the same bytes under two suffixes are two renditions.
+    # Which reader actually read these bytes: "document", "image" or
+    # "snapshot". Part of the rendition and therefore part of what the
+    # caller is told, since the same bytes under two suffixes are two
+    # renditions. Derived in exactly one place; see extract.kind_of.
     kind: str
     created_at: str
 
@@ -571,6 +574,104 @@ class AttachmentList(BaseModel):
     """
 
     attachments: list[Attachment]
+
+
+# The longest root path a request may name. Linux caps a path at
+# PATH_MAX, 4096 bytes, so a longer one cannot name anything, and
+# refusing here means the message is about the request rather than
+# about a system call.
+MAX_ROOT_CHARS = 4096
+
+
+class SnapshotMember(BaseModel):
+    """One file inside a snapshot, as the manifest records it.
+
+    PATH, SIZE AND DIGEST AND NOT CONTENT, which is the same promise
+    Attachment makes one class up: the composed text is what a model
+    read and lives in the database, and an endpoint that served member
+    bytes back would make the bench a file host for somebody's
+    repository.
+
+    The three fields together are what makes "nothing was truncated"
+    checkable after the fact: the size and the digest describe the bytes
+    on disk, and the composed block carries the same two in its header.
+    """
+
+    path: str
+    size: int
+    digest: str
+
+
+class SnapshotManifest(BaseModel):
+    """What one snapshot's reading covered.
+
+    PROVENANCE OF THE SAME KIND AS extractor_version. That field says
+    which walker produced the text; this says which tree it walked,
+    under which selection, at which commit. A snapshot without it would
+    be a wall of source nobody could tie back to a repository state.
+
+    head and dirty are read locally from the clone and are both
+    nullable, which is deliberate and differs from _app_sha's rule.
+    _app_sha degrades the WHOLE label to None when the dirty question
+    cannot be answered, because a bare sha is the clean claim and
+    asserting it unverified is the lie that function guards against.
+    Here the two are separate fields, so a head with dirty None says
+    exactly what happened: the commit is known and whether the tree was
+    modified is not.
+    """
+
+    files: list[SnapshotMember]
+    patterns: list[str]
+    excludes: list[str]
+    head: str | None
+    dirty: bool | None
+    encoding: str
+
+
+class AttachmentDetail(Attachment):
+    """One attachment, with the manifest when it has one.
+
+    A SEPARATE MODEL FROM Attachment RATHER THAN A FIELD ON IT, and the
+    split is about the LIST. A member manifest is body-sized: a snapshot
+    of two thousand files carries two thousand rows, and a page of five
+    hundred attachments carrying those would undo exactly what K1.5
+    bought when it stopped the list reader from loading bodies. The list
+    answers Attachment, the two single-attachment doors answer this, and
+    neither shape has to be read as "sometimes populated".
+
+    None is every rendition of a single file, which is every rendition
+    but a snapshot's. It is not a missing value; see the migration entry
+    for manifest_json.
+    """
+
+    manifest: SnapshotManifest | None = None
+
+
+class SnapshotCreate(BaseModel):
+    """A repository snapshot request: one root, and what to select in it.
+
+    JSON AND NOT A FORM, for the reason AttachmentCreate gives: a POST
+    that is not application/json forces cross-origin senders into a
+    preflight this server never answers, and that invariant is the whole
+    boundary.
+
+    NO EXCLUSION FIELD, deliberately. The defaults in bench.snapshot are
+    not overridable, because the group of them that matters most is the
+    secrets group, and an exclusion list a request could replace would
+    make that group opt-out. An opt-out default is not a default.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    # The clone root to walk. Refused unless it resolves under one of
+    # BENCH_REPO_ROOTS; see the door.
+    root: str = Field(min_length=1, max_length=MAX_ROOT_CHARS)
+
+    # Repo-relative include globs. Bounded here as well as in
+    # enforce_patterns because a body is refused more cheaply than it is
+    # parsed, and the two bounds are the same constant rather than two
+    # numbers that could drift.
+    patterns: list[str] = Field(min_length=1, max_length=snapshot.MAX_PATTERNS)
 
 
 class AttachmentRef(BaseModel):
@@ -1086,13 +1187,20 @@ class GroupDetail(BaseModel):
     renditions: list[RenditionPin] | None = None
 
 
-def _git(args: list[str]) -> str | None:
+def _git(args: list[str], *, cwd: str | None = None) -> str | None:
     """One git command's stdout, or None when git could not answer.
 
     Split out of _app_sha so both of that function's questions run under
     one timeout and degrade discipline, and so a test can substitute a
     runner without reaching into subprocess. A non-zero exit is an answer
     the caller cannot use, which is the same as no answer.
+
+    cwd DEFAULTS TO THIS CHECKOUT and Phase L is why it is a parameter
+    at all. _app_sha asks about the code that is running, which is
+    always this tree; a snapshot asks about the clone it just walked,
+    which is somebody else's. Both questions want the same two-second
+    timeout and the same degrade-to-None, so they get the same runner
+    rather than a second one that could drift on either.
     """
     try:
         proc = subprocess.run(
@@ -1100,7 +1208,7 @@ def _git(args: list[str]) -> str | None:
             capture_output=True,
             text=True,
             timeout=2,
-            cwd=Path(__file__).resolve().parent.parent,
+            cwd=cwd or Path(__file__).resolve().parent.parent,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1167,6 +1275,93 @@ def _parse_spend_limit(raw: str | None) -> float | None:
             "Unset it for no limit."
         )
     return limit
+
+
+# What the snapshot door says when it has no allowlist to check against.
+#
+# ONE SENTENCE, TWO PLACES. The composer's snapshot control shows this
+# same text when the feature is off, so the UI never offers a door the
+# server will refuse; a second wording would be a second explanation of
+# one fact, and the one the person read would depend on where they
+# happened to look.
+SNAPSHOTS_OFF = (
+    "snapshots are off because BENCH_REPO_ROOTS is not set. A snapshot "
+    "walks a directory tree and composes its files into a prompt sent "
+    "to a provider, so which trees may be walked is an explicit "
+    "allowlist rather than whatever path a request names: the localhost "
+    "posture applied to the filesystem. Set BENCH_REPO_ROOTS to the "
+    "clone roots that may be snapshotted, separated by the platform's "
+    "path separator, and restart the bench."
+)
+
+
+def _resolved_directory(path: str) -> str | None:
+    """The fully resolved path, if it is a directory, else None.
+
+    The one filesystem question the allowlist parser and the door both
+    ask, in one place so the two cannot answer it differently. realpath
+    rather than absolute: a root reached through a symlink has to be
+    compared as what it IS, or an allowlist of real paths could be
+    walked around by naming a link to one of them.
+    """
+    real = os.path.realpath(path)
+    return real if os.path.isdir(real) else None
+
+
+def _parse_repo_roots(
+    raw: str | None, *, resolved: Callable[[str], str | None]
+) -> tuple[str, ...]:
+    """BENCH_REPO_ROOTS as resolved roots, or () when it is not set.
+
+    ABSENT IS THE FEATURE OFF, NOT A BOOT FAILURE, and the difference
+    from OPENROUTER_API_KEY is the whole reason this returns a tuple
+    instead of raising. The key is not optional: a bench without one
+    reports every model as errored and looks like an outage, so it fails
+    at boot. Snapshots are optional, and a bench that refused to start
+    because a feature nobody uses was unconfigured would be a worse
+    bench. The door refuses instead, with SNAPSHOTS_OFF, which is the
+    unfetchable catalog's shape: degrade with honesty, refuse at the
+    door that needs the thing.
+
+    SET AND WRONG IS A BOOT FAILURE, which is the other half and is not
+    a contradiction. Setting the variable is a person saying "these
+    trees", and a relative path or a directory that does not exist means
+    the sentence they wrote does not name what they meant. Failing here
+    is failing before any request can be refused for a reason the
+    operator would then have to go looking for.
+
+    AN EMPTY ENTRY IS REFUSED rather than skipped. A trailing separator
+    is the ordinary typo, and in a PATH-shaped variable an empty entry
+    has historically meant the current working directory, which is
+    exactly the accident an allowlist exists to prevent.
+    """
+    if raw is None or not raw.strip():
+        return ()
+    out: list[str] = []
+    for entry in raw.split(os.pathsep):
+        named = entry.strip()
+        if not named:
+            raise RuntimeError(
+                "BENCH_REPO_ROOTS has an empty entry, which is usually a "
+                f"stray {os.pathsep!r}. Every entry must be an absolute "
+                "path to a directory."
+            )
+        if not os.path.isabs(named):
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {named!r} is not an absolute "
+                "path. The allowlist is compared against resolved paths, "
+                "so a relative entry would depend on where the bench "
+                "happened to be started."
+            )
+        real = resolved(named)
+        if real is None:
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {named!r} is not a directory. "
+                "Each entry is a clone root the bench may walk."
+            )
+        if real not in out:
+            out.append(real)
+    return tuple(out)
 
 
 def _parse_data_policy(raw: str | None) -> str:
@@ -1240,6 +1435,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # request can be built. The resolved provider block is computed once
     # here rather than per request: it is boot-scoped by design, so a run
     # can never be sent under a policy other than the one its row records.
+    # Which trees POST /snapshots may walk, resolved once at boot. Unset
+    # is the feature off and is not an error; set and wrong raises here,
+    # beside the key check and the spend ceiling. See _parse_repo_roots.
+    app.state.repo_roots = _parse_repo_roots(
+        os.environ.get("BENCH_REPO_ROOTS"), resolved=_resolved_directory
+    )
+    if app.state.repo_roots:
+        logger.info("snapshot roots: %s", ", ".join(app.state.repo_roots))
     app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
     app.state.provider_prefs = provider_preferences(app.state.data_policy)
     if app.state.data_policy != "standard":
@@ -2145,7 +2348,7 @@ def row_rendition(row: dict[str, Any]) -> dict[str, Any]:
         "digest": row["digest"],
         "extractor": row["extractor"],
         "extractor_version": row["extractor_version"],
-        "kind": IMAGE_KIND if row["extractor"] == "none" else DOCUMENT_KIND,
+        "kind": kind_of(row["extractor"]),
     }
 
 
@@ -5787,9 +5990,7 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
             "were given the pinned one. Re-upload the file to store this "
             "reading again, or start a new comparison.",
         )
-    stored_kind = found.get("kind") or (
-        IMAGE_KIND if found["extractor"] == "none" else DOCUMENT_KIND
-    )
+    stored_kind = found.get("kind") or kind_of(found["extractor"])
     if pin["kind"] != stored_kind:
         raise HTTPException(
             422,
@@ -5831,8 +6032,7 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
         # the caller to re-derive from the suffix they sent. A response
         # that named the parser but not the kind still left "was this
         # read as an image or as a document" to be guessed.
-        "kind": row.get("kind")
-        or (IMAGE_KIND if row["extractor"] == "none" else DOCUMENT_KIND),
+        "kind": row.get("kind") or kind_of(row["extractor"]),
         "created_at": row["created_at"],
     }
 
@@ -6163,6 +6363,279 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     return _attachment_view(stored)
 
 
+# What a snapshot's stored row is called, and it is not a path.
+#
+# K.3'S FILENAME RULE EXTENDED TO A TREE. A name is display metadata: no
+# declaration can select one, nothing in the composed prompt carries it,
+# and the blind view must not show a path. The root a person walked is
+# the one string here that would name their filesystem, so the stored
+# name is a pure function of the digest instead, which makes it stable
+# across a re-compose of the same bytes and empty of anything private.
+#
+# The suffix is real rather than decorative: the stored bytes are UTF-8
+# text, media_type_for answers text/plain for a .txt, and a name whose
+# suffix disagreed with the type would be the disagreement K.3 spent a
+# phase removing.
+SNAPSHOT_SUFFIX = ".txt"
+
+
+def _snapshot_filename(digest: str) -> str:
+    """The display name for a snapshot of these bytes."""
+    return f"snapshot-{digest[:12]}{SNAPSHOT_SUFFIX}"
+
+
+def enforce_snapshot_root(named: str, roots: Sequence[str], *, real: str | None) -> str:
+    """The resolved root a request may walk, or a refusal saying why not.
+
+    THREE REFUSALS AND TWO CODES. No allowlist at all and a root outside
+    it are both 403: the request is well formed and the bench's policy
+    says no, which is the same answer LocalOnlyGuard gives a non-loopback
+    client and for the same reason. A root that is not a directory is
+    422, because that one is about what the caller wrote.
+
+    The allowed roots are named back on refusal. They are the operator's
+    own configuration and the caller is that operator on loopback, so
+    listing them is the difference between "no" and "no, and here is
+    what you meant to type".
+
+    resolution ARRIVES AS AN ARGUMENT so this stays a value-in-value-out
+    decision. The caller does the realpath; this decides.
+    """
+    if not roots:
+        raise HTTPException(403, SNAPSHOTS_OFF)
+    if real is None:
+        raise HTTPException(
+            422,
+            f"{named!r} is not a directory the bench can read. A snapshot "
+            "walks a clone root, so this wants the directory the "
+            "repository was cloned into.",
+        )
+    if not any(snapshot.contained(real, allowed) for allowed in roots):
+        raise HTTPException(
+            403,
+            f"{named!r} resolves to {real}, which is not under any entry "
+            f"of BENCH_REPO_ROOTS ({', '.join(roots)}). A snapshot "
+            "composes a tree's files into a prompt sent to a provider, "
+            "so which trees may be walked is an explicit allowlist "
+            "rather than whatever path a request names.",
+        )
+    return real
+
+
+def _snapshot_filesystem(
+    root: str,
+) -> tuple[Callable[[str], list[tuple[str, bool, bool]]], Callable[[str], str]]:
+    """The two callables bench.snapshot's walk is expressed over.
+
+    Written here because this is where I/O belongs, which is the same
+    split extraction has: the edge decides what may be touched, the pure
+    module decides what is valid. is_dir is asked WITHOUT following
+    links because the walk checks the link flag first and refuses or
+    skips on it; answering it with links followed would classify an
+    escaping directory link as a directory and hide it behind the
+    descent.
+
+    A directory that cannot be listed is a SnapshotError rather than a
+    500, because the person's next action is to fix a permission or
+    narrow a pattern, and a traceback tells them neither.
+    """
+
+    def entries(where: str) -> list[tuple[str, bool, bool]]:
+        try:
+            with os.scandir(os.path.join(root, where) if where else root) as listing:
+                return [
+                    (
+                        entry.name,
+                        entry.is_dir(follow_symlinks=False),
+                        entry.is_symlink(),
+                    )
+                    for entry in listing
+                ]
+        except OSError as exc:
+            raise snapshot.SnapshotError(
+                f"{where or 'the snapshot root'} could not be listed: {exc.strerror}."
+            ) from None
+
+    def resolve(where: str) -> str:
+        return os.path.realpath(os.path.join(root, where) if where else root)
+
+    return entries, resolve
+
+
+def _snapshot_members(root: str, paths: list[str]) -> list[tuple[str, bytes]]:
+    """Read the selected files, refusing anything a snapshot may not hold.
+
+    THE OBLIGATION walk's DOCSTRING NAMES. That module does no I/O, so
+    it cannot tell a regular file from a socket, a device or a fifo, and
+    it says the door must. Opening a fifo can block forever, which is
+    the one failure here that no timeout in this process would end.
+
+    THE SIZE IS CHECKED BEFORE THE READ, and compose checks it again
+    afterwards. Not a duplicated rule but the same rule at the only two
+    places it can be applied: a pure function handed bytes cannot un-read
+    them, and a boundary that read first would have spent the memory
+    before asking. The running total is bounded by MAX_READ_BYTES, which
+    is four times the composed ceiling precisely so that stopping here
+    can never refuse a snapshot the composition would have accepted.
+    """
+    members: list[tuple[str, bytes]] = []
+    running = 0
+    for path in paths:
+        full = os.path.join(root, path)
+        try:
+            info = os.stat(full, follow_symlinks=False)
+        except OSError as exc:
+            raise snapshot.SnapshotError(
+                f"{path} could not be read: {exc.strerror}."
+            ) from None
+        if not stat.S_ISREG(info.st_mode):
+            raise snapshot.SnapshotError(
+                f"{path} is not a regular file, so the bench will not open "
+                "it. A socket, a device or a named pipe under a source "
+                "tree is refused rather than read, because reading one "
+                "can block with nothing to time out."
+            )
+        if info.st_size > snapshot.MAX_MEMBER_BYTES:
+            raise snapshot.SnapshotError(
+                f"{path} is {info.st_size} bytes, over the "
+                f"{snapshot.MAX_MEMBER_BYTES} limit for one file in a "
+                "snapshot, and is refused before it is read. Nothing is "
+                "truncated, so narrow the patterns around it."
+            )
+        running += info.st_size
+        if running > snapshot.MAX_READ_BYTES:
+            raise snapshot.SnapshotError(
+                f"the selection passed {snapshot.MAX_READ_BYTES} bytes at "
+                f"{path} and the bench stopped reading. Even at four bytes "
+                "per character that cannot compose under the "
+                f"{MAX_COMPOSED_CHARS} character ceiling, so "
+                "narrow the patterns."
+            )
+        try:
+            members.append((path, Path(full).read_bytes()))
+        except OSError as exc:
+            raise snapshot.SnapshotError(
+                f"{path} could not be read: {exc.strerror}."
+            ) from None
+    return members
+
+
+def _clone_state(root: str) -> tuple[str | None, bool | None]:
+    """The commit the walked tree is at and whether it is modified.
+
+    TWO NULLABLE FIELDS RATHER THAN ONE DEGRADED LABEL, which is where
+    this deliberately differs from _app_sha. That function answers
+    "which code is running" as a single string, so a sha it cannot
+    qualify as clean degrades to None entirely: an unqualified sha IS
+    the clean claim. Here the two are separate manifest fields, so a
+    head with dirty None is not a claim about cleanliness at all, it is
+    the honest "the commit is known and the tree's state is not".
+
+    THE STATUS IS SCOPED TO THE ROOT with an explicit path argument. A
+    clone root may be a subdirectory of a larger repository, and a bare
+    status would report that whole repository as modified when the tree
+    being snapshotted was untouched. The head is still the containing
+    repository's, which is the only commit there is.
+
+    Untracked files count as modified, which is _app_sha's reasoning
+    inherited: an untracked file under the root is a file the walk may
+    well have just composed.
+    """
+    head = as_text((_git(["rev-parse", "HEAD"], cwd=root) or "").strip()) or None
+    if head is None:
+        return (None, None)
+    status = _git(["status", "--porcelain", "."], cwd=root)
+    if status is None:
+        return (head, None)
+    return (head, bool(status.strip()))
+
+
+def _attachment_detail(row: dict[str, Any]) -> dict[str, Any]:
+    """One attachment with its stored manifest, for the two single doors.
+
+    THE STORED MANIFEST AND NOT THE ONE JUST COMPOSED, so POST and GET
+    cannot contradict each other about one digest, which is the failure
+    K.3 spent a phase removing from the upload path.
+
+    It matters here because the manifest is NOT a function of the
+    rendition key. Two walks of one clone at two commits compose
+    byte-identical text whenever the selected files did not change, so
+    they are one rendition with one row, and the head recorded is the
+    first walk's. That is a true statement about these bytes rather than
+    a stale one: the snapshot IS its content, and the earlier commit
+    produced exactly this content. Rule two's forward-only law does the
+    rest, since rewriting the manifest would relabel a record every
+    existing comparison already cites.
+    """
+    view = _attachment_view(row)
+    stored = store.extraction_for(
+        app.state.db, row["digest"], view["extractor"], view["extractor_version"]
+    )
+    raw = (stored or {}).get("manifest_json")
+    return {**view, "manifest": json.loads(raw) if raw else None}
+
+
+@app.post("/snapshots", response_model=AttachmentDetail, status_code=201)
+async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
+    """Walk one allowlisted clone and store the reading as one attachment.
+
+    IT FETCHES NOTHING. The single-outbound-destination posture is
+    untouched: this reads the local filesystem and the local git, and
+    the only thing that ever leaves the machine is the composed prompt,
+    through the same door every other comparison uses.
+
+    THE WHOLE SNAPSHOT IS ONE ATTACHMENT, which is what keeps the
+    fairness law intact for free. One digest, one rendition, one
+    composed text, delivered byte-identically to every model exactly as
+    a document is.
+
+    Composing the same tree twice returns the existing row rather than a
+    second copy, on the same content-addressed dedupe an upload gets. A
+    tree that has not changed composes byte-identical text, so the digest
+    is the same and INSERT OR IGNORE does the rest.
+
+    SYNCHRONOUS ON THE EVENT LOOP, bounded rather than offloaded. The
+    walk stops at MAX_WALKED_ENTRIES and the read at MAX_READ_BYTES, so
+    the worst case is twenty thousand stat calls and eight hundred
+    kilobytes, which is the same order as the base64 decode and
+    extraction create_attachment already does inline.
+    """
+    root = enforce_snapshot_root(
+        body.root, app.state.repo_roots, real=_resolved_directory(body.root)
+    )
+    entries, resolve = _snapshot_filesystem(root)
+    try:
+        paths = snapshot.walk(entries=entries, resolve=resolve, patterns=body.patterns)
+        members = _snapshot_members(root, paths)
+        head, dirty = _clone_state(root)
+        built = snapshot.compose(
+            members, patterns=body.patterns, head=head, dirty=dirty
+        )
+    except snapshot.SnapshotError as exc:
+        # 422 for every refusal from here down, because every one of them
+        # is about what the request selected and the caller's next action
+        # is to change a pattern. The message is written to be shown.
+        raise HTTPException(422, str(exc)) from None
+    content = built["text"].encode("utf-8")
+    filename = _snapshot_filename(built["digest"])
+    stored = store.save_attachment(
+        app.state.db,
+        {
+            "digest": built["digest"],
+            "filename": filename,
+            "mime": media_type_for(filename),
+            "byte_size": len(content),
+            "content": content,
+            "extracted_text": built["text"],
+            "extractor": built["extractor"],
+            "extractor_version": built["extractor_version"],
+            "kind": built["kind"],
+            "manifest_json": json.dumps(built["manifest"]),
+        },
+    )
+    return _attachment_detail(stored)
+
+
 @app.get("/attachments", response_model=AttachmentList)
 async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     """Every stored document, newest first. Never any content.
@@ -6193,7 +6666,7 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     }
 
 
-@app.get("/attachments/{digest}", response_model=Attachment)
+@app.get("/attachments/{digest}", response_model=AttachmentDetail)
 async def get_attachment(digest: str) -> dict[str, Any]:
     """Metadata for one stored document. Never its content.
 
@@ -6208,8 +6681,11 @@ async def get_attachment(digest: str) -> dict[str, Any]:
     # The row's OWN rendition, with no substitution. GET by digest
     # answers "what is stored under these bytes", and the row is the
     # first reading of them; the response names the extractor and
-    # version, so the answer is specific rather than ambiguous.
-    return _attachment_view(row)
+    # version, so the answer is specific rather than ambiguous. The
+    # manifest rides along for a snapshot and is None for everything
+    # else, and it is the STORED one, so this and POST /snapshots cannot
+    # disagree about one digest.
+    return _attachment_detail(row)
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)
