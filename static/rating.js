@@ -229,6 +229,12 @@
     window.BenchState.newViewEpoch();
     resultsEl.replaceChildren();
     runControlsEl.replaceChildren();
+    // THE COMPOSER FORGETS ITS SNAPSHOT INPUTS, the fourteenth review's
+    // medium. The blind cards themselves never carried a path, but the
+    // composer stays on the page under them, and a root typed earlier
+    // sat in a hidden input one click from view. A view whose rule is
+    // "shows no file paths" cannot hold one anywhere on the page.
+    window.BenchAttach.forgetSnapshot();
     labelEl.textContent = "Blind rating: comparison #" + groupId;
     let payload;
     try {

@@ -2726,12 +2726,27 @@ def enforce_inline_mode(pins: list[dict[str, Any]]) -> None:
     # reader that actually read the bytes, and pinned.
     wrong = [p["digest"][:12] for p in pins if p["kind"] == IMAGE_KIND]
     if wrong:
+        # THE REMEDY NAMES ONLY WHAT CAN MAKE THE SET VALID, the
+        # fourteenth review's medium. "Use native mode" is a real fix
+        # when every document in the set is an image, because native
+        # takes all of them; a set that also holds a document or a
+        # snapshot has no mode that sends it whole, and telling the
+        # person to switch would send them to a second refusal one
+        # word later. Then the only true sentence is that the set must
+        # be split.
+        others = sorted({p["kind"] for p in pins if p["kind"] != IMAGE_KIND})
+        remedy = (
+            "Use native mode, which hands the image to the model itself and "
+            "checks that every model in the lineup accepts one"
+            if not others
+            else "No single mode sends this set: inline cannot send an image "
+            f"and native cannot send a {' or a '.join(others)}. Split the "
+            "comparison so each set has one kind of reading"
+        )
         raise HTTPException(
             422,
             f"sha256 {', '.join(wrong)} is an image, and inline mode "
-            "sends extracted text, which an image has none of. Use "
-            "native mode, which hands the image to the model itself and "
-            "checks that every model in the lineup accepts one.",
+            f"sends extracted text, which an image has none of. {remedy}.",
         )
 
 
@@ -2798,7 +2813,11 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
             "Use inline mode, which extracts the text and gives every model "
             "the same reading of it"
         )
-        if any(p["kind"] == DOCUMENT_KIND for p in wrong):
+        # Re-uploading as an image fixes a DOCUMENT and is offered only
+        # when every wrong pin is one: a snapshot has no upload to redo,
+        # so a set holding one cannot be made native by re-uploading its
+        # neighbours, and a remedy that fixes half a set is not a remedy.
+        if all(p["kind"] == DOCUMENT_KIND for p in wrong):
             remedy += (
                 ", or re-upload the file under an image extension so the "
                 "bench reads it as an image"
@@ -6157,9 +6176,16 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
             f"{pin['extractor_version']} is stored as a {stored_kind} and "
             f"the declaration calls it a {pin['kind']}. The bench will not "
             "relabel a reading: the kind decides which mode may use it and "
-            f"what the models are shown. Declare it as a {stored_kind}, or "
-            "upload the file under an extension that makes it "
-            f"a {pin['kind']}.",
+            f"what the models are shown. Declare it as a {stored_kind}"
+            + (
+                # A file can be uploaded again under another name and
+                # read the other way; a snapshot cannot, and neither
+                # can any reading be turned INTO a snapshot by renaming.
+                f", or upload the file under an extension that makes it a "
+                f"{pin['kind']}."
+                if SNAPSHOT_KIND not in (stored_kind, pin["kind"])
+                else "."
+            ),
         )
     return found
 

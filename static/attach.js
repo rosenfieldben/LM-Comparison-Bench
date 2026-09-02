@@ -255,8 +255,10 @@
     modeEl.value = mode === "native" ? "native" : "inline";
     msgEl.textContent = "";
     // The snapshot control's last answer described a staging set that no
-    // longer exists, so it stops outranking the blocker.
+    // longer exists, so it stops outranking the blocker, and a root
+    // typed for that set is forgotten with it.
     snapMsgEl.dataset.said = "";
+    forgetSnapshot();
     render();
   }
 
@@ -266,6 +268,7 @@
     modeEl.value = "inline";
     msgEl.textContent = "";
     snapMsgEl.dataset.said = "";
+    forgetSnapshot();
     render();
   }
 
@@ -732,6 +735,17 @@
     snapOpenEl.setAttribute("aria-expanded", "false");
   }
 
+  // Close the panel AND empty its inputs. Called on a composed
+  // snapshot, on every view takeover that replaces the staging set, and
+  // by the blind view when it opens, because a control holding a clone
+  // root is a path waiting to be shown and the blind view's rule is
+  // that it shows none.
+  function forgetSnapshot() {
+    snapRootEl.value = "";
+    snapPatternsEl.value = "";
+    closeSnapshotPanel();
+  }
+
   // A message this control produced in ANSWER to something the person
   // did, as opposed to one it is merely restating. Set by every path in
   // composeSnapshot, cleared when a snapshot lands or the staged set is
@@ -763,12 +777,14 @@
 
   async function composeSnapshot() {
     const root = snapRootEl.value.trim();
-    // Comma-separated, which is safe because the pattern syntax has no
-    // comma in it: the walker supports *, ?, ** and character classes,
-    // and deliberately not brace expansion, so there is nothing a person
-    // could write here that a comma would cut in half.
+    // ONE PER LINE, NEVER SPLIT ON COMMAS: the fourteenth review's
+    // medium. The server accepts a comma literally in a pattern and
+    // inside a character class, so "a,b.py" is one pattern naming one
+    // file, and a comma split sent "a" and "b.py" and could have
+    // selected two different files from what was typed. A newline can
+    // never be part of a pattern, so it is the one safe separator.
     const patterns = snapPatternsEl.value
-      .split(",")
+      .split("\n")
       .map((pattern) => pattern.trim())
       .filter((pattern) => pattern !== "");
     if (root === "") {
@@ -848,7 +864,12 @@
       }
       staged.push(body);
       said("");
-      closeSnapshotPanel();
+      // The inputs are cleared on success and the panel closed, so the
+      // root that was typed does not sit on the page waiting for the
+      // next open: a clone root is a path on somebody's filesystem, the
+      // one thing this feature never shows, and a hidden input holding
+      // one is a view that shows it one click later.
+      forgetSnapshot();
     } catch (err) {
       if (stale(epoch, staging)) return;
       said("the snapshot request could not be sent: " + err.message);
@@ -994,6 +1015,7 @@
 
   A.busy = busy;
   A.blockingReason = blockingReason;
+  A.forgetSnapshot = forgetSnapshot;
   // Repaint on new facts from outside, currently the data policy landing
   // with the catalog. Named refresh rather than exposing render, because
   // a caller must not be able to pass it arguments and change what is

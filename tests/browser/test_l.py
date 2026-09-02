@@ -253,3 +253,109 @@ def test_a_staged_snapshot_chip_names_the_walk_it_was(snapshot_bench, snapshot_r
     assert "no commit, unknown" in title
     declared = page.evaluate("() => window.BenchAttach.declared()")
     assert isinstance(declared["renditions"][0]["capture_id"], int)
+
+
+# ----- the fourteenth review's mediums at the seam ---------------------
+
+
+def test_review_repro_a_pattern_with_a_comma_is_sent_as_one_pattern(
+    snapshot_bench, snapshot_root
+):
+    """WINDOW: the body POST /snapshots receives for a pattern box holding
+    "a,b.py" on one line and "pkg/*.py" on the next.
+
+    THE REVIEW'S MEDIUM. The server takes a comma literally and inside a
+    character class, so "a,b.py" is one pattern naming one file; the
+    composer split on commas and sent "a" and "b.py", which could select
+    two different files from what was typed. Patterns are one per line
+    now and a newline can never be part of a pattern, so it is the one
+    safe separator.
+    """
+    page = snapshot_bench(["model/alpha"])
+    sent = []
+    page.route(
+        "**/snapshots",
+        lambda route: (
+            sent.append(route.request.post_data_json),
+            route.continue_(),
+        ),
+    )
+    page.get_by_test_id("snapshot-open").click()
+    page.get_by_test_id("snapshot-root").fill(str(snapshot_root))
+    page.get_by_test_id("snapshot-patterns").fill("a,b.py\npkg/*.py")
+    page.get_by_test_id("snapshot-compose").click()
+    # What was SENT is the claim; the chip is the consequence. Asserted
+    # in that order so a failure names the split rather than its
+    # downstream refusal.
+    expect(page.get_by_test_id("attachment-chip")).to_have_count(1, timeout=10_000)
+    assert sent and sent[0]["patterns"] == ["a,b.py", "pkg/*.py"]
+
+
+def test_review_repro_success_clears_the_root_from_the_composer(
+    snapshot_bench, snapshot_root
+):
+    """WINDOW: the snapshot inputs after Compose snapshot succeeded.
+
+    THE REVIEW'S MEDIUM, first half. Success hid the panel and left the
+    root in its input, so a clone root, a path on somebody's
+    filesystem and the one thing this feature never shows, sat on the
+    page one click from view. Success empties the inputs and closes the
+    panel.
+    """
+    page = snapshot_bench(["model/alpha"])
+    page.get_by_test_id("snapshot-open").click()
+    page.get_by_test_id("snapshot-root").fill(str(snapshot_root))
+    page.get_by_test_id("snapshot-patterns").fill("pkg/*.py")
+    page.get_by_test_id("snapshot-compose").click()
+    expect(page.get_by_test_id("attachment-chip")).to_have_count(1)
+
+    expect(page.get_by_test_id("snapshot-panel")).to_be_hidden()
+    assert page.get_by_test_id("snapshot-root").input_value() == ""
+    assert page.get_by_test_id("snapshot-patterns").input_value() == ""
+
+
+def test_review_repro_the_blind_view_never_holds_a_root_anywhere_on_the_page(
+    snapshot_bench, snapshot_bench_url, snapshot_root
+):
+    """WINDOW: the snapshot inputs after a blind session opens over a
+    composer that had a root typed and not yet composed.
+
+    THE REVIEW'S MEDIUM, second half. The blind cards never carried a
+    path, but the composer stays on the page under them, and a root
+    typed earlier sat in a hidden input that + Snapshot would reopen.
+    A view whose rule is "shows no file paths" cannot hold one anywhere
+    on the page, so opening the blind view forgets the inputs and closes
+    the panel.
+    """
+    page = snapshot_bench(["stub/fast", "stub/slow"])
+    api = page.request
+    group = api.post(
+        snapshot_bench_url + "/groups",
+        data={
+            "prompt": "blind over a typed root",
+            "models": ["stub/fast", "stub/slow"],
+            "budget": "standard",
+        },
+    )
+    assert group.ok, group.text()
+    group_id = group.json()["id"]
+    # One batch over the whole lineup, which is what a group's members
+    # are: two cards to be blind between.
+    batch = api.post(
+        snapshot_bench_url + "/compare",
+        data={
+            "prompt": "blind over a typed root",
+            "models": ["stub/fast", "stub/slow"],
+            "group_id": group_id,
+        },
+    )
+    assert batch.ok, batch.text()
+
+    page.get_by_test_id("snapshot-open").click()
+    page.get_by_test_id("snapshot-root").fill(str(snapshot_root))
+    page.evaluate("id => window.BenchRating.startBlind(id)", group_id)
+    expect(page.get_by_test_id("rating-panel")).to_be_visible()
+
+    expect(page.get_by_test_id("snapshot-panel")).to_be_hidden()
+    assert page.get_by_test_id("snapshot-root").input_value() == ""
+    assert str(snapshot_root) not in page.locator("#attach-row").inner_text()

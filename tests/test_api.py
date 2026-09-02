@@ -17682,3 +17682,121 @@ def test_an_export_taken_before_any_run_still_explains_its_captures(client, tmp_
     assert [x for x in lines if x["type"] == "trial"] == []
     assert manifest["task_attachments"]["t1"][0]["capture_id"] == built["capture"]["id"]
     assert str(built["capture"]["id"]) in manifest["captures"]
+
+
+# ===================================================================
+# The fourteenth review's mediums: remedies name only what can make
+# the set valid.
+# ===================================================================
+
+
+def test_review_repro_a_misdeclared_snapshot_is_not_told_to_re_upload(client, tmp_path):
+    """WINDOW: resolve_rendition's kind-mismatch refusal for a pin that
+    calls a stored snapshot a document.
+
+    A FALSE REMEDY, the review's medium. "Upload the file under an
+    extension that makes it a document" is a real fix when a document
+    was stored under an image suffix; a snapshot has no file and no
+    suffix, and nothing can be uploaded to turn a walk into a document
+    or a document into a walk. The refusal names the one action that
+    makes the declaration valid, declaring the stored kind, and stops.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [built["digest"]],
+            "renditions": [
+                {
+                    "digest": built["digest"],
+                    "extractor": built["extractor"],
+                    "extractor_version": built["extractor_version"],
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "Declare it as a snapshot" in detail
+    assert "upload the file" not in detail
+
+
+def test_review_repro_a_mixed_snapshot_and_document_set_under_native_is_not_told_to_re_upload(
+    client, tmp_path
+):
+    """WINDOW: enforce_native_mode's refusal over a document AND a
+    snapshot declared native.
+
+    Re-uploading the document as an image is offered only when every
+    wrong pin is a document: with a snapshot in the set, doing so would
+    leave the set exactly as unsendable, one refusal later. The remedy
+    that makes the whole set valid is inline mode, and it is the only
+    one named.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    doc = upload(client, "c.txt", b"forty two days").json()["digest"]
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [doc, built["digest"]],
+            "attachments_mode": "native",
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "Use inline mode" in detail
+    assert "re-upload" not in detail.lower()
+
+
+def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
+    client, tmp_path
+):
+    """WINDOW: enforce_inline_mode's refusal over an image AND a snapshot
+    declared inline.
+
+    "Use native mode" is a real fix when every document in the set is an
+    image, because native takes all of them. With a snapshot beside the
+    image no mode sends the set whole: inline cannot send the image and
+    native cannot send the snapshot, and telling the person to switch
+    sends them to a second refusal one word later. The only true
+    sentence is that the set must be split, so that is the sentence.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    image = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [image, built["digest"]],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "No single mode sends this set" in detail
+    assert "native cannot send a snapshot" in detail
+    assert "Use native mode" not in detail
+
+    # And the image-only set keeps its real remedy, so the change chose
+    # rather than replaced.
+    alone = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [image],
+        },
+    )
+    assert "Use native mode" in alone.json()["detail"]

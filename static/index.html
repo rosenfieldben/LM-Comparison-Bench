@@ -92,9 +92,12 @@
       <input id="snapshot-root" data-testid="snapshot-root" type="text"
              aria-label="Clone root to snapshot"
              placeholder="Clone root, an absolute path under BENCH_REPO_ROOTS">
-      <input id="snapshot-patterns" data-testid="snapshot-patterns" type="text"
-             aria-label="Include patterns, comma separated"
-             placeholder="Include patterns, comma separated: bench/**/*.py, README.md">
+      <!-- One pattern per line, never comma-separated: the server takes
+           a comma literally and inside a character class, so a comma
+           split would send two patterns where one was typed. -->
+      <textarea id="snapshot-patterns" data-testid="snapshot-patterns" rows="2"
+                aria-label="Include patterns, one per line"
+                placeholder="Include patterns, one per line: bench/**/*.py then README.md"></textarea>
       <button id="snapshot-compose" data-testid="snapshot-compose"
               type="button">Compose snapshot</button>
     </div>
