@@ -868,6 +868,58 @@
   outline-offset: 2px;
 }
 #attach-mode { font-size: 11px; }
+/* The snapshot control. A disabled + Snapshot reads as unavailable
+   rather than as broken, and the sentence saying why is #snapshot-msg
+   below, which is text on the page and not a hover title. */
+.attach-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.attach-btn:disabled:hover { background: none; }
+/* [hidden] is set from script and must actually hide: this row is a
+   flex container, and a flex item's display wins over the UA's
+   [hidden] rule unless it is said here. */
+#snapshot-panel[hidden] { display: none; }
+#snapshot-panel {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+  flex-basis: 100%;
+  margin-top: 6px;
+}
+#snapshot-root { flex: 2 1 260px; }
+#snapshot-patterns { flex: 3 1 300px; resize: vertical; line-height: 1.5; }
+#snapshot-root,
+#snapshot-patterns {
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 4px;
+  border: 1px solid var(--accent-dash-border);
+  background: none;
+  color: var(--text);
+  font-size: 11.5px;
+  font-family: inherit;
+}
+#snapshot-compose {
+  min-height: 28px;
+  padding: 0 13px;
+  border-radius: 4px;
+  border: 1px dashed var(--accent-dash-border);
+  color: var(--accent-label);
+  background: none;
+  font-size: 11.5px;
+  cursor: pointer;
+}
+#snapshot-compose:hover { background: var(--accent-tint); }
+#snapshot-compose:disabled { cursor: not-allowed; opacity: 0.55; }
+#snapshot-compose:disabled:hover { background: none; }
+#snapshot-msg {
+  font-size: 11px;
+  color: var(--text-faint);
+  flex-basis: 100%;
+  margin-top: 4px;
+}
 #attach-msg { font-size: 11px; color: var(--warn, var(--text-faint)); flex-basis: 100%; }
 #attach-note { font-size: 10.5px; color: var(--text-faint); flex-basis: 100%; }
 .attach-note-line { margin-top: 2px; }

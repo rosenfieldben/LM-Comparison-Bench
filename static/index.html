@@ -78,7 +78,34 @@
           <option value="native">native: the model sees the image</option>
         </select>
       </span>
+      <!-- A repository snapshot is an attachment the bench composes
+           rather than one the person uploads, so it sits beside Attach
+           and produces the same chip. Disabled, with the server's own
+           refusal in the title, when BENCH_REPO_ROOTS is unset: a
+           control that offers a door the server will refuse is worse
+           than one that says why it cannot. -->
+      <button id="snapshot-open" data-testid="snapshot-open" type="button"
+              class="attach-btn" aria-expanded="false"
+              aria-controls="snapshot-panel">+ Snapshot</button>
     </div>
+    <div id="snapshot-panel" data-testid="snapshot-panel" hidden>
+      <input id="snapshot-root" data-testid="snapshot-root" type="text"
+             aria-label="Clone root to snapshot"
+             placeholder="Clone root, an absolute path under BENCH_REPO_ROOTS">
+      <!-- One pattern per line, never comma-separated: the server takes
+           a comma literally and inside a character class, so a comma
+           split would send two patterns where one was typed. -->
+      <textarea id="snapshot-patterns" data-testid="snapshot-patterns" rows="2"
+                aria-label="Include patterns, one per line"
+                placeholder="Include patterns, one per line: bench/**/*.py then README.md"></textarea>
+      <button id="snapshot-compose" data-testid="snapshot-compose"
+              type="button">Compose snapshot</button>
+    </div>
+    <!-- Outside the panel on purpose. When BENCH_REPO_ROOTS is unset the
+         panel never opens, and the server's own sentence has to be
+         readable anyway: a reason available only in a disabled button's
+         hover title is a reason no keyboard user ever sees. -->
+    <div id="snapshot-msg" data-testid="snapshot-msg" role="status"></div>
     <div id="attach-msg" data-testid="attach-msg" role="status"></div>
     <div id="attach-note" data-testid="attach-note"></div>
   </div>

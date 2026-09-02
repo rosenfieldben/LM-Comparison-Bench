@@ -3434,3 +3434,272 @@ def test_a_migration_failure_that_is_not_a_race_still_raises(tmp_path):
     with mock.patch.object(store, "MIGRATIONS", (("no_such_table", "c", "INTEGER"),)):
         with pytest.raises(sqlite3.OperationalError):
             store.connect(str(db_path))
+
+
+PRE_L_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_l_schema.sql"
+).read_text()
+
+
+def test_migration_onto_pre_l_database_is_additive_and_idempotent(tmp_path):
+    """WINDOW: a database whose schema is exactly 7cbe668's, through
+    connect(), from the pre-state to the post-state and a second boot.
+
+    ONE ADDITIVE COLUMN: manifest_json onto attachment_extractions. The
+    fixture is the schema string taken out of git rather than
+    transcribed, because a hand-copied era snapshot proves what somebody
+    believed the schema was.
+
+    NOTHING BACKFILLS IT, and asserting that is the point of this test
+    rather than an omission from it. Every rendition written before
+    Phase L is a reading of ONE FILE, and a reading of one file has no
+    member manifest and never will, so NULL here is the affirmative fact
+    that this row is not a snapshot. A backfill would have to invent
+    one. Contrast kind and filename two eras back, where the attachments
+    row genuinely held the answer and the migration copied it across.
+
+    THE EXISTING ROW SURVIVES UNCHANGED, which is the additive
+    invariant: an old extraction keeps its text, its rendition and its
+    counts, and gains one NULL.
+    """
+    db_path = tmp_path / "pre_l.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_L_SCHEMA)
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at,
+                                    extracted_chars)
+           VALUES ('cd', 'old.txt', 'text/plain', 6, X'6f6c6465', 'old text',
+                   'text', '1', '2026-08-01T00:00:00+00:00', 8)"""
+    )
+    legacy.execute(
+        """INSERT INTO attachment_extractions (digest, extractor,
+                                               extractor_version,
+                                               extracted_text, created_at,
+                                               kind, filename, mime,
+                                               extracted_chars)
+           VALUES ('cd', 'text', '1', 'old text',
+                   '2026-08-01T00:00:00+00:00', 'document', 'old.txt',
+                   'text/plain', 8)"""
+    )
+    legacy.commit()
+
+    # The pre-state, asserted. Without it this could pass against a
+    # fixture that already had the column, proving nothing.
+    before = [r[1] for r in legacy.execute("PRAGMA table_info(attachment_extractions)")]
+    assert "manifest_json" not in before
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        after = [
+            r["name"] for r in conn.execute("PRAGMA table_info(attachment_extractions)")
+        ]
+        assert "manifest_json" in after
+
+        # The old reading is intact and its manifest is NULL, which is
+        # the fact rather than a gap: it read one file.
+        found = store.extraction_for(conn, "cd", "text", "1")
+        assert found is not None
+        assert found["extracted_text"] == "old text"
+        assert found["kind"] == "document"
+        assert found["manifest_json"] is None
+
+        # And a snapshot written onto the migrated database keeps its
+        # manifest, so the column is not merely present but wired.
+        store.save_attachment(
+            conn,
+            {
+                "digest": "ef",
+                "filename": "snapshot-ef.txt",
+                "mime": "text/plain",
+                "byte_size": 4,
+                "content": b"tree",
+                "extracted_text": "tree",
+                "extractor": "repo-walk",
+                "extractor_version": "1",
+                "kind": "snapshot",
+                "manifest_json": '{"files": []}',
+            },
+        )
+        walked = store.extraction_for(conn, "ef", "repo-walk", "1")
+        assert walked is not None
+        assert walked["manifest_json"] == '{"files": []}'
+        assert walked["kind"] == "snapshot"
+    finally:
+        conn.close()
+
+    # Idempotent: a second connect must not fail and must not disturb
+    # what the first one wrote.
+    again = store.connect(str(db_path))
+    try:
+        assert store.extraction_for(again, "cd", "text", "1")["manifest_json"] is None
+        assert (
+            store.extraction_for(again, "ef", "repo-walk", "1")["manifest_json"]
+            == '{"files": []}'
+        )
+    finally:
+        again.close()
+
+
+PRE_CAPTURE_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_capture_schema.sql"
+).read_text()
+
+
+def test_migration_onto_pre_capture_database_adds_the_table_and_backfills_once(
+    tmp_path,
+):
+    """WINDOW: a database whose schema is exactly 46a5825's, through
+    connect(), from the pre-state to the post-state and a second boot.
+
+    THE FOURTEENTH REVIEW'S H2, at the store. A Phase L snapshot kept
+    its commit, dirty flag, patterns and exclusions inside manifest_json,
+    one per rendition, so a second walk composing identical bytes lost
+    its own. The captures table is new and additive (CREATE TABLE IF NOT
+    EXISTS through the same executescript every boot runs), and the era
+    row's walk facts are backfilled into exactly one capture dated by the
+    extraction's own created_at. The manifest column is left as written:
+    forward-only, and the readers project it.
+
+    ONCE, AND NEVER AGAIN: the second connect must not add a second
+    capture for the same rendition, which is the idempotence a boot-time
+    backfill has to have or every restart would invent a walk.
+    """
+    db_path = tmp_path / "pre_capture.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_CAPTURE_SCHEMA)
+    # The era's manifest_json came from MIGRATIONS, not from SCHEMA, so
+    # the fixture (which is SCHEMA verbatim) lacks it and a Phase L
+    # database has it. Added here the way that era's boot added it, so
+    # the pre-state is a database that HELD manifests and no captures.
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    era_manifest = json.dumps(
+        {
+            "files": [{"path": "a.py", "size": 6, "digest": "aa"}],
+            "patterns": ["*.py"],
+            "excludes": [".git"],
+            "head": "0123456789abcdef0123456789abcdef01234567",
+            "dirty": True,
+            "encoding": "UTF-8, strict, with a leading byte-order mark removed",
+        }
+    )
+    legacy.execute(
+        """INSERT INTO attachments (digest, filename, mime, byte_size, content,
+                                    extracted_text, extractor,
+                                    extractor_version, created_at,
+                                    extracted_chars)
+           VALUES ('ab', 'snapshot-ab.txt', 'text/plain', 4, X'74726565',
+                   'tree', 'repo-walk', '1', '2026-08-30T00:00:00+00:00', 4)"""
+    )
+    legacy.execute(
+        """INSERT INTO attachment_extractions (digest, extractor,
+                                               extractor_version,
+                                               extracted_text, created_at,
+                                               kind, filename, mime,
+                                               extracted_chars, manifest_json)
+           VALUES ('ab', 'repo-walk', '1', 'tree',
+                   '2026-08-30T00:00:00+00:00', 'snapshot', 'snapshot-ab.txt',
+                   'text/plain', 4, ?)""",
+        (era_manifest,),
+    )
+    legacy.commit()
+    # The pre-state, asserted: no captures table at all.
+    tables = {r[0] for r in legacy.execute("SELECT name FROM sqlite_master")}
+    assert "snapshot_captures" not in tables
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        found = store.latest_capture(conn, "ab", "repo-walk", "1")
+        assert found is not None
+        assert found["head"] == "0123456789abcdef0123456789abcdef01234567"
+        assert found["dirty"] is True
+        assert found["patterns"] == ["*.py"]
+        assert found["excludes"] == [".git"]
+        # Dated by the walk, which is the extraction's own timestamp,
+        # and not by this boot.
+        assert found["captured_at"] == "2026-08-30T00:00:00+00:00"
+        # The era row is untouched: forward-only.
+        assert store.extraction_for(conn, "ab", "repo-walk", "1")["manifest_json"] == (
+            era_manifest
+        )
+        count = conn.execute("SELECT count(*) FROM snapshot_captures").fetchone()[0]
+        assert count == 1
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        assert (
+            again.execute("SELECT count(*) FROM snapshot_captures").fetchone()[0] == 1
+        )
+    finally:
+        again.close()
+
+
+def test_a_capture_is_recorded_per_walk_and_read_back_by_id_and_by_latest(tmp_path):
+    """WINDOW: record_capture, capture, captures_for and latest_capture over
+    two walks of one rendition.
+
+    CONTENT DEDUPES; CAPTURES DO NOT. Two records for one (digest,
+    extractor, version), each its own row, the latest being the newest
+    id, and the batch reader returning both keyed by id.
+    """
+    conn = store.connect(str(tmp_path / "c.db"))
+    try:
+        first = store.record_capture(
+            conn,
+            "ab",
+            "repo-walk",
+            "1",
+            head="c1",
+            dirty=False,
+            patterns=["*.py"],
+            excludes=[".git"],
+        )
+        second = store.record_capture(
+            conn,
+            "ab",
+            "repo-walk",
+            "1",
+            head="c1",
+            dirty=True,
+            patterns=["*.py"],
+            excludes=[".git"],
+        )
+        assert first["id"] != second["id"]
+        assert store.latest_capture(conn, "ab", "repo-walk", "1")["id"] == second["id"]
+        assert store.capture(conn, first["id"])["dirty"] is False
+        both = store.captures_for(conn, [first["id"], second["id"]])
+        assert sorted(both) == sorted([first["id"], second["id"]])
+        assert store.captures_for(conn, []) == {}
+        assert store.capture(conn, 99) is None
+    finally:
+        conn.close()
+
+
+def test_the_pin_decoder_carries_an_integer_capture_and_refuses_a_wrong_type():
+    """WINDOW: _decoded_renditions, the fifth optional key.
+
+    Absent reads as None, an integer reads as itself, and anything else
+    in the slot refuses the pin whole, which is the shape check every
+    other key already gets. bool is refused explicitly because it is an
+    int to isinstance and "capture_id": true is a typo, not a row.
+    """
+    pin = {
+        "digest": "a" * 64,
+        "extractor": "repo-walk",
+        "extractor_version": "1",
+        "kind": "snapshot",
+    }
+    assert store._decoded_renditions(json.dumps([pin]))[0]["capture_id"] is None
+    assert (
+        store._decoded_renditions(json.dumps([{**pin, "capture_id": 7}]))[0][
+            "capture_id"
+        ]
+        == 7
+    )
+    assert store._decoded_renditions(json.dumps([{**pin, "capture_id": "7"}])) is None
+    assert store._decoded_renditions(json.dumps([{**pin, "capture_id": True}])) is None

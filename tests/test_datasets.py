@@ -93,7 +93,10 @@ def test_review_repro_a_task_may_cite_a_digest_or_a_full_rendition():
 
     assert out["tasks"][0]["attachments"] == [{"digest": DIGEST}]
     assert "extractor" not in out["tasks"][0]["attachments"][0]
-    assert out["tasks"][1]["attachments"] == [FULL_PIN]
+    # The fifth part, unnamed, is carried as None: the loader completes
+    # the SHAPE and never the reading, so a pin nobody wrote a capture
+    # into stays a pin with no capture.
+    assert out["tasks"][1]["attachments"] == [{**FULL_PIN, "capture_id": None}]
 
 
 def test_the_pin_shape_is_one_shape_in_three_files():
@@ -564,6 +567,7 @@ def test_the_readme_dataset_example_is_one_the_loader_accepts():
             "extractor": "pypdf",
             "extractor_version": "6.15.0",
             "kind": "document",
+            "capture_id": None,
         }
     ]
 
@@ -639,3 +643,44 @@ def test_the_same_anchor_holds_inside_a_full_pin():
         parse_dataset(dataset(line(id="t1", prompt="a", attachments=[pin])))
 
     assert "task 't1'" in str(exc.value)
+
+
+def test_a_pin_capture_is_a_positive_integer_or_refused():
+    """WINDOW: the loader, the fifth part of a pin.
+
+    A capture id is a row number and nothing else may stand in for one:
+    a string, a bool (an int to isinstance, and "capture_id: true" is a
+    typo), zero and a negative are all refused at the line that wrote
+    them.
+    """
+    from bench.datasets import DatasetError, parse_dataset
+
+    snapshot = {
+        **FULL_PIN,
+        "extractor": "repo-walk",
+        "extractor_version": "1",
+        "kind": "snapshot",
+    }
+    for bad in ("7", True, 0, -3):
+        raw = (
+            json.dumps(
+                {
+                    "id": "t",
+                    "prompt": "p",
+                    "attachments": [{**snapshot, "capture_id": bad}],
+                }
+            )
+            + "\n"
+        ).encode()
+        with pytest.raises(DatasetError) as caught:
+            parse_dataset(raw)
+        assert "capture_id" in str(caught.value) and "positive integer" in str(
+            caught.value
+        )
+    good = (
+        json.dumps(
+            {"id": "t", "prompt": "p", "attachments": [{**snapshot, "capture_id": 7}]}
+        )
+        + "\n"
+    ).encode()
+    assert parse_dataset(good)["tasks"][0]["attachments"][0]["capture_id"] == 7

@@ -154,6 +154,17 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     extracted_chars INTEGER,
     UNIQUE (digest, extractor, extractor_version)
 );
+CREATE TABLE IF NOT EXISTS snapshot_captures (
+    id INTEGER PRIMARY KEY,
+    digest TEXT NOT NULL,
+    extractor TEXT NOT NULL,
+    extractor_version TEXT NOT NULL,
+    head TEXT,
+    dirty INTEGER,
+    patterns_json TEXT NOT NULL,
+    excludes_json TEXT NOT NULL,
+    captured_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -190,6 +201,8 @@ CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
 CREATE INDEX IF NOT EXISTS idx_groups_experiment_id ON groups(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
+CREATE INDEX IF NOT EXISTS idx_snapshot_captures_rendition
+    ON snapshot_captures(digest, extractor, extractor_version);
 """
 
 # Deleting an attachment deletes every reading of it.
@@ -419,10 +432,13 @@ MIGRATIONS = [
     # cannot widen UNIQUE (digest, extractor, extractor_version) and
     # cannot ADD COLUMN UNIQUE, so a four-column key would be
     # unreachable on any existing database. It is not needed: kind is a
-    # FUNCTION of the extractor ("none" is the image reader and nothing
-    # else is), so the three-column constraint already enforces the
-    # four-part key and the fourth part is recorded rather than
-    # constrained. If a future extractor ever produced two kinds, this
+    # FUNCTION of the extractor, so the three-column constraint already
+    # enforces the four-part key and the fourth part is recorded rather
+    # than constrained. Each extractor maps to exactly one kind, and
+    # Phase L adding a third kind did not weaken that: "none" is the
+    # image reader and nothing else is, "repo-walk" is the tree walker
+    # and nothing else is, and every remaining extractor reads one file
+    # into text. If a future extractor ever produced two kinds, this
     # comment is the thing that would have to change first.
     ("attachment_extractions", "kind", "TEXT"),
     ("attachment_extractions", "filename", "TEXT"),
@@ -546,6 +562,45 @@ MIGRATIONS = [
     # NULL is the same pair of eras as the column above, and for the
     # same reason: pre-M, or no documents to have a mode about.
     ("experiments", "attachments_mode", "TEXT"),
+    # Phase L, the snapshot's MEMBER MANIFEST. One column, nullable and
+    # additive, on the RENDITION rather than on the attachment.
+    #
+    # A snapshot's attachment is one text and one digest, and that text
+    # is the reading. What the reading COVERED is a different fact:
+    # which files at which sizes with which digests, which exclusions
+    # were in force, which patterns selected, and which commit the clone
+    # was at with whether its tree was dirty. That is provenance of
+    # exactly the kind extractor_version is, so it belongs beside it.
+    #
+    # ON THE EXTRACTION AND NOT ON attachments, for the reason kind and
+    # mime moved here in K.1 and K.3: the base row belongs to whichever
+    # write arrived first, and the manifest is a property of the
+    # reading. Two walks of one clone a commit apart compose different
+    # text, so they are different renditions with different manifests,
+    # and a manifest on the base row could only describe one of them.
+    #
+    # NULL IS EVERY OTHER RENDITION AND IS NOT A GAP. A document and an
+    # image have no member manifest and never will, so NULL here is the
+    # affirmative fact that this reading was of one file rather than of
+    # a tree. Nothing backfills it, which is what makes this the rare
+    # additive column with nothing to derive: there is no earlier era
+    # whose snapshots lost their manifests, because there were no
+    # snapshots.
+    #
+    # WHAT IT HOLDS NARROWED AT THE FOURTEENTH REVIEW'S H2, and the
+    # column did not change; what is written into it did. Phase L wrote
+    # the whole manifest here: members, encoding, AND the commit, the
+    # dirty flag, the patterns and the exclusions. The first two are
+    # facts about the CONTENT and belong on the rendition, which is keyed
+    # by content. The other four are facts about a CAPTURE, a moment
+    # somebody walked a tree, and two walks that compose identical bytes
+    # are one rendition and two captures. Keeping them here kept the
+    # first walk's and lost every later one's, reproduced: identical
+    # selected bytes with a dirtied tree answered dirty false. New rows
+    # write only files and encoding here; captures have their own table
+    # below, and rows written before it are read as they are and
+    # backfilled into it at boot (see connect).
+    ("attachment_extractions", "manifest_json", "TEXT"),
 ]
 
 
@@ -749,13 +804,23 @@ def connect(path: str) -> sqlite3.Connection:
     # rather than from the filename, because the extractor is what
     # actually did the reading and the filename is the thing K.1 stopped
     # trusting.
+    #
+    # THE THREE SPELLINGS ARE LITERALS AND THAT IS DELIBERATE. This
+    # module imports nothing from bench and is the persistence layer
+    # rather than a participant in the vocabulary, so 'none',
+    # 'image', 'document', 'repo-walk' and 'snapshot' are written out
+    # here instead of interpolated from extract and snapshot. What stops
+    # them drifting is an assertion rather than an import; see
+    # test_the_sql_kind_derivation_agrees_with_the_modules_that_name_it.
     conn.execute(
         """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
                 created_at, kind, filename, mime)
            SELECT digest, extractor, extractor_version, extracted_text,
                   created_at,
-                  CASE WHEN extractor = 'none' THEN 'image' ELSE 'document' END,
+                  CASE WHEN extractor = 'none' THEN 'image'
+                       WHEN extractor = 'repo-walk' THEN 'snapshot'
+                       ELSE 'document' END,
                   filename, mime
            FROM attachments"""
     )
@@ -785,6 +850,7 @@ def connect(path: str) -> sqlite3.Connection:
               SET kind = COALESCE(
                       e.kind,
                       CASE WHEN e.extractor = 'none' THEN 'image'
+                           WHEN e.extractor = 'repo-walk' THEN 'snapshot'
                            ELSE 'document' END),
                   filename = COALESCE(
                       e.filename,
@@ -861,6 +927,61 @@ def connect(path: str) -> sqlite3.Connection:
         conn.executemany(
             "UPDATE attachment_extractions SET extracted_chars = ? WHERE id = ?",
             per_reading,
+        )
+    # THE CAPTURE BACKFILL, the fourteenth review's H2, once per
+    # rendition and never again.
+    #
+    # A snapshot written in Phase L's era holds its commit, dirty flag,
+    # patterns and exclusions inside manifest_json, because that era
+    # had no other home for them. Those are capture facts and the table
+    # for them now exists, so each such rendition gets one capture row
+    # carrying exactly what its manifest recorded, dated by the
+    # extraction's own created_at because that is when the walk was.
+    # The manifest is left as written: rule two's forward-only law, and
+    # the readers project it. Idempotent by construction, since a
+    # rendition that already has any capture is skipped, and a
+    # manifest without a patterns key was written after this era and
+    # is not touched.
+    #
+    # ONE CAPTURE PER ERA RENDITION, NOT ONE PER WALK, and that is a
+    # limit rather than a choice: the era kept only the first walk's
+    # facts, which is the defect, and a backfill cannot recover walks
+    # the era discarded. The row it creates is honest about the one
+    # walk it can describe.
+    era = conn.execute(
+        """SELECT e.digest, e.extractor, e.extractor_version, e.manifest_json,
+                  e.created_at
+           FROM attachment_extractions e
+           WHERE e.manifest_json IS NOT NULL
+             AND e.manifest_json LIKE '%"patterns"%'
+             AND NOT EXISTS (SELECT 1 FROM snapshot_captures c
+                             WHERE c.digest = e.digest
+                               AND c.extractor = e.extractor
+                               AND c.extractor_version = e.extractor_version)"""
+    ).fetchall()
+    for row in era:
+        try:
+            recorded = json.loads(row["manifest_json"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(recorded, dict) or "patterns" not in recorded:
+            continue
+        dirty = recorded.get("dirty")
+        conn.execute(
+            """INSERT INTO snapshot_captures
+               (digest, extractor, extractor_version, head, dirty,
+                patterns_json, excludes_json, captured_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                row["digest"],
+                row["extractor"],
+                row["extractor_version"],
+                recorded.get("head"),
+                None if dirty is None else int(bool(dirty)),
+                json.dumps(list(recorded.get("patterns") or [])),
+                json.dumps(list(recorded.get("excludes") or [])),
+                row["created_at"],
+            ),
         )
     conn.commit()
     return conn
@@ -1189,8 +1310,9 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         conn.execute(
             """INSERT OR IGNORE INTO attachment_extractions
                (digest, extractor, extractor_version, extracted_text,
-                created_at, kind, filename, mime, extracted_chars)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                created_at, kind, filename, mime, extracted_chars,
+                manifest_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 record["digest"],
                 record["extractor"],
@@ -1214,6 +1336,13 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
                 # migration entry for what sqlite's length() does to a
                 # document containing a NUL.
                 chars,
+                # What this reading COVERED, for a reading of a tree.
+                # .get rather than [] because every caller before Phase
+                # L reads one file and has no manifest to give, and a
+                # required key would make this function refuse the
+                # records it has always taken. See the migration entry
+                # for why NULL here is a fact rather than a gap.
+                record.get("manifest_json"),
             ),
         )
     out = dict(row)
@@ -1245,6 +1374,112 @@ def save_attachment(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
     return out
 
 
+def record_capture(
+    conn: sqlite3.Connection,
+    digest: str,
+    extractor: str,
+    version: str,
+    *,
+    head: str | None,
+    dirty: bool | None,
+    patterns: list[str],
+    excludes: list[str],
+) -> dict[str, Any]:
+    """One CAPTURE: the moment a tree was walked into this rendition.
+
+    ALWAYS A NEW ROW, which is the whole difference from
+    save_attachment one function up. Content is deduplicated by digest
+    because the same composed bytes are the same treatment for every
+    model; a capture is a per-capture fact and not a row fact, and two
+    walks that composed identical bytes at two commits, or on a clean
+    tree and a dirtied one, are two captures of one rendition. The
+    fourteenth review reproduced the alternative: keeping capture facts
+    on the rendition kept the first walk's and silently lost every
+    later walk's. A pin names a capture by this row's id, so nothing
+    downstream has to guess which walk it meant.
+    """
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO snapshot_captures
+               (digest, extractor, extractor_version, head, dirty,
+                patterns_json, excludes_json, captured_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                digest,
+                extractor,
+                version,
+                head,
+                None if dirty is None else int(dirty),
+                json.dumps(list(patterns)),
+                json.dumps(list(excludes)),
+                _now(),
+            ),
+        )
+    found = capture(conn, int(cur.lastrowid or 0))
+    assert found is not None
+    return found
+
+
+def _capture_view(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "digest": row["digest"],
+        "extractor": row["extractor"],
+        "extractor_version": row["extractor_version"],
+        "head": row["head"],
+        "dirty": None if row["dirty"] is None else bool(row["dirty"]),
+        "patterns": json.loads(row["patterns_json"]),
+        "excludes": json.loads(row["excludes_json"]),
+        "captured_at": row["captured_at"],
+    }
+
+
+def capture(conn: sqlite3.Connection, capture_id: int) -> dict[str, Any] | None:
+    """One capture by id, or None."""
+    row = conn.execute(
+        "SELECT * FROM snapshot_captures WHERE id = ?", (capture_id,)
+    ).fetchone()
+    return None if row is None else _capture_view(row)
+
+
+def captures_for(
+    conn: sqlite3.Connection, capture_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    """The named captures by id, for callers holding a list.
+
+    One query rather than N, for the reason attachments_for exists
+    beside get_attachment: a history page of five hundred comparisons
+    over snapshots resolves every capture on it in one round trip.
+    """
+    wanted = sorted({int(c) for c in capture_ids})
+    if not wanted:
+        return {}
+    marks = ", ".join("?" for _ in wanted)
+    rows = conn.execute(
+        f"SELECT * FROM snapshot_captures WHERE id IN ({marks})", wanted
+    )
+    return {row["id"]: _capture_view(row) for row in rows}
+
+
+def latest_capture(
+    conn: sqlite3.Connection, digest: str, extractor: str, version: str
+) -> dict[str, Any] | None:
+    """The most recent capture of one rendition, or None.
+
+    What a bare citation of a snapshot resolves to at creation, in the
+    same sense a bare digest resolves to its row's own rendition: a
+    fact frozen at that moment rather than a lookup repeated later.
+    Newest by id, which is insertion order and therefore capture order.
+    """
+    row = conn.execute(
+        """SELECT * FROM snapshot_captures
+           WHERE digest = ? AND extractor = ? AND extractor_version = ?
+           ORDER BY id DESC LIMIT 1""",
+        (digest, extractor, version),
+    ).fetchone()
+    return None if row is None else _capture_view(row)
+
+
 def extraction_for(
     conn: sqlite3.Connection, digest: str, extractor: str, version: str
 ) -> dict[str, Any] | None:
@@ -1270,10 +1505,15 @@ def extraction_for(
     base row for it. Backfilled at boot from the rendition's own
     filename by the same function the boundary uses, so it is None only
     on a row that has neither, which connect() cannot produce.
+
+    manifest_json is None on every reading of a single file, which is
+    every rendition but a snapshot's. Nothing backfills it, because a
+    NULL there is the affirmative fact that this reading was of one file
+    rather than of a tree; see the migration entry.
     """
     row = conn.execute(
         """SELECT digest, extractor, extractor_version, extracted_text,
-                  kind, filename, mime
+                  kind, filename, mime, manifest_json
            FROM attachment_extractions
            WHERE digest = ? AND extractor = ? AND extractor_version = ?""",
         (digest, extractor, version),
@@ -1357,12 +1597,24 @@ def _decoded_renditions(raw: object) -> list[dict[str, Any]] | None:
             for key in ("digest", "extractor", "extractor_version", "kind")
         ):
             return None
-        out.append(
-            {
-                key: item[key]
-                for key in ("digest", "extractor", "extractor_version", "kind")
-            }
-        )
+        # THE FIFTH KEY IS OPTIONAL AND AN INTEGER, the fourteenth
+        # review's H2: which CAPTURE of a snapshot this pin names. Absent
+        # on every pin written before the column's era and on every pin
+        # of a document or an image, which have no captures; present as
+        # a row id on a snapshot pin from H2 on. Anything else in the
+        # slot is the shape check's business and the pin is refused
+        # whole, like a wrong type in any of the four.
+        capture = item.get("capture_id")
+        if capture is not None and (
+            isinstance(capture, bool) or not isinstance(capture, int)
+        ):
+            return None
+        pin = {
+            key: item[key]
+            for key in ("digest", "extractor", "extractor_version", "kind")
+        }
+        pin["capture_id"] = capture
+        out.append(pin)
     return out
 
 

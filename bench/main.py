@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -15,9 +16,10 @@ import random
 import re
 import secrets
 import sqlite3
+import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -31,7 +33,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from bench import store
+from bench import snapshot, store
 from bench.datasets import DatasetError, parse_dataset
 from bench.experiments import plan_trials, seed_for_repeat
 from bench.extract import (
@@ -39,12 +41,14 @@ from bench.extract import (
     IMAGE_KIND,
     IMAGE_MODALITY,
     MAX_ATTACHMENTS,
+    SNAPSHOT_KIND,
     CompositionError,
     ExtractionError,
     compose,
     compose_native,
     enforce_composed_size,
     ingest,
+    kind_of,
     media_type_for,
     rendition_of,
 )
@@ -77,6 +81,7 @@ from bench.report import (
     export_line,
     export_manifest,
     export_trial,
+    referenced_captures,
 )
 from bench.scoring import judged_pass, score_response
 
@@ -259,7 +264,38 @@ class RenditionPin(BaseModel):
     digest: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
     extractor: str = Field(min_length=1, max_length=64)
     extractor_version: str = Field(min_length=1, max_length=64)
-    kind: Literal["document", "image"]
+    kind: Literal["document", "image", "snapshot"]
+    # WHICH CAPTURE, the fourteenth review's H2. A rendition is keyed by
+    # content, and two walks that compose identical bytes are one
+    # rendition and two captures: two commits, or a clean tree and a
+    # dirtied one. The pin names the capture so the record can say
+    # which walk this comparison read, and it is optional because a
+    # document or an image has no captures and a snapshot cited without
+    # one resolves to its latest at creation, the way a bare digest
+    # resolves to its row's own reading. Honored verbatim or refused
+    # like the four above: resolve_rendition checks that the capture
+    # exists and is a capture of THIS reading.
+    capture_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
+
+
+class SnapshotCapture(BaseModel):
+    """One walk of a tree into a rendition: when, at which commit, with
+    the tree in which state, selecting what and excluding what.
+
+    A PER-CAPTURE FACT, NOT A ROW FACT. This is what Phase L kept on the
+    rendition's manifest and what the fourteenth review found lost
+    there: the manifest is one per rendition, a rendition is one per
+    composed text, and two captures of identical text kept the first
+    walk's commit and dirty flag and dropped the second's. Each capture
+    is its own record now, referenced from the pin by id.
+    """
+
+    id: int
+    head: str | None
+    dirty: bool | None
+    patterns: list[str]
+    excludes: list[str]
+    captured_at: str
 
 
 class CompareRequest(BaseModel):
@@ -555,9 +591,10 @@ class Attachment(BaseModel):
     extracted_chars: int
     extractor: str
     extractor_version: str
-    # Which reader actually read these bytes: "document" or "image".
-    # Part of the rendition and therefore part of what the caller is
-    # told, since the same bytes under two suffixes are two renditions.
+    # Which reader actually read these bytes: "document", "image" or
+    # "snapshot". Part of the rendition and therefore part of what the
+    # caller is told, since the same bytes under two suffixes are two
+    # renditions. Derived in exactly one place; see extract.kind_of.
     kind: str
     created_at: str
 
@@ -571,6 +608,109 @@ class AttachmentList(BaseModel):
     """
 
     attachments: list[Attachment]
+
+
+# The longest root path a request may name. Linux caps a path at
+# PATH_MAX, 4096 bytes, so a longer one cannot name anything, and
+# refusing here means the message is about the request rather than
+# about a system call.
+MAX_ROOT_CHARS = 4096
+
+
+class SnapshotMember(BaseModel):
+    """One file inside a snapshot, as the manifest records it.
+
+    PATH, SIZE AND DIGEST AND NOT CONTENT, which is the same promise
+    Attachment makes one class up: the composed text is what a model
+    read and lives in the database, and an endpoint that served member
+    bytes back would make the bench a file host for somebody's
+    repository.
+
+    The three fields together are what makes "nothing was truncated"
+    checkable after the fact: the size and the digest describe the bytes
+    on disk, and the composed block carries the same two in its header.
+    """
+
+    path: str
+    size: int
+    digest: str
+
+
+class SnapshotManifest(BaseModel):
+    """What one snapshot's reading covered.
+
+    PROVENANCE OF THE SAME KIND AS extractor_version. That field says
+    which walker produced the text; this says which tree it walked,
+    under which selection, at which commit. A snapshot without it would
+    be a wall of source nobody could tie back to a repository state.
+
+    CONTENT-DERIVED AND NOTHING ELSE, since the fourteenth review's H2.
+    The members and the encoding are functions of the composed text and
+    belong on the rendition, which is keyed by content. The commit, the
+    dirty flag, the patterns and the exclusions are facts about a WALK,
+    and a rendition may have been walked into more than once; those
+    live on SnapshotCapture, one record per walk, referenced from the
+    pin. A manifest written in Phase L's era still holds them and is
+    projected down to these two fields on the way out, with its capture
+    backfilled from them at boot; see store.connect.
+    """
+
+    files: list[SnapshotMember]
+    encoding: str
+
+
+class AttachmentDetail(Attachment):
+    """One attachment, with the manifest when it has one.
+
+    A SEPARATE MODEL FROM Attachment RATHER THAN A FIELD ON IT, and the
+    split is about the LIST. A member manifest is body-sized: a snapshot
+    of two thousand files carries two thousand rows, and a page of five
+    hundred attachments carrying those would undo exactly what K1.5
+    bought when it stopped the list reader from loading bodies. The list
+    answers Attachment, the two single-attachment doors answer this, and
+    neither shape has to be read as "sometimes populated".
+
+    None is every rendition of a single file, which is every rendition
+    but a snapshot's. It is not a missing value; see the migration entry
+    for manifest_json.
+
+    THE CAPTURE BESIDE IT is which walk this response is about: on POST
+    /snapshots the walk just made, on GET the rendition's latest. A
+    snapshot's manifest says what the bytes cover; its capture says
+    when and from what they were taken. The pin a client sends back
+    carries the capture's id, so the comparison records the walk it
+    meant rather than whichever walk was first.
+    """
+
+    manifest: SnapshotManifest | None = None
+    capture: SnapshotCapture | None = None
+
+
+class SnapshotCreate(BaseModel):
+    """A repository snapshot request: one root, and what to select in it.
+
+    JSON AND NOT A FORM, for the reason AttachmentCreate gives: a POST
+    that is not application/json forces cross-origin senders into a
+    preflight this server never answers, and that invariant is the whole
+    boundary.
+
+    NO EXCLUSION FIELD, deliberately. The defaults in bench.snapshot are
+    not overridable, because the group of them that matters most is the
+    secrets group, and an exclusion list a request could replace would
+    make that group opt-out. An opt-out default is not a default.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    # The clone root to walk. Refused unless it resolves under one of
+    # BENCH_REPO_ROOTS; see the door.
+    root: str = Field(min_length=1, max_length=MAX_ROOT_CHARS)
+
+    # Repo-relative include globs. Bounded here as well as in
+    # enforce_patterns because a body is refused more cheaply than it is
+    # parsed, and the two bounds are the same constant rather than two
+    # numbers that could drift.
+    patterns: list[str] = Field(min_length=1, max_length=snapshot.MAX_PATTERNS)
 
 
 class AttachmentRef(BaseModel):
@@ -602,6 +742,11 @@ class AttachmentRef(BaseModel):
     extractor: str | None = None
     extractor_version: str | None = None
     kind: str | None = None
+    # The capture the pin named, resolved, so a history chip can say
+    # which walk a snapshot was and the reuse action restages the same
+    # one. None for every document and image, and for a snapshot pinned
+    # before captures existed.
+    capture: SnapshotCapture | None = None
 
 
 class PromptCreate(BaseModel):
@@ -984,6 +1129,23 @@ class CatalogResponse(BaseModel):
     # fetches this once at boot, and one more round trip to learn one word
     # is not worth an endpoint.
     data_policy: str = "standard"
+    # Whether POST /snapshots will answer at all, and the sentence it
+    # refuses with when it will not. Riding the catalog response for
+    # exactly the reason data_policy does, one field up.
+    #
+    # THE SENTENCE TRAVELS RATHER THAN BEING RESTATED IN THE PAGE. The
+    # composer's snapshot control shows this text verbatim when the
+    # feature is off, so the UI never offers a door the server would
+    # refuse, and a person reading the control and a person reading a
+    # 403 read the same words. A copy in JavaScript would be a second
+    # explanation of one fact, and which one somebody got would depend
+    # on where they happened to look.
+    #
+    # Empty when the feature IS on, because there is then nothing to
+    # explain and shipping the paragraph on every boot to be discarded
+    # is waste.
+    snapshots_enabled: bool = False
+    snapshots_off_reason: str = ""
 
 
 class StoredModelResult(ModelResult):
@@ -1086,13 +1248,20 @@ class GroupDetail(BaseModel):
     renditions: list[RenditionPin] | None = None
 
 
-def _git(args: list[str]) -> str | None:
+def _git(args: list[str], *, cwd: str | None = None) -> str | None:
     """One git command's stdout, or None when git could not answer.
 
     Split out of _app_sha so both of that function's questions run under
     one timeout and degrade discipline, and so a test can substitute a
     runner without reaching into subprocess. A non-zero exit is an answer
     the caller cannot use, which is the same as no answer.
+
+    cwd DEFAULTS TO THIS CHECKOUT and Phase L is why it is a parameter
+    at all. _app_sha asks about the code that is running, which is
+    always this tree; a snapshot asks about the clone it just walked,
+    which is somebody else's. Both questions want the same two-second
+    timeout and the same degrade-to-None, so they get the same runner
+    rather than a second one that could drift on either.
     """
     try:
         proc = subprocess.run(
@@ -1100,7 +1269,7 @@ def _git(args: list[str]) -> str | None:
             capture_output=True,
             text=True,
             timeout=2,
-            cwd=Path(__file__).resolve().parent.parent,
+            cwd=cwd or Path(__file__).resolve().parent.parent,
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
@@ -1167,6 +1336,93 @@ def _parse_spend_limit(raw: str | None) -> float | None:
             "Unset it for no limit."
         )
     return limit
+
+
+# What the snapshot door says when it has no allowlist to check against.
+#
+# ONE SENTENCE, TWO PLACES. The composer's snapshot control shows this
+# same text when the feature is off, so the UI never offers a door the
+# server will refuse; a second wording would be a second explanation of
+# one fact, and the one the person read would depend on where they
+# happened to look.
+SNAPSHOTS_OFF = (
+    "snapshots are off because BENCH_REPO_ROOTS is not set. A snapshot "
+    "walks a directory tree and composes its files into a prompt sent "
+    "to a provider, so which trees may be walked is an explicit "
+    "allowlist rather than whatever path a request names: the localhost "
+    "posture applied to the filesystem. Set BENCH_REPO_ROOTS to the "
+    "clone roots that may be snapshotted, separated by the platform's "
+    "path separator, and restart the bench."
+)
+
+
+def _resolved_directory(path: str) -> str | None:
+    """The fully resolved path, if it is a directory, else None.
+
+    The one filesystem question the allowlist parser and the door both
+    ask, in one place so the two cannot answer it differently. realpath
+    rather than absolute: a root reached through a symlink has to be
+    compared as what it IS, or an allowlist of real paths could be
+    walked around by naming a link to one of them.
+    """
+    real = os.path.realpath(path)
+    return real if os.path.isdir(real) else None
+
+
+def _parse_repo_roots(
+    raw: str | None, *, resolved: Callable[[str], str | None]
+) -> tuple[str, ...]:
+    """BENCH_REPO_ROOTS as resolved roots, or () when it is not set.
+
+    ABSENT IS THE FEATURE OFF, NOT A BOOT FAILURE, and the difference
+    from OPENROUTER_API_KEY is the whole reason this returns a tuple
+    instead of raising. The key is not optional: a bench without one
+    reports every model as errored and looks like an outage, so it fails
+    at boot. Snapshots are optional, and a bench that refused to start
+    because a feature nobody uses was unconfigured would be a worse
+    bench. The door refuses instead, with SNAPSHOTS_OFF, which is the
+    unfetchable catalog's shape: degrade with honesty, refuse at the
+    door that needs the thing.
+
+    SET AND WRONG IS A BOOT FAILURE, which is the other half and is not
+    a contradiction. Setting the variable is a person saying "these
+    trees", and a relative path or a directory that does not exist means
+    the sentence they wrote does not name what they meant. Failing here
+    is failing before any request can be refused for a reason the
+    operator would then have to go looking for.
+
+    AN EMPTY ENTRY IS REFUSED rather than skipped. A trailing separator
+    is the ordinary typo, and in a PATH-shaped variable an empty entry
+    has historically meant the current working directory, which is
+    exactly the accident an allowlist exists to prevent.
+    """
+    if raw is None or not raw.strip():
+        return ()
+    out: list[str] = []
+    for entry in raw.split(os.pathsep):
+        named = entry.strip()
+        if not named:
+            raise RuntimeError(
+                "BENCH_REPO_ROOTS has an empty entry, which is usually a "
+                f"stray {os.pathsep!r}. Every entry must be an absolute "
+                "path to a directory."
+            )
+        if not os.path.isabs(named):
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {named!r} is not an absolute "
+                "path. The allowlist is compared against resolved paths, "
+                "so a relative entry would depend on where the bench "
+                "happened to be started."
+            )
+        real = resolved(named)
+        if real is None:
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {named!r} is not a directory. "
+                "Each entry is a clone root the bench may walk."
+            )
+        if real not in out:
+            out.append(real)
+    return tuple(out)
 
 
 def _parse_data_policy(raw: str | None) -> str:
@@ -1240,6 +1496,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # request can be built. The resolved provider block is computed once
     # here rather than per request: it is boot-scoped by design, so a run
     # can never be sent under a policy other than the one its row records.
+    # Which trees POST /snapshots may walk, resolved once at boot. Unset
+    # is the feature off and is not an error; set and wrong raises here,
+    # beside the key check and the spend ceiling. See _parse_repo_roots.
+    app.state.repo_roots = _parse_repo_roots(
+        os.environ.get("BENCH_REPO_ROOTS"), resolved=_resolved_directory
+    )
+    if app.state.repo_roots:
+        logger.info("snapshot roots: %s", ", ".join(app.state.repo_roots))
     app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
     app.state.provider_prefs = provider_preferences(app.state.data_policy)
     if app.state.data_policy != "standard":
@@ -2145,8 +2409,37 @@ def row_rendition(row: dict[str, Any]) -> dict[str, Any]:
         "digest": row["digest"],
         "extractor": row["extractor"],
         "extractor_version": row["extractor_version"],
-        "kind": IMAGE_KIND if row["extractor"] == "none" else DOCUMENT_KIND,
+        "kind": kind_of(row["extractor"]),
+        # A row knows no capture; with_captures fills this for a
+        # snapshot at the doors that resolve a bare citation.
+        "capture_id": None,
     }
+
+
+def with_captures(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each snapshot pin that names no capture, resolved to its latest.
+
+    THE BARE CITATION'S OTHER HALF. A digest cited alone resolves to its
+    row's own reading at creation and is frozen; a snapshot cited alone
+    resolves to its latest capture at the same moment, for the same
+    reason, so the record says which walk rather than leaving it to be
+    looked up later against a table that grows. Documents and images
+    pass through untouched, and so does a snapshot that already names
+    its capture, which is a declaration and not a question.
+
+    A snapshot whose rendition has no capture at all keeps None: that
+    is a row somebody wrote by hand, and inventing a capture for it
+    would be the substitution this codebase refuses everywhere else.
+    """
+    out = []
+    for pin in pins:
+        if pin["kind"] == SNAPSHOT_KIND and pin.get("capture_id") is None:
+            latest = store.latest_capture(
+                app.state.db, pin["digest"], pin["extractor"], pin["extractor_version"]
+            )
+            pin = {**pin, "capture_id": latest["id"] if latest else None}
+        out.append(pin)
+    return out
 
 
 def _pin_dicts(declared: list[Any]) -> list[dict[str, Any]]:
@@ -2162,6 +2455,7 @@ def _pin_dicts(declared: list[Any]) -> list[dict[str, Any]]:
             "extractor": pin.extractor,
             "extractor_version": pin.extractor_version,
             "kind": pin.kind,
+            "capture_id": pin.capture_id,
         }
         for pin in declared
     ]
@@ -2185,7 +2479,9 @@ def declared_pins(
     reader downstream believes the first.
     """
     if declared is None:
-        return [row_rendition(row) for row in enforce_attachments_exist(digests)]
+        return with_captures(
+            [row_rendition(row) for row in enforce_attachments_exist(digests)]
+        )
     pins = _pin_dicts(declared)
     if [pin["digest"] for pin in pins] != digests:
         raise HTTPException(
@@ -2196,10 +2492,12 @@ def declared_pins(
             "describe a different comparison from the one that runs.",
         )
     # Checked, not trusted: resolve_rendition raises when a pin names a
-    # reading the bench never produced.
+    # reading the bench never produced, or a capture that is not of it.
     for pin in pins:
         resolve_rendition(pin)
-    return pins
+    # And a snapshot pin that named no capture takes the latest now,
+    # so the group records which walk; see with_captures.
+    return with_captures(pins)
 
 
 def pins_for(
@@ -2256,7 +2554,13 @@ def pins_for(
     if group_id is not None:
         pinned = store.group_renditions(app.state.db, group_id)
         if pinned is not None:
-            if declared is not None and _pin_dicts(declared) != pinned:
+            # The member's declaration is normalised the way the group's
+            # was before the two are compared, so a member restating
+            # the four parts and leaving the capture unnamed matches a
+            # group whose pin took the latest at creation, and one
+            # naming a DIFFERENT capture is the different comparison
+            # the refusal below describes.
+            if declared is not None and with_captures(_pin_dicts(declared)) != pinned:
                 raise HTTPException(
                     409,
                     "renditions do not match this comparison's declaration. "
@@ -2422,12 +2726,27 @@ def enforce_inline_mode(pins: list[dict[str, Any]]) -> None:
     # reader that actually read the bytes, and pinned.
     wrong = [p["digest"][:12] for p in pins if p["kind"] == IMAGE_KIND]
     if wrong:
+        # THE REMEDY NAMES ONLY WHAT CAN MAKE THE SET VALID, the
+        # fourteenth review's medium. "Use native mode" is a real fix
+        # when every document in the set is an image, because native
+        # takes all of them; a set that also holds a document or a
+        # snapshot has no mode that sends it whole, and telling the
+        # person to switch would send them to a second refusal one
+        # word later. Then the only true sentence is that the set must
+        # be split.
+        others = sorted({p["kind"] for p in pins if p["kind"] != IMAGE_KIND})
+        remedy = (
+            "Use native mode, which hands the image to the model itself and "
+            "checks that every model in the lineup accepts one"
+            if not others
+            else "No single mode sends this set: inline cannot send an image "
+            f"and native cannot send a {' or a '.join(others)}. Split the "
+            "comparison so each set has one kind of reading"
+        )
         raise HTTPException(
             422,
             f"sha256 {', '.join(wrong)} is an image, and inline mode "
-            "sends extracted text, which an image has none of. Use "
-            "native mode, which hands the image to the model itself and "
-            "checks that every model in the lineup accepts one.",
+            f"sends extracted text, which an image has none of. {remedy}.",
         )
 
 
@@ -2476,15 +2795,37 @@ def enforce_native_mode(pins: list[dict[str, Any]], lineup: list[str] | None) ->
     # first uploaded under a document suffix used to be refused from
     # native mode forever, by a message naming a filename the caller had
     # never sent.
-    wrong = [p["digest"][:12] for p in pins if p["kind"] != IMAGE_KIND]
+    #
+    # THE REMEDY IS OFFERED ONLY WHERE IT EXISTS, which is Phase L's
+    # correction rather than a rewording. "Re-upload under an image
+    # extension" is a real fix for a document, because a document has a
+    # file behind it that the person still has. A snapshot has no
+    # upload: it was composed from a tree, and telling somebody to
+    # re-upload one is instructing them to do something impossible,
+    # which is the false-remedy family that this codebase treats as a
+    # defect rather than as a wording preference.
+    wrong = [p for p in pins if p["kind"] != IMAGE_KIND]
     if wrong:
+        named = ", ".join(
+            f"sha256 {p['digest'][:12]} read as a {p['kind']}" for p in wrong
+        )
+        remedy = (
+            "Use inline mode, which extracts the text and gives every model "
+            "the same reading of it"
+        )
+        # Re-uploading as an image fixes a DOCUMENT and is offered only
+        # when every wrong pin is one: a snapshot has no upload to redo,
+        # so a set holding one cannot be made native by re-uploading its
+        # neighbours, and a remedy that fixes half a set is not a remedy.
+        if all(p["kind"] == DOCUMENT_KIND for p in wrong):
+            remedy += (
+                ", or re-upload the file under an image extension so the "
+                "bench reads it as an image"
+            )
         raise HTTPException(
             422,
-            f"native mode sends images as content parts, and sha256 "
-            f"{', '.join(wrong)} was not read as one. Use inline mode, "
-            "which extracts the text and gives every model the same "
-            "reading of it, or re-upload the file under an image "
-            "extension so the bench reads it as an image.",
+            f"native mode sends images as content parts, and these were "
+            f"not read as images: {named}. {remedy}.",
         )
     if not lineup:
         return
@@ -3879,6 +4220,16 @@ def read_dataset(path: str) -> dict[str, Any]:
     "reads any path the caller names" looks like a hole until you have the
     threat model beside it.
 
+    AND THE SNAPSHOT DOOR IS ALLOWLISTED ANYWAY, which is not a reversal
+    of the paragraph above but the place where its reasoning stops. This
+    function reads ONE file the caller named, and a mistyped path here
+    fails: it does not parse as a dataset, and the caller gets a 422
+    naming the line. A snapshot walks a TREE, and a mistyped root there
+    does not fail. It succeeds, gathers whatever it finds, and composes
+    the contents into a prompt sent to a provider. BENCH_REPO_ROOTS
+    bounds what one typo can gather, not what the user may name, which
+    is why it is on that door and not on this one.
+
     Every failure is a 422 naming the file and the line, because the
     caller's next action is to fix the file and a 500 would tell them
     nothing about which line to open.
@@ -4102,7 +4453,7 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
                     "cite the digest the upload returns.",
                 )
             if "extractor" not in entry:
-                pins.append(row_rendition(row))
+                pins.extend(with_captures([row_rendition(row)]))
                 continue
             # Declared in full: honored exactly or refused. The call is
             # for its refusal; the pin that gets frozen is the one the
@@ -4125,7 +4476,11 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
                     f"task {task['id']!r} pins a reading the bench does "
                     f"not hold. {exc.detail}",
                 ) from None
-            pins.append(dict(entry))
+            # Verbatim on the four parts. The fifth, when the dataset
+            # named none, resolves to the latest capture at this same
+            # moment, which is what "cited without one" means for a
+            # snapshot; a dataset that named one had it checked above.
+            pins.extend(with_captures([dict(entry)]))
         frozen[task["id"]] = pins
     return frozen
 
@@ -5689,10 +6044,15 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
 
 @app.get("/models", response_model=CatalogResponse)
 async def get_models() -> dict[str, Any]:
+    enabled = bool(getattr(app.state, "repo_roots", ()))
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
         "data_policy": app.state.data_policy,
+        "snapshots_enabled": enabled,
+        # The door's own sentence, not a second one. See
+        # CatalogResponse for why it travels rather than being restated.
+        "snapshots_off_reason": "" if enabled else SNAPSHOTS_OFF,
     }
 
 
@@ -5768,18 +6128,47 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
         app.state.db, pin["digest"], pin["extractor"], pin["extractor_version"]
     )
     if found is None:
+        # THE REMEDY DEPENDS ON WHERE THE READING CAME FROM. A document
+        # or an image is re-uploaded; a snapshot has no upload to redo
+        # and is re-composed from the root and patterns its manifest
+        # recorded. One sentence for both would have to be vague enough
+        # to be useless to either.
+        restore = (
+            "Compose the snapshot again from the root and patterns its manifest names"
+            if pin["kind"] == SNAPSHOT_KIND
+            else "Re-upload the file to store this reading again"
+        )
         raise HTTPException(
             422,
             f"this comparison pinned sha256 {pin['digest'][:12]} as read by "
             f"{pin['extractor']} {pin['extractor_version']}, and no such "
             "reading is stored. The bench will not substitute a different "
             "parser's reading, because the other members of this comparison "
-            "were given the pinned one. Re-upload the file to store this "
-            "reading again, or start a new comparison.",
+            f"were given the pinned one. {restore}, or start a new "
+            "comparison.",
         )
-    stored_kind = found.get("kind") or (
-        IMAGE_KIND if found["extractor"] == "none" else DOCUMENT_KIND
-    )
+    if pin.get("capture_id") is not None:
+        # THE FIFTH PART IS CHECKED LIKE THE FOUR. A capture id is a row
+        # somebody can type, and a pin naming one that belongs to a
+        # different rendition, or to nothing, would let a comparison
+        # claim a walk that did not produce the bytes it sent.
+        named = store.capture(app.state.db, int(pin["capture_id"]))
+        if named is None or (
+            named["digest"],
+            named["extractor"],
+            named["extractor_version"],
+        ) != (pin["digest"], pin["extractor"], pin["extractor_version"]):
+            raise HTTPException(
+                422,
+                f"sha256 {pin['digest'][:12]} read by {pin['extractor']} "
+                f"{pin['extractor_version']} names capture "
+                f"{pin['capture_id']}, which is not a capture of that "
+                "reading. A capture is one walk of a tree into exactly this "
+                "rendition, and the bench will not attach a walk to bytes "
+                "it did not produce. Cite the digest alone to take the "
+                "latest capture, or name one of this rendition's own.",
+            )
+    stored_kind = found.get("kind") or kind_of(found["extractor"])
     if pin["kind"] != stored_kind:
         raise HTTPException(
             422,
@@ -5787,9 +6176,16 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
             f"{pin['extractor_version']} is stored as a {stored_kind} and "
             f"the declaration calls it a {pin['kind']}. The bench will not "
             "relabel a reading: the kind decides which mode may use it and "
-            f"what the models are shown. Declare it as a {stored_kind}, or "
-            "upload the file under an extension that makes it "
-            f"a {pin['kind']}.",
+            f"what the models are shown. Declare it as a {stored_kind}"
+            + (
+                # A file can be uploaded again under another name and
+                # read the other way; a snapshot cannot, and neither
+                # can any reading be turned INTO a snapshot by renaming.
+                f", or upload the file under an extension that makes it a "
+                f"{pin['kind']}."
+                if SNAPSHOT_KIND not in (stored_kind, pin["kind"])
+                else "."
+            ),
         )
     return found
 
@@ -5821,8 +6217,7 @@ def _attachment_view(row: dict[str, Any]) -> dict[str, Any]:
         # the caller to re-derive from the suffix they sent. A response
         # that named the parser but not the kind still left "was this
         # read as an image or as a document" to be guessed.
-        "kind": row.get("kind")
-        or (IMAGE_KIND if row["extractor"] == "none" else DOCUMENT_KIND),
+        "kind": row.get("kind") or kind_of(row["extractor"]),
         "created_at": row["created_at"],
     }
 
@@ -5876,6 +6271,7 @@ def _pinned_refs(
     pins: list[dict[str, Any]],
     rows: dict[str, dict[str, Any]],
     resolved: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    captures: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """A declaration's PINNED renditions as refs, in declaration order.
 
@@ -5905,6 +6301,11 @@ def _pinned_refs(
     # reading as one line.
     if resolved is None:
         resolved = store.extractions_for(app.state.db, pins)
+    if captures is None:
+        captures = store.captures_for(
+            app.state.db,
+            [int(p["capture_id"]) for p in pins if p.get("capture_id") is not None],
+        )
     out = []
     for pin in pins:
         row = rows.get(pin["digest"])
@@ -5914,6 +6315,7 @@ def _pinned_refs(
         if row is None or rendition is None:
             out.append({"digest": pin["digest"]})
             continue
+        capture_id = pin.get("capture_id")
         out.append(
             {
                 "digest": pin["digest"],
@@ -5925,9 +6327,29 @@ def _pinned_refs(
                 "extractor": pin["extractor"],
                 "extractor_version": pin["extractor_version"],
                 "kind": pin["kind"],
+                # The walk the pin named, resolved for the chip and for
+                # reuse. None when the pin named none.
+                "capture": _capture_view(captures.get(capture_id))
+                if capture_id is not None
+                else None,
             }
         )
     return out
+
+
+def _capture_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A capture as the API describes it: the walk's facts, not the
+    rendition key it belongs to, which the pin beside it already says."""
+    if record is None:
+        return None
+    return {
+        "id": record["id"],
+        "head": record["head"],
+        "dirty": record["dirty"],
+        "patterns": record["patterns"],
+        "excludes": record["excludes"],
+        "captured_at": record["captured_at"],
+    }
 
 
 def _attachment_refs(
@@ -6153,6 +6575,428 @@ async def create_attachment(body: AttachmentCreate) -> dict[str, Any]:
     return _attachment_view(stored)
 
 
+# What a snapshot's stored row is called, and it is not a path.
+#
+# K.3'S FILENAME RULE EXTENDED TO A TREE. A name is display metadata: no
+# declaration can select one, nothing in the composed prompt carries it,
+# and the blind view must not show a path. The root a person walked is
+# the one string here that would name their filesystem, so the stored
+# name is a pure function of the digest instead, which makes it stable
+# across a re-compose of the same bytes and empty of anything private.
+#
+# The suffix is real rather than decorative: the stored bytes are UTF-8
+# text, media_type_for answers text/plain for a .txt, and a name whose
+# suffix disagreed with the type would be the disagreement K.3 spent a
+# phase removing.
+SNAPSHOT_SUFFIX = ".txt"
+
+
+def _snapshot_filename(digest: str) -> str:
+    """The display name for a snapshot of these bytes."""
+    return f"snapshot-{digest[:12]}{SNAPSHOT_SUFFIX}"
+
+
+def enforce_snapshot_root(
+    named: str, roots: Sequence[str], *, resolve: Callable[[str], str | None]
+) -> str:
+    """The resolved root a request may walk, or a refusal saying why not.
+
+    THREE REFUSALS AND TWO CODES. No allowlist at all and a root outside
+    it are both 403: the request is well formed and the bench's policy
+    says no, which is the same answer LocalOnlyGuard gives a non-loopback
+    client and for the same reason. A root that is not a directory is
+    422, because that one is about what the caller wrote.
+
+    The allowed roots are named back on refusal. They are the operator's
+    own configuration and the caller is that operator on loopback, so
+    listing them is the difference between "no" and "no, and here is
+    what you meant to type".
+
+    THE RESOLVER IS INJECTED RATHER THAN THE RESOLUTION, and the
+    difference is an ordering rather than a style. A resolved path passed
+    in as a value has already been resolved, which means a realpath and
+    an isdir ran against a caller's string before this function decided
+    whether the feature is switched on at all. Nothing leaked: the 403
+    still fired first and the caller learned nothing either way. But "no
+    filesystem call on a request's path until the allowlist says there is
+    one" is a posture worth being able to state without a footnote, and
+    with the callable here the off case touches no disk.
+    """
+    if not roots:
+        raise HTTPException(403, SNAPSHOTS_OFF)
+    real = resolve(named)
+    if real is None:
+        raise HTTPException(
+            422,
+            f"{named!r} is not a directory the bench can read. A snapshot "
+            "walks a clone root, so this wants the directory the "
+            "repository was cloned into.",
+        )
+    if not any(snapshot.contained(real, allowed) for allowed in roots):
+        raise HTTPException(
+            403,
+            f"{named!r} resolves to {real}, which is not under any entry "
+            f"of BENCH_REPO_ROOTS ({', '.join(roots)}). A snapshot "
+            "composes a tree's files into a prompt sent to a provider, "
+            "so which trees may be walked is an explicit allowlist "
+            "rather than whatever path a request names.",
+        )
+    return real
+
+
+class DescriptorTree:
+    """bench.snapshot's Tree, over file descriptors.
+
+    CONTAINMENT BY DESCRIPTOR, and the reason it is not containment by
+    path. The first shape of this door checked every path by name and
+    then reopened it by name to read it: a stat with follow_symlinks
+    off, then Path.read_bytes, which follows. The fourteenth review
+    reproduced what that window permits, and so did this repository
+    before the fix, deterministically: a selected file replaced by a
+    link out of the root between the stat and the read was followed and
+    its target stored; a queued directory replaced by a link before
+    descent was listed through and its files stored; a file replaced by
+    a fifo hung the request; a file that grew after its stat was read
+    whole. 04254ca called the no-follow stat "the whole guard". It was
+    half of one, and the half that does not matter: a check by name
+    guards the name, and the name is the thing being swapped.
+
+    NOTHING HERE IS OPENED BY NAME BUT THE ROOT. The root is opened once
+    with O_DIRECTORY and O_NOFOLLOW; every child directory is opened
+    through its parent's descriptor with the same flags; every member is
+    opened through its directory's descriptor with O_NOFOLLOW and
+    O_NONBLOCK; every read goes through the member's own descriptor and
+    is bounded there. What the walk verifies against those descriptors
+    is bench.snapshot's business and is written there; what this class
+    promises is that the descriptor it hands back describes the object
+    that was opened and nothing else, because fstat on a descriptor
+    cannot be redirected by a rename.
+
+    O_NOFOLLOW turns a link swapped in for a file or a directory into
+    ELOOP at the open, before anything is read; O_DIRECTORY turns a file
+    swapped in for a directory into ENOTDIR; O_NONBLOCK makes opening a
+    fifo with no writer return instead of wait, so its fstat can say
+    what it is and the walk can refuse it. A device that opens is
+    refused the same way. Both flag sets are stated in the review's
+    words on purpose: "opened with no-follow flags and verified after
+    opening".
+
+    The one operation that resolves a NAME is link_target, and it never
+    opens anything: it reads where a link points so the walk can decide
+    whether the link leaves the root, and that decision is about a link
+    the walk will not follow either way.
+    """
+
+    def __init__(self, root: str) -> None:
+        self.root = root
+
+    def root_path(self) -> str:
+        return self.root
+
+    @staticmethod
+    def _could_not(path: str, verb: str, exc: OSError) -> snapshot.SnapshotError:
+        return snapshot.SnapshotError(
+            f"{path or 'the snapshot root'} could not be {verb}: {exc.strerror or exc}."
+        )
+
+    def _directory(self, path: str, name: str, dir_fd: int | None) -> snapshot.Handle:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+        try:
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except OSError as exc:
+            # ONE MESSAGE FOR BOTH ERRNOS, because the kernel does not
+            # say which. With O_DIRECTORY and O_NOFOLLOW together, Linux
+            # answers a symbolic link where a directory was with ENOTDIR
+            # rather than ELOOP (measured: the directory-swap tombstone
+            # at the door), so telling the two apart would take a
+            # by-name stat this class exists to not make. Either way the
+            # object is refused before it is opened, which is the
+            # property; the sentence names both shapes rather than
+            # guessing one.
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise snapshot.SnapshotError(
+                    f"{path or 'the snapshot root'} was listed as a directory "
+                    "and is no longer one the walk may open: a symbolic "
+                    "link, or not a directory at all. A tree being edited "
+                    "or swapped under a walk is refused rather than read."
+                ) from None
+            raise self._could_not(path, "opened", exc) from None
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise self._could_not(path, "described", exc) from None
+        return snapshot.Handle(path, (info.st_dev, info.st_ino), fd)
+
+    def open_root(self) -> snapshot.Handle:
+        return self._directory("", self.root, None)
+
+    def entries(self, handle: snapshot.Handle) -> Iterator[snapshot.Entry]:
+        # A generator, so the walk counts each child as it arrives and a
+        # directory too wide is refused before it is materialised. The
+        # descriptor is the handle's; scandir does not close it.
+        try:
+            with os.scandir(handle.token) as listing:
+                for entry in listing:
+                    info = entry.stat(follow_symlinks=False)
+                    if entry.is_symlink():
+                        kind = snapshot.SYMLINK
+                    elif stat.S_ISDIR(info.st_mode):
+                        kind = snapshot.DIRECTORY
+                    elif stat.S_ISREG(info.st_mode):
+                        kind = snapshot.FILE
+                    else:
+                        kind = snapshot.OTHER
+                    yield snapshot.Entry(
+                        entry.name, kind, (info.st_dev, info.st_ino), info.st_size
+                    )
+        except OSError as exc:
+            raise self._could_not(handle.path, "listed", exc) from None
+
+    def descend(
+        self, handle: snapshot.Handle, entry: snapshot.Entry
+    ) -> snapshot.Handle:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        return self._directory(path, entry.name, handle.token)
+
+    def open_member(
+        self, handle: snapshot.Handle, entry: snapshot.Entry
+    ) -> snapshot.Opened:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+        try:
+            fd = os.open(entry.name, flags, dir_fd=handle.token)
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise snapshot.SnapshotError(
+                    f"{path} was listed as a regular file and is now a "
+                    "symbolic link. A tree being edited or swapped under a "
+                    "walk is refused rather than read."
+                ) from None
+            raise self._could_not(path, "opened", exc) from None
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise self._could_not(path, "described", exc) from None
+        if stat.S_ISREG(info.st_mode):
+            kind = snapshot.FILE
+        elif stat.S_ISDIR(info.st_mode):
+            kind = snapshot.DIRECTORY
+        else:
+            kind = snapshot.OTHER
+        return snapshot.Opened(path, kind, (info.st_dev, info.st_ino), info.st_size, fd)
+
+    def read_member(self, opened: snapshot.Opened, limit: int) -> bytes:
+        # At most limit + 1 bytes, so the walk can tell "grew past the
+        # bound" from "exactly at it" without this holding the growth.
+        chunks: list[bytes] = []
+        got = 0
+        while got <= limit:
+            try:
+                chunk = os.read(opened.token, min(65536, limit + 1 - got))
+            except OSError as exc:
+                raise self._could_not(opened.path, "read", exc) from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks)
+
+    def close_handle(self, held: snapshot.Handle | snapshot.Opened) -> None:
+        try:
+            os.close(held.token)
+        except OSError:
+            # Best effort. A close that fails cannot un-read anything,
+            # and a refusal raised from inside a close would hide the
+            # refusal that was already on its way.
+            pass
+
+    def link_target(self, handle: snapshot.Handle, entry: snapshot.Entry) -> str:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        try:
+            raw = os.readlink(entry.name, dir_fd=handle.token)
+        except OSError as exc:
+            raise self._could_not(path, "read as a link", exc) from None
+        # Resolved BY NAME, which is the one place in this class that
+        # is, and it is safe for the reason the docstring gives: the
+        # answer decides whether to refuse a link the walk will not
+        # follow in either case. A race here can change which refusal a
+        # person reads, never what is read.
+        return os.path.realpath(os.path.join(self.root, handle.path, raw))
+
+
+def _clone_state(root: str) -> tuple[str | None, bool | None]:
+    """The commit the walked tree is at and whether it is modified.
+
+    TWO NULLABLE FIELDS RATHER THAN ONE DEGRADED LABEL, which is where
+    this deliberately differs from _app_sha. That function answers
+    "which code is running" as a single string, so a sha it cannot
+    qualify as clean degrades to None entirely: an unqualified sha IS
+    the clean claim. Here the two are separate manifest fields, so a
+    head with dirty None is not a claim about cleanliness at all, it is
+    the honest "the commit is known and the tree's state is not".
+
+    THE STATUS IS SCOPED TO THE ROOT with an explicit path argument. A
+    clone root may be a subdirectory of a larger repository, and a bare
+    status would report that whole repository as modified when the tree
+    being snapshotted was untouched. The head is still the containing
+    repository's, which is the only commit there is.
+
+    Untracked files count as modified, which is _app_sha's reasoning
+    inherited: an untracked file under the root is a file the walk may
+    well have just composed.
+    """
+    head = as_text((_git(["rev-parse", "HEAD"], cwd=root) or "").strip()) or None
+    if head is None:
+        return (None, None)
+    status = _git(["status", "--porcelain", "."], cwd=root)
+    if status is None:
+        return (head, None)
+    return (head, bool(status.strip()))
+
+
+def _attachment_detail(
+    row: dict[str, Any], capture: dict[str, Any] | None = None
+) -> dict[str, Any]:
+    """One attachment with its stored manifest, for the two single doors.
+
+    THE STORED MANIFEST AND NOT THE ONE JUST COMPOSED, so POST and GET
+    cannot contradict each other about one digest, which is the failure
+    K.3 spent a phase removing from the upload path.
+
+    It matters here because the manifest is NOT a function of the
+    rendition key. Two walks of one clone at two commits compose
+    byte-identical text whenever the selected files did not change, so
+    they are one rendition with one row, and the head recorded is the
+    first walk's. That is a true statement about these bytes rather than
+    a stale one: the snapshot IS its content, and the earlier commit
+    produced exactly this content. Rule two's forward-only law does the
+    rest, since rewriting the manifest would relabel a record every
+    existing comparison already cites.
+    """
+    view = _attachment_view(row)
+    stored = store.extraction_for(
+        app.state.db, row["digest"], view["extractor"], view["extractor_version"]
+    )
+    raw = (stored or {}).get("manifest_json")
+    manifest = _manifest_view(json.loads(raw)) if raw else None
+    if manifest is not None and capture is None:
+        capture = store.latest_capture(
+            app.state.db, row["digest"], view["extractor"], view["extractor_version"]
+        )
+    return {**view, "manifest": manifest, "capture": _capture_view(capture)}
+
+
+def _manifest_view(recorded: dict[str, Any]) -> dict[str, Any]:
+    """The content half of a stored manifest, whichever era wrote it.
+
+    A Phase L manifest carries the walk's facts too (head, dirty,
+    patterns, excludes); those are a capture's now and were backfilled
+    into one at boot, and the row itself is left as written. Projecting
+    here is what lets the era row and the H2 row answer the same shape.
+    """
+    return {
+        "files": recorded.get("files", []),
+        "encoding": recorded.get("encoding", ""),
+    }
+
+
+@app.post("/snapshots", response_model=AttachmentDetail, status_code=201)
+async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
+    """Walk one allowlisted clone and store the reading as one attachment.
+
+    IT FETCHES NOTHING. The single-outbound-destination posture is
+    untouched: this reads the local filesystem and the local git, and
+    the only thing that ever leaves the machine is the composed prompt,
+    through the same door every other comparison uses.
+
+    THE WHOLE SNAPSHOT IS ONE ATTACHMENT, which is what keeps the
+    fairness law intact for free. One digest, one rendition, one
+    composed text, delivered byte-identically to every model exactly as
+    a document is.
+
+    Composing the same tree twice returns the existing row rather than a
+    second copy, on the same content-addressed dedupe an upload gets. A
+    tree that has not changed composes byte-identical text, so the digest
+    is the same and INSERT OR IGNORE does the rest.
+
+    SYNCHRONOUS ON THE EVENT LOOP, bounded rather than offloaded. The
+    walk stops at MAX_WALKED_ENTRIES entries, MAX_DEPTH open directories
+    and MAX_READ_BYTES read, so the worst case is twenty thousand stats,
+    a few thousand opens and eight hundred kilobytes, which is the same
+    order as the base64 decode and extraction create_attachment already
+    does inline.
+
+    TWO MOMENTS AND NOT ONE, said here because a manifest reads like a
+    photograph and is not. The walk reads each file at the moment it
+    looks at it, through the descriptor it opened, and refuses if what
+    it opened is not what it listed; that is one moment per file and
+    it is exact about the bytes. The git query is a second moment,
+    after the walk, and nothing locks the tree between them, so a
+    commit made mid-request can move under the flag. WHAT IS IDENTIFIED
+    IS THE BYTES: every member's digest is computed from the bytes that
+    were read and the snapshot's own digest is over the text those
+    produced. The head and the dirty flag are the softer half of the
+    provenance and are recorded as read locally rather than as a
+    guarantee about the instant of the walk.
+    """
+    root = enforce_snapshot_root(
+        body.root, app.state.repo_roots, resolve=_resolved_directory
+    )
+    try:
+        members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
+        head, dirty = _clone_state(root)
+        built = snapshot.compose(
+            members, patterns=body.patterns, head=head, dirty=dirty
+        )
+    except snapshot.SnapshotError as exc:
+        # 422 for every refusal from here down, because every one of them
+        # is about what the request selected and the caller's next action
+        # is to change a pattern. The message is written to be shown.
+        raise HTTPException(422, str(exc)) from None
+    content = built["text"].encode("utf-8")
+    filename = _snapshot_filename(built["digest"])
+    manifest = built["manifest"]
+    stored = store.save_attachment(
+        app.state.db,
+        {
+            "digest": built["digest"],
+            "filename": filename,
+            "mime": media_type_for(filename),
+            "byte_size": len(content),
+            "content": content,
+            "extracted_text": built["text"],
+            "extractor": built["extractor"],
+            "extractor_version": built["extractor_version"],
+            "kind": built["kind"],
+            # THE CONTENT HALF ONLY. Members and encoding are functions
+            # of the bytes and belong on the rendition; the walk's facts
+            # go to their own record one statement down, because the
+            # rendition may already exist and this walk is still a walk.
+            "manifest_json": json.dumps(
+                {"files": manifest["files"], "encoding": manifest["encoding"]}
+            ),
+        },
+    )
+    # ALWAYS RECORDED, which is the fourteenth review's H2 in one line.
+    # save_attachment deduplicates by content, so two walks composing
+    # identical bytes share a row; the capture is a fact about THIS
+    # walk and is never deduplicated. The response carries it, and the
+    # pin a client sends back names it by id.
+    recorded = store.record_capture(
+        app.state.db,
+        built["digest"],
+        built["extractor"],
+        built["extractor_version"],
+        head=head,
+        dirty=dirty,
+        patterns=list(body.patterns),
+        excludes=list(manifest["excludes"]),
+    )
+    return _attachment_detail(stored, capture=recorded)
+
+
 @app.get("/attachments", response_model=AttachmentList)
 async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     """Every stored document, newest first. Never any content.
@@ -6183,7 +7027,7 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     }
 
 
-@app.get("/attachments/{digest}", response_model=Attachment)
+@app.get("/attachments/{digest}", response_model=AttachmentDetail)
 async def get_attachment(digest: str) -> dict[str, Any]:
     """Metadata for one stored document. Never its content.
 
@@ -6198,8 +7042,11 @@ async def get_attachment(digest: str) -> dict[str, Any]:
     # The row's OWN rendition, with no substitution. GET by digest
     # answers "what is stored under these bytes", and the row is the
     # first reading of them; the response names the extractor and
-    # version, so the answer is specific rather than ambiguous.
-    return _attachment_view(row)
+    # version, so the answer is specific rather than ambiguous. The
+    # manifest rides along for a snapshot and is None for everything
+    # else, and it is the STORED one, so this and POST /snapshots cannot
+    # disagree about one digest.
+    return _attachment_detail(row)
 
 
 @app.delete("/prompts/{prompt_id}", status_code=204)
@@ -6232,6 +7079,12 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # was still substituting after K3.4.
     every_pin = [pin for run in runs for pin in (run.get("renditions") or [])]
     resolved = store.extractions_for(app.state.db, every_pin)
+    # And every CAPTURE those pins name, in one query, for the same
+    # reason: a page of snapshot comparisons says which walk each was.
+    captures = store.captures_for(
+        app.state.db,
+        [int(p["capture_id"]) for p in every_pin if p.get("capture_id") is not None],
+    )
     # Append a marker only when a cut happened, so API consumers can tell
     # a short prompt from a truncated one.
     for run in runs:
@@ -6240,7 +7093,7 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
         if run["type"] == "group":
             pinned = run.pop("renditions", None)
             run["attachments"] = (
-                _pinned_refs(pinned, rows, resolved)
+                _pinned_refs(pinned, rows, resolved, captures)
                 if pinned
                 else _attachment_refs(run["attachments"], rows)
             )
@@ -6748,12 +7601,28 @@ def _report_inputs(
         runs = detail["runs"] if detail else []
         runs_by_group[group["id"]] = runs
         result_ids.extend(r["id"] for run in runs for r in run["results"])
+    experiment = store.get_experiment(db, experiment_id) or {}
     return {
         "groups": groups,
         "runs_by_group": runs_by_group,
         "scores_by_result": store.scores_for_results(db, result_ids),
         "tasks_by_id": tasks_by_id,
         "seed": REPORT_SEED,
+        "captures": _captures_named(groups, experiment.get("task_attachments")),
+    }
+
+
+def _captures_named(
+    groups: list[dict[str, Any]], task_attachments: dict[str, Any] | None
+) -> dict[str, dict[str, Any]]:
+    """The captures a report or an export must explain, keyed by id as a
+    string, resolved in one query. See report.referenced_captures for
+    why both the recorded cells and the frozen declaration are read."""
+    wanted = referenced_captures(groups, task_attachments)
+    found = store.captures_for(app.state.db, wanted)
+    return {
+        str(capture_id): dict(_capture_view(record) or {})
+        for capture_id, record in sorted(found.items())
     }
 
 
@@ -6793,7 +7662,8 @@ def _export_lines(
     # same window, which is the whole point of the snapshot.
     out: list[dict[str, Any]] = []
     with store.read_snapshot(db):
-        for group in store.experiment_groups(db, experiment_id):
+        groups = store.experiment_groups(db, experiment_id)
+        for group in groups:
             detail = store.get_group(db, group["id"])
             if detail is None:
                 continue
@@ -6834,7 +7704,16 @@ def _export_lines(
         referenced = any(line.get("attachments") for line in out) or bool(
             experiment.get("task_attachments")
         )
-        out.insert(0, export_manifest(experiment, REPORT_SEED, thresholds, referenced))
+        out.insert(
+            0,
+            export_manifest(
+                experiment,
+                REPORT_SEED,
+                thresholds,
+                referenced,
+                _captures_named(groups, experiment.get("task_attachments")),
+            ),
+        )
     return out
 
 

@@ -1309,6 +1309,21 @@ the composition can do about it: a document's own text can try to
 instruct the model, and marking the boundary clearly is a mitigation, not
 a guarantee.
 
+**A repository snapshot is the same input with more seams**, and it gets
+the same treatment one level in: every file sits between a header line
+naming its path, byte size and short digest, and a closing marker saying
+the file ended. The closing marker is there because a file in a
+repository may contain a line that looks like the next file's header, so
+without one a file could annex its successor. It is a **mitigation and
+not a guarantee**, in exactly the sense the paragraph above means:
+nothing stops a file from containing a convincing forgery of a header
+and a footer together, and the bench does not escape or rewrite file
+contents to prevent it, because a snapshot whose text differed from the
+repository would be a snapshot of nothing. What the header buys instead
+is checkability after the fact: the manifest records every member's path,
+size and digest, so a claim made inside the composed text can be weighed
+against the record rather than believed.
+
 The inflated bound is there because the 8 MiB upload cap says nothing
 about what comes out of the upload: deflate reaches ratios past 1000:1 on
 repetitive XML, so a small, perfectly valid `.docx` can ask the process to
@@ -1388,17 +1403,21 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 5**. Each trial line carries the ordered
+An **export is schema version 7**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
-`is_byok`. Version 5 adds `task_attachments` and `attachments_mode` to
+`is_byok`. Version 5 added `task_attachments` and `attachments_mode` to
 the manifest: trial lines describe the cells that *ran*, and a task that
 never ran leaves no line, so a halted experiment's un-run tasks had their
-declaration nowhere in the file. The manifest states the reason for the
-current bump in the file itself, and it names every field the earlier
-versions added, because a reader holding a v5 artifact and a v2 parser
-needs the whole list from the file in their hand.
+declaration nowhere in the file. Version 6 let a pin's `kind` be
+`snapshot`. Version 7 lets a pin name a `capture_id` and adds `captures`
+to the manifest, the records those ids name, so a reader can say which
+*walk* of a repository each snapshot cell read and not merely which
+bytes. The manifest states the reason for the current bump in the file
+itself, and it names every field the earlier versions added, because a
+reader holding a v7 artifact and a v2 parser needs the whole list from
+the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1645,6 +1664,108 @@ A digest the bench does not hold is a 422 naming the task and the
 digest. Deleting the bytes afterwards does not rewrite the record: the
 experiment and its export keep their pins, and anything that needs the
 content again refuses naming what is missing.
+
+### A repository snapshot
+
+**One clone, one attachment.** `POST /snapshots` walks a directory tree
+you name, composes the files it selects into one text, and stores that
+as a single attachment with its own digest. From there it is an
+attachment like any other: cite the digest from a dataset task, pin the
+reading, attach it to a hand comparison. Every model receives the same
+composed bytes, which is the fairness law getting the property for free.
+
+**It is off until you allowlist a root.** `BENCH_REPO_ROOTS` is a list
+of absolute directory paths separated by the platform's path separator,
+and nothing is walkable until it is set. Unset is not a boot failure:
+the bench starts normally and the door refuses, naming the variable and
+saying why the allowlist exists. This is the localhost posture applied
+to the filesystem. A snapshot composes file contents into a prompt sent
+to a provider, and one mistyped root is the difference between sharing a
+module and sharing whatever happened to be under a parent directory. The
+allowlist bounds what a typo can gather.
+
+```sh
+BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
+
+curl -s -X POST localhost:8000/snapshots \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/home/you/code/myproject",
+       "patterns": ["bench/**/*.py", "README.md"]}'
+```
+
+Patterns are repo-relative globs and **do not recurse unless they say
+so**: `*.py` is the top level, `**/*.py` is every depth, `src/**` is
+everything under `src`. A selection that matches nothing is refused
+naming the patterns, rather than composing an empty snapshot every model
+would be asked about.
+
+**Text or refused, and never truncated.** A binary file in the selection
+refuses the whole snapshot naming it, a file that is not valid UTF-8 is
+refused by name and byte offset, and a selection too large for the
+composed ceiling is refused naming its largest files. Nothing is silently
+dropped and nothing is shortened: a snapshot that quietly omitted a file
+would be a comparison over a repository you think you sent.
+
+**The ceiling is the same one a set of attachments has, and there is no
+snapshot exception.** It exists because of what a model can receive and
+what the fairness law can promise, and neither of those cares where the
+bytes came from; raising it here would only move the refusal to the
+provider's context window and to your money. A repository that does not
+fit is a repository you select from, and the refusal names the largest
+files so the selection is made from fact rather than from guessing.
+
+This bench is its own worked example. `bench/main.py` is past the
+per-file bound on its own, so `bench/*.py` is refused naming that file,
+and `static/*.js` composes past the total. Snapshotting this repository
+means naming modules rather than directories, which is what the rule
+says and not a defect in it.
+
+**It fetches nothing.** The single-outbound-destination posture is
+untouched. The bench reads the local filesystem and the local git, and
+the only thing that leaves the machine is the composed prompt, through
+the door every other comparison uses. Remote repositories, diffs between
+snapshots and agentic file browsing are all deliberately out.
+
+Default exclusions apply and are recorded in every snapshot's manifest:
+version control and dependency trees (`.git`, `node_modules`, `.venv`,
+`vendor`), build output and caches (`__pycache__`, `dist`, `*.pyc`,
+`*.so`, `*.db`, `.hypothesis`), and **secrets** (`.env`, `.env.*`,
+`*.pem`, `*.key`, `id_rsa*`, `.netrc`, `.npmrc`). The last group is not
+overridable by a request, because an exclusion list a request could
+replace would make it opt-out, and an opt-out default is not a default.
+
+**In the composer**, `+ Snapshot` opens a root and a pattern box beside
+`+ Attach`, and a composed snapshot becomes one chip like any other
+document, reading `repository snapshot` with the number of files it
+selected. When `BENCH_REPO_ROOTS` is unset the button is disabled and the
+server's own refusal is printed beside it, so the page never offers a
+door the server would refuse and the sentence you read there is the
+sentence a `403` would carry. No view ever shows the clone root: the
+stored name is derived from the digest, which is the filename rule
+extended from a file to a tree.
+
+`GET /attachments/{digest}` serves the snapshot's **manifest**, which is
+the content half: every member's path, byte size and digest, and the
+encoding rule. Beside it rides the **capture**, which is the walk's
+half: the clone's HEAD commit, whether its tree was modified, the
+patterns that selected and the exclusions that were in force, and when.
+Never any content, which is the promise every attachment response
+makes. The list endpoint omits both deliberately, since a page of
+snapshots carrying theirs would be a page of bodies.
+
+**Content dedupes; captures do not.** Composing the same unchanged tree
+twice composes identical text, so the digest matches and the
+content-addressed store keeps one row. But each walk is recorded as its
+own capture, because which commit a tree was at and whether it was
+dirty are facts about the walk and not about the bytes: two walks of
+identical selected files, one on a clean tree and one after an
+untracked file appeared elsewhere in it, are one rendition and two
+captures. `POST /snapshots` returns the capture it just made; `GET`
+returns the rendition's latest; a pin names one by `capture_id`, and a
+snapshot cited by bare digest freezes its latest capture at creation
+the same way a bare digest freezes the row's own reading. Reports and
+exports carry the records those ids name, so nothing about a walk is
+silently lost when its bytes happened to match an earlier one.
 
 **A dataset's version is its content.** There is no version field to keep
 in sync and no way to edit a file and leave a stale label behind: the

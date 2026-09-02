@@ -1,3 +1,4 @@
+import ast
 import base64
 import json
 import math
@@ -959,7 +960,19 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
     monkeypatch.setattr("bench.main.fetch_catalog", offline_catalog)
     with TestClient(app, base_url="http://localhost") as c:
         body = c.get("/models").json()
-        assert body == {"models": [], "fetched": False, "data_policy": "standard"}
+        assert body == {
+            "models": [],
+            "fetched": False,
+            "data_policy": "standard",
+            # Phase L. The snapshot posture rides this response for the
+            # reason data_policy does: the page already fetches it once
+            # at boot, and one more round trip to learn one fact is not
+            # worth an endpoint. An offline boot says snapshots are off
+            # for a reason of its own, unrelated to the catalog, and the
+            # sentence is the door's own rather than a second wording.
+            "snapshots_enabled": False,
+            "snapshots_off_reason": main.SNAPSHOTS_OFF,
+        }
 
         with respx.mock:
             respx.post(OPENROUTER_URL).respond(json=FIXTURE)
@@ -6320,20 +6333,29 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 5
+    assert manifest["export_schema_version"] == 7
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[5]
-    # Version 5 is Phase M's manifest change. Its note still names what
-    # earlier versions added, deliberately: EXPORT_SCHEMA_NOTES emits
-    # only the CURRENT version's sentence, so a v5 note that dropped the
-    # earlier explanations would leave a v5 artifact unable to explain
-    # fields it still carries.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[7]
+    # Version 7 is the fourteenth review's H2: pins may name a capture
+    # and the manifest carries the captures those ids name, so a reader
+    # holding only the file can say which walk a snapshot cell read.
+    assert "capture_id" in manifest["export_schema_change"]
+    assert "captures" in manifest["export_schema_change"]
+    # Present and empty on an experiment with no snapshot in it, so a
+    # reader can tell "no captures" from "this key is absent".
+    assert manifest["captures"] == {}
+    # And version 6's widening is still named, as carried.
+    assert "kind may be snapshot from version 6" in manifest["export_schema_change"]
+    # Its note still names what earlier versions added, deliberately:
+    # EXPORT_SCHEMA_NOTES emits only the CURRENT version's sentence, so a
+    # note that dropped the earlier explanations would leave the artifact
+    # unable to explain fields it still carries.
     assert "task_attachments" in manifest["export_schema_change"]
     # And the one earlier field whose truth conditions v5 widened is
-    # named as widened rather than as carried unchanged: the note is a
-    # reader's only changelog, and something moved.
+    # still named as widened rather than as carried unchanged: the note
+    # is a reader's only changelog, and something moved.
     assert "truth conditions widened" in manifest["export_schema_change"]
     assert "token_counts" in manifest["export_schema_change"]
     assert "is_byok" in manifest["export_schema_change"]
@@ -8185,6 +8207,9 @@ def test_review_repro_creation_freezes_the_reading_a_digest_resolved_to(
                 "extractor": "text",
                 "extractor_version": "1",
                 "kind": "document",
+                # A document has no captures; the fifth part is None and
+                # present, since H2, so the record's shape is one shape.
+                "capture_id": None,
             }
         ]
     }
@@ -8300,8 +8325,9 @@ def test_a_dataset_declaring_a_full_pin_is_honored_verbatim(client, tmp_path):
     eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
 
     frozen = client.get(f"/experiments/{eid}").json()["task_attachments"]
-    # The DATASET's pin, not the row's newer reading.
-    assert frozen == {"t1": [pin]}
+    # The DATASET's pin, not the row's newer reading. The record carries
+    # the fifth part as None for a document.
+    assert frozen == {"t1": [{**pin, "capture_id": None}]}
 
 
 def test_a_dataset_declaring_a_reading_the_bench_lacks_is_refused(client, tmp_path):
@@ -9392,7 +9418,9 @@ def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
     ).json()["id"]
 
     # HOP: the creation freeze keeps both, in order.
-    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == pins
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == [
+        {**p, "capture_id": None} for p in pins
+    ]
     final = run_experiment_to_completion(client, eid, path)
     assert final["status"] == "done", final
 
@@ -9410,10 +9438,15 @@ def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
     # And the payload really did carry both readings, so the report is
     # describing something that happened.
     group = client.get("/runs").json()["runs"][0]
-    assert store.group_renditions(app.state.db, group["id"]) == pins
+    assert store.group_renditions(app.state.db, group["id"]) == [
+        {**p, "capture_id": None} for p in pins
+    ]
     lines = export_lines(client, eid)
-    assert lines[0]["task_attachments"]["t1"] == pins
-    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [pins]
+    carried = [{**p, "capture_id": None} for p in pins]
+    assert lines[0]["task_attachments"]["t1"] == carried
+    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [
+        carried
+    ]
 
 
 def test_the_dedup_key_is_the_whole_pin_and_not_three_quarters_of_it(client):
@@ -10482,9 +10515,23 @@ def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client)
     assert resp.status_code == 200
     listed = resp.json()["attachments"]
     assert [entry["digest"] for entry in listed] == [third, second, first]
-    # THE SAME SHAPE the detail endpoint serves, field for field, so a
-    # caller that can read one can read a page of them.
-    assert listed[0] == client.get(f"/attachments/{third}").json()
+    # THE SAME SHAPE the detail endpoint serves, field for field, EXCEPT
+    # the member manifest, and the exception is Phase L's deliberate
+    # split rather than a drift. A snapshot's manifest is body-sized: a
+    # snapshot of two thousand files carries two thousand rows, and a
+    # page of five hundred attachments carrying those would undo what
+    # K1.5 bought when it stopped this reader loading bodies. The list
+    # answers Attachment, the two single-attachment doors answer
+    # AttachmentDetail, and neither shape has to be read as "sometimes
+    # populated".
+    detail = client.get(f"/attachments/{third}").json()
+    assert listed[0] == {
+        key: value
+        for key, value in detail.items()
+        if key not in ("manifest", "capture")
+    }
+    assert detail["manifest"] is None
+    assert "manifest" not in listed[0]
     # NEVER CONTENT, on this endpoint as on every other. The bodies are
     # short and distinctive precisely so this scan can be exact.
     whole = resp.text
@@ -10841,6 +10888,16 @@ def test_review_repro_no_attachment_response_ever_carries_the_content(client):
         "extractor",
         "extractor_version",
         "created_at",
+        # Phase L. None for a document and for an image, and the member
+        # manifest for a snapshot: paths, sizes and digests, the
+        # exclusions in force, and the clone's commit. It is metadata by
+        # construction and this test is the one that says so, since a
+        # manifest that carried a member's TEXT would be exactly the
+        # content leak the rest of the test is about.
+        "manifest",
+        # The walk, when the row is a snapshot; None here, and present,
+        # since H2.
+        "capture",
     }
 
 
@@ -11398,8 +11455,14 @@ def test_review_repro_a_non_image_under_native_refuses_and_names_the_remedy(clie
     # The DIGEST, not a filename. The old message named the stored row's
     # name, which after a second upload under a different suffix was a
     # name the caller had never sent.
-    assert "was not read as one" in detail
+    assert f"sha256 {digest[:12]} read as a document" in detail
+    assert "not read as images" in detail
     assert "Use inline mode" in detail
+    # And for a DOCUMENT the second remedy is offered, because a document
+    # has a file behind it the person still has. Phase L made that clause
+    # conditional; see the snapshot case in the Phase L section, where
+    # offering it would be instructing somebody to re-upload a tree.
+    assert "re-upload the file under an image extension" in detail
     assert respx.calls.call_count == 0
 
 
@@ -12073,6 +12136,7 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
             "extractor": "text",
             "extractor_version": "1",
             "kind": "document",
+            "capture_id": None,
         }
     ]
     assert [entry["digest"] for entry in rebuilt["task_attachments"]["t2"]] == [second]
@@ -13130,6 +13194,7 @@ def test_review_repro_an_image_stays_usable_after_a_document_suffix_upload(clien
             "extractor": "none",
             "extractor_version": "0",
             "kind": "image",
+            "capture_id": None,
         }
     ]
 
@@ -13291,6 +13356,7 @@ def test_review_repro_an_ungrouped_run_records_the_documents_it_sent(client):
             "extractor": "text",
             "extractor_version": "1",
             "kind": "document",
+            "capture_id": None,
         }
     ]
     # NEVER THE CONTENT, on this reader like every other.
@@ -14412,7 +14478,7 @@ def test_review_repro_group_detail_describes_the_rendition_it_pinned(client):
     detail = client.get(f"/groups/{group_id}").json()
 
     # The pin itself, served.
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     # And the metadata derived from it rather than from the base row.
     ref = detail["attachments"][0]
     assert ref["kind"] == "image"
@@ -14485,7 +14551,9 @@ def test_review_repro_a_reuse_carries_the_pin_and_not_the_base_row(client):
         },
     )
     assert second.status_code == 201, second.text
-    assert store.group_renditions(client.app.state.db, second.json()["id"]) == [pin]
+    assert store.group_renditions(client.app.state.db, second.json()["id"]) == [
+        {**pin, "capture_id": None}
+    ]
 
 
 @respx.mock
@@ -14546,11 +14614,11 @@ async def test_review_repro_an_aborted_stream_records_the_pin(client):
     ).fetchone()
     assert row is not None
     stored = store.run_renditions(client.app.state.db, row["id"])
-    assert stored == [pin], stored
+    assert stored == [{**pin, "capture_id": None}], stored
     # And the replay reads it back as the image it pinned, not as the
     # base row's text reading.
     detail = client.get(f"/runs/{row['id']}").json()
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     assert detail["attachments"][0]["kind"] == "image"
     assert detail["attachments"][0]["filename"] == "aborted.png"
 
@@ -14620,7 +14688,11 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 5
+    # Bound to the constant rather than to a literal, because this test
+    # is about the rendition round-tripping and not about which version
+    # the artifact is at; the version's own contract is asserted in
+    # test_the_export_is_ordered_and_manifested.
+    assert manifest["export_schema_version"] == report.EXPORT_SCHEMA_VERSION
     assert manifest["attachments_referenced"] is True
 
     cited = [t for t in lines if t.get("type") == "trial" and t.get("attachments")]
@@ -14631,7 +14703,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
     # do it: read four fields off the line and reconstruct the identity.
     assert trial["attachments"] == [digest]
     assert trial["attachments_mode"] == "native"
-    assert trial["renditions"] == [pin]
+    assert trial["renditions"] == [{**pin, "capture_id": None}]
     rebuilt = {
         (r["digest"], r["extractor"], r["extractor_version"], r["kind"])
         for r in trial["renditions"]
@@ -14639,7 +14711,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
     assert rebuilt == {(digest, "none", "0", "image")}
     # Which is the identity the bench itself holds, checked against the
     # database the reader would NOT have.
-    assert store.group_renditions(db, group_id) == [pin]
+    assert store.group_renditions(db, group_id) == [{**pin, "capture_id": None}]
 
     # And no content, at any version. The artifact cites bytes it does
     # not embed, which is what attachments_referenced announces.
@@ -14788,8 +14860,8 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     run_id = db.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1").fetchone()["id"]
 
     # Every hop, in order, each asserted on the value it carries.
-    assert store.group_renditions(db, group_id) == [pin]
-    assert store.run_renditions(db, run_id) == [pin]
+    assert store.group_renditions(db, group_id) == [{**pin, "capture_id": None}]
+    assert store.run_renditions(db, run_id) == [{**pin, "capture_id": None}]
 
     recorded = db.execute(
         "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
@@ -14798,11 +14870,11 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     assert "text/plain" not in recorded
 
     detail = client.get(f"/groups/{group_id}").json()
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     assert detail["attachments"][0]["kind"] == "image"
 
     run_detail = client.get(f"/runs/{run_id}").json()
-    assert run_detail["renditions"] == [pin]
+    assert run_detail["renditions"] == [{**pin, "capture_id": None}]
     assert run_detail["attachments"][0]["kind"] == "image"
 
     listed = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
@@ -14816,7 +14888,10 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     path = write_dataset(
         tmp_path, {"id": "t1", "prompt": "describe", "attachments": [pin]}
     )
-    assert main.read_dataset(path)["tasks"][0]["attachments"] == [pin]
+    # The loader completes the SHAPE, never the reading: the fifth
+    # part is present and None until the freeze resolves it.
+    carried = {**pin, "capture_id": None}
+    assert main.read_dataset(path)["tasks"][0]["attachments"] == [carried]
 
     # HOP: THE CREATION FREEZE. The experiment record is the declaration
     # from here on, and it holds the full pin rather than the digest it
@@ -14825,7 +14900,9 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
         "/experiments",
         json=experiment_body(path, lineup=["model/vision"], attachments_mode="native"),
     ).json()["id"]
-    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {"t1": [pin]}
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {
+        "t1": [carried]
+    }
 
     # HOP: THE RUNNER. What actually went upstream, read off the mock.
     sent = []
@@ -14843,9 +14920,9 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     # HOP: THE GROUP THE RUNNER WROTE, which is where the eleven hops
     # above pick the declaration up. Same value, written from the freeze.
     cell = store.experiment_groups(db, eid)[0]
-    assert store.group_renditions(db, cell["id"]) == [pin]
+    assert store.group_renditions(db, cell["id"]) == [carried]
     trial_run = store.get_group(db, cell["id"])["runs"][0]
-    assert store.run_renditions(db, trial_run["id"]) == [pin]
+    assert store.run_renditions(db, trial_run["id"]) == [carried]
     assert client.get(f"/groups/{cell['id']}").json()["attachments"][0]["kind"] == (
         "image"
     )
@@ -14857,10 +14934,10 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
 
     # HOP: THE EXPORT, at line one and on the trial line.
     lines = export_lines(client, eid)
-    assert lines[0]["task_attachments"] == {"t1": [pin]}
+    assert lines[0]["task_attachments"] == {"t1": [carried]}
     assert lines[0]["attachments_mode"] == "native"
     exported = [line for line in lines if line["type"] == "trial"]
-    assert [line["renditions"] for line in exported] == [[pin]]
+    assert [line["renditions"] for line in exported] == [[carried]]
 
     # And nowhere on the way out does the base row's reading appear.
     for payload in (detail, run_detail, listed, per_task):
@@ -15105,7 +15182,7 @@ def test_review_repro_a_groups_member_runs_carry_their_own_documents(client):
     detail = client.get(f"/groups/{group_id}").json()
     member = detail["runs"][0]
 
-    assert member["renditions"] == [pin]
+    assert member["renditions"] == [{**pin, "capture_id": None}]
     assert member["attachments"][0]["kind"] == "image"
     # And the two endpoints agree about the same run, which is the
     # property that was broken rather than merely the field that was
@@ -15956,3 +16033,1770 @@ def test_review_repro_a_non_byok_upstream_figure_is_not_reported_as_a_second_bil
     assert cost["upstream"]["not_byok"]["values"] == [
         repr(probe["cost_details"]["upstream_inference_cost"])
     ]
+
+
+# ===================================================================
+# Phase L: a repository snapshot rides the comparison.
+#
+# The walk and the composition are pure and are proven in
+# tests/test_snapshot.py against injected callables. What is asserted
+# here is the DOOR: which trees may be walked at all, what the refusals
+# say, what the record keeps, and that the snapshot is one attachment
+# like any other once it is stored.
+# ===================================================================
+
+import os
+import shutil
+import stat as stat_module
+
+from bench import snapshot as bench_snapshot
+from bench.main import SNAPSHOTS_OFF, _parse_repo_roots
+
+
+def clone(root: Path, files: dict[str, bytes]) -> Path:
+    """A tree on disk, made from a mapping of repo-relative path to bytes."""
+    for name, body in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    return root
+
+
+def snapshot_of(client, root, patterns=("**/*.py",)):
+    """POST /snapshots against an allowlisted root."""
+    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    return client.post(
+        "/snapshots", json={"root": str(root), "patterns": list(patterns)}
+    )
+
+
+# ----- the allowlist ------------------------------------------------
+
+
+def test_the_snapshot_door_is_off_when_no_allowlist_is_set(client, tmp_path):
+    """WINDOW: POST /snapshots with app.state.repo_roots empty.
+
+    ABSENT IS THE FEATURE OFF, NOT A BOOT FAILURE, which is the ruling
+    this asserts at the only place it is visible. A missing
+    OPENROUTER_API_KEY fails at boot because a bench without one reports
+    every model as errored and looks like an outage; snapshots are
+    optional, so the process starts and the door refuses. That is the
+    unfetchable catalog's shape: degrade with honesty, refuse at the
+    door that needs the thing.
+    """
+    clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = ()
+
+    resp = client.post(
+        "/snapshots", json={"root": str(tmp_path), "patterns": ["**/*.py"]}
+    )
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert detail == SNAPSHOTS_OFF
+    assert "BENCH_REPO_ROOTS" in detail
+    # And it says WHY the allowlist exists, not merely that it is
+    # missing: the person's next action is to decide which trees may be
+    # walked, and "unset" alone does not tell them what they are
+    # deciding.
+    assert "composes its files into a prompt sent to a provider" in detail
+
+
+def test_the_off_door_touches_no_path_the_caller_named(client, tmp_path, monkeypatch):
+    """WINDOW: POST /snapshots with the allowlist empty, watching whether
+    the resolver ran at all.
+
+    AN ORDERING, ASSERTED, because nothing else can see it. The allowlist
+    check and the resolution both live in enforce_snapshot_root and the
+    caller learns the same 403 whichever runs first, so the only way this
+    can be wrong without a test is silently. "No filesystem call on a
+    request's path until the allowlist says there is one" is a posture
+    worth being able to state without a footnote, and a resolution passed
+    in as a value rather than as a callable had already run by the time
+    the function was entered.
+
+    The second half is what makes it an order rather than a claim that
+    the resolver is dead code: with the feature on, the same request
+    resolves exactly the path it named.
+    """
+    seen = []
+    resolver = main._resolved_directory
+
+    def watched(path):
+        seen.append(path)
+        return resolver(path)
+
+    monkeypatch.setattr(main, "_resolved_directory", watched)
+    client.app.state.repo_roots = ()
+
+    refused = client.post(
+        "/snapshots", json={"root": str(tmp_path), "patterns": ["**/*"]}
+    )
+    assert refused.status_code == 403
+    assert seen == []
+
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    client.post("/snapshots", json={"root": str(tmp_path), "patterns": ["**/*"]})
+    assert seen == [str(tmp_path)]
+
+
+def test_a_root_outside_the_allowlist_is_refused_and_both_are_named(client, tmp_path):
+    """WINDOW: POST /snapshots naming a real directory off the allowlist.
+
+    403 rather than 422 because the request is well formed and the
+    bench's policy says no, which is the answer LocalOnlyGuard gives a
+    non-loopback client. The allowed roots are named back: they are the
+    operator's own configuration and the caller is that operator on
+    loopback, so listing them is the difference between "no" and "no,
+    and here is what you meant to type".
+    """
+    allowed = clone(tmp_path / "allowed", {"a.py": b"x = 1\n"})
+    other = clone(tmp_path / "elsewhere", {"b.py": b"y = 2\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post("/snapshots", json={"root": str(other), "patterns": ["**/*.py"]})
+
+    assert resp.status_code == 403
+    detail = resp.json()["detail"]
+    assert str(other) in detail
+    assert str(allowed.resolve()) in detail
+    assert "BENCH_REPO_ROOTS" in detail
+
+
+def test_a_directory_under_an_allowed_root_is_allowed(client, tmp_path):
+    """WINDOW: POST /snapshots naming a subdirectory of an allowlist entry.
+
+    "not under BENCH_REPO_ROOTS" is the refusal, so under it is the
+    permission: an operator who allowlists their work directory can
+    snapshot any clone inside it without listing each one.
+    """
+    allowed = clone(tmp_path / "work", {"proj/a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post(
+        "/snapshots", json={"root": str(allowed / "proj"), "patterns": ["*.py"]}
+    )
+
+    assert resp.status_code == 201
+
+
+def test_a_sibling_root_sharing_a_prefix_is_not_under_the_allowlist(client, tmp_path):
+    """WINDOW: POST /snapshots with a root whose path prefixes an entry.
+
+    "/work-old" starts with "/work" and is not under it. The oldest bug
+    in path containment, refused by the same helper the walk uses for
+    symlink targets, which is why there is one separator to get right
+    rather than two.
+    """
+    allowed = clone(tmp_path / "work", {"a.py": b"x = 1\n"})
+    sibling = clone(tmp_path / "work-old", {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(allowed.resolve()),)
+
+    resp = client.post("/snapshots", json={"root": str(sibling), "patterns": ["*.py"]})
+
+    assert resp.status_code == 403
+
+
+def test_a_root_that_is_not_a_directory_is_a_422(client, tmp_path):
+    """WINDOW: POST /snapshots naming a file, and naming nothing.
+
+    422 rather than 403 for this one, because it is about what the
+    caller wrote rather than about what the bench permits. The order
+    matters: the allowlist is consulted first, so a nonexistent path
+    outside the allowlist is still refused as a policy matter and never
+    tells an outside caller whether it exists.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+
+    resp = client.post(
+        "/snapshots", json={"root": str(root / "a.py"), "patterns": ["*"]}
+    )
+    assert resp.status_code == 422
+    assert "not a directory" in resp.json()["detail"]
+
+    resp = client.post(
+        "/snapshots", json={"root": str(root / "gone"), "patterns": ["*"]}
+    )
+    assert resp.status_code == 422
+
+
+def test_parse_repo_roots_takes_absent_and_refuses_wrong(tmp_path):
+    """WINDOW: _parse_repo_roots, over each shape the variable can have.
+
+    SET AND WRONG IS A BOOT FAILURE and unset is not, which is the pair
+    that makes the feature optional without making it sloppy. Setting
+    the variable is a person saying "these trees"; a relative entry or a
+    directory that does not exist means the sentence they wrote does not
+    name what they meant, and failing at boot beats a refusal later
+    whose cause they would have to go looking for.
+    """
+    real = {str(tmp_path): str(tmp_path)}
+
+    def resolved(path):
+        return real.get(path)
+
+    assert _parse_repo_roots(None, resolved=resolved) == ()
+    assert _parse_repo_roots("   ", resolved=resolved) == ()
+    assert _parse_repo_roots(str(tmp_path), resolved=resolved) == (str(tmp_path),)
+    # Duplicates collapse: one root named twice is one root.
+    doubled = os.pathsep.join([str(tmp_path), str(tmp_path)])
+    assert _parse_repo_roots(doubled, resolved=resolved) == (str(tmp_path),)
+
+    # A stray separator is the ordinary typo, and in a PATH-shaped
+    # variable an empty entry has historically meant the working
+    # directory, which is exactly the accident an allowlist prevents.
+    with pytest.raises(RuntimeError, match="empty entry"):
+        _parse_repo_roots(f"{tmp_path}{os.pathsep}", resolved=resolved)
+    with pytest.raises(RuntimeError, match="not an absolute path"):
+        _parse_repo_roots("relative/path", resolved=resolved)
+    with pytest.raises(RuntimeError, match="not a directory"):
+        _parse_repo_roots("/nope/not/here", resolved=resolved)
+
+
+# ----- what the door composes and records ---------------------------
+
+
+def test_a_snapshot_is_one_attachment_carrying_its_whole_manifest(client, tmp_path):
+    """WINDOW: POST /snapshots over a two-file clone, response and record.
+
+    THE WHOLE SNAPSHOT IS ONE ATTACHMENT, which is what keeps the
+    fairness law intact for free: one digest, one rendition, one
+    composed text, delivered byte-identically to every model exactly as
+    a document is.
+    """
+    root = clone(
+        tmp_path,
+        {
+            "pkg/a.py": b"x = 1\n",
+            "pkg/b.py": b"y = 2\n",
+            "README.md": b"not selected\n",
+            ".git/config": b"[core]\n",
+        },
+    )
+
+    resp = snapshot_of(client, root, ["**/*.py"])
+
+    assert resp.status_code == 201
+    got = resp.json()
+    assert got["kind"] == "snapshot"
+    assert got["extractor"] == bench_snapshot.SNAPSHOT_EXTRACTOR
+    assert got["extractor_version"] == bench_snapshot.SNAPSHOT_VERSION
+    # The stored name is a pure function of the digest and carries no
+    # path: K.3's filename rule extended to a tree, and the reason the
+    # blind view can show a snapshot without showing where it came from.
+    assert got["filename"] == f"snapshot-{got['digest'][:12]}.txt"
+    assert str(tmp_path) not in json.dumps(got)
+
+    manifest = got["manifest"]
+    assert [member["path"] for member in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
+    assert manifest["files"][0]["size"] == 6
+    assert manifest["encoding"] == bench_snapshot.ENCODING_RULE
+    # THE WALK'S FACTS ARE THE CAPTURE'S, since H2: the manifest is
+    # content and the capture is the moment. The response carries the
+    # capture this walk made.
+    capture = got["capture"]
+    assert capture["patterns"] == ["**/*.py"]
+    assert ".git" in capture["excludes"]
+    assert isinstance(capture["id"], int)
+    # No repository here, so git answers nothing and both fields degrade
+    # together rather than one of them asserting a clean tree.
+    assert capture["head"] is None
+    assert capture["dirty"] is None
+    # The excluded and unselected files are absent from the reading.
+    assert [m["path"] for m in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
+
+
+def test_the_snapshot_records_the_clone_commit_and_whether_it_was_dirty(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots over a real git clone, manifest head and dirty.
+
+    Provenance of the same kind extractor_version is: that field says
+    which walker produced the text, this says which tree it walked at
+    which commit. Read locally with the same two-second timeout and
+    degrade discipline _app_sha uses, because it is the same runner.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "t"],
+        ["add", "-A"],
+        ["commit", "-qm", "one"],
+    ):
+        # None is a non-zero exit, so this asserts each step of the
+        # setup actually worked rather than that git was present.
+        assert main._git(args, cwd=str(root)) is not None
+
+    clean = snapshot_of(client, root, ["*.py"]).json()
+    assert clean["capture"]["head"] is not None
+    assert len(clean["capture"]["head"]) == 40
+    assert clean["capture"]["dirty"] is False
+
+    # An untracked file counts as modified, which is _app_sha's rule
+    # inherited: an untracked file under the root is a file the walk may
+    # well have just composed.
+    (root / "b.py").write_bytes(b"z = 3\n")
+    dirty = snapshot_of(client, root, ["*.py"]).json()
+    assert dirty["capture"]["dirty"] is True
+    assert dirty["digest"] != clean["digest"]
+
+
+def test_composing_one_tree_twice_returns_the_first_row(client, tmp_path):
+    """WINDOW: two identical POST /snapshots calls over one unchanged tree.
+
+    THE DEDUPE TOMBSTONE. A tree that has not changed composes
+    byte-identical text, so the digest is the same and the
+    content-addressed store returns the existing row rather than a
+    second copy: ten comparisons over one snapshot cost one copy of it,
+    which is the promise the whole attachments table rests on.
+
+    The MANIFEST is the first walk's, and that is the interesting half.
+    It is not a function of the rendition key, so two walks a commit
+    apart whose selected files did not change are one row, and the head
+    recorded is the earlier one. That is a true statement about these
+    bytes rather than a stale one, and rewriting it would relabel a
+    record every existing comparison already cites.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+
+    first = snapshot_of(client, root, ["*.py"]).json()
+    second = snapshot_of(client, root, ["*.py"]).json()
+
+    assert first["digest"] == second["digest"]
+    assert first["created_at"] == second["created_at"]
+    assert first["manifest"] == second["manifest"]
+    listed = client.get("/attachments").json()["attachments"]
+    assert [entry["digest"] for entry in listed] == [first["digest"]]
+
+
+def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
+    client, tmp_path
+):
+    """WINDOW: GET /attachments/{digest} and GET /attachments, for a snapshot.
+
+    POST AND GET AGREE ABOUT ONE DIGEST, which is the failure K.3 spent
+    a phase removing from the upload path and which the manifest could
+    reintroduce, since the manifest is not part of the rendition key.
+    Both doors read the STORED row.
+
+    The LIST does not carry it, and the split is deliberate: a snapshot
+    of two thousand files carries two thousand manifest rows, and a page
+    of five hundred attachments carrying those would undo what K1.5
+    bought when it stopped this reader loading bodies.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    created = snapshot_of(client, root, ["*.py"]).json()
+
+    fetched = client.get(f"/attachments/{created['digest']}").json()
+    assert fetched["manifest"] == created["manifest"]
+
+    listed = client.get("/attachments").json()["attachments"]
+    assert "manifest" not in listed[0]
+    # And never the content, on either door, which is the promise every
+    # attachment response makes.
+    assert "x = 1" not in json.dumps(fetched)
+    assert "x = 1" not in json.dumps(listed)
+
+
+# ----- what the door refuses ----------------------------------------
+
+
+def test_a_binary_in_the_selection_refuses_the_whole_snapshot(client, tmp_path):
+    """WINDOW: POST /snapshots where a pattern selects an object file.
+
+    Never a silent drop. The caller wrote a pattern, not a list, so the
+    difference between "your pattern matched a PNG" and a snapshot
+    quietly missing it is the difference between a person fixing their
+    selection and a person comparing models on a repository they think
+    they sent.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "blob.py": b"ELF\x00\x01\x02"})
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "blob.py" in resp.json()["detail"]
+    assert "NUL byte" in resp.json()["detail"]
+
+
+def test_a_symlink_leaving_the_root_refuses_at_the_door(client, tmp_path):
+    """WINDOW: POST /snapshots over a tree holding an escaping symlink.
+
+    The containment law reaching the boundary. BENCH_REPO_ROOTS bounds
+    which roots may be walked at all, and a link is exactly the
+    construct that would let a walk of an allowed root read a file in a
+    disallowed one.
+    """
+    outside = clone(tmp_path / "outside", {"secret.py": b"KEY = 'x'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    (root / "escape.py").symlink_to(outside / "secret.py")
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "escape.py" in detail
+    assert "outside the snapshot root" in detail
+    # And nothing from the file it pointed at reached the response.
+    assert "KEY" not in detail
+
+
+def test_a_named_pipe_in_the_selection_is_refused_rather_than_opened(client, tmp_path):
+    """WINDOW: POST /snapshots where a pattern selects a fifo.
+
+    THE OBLIGATION bench.snapshot's walk DOCSTRING NAMES. That module
+    does no I/O and cannot tell a regular file from a socket, a device
+    or a named pipe, so it says the door must. Opening a fifo with no
+    writer blocks forever, which is the one failure here that no timeout
+    in this process would end.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    os.mkfifo(root / "pipe.py")
+    assert stat_module.S_ISFIFO(os.stat(root / "pipe.py").st_mode)
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "pipe.py" in resp.json()["detail"]
+    assert "not a regular file" in resp.json()["detail"]
+
+
+def _on_disk_before(monkeypatch, method, name, action):
+    """Run action() on disk the moment the descriptor tree is about to
+    perform `method` on the entry called `name`, then let it proceed.
+
+    This is the review's race made deterministic through the door's own
+    tree: the listing has already happened, the swap lands, and the
+    real os.open with its real flags is what answers. Nothing about the
+    tree is faked; only the timing is fixed.
+    """
+    original = getattr(main.DescriptorTree, method)
+
+    def hooked(self, *args):
+        # An Entry carries a name and an Opened carries a path; whichever
+        # argument names the target is the one the swap is keyed on.
+        for arg in args:
+            spelled = getattr(arg, "name", None) or getattr(arg, "path", None)
+            if spelled == name:
+                action()
+                break
+        return original(self, *args)
+
+    monkeypatch.setattr(main.DescriptorTree, method, hooked)
+
+
+def test_review_repro_a_file_swapped_for_a_link_at_the_door_is_refused_unread(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file becomes a link out of
+    the root between the walk's listing and its open, on the real tree.
+
+    THE REVIEW'S FIRST SWAP AT THE DOOR. Reproduced on HEAD at this exact
+    window: 201, and the outside file's content in the stored text. Now
+    the open carries O_NOFOLLOW, ELOOP is the answer, and the request is
+    refused with nothing stored.
+    """
+    outside = clone(tmp_path / "outside", {"secret.py": b"LEAK = 'outside'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n", "b.py": b"y = 2\n"})
+
+    def swap():
+        (root / "b.py").unlink()
+        (root / "b.py").symlink_to(outside / "secret.py")
+
+    _on_disk_before(monkeypatch, "open_member", "b.py", swap)
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert (
+        "b.py was listed as a regular file and is now a symbolic link"
+        in (resp.json()["detail"])
+    )
+    assert store.list_attachments(client.app.state.db, 10) == []
+
+
+def test_review_repro_a_directory_swapped_for_a_link_at_the_door_is_refused(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a queued directory becomes a link to
+    another tree before the walk descends, on the real tree.
+
+    THE REVIEW'S SECOND SWAP AT THE DOOR. Reproduced on HEAD: 201, and
+    the other tree's file stored under a path claiming to be inside the
+    clone. Now the descent is an open through the parent's descriptor
+    with O_DIRECTORY and O_NOFOLLOW, and a link there is ELOOP.
+    """
+    outside = clone(tmp_path / "outside", {"z.py": b"LEAK2 = 'outside'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n", "d/inner.py": b"i = 1\n"})
+
+    def swap():
+        shutil.rmtree(root / "d")
+        (root / "d").symlink_to(outside)
+
+    _on_disk_before(monkeypatch, "descend", "d", swap)
+    resp = snapshot_of(client, root, ["**/*.py"])
+
+    assert resp.status_code == 422
+    assert (
+        "d was listed as a directory and is no longer one the walk may open"
+        in (resp.json()["detail"])
+    )
+    assert store.list_attachments(client.app.state.db, 10) == []
+
+
+def test_review_repro_a_fifo_swapped_in_at_the_door_is_refused_without_a_hang(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file becomes a named pipe
+    between the listing and the open, on the real tree.
+
+    THE REVIEW'S THIRD SHAPE AT THE DOOR, the one no timeout could end:
+    reproduced on HEAD as a request still blocked after three seconds.
+    The open now carries O_NONBLOCK, so a fifo with no writer opens and
+    returns, its own fstat says what it is, and the walk refuses it
+    before reading. The elapsed-time assertion is the hang's absence.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "p.py": b"p = 1\n"})
+
+    def swap():
+        (root / "p.py").unlink()
+        os.mkfifo(root / "p.py")
+
+    _on_disk_before(monkeypatch, "open_member", "p.py", swap)
+    started = time.monotonic()
+    resp = snapshot_of(client, root, ["*.py"])
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 422
+    assert "a socket, a device or a named pipe" in resp.json()["detail"]
+    assert elapsed < 2.0
+
+
+def test_review_repro_a_file_that_grows_after_its_open_is_refused_at_the_bound(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file grows past the bound
+    between its descriptor's stat and its read, on the real tree.
+
+    THE REVIEW'S FOURTH SHAPE AT THE DOOR: on HEAD the whole grown file
+    was read into memory, 800,022 bytes measured, and refused only
+    afterwards. The read is bounded at the descriptor now, so the door
+    asks for the bound plus one byte and refuses on the extra one.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "g.py": b"g = 1\n"})
+
+    def grow():
+        with open(root / "g.py", "ab") as handle:
+            handle.write(b"#" * (bench_snapshot.MAX_MEMBER_BYTES + 1))
+
+    _on_disk_before(monkeypatch, "read_member", "g.py", grow)
+    # And how much the descriptor read actually handed back, which is
+    # the bound itself: the walk asked for one byte past it and the
+    # tree obliged with no more, so the growth was never held.
+    returned = []
+    bounded = main.DescriptorTree.read_member
+
+    def measured(self, opened, limit):
+        data = bounded(self, opened, limit)
+        returned.append((opened.path, len(data)))
+        return data
+
+    monkeypatch.setattr(main.DescriptorTree, "read_member", measured)
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "g.py grew past" in resp.json()["detail"]
+    assert ("g.py", bench_snapshot.MAX_MEMBER_BYTES + 1) in returned
+
+
+def test_a_dangling_link_inside_the_root_is_skipped_and_the_walk_succeeds(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots over a tree holding a link whose target does
+    not exist but would sit inside the root.
+
+    The listing stats WITHOUT following, so a dangling link is a link
+    and not an error. A stat that followed would raise on the missing
+    target and the whole snapshot would be refused as unlistable, for a
+    link the walk was never going to open. Skipped, like every contained
+    link, because its bytes are the target's and the target has none.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    (root / "ghost.py").symlink_to(root / "not-there.py")
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 201, resp.text
+    assert [m["path"] for m in resp.json()["manifest"]["files"]] == ["a.py"]
+
+
+def test_a_file_over_the_member_ceiling_is_refused_before_it_is_read(client, tmp_path):
+    """WINDOW: POST /snapshots where one selected file is over the ceiling.
+
+    The size is checked from the stat, before the read, because a pure
+    function handed bytes cannot un-read them and a boundary that read
+    first would have spent the memory before asking. compose holds the
+    same bound for a caller that did not check.
+    """
+    root = clone(
+        tmp_path,
+        {
+            "a.py": b"x = 1\n",
+            "huge.py": b"z" * (bench_snapshot.MAX_MEMBER_BYTES + 1),
+        },
+    )
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "huge.py" in detail
+    assert "before it is read" in detail
+
+
+def test_a_selection_matching_nothing_names_the_patterns(client, tmp_path):
+    """WINDOW: POST /snapshots with a pattern that selects no file.
+
+    An empty snapshot would compose to an intro line and nothing else,
+    and every model would be asked about a repository none of them
+    received. The refusal names the patterns because the ordinary cause
+    is a person who wrote "*.py" expecting recursion.
+    """
+    root = clone(tmp_path, {"pkg/a.py": b"x = 1\n"})
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "'*.py'" in resp.json()["detail"]
+
+
+def test_the_snapshot_door_refuses_a_body_it_cannot_read(client, tmp_path):
+    """WINDOW: POST /snapshots with a malformed body and a non-JSON POST.
+
+    extra="forbid" and the JSON content-type guard, on the newest door,
+    because a door that took an unknown field would take a typo for a
+    setting and a door that took a form body would be the CORS hole the
+    whole boundary is built to close.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+
+    unknown = client.post(
+        "/snapshots",
+        json={"root": str(root), "patterns": ["*.py"], "excludes": ["a.py"]},
+    )
+    assert unknown.status_code == 422
+
+    empty = client.post("/snapshots", json={"root": str(root), "patterns": []})
+    assert empty.status_code == 422
+
+    too_many = client.post(
+        "/snapshots",
+        json={
+            "root": str(root),
+            "patterns": ["*.py"] * (bench_snapshot.MAX_PATTERNS + 1),
+        },
+    )
+    assert too_many.status_code == 422
+    # REFUSED BY THE MODEL AND NOT BY THE WALK, which is what the bound
+    # on the field buys: enforce_patterns holds the same number and
+    # would refuse this too, so without checking WHICH layer answered,
+    # the field's bound could be deleted and the door would still say
+    # 422. FastAPI renders a model violation as a list of error objects
+    # and the bench's own refusals as a string, so the shape is the
+    # proof that the body never reached the filesystem.
+    assert isinstance(too_many.json()["detail"], list)
+
+    form = client.post(
+        "/snapshots",
+        content=b"root=/tmp",
+        headers={"content-type": "application/x-www-form-urlencoded"},
+    )
+    assert form.status_code == 415
+
+
+# ----- the vocabulary holds across modules --------------------------
+
+
+def test_the_sql_kind_derivation_agrees_with_the_modules_that_name_it():
+    """WINDOW: the two CASE expressions in bench/store.py, read as text.
+
+    bench/store.py imports nothing from bench and is the persistence
+    layer rather than a participant in the vocabulary, so 'none',
+    'image', 'document', 'repo-walk' and 'snapshot' are SQL literals
+    there. What stops them drifting from the constants is this
+    assertion rather than an import, which is the same arrangement
+    PIN_FIELDS and RenditionPin live under one module over.
+    """
+    source = Path("bench/store.py").read_text()
+    for literal in (
+        bench_extract.IMAGE_KIND,
+        bench_extract.DOCUMENT_KIND,
+        bench_extract.SNAPSHOT_KIND,
+        bench_extract.SNAPSHOT_EXTRACTOR,
+    ):
+        assert f"'{literal}'" in source, literal
+    # Both derivations learned the third kind, not just the one a test
+    # happened to reach: the backfill that inserts from attachments and
+    # the update that fills a NULL on a row already there.
+    assert source.count("THEN 'snapshot'") == 2
+
+
+def test_kind_is_derived_in_exactly_one_place():
+    """WINDOW: every Python site that decides a rendition's kind.
+
+    ONE PLACE DECIDES KIND. It was three ternaries in three modules
+    while there were two kinds, which was survivable because a two-way
+    conditional reads at a glance; a third turns each into a chain, and
+    three chains that must agree is the shape this codebase has already
+    paid for twice. This asserts the ternaries did not come back.
+    """
+    # EXACTLY ONE comparison against the image extractor's name in the
+    # whole package, and it is kind_of's own. Counting rather than
+    # forbidding is what makes this catch the case a bare "not in"
+    # cannot: extract.py has to contain one, so a second one there,
+    # inside rendition_of where it used to live, would read as allowed.
+    #
+    # That second one is behaviourally inert today, since rendition_of
+    # derives its extractor from a suffix and no suffix routes to the
+    # walker, and inert is exactly why it needs a structural assertion.
+    # A door with no behaviour to prove is a door that comes back.
+    package = {
+        path: Path(path).read_text()
+        for path in (
+            "bench/main.py",
+            "bench/extract.py",
+            "bench/report.py",
+            "bench/store.py",
+        )
+    }
+    assert sum(source.count('== "none"') for source in package.values()) == 1
+    assert package["bench/extract.py"].count('extractor == "none"') == 1
+    assert 'row["extractor"] == "none"' not in package["bench/main.py"]
+    assert 'found["extractor"] == "none"' not in package["bench/main.py"]
+    assert bench_extract.kind_of("none") == bench_extract.IMAGE_KIND
+    assert bench_extract.kind_of("pypdf") == bench_extract.DOCUMENT_KIND
+    assert bench_extract.kind_of("text") == bench_extract.DOCUMENT_KIND
+    assert (
+        bench_extract.kind_of(bench_extract.SNAPSHOT_EXTRACTOR)
+        == bench_extract.SNAPSHOT_KIND
+    )
+
+
+# ===================================================================
+# Phase L3: the snapshot travels.
+#
+# Once stored, a snapshot IS an attachment: a task cites its digest or
+# pins its reading, creation resolves and freezes it, the runner composes
+# it, and the export carries the pin. What is asserted here is that
+# nothing along that path had to learn a special case, and that the two
+# refusals whose remedy only made sense for an uploaded FILE now say
+# something a person holding a snapshot can act on.
+# ===================================================================
+
+
+def stored_snapshot(client, tmp_path, files=None, patterns=("**/*.py",)):
+    """A snapshot of a small clone, through the real door, as a digest."""
+    root = clone(tmp_path / "clone", files or {"pkg/a.py": b"ANSWER = 42\n"})
+    resp = snapshot_of(client, root, patterns)
+    assert resp.status_code == 201, resp.text
+    return resp.json()
+
+
+def test_a_dataset_task_can_cite_a_snapshot_by_digest(client, tmp_path):
+    """WINDOW: POST /experiments over a dataset citing a snapshot digest,
+    read back as the frozen task_attachments.
+
+    THE TWO-LAYER DECLARATION, unchanged. The dataset cited a DIGEST and
+    nothing else, and the record holds a full four-part pin resolved once
+    against the store at creation. The only thing Phase L had to widen
+    for this to work is the VOCABULARY: PIN_KINDS and RenditionPin's
+    Literal both held two values, so the resolution that would have
+    honored the citation was refused one door earlier by a check about
+    what a dataset may claim.
+    """
+    built = stored_snapshot(client, tmp_path)
+    path = m_dataset(tmp_path, built["digest"])
+
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    assert detail["task_attachments"] == {
+        "t1": [
+            {
+                "digest": built["digest"],
+                "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
+                "extractor_version": bench_snapshot.SNAPSHOT_VERSION,
+                "kind": "snapshot",
+                # A bare citation of a snapshot freezes its latest
+                # capture, the way a bare digest freezes the row's own
+                # reading; see with_captures.
+                "capture_id": built["capture"]["id"],
+            }
+        ]
+    }
+    assert detail["attachments_mode"] == "inline"
+
+
+def test_a_dataset_task_can_pin_a_snapshot_reading_verbatim(client, tmp_path):
+    """WINDOW: POST /experiments over a dataset pinning all four parts of
+    a snapshot rendition.
+
+    K.3'S LAW, one kind wider: a pin is honored verbatim or refused,
+    never substituted. The four-part form is what a person writes when
+    they mean "this reading and no other", and a walker version bump
+    between authoring and creation must refuse rather than compose a
+    different tree under the pinned name.
+    """
+    built = stored_snapshot(client, tmp_path)
+    pin = {
+        "digest": built["digest"],
+        "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
+        "extractor_version": bench_snapshot.SNAPSHOT_VERSION,
+        "kind": "snapshot",
+    }
+    path = m_dataset(tmp_path, built["digest"], attachments=[pin])
+
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+    detail = client.get(f"/experiments/{created.json()['id']}").json()
+    # The four-part pin was honored verbatim, and its fifth part,
+    # unnamed by the dataset, resolved to the latest capture at the
+    # freeze, exactly as a bare citation's would.
+    assert detail["task_attachments"]["t1"] == [
+        {**pin, "capture_id": built["capture"]["id"]}
+    ]
+
+    # And a version the bench never ran is refused rather than resolved
+    # to the one it has, naming the task.
+    unrun = dict(pin, extractor_version="99")
+    refused = client.post(
+        "/experiments",
+        json=experiment_body(m_dataset(tmp_path, built["digest"], attachments=[unrun])),
+    )
+    assert refused.status_code == 422
+    assert "t1" in refused.json()["detail"]
+
+
+@respx.mock
+def test_the_tree_reaches_every_model_byte_identically(client, tmp_path):
+    """WINDOW: the composed user message of a two-model comparison whose
+    group declared a snapshot.
+
+    THE FAIRNESS LAW, which a snapshot gets for free by being ONE
+    attachment: one digest, one rendition, one composed text. This
+    asserts the property rather than the mechanism, because the mechanism
+    is the reason it is cheap and the property is the reason it matters.
+
+    The composed block names the RENDITION and not a filename, so the
+    models are told they are reading a snapshot read by repo-walk at a
+    version, and never where on somebody's disk it came from.
+    """
+    captured = []
+
+    def route(request):
+        captured.append(json.loads(request.content))
+        return httpx.Response(200, json=response_for("model/alpha", "ok"))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    built = stored_snapshot(client, tmp_path)
+
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "review this",
+            "models": ["model/alpha", "model/beta"],
+            "attachments": [built["digest"]],
+        },
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert len(captured) == 2
+    sent = [body["messages"][-1]["content"] for body in captured]
+    # Byte-identical, which is the whole claim.
+    assert sent[0] == sent[1]
+    composed = sent[0]
+    assert "ANSWER = 42" in composed
+    assert "pkg/a.py" in composed
+    # The delimiter names the rendition, not a path on disk.
+    assert "attachment 1 of 1: snapshot, read by repo-walk " in composed
+    assert str(tmp_path) not in composed
+
+
+def test_native_mode_refuses_a_snapshot_without_a_remedy_it_cannot_take(
+    client, tmp_path
+):
+    """WINDOW: POST /groups declaring a snapshot under native mode.
+
+    THE FALSE REMEDY, tombstoned. Native mode's refusal offered "or
+    re-upload the file under an image extension", which is a real fix for
+    a document and an instruction to do something impossible for a
+    snapshot: there is no upload to redo, because the bytes were composed
+    from a tree. A refusal that names a remedy the person cannot take is
+    a dead end wearing a helpful sentence, which this codebase treats as
+    a defect of the same severity as a wrong answer.
+    """
+    built = stored_snapshot(client, tmp_path)
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [built["digest"]],
+            "attachments_mode": "native",
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert f"sha256 {built['digest'][:12]} read as a snapshot" in detail
+    assert "Use inline mode" in detail
+    # The clause that only applies to a file is absent.
+    assert "re-upload" not in detail.lower()
+
+
+def test_a_missing_snapshot_reading_is_refused_with_a_remedy_that_exists(
+    client, tmp_path
+):
+    """WINDOW: resolve_rendition, reached through POST /groups carrying a
+    snapshot pin naming a walker version that never composed these bytes.
+
+    The mirror of the case above, one layer down. resolve_rendition
+    refuses rather than substituting another reading, which is K.3's law,
+    and its remedy said "Re-upload the file". A snapshot is re-COMPOSED
+    from the root and patterns its manifest names, and the manifest is on
+    the record precisely so that instruction can be followed.
+    """
+    built = stored_snapshot(client, tmp_path)
+
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [built["digest"]],
+            "renditions": [
+                {
+                    "digest": built["digest"],
+                    "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
+                    "extractor_version": "99",
+                    "kind": "snapshot",
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "no such reading is stored" in detail
+    assert "Compose the snapshot again" in detail
+    assert "manifest names" in detail
+    assert "Re-upload" not in detail
+
+    # And the same refusal for a DOCUMENT still names the remedy that
+    # exists for one, so the branch chose rather than replaced.
+    doc = upload(client, "c.txt", b"forty two days").json()["digest"]
+    other = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [doc],
+            "renditions": [
+                {
+                    "digest": doc,
+                    "extractor": "text",
+                    "extractor_version": "99",
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+    assert "Re-upload the file" in other.json()["detail"]
+
+
+@respx.mock
+def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
+    """WINDOW: the export manifest and trial lines of an experiment whose
+    task cited a snapshot.
+
+    A VALUE-DOMAIN BUMP IS STILL A BUMP. No key moved and no field
+    changed meaning, and kind may now be snapshot: a reader that ignores
+    unknown things absorbs that perfectly, and a STRICT reader validating
+    kind against the two earlier values rejects the artifact. The bench's
+    own RenditionPin held exactly those two values until this phase,
+    so it would have refused its own export.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    built = stored_snapshot(client, tmp_path)
+    path = m_dataset(tmp_path, built["digest"])
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+    manifest = lines[0]
+    assert manifest["export_schema_version"] == 7
+    assert "capture_id" in manifest["export_schema_change"]
+    pin = {
+        "digest": built["digest"],
+        "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
+        "extractor_version": bench_snapshot.SNAPSHOT_VERSION,
+        "kind": "snapshot",
+        # The bare citation froze the latest capture, which is the one
+        # POST /snapshots just made, and the pin names it everywhere.
+        "capture_id": built["capture"]["id"],
+    }
+    assert manifest["task_attachments"]["t1"] == [pin]
+    trials = [x for x in lines if x["type"] == "trial"]
+    assert trials
+    assert all(t["renditions"] == [pin] for t in trials)
+    # And the manifest explains the id it named: the walk's own facts,
+    # keyed by the id as a string.
+    named = manifest["captures"][str(built["capture"]["id"])]
+    assert named["patterns"] == ["**/*.py"]
+    assert named["head"] is None and named["dirty"] is None
+
+
+# ---- Phase L closing: the filesystem posture, enumerated.
+
+
+FILESYSTEM_CALLS = {
+    # module, enclosing function -> why this one is allowed to touch a
+    # path or a descriptor, and where its input comes from.
+    #
+    # ---- Inside the snapshot root check. Every one of these runs on a
+    # ---- root enforce_snapshot_root already resolved and matched
+    # ---- against BENCH_REPO_ROOTS, or through a DESCRIPTOR the walk
+    # ---- opened from that root. None of them takes a caller string,
+    # ---- and after open_root none of them takes a path at all.
+    ("main.py", "_resolved_directory"): {"os.path.isdir", "os.path.realpath"},
+    # The injected resolver, called only after the allowlist has been
+    # found non-empty. This entry IS the ordering: when the resolution
+    # was passed in as a value, the realpath ran in create_snapshot
+    # before the feature was known to be on, and this table said so.
+    ("main.py", "enforce_snapshot_root"): {"resolve"},
+    # THE DESCRIPTOR TREE, the fourteenth review's H1. The root is
+    # opened once by name with O_DIRECTORY and O_NOFOLLOW; every child
+    # directory is opened through its parent's descriptor; every member
+    # is opened through its directory's descriptor with O_NOFOLLOW and
+    # O_NONBLOCK; every read goes through the member's own descriptor.
+    # The one by-name resolution left is link_target's realpath, which
+    # decides whether to refuse a link the walk will not follow either
+    # way and never opens anything.
+    ("main.py", "DescriptorTree._directory"): {"os.close", "os.fstat", "os.open"},
+    ("main.py", "DescriptorTree.entries"): {
+        "entry.is_symlink",
+        "entry.stat",
+        "os.scandir",
+    },
+    ("main.py", "DescriptorTree.open_member"): {"os.close", "os.fstat", "os.open"},
+    ("main.py", "DescriptorTree.read_member"): {"os.read"},
+    ("main.py", "DescriptorTree.close_handle"): {"os.close"},
+    ("main.py", "DescriptorTree.link_target"): {"os.path.realpath", "os.readlink"},
+    # snapshot.py does no I/O at all: these are the INJECTED operations
+    # being called, which is the whole reason the module can be tested
+    # as a value in and a value out, and the reason the review's races
+    # are deterministic tests there.
+    ("snapshot.py", "walk"): {
+        "tree.close_handle",
+        "tree.descend",
+        "tree.link_target",
+        "tree.open_member",
+        "tree.open_root",
+        "tree.read_member",
+        "tree.root_path",
+    },
+    ("snapshot.py", "listing"): {"tree.entries"},
+    #
+    # ---- Outside it, each on its own posture.
+    #
+    # One file the operator named, parsed as prompts they wrote. A
+    # mistyped path here fails with a 422 naming the line; see
+    # read_dataset's docstring for why the allowlist stops at the door
+    # that walks a TREE.
+    ("main.py", "read_dataset"): {"read_bytes"},
+    # The application's own static directory and index, derived from
+    # __file__ and never from a request. StaticFiles is Starlette
+    # serving that directory; its input is the same constant.
+    ("main.py", "<module>"): {"INDEX_HTML.read_text", "StaticFiles", "resolve"},
+    ("main.py", "static_rev"): {"directory.rglob", "path.is_file", "path.read_bytes"},
+    # The git runner: its default working directory is from __file__,
+    # and its cwd parameter is where a snapshot passes an allowlisted
+    # root. subprocess.run is listed because a working directory is a
+    # path operation, whatever the command.
+    ("main.py", "_git"): {"resolve", "subprocess.run"},
+    # The database path from BENCH_DB, set by the operator at boot and
+    # never per request: created private, tightened if found loose,
+    # and then opened.
+    ("store.py", "_keep_private"): {
+        "os.chmod",
+        "os.close",
+        "os.makedirs",
+        "os.open",
+        "os.path.abspath",
+        "os.path.exists",
+        "os.path.isdir",
+        "os.stat",
+    },
+    ("store.py", "connect"): {"sqlite3.connect"},
+    # A constant member name inside an uploaded zip. No filesystem is
+    # touched at all: this is ZipFile.open over bytes already in memory.
+    ("extract.py", "_extract_docx"): {"archive.open"},
+}
+
+# Every way this codebase touches a path, a descriptor or a directory.
+# The os names are exhaustive over the os module by construction (see
+# the test's completeness rule); the rest are the constructors and
+# methods this codebase calls, listed by name, and a NEW library that
+# reaches disk would have to be added here to be seen.
+FILESYSTEM_TOUCHERS = {
+    "os.chmod",
+    "os.close",
+    "os.fstat",
+    "os.listdir",
+    "os.makedirs",
+    "os.open",
+    "os.read",
+    "os.readlink",
+    "os.remove",
+    "os.rename",
+    "os.replace",
+    "os.scandir",
+    "os.stat",
+    "os.unlink",
+    "os.path.abspath",
+    "os.path.exists",
+    "os.path.isdir",
+    "os.path.realpath",
+    "open",
+    "sqlite3.connect",
+    "subprocess.run",
+    "StaticFiles",
+    # pathlib and DirEntry methods, matched on the method name.
+    "read_bytes",
+    "read_text",
+    "write_text",
+    "write_bytes",
+    "rglob",
+    "glob",
+    "iterdir",
+    "mkdir",
+    "unlink",
+    "touch",
+    "exists",
+    "is_dir",
+    "is_file",
+    "is_symlink",
+    "resolve",
+    "stat",
+    # The Tree protocol, so the pure walk's injected operations appear
+    # under the function that makes them.
+    "open_root",
+    "entries",
+    "descend",
+    "open_member",
+    "read_member",
+    "close_handle",
+    "link_target",
+    "root_path",
+}
+
+# os calls that compute on strings and touch nothing. A call into os
+# that is in neither set fails the test as unclassified, which is how
+# the os half of the list stays complete without anybody remembering.
+PURE_OS_CALLS = {
+    "os.environ.get",
+    "os.path.basename",
+    "os.path.commonpath",
+    "os.path.dirname",
+    "os.path.isabs",
+    "os.path.join",
+    "os.path.normcase",
+    "os.path.normpath",
+}
+
+
+def _dotted(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+def test_review_repro_every_path_operation_sits_in_a_named_posture():
+    """WINDOW: every filesystem-touching call in bench/, mapped to the
+    function that makes it, read as an AST.
+
+    THE POSTURE WALK THE OPERATOR COMMISSIONED, written as a test rather
+    than as a paragraph. Phase L adds the first door that takes a PATH
+    from a request, so "which code can touch the filesystem, and on whose
+    input" stopped being obvious. The answer is the table above, and this
+    is what keeps the table true.
+
+    HOW COMPLETE IS "EVERY", stated because the fourteenth review found
+    the first version claiming it and missing four. Two rules, and they
+    are different kinds of rule.
+
+    The os half is complete BY CONSTRUCTION: every call into the os
+    module anywhere in bench/ must be in FILESYSTEM_TOUCHERS or in
+    PURE_OS_CALLS, and one in neither fails this test as unclassified.
+    So an os call cannot be added without somebody saying which it is,
+    and the four the review named (is_symlink, chmod, sqlite3.connect,
+    StaticFiles) are in the list because this rule and the next would
+    now refuse a tree without them.
+
+    The non-os half is complete BY ENUMERATION and says so: builtins
+    open, the pathlib and DirEntry methods this codebase calls,
+    sqlite3.connect, subprocess.run for its working directory,
+    Starlette's StaticFiles for the directory it serves, and the Tree
+    protocol's operations so the pure walk's injected calls appear under
+    the function that makes them. A NEW library that reaches disk under
+    a name not in that list would not be seen, and that is the limit of
+    what an AST scan of call names can promise.
+
+    A NEW ENTRY FAILS THIS TEST, which is the point. Adding a read or a
+    stat anywhere in bench/ now requires saying which posture it sits in:
+    inside the root check on a descriptor the walk opened, or outside it
+    on a path that came from the operator's own configuration. There is
+    no third category, and a call that cannot be put in one of the two is
+    the finding.
+
+    Keyed on QUALIFIED FUNCTION NAME and not on a line number, because a
+    test anchored to an offset in a seven-thousand-line file breaks on
+    every unrelated edit and gets deleted. A method is keyed as
+    Class.method so the descriptor tree's eight operations read as its.
+    """
+    found = {}
+    unclassified = set()
+    for path in sorted(Path("bench").glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
+        scope = {}
+        # Breadth-first, so an inner function's assignment lands after
+        # its enclosing function's and the innermost name wins.
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                parent = parents.get(id(node))
+                name = (
+                    f"{parent.name}.{node.name}"
+                    if isinstance(parent, ast.ClassDef)
+                    else node.name
+                )
+                for child in ast.walk(node):
+                    scope[id(child)] = name
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            name = _dotted(node.func)
+            key = (path.name, scope.get(id(node), "<module>"))
+            if name.startswith("os."):
+                if name in FILESYSTEM_TOUCHERS:
+                    found.setdefault(key, set()).add(name)
+                elif name not in PURE_OS_CALLS:
+                    unclassified.add((path.name, key[1], name))
+                continue
+            if (
+                name in FILESYSTEM_TOUCHERS
+                or name.rsplit(".", 1)[-1] in FILESYSTEM_TOUCHERS
+            ):
+                found.setdefault(key, set()).add(name)
+
+    assert unclassified == set(), (
+        "os calls that are neither touchers nor pure: classify them in "
+        f"FILESYSTEM_TOUCHERS or PURE_OS_CALLS: {sorted(unclassified)}"
+    )
+    assert found == FILESYSTEM_CALLS
+
+
+# ===================================================================
+# The fourteenth review's H2: capture provenance travels.
+# ===================================================================
+
+
+def git_clone(root: Path) -> None:
+    """Turn a tree into a committed clone, asserting each step."""
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "t"],
+        ["add", "-A"],
+        ["commit", "-qm", "one"],
+    ):
+        assert main._git(args, cwd=str(root)) is not None
+
+
+def test_review_repro_two_captures_of_identical_bytes_keep_two_provenances(
+    client, tmp_path
+):
+    """WINDOW: two POST /snapshots over one clone whose SELECTED bytes did
+    not change while its tree went from clean to dirty, then the record.
+
+    THE REVIEWER'S SHAPE, reproduced on HEAD before this fix: same
+    digest, second response reported dirty false, one row holding one
+    walk's facts, the second walk's silently gone. Content identity
+    stays deduplicated, because the same composed bytes are the same
+    treatment for every model; capture provenance is a per-capture fact,
+    so the second walk is its own record, the response carries it, and
+    a pin can name either.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+
+    clean = snapshot_of(client, root, ["*.py"]).json()
+    # An untracked file the pattern does NOT select: identical bytes,
+    # dirtied tree.
+    (root / "notes.md").write_bytes(b"scratch\n")
+    dirty = snapshot_of(client, root, ["*.py"]).json()
+
+    assert clean["digest"] == dirty["digest"]
+    assert clean["created_at"] == dirty["created_at"]
+    assert clean["manifest"] == dirty["manifest"]
+    # Two walks, two captures, each telling the truth about its moment.
+    assert clean["capture"]["dirty"] is False
+    assert dirty["capture"]["dirty"] is True
+    assert clean["capture"]["id"] != dirty["capture"]["id"]
+    assert clean["capture"]["head"] == dirty["capture"]["head"]
+    # GET answers the latest, which is the second walk.
+    fetched = client.get(f"/attachments/{clean['digest']}").json()
+    assert fetched["capture"]["id"] == dirty["capture"]["id"]
+    # And nothing was lost: both are on the record.
+    both = store.captures_for(
+        client.app.state.db, [clean["capture"]["id"], dirty["capture"]["id"]]
+    )
+    assert {c["dirty"] for c in both.values()} == {False, True}
+
+
+@respx.mock
+def test_a_comparison_names_the_capture_it_read_and_the_report_explains_it(
+    client, tmp_path
+):
+    """WINDOW: a group pinning the EARLIER of two captures of one
+    rendition, through /compare, the group detail, the history list and
+    the experiment-shaped report inputs.
+
+    THE PIN NAMES THE WALK. With two captures of identical bytes, a
+    comparison declaring the first one records the first one, and every
+    reader downstream describes that walk and not the latest: the detail
+    view's refs carry the capture, the history page resolves it in one
+    query, and a bare-digest member of the same group is handed the
+    group's pin rather than the newer capture.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+    first = snapshot_of(client, root, ["*.py"]).json()
+    (root / "notes.md").write_bytes(b"scratch\n")
+    second = snapshot_of(client, root, ["*.py"]).json()
+    assert first["digest"] == second["digest"]
+    earlier = {
+        "digest": first["digest"],
+        "extractor": first["extractor"],
+        "extractor_version": first["extractor_version"],
+        "kind": "snapshot",
+        "capture_id": first["capture"]["id"],
+    }
+
+    group = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [first["digest"]],
+            "renditions": [earlier],
+        },
+    )
+    assert group.status_code == 201, group.text
+    group_id = group.json()["id"]
+    assert store.group_renditions(client.app.state.db, group_id) == [earlier]
+
+    detail = client.get(f"/groups/{group_id}").json()
+    assert detail["renditions"] == [earlier]
+    assert detail["attachments"][0]["capture"]["id"] == first["capture"]["id"]
+    assert detail["attachments"][0]["capture"]["dirty"] is False
+
+    # A member citing the digest bare is given the group's pin, capture
+    # included, and not the newer capture.
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments": [first["digest"]],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    run_id = client.app.state.db.execute(
+        "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    assert store.run_renditions(client.app.state.db, run_id) == [earlier]
+
+    listed = client.get("/runs").json()["runs"]
+    entry = next(r for r in listed if r["id"] == group_id)
+    assert entry["attachments"][0]["capture"]["id"] == first["capture"]["id"]
+
+
+def test_a_pin_naming_a_capture_of_another_reading_is_refused(client, tmp_path):
+    """WINDOW: POST /groups whose snapshot pin names a capture that is not
+    a capture of that rendition.
+
+    K.3'S LAW ON THE FIFTH PART. A capture id is a row somebody can
+    type, and a pin naming one that belongs to a different rendition,
+    or to nothing, would let a comparison claim a walk that did not
+    produce the bytes it sent. Honored verbatim or refused, like the
+    four parts before it.
+    """
+    root_a = clone(tmp_path / "a", {"a.py": b"x = 1\n"})
+    root_b = clone(tmp_path / "b", {"b.py": b"y = 2\n"})
+    one = snapshot_of(client, root_a, ["*.py"]).json()
+    other = snapshot_of(client, root_b, ["*.py"]).json()
+    assert one["digest"] != other["digest"]
+
+    def declare(capture_id):
+        return client.post(
+            "/groups",
+            json={
+                "prompt": "review",
+                "models": ["model/alpha"],
+                "budget": "standard",
+                "attachments": [one["digest"]],
+                "renditions": [
+                    {
+                        "digest": one["digest"],
+                        "extractor": one["extractor"],
+                        "extractor_version": one["extractor_version"],
+                        "kind": "snapshot",
+                        "capture_id": capture_id,
+                    }
+                ],
+            },
+        )
+
+    wrong = declare(other["capture"]["id"])
+    assert wrong.status_code == 422
+    assert "is not a capture of that reading" in wrong.json()["detail"]
+    missing = declare(999_999)
+    assert missing.status_code == 422
+    assert "is not a capture of that reading" in missing.json()["detail"]
+    right = declare(one["capture"]["id"])
+    assert right.status_code == 201, right.text
+
+
+def test_a_dataset_pin_may_name_a_capture_and_a_document_pin_may_not(client, tmp_path):
+    """WINDOW: datasets pinning capture_id, through the loader and the
+    creation freeze.
+
+    A snapshot pin naming its capture is honored verbatim; a document
+    pin naming one is refused at the loader, because only a snapshot has
+    captures and a capture on a document is a typo with a row number.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    pin = {
+        "digest": built["digest"],
+        "extractor": built["extractor"],
+        "extractor_version": built["extractor_version"],
+        "kind": "snapshot",
+        "capture_id": built["capture"]["id"],
+    }
+    path = m_dataset(tmp_path, built["digest"], attachments=[pin])
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+    assert client.get(f"/experiments/{created.json()['id']}").json()[
+        "task_attachments"
+    ] == {"t1": [pin]}
+
+    doc = upload(client, "c.txt", b"forty two days").json()["digest"]
+    bad = {
+        "digest": doc,
+        "extractor": "text",
+        "extractor_version": "1",
+        "kind": "document",
+        "capture_id": 1,
+    }
+    refused = client.post(
+        "/experiments",
+        json=experiment_body(m_dataset(tmp_path, doc, attachments=[bad])),
+    )
+    assert refused.status_code == 422
+    assert "only a snapshot has captures" in refused.json()["detail"]
+
+
+@respx.mock
+def test_the_report_carries_the_captures_its_pins_name(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/report, the captures key.
+
+    The report's per-task chips name a capture by id, and the report
+    carries the records those ids name, keyed by the id as a string, so
+    the page can say which walk without a second round trip and a
+    rebuild from the export can say the same.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    git_clone(root)
+    built = snapshot_of(client, root, ["*.py"]).json()
+    path = m_dataset(tmp_path, built["digest"])
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+    entry = report_body["task_attachments"]["t1"][0]
+    assert entry["capture_id"] == built["capture"]["id"]
+    named = report_body["captures"][str(built["capture"]["id"])]
+    assert named["head"] == built["capture"]["head"]
+    assert named["dirty"] is False
+    assert named["patterns"] == ["*.py"]
+
+
+@respx.mock
+def test_a_member_restating_the_four_parts_matches_a_group_that_took_the_latest(
+    client, tmp_path
+):
+    """WINDOW: pins_for, a grouped member declaring a snapshot pin with no
+    capture against a group whose pin resolved to the latest at creation.
+
+    THE COMPARISON IS NORMALISED THE WAY THE GROUP WAS. A member that
+    restates the four parts and leaves the fifth unnamed means "this
+    reading, whichever walk you froze", which is what the group froze;
+    refusing it would be refusing a member for not repeating a number
+    the group assigned. A member naming a DIFFERENT capture is asking
+    for a different comparison and is the 409 below.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+    first = snapshot_of(client, root, ["*.py"]).json()
+    four = {
+        "digest": first["digest"],
+        "extractor": first["extractor"],
+        "extractor_version": first["extractor_version"],
+        "kind": "snapshot",
+    }
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [first["digest"]],
+            "renditions": [four],
+        },
+    ).json()["id"]
+    assert store.group_renditions(client.app.state.db, group_id) == [
+        {**four, "capture_id": first["capture"]["id"]}
+    ]
+
+    body = {
+        "prompt": "review",
+        "models": ["model/alpha"],
+        "group_id": group_id,
+        "attachments": [first["digest"]],
+        "renditions": [four],
+    }
+    assert client.post("/compare", json=body).status_code == 200
+
+    (root / "notes.md").write_bytes(b"scratch\n")
+    second = snapshot_of(client, root, ["*.py"]).json()
+    other = {**four, "capture_id": second["capture"]["id"]}
+    refused = client.post("/compare", json={**body, "renditions": [other]})
+    assert refused.status_code == 409
+    assert "different comparison" in refused.json()["detail"]
+
+
+def test_review_repro_two_captures_of_one_rendition_are_two_report_entries(client):
+    """WINDOW: _declared_documents over two pins differing only in
+    capture_id.
+
+    The dedup key is the declaration, and since H2 the declaration has
+    a fifth part. Two cells over one rendition at two captures read the
+    same bytes under two provenances; a report keyed on the four parts
+    would say one walk happened.
+    """
+    digest = "d" * 64
+    group = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": [digest, digest],
+        "renditions": [
+            {
+                "digest": digest,
+                "extractor": "repo-walk",
+                "extractor_version": "1",
+                "kind": "snapshot",
+                "capture_id": capture,
+            }
+            for capture in (1, 2)
+        ],
+    }
+    keys = [key for key, _entry in report._declared_documents(group)]
+    assert len(set(keys)) == 2
+    entries = [entry for _key, entry in report._declared_documents(group)]
+    assert [entry["capture_id"] for entry in entries] == [1, 2]
+
+
+def test_an_export_taken_before_any_run_still_explains_its_captures(client, tmp_path):
+    """WINDOW: the export manifest of an experiment that has not run,
+    whose frozen declaration names a capture.
+
+    A task that never ran has no trial line, so the manifest's
+    task_attachments is the only place its pin appears, and a capture
+    named there and explained nowhere would be an id a reader could not
+    look up. referenced_captures reads the frozen declaration as well as
+    the recorded cells for exactly this.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    path = m_dataset(tmp_path, built["digest"])
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+    manifest = lines[0]
+    assert [x for x in lines if x["type"] == "trial"] == []
+    assert manifest["task_attachments"]["t1"][0]["capture_id"] == built["capture"]["id"]
+    assert str(built["capture"]["id"]) in manifest["captures"]
+
+
+# ===================================================================
+# The fourteenth review's mediums: remedies name only what can make
+# the set valid.
+# ===================================================================
+
+
+def test_review_repro_a_misdeclared_snapshot_is_not_told_to_re_upload(client, tmp_path):
+    """WINDOW: resolve_rendition's kind-mismatch refusal for a pin that
+    calls a stored snapshot a document.
+
+    A FALSE REMEDY, the review's medium. "Upload the file under an
+    extension that makes it a document" is a real fix when a document
+    was stored under an image suffix; a snapshot has no file and no
+    suffix, and nothing can be uploaded to turn a walk into a document
+    or a document into a walk. The refusal names the one action that
+    makes the declaration valid, declaring the stored kind, and stops.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [built["digest"]],
+            "renditions": [
+                {
+                    "digest": built["digest"],
+                    "extractor": built["extractor"],
+                    "extractor_version": built["extractor_version"],
+                    "kind": "document",
+                }
+            ],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "Declare it as a snapshot" in detail
+    assert "upload the file" not in detail
+
+
+def test_review_repro_a_mixed_snapshot_and_document_set_under_native_is_not_told_to_re_upload(
+    client, tmp_path
+):
+    """WINDOW: enforce_native_mode's refusal over a document AND a
+    snapshot declared native.
+
+    Re-uploading the document as an image is offered only when every
+    wrong pin is a document: with a snapshot in the set, doing so would
+    leave the set exactly as unsendable, one refusal later. The remedy
+    that makes the whole set valid is inline mode, and it is the only
+    one named.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    doc = upload(client, "c.txt", b"forty two days").json()["digest"]
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [doc, built["digest"]],
+            "attachments_mode": "native",
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "Use inline mode" in detail
+    assert "re-upload" not in detail.lower()
+
+
+def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
+    client, tmp_path
+):
+    """WINDOW: enforce_inline_mode's refusal over an image AND a snapshot
+    declared inline.
+
+    "Use native mode" is a real fix when every document in the set is an
+    image, because native takes all of them. With a snapshot beside the
+    image no mode sends the set whole: inline cannot send the image and
+    native cannot send the snapshot, and telling the person to switch
+    sends them to a second refusal one word later. The only true
+    sentence is that the set must be split, so that is the sentence.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    image = upload(client, "shot.png", PNG_BYTES).json()["digest"]
+    resp = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [image, built["digest"]],
+        },
+    )
+    assert resp.status_code == 422
+    detail = resp.json()["detail"]
+    assert "No single mode sends this set" in detail
+    assert "native cannot send a snapshot" in detail
+    assert "Use native mode" not in detail
+
+    # And the image-only set keeps its real remedy, so the change chose
+    # rather than replaced.
+    alone = client.post(
+        "/groups",
+        json={
+            "prompt": "look",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [image],
+        },
+    )
+    assert "Use native mode" in alone.json()["detail"]
