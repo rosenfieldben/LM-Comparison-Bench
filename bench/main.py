@@ -81,6 +81,7 @@ from bench.report import (
     export_line,
     export_manifest,
     export_trial,
+    referenced_captures,
 )
 from bench.scoring import judged_pass, score_response
 
@@ -264,6 +265,37 @@ class RenditionPin(BaseModel):
     extractor: str = Field(min_length=1, max_length=64)
     extractor_version: str = Field(min_length=1, max_length=64)
     kind: Literal["document", "image", "snapshot"]
+    # WHICH CAPTURE, the fourteenth review's H2. A rendition is keyed by
+    # content, and two walks that compose identical bytes are one
+    # rendition and two captures: two commits, or a clean tree and a
+    # dirtied one. The pin names the capture so the record can say
+    # which walk this comparison read, and it is optional because a
+    # document or an image has no captures and a snapshot cited without
+    # one resolves to its latest at creation, the way a bare digest
+    # resolves to its row's own reading. Honored verbatim or refused
+    # like the four above: resolve_rendition checks that the capture
+    # exists and is a capture of THIS reading.
+    capture_id: int | None = Field(default=None, ge=1, le=MAX_SQLITE_ROWID)
+
+
+class SnapshotCapture(BaseModel):
+    """One walk of a tree into a rendition: when, at which commit, with
+    the tree in which state, selecting what and excluding what.
+
+    A PER-CAPTURE FACT, NOT A ROW FACT. This is what Phase L kept on the
+    rendition's manifest and what the fourteenth review found lost
+    there: the manifest is one per rendition, a rendition is one per
+    composed text, and two captures of identical text kept the first
+    walk's commit and dirty flag and dropped the second's. Each capture
+    is its own record now, referenced from the pin by id.
+    """
+
+    id: int
+    head: str | None
+    dirty: bool | None
+    patterns: list[str]
+    excludes: list[str]
+    captured_at: str
 
 
 class CompareRequest(BaseModel):
@@ -612,21 +644,18 @@ class SnapshotManifest(BaseModel):
     under which selection, at which commit. A snapshot without it would
     be a wall of source nobody could tie back to a repository state.
 
-    head and dirty are read locally from the clone and are both
-    nullable, which is deliberate and differs from _app_sha's rule.
-    _app_sha degrades the WHOLE label to None when the dirty question
-    cannot be answered, because a bare sha is the clean claim and
-    asserting it unverified is the lie that function guards against.
-    Here the two are separate fields, so a head with dirty None says
-    exactly what happened: the commit is known and whether the tree was
-    modified is not.
+    CONTENT-DERIVED AND NOTHING ELSE, since the fourteenth review's H2.
+    The members and the encoding are functions of the composed text and
+    belong on the rendition, which is keyed by content. The commit, the
+    dirty flag, the patterns and the exclusions are facts about a WALK,
+    and a rendition may have been walked into more than once; those
+    live on SnapshotCapture, one record per walk, referenced from the
+    pin. A manifest written in Phase L's era still holds them and is
+    projected down to these two fields on the way out, with its capture
+    backfilled from them at boot; see store.connect.
     """
 
     files: list[SnapshotMember]
-    patterns: list[str]
-    excludes: list[str]
-    head: str | None
-    dirty: bool | None
     encoding: str
 
 
@@ -644,9 +673,17 @@ class AttachmentDetail(Attachment):
     None is every rendition of a single file, which is every rendition
     but a snapshot's. It is not a missing value; see the migration entry
     for manifest_json.
+
+    THE CAPTURE BESIDE IT is which walk this response is about: on POST
+    /snapshots the walk just made, on GET the rendition's latest. A
+    snapshot's manifest says what the bytes cover; its capture says
+    when and from what they were taken. The pin a client sends back
+    carries the capture's id, so the comparison records the walk it
+    meant rather than whichever walk was first.
     """
 
     manifest: SnapshotManifest | None = None
+    capture: SnapshotCapture | None = None
 
 
 class SnapshotCreate(BaseModel):
@@ -705,6 +742,11 @@ class AttachmentRef(BaseModel):
     extractor: str | None = None
     extractor_version: str | None = None
     kind: str | None = None
+    # The capture the pin named, resolved, so a history chip can say
+    # which walk a snapshot was and the reuse action restages the same
+    # one. None for every document and image, and for a snapshot pinned
+    # before captures existed.
+    capture: SnapshotCapture | None = None
 
 
 class PromptCreate(BaseModel):
@@ -2368,7 +2410,36 @@ def row_rendition(row: dict[str, Any]) -> dict[str, Any]:
         "extractor": row["extractor"],
         "extractor_version": row["extractor_version"],
         "kind": kind_of(row["extractor"]),
+        # A row knows no capture; with_captures fills this for a
+        # snapshot at the doors that resolve a bare citation.
+        "capture_id": None,
     }
+
+
+def with_captures(pins: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Each snapshot pin that names no capture, resolved to its latest.
+
+    THE BARE CITATION'S OTHER HALF. A digest cited alone resolves to its
+    row's own reading at creation and is frozen; a snapshot cited alone
+    resolves to its latest capture at the same moment, for the same
+    reason, so the record says which walk rather than leaving it to be
+    looked up later against a table that grows. Documents and images
+    pass through untouched, and so does a snapshot that already names
+    its capture, which is a declaration and not a question.
+
+    A snapshot whose rendition has no capture at all keeps None: that
+    is a row somebody wrote by hand, and inventing a capture for it
+    would be the substitution this codebase refuses everywhere else.
+    """
+    out = []
+    for pin in pins:
+        if pin["kind"] == SNAPSHOT_KIND and pin.get("capture_id") is None:
+            latest = store.latest_capture(
+                app.state.db, pin["digest"], pin["extractor"], pin["extractor_version"]
+            )
+            pin = {**pin, "capture_id": latest["id"] if latest else None}
+        out.append(pin)
+    return out
 
 
 def _pin_dicts(declared: list[Any]) -> list[dict[str, Any]]:
@@ -2384,6 +2455,7 @@ def _pin_dicts(declared: list[Any]) -> list[dict[str, Any]]:
             "extractor": pin.extractor,
             "extractor_version": pin.extractor_version,
             "kind": pin.kind,
+            "capture_id": pin.capture_id,
         }
         for pin in declared
     ]
@@ -2407,7 +2479,9 @@ def declared_pins(
     reader downstream believes the first.
     """
     if declared is None:
-        return [row_rendition(row) for row in enforce_attachments_exist(digests)]
+        return with_captures(
+            [row_rendition(row) for row in enforce_attachments_exist(digests)]
+        )
     pins = _pin_dicts(declared)
     if [pin["digest"] for pin in pins] != digests:
         raise HTTPException(
@@ -2418,10 +2492,12 @@ def declared_pins(
             "describe a different comparison from the one that runs.",
         )
     # Checked, not trusted: resolve_rendition raises when a pin names a
-    # reading the bench never produced.
+    # reading the bench never produced, or a capture that is not of it.
     for pin in pins:
         resolve_rendition(pin)
-    return pins
+    # And a snapshot pin that named no capture takes the latest now,
+    # so the group records which walk; see with_captures.
+    return with_captures(pins)
 
 
 def pins_for(
@@ -2478,7 +2554,13 @@ def pins_for(
     if group_id is not None:
         pinned = store.group_renditions(app.state.db, group_id)
         if pinned is not None:
-            if declared is not None and _pin_dicts(declared) != pinned:
+            # The member's declaration is normalised the way the group's
+            # was before the two are compared, so a member restating
+            # the four parts and leaving the capture unnamed matches a
+            # group whose pin took the latest at creation, and one
+            # naming a DIFFERENT capture is the different comparison
+            # the refusal below describes.
+            if declared is not None and with_captures(_pin_dicts(declared)) != pinned:
                 raise HTTPException(
                     409,
                     "renditions do not match this comparison's declaration. "
@@ -4352,7 +4434,7 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
                     "cite the digest the upload returns.",
                 )
             if "extractor" not in entry:
-                pins.append(row_rendition(row))
+                pins.extend(with_captures([row_rendition(row)]))
                 continue
             # Declared in full: honored exactly or refused. The call is
             # for its refusal; the pin that gets frozen is the one the
@@ -4375,7 +4457,11 @@ def freeze_task_attachments(dataset: dict[str, Any]) -> dict[str, list[dict[str,
                     f"task {task['id']!r} pins a reading the bench does "
                     f"not hold. {exc.detail}",
                 ) from None
-            pins.append(dict(entry))
+            # Verbatim on the four parts. The fifth, when the dataset
+            # named none, resolves to the latest capture at this same
+            # moment, which is what "cited without one" means for a
+            # snapshot; a dataset that named one had it checked above.
+            pins.extend(with_captures([dict(entry)]))
         frozen[task["id"]] = pins
     return frozen
 
@@ -6042,6 +6128,27 @@ def resolve_rendition(pin: dict[str, Any]) -> dict[str, Any]:
             f"were given the pinned one. {restore}, or start a new "
             "comparison.",
         )
+    if pin.get("capture_id") is not None:
+        # THE FIFTH PART IS CHECKED LIKE THE FOUR. A capture id is a row
+        # somebody can type, and a pin naming one that belongs to a
+        # different rendition, or to nothing, would let a comparison
+        # claim a walk that did not produce the bytes it sent.
+        named = store.capture(app.state.db, int(pin["capture_id"]))
+        if named is None or (
+            named["digest"],
+            named["extractor"],
+            named["extractor_version"],
+        ) != (pin["digest"], pin["extractor"], pin["extractor_version"]):
+            raise HTTPException(
+                422,
+                f"sha256 {pin['digest'][:12]} read by {pin['extractor']} "
+                f"{pin['extractor_version']} names capture "
+                f"{pin['capture_id']}, which is not a capture of that "
+                "reading. A capture is one walk of a tree into exactly this "
+                "rendition, and the bench will not attach a walk to bytes "
+                "it did not produce. Cite the digest alone to take the "
+                "latest capture, or name one of this rendition's own.",
+            )
     stored_kind = found.get("kind") or kind_of(found["extractor"])
     if pin["kind"] != stored_kind:
         raise HTTPException(
@@ -6138,6 +6245,7 @@ def _pinned_refs(
     pins: list[dict[str, Any]],
     rows: dict[str, dict[str, Any]],
     resolved: dict[tuple[str, str, str], dict[str, Any]] | None = None,
+    captures: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """A declaration's PINNED renditions as refs, in declaration order.
 
@@ -6167,6 +6275,11 @@ def _pinned_refs(
     # reading as one line.
     if resolved is None:
         resolved = store.extractions_for(app.state.db, pins)
+    if captures is None:
+        captures = store.captures_for(
+            app.state.db,
+            [int(p["capture_id"]) for p in pins if p.get("capture_id") is not None],
+        )
     out = []
     for pin in pins:
         row = rows.get(pin["digest"])
@@ -6176,6 +6289,7 @@ def _pinned_refs(
         if row is None or rendition is None:
             out.append({"digest": pin["digest"]})
             continue
+        capture_id = pin.get("capture_id")
         out.append(
             {
                 "digest": pin["digest"],
@@ -6187,9 +6301,29 @@ def _pinned_refs(
                 "extractor": pin["extractor"],
                 "extractor_version": pin["extractor_version"],
                 "kind": pin["kind"],
+                # The walk the pin named, resolved for the chip and for
+                # reuse. None when the pin named none.
+                "capture": _capture_view(captures.get(capture_id))
+                if capture_id is not None
+                else None,
             }
         )
     return out
+
+
+def _capture_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
+    """A capture as the API describes it: the walk's facts, not the
+    rendition key it belongs to, which the pin beside it already says."""
+    if record is None:
+        return None
+    return {
+        "id": record["id"],
+        "head": record["head"],
+        "dirty": record["dirty"],
+        "patterns": record["patterns"],
+        "excludes": record["excludes"],
+        "captured_at": record["captured_at"],
+    }
 
 
 def _attachment_refs(
@@ -6696,7 +6830,9 @@ def _clone_state(root: str) -> tuple[str | None, bool | None]:
     return (head, bool(status.strip()))
 
 
-def _attachment_detail(row: dict[str, Any]) -> dict[str, Any]:
+def _attachment_detail(
+    row: dict[str, Any], capture: dict[str, Any] | None = None
+) -> dict[str, Any]:
     """One attachment with its stored manifest, for the two single doors.
 
     THE STORED MANIFEST AND NOT THE ONE JUST COMPOSED, so POST and GET
@@ -6718,7 +6854,26 @@ def _attachment_detail(row: dict[str, Any]) -> dict[str, Any]:
         app.state.db, row["digest"], view["extractor"], view["extractor_version"]
     )
     raw = (stored or {}).get("manifest_json")
-    return {**view, "manifest": json.loads(raw) if raw else None}
+    manifest = _manifest_view(json.loads(raw)) if raw else None
+    if manifest is not None and capture is None:
+        capture = store.latest_capture(
+            app.state.db, row["digest"], view["extractor"], view["extractor_version"]
+        )
+    return {**view, "manifest": manifest, "capture": _capture_view(capture)}
+
+
+def _manifest_view(recorded: dict[str, Any]) -> dict[str, Any]:
+    """The content half of a stored manifest, whichever era wrote it.
+
+    A Phase L manifest carries the walk's facts too (head, dirty,
+    patterns, excludes); those are a capture's now and were backfilled
+    into one at boot, and the row itself is left as written. Projecting
+    here is what lets the era row and the H2 row answer the same shape.
+    """
+    return {
+        "files": recorded.get("files", []),
+        "encoding": recorded.get("encoding", ""),
+    }
 
 
 @app.post("/snapshots", response_model=AttachmentDetail, status_code=201)
@@ -6776,6 +6931,7 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
     content = built["text"].encode("utf-8")
     filename = _snapshot_filename(built["digest"])
+    manifest = built["manifest"]
     stored = store.save_attachment(
         app.state.db,
         {
@@ -6788,10 +6944,31 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
             "extractor": built["extractor"],
             "extractor_version": built["extractor_version"],
             "kind": built["kind"],
-            "manifest_json": json.dumps(built["manifest"]),
+            # THE CONTENT HALF ONLY. Members and encoding are functions
+            # of the bytes and belong on the rendition; the walk's facts
+            # go to their own record one statement down, because the
+            # rendition may already exist and this walk is still a walk.
+            "manifest_json": json.dumps(
+                {"files": manifest["files"], "encoding": manifest["encoding"]}
+            ),
         },
     )
-    return _attachment_detail(stored)
+    # ALWAYS RECORDED, which is the fourteenth review's H2 in one line.
+    # save_attachment deduplicates by content, so two walks composing
+    # identical bytes share a row; the capture is a fact about THIS
+    # walk and is never deduplicated. The response carries it, and the
+    # pin a client sends back names it by id.
+    recorded = store.record_capture(
+        app.state.db,
+        built["digest"],
+        built["extractor"],
+        built["extractor_version"],
+        head=head,
+        dirty=dirty,
+        patterns=list(body.patterns),
+        excludes=list(manifest["excludes"]),
+    )
+    return _attachment_detail(stored, capture=recorded)
 
 
 @app.get("/attachments", response_model=AttachmentList)
@@ -6876,6 +7053,12 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
     # was still substituting after K3.4.
     every_pin = [pin for run in runs for pin in (run.get("renditions") or [])]
     resolved = store.extractions_for(app.state.db, every_pin)
+    # And every CAPTURE those pins name, in one query, for the same
+    # reason: a page of snapshot comparisons says which walk each was.
+    captures = store.captures_for(
+        app.state.db,
+        [int(p["capture_id"]) for p in every_pin if p.get("capture_id") is not None],
+    )
     # Append a marker only when a cut happened, so API consumers can tell
     # a short prompt from a truncated one.
     for run in runs:
@@ -6884,7 +7067,7 @@ async def get_runs(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
         if run["type"] == "group":
             pinned = run.pop("renditions", None)
             run["attachments"] = (
-                _pinned_refs(pinned, rows, resolved)
+                _pinned_refs(pinned, rows, resolved, captures)
                 if pinned
                 else _attachment_refs(run["attachments"], rows)
             )
@@ -7392,12 +7575,28 @@ def _report_inputs(
         runs = detail["runs"] if detail else []
         runs_by_group[group["id"]] = runs
         result_ids.extend(r["id"] for run in runs for r in run["results"])
+    experiment = store.get_experiment(db, experiment_id) or {}
     return {
         "groups": groups,
         "runs_by_group": runs_by_group,
         "scores_by_result": store.scores_for_results(db, result_ids),
         "tasks_by_id": tasks_by_id,
         "seed": REPORT_SEED,
+        "captures": _captures_named(groups, experiment.get("task_attachments")),
+    }
+
+
+def _captures_named(
+    groups: list[dict[str, Any]], task_attachments: dict[str, Any] | None
+) -> dict[str, dict[str, Any]]:
+    """The captures a report or an export must explain, keyed by id as a
+    string, resolved in one query. See report.referenced_captures for
+    why both the recorded cells and the frozen declaration are read."""
+    wanted = referenced_captures(groups, task_attachments)
+    found = store.captures_for(app.state.db, wanted)
+    return {
+        str(capture_id): dict(_capture_view(record) or {})
+        for capture_id, record in sorted(found.items())
     }
 
 
@@ -7437,7 +7636,8 @@ def _export_lines(
     # same window, which is the whole point of the snapshot.
     out: list[dict[str, Any]] = []
     with store.read_snapshot(db):
-        for group in store.experiment_groups(db, experiment_id):
+        groups = store.experiment_groups(db, experiment_id)
+        for group in groups:
             detail = store.get_group(db, group["id"])
             if detail is None:
                 continue
@@ -7478,7 +7678,16 @@ def _export_lines(
         referenced = any(line.get("attachments") for line in out) or bool(
             experiment.get("task_attachments")
         )
-        out.insert(0, export_manifest(experiment, REPORT_SEED, thresholds, referenced))
+        out.insert(
+            0,
+            export_manifest(
+                experiment,
+                REPORT_SEED,
+                thresholds,
+                referenced,
+                _captures_named(groups, experiment.get("task_attachments")),
+            ),
+        )
     return out
 
 

@@ -92,6 +92,24 @@
     return doc.kind === SNAPSHOT_KIND ? SNAPSHOT_LABEL : doc.filename;
   }
 
+  // One line saying which walk a snapshot was, for a title or a chip
+  // bit, or "" for anything without a capture. The commit is shortened
+  // to the seven characters git itself shows; "dirty" or "clean" is the
+  // tree's state at the walk, and "unknown" when the bench could read
+  // the commit but not the status.
+  function captureLine(capture) {
+    if (!capture || !Number.isInteger(capture.id)) return "";
+    const head =
+      typeof capture.head === "string" ? capture.head.slice(0, 7) : "no commit";
+    const state =
+      capture.dirty === true
+        ? "dirty"
+        : capture.dirty === false
+          ? "clean"
+          : "unknown";
+    return "capture #" + capture.id + " at " + head + ", " + state;
+  }
+
   // Staged documents, in attachment order, which IS the order they are
   // composed into the prompt. Array and not a Set keyed by digest,
   // because order is part of the declaration.
@@ -164,12 +182,24 @@
     ) {
       return null;
     }
-    return {
+    const pin = {
       digest: doc.digest,
       extractor: doc.extractor,
       extractor_version: doc.extractor_version,
       kind: doc.kind,
     };
+    // THE CAPTURE RIDES ALONG, the fourteenth review's H2. A snapshot
+    // staged from POST /snapshots or restaged from a stored comparison
+    // carries the walk it was, and the pin names it by id so the record
+    // says which commit and which tree state the models read from. Sent
+    // only when known: a document has none, and a snapshot stored
+    // before captures existed has none to name, and the server resolves
+    // a bare snapshot pin to its latest capture rather than this page
+    // guessing one.
+    if (doc.capture && Number.isInteger(doc.capture.id)) {
+      pin.capture_id = doc.capture.id;
+    }
+    return pin;
   }
 
   // What goes on the wire. RULE ONE at the client edge: with nothing
@@ -300,7 +330,8 @@
         "\nread by " +
         doc.extractor +
         " " +
-        doc.extractor_version;
+        doc.extractor_version +
+        (captureLine(doc.capture) ? "\n" + captureLine(doc.capture) : "");
     }
 
     const remove = document.createElement("button");
@@ -924,6 +955,7 @@
     if (!missing && ref.extractor && ref.extractor !== "none") {
       bits.push("read by " + ref.extractor + " " + ref.extractor_version);
     }
+    if (captureLine(ref.capture)) bits.push(captureLine(ref.capture));
     return readOnlyChip(
       missing ? "(no longer stored)" : docLabel(ref),
       bits,
@@ -944,13 +976,14 @@
   // citing a fact about a filesystem in an artifact about an
   // experiment. The document is stored and the chip must not say
   // otherwise.
-  A.pinChip = function (entry, where) {
+  A.pinChip = function (entry, where, capture) {
     const bits = ["sha256 " + entry.digest];
     if (entry.mode) bits.push(entry.mode);
     if (entry.kind) bits.push("read as " + entry.kind);
     if (entry.extractor && entry.extractor !== "none") {
       bits.push("read by " + entry.extractor + " " + entry.extractor_version);
     }
+    if (captureLine(capture)) bits.push(captureLine(capture));
     return readOnlyChip(
       "sha256 " + shortDigest(entry.digest),
       bits,

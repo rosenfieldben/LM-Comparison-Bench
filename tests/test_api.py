@@ -6333,18 +6333,21 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 6
+    assert manifest["export_schema_version"] == 7
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[6]
-    # Version 6 is Phase L, and it is a VALUE-DOMAIN bump rather than a
-    # field one: no key moved, and kind may now be snapshot. A reader
-    # that ignores unknown things absorbs it; a strict reader validating
-    # kind against the two earlier values rejects the artifact, which is
-    # the first limb of the bump rule rather than the second.
-    assert "may now be snapshot" in manifest["export_schema_change"]
-    assert "widened value domain" in manifest["export_schema_change"]
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[7]
+    # Version 7 is the fourteenth review's H2: pins may name a capture
+    # and the manifest carries the captures those ids name, so a reader
+    # holding only the file can say which walk a snapshot cell read.
+    assert "capture_id" in manifest["export_schema_change"]
+    assert "captures" in manifest["export_schema_change"]
+    # Present and empty on an experiment with no snapshot in it, so a
+    # reader can tell "no captures" from "this key is absent".
+    assert manifest["captures"] == {}
+    # And version 6's widening is still named, as carried.
+    assert "kind may be snapshot from version 6" in manifest["export_schema_change"]
     # Its note still names what earlier versions added, deliberately:
     # EXPORT_SCHEMA_NOTES emits only the CURRENT version's sentence, so a
     # note that dropped the earlier explanations would leave the artifact
@@ -8204,6 +8207,9 @@ def test_review_repro_creation_freezes_the_reading_a_digest_resolved_to(
                 "extractor": "text",
                 "extractor_version": "1",
                 "kind": "document",
+                # A document has no captures; the fifth part is None and
+                # present, since H2, so the record's shape is one shape.
+                "capture_id": None,
             }
         ]
     }
@@ -8319,8 +8325,9 @@ def test_a_dataset_declaring_a_full_pin_is_honored_verbatim(client, tmp_path):
     eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
 
     frozen = client.get(f"/experiments/{eid}").json()["task_attachments"]
-    # The DATASET's pin, not the row's newer reading.
-    assert frozen == {"t1": [pin]}
+    # The DATASET's pin, not the row's newer reading. The record carries
+    # the fifth part as None for a document.
+    assert frozen == {"t1": [{**pin, "capture_id": None}]}
 
 
 def test_a_dataset_declaring_a_reading_the_bench_lacks_is_refused(client, tmp_path):
@@ -9411,7 +9418,9 @@ def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
     ).json()["id"]
 
     # HOP: the creation freeze keeps both, in order.
-    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == pins
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"]["t1"] == [
+        {**p, "capture_id": None} for p in pins
+    ]
     final = run_experiment_to_completion(client, eid, path)
     assert final["status"] == "done", final
 
@@ -9429,10 +9438,15 @@ def test_review_repro_two_readings_of_one_digest_survive_into_the_report(
     # And the payload really did carry both readings, so the report is
     # describing something that happened.
     group = client.get("/runs").json()["runs"][0]
-    assert store.group_renditions(app.state.db, group["id"]) == pins
+    assert store.group_renditions(app.state.db, group["id"]) == [
+        {**p, "capture_id": None} for p in pins
+    ]
     lines = export_lines(client, eid)
-    assert lines[0]["task_attachments"]["t1"] == pins
-    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [pins]
+    carried = [{**p, "capture_id": None} for p in pins]
+    assert lines[0]["task_attachments"]["t1"] == carried
+    assert [line["renditions"] for line in lines if line["type"] == "trial"] == [
+        carried
+    ]
 
 
 def test_the_dedup_key_is_the_whole_pin_and_not_three_quarters_of_it(client):
@@ -10512,7 +10526,9 @@ def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client)
     # populated".
     detail = client.get(f"/attachments/{third}").json()
     assert listed[0] == {
-        key: value for key, value in detail.items() if key != "manifest"
+        key: value
+        for key, value in detail.items()
+        if key not in ("manifest", "capture")
     }
     assert detail["manifest"] is None
     assert "manifest" not in listed[0]
@@ -10879,6 +10895,9 @@ def test_review_repro_no_attachment_response_ever_carries_the_content(client):
         # manifest that carried a member's TEXT would be exactly the
         # content leak the rest of the test is about.
         "manifest",
+        # The walk, when the row is a snapshot; None here, and present,
+        # since H2.
+        "capture",
     }
 
 
@@ -12117,6 +12136,7 @@ def test_review_repro_the_export_round_trips_a_comparison_with_a_document(
             "extractor": "text",
             "extractor_version": "1",
             "kind": "document",
+            "capture_id": None,
         }
     ]
     assert [entry["digest"] for entry in rebuilt["task_attachments"]["t2"]] == [second]
@@ -13174,6 +13194,7 @@ def test_review_repro_an_image_stays_usable_after_a_document_suffix_upload(clien
             "extractor": "none",
             "extractor_version": "0",
             "kind": "image",
+            "capture_id": None,
         }
     ]
 
@@ -13335,6 +13356,7 @@ def test_review_repro_an_ungrouped_run_records_the_documents_it_sent(client):
             "extractor": "text",
             "extractor_version": "1",
             "kind": "document",
+            "capture_id": None,
         }
     ]
     # NEVER THE CONTENT, on this reader like every other.
@@ -14456,7 +14478,7 @@ def test_review_repro_group_detail_describes_the_rendition_it_pinned(client):
     detail = client.get(f"/groups/{group_id}").json()
 
     # The pin itself, served.
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     # And the metadata derived from it rather than from the base row.
     ref = detail["attachments"][0]
     assert ref["kind"] == "image"
@@ -14529,7 +14551,9 @@ def test_review_repro_a_reuse_carries_the_pin_and_not_the_base_row(client):
         },
     )
     assert second.status_code == 201, second.text
-    assert store.group_renditions(client.app.state.db, second.json()["id"]) == [pin]
+    assert store.group_renditions(client.app.state.db, second.json()["id"]) == [
+        {**pin, "capture_id": None}
+    ]
 
 
 @respx.mock
@@ -14590,11 +14614,11 @@ async def test_review_repro_an_aborted_stream_records_the_pin(client):
     ).fetchone()
     assert row is not None
     stored = store.run_renditions(client.app.state.db, row["id"])
-    assert stored == [pin], stored
+    assert stored == [{**pin, "capture_id": None}], stored
     # And the replay reads it back as the image it pinned, not as the
     # base row's text reading.
     detail = client.get(f"/runs/{row['id']}").json()
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     assert detail["attachments"][0]["kind"] == "image"
     assert detail["attachments"][0]["filename"] == "aborted.png"
 
@@ -14679,7 +14703,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
     # do it: read four fields off the line and reconstruct the identity.
     assert trial["attachments"] == [digest]
     assert trial["attachments_mode"] == "native"
-    assert trial["renditions"] == [pin]
+    assert trial["renditions"] == [{**pin, "capture_id": None}]
     rebuilt = {
         (r["digest"], r["extractor"], r["extractor_version"], r["kind"])
         for r in trial["renditions"]
@@ -14687,7 +14711,7 @@ def test_review_repro_the_export_re_derives_the_rendition_from_itself(client, tm
     assert rebuilt == {(digest, "none", "0", "image")}
     # Which is the identity the bench itself holds, checked against the
     # database the reader would NOT have.
-    assert store.group_renditions(db, group_id) == [pin]
+    assert store.group_renditions(db, group_id) == [{**pin, "capture_id": None}]
 
     # And no content, at any version. The artifact cites bytes it does
     # not embed, which is what attachments_referenced announces.
@@ -14836,8 +14860,8 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     run_id = db.execute("SELECT id FROM runs ORDER BY id DESC LIMIT 1").fetchone()["id"]
 
     # Every hop, in order, each asserted on the value it carries.
-    assert store.group_renditions(db, group_id) == [pin]
-    assert store.run_renditions(db, run_id) == [pin]
+    assert store.group_renditions(db, group_id) == [{**pin, "capture_id": None}]
+    assert store.run_renditions(db, run_id) == [{**pin, "capture_id": None}]
 
     recorded = db.execute(
         "SELECT request_json FROM results ORDER BY id DESC LIMIT 1"
@@ -14846,11 +14870,11 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     assert "text/plain" not in recorded
 
     detail = client.get(f"/groups/{group_id}").json()
-    assert detail["renditions"] == [pin]
+    assert detail["renditions"] == [{**pin, "capture_id": None}]
     assert detail["attachments"][0]["kind"] == "image"
 
     run_detail = client.get(f"/runs/{run_id}").json()
-    assert run_detail["renditions"] == [pin]
+    assert run_detail["renditions"] == [{**pin, "capture_id": None}]
     assert run_detail["attachments"][0]["kind"] == "image"
 
     listed = next(e for e in client.get("/runs").json()["runs"] if e["type"] == "group")
@@ -14864,7 +14888,10 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     path = write_dataset(
         tmp_path, {"id": "t1", "prompt": "describe", "attachments": [pin]}
     )
-    assert main.read_dataset(path)["tasks"][0]["attachments"] == [pin]
+    # The loader completes the SHAPE, never the reading: the fifth
+    # part is present and None until the freeze resolves it.
+    carried = {**pin, "capture_id": None}
+    assert main.read_dataset(path)["tasks"][0]["attachments"] == [carried]
 
     # HOP: THE CREATION FREEZE. The experiment record is the declaration
     # from here on, and it holds the full pin rather than the digest it
@@ -14873,7 +14900,9 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
         "/experiments",
         json=experiment_body(path, lineup=["model/vision"], attachments_mode="native"),
     ).json()["id"]
-    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {"t1": [pin]}
+    assert client.get(f"/experiments/{eid}").json()["task_attachments"] == {
+        "t1": [carried]
+    }
 
     # HOP: THE RUNNER. What actually went upstream, read off the mock.
     sent = []
@@ -14891,9 +14920,9 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
     # HOP: THE GROUP THE RUNNER WROTE, which is where the eleven hops
     # above pick the declaration up. Same value, written from the freeze.
     cell = store.experiment_groups(db, eid)[0]
-    assert store.group_renditions(db, cell["id"]) == [pin]
+    assert store.group_renditions(db, cell["id"]) == [carried]
     trial_run = store.get_group(db, cell["id"])["runs"][0]
-    assert store.run_renditions(db, trial_run["id"]) == [pin]
+    assert store.run_renditions(db, trial_run["id"]) == [carried]
     assert client.get(f"/groups/{cell['id']}").json()["attachments"][0]["kind"] == (
         "image"
     )
@@ -14905,10 +14934,10 @@ def test_the_pin_reaches_every_layer_that_carries_it(client, tmp_path):
 
     # HOP: THE EXPORT, at line one and on the trial line.
     lines = export_lines(client, eid)
-    assert lines[0]["task_attachments"] == {"t1": [pin]}
+    assert lines[0]["task_attachments"] == {"t1": [carried]}
     assert lines[0]["attachments_mode"] == "native"
     exported = [line for line in lines if line["type"] == "trial"]
-    assert [line["renditions"] for line in exported] == [[pin]]
+    assert [line["renditions"] for line in exported] == [[carried]]
 
     # And nowhere on the way out does the base row's reading appear.
     for payload in (detail, run_detail, listed, per_task):
@@ -15153,7 +15182,7 @@ def test_review_repro_a_groups_member_runs_carry_their_own_documents(client):
     detail = client.get(f"/groups/{group_id}").json()
     member = detail["runs"][0]
 
-    assert member["renditions"] == [pin]
+    assert member["renditions"] == [{**pin, "capture_id": None}]
     assert member["attachments"][0]["kind"] == "image"
     # And the two endpoints agree about the same run, which is the
     # property that was broken rather than merely the field that was
@@ -16262,13 +16291,18 @@ def test_a_snapshot_is_one_attachment_carrying_its_whole_manifest(client, tmp_pa
     manifest = got["manifest"]
     assert [member["path"] for member in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
     assert manifest["files"][0]["size"] == 6
-    assert manifest["patterns"] == ["**/*.py"]
-    assert ".git" in manifest["excludes"]
     assert manifest["encoding"] == bench_snapshot.ENCODING_RULE
+    # THE WALK'S FACTS ARE THE CAPTURE'S, since H2: the manifest is
+    # content and the capture is the moment. The response carries the
+    # capture this walk made.
+    capture = got["capture"]
+    assert capture["patterns"] == ["**/*.py"]
+    assert ".git" in capture["excludes"]
+    assert isinstance(capture["id"], int)
     # No repository here, so git answers nothing and both fields degrade
     # together rather than one of them asserting a clean tree.
-    assert manifest["head"] is None
-    assert manifest["dirty"] is None
+    assert capture["head"] is None
+    assert capture["dirty"] is None
     # The excluded and unselected files are absent from the reading.
     assert [m["path"] for m in manifest["files"]] == ["pkg/a.py", "pkg/b.py"]
 
@@ -16296,16 +16330,16 @@ def test_the_snapshot_records_the_clone_commit_and_whether_it_was_dirty(
         assert main._git(args, cwd=str(root)) is not None
 
     clean = snapshot_of(client, root, ["*.py"]).json()
-    assert clean["manifest"]["head"] is not None
-    assert len(clean["manifest"]["head"]) == 40
-    assert clean["manifest"]["dirty"] is False
+    assert clean["capture"]["head"] is not None
+    assert len(clean["capture"]["head"]) == 40
+    assert clean["capture"]["dirty"] is False
 
     # An untracked file counts as modified, which is _app_sha's rule
     # inherited: an untracked file under the root is a file the walk may
     # well have just composed.
     (root / "b.py").write_bytes(b"z = 3\n")
     dirty = snapshot_of(client, root, ["*.py"]).json()
-    assert dirty["manifest"]["dirty"] is True
+    assert dirty["capture"]["dirty"] is True
     assert dirty["digest"] != clean["digest"]
 
 
@@ -16796,6 +16830,10 @@ def test_a_dataset_task_can_cite_a_snapshot_by_digest(client, tmp_path):
                 "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
                 "extractor_version": bench_snapshot.SNAPSHOT_VERSION,
                 "kind": "snapshot",
+                # A bare citation of a snapshot freezes its latest
+                # capture, the way a bare digest freezes the row's own
+                # reading; see with_captures.
+                "capture_id": built["capture"]["id"],
             }
         ]
     }
@@ -16824,7 +16862,12 @@ def test_a_dataset_task_can_pin_a_snapshot_reading_verbatim(client, tmp_path):
     created = client.post("/experiments", json=experiment_body(path))
     assert created.status_code == 201, created.text
     detail = client.get(f"/experiments/{created.json()['id']}").json()
-    assert detail["task_attachments"]["t1"] == [pin]
+    # The four-part pin was honored verbatim, and its fifth part,
+    # unnamed by the dataset, resolved to the latest capture at the
+    # freeze, exactly as a bare citation's would.
+    assert detail["task_attachments"]["t1"] == [
+        {**pin, "capture_id": built["capture"]["id"]}
+    ]
 
     # And a version the bench never ran is refused rather than resolved
     # to the one it has, naming the task.
@@ -16979,7 +17022,7 @@ def test_a_missing_snapshot_reading_is_refused_with_a_remedy_that_exists(
 
 
 @respx.mock
-def test_the_export_carries_the_snapshot_pin_at_schema_six(client, tmp_path):
+def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
     """WINDOW: the export manifest and trial lines of an experiment whose
     task cited a snapshot.
 
@@ -17004,18 +17047,26 @@ def test_the_export_carries_the_snapshot_pin_at_schema_six(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 6
-    assert "may now be snapshot" in manifest["export_schema_change"]
+    assert manifest["export_schema_version"] == 7
+    assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
         "extractor": bench_snapshot.SNAPSHOT_EXTRACTOR,
         "extractor_version": bench_snapshot.SNAPSHOT_VERSION,
         "kind": "snapshot",
+        # The bare citation froze the latest capture, which is the one
+        # POST /snapshots just made, and the pin names it everywhere.
+        "capture_id": built["capture"]["id"],
     }
     assert manifest["task_attachments"]["t1"] == [pin]
     trials = [x for x in lines if x["type"] == "trial"]
     assert trials
     assert all(t["renditions"] == [pin] for t in trials)
+    # And the manifest explains the id it named: the walk's own facts,
+    # keyed by the id as a string.
+    named = manifest["captures"][str(built["capture"]["id"])]
+    assert named["patterns"] == ["**/*.py"]
+    assert named["head"] is None and named["dirty"] is None
 
 
 # ---- Phase L closing: the filesystem posture, enumerated.
@@ -17272,3 +17323,362 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
         f"FILESYSTEM_TOUCHERS or PURE_OS_CALLS: {sorted(unclassified)}"
     )
     assert found == FILESYSTEM_CALLS
+
+
+# ===================================================================
+# The fourteenth review's H2: capture provenance travels.
+# ===================================================================
+
+
+def git_clone(root: Path) -> None:
+    """Turn a tree into a committed clone, asserting each step."""
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.com"],
+        ["config", "user.name", "t"],
+        ["add", "-A"],
+        ["commit", "-qm", "one"],
+    ):
+        assert main._git(args, cwd=str(root)) is not None
+
+
+def test_review_repro_two_captures_of_identical_bytes_keep_two_provenances(
+    client, tmp_path
+):
+    """WINDOW: two POST /snapshots over one clone whose SELECTED bytes did
+    not change while its tree went from clean to dirty, then the record.
+
+    THE REVIEWER'S SHAPE, reproduced on HEAD before this fix: same
+    digest, second response reported dirty false, one row holding one
+    walk's facts, the second walk's silently gone. Content identity
+    stays deduplicated, because the same composed bytes are the same
+    treatment for every model; capture provenance is a per-capture fact,
+    so the second walk is its own record, the response carries it, and
+    a pin can name either.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+
+    clean = snapshot_of(client, root, ["*.py"]).json()
+    # An untracked file the pattern does NOT select: identical bytes,
+    # dirtied tree.
+    (root / "notes.md").write_bytes(b"scratch\n")
+    dirty = snapshot_of(client, root, ["*.py"]).json()
+
+    assert clean["digest"] == dirty["digest"]
+    assert clean["created_at"] == dirty["created_at"]
+    assert clean["manifest"] == dirty["manifest"]
+    # Two walks, two captures, each telling the truth about its moment.
+    assert clean["capture"]["dirty"] is False
+    assert dirty["capture"]["dirty"] is True
+    assert clean["capture"]["id"] != dirty["capture"]["id"]
+    assert clean["capture"]["head"] == dirty["capture"]["head"]
+    # GET answers the latest, which is the second walk.
+    fetched = client.get(f"/attachments/{clean['digest']}").json()
+    assert fetched["capture"]["id"] == dirty["capture"]["id"]
+    # And nothing was lost: both are on the record.
+    both = store.captures_for(
+        client.app.state.db, [clean["capture"]["id"], dirty["capture"]["id"]]
+    )
+    assert {c["dirty"] for c in both.values()} == {False, True}
+
+
+@respx.mock
+def test_a_comparison_names_the_capture_it_read_and_the_report_explains_it(
+    client, tmp_path
+):
+    """WINDOW: a group pinning the EARLIER of two captures of one
+    rendition, through /compare, the group detail, the history list and
+    the experiment-shaped report inputs.
+
+    THE PIN NAMES THE WALK. With two captures of identical bytes, a
+    comparison declaring the first one records the first one, and every
+    reader downstream describes that walk and not the latest: the detail
+    view's refs carry the capture, the history page resolves it in one
+    query, and a bare-digest member of the same group is handed the
+    group's pin rather than the newer capture.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+    first = snapshot_of(client, root, ["*.py"]).json()
+    (root / "notes.md").write_bytes(b"scratch\n")
+    second = snapshot_of(client, root, ["*.py"]).json()
+    assert first["digest"] == second["digest"]
+    earlier = {
+        "digest": first["digest"],
+        "extractor": first["extractor"],
+        "extractor_version": first["extractor_version"],
+        "kind": "snapshot",
+        "capture_id": first["capture"]["id"],
+    }
+
+    group = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [first["digest"]],
+            "renditions": [earlier],
+        },
+    )
+    assert group.status_code == 201, group.text
+    group_id = group.json()["id"]
+    assert store.group_renditions(client.app.state.db, group_id) == [earlier]
+
+    detail = client.get(f"/groups/{group_id}").json()
+    assert detail["renditions"] == [earlier]
+    assert detail["attachments"][0]["capture"]["id"] == first["capture"]["id"]
+    assert detail["attachments"][0]["capture"]["dirty"] is False
+
+    # A member citing the digest bare is given the group's pin, capture
+    # included, and not the newer capture.
+    resp = client.post(
+        "/compare",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "group_id": group_id,
+            "attachments": [first["digest"]],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    run_id = client.app.state.db.execute(
+        "SELECT id FROM runs ORDER BY id DESC LIMIT 1"
+    ).fetchone()["id"]
+    assert store.run_renditions(client.app.state.db, run_id) == [earlier]
+
+    listed = client.get("/runs").json()["runs"]
+    entry = next(r for r in listed if r["id"] == group_id)
+    assert entry["attachments"][0]["capture"]["id"] == first["capture"]["id"]
+
+
+def test_a_pin_naming_a_capture_of_another_reading_is_refused(client, tmp_path):
+    """WINDOW: POST /groups whose snapshot pin names a capture that is not
+    a capture of that rendition.
+
+    K.3'S LAW ON THE FIFTH PART. A capture id is a row somebody can
+    type, and a pin naming one that belongs to a different rendition,
+    or to nothing, would let a comparison claim a walk that did not
+    produce the bytes it sent. Honored verbatim or refused, like the
+    four parts before it.
+    """
+    root_a = clone(tmp_path / "a", {"a.py": b"x = 1\n"})
+    root_b = clone(tmp_path / "b", {"b.py": b"y = 2\n"})
+    one = snapshot_of(client, root_a, ["*.py"]).json()
+    other = snapshot_of(client, root_b, ["*.py"]).json()
+    assert one["digest"] != other["digest"]
+
+    def declare(capture_id):
+        return client.post(
+            "/groups",
+            json={
+                "prompt": "review",
+                "models": ["model/alpha"],
+                "budget": "standard",
+                "attachments": [one["digest"]],
+                "renditions": [
+                    {
+                        "digest": one["digest"],
+                        "extractor": one["extractor"],
+                        "extractor_version": one["extractor_version"],
+                        "kind": "snapshot",
+                        "capture_id": capture_id,
+                    }
+                ],
+            },
+        )
+
+    wrong = declare(other["capture"]["id"])
+    assert wrong.status_code == 422
+    assert "is not a capture of that reading" in wrong.json()["detail"]
+    missing = declare(999_999)
+    assert missing.status_code == 422
+    assert "is not a capture of that reading" in missing.json()["detail"]
+    right = declare(one["capture"]["id"])
+    assert right.status_code == 201, right.text
+
+
+def test_a_dataset_pin_may_name_a_capture_and_a_document_pin_may_not(client, tmp_path):
+    """WINDOW: datasets pinning capture_id, through the loader and the
+    creation freeze.
+
+    A snapshot pin naming its capture is honored verbatim; a document
+    pin naming one is refused at the loader, because only a snapshot has
+    captures and a capture on a document is a typo with a row number.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    pin = {
+        "digest": built["digest"],
+        "extractor": built["extractor"],
+        "extractor_version": built["extractor_version"],
+        "kind": "snapshot",
+        "capture_id": built["capture"]["id"],
+    }
+    path = m_dataset(tmp_path, built["digest"], attachments=[pin])
+    created = client.post("/experiments", json=experiment_body(path))
+    assert created.status_code == 201, created.text
+    assert client.get(f"/experiments/{created.json()['id']}").json()[
+        "task_attachments"
+    ] == {"t1": [pin]}
+
+    doc = upload(client, "c.txt", b"forty two days").json()["digest"]
+    bad = {
+        "digest": doc,
+        "extractor": "text",
+        "extractor_version": "1",
+        "kind": "document",
+        "capture_id": 1,
+    }
+    refused = client.post(
+        "/experiments",
+        json=experiment_body(m_dataset(tmp_path, doc, attachments=[bad])),
+    )
+    assert refused.status_code == 422
+    assert "only a snapshot has captures" in refused.json()["detail"]
+
+
+@respx.mock
+def test_the_report_carries_the_captures_its_pins_name(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/report, the captures key.
+
+    The report's per-task chips name a capture by id, and the report
+    carries the records those ids name, keyed by the id as a string, so
+    the page can say which walk without a second round trip and a
+    rebuild from the export can say the same.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    git_clone(root)
+    built = snapshot_of(client, root, ["*.py"]).json()
+    path = m_dataset(tmp_path, built["digest"])
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    report_body = client.get(f"/experiments/{eid}/report").json()
+    entry = report_body["task_attachments"]["t1"][0]
+    assert entry["capture_id"] == built["capture"]["id"]
+    named = report_body["captures"][str(built["capture"]["id"])]
+    assert named["head"] == built["capture"]["head"]
+    assert named["dirty"] is False
+    assert named["patterns"] == ["*.py"]
+
+
+@respx.mock
+def test_a_member_restating_the_four_parts_matches_a_group_that_took_the_latest(
+    client, tmp_path
+):
+    """WINDOW: pins_for, a grouped member declaring a snapshot pin with no
+    capture against a group whose pin resolved to the latest at creation.
+
+    THE COMPARISON IS NORMALISED THE WAY THE GROUP WAS. A member that
+    restates the four parts and leaves the fifth unnamed means "this
+    reading, whichever walk you froze", which is what the group froze;
+    refusing it would be refusing a member for not repeating a number
+    the group assigned. A member naming a DIFFERENT capture is asking
+    for a different comparison and is the 409 below.
+    """
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    git_clone(root)
+    first = snapshot_of(client, root, ["*.py"]).json()
+    four = {
+        "digest": first["digest"],
+        "extractor": first["extractor"],
+        "extractor_version": first["extractor_version"],
+        "kind": "snapshot",
+    }
+    group_id = client.post(
+        "/groups",
+        json={
+            "prompt": "review",
+            "models": ["model/alpha"],
+            "budget": "standard",
+            "attachments": [first["digest"]],
+            "renditions": [four],
+        },
+    ).json()["id"]
+    assert store.group_renditions(client.app.state.db, group_id) == [
+        {**four, "capture_id": first["capture"]["id"]}
+    ]
+
+    body = {
+        "prompt": "review",
+        "models": ["model/alpha"],
+        "group_id": group_id,
+        "attachments": [first["digest"]],
+        "renditions": [four],
+    }
+    assert client.post("/compare", json=body).status_code == 200
+
+    (root / "notes.md").write_bytes(b"scratch\n")
+    second = snapshot_of(client, root, ["*.py"]).json()
+    other = {**four, "capture_id": second["capture"]["id"]}
+    refused = client.post("/compare", json={**body, "renditions": [other]})
+    assert refused.status_code == 409
+    assert "different comparison" in refused.json()["detail"]
+
+
+def test_review_repro_two_captures_of_one_rendition_are_two_report_entries(client):
+    """WINDOW: _declared_documents over two pins differing only in
+    capture_id.
+
+    The dedup key is the declaration, and since H2 the declaration has
+    a fifth part. Two cells over one rendition at two captures read the
+    same bytes under two provenances; a report keyed on the four parts
+    would say one walk happened.
+    """
+    digest = "d" * 64
+    group = {
+        "task_id": "t1",
+        "attachments_mode": "inline",
+        "attachments": [digest, digest],
+        "renditions": [
+            {
+                "digest": digest,
+                "extractor": "repo-walk",
+                "extractor_version": "1",
+                "kind": "snapshot",
+                "capture_id": capture,
+            }
+            for capture in (1, 2)
+        ],
+    }
+    keys = [key for key, _entry in report._declared_documents(group)]
+    assert len(set(keys)) == 2
+    entries = [entry for _key, entry in report._declared_documents(group)]
+    assert [entry["capture_id"] for entry in entries] == [1, 2]
+
+
+def test_an_export_taken_before_any_run_still_explains_its_captures(client, tmp_path):
+    """WINDOW: the export manifest of an experiment that has not run,
+    whose frozen declaration names a capture.
+
+    A task that never ran has no trial line, so the manifest's
+    task_attachments is the only place its pin appears, and a capture
+    named there and explained nowhere would be an id a reader could not
+    look up. referenced_captures reads the frozen declaration as well as
+    the recorded cells for exactly this.
+    """
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n"})
+    built = snapshot_of(client, root, ["*.py"]).json()
+    path = m_dataset(tmp_path, built["digest"])
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+
+    lines = [
+        json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
+    ]
+    manifest = lines[0]
+    assert [x for x in lines if x["type"] == "trial"] == []
+    assert manifest["task_attachments"]["t1"][0]["capture_id"] == built["capture"]["id"]
+    assert str(built["capture"]["id"]) in manifest["captures"]

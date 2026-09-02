@@ -422,10 +422,15 @@ def _declared_documents(
     digest-only, which is the honest answer for a comparison that
     pinned nothing.
 
-    THE KEY IS THE WHOLE PIN, all four fields plus the mode. The old one
-    omitted kind, which was harmless only because two readings that
-    differ in kind also differ in extractor today; a key that is the
-    declaration cannot be wrong tomorrow for a reason nobody wrote down.
+    THE KEY IS THE WHOLE PIN, all four fields plus the mode, and since
+    the fourteenth review's H2 the capture too. The old one omitted
+    kind, which was harmless only because two readings that differ in
+    kind also differ in extractor today; a key that is the declaration
+    cannot be wrong tomorrow for a reason nobody wrote down. The capture
+    is in it for the same reason it is on the pin: two cells over one
+    rendition at two captures read the same bytes under two
+    provenances, and a report that collapsed them would say one walk
+    happened.
     """
     mode = group.get("attachments_mode")
     digests = group.get("attachments") or []
@@ -437,20 +442,48 @@ def _declared_documents(
     )
     rows: list[tuple[tuple[str | None, ...], dict[str, Any]]] = []
     for digest, pin in paired:
+        capture = pin.get("capture_id") if pin else None
         key = (
             digest,
             mode,
             pin["extractor"] if pin else None,
             pin["extractor_version"] if pin else None,
             pin["kind"] if pin else None,
+            None if capture is None else str(capture),
         )
         entry: dict[str, Any] = {"digest": digest, "mode": mode}
         if pin is not None:
             entry["extractor"] = pin["extractor"]
             entry["extractor_version"] = pin["extractor_version"]
             entry["kind"] = pin["kind"]
+            entry["capture_id"] = capture
         rows.append((key, entry))
     return rows
+
+
+def referenced_captures(
+    groups: list[dict[str, Any]], task_attachments: dict[str, Any] | None
+) -> list[int]:
+    """Every capture id any pin in a report or an export names, once.
+
+    Written once because two artifacts need it: the report, so its
+    chips can say which walk a snapshot was, and the export manifest,
+    so a reader holding only the file can. Both the recorded cells and
+    the frozen declaration are read, for the reason the manifest
+    carries task_attachments at all: a task that never ran has no
+    trial line, and its capture would otherwise be named by an id the
+    artifact never explained.
+    """
+    found: set[int] = set()
+    for group in groups:
+        for pin in group.get("renditions") or []:
+            if pin.get("capture_id") is not None:
+                found.add(int(pin["capture_id"]))
+    for pins in (task_attachments or {}).values():
+        for pin in pins:
+            if pin.get("capture_id") is not None:
+                found.add(int(pin["capture_id"]))
+    return sorted(found)
 
 
 def _report_task_attachments(
@@ -546,6 +579,7 @@ def build_report(
     scores_by_result: dict[int, list[dict[str, Any]]],
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
+    captures: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One experiment's aggregates, per model.
 
@@ -742,6 +776,10 @@ def build_report(
         # and a corpus-wide document list cannot be joined by a reader
         # holding only the report. Empty exactly when the list above is.
         "task_attachments": _report_task_attachments(groups),
+        # The captures those pins name, so a chip can say which walk a
+        # snapshot was; see referenced_captures. Empty and present when
+        # nothing in the report is a snapshot.
+        "captures": captures or {},
         # The caveat, in the payload, as one sentence a page can print.
         # None when nothing was reconstructed, so a reader who sees the
         # key filled in knows it was earned rather than boilerplate.
@@ -1612,7 +1650,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 6
+EXPORT_SCHEMA_VERSION = 7
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1718,6 +1756,16 @@ def _manifest_token_note() -> str:
 # have refused its own new export. Two files both calling themselves
 # version 5 while one carries a kind the other's readers reject is the
 # ambiguity the number exists to remove.
+# Version 7 is the fourteenth review's H2: provenance of a snapshot
+# CAPTURE travels. A rendition is keyed by content and two walks that
+# compose identical bytes are one rendition; which commit each walk was
+# at, whether its tree was dirty, which patterns selected and which
+# exclusions were in force are facts about the walk and not the bytes,
+# and version 6 carried none of them. Pins gain an optional capture_id,
+# and the manifest gains captures, the records those ids name, so a
+# reader holding only the file can say which walk each snapshot cell
+# read. Field additions on both the trial line and the manifest, so the
+# first limb of the rule again.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -1791,6 +1839,27 @@ EXPORT_SCHEMA_NOTES = {
         "attachments_mode, the one mode the whole experiment ran under, "
         "from version 5."
     ),
+    7: (
+        "rendition pins may carry capture_id, naming which CAPTURE of a "
+        "snapshot the cell read, and the manifest carries captures, the "
+        "records those ids name: head, dirty, patterns, excludes and "
+        "captured_at for each. A rendition is keyed by content and two "
+        "walks composing identical bytes are one rendition; the commit "
+        "and the dirty flag are facts about the walk and not the bytes, "
+        "so version 6 could not say which walk a snapshot cell read. "
+        "capture_id is null on every document and image pin and on "
+        "snapshot pins frozen before this version. Every field the "
+        "earlier versions added is carried with its meaning intact: "
+        "attachments and attachments_mode on each trial line and "
+        "attachments_referenced in the manifest from version 2, whose "
+        "truth conditions widened at version 5 because the manifest "
+        "itself now cites digests; renditions, the ordered pins each "
+        "with digest, extractor, extractor_version and kind, from "
+        "version 3, and kind may be snapshot from version 6; "
+        "token_counts in the manifest and is_byok on each trial line "
+        "from version 4; task_attachments and attachments_mode in the "
+        "manifest from version 5."
+    ),
 }
 
 
@@ -1825,6 +1894,7 @@ def export_manifest(
     seed: int,
     thresholds: dict[str, Any] | None = None,
     attachments_referenced: bool = False,
+    captures: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Line one: what this artifact IS.
 
@@ -1893,6 +1963,12 @@ def export_manifest(
         # the trial lines cover the cells that produced results, and this
         # covers the ones that did not.
         "task_attachments": experiment.get("task_attachments"),
+        # THE CAPTURES THE PINS NAME, keyed by id as strings because
+        # JSON object keys are strings and a reader should not have to
+        # know that a number was meant. Empty when nothing in the
+        # artifact is a snapshot, present regardless, so a version 7
+        # reader can tell "no captures" from "this key is absent".
+        "captures": captures or {},
         # ONE MODE PER EXPERIMENT is a law of this bench, and the
         # artifact states it once rather than leaving a reader to infer
         # it from every trial line agreeing. A file whose trial lines

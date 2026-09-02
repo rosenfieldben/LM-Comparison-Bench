@@ -376,7 +376,14 @@
       name.textContent = id;
       row.append(name);
       for (const entry of perTask[id]) {
-        row.append(window.BenchAttach.pinChip(entry, "task"));
+        // The capture a snapshot pin names, from the report's own
+        // records: which commit, which tree state, when. Keyed by the
+        // id as a string, since that is how JSON carries object keys.
+        const capture =
+          entry.capture_id === null || entry.capture_id === undefined
+            ? null
+            : report.captures?.[String(entry.capture_id)] || null;
+        row.append(window.BenchAttach.pinChip(entry, "task", capture));
       }
       el.append(row);
     }

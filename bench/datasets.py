@@ -61,8 +61,17 @@ MAX_PATTERN_CHARS = 500
 # dataset is allowed to CLAIM, and the cross-module test holds the two
 # in agreement rather than an import, since this module cannot reach
 # extract without reaching the boundary that imports it.
-PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind")
+PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind", "capture_id")
 PIN_KINDS = ("document", "image", "snapshot")
+
+# THE FOUR A PIN MUST NAME, and the fifth it may. capture_id is the
+# fourteenth review's H2: which CAPTURE of a snapshot a pin means, a row
+# id on the bench's captures table. A document or an image has no
+# capture, and a snapshot cited without one resolves to its latest
+# capture at creation, the same way a bare digest resolves to its row's
+# own reading; so the fifth is optional where the four are not, and a
+# pin naming it is honored verbatim or refused like any other part.
+PIN_REQUIRED = ("digest", "extractor", "extractor_version", "kind")
 
 # sha256, lowercase hex. The same shape RenditionPin enforces at the API
 # boundary, checked here because a dataset that cites a malformed digest
@@ -247,7 +256,7 @@ def _checked_attachments(
                 f"{type(entry).__name__}",
             )
             return None
-        missing = [field for field in PIN_FIELDS if field not in entry]
+        missing = [field for field in PIN_REQUIRED if field not in entry]
         if missing:
             # A PARTIAL PIN IS REFUSED RATHER THAN COMPLETED. Filling the
             # gaps from the current store would make the dataset's
@@ -257,7 +266,7 @@ def _checked_attachments(
             _fail(
                 line_no,
                 f"{at} is missing {', '.join(missing)}. A rendition names "
-                f"all four of {', '.join(PIN_FIELDS)}, or cite the digest "
+                f"all four of {', '.join(PIN_REQUIRED)}, or cite the digest "
                 "alone and let the experiment freeze the reading.",
             )
         unknown = sorted(set(entry) - set(PIN_FIELDS))
@@ -281,6 +290,22 @@ def _checked_attachments(
                 f"{at}.kind is {kind!r}, not one of {', '.join(PIN_KINDS)}",
             )
         pin["kind"] = kind
+        capture = entry.get("capture_id")
+        if capture is not None:
+            # A positive integer or nothing. bool is refused explicitly
+            # because True is an int to isinstance and "capture_id: true"
+            # is a typo, not a row.
+            if isinstance(capture, bool) or not isinstance(capture, int) or capture < 1:
+                _fail(
+                    line_no, f"{at}.capture_id is {capture!r}, not a positive integer"
+                )
+            if kind != "snapshot":
+                _fail(
+                    line_no,
+                    f"{at}.capture_id names a capture, and only a snapshot "
+                    f"has captures; this pin is a {kind}.",
+                )
+        pin["capture_id"] = capture
         out.append(pin)
     return out
 

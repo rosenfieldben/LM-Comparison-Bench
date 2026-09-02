@@ -1403,17 +1403,21 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 5**. Each trial line carries the ordered
+An **export is schema version 7**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
-`is_byok`. Version 5 adds `task_attachments` and `attachments_mode` to
+`is_byok`. Version 5 added `task_attachments` and `attachments_mode` to
 the manifest: trial lines describe the cells that *ran*, and a task that
 never ran leaves no line, so a halted experiment's un-run tasks had their
-declaration nowhere in the file. The manifest states the reason for the
-current bump in the file itself, and it names every field the earlier
-versions added, because a reader holding a v5 artifact and a v2 parser
-needs the whole list from the file in their hand.
+declaration nowhere in the file. Version 6 let a pin's `kind` be
+`snapshot`. Version 7 lets a pin name a `capture_id` and adds `captures`
+to the manifest, the records those ids name, so a reader can say which
+*walk* of a repository each snapshot cell read and not merely which
+bytes. The manifest states the reason for the current bump in the file
+itself, and it names every field the earlier versions added, because a
+reader holding a v7 artifact and a v2 parser needs the whole list from
+the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1740,19 +1744,28 @@ sentence a `403` would carry. No view ever shows the clone root: the
 stored name is derived from the digest, which is the filename rule
 extended from a file to a tree.
 
-`GET /attachments/{digest}` serves the snapshot's **manifest**: every
-member's path, byte size and digest, the patterns and exclusions that
-were in force, the encoding rule, and the clone's HEAD commit with
-whether its tree was modified. Never any content, which is the promise
-every attachment response makes. The list endpoint omits the manifest
-deliberately, since a page of snapshots carrying theirs would be a page
-of bodies.
+`GET /attachments/{digest}` serves the snapshot's **manifest**, which is
+the content half: every member's path, byte size and digest, and the
+encoding rule. Beside it rides the **capture**, which is the walk's
+half: the clone's HEAD commit, whether its tree was modified, the
+patterns that selected and the exclusions that were in force, and when.
+Never any content, which is the promise every attachment response
+makes. The list endpoint omits both deliberately, since a page of
+snapshots carrying theirs would be a page of bodies.
 
-Composing the same unchanged tree twice returns the first row: identical
-files compose identical text, so the digest matches and the
-content-addressed store does the rest. The manifest kept is the first
-walk's, including its commit, which stays a true statement about those
-bytes rather than becoming a stale one.
+**Content dedupes; captures do not.** Composing the same unchanged tree
+twice composes identical text, so the digest matches and the
+content-addressed store keeps one row. But each walk is recorded as its
+own capture, because which commit a tree was at and whether it was
+dirty are facts about the walk and not about the bytes: two walks of
+identical selected files, one on a clean tree and one after an
+untracked file appeared elsewhere in it, are one rendition and two
+captures. `POST /snapshots` returns the capture it just made; `GET`
+returns the rendition's latest; a pin names one by `capture_id`, and a
+snapshot cited by bare digest freezes its latest capture at creation
+the same way a bare digest freezes the row's own reading. Reports and
+exports carry the records those ids name, so nothing about a walk is
+silently lost when its bytes happened to match an earlier one.
 
 **A dataset's version is its content.** There is no version field to keep
 in sync and no way to edit a file and leave a stale label behind: the

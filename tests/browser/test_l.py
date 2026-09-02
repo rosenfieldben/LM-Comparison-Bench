@@ -225,3 +225,31 @@ def test_a_success_whose_body_cannot_be_read_says_so(snapshot_bench, snapshot_ro
     expect(message).to_contain_text("could not read")
     assert "could not be sent" not in message.inner_text()
     expect(page.get_by_test_id("attachment-chip")).to_have_count(0)
+
+
+def test_a_staged_snapshot_chip_names_the_walk_it_was(snapshot_bench, snapshot_root):
+    """WINDOW: the composer chip's title after Compose snapshot, and the
+    pin the page would declare.
+
+    THE FOURTEENTH REVIEW'S H2 AT THE SEAM. The chip's face stays a
+    label and a count; its title says which walk this was, capture id,
+    commit and tree state, and the declaration the page sends carries
+    the capture's id so the comparison records that walk and not
+    whichever the rendition's latest happens to be by run time. The
+    test clone is not a git repository, so the walk reports no commit
+    and an unknown tree state, which is what the title must say rather
+    than "clean".
+    """
+    page = snapshot_bench(["model/alpha"])
+    page.get_by_test_id("snapshot-open").click()
+    page.get_by_test_id("snapshot-root").fill(str(snapshot_root))
+    page.get_by_test_id("snapshot-patterns").fill("pkg/*.py")
+    page.get_by_test_id("snapshot-compose").click()
+    chip = page.get_by_test_id("attachment-chip")
+    expect(chip).to_have_count(1)
+
+    title = chip.get_attribute("title")
+    assert "capture #" in title
+    assert "no commit, unknown" in title
+    declared = page.evaluate("() => window.BenchAttach.declared()")
+    assert isinstance(declared["renditions"][0]["capture_id"], int)
