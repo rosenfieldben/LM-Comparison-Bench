@@ -16017,6 +16017,7 @@ def test_review_repro_a_non_byok_upstream_figure_is_not_reported_as_a_second_bil
 # ===================================================================
 
 import os
+import shutil
 import stat as stat_module
 
 from bench import snapshot as bench_snapshot
@@ -16426,6 +16427,174 @@ def test_a_named_pipe_in_the_selection_is_refused_rather_than_opened(client, tmp
     assert resp.status_code == 422
     assert "pipe.py" in resp.json()["detail"]
     assert "not a regular file" in resp.json()["detail"]
+
+
+def _on_disk_before(monkeypatch, method, name, action):
+    """Run action() on disk the moment the descriptor tree is about to
+    perform `method` on the entry called `name`, then let it proceed.
+
+    This is the review's race made deterministic through the door's own
+    tree: the listing has already happened, the swap lands, and the
+    real os.open with its real flags is what answers. Nothing about the
+    tree is faked; only the timing is fixed.
+    """
+    original = getattr(main.DescriptorTree, method)
+
+    def hooked(self, *args):
+        # An Entry carries a name and an Opened carries a path; whichever
+        # argument names the target is the one the swap is keyed on.
+        for arg in args:
+            spelled = getattr(arg, "name", None) or getattr(arg, "path", None)
+            if spelled == name:
+                action()
+                break
+        return original(self, *args)
+
+    monkeypatch.setattr(main.DescriptorTree, method, hooked)
+
+
+def test_review_repro_a_file_swapped_for_a_link_at_the_door_is_refused_unread(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file becomes a link out of
+    the root between the walk's listing and its open, on the real tree.
+
+    THE REVIEW'S FIRST SWAP AT THE DOOR. Reproduced on HEAD at this exact
+    window: 201, and the outside file's content in the stored text. Now
+    the open carries O_NOFOLLOW, ELOOP is the answer, and the request is
+    refused with nothing stored.
+    """
+    outside = clone(tmp_path / "outside", {"secret.py": b"LEAK = 'outside'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n", "b.py": b"y = 2\n"})
+
+    def swap():
+        (root / "b.py").unlink()
+        (root / "b.py").symlink_to(outside / "secret.py")
+
+    _on_disk_before(monkeypatch, "open_member", "b.py", swap)
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert (
+        "b.py was listed as a regular file and is now a symbolic link"
+        in (resp.json()["detail"])
+    )
+    assert store.list_attachments(client.app.state.db, 10) == []
+
+
+def test_review_repro_a_directory_swapped_for_a_link_at_the_door_is_refused(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a queued directory becomes a link to
+    another tree before the walk descends, on the real tree.
+
+    THE REVIEW'S SECOND SWAP AT THE DOOR. Reproduced on HEAD: 201, and
+    the other tree's file stored under a path claiming to be inside the
+    clone. Now the descent is an open through the parent's descriptor
+    with O_DIRECTORY and O_NOFOLLOW, and a link there is ELOOP.
+    """
+    outside = clone(tmp_path / "outside", {"z.py": b"LEAK2 = 'outside'\n"})
+    root = clone(tmp_path / "repo", {"a.py": b"x = 1\n", "d/inner.py": b"i = 1\n"})
+
+    def swap():
+        shutil.rmtree(root / "d")
+        (root / "d").symlink_to(outside)
+
+    _on_disk_before(monkeypatch, "descend", "d", swap)
+    resp = snapshot_of(client, root, ["**/*.py"])
+
+    assert resp.status_code == 422
+    assert (
+        "d was listed as a directory and is no longer one the walk may open"
+        in (resp.json()["detail"])
+    )
+    assert store.list_attachments(client.app.state.db, 10) == []
+
+
+def test_review_repro_a_fifo_swapped_in_at_the_door_is_refused_without_a_hang(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file becomes a named pipe
+    between the listing and the open, on the real tree.
+
+    THE REVIEW'S THIRD SHAPE AT THE DOOR, the one no timeout could end:
+    reproduced on HEAD as a request still blocked after three seconds.
+    The open now carries O_NONBLOCK, so a fifo with no writer opens and
+    returns, its own fstat says what it is, and the walk refuses it
+    before reading. The elapsed-time assertion is the hang's absence.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "p.py": b"p = 1\n"})
+
+    def swap():
+        (root / "p.py").unlink()
+        os.mkfifo(root / "p.py")
+
+    _on_disk_before(monkeypatch, "open_member", "p.py", swap)
+    started = time.monotonic()
+    resp = snapshot_of(client, root, ["*.py"])
+    elapsed = time.monotonic() - started
+
+    assert resp.status_code == 422
+    assert "a socket, a device or a named pipe" in resp.json()["detail"]
+    assert elapsed < 2.0
+
+
+def test_review_repro_a_file_that_grows_after_its_open_is_refused_at_the_bound(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots where a selected file grows past the bound
+    between its descriptor's stat and its read, on the real tree.
+
+    THE REVIEW'S FOURTH SHAPE AT THE DOOR: on HEAD the whole grown file
+    was read into memory, 800,022 bytes measured, and refused only
+    afterwards. The read is bounded at the descriptor now, so the door
+    asks for the bound plus one byte and refuses on the extra one.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n", "g.py": b"g = 1\n"})
+
+    def grow():
+        with open(root / "g.py", "ab") as handle:
+            handle.write(b"#" * (bench_snapshot.MAX_MEMBER_BYTES + 1))
+
+    _on_disk_before(monkeypatch, "read_member", "g.py", grow)
+    # And how much the descriptor read actually handed back, which is
+    # the bound itself: the walk asked for one byte past it and the
+    # tree obliged with no more, so the growth was never held.
+    returned = []
+    bounded = main.DescriptorTree.read_member
+
+    def measured(self, opened, limit):
+        data = bounded(self, opened, limit)
+        returned.append((opened.path, len(data)))
+        return data
+
+    monkeypatch.setattr(main.DescriptorTree, "read_member", measured)
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 422
+    assert "g.py grew past" in resp.json()["detail"]
+    assert ("g.py", bench_snapshot.MAX_MEMBER_BYTES + 1) in returned
+
+
+def test_a_dangling_link_inside_the_root_is_skipped_and_the_walk_succeeds(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots over a tree holding a link whose target does
+    not exist but would sit inside the root.
+
+    The listing stats WITHOUT following, so a dangling link is a link
+    and not an error. A stat that followed would raise on the missing
+    target and the whole snapshot would be refused as unlistable, for a
+    link the walk was never going to open. Skipped, like every contained
+    link, because its bytes are the target's and the target has none.
+    """
+    root = clone(tmp_path, {"a.py": b"x = 1\n"})
+    (root / "ghost.py").symlink_to(root / "not-there.py")
+
+    resp = snapshot_of(client, root, ["*.py"])
+
+    assert resp.status_code == 201, resp.text
+    assert [m["path"] for m in resp.json()["manifest"]["files"]] == ["a.py"]
 
 
 def test_a_file_over_the_member_ceiling_is_refused_before_it_is_read(client, tmp_path):
@@ -16854,25 +17023,51 @@ def test_the_export_carries_the_snapshot_pin_at_schema_six(client, tmp_path):
 
 FILESYSTEM_CALLS = {
     # module, enclosing function -> why this one is allowed to touch a
-    # path, and where its input comes from.
+    # path or a descriptor, and where its input comes from.
     #
     # ---- Inside the snapshot root check. Every one of these runs on a
     # ---- root enforce_snapshot_root already resolved and matched
-    # ---- against BENCH_REPO_ROOTS, or on a path the WALK built out of
-    # ---- directory entries. None of them takes a caller string.
+    # ---- against BENCH_REPO_ROOTS, or through a DESCRIPTOR the walk
+    # ---- opened from that root. None of them takes a caller string,
+    # ---- and after open_root none of them takes a path at all.
     ("main.py", "_resolved_directory"): {"os.path.isdir", "os.path.realpath"},
     # The injected resolver, called only after the allowlist has been
     # found non-empty. This entry IS the ordering: when the resolution
     # was passed in as a value, the realpath ran in create_snapshot
     # before the feature was known to be on, and this table said so.
     ("main.py", "enforce_snapshot_root"): {"resolve"},
-    ("main.py", "resolve"): {"os.path.realpath"},
-    ("main.py", "entries"): {"entry.is_dir", "os.scandir"},
-    ("main.py", "_snapshot_members"): {"os.stat", "read_bytes"},
-    # snapshot.py does no I/O at all: this is the INJECTED callable being
-    # called, which is the whole reason the module can be tested as a
-    # value in and a value out.
-    ("snapshot.py", "walk"): {"resolve"},
+    # THE DESCRIPTOR TREE, the fourteenth review's H1. The root is
+    # opened once by name with O_DIRECTORY and O_NOFOLLOW; every child
+    # directory is opened through its parent's descriptor; every member
+    # is opened through its directory's descriptor with O_NOFOLLOW and
+    # O_NONBLOCK; every read goes through the member's own descriptor.
+    # The one by-name resolution left is link_target's realpath, which
+    # decides whether to refuse a link the walk will not follow either
+    # way and never opens anything.
+    ("main.py", "DescriptorTree._directory"): {"os.close", "os.fstat", "os.open"},
+    ("main.py", "DescriptorTree.entries"): {
+        "entry.is_symlink",
+        "entry.stat",
+        "os.scandir",
+    },
+    ("main.py", "DescriptorTree.open_member"): {"os.close", "os.fstat", "os.open"},
+    ("main.py", "DescriptorTree.read_member"): {"os.read"},
+    ("main.py", "DescriptorTree.close_handle"): {"os.close"},
+    ("main.py", "DescriptorTree.link_target"): {"os.path.realpath", "os.readlink"},
+    # snapshot.py does no I/O at all: these are the INJECTED operations
+    # being called, which is the whole reason the module can be tested
+    # as a value in and a value out, and the reason the review's races
+    # are deterministic tests there.
+    ("snapshot.py", "walk"): {
+        "tree.close_handle",
+        "tree.descend",
+        "tree.link_target",
+        "tree.open_member",
+        "tree.open_root",
+        "tree.read_member",
+        "tree.root_path",
+    },
+    ("snapshot.py", "listing"): {"tree.entries"},
     #
     # ---- Outside it, each on its own posture.
     #
@@ -16882,15 +17077,21 @@ FILESYSTEM_CALLS = {
     # that walks a TREE.
     ("main.py", "read_dataset"): {"read_bytes"},
     # The application's own static directory and index, derived from
-    # __file__ and never from a request.
-    ("main.py", "<module>"): {"INDEX_HTML.read_text", "resolve"},
+    # __file__ and never from a request. StaticFiles is Starlette
+    # serving that directory; its input is the same constant.
+    ("main.py", "<module>"): {"INDEX_HTML.read_text", "StaticFiles", "resolve"},
     ("main.py", "static_rev"): {"directory.rglob", "path.is_file", "path.read_bytes"},
-    # The git runner's default working directory, also from __file__.
-    # Its cwd parameter is where a snapshot passes an allowlisted root.
-    ("main.py", "_git"): {"resolve"},
+    # The git runner: its default working directory is from __file__,
+    # and its cwd parameter is where a snapshot passes an allowlisted
+    # root. subprocess.run is listed because a working directory is a
+    # path operation, whatever the command.
+    ("main.py", "_git"): {"resolve", "subprocess.run"},
     # The database path from BENCH_DB, set by the operator at boot and
-    # never per request.
+    # never per request: created private, tightened if found loose,
+    # and then opened.
     ("store.py", "_keep_private"): {
+        "os.chmod",
+        "os.close",
         "os.makedirs",
         "os.open",
         "os.path.abspath",
@@ -16898,9 +17099,81 @@ FILESYSTEM_CALLS = {
         "os.path.isdir",
         "os.stat",
     },
+    ("store.py", "connect"): {"sqlite3.connect"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
+}
+
+# Every way this codebase touches a path, a descriptor or a directory.
+# The os names are exhaustive over the os module by construction (see
+# the test's completeness rule); the rest are the constructors and
+# methods this codebase calls, listed by name, and a NEW library that
+# reaches disk would have to be added here to be seen.
+FILESYSTEM_TOUCHERS = {
+    "os.chmod",
+    "os.close",
+    "os.fstat",
+    "os.listdir",
+    "os.makedirs",
+    "os.open",
+    "os.read",
+    "os.readlink",
+    "os.remove",
+    "os.rename",
+    "os.replace",
+    "os.scandir",
+    "os.stat",
+    "os.unlink",
+    "os.path.abspath",
+    "os.path.exists",
+    "os.path.isdir",
+    "os.path.realpath",
+    "open",
+    "sqlite3.connect",
+    "subprocess.run",
+    "StaticFiles",
+    # pathlib and DirEntry methods, matched on the method name.
+    "read_bytes",
+    "read_text",
+    "write_text",
+    "write_bytes",
+    "rglob",
+    "glob",
+    "iterdir",
+    "mkdir",
+    "unlink",
+    "touch",
+    "exists",
+    "is_dir",
+    "is_file",
+    "is_symlink",
+    "resolve",
+    "stat",
+    # The Tree protocol, so the pure walk's injected operations appear
+    # under the function that makes them.
+    "open_root",
+    "entries",
+    "descend",
+    "open_member",
+    "read_member",
+    "close_handle",
+    "link_target",
+    "root_path",
+}
+
+# os calls that compute on strings and touch nothing. A call into os
+# that is in neither set fails the test as unclassified, which is how
+# the os half of the list stays complete without anybody remembering.
+PURE_OS_CALLS = {
+    "os.environ.get",
+    "os.path.basename",
+    "os.path.commonpath",
+    "os.path.dirname",
+    "os.path.isabs",
+    "os.path.join",
+    "os.path.normcase",
+    "os.path.normpath",
 }
 
 
@@ -16923,62 +17196,79 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
     input" stopped being obvious. The answer is the table above, and this
     is what keeps the table true.
 
+    HOW COMPLETE IS "EVERY", stated because the fourteenth review found
+    the first version claiming it and missing four. Two rules, and they
+    are different kinds of rule.
+
+    The os half is complete BY CONSTRUCTION: every call into the os
+    module anywhere in bench/ must be in FILESYSTEM_TOUCHERS or in
+    PURE_OS_CALLS, and one in neither fails this test as unclassified.
+    So an os call cannot be added without somebody saying which it is,
+    and the four the review named (is_symlink, chmod, sqlite3.connect,
+    StaticFiles) are in the list because this rule and the next would
+    now refuse a tree without them.
+
+    The non-os half is complete BY ENUMERATION and says so: builtins
+    open, the pathlib and DirEntry methods this codebase calls,
+    sqlite3.connect, subprocess.run for its working directory,
+    Starlette's StaticFiles for the directory it serves, and the Tree
+    protocol's operations so the pure walk's injected calls appear under
+    the function that makes them. A NEW library that reaches disk under
+    a name not in that list would not be seen, and that is the limit of
+    what an AST scan of call names can promise.
+
     A NEW ENTRY FAILS THIS TEST, which is the point. Adding a read or a
     stat anywhere in bench/ now requires saying which posture it sits in:
-    inside the root check on a path the walk built, or outside it on a
-    path that came from the operator's own configuration. There is no
-    third category, and a call that cannot be put in one of the two is
+    inside the root check on a descriptor the walk opened, or outside it
+    on a path that came from the operator's own configuration. There is
+    no third category, and a call that cannot be put in one of the two is
     the finding.
 
-    Keyed on FUNCTION NAME and not on a line number, because a test
-    anchored to an offset in a seven-thousand-line file is a test that
-    breaks on every unrelated edit and gets deleted.
+    Keyed on QUALIFIED FUNCTION NAME and not on a line number, because a
+    test anchored to an offset in a seven-thousand-line file breaks on
+    every unrelated edit and gets deleted. A method is keyed as
+    Class.method so the descriptor tree's eight operations read as its.
     """
-    touchers = {
-        "os.scandir",
-        "os.stat",
-        "os.listdir",
-        "os.makedirs",
-        "os.open",
-        "os.remove",
-        "os.unlink",
-        "os.rename",
-        "os.replace",
-        "os.path.realpath",
-        "os.path.isdir",
-        "os.path.exists",
-        "os.path.abspath",
-        "open",
-        "read_bytes",
-        "read_text",
-        "write_text",
-        "write_bytes",
-        "rglob",
-        "glob",
-        "iterdir",
-        "mkdir",
-        "unlink",
-        "touch",
-        "exists",
-        "is_dir",
-        "is_file",
-        "resolve",
-        "stat",
-    }
     found = {}
+    unclassified = set()
     for path in sorted(Path("bench").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                parents[id(child)] = node
         scope = {}
+        # Breadth-first, so an inner function's assignment lands after
+        # its enclosing function's and the innermost name wins.
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                parent = parents.get(id(node))
+                name = (
+                    f"{parent.name}.{node.name}"
+                    if isinstance(parent, ast.ClassDef)
+                    else node.name
+                )
                 for child in ast.walk(node):
-                    scope[id(child)] = node.name
+                    scope[id(child)] = name
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             name = _dotted(node.func)
-            if name in touchers or name.rsplit(".", 1)[-1] in touchers:
-                key = (path.name, scope.get(id(node), "<module>"))
+            key = (path.name, scope.get(id(node), "<module>"))
+            if name.startswith("os."):
+                if name in FILESYSTEM_TOUCHERS:
+                    found.setdefault(key, set()).add(name)
+                elif name not in PURE_OS_CALLS:
+                    unclassified.add((path.name, key[1], name))
+                continue
+            if (
+                name in FILESYSTEM_TOUCHERS
+                or name.rsplit(".", 1)[-1] in FILESYSTEM_TOUCHERS
+            ):
                 found.setdefault(key, set()).add(name)
 
+    assert unclassified == set(), (
+        "os calls that are neither touchers nor pure: classify them in "
+        f"FILESYSTEM_TOUCHERS or PURE_OS_CALLS: {sorted(unclassified)}"
+    )
     assert found == FILESYSTEM_CALLS

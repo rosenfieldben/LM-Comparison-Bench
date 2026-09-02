@@ -22,13 +22,23 @@ import pytest
 from bench.extract import MAX_COMPOSED_CHARS, SNAPSHOT_KIND
 from bench.snapshot import (
     DEFAULT_EXCLUDES,
+    DIRECTORY,
     ENCODING_RULE,
+    FILE,
+    MAX_DEPTH,
     MAX_MEMBER_BYTES,
+    MAX_READ_BYTES,
     MAX_WALKED_ENTRIES,
+    OTHER,
     SNAPSHOT_EXTRACTOR,
     SNAPSHOT_VERSION,
+    SYMLINK,
+    Entry,
+    Handle,
+    Opened,
     SnapshotError,
     compose,
+    contained,
     digest_of,
     enforce_patterns,
     excluded,
@@ -39,55 +49,143 @@ from bench.snapshot import (
 ROOT = "/repo"
 
 
-def tree(paths, *, links=None, root=ROOT, order=None):
-    """entries and resolve over a tree described as a list of paths.
+class FakeTree:
+    """bench.snapshot's Tree over a dict, with the review's races as knobs.
 
-    paths are repo-relative files; links maps a repo-relative path to
-    the absolute path it resolves to, and a link whose repo-relative
-    path is also named in dirs is reported as a directory. order, when
-    given, reorders each directory's entries so a test can prove the
-    walk does not inherit the filesystem's listing order.
+    A tree described as paths and bytes, plus three hooks that model the
+    moments the fourteenth review's H1 sits between. swap_on_open makes
+    an entry look one way in its parent's listing and another way the
+    moment it is opened, which is the file-for-link, directory-for-link
+    and file-for-fifo swap; grow_on_read appends bytes to a file after
+    its size was taken, which is the growth past the bound; and
+    listing_hook replaces a directory's listing with an arbitrary
+    iterator, which is how a directory a million entries wide is
+    described without a million dicts.
+
+    Every open and close is recorded, so a test can assert the walk
+    holds one descriptor per level and closes what it opened even when
+    it refuses part-way.
     """
-    links = links or {}
-    dirs = {name for name in links if links[name].endswith("/")}
-    children: dict[str, list[tuple[str, bool, bool]]] = {}
 
-    def add(path, is_directory, is_symlink):
-        parent, _, name = path.rpartition("/")
-        entry = (name, is_directory, is_symlink)
-        if entry not in children.setdefault(parent, []):
-            children[parent].append(entry)
+    def __init__(
+        self,
+        files,
+        *,
+        links=None,
+        others=(),
+        order=None,
+        root=ROOT,
+        swap_on_open=None,
+        grow_on_read=None,
+        listing_hook=None,
+    ):
+        self.root = root
+        self.order = order
+        self.swap_on_open = swap_on_open or {}
+        self.grow_on_read = grow_on_read or {}
+        self.listing_hook = listing_hook
+        self.opened = []
+        self.closed = []
+        self.reads = []
+        self.max_open = 0
+        self.nodes = {"": {"kind": DIRECTORY, "identity": (1, 0), "size": 0}}
+        self.children = {"": []}
+        self._next = 1
 
-    def parents(path):
-        parts = path.split("/")
-        for depth in range(len(parts) - 1):
-            add("/".join(parts[: depth + 1]), True, False)
+        def add(path, node):
+            parent, _, name = path.rpartition("/")
+            for depth in range(1, len(path.split("/"))):
+                ancestor = "/".join(path.split("/")[:depth])
+                if ancestor not in self.nodes:
+                    add(ancestor, {"kind": DIRECTORY, "size": 0})
+            node.setdefault("identity", (1, self._next))
+            self._next += 1
+            self.nodes[path] = node
+            self.children.setdefault(path, []) if node["kind"] == DIRECTORY else None
+            if name not in self.children.setdefault(parent, []):
+                self.children[parent].append(name)
 
-    for path in paths:
-        parents(path)
-        add(path, False, False)
-    for path in links:
-        parents(path)
-        add(path, True, True) if path in dirs else add(path, False, True)
+        for path, content in (files or {}).items():
+            add(path, {"kind": FILE, "size": len(content), "content": content})
+        for path, target in (links or {}).items():
+            add(path, {"kind": SYMLINK, "size": 0, "target": target.rstrip("/")})
+        for path in others:
+            add(path, {"kind": OTHER, "size": 0})
 
-    def entries(where):
-        listing = list(children.get(where, []))
-        return order(listing) if order else listing
+    def root_path(self):
+        return self.root
 
-    def resolve(where):
-        if where == "":
-            return root
-        if where in links:
-            return links[where].rstrip("/")
-        return f"{root}/{where}"
+    def _open(self, path, node, cls, **extra):
+        self.opened.append(path)
+        self.max_open = max(self.max_open, len(self.opened) - len(self.closed))
+        return cls(path=path, identity=node["identity"], token=path, **extra)
 
-    return entries, resolve
+    def open_root(self):
+        return self._open("", self.nodes[""], Handle)
+
+    def entries(self, handle):
+        if self.listing_hook is not None:
+            yield from self.listing_hook(handle.path)
+            return
+        names = list(self.children.get(handle.path, []))
+        if self.order:
+            names = self.order(names)
+        for name in names:
+            path = f"{handle.path}/{name}" if handle.path else name
+            node = self.nodes[path]
+            yield Entry(name, node["kind"], node["identity"], node["size"])
+
+    def _seen_at_open(self, path):
+        return self.swap_on_open.get(path, self.nodes[path])
+
+    def descend(self, handle, entry):
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        node = self._seen_at_open(path)
+        if node["kind"] != DIRECTORY:
+            # What the door's O_DIRECTORY | O_NOFOLLOW open does with a
+            # link or a file where a directory was: refuses at the open,
+            # in one sentence, because the kernel answers both with
+            # ENOTDIR and the door does not guess which.
+            raise SnapshotError(
+                f"{path} was listed as a directory and is no longer one the "
+                "walk may open: a symbolic link, or not a directory at all."
+            )
+        return self._open(path, node, Handle)
+
+    def open_member(self, handle, entry):
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        node = self._seen_at_open(path)
+        if node["kind"] == SYMLINK:
+            # ELOOP at the door; the fake mirrors it rather than handing
+            # back a descriptor to a link, which O_NOFOLLOW never does.
+            raise SnapshotError(
+                f"{path} was listed as a regular file and is now a symbolic link."
+            )
+        return self._open(path, node, Opened, kind=node["kind"], size=node["size"])
+
+    def read_member(self, opened, limit):
+        self.reads.append((opened.path, limit))
+        node = self._seen_at_open(opened.path)
+        content = node.get("content", b"") + self.grow_on_read.get(opened.path, b"")
+        return content[: limit + 1]
+
+    def close_handle(self, held):
+        self.closed.append(held.path)
+
+    def link_target(self, handle, entry):
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        return self.nodes[path]["target"]
+
+
+def tree(paths, **kwargs):
+    """A FakeTree from a list of paths, each holding a body naming it."""
+    files = {path: f"body of {path}\n".encode() for path in paths}
+    return FakeTree(files, **kwargs)
 
 
 def selection(paths, patterns, **kwargs):
     """walk over a described tree, for the cases that only need paths."""
-    entries, resolve = tree(paths, **kwargs)
-    return walk(entries=entries, resolve=resolve, patterns=patterns)
+    return [path for path, _ in walk(tree=tree(paths, **kwargs), patterns=patterns)]
 
 
 def snapshot(members, patterns=("**/*",), head="abc1234", dirty=False):
@@ -231,13 +329,14 @@ def test_two_walks_of_one_tree_compose_the_same_snapshot():
     listed backwards.
     """
     paths = ["src/a.py", "src/b.py", "README.md", "src/deep/c.py"]
-    forward = selection(paths, ["**/*"])
-    backward = selection(paths, ["**/*"], order=lambda listing: listing[::-1])
+    forward = walk(tree=tree(paths), patterns=["**/*"])
+    backward = walk(
+        tree=tree(paths, order=lambda names: names[::-1]), patterns=["**/*"]
+    )
     assert forward == backward
 
-    members = [(path, f"body of {path}\n".encode()) for path in forward]
-    first = snapshot(members)
-    second = snapshot(members[::-1])
+    first = snapshot(forward)
+    second = snapshot(backward[::-1])
     assert first["text"] == second["text"]
     assert first["digest"] == second["digest"]
 
@@ -266,11 +365,22 @@ def test_the_walk_gives_up_before_traversing_a_home_directory():
     says so rather than reporting a limit the person has no way to act
     on.
     """
-    paths = [f"f{index:06d}.txt" for index in range(MAX_WALKED_ENTRIES + 1)]
+    consumed = {"n": 0}
+
+    def endless(_path):
+        for index in range(MAX_WALKED_ENTRIES * 3):
+            consumed["n"] += 1
+            yield Entry(f"f{index:06d}.txt", FILE, (1, index + 7), 3)
+
     with pytest.raises(SnapshotError) as caught:
-        selection(paths, ["**/*"])
+        walk(tree=FakeTree({}, listing_hook=endless), patterns=["**/*"])
     assert str(MAX_WALKED_ENTRIES) in str(caught.value)
     assert "Point it at the clone itself" in str(caught.value)
+    # THE REVIEW'S MEDIUM: the first walk sorted a directory before
+    # counting it, so a directory three times the ceiling was consumed
+    # whole (60,000 measured) before the ceiling fired. The count is per
+    # streamed entry now, and the refusal comes at the first entry over.
+    assert consumed["n"] == MAX_WALKED_ENTRIES + 1
 
 
 # ----- containment ---------------------------------------------------
@@ -742,3 +852,323 @@ def test_the_readme_names_exclusions_the_walker_actually_applies():
     # commission did not ask for and the one a reader most needs to be
     # able to trust.
     assert {".env", "*.pem", "*.key", "id_rsa*", ".netrc", ".npmrc"} <= named
+
+
+# ----- the races the fourteenth review reproduced, made deterministic -----
+
+
+def test_review_repro_a_file_swapped_for_a_link_after_the_look_is_refused_unread():
+    """WINDOW: walk, a member listed as a regular file and a symbolic link
+    by the time it is opened.
+
+    THE REVIEW'S FIRST SWAP, and 04254ca's guard did not cover it. That
+    commit called the no-follow stat "the whole guard" on a tree edited
+    between the walk and the read; the stat guarded the moment of the
+    stat, and the read that followed it reopened the path by name and
+    followed whatever the name pointed at by then. Reproduced on HEAD
+    before this fix: a file replaced by a link to an outside file in
+    that window was followed and its content stored.
+
+    Now the walk reads through the descriptor it opened, and a link
+    where a file was is what O_NOFOLLOW refuses at the open. The fake
+    mirrors ELOOP; the assertion that matters is the last one, that no
+    read of the swapped path was ever attempted.
+    """
+    fake = FakeTree(
+        {"a.py": b"x = 1\n", "b.py": b"y = 2\n"},
+        swap_on_open={"b.py": {"kind": SYMLINK, "identity": (1, 99), "size": 0}},
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "b.py" in str(caught.value)
+    assert "now a symbolic link" in str(caught.value)
+    assert [path for path, _ in fake.reads] == ["a.py"]
+
+
+def test_review_repro_a_member_swapped_for_another_file_is_refused_by_identity():
+    """WINDOW: walk, a member whose descriptor describes a different inode
+    from the one its parent's listing described.
+
+    The swap that no flag catches: a regular file replaced by another
+    regular file. O_NOFOLLOW is silent about it, because there is no
+    link. What catches it is the identity check after the open, which
+    is why the walk verifies against what it listed rather than only
+    against what it wanted.
+    """
+    fake = FakeTree(
+        {"a.py": b"x = 1\n", "b.py": b"y = 2\n"},
+        swap_on_open={
+            "b.py": {
+                "kind": FILE,
+                "identity": (1, 500),
+                "size": 6,
+                "content": b"z = 3\n",
+            }
+        },
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "b.py changed while the snapshot was being taken" in str(caught.value)
+    assert "a different file" in str(caught.value)
+    assert [path for path, _ in fake.reads] == ["a.py"]
+
+
+def test_review_repro_a_queued_directory_swapped_before_descent_is_refused():
+    """WINDOW: walk, a directory listed by its parent and replaced before
+    the walk descends into it.
+
+    THE REVIEW'S SECOND SWAP. The first walk listed a directory by name
+    and later listed its children by name, and between those two moments
+    the directory could be replaced by a link to another tree, whose
+    files were then listed and read under paths that claimed to be
+    inside the clone. Reproduced on HEAD: outside content was stored.
+
+    Two variants, because two mechanisms catch them. A link where the
+    directory was is refused by the open itself, which is O_DIRECTORY
+    with O_NOFOLLOW at the door and the fake's mirror of it here. A
+    DIFFERENT directory where the directory was opens fine, and is
+    refused by the identity check the walk makes on the handle it got
+    back. Neither variant reads anything under the swapped name.
+    """
+    linked = FakeTree(
+        {"a.py": b"x = 1\n", "d/inner.py": b"i = 1\n"},
+        swap_on_open={"d": {"kind": SYMLINK, "identity": (1, 77), "size": 0}},
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=linked, patterns=["**/*.py"])
+    assert "d was listed as a directory and is no longer one the walk may open" in (
+        str(caught.value)
+    )
+    assert all(not path.startswith("d/") for path, _ in linked.reads)
+
+    replaced = FakeTree(
+        {"a.py": b"x = 1\n", "d/inner.py": b"i = 1\n"},
+        swap_on_open={"d": {"kind": DIRECTORY, "identity": (1, 78), "size": 0}},
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=replaced, patterns=["**/*.py"])
+    assert "d changed while the snapshot was being taken" in str(caught.value)
+    assert "a different one" in str(caught.value)
+    assert all(not path.startswith("d/") for path, _ in replaced.reads)
+    # The handle the swapped directory handed back was closed on the
+    # way out, so a refusal is not a leaked descriptor.
+    assert sorted(replaced.opened) == sorted(replaced.closed)
+
+
+def test_review_repro_a_fifo_swapped_in_after_the_look_is_refused_not_read():
+    """WINDOW: walk, a member listed as a regular file whose descriptor
+    says it is something that is not one.
+
+    THE REVIEW'S THIRD SHAPE, and the one no timeout in this process
+    could have ended: a regular file replaced by a named pipe between
+    the stat and the read hung the request, reproduced on HEAD at three
+    seconds and counting. Now the open blocks on nothing (O_NONBLOCK at
+    the door), the descriptor's own stat says what was opened, and the
+    walk refuses anything that is not a regular file before a byte is
+    read through it. The fake hands back an Opened of the other kind,
+    which is exactly what fstat on a fifo's descriptor says.
+    """
+    fake = FakeTree(
+        {"a.py": b"x = 1\n", "p.py": b"p = 1\n"},
+        swap_on_open={"p.py": {"kind": OTHER, "identity": (1, 2), "size": 0}},
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "p.py changed while the snapshot was being taken" in str(caught.value)
+    assert "a socket, a device or a named pipe" in str(caught.value)
+    assert [path for path, _ in fake.reads] == ["a.py"]
+    assert sorted(fake.opened) == sorted(fake.closed)
+
+
+def test_review_repro_a_file_that_grew_after_its_stat_is_refused_at_the_bound():
+    """WINDOW: walk, a member whose bytes exceed the size its stat gave.
+
+    THE REVIEW'S FOURTH SHAPE: a file that grew between its stat and
+    its read was read whole, 800,022 bytes into memory on HEAD against
+    an 800,000 bound, and the bound was applied to the number the stat
+    had reported rather than to what arrived. The read is now bounded
+    AT THE DESCRIPTOR: the walk asks for the bound plus one byte and no
+    more, so the growth is never held, and one byte over is the refusal.
+    """
+    fake = FakeTree(
+        {"a.py": b"x = 1\n", "g.py": b"g = 1\n"},
+        grow_on_read={"g.py": b"#" * (MAX_MEMBER_BYTES + 5)},
+    )
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "g.py grew past" in str(caught.value)
+    # The walk asked for exactly the bound plus one, which is the whole
+    # of what it needs to know the file grew and none of the growth.
+    assert ("g.py", MAX_MEMBER_BYTES) in fake.reads
+
+
+def test_a_size_over_the_bound_at_the_descriptor_is_refused_before_the_read():
+    """WINDOW: walk, a member whose listing said small and whose
+    descriptor says large.
+
+    The same bound one moment earlier. The listing's size is checked
+    first because it costs an integer and the open costs a descriptor;
+    the descriptor's own size is checked again because the listing is
+    a claim about a moment that has passed. Refused from the second
+    before any read.
+    """
+    fake = FakeTree(
+        {"a.py": b"x = 1\n", "b.py": b"y = 2\n"},
+        swap_on_open={
+            "b.py": {
+                "kind": FILE,
+                "identity": (1, 2),
+                "size": MAX_MEMBER_BYTES + 1,
+                "content": b"",
+            }
+        },
+    )
+    fake.nodes["b.py"]["identity"] = (1, 2)
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "refused before it is read" in str(caught.value)
+    assert [path for path, _ in fake.reads] == ["a.py"]
+
+
+def test_review_repro_the_total_refusal_names_the_largest_files():
+    """WINDOW: walk, a selection whose total crosses MAX_READ_BYTES on a
+    small file.
+
+    THE REVIEW'S LOW, and the original commission. The first walk named
+    the file whose bytes crossed the line, which in path order was a
+    six-byte file after four large ones, and told the person to narrow
+    their patterns around it. The refusal names the largest files
+    selected instead, which are the ones a pattern can actually be
+    narrowed around.
+    """
+    big = MAX_MEMBER_BYTES - 50
+    files = {f"{name}.py": b"#" * big for name in "abcd"}
+    files["e.py"] = b"e = 1\n" * 50
+    # Four large files sit just under the total and the small one
+    # crosses it, which is the shape the first message got wrong.
+    assert 4 * big < MAX_READ_BYTES < 4 * big + len(files["e.py"])
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=FakeTree(files), patterns=["*.py"])
+    message = str(caught.value)
+    assert "The largest files selected so far are" in message
+    assert f"a.py at {big} bytes" in message
+    assert "e.py at" not in message
+
+
+def test_a_name_that_is_not_utf8_is_refused_by_name_and_directory():
+    """WINDOW: walk, a directory holding an entry whose name carries the
+    surrogate a non-UTF-8 filename decodes to.
+
+    THE REVIEW'S LOW. Such a name reached the snapshot header's
+    encode() as a UnicodeEncodeError and left the door as a 500. It is
+    a 422 now, from the walk, naming the directory and the entry as
+    Python spells it, because a path the snapshot could not put in its
+    own header is a path it could not describe.
+    """
+    bad = "caf\udce9.py"
+    with pytest.raises(SnapshotError) as caught:
+        walk(
+            tree=FakeTree({"src/a.py": b"x\n", f"src/{bad}": b"c\n"}),
+            patterns=["**/*.py"],
+        )
+    message = str(caught.value)
+    assert "src holds an entry whose name is not valid UTF-8" in message
+    assert repr(bad) in message
+
+
+def test_a_walk_holds_one_directory_per_level_and_closes_every_one():
+    """WINDOW: the FakeTree's open and close ledger across a whole walk.
+
+    ONE DESCRIPTOR PER LEVEL is what makes descending through
+    descriptors affordable: a directory is closed the moment its last
+    child has been seen, so the descriptors held are the depth and not
+    the width. Forty sibling directories under one root hold two at a
+    time, and every open is matched by a close when the walk finishes.
+    """
+    files = {f"d{n:02d}/x.py": b"x\n" for n in range(40)}
+    fake = FakeTree(files)
+    got = walk(tree=fake, patterns=["**/*.py"])
+    assert len(got) == 40
+    # Root, one child directory, and one member open at the widest
+    # point: never forty.
+    assert fake.max_open <= 3
+    assert sorted(fake.opened) == sorted(fake.closed)
+
+
+def test_a_tree_deeper_than_max_depth_is_refused():
+    """WINDOW: walk, a chain of directories one past MAX_DEPTH."""
+    deep = "/".join(f"d{n}" for n in range(MAX_DEPTH)) + "/x.py"
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=FakeTree({deep: b"x\n"}), patterns=["**/*.py"])
+    assert f"{MAX_DEPTH} directories deep" in str(caught.value)
+
+
+def test_an_entry_that_is_neither_file_nor_directory_is_refused_at_the_listing():
+    """WINDOW: walk, a fifo the listing already reports as such.
+
+    The still-tree half of the fifo case. The race above is the fifo
+    arriving after the look; this is the fifo that was there all along,
+    which the listing's own stat reports, and the walk refuses without
+    opening. Not a silent skip: a person's pattern selected it.
+    """
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=FakeTree({"a.py": b"x\n"}, others=["pipe.py"]), patterns=["*.py"])
+    assert "pipe.py is not a regular file" in str(caught.value)
+
+
+def test_a_symlink_target_is_resolved_for_the_decision_and_never_opened():
+    """WINDOW: the FakeTree's ledger across a walk over a contained link.
+
+    The one by-name resolution the walk still makes is about a link it
+    will not follow either way, so a race there can change which
+    refusal a person reads and never what is read. The ledger says the
+    link's path was neither opened nor read.
+    """
+    fake = FakeTree(
+        {"src/real.py": b"x\n"}, links={"src/alias.py": "/repo/src/real.py"}
+    )
+    got = walk(tree=fake, patterns=["**/*"])
+    assert [path for path, _ in got] == ["src/real.py"]
+    assert "src/alias.py" not in fake.opened
+    assert all(path != "src/alias.py" for path, _ in fake.reads)
+
+
+# ----- containment, spelled portably ---------------------------------
+
+
+def test_containment_is_a_common_path_check_and_not_a_prefix():
+    """WINDOW: contained, on the pairs a prefix check gets wrong.
+
+    THE REVIEW'S PORTABILITY MEDIUM. The first spelling appended "/"
+    and called startswith, which is the POSIX answer hardcoded; on a
+    platform whose separator is not "/" it called a directory a
+    stranger to its own parent. commonpath splits on the platform's
+    own separator and compares in its own terms. The limit is stated in
+    the docstring rather than hidden: the rest of the walk is POSIX,
+    and this is the one piece spelled portably.
+    """
+    assert contained("/repo", "/repo")
+    assert contained("/repo/a/b", "/repo")
+    assert contained("/repo/a", "/repo/")
+    assert not contained("/repo-old/x.py", "/repo")
+    assert not contained("/elsewhere", "/repo")
+    # Nothing in common at all, which commonpath reports by raising and
+    # this reports as not contained.
+    assert not contained("relative/path", "/repo")
+
+
+def test_a_file_over_the_bound_at_the_listing_is_refused_without_being_opened():
+    """WINDOW: the FakeTree's open ledger for a member the listing already
+    says is over MAX_MEMBER_BYTES.
+
+    The listing's size is checked before the open because a size is one
+    integer and an open is a descriptor. The refusal is the same either
+    way; what this asserts is the cost: the file was never opened, which
+    is the only thing the pre-check buys and the only way to tell it is
+    there.
+    """
+    fake = FakeTree({"a.py": b"x\n", "huge.py": b"#" * (MAX_MEMBER_BYTES + 1)})
+    with pytest.raises(SnapshotError) as caught:
+        walk(tree=fake, patterns=["*.py"])
+    assert "huge.py" in str(caught.value)
+    assert "huge.py" not in fake.opened

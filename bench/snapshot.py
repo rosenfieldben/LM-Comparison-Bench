@@ -20,17 +20,33 @@ the one thing this codebase has repeatedly paid for is a constant that
 existed twice. extract itself imports nothing from bench, so the edge
 is one directed hop and there is no cycle to reason about.
 
-NO I/O AND NO CLOCK. The walk is expressed over two injected callables
-and the composition over bytes the caller already read, so every case
-below is a value in and a value out. The caller owns the filesystem,
-the allowlist that says which roots may be walked at all, and the
-decision to store anything.
+NO I/O AND NO CLOCK. The walk is expressed over an injected Tree, a
+handful of operations a door implements over file descriptors and a
+test implements over a dict, and the composition over bytes the walk
+already read. Every case below is therefore a value in and a value out.
+The caller owns the filesystem, the allowlist that says which roots may
+be walked at all, and the decision to store anything.
+
+THE WALK READS THROUGH WHAT IT OPENED, and that sentence is the
+fourteenth review's H1. The first shape of this module looked at a
+tree by name and handed back paths, and the door then reopened each
+path by name to read it. Between the look and the reopen a file could
+be replaced by a symbolic link out of the root, a queued directory by a
+link to another tree, a regular file by a named pipe that blocks
+forever, or a small file by one that had grown past every bound; all
+four were reproduced. Now every directory is descended through the
+descriptor of its parent, every file is opened with no-follow flags and
+verified after opening against what the listing said it was, and the
+bytes are read through that descriptor and bounded at it. A tree that
+changes under the walk is refused, not read.
 """
 
 import fnmatch
 import hashlib
-from collections.abc import Callable, Iterable, Sequence
-from typing import Any
+import os.path
+from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import dataclass
+from typing import Any, NamedTuple, Protocol
 
 from bench.extract import (
     IMAGE_SIGNATURES,
@@ -50,15 +66,24 @@ from bench.extract import (
 # the version moves with it.
 __all__ = [
     "DEFAULT_EXCLUDES",
+    "DIRECTORY",
     "ENCODING_RULE",
+    "FILE",
+    "MAX_DEPTH",
     "MAX_MEMBER_BYTES",
     "MAX_READ_BYTES",
     "MAX_PATTERNS",
     "MAX_WALKED_ENTRIES",
+    "OTHER",
     "SNAPSHOT_EXTRACTOR",
     "SNAPSHOT_KIND",
     "SNAPSHOT_VERSION",
+    "SYMLINK",
+    "Entry",
+    "Handle",
+    "Opened",
     "SnapshotError",
+    "Tree",
     "compose",
     "contained",
     "digest_of",
@@ -174,7 +199,28 @@ MAX_PATTERNS = 20
 # minute is the whole reason this number exists. Twenty thousand entries
 # is several times this repository and well under a wait a person would
 # notice.
+#
+# COUNTED AS THEY STREAM, one per entry the tree yields and before that
+# entry is kept, which is what makes this a bound on time and memory
+# rather than a label. The first shape of the walk sorted each
+# directory's listing before counting it, so one directory of a million
+# children was materialised whole and only then refused: the fourteenth
+# review measured sixty thousand entries consumed before a twenty
+# thousand ceiling fired. The tree's entries() is an iterator, the walk
+# counts each one as it arrives, and a directory that is too wide is
+# refused holding at most this many of its children.
 MAX_WALKED_ENTRIES = 20_000
+
+# How many directories deep a walk will go, and it is a count of OPEN
+# DESCRIPTORS rather than a path length. The walk holds one open
+# directory per level, because descending through the parent's
+# descriptor rather than by name is what makes a swapped directory
+# unable to redirect it, and a descriptor is a bounded resource: past a
+# process's limit every open fails with "too many open files", which is
+# a true sentence about the process and a useless one about the tree. A
+# hundred and twenty-eight levels is past any source tree and under the
+# smallest per-process limit worth planning for.
+MAX_DEPTH = 128
 
 # The largest single file a snapshot may carry, in BYTES, and the same
 # number as the composed ceiling counts in CHARACTERS.
@@ -198,13 +244,13 @@ MAX_WALKED_ENTRIES = 20_000
 # applies it again because a pure function does not assume its caller.
 MAX_MEMBER_BYTES = MAX_COMPOSED_CHARS
 
-# The largest total a door may READ into memory before composing, and
+# The largest total the walk may READ into memory before composing, and
 # the one number here that is derived rather than chosen.
 #
 # UTF-8 ENCODES ONE CHARACTER IN AT MOST FOUR BYTES, so a selection
 # whose bytes exceed four times the composed ceiling cannot possibly
 # compose to fewer characters than that ceiling, whatever it encodes.
-# The door can therefore stop reading at this point and be certain it
+# The walk can therefore stop reading at this point and be certain it
 # has not refused a snapshot the composition would have accepted, which
 # is the property a cheaper bound would not have: refusing at
 # MAX_COMPOSED_CHARS BYTES would refuse a perfectly composable snapshot
@@ -212,9 +258,16 @@ MAX_MEMBER_BYTES = MAX_COMPOSED_CHARS
 # real over-ceiling refusal.
 #
 # WHAT IT BUYS is the memory. The per-file bound alone permits a
-# selection of two thousand files at 200 KB each, and the door reads
+# selection of two thousand files at 200 KB each, and the walk reads
 # every one of them before compose sees a byte. This bounds what is held
 # to 800 KB plus one file, and the composition still owns the refusal.
+#
+# THE REFUSAL NAMES THE LARGEST FILES SELECTED, not the one whose bytes
+# crossed the line. The line is crossed by whichever file happened to
+# come last in path order, which can be a six-byte file after four
+# large ones, and a person told to narrow their patterns around that
+# one would be narrowing around the wrong file. This was the original
+# commission and the first shape got it wrong.
 MAX_READ_BYTES = MAX_COMPOSED_CHARS * 4
 
 # The delimiters around each file in the composed snapshot.
@@ -398,81 +451,249 @@ def enforce_patterns(patterns: Sequence[str]) -> None:
 def contained(real: str, root: str) -> bool:
     """Whether a resolved path is the root or sits under it.
 
-    String containment rather than a walk up the tree because both
-    arguments are already fully resolved by the caller's realpath: no
-    symlink and no ".." survives resolution, so a prefix comparison is
-    the whole question. The separator is appended so that "/repo-old"
-    does not read as being under "/repo".
+    A COMMON-PATH CHECK RATHER THAN A PREFIX CHECK. Both arguments are
+    already fully resolved by the caller's realpath, so no symlink and
+    no ".." survives, and the question is only whether the root is an
+    ancestor. os.path.commonpath answers that in the platform's own
+    terms: it splits on the platform's separator, so "/repo-old" is not
+    under "/repo" because their common path is "/" and not "/repo",
+    and on Windows it compares drives and folds case the way ntpath
+    does. The first shape appended "/" and used startswith, which is
+    the POSIX answer hardcoded, and would have called C:\\repo\\project
+    a stranger to C:\\repo.
+
+    THE LIMIT, STATED RATHER THAN HIDDEN. The bench runs on POSIX today:
+    the door opens files with O_NOFOLLOW and O_DIRECTORY, the test suite
+    makes fifos, and LocalOnlyGuard reasons about loopback. This
+    function is the one piece of the containment story spelled
+    portably, and it is the only piece that has been. A ValueError from
+    commonpath, which is what different drives or a mixed absolute and
+    relative pair raise, is "nothing in common" and therefore not
+    contained.
 
     PUBLIC BECAUSE THE ALLOWLIST ASKS THE SAME QUESTION. The walk asks
     whether a symlink's target left the root; the door asks whether the
     root a request named sits under one of BENCH_REPO_ROOTS. One rule,
-    one separator bug to not have twice.
+    one containment bug to not have twice.
     """
-    return real == root or real.startswith(root.rstrip("/") + "/")
+    try:
+        common = os.path.commonpath([real, root])
+    except ValueError:
+        return False
+    return os.path.normcase(common) == os.path.normcase(os.path.normpath(root))
+
+
+# The kinds a directory entry can be, as the walk tells them apart. Four
+# rather than a boolean pair because the fourth is a refusal: a socket,
+# a device or a named pipe is none of the other three and must never be
+# opened for reading, since reading one can block with nothing to time
+# out.
+FILE = "file"
+DIRECTORY = "directory"
+SYMLINK = "symlink"
+OTHER = "other"
+
+# (device, inode): what a filesystem calls one object, however many
+# names it has. Two stats that agree on both are stats of the same
+# thing, and that agreement is the whole of how the walk knows the file
+# it opened is the file it listed.
+Identity = tuple[int, int]
+
+
+class Entry(NamedTuple):
+    """One child of a directory, as the listing described it.
+
+    The identity and size are recorded AT THE LISTING and checked again
+    after the open, which is the pair of moments the review's races sit
+    between. An entry is a claim; the descriptor is the fact.
+    """
+
+    name: str
+    kind: str
+    identity: Identity
+    size: int
+
+
+@dataclass(frozen=True)
+class Handle:
+    """An open directory: where it is, what it is, and the tree's token.
+
+    token is whatever the tree needs to address the open directory
+    again, a file descriptor for the door's tree and a dict key for a
+    test's, and this module never looks inside it. path is
+    repo-relative, "" for the root, and exists for messages and for
+    building member paths; it is never used to open anything.
+    """
+
+    path: str
+    identity: Identity
+    token: Any
+
+
+@dataclass(frozen=True)
+class Opened:
+    """A member as its OWN descriptor describes it, after opening.
+
+    Distinct from Entry on purpose: an Entry is what the parent listing
+    said, an Opened is what the object turned out to be once held. The
+    walk compares the two and refuses on any disagreement.
+    """
+
+    path: str
+    kind: str
+    identity: Identity
+    size: int
+    token: Any
+
+
+class Tree(Protocol):
+    """The filesystem as the walk sees it: eight operations, no names.
+
+    EVERY OPERATION AFTER open_root TAKES A HANDLE OR AN OPENED, never a
+    path. That is the containment: a directory is descended through the
+    handle of its parent, a member is opened through the handle of its
+    directory, and bytes are read through the member's own descriptor.
+    Nothing is ever reopened by name, so nothing a name can be made to
+    point at between two moments can redirect the walk.
+
+    The door implements this over os.open with dir_fd and O_NOFOLLOW; a
+    test implements it over a dict, which is how a swapped file, a
+    swapped directory and a fifo appearing after the look are ordinary
+    deterministic tests rather than races somebody has to win.
+    """
+
+    def root_path(self) -> str:
+        """The resolved absolute root, for containment decisions and
+        messages only."""
+        ...
+
+    def open_root(self) -> Handle: ...
+
+    def entries(self, handle: Handle) -> Iterator[Entry]:
+        """The children of an open directory, one at a time. An iterator
+        and not a list, so the walk can count and stop before a hostile
+        directory is materialised."""
+        ...
+
+    def descend(self, handle: Handle, entry: Entry) -> Handle:
+        """Open a child directory through its parent's handle, following
+        no link. Raises SnapshotError if it cannot."""
+        ...
+
+    def open_member(self, handle: Handle, entry: Entry) -> Opened:
+        """Open a child through its directory's handle, following no link
+        and blocking on nothing, and describe what was opened."""
+        ...
+
+    def read_member(self, opened: Opened, limit: int) -> bytes:
+        """At most limit + 1 bytes through the descriptor, so the walk can
+        see a file that grew without holding all of it."""
+        ...
+
+    def close_handle(self, held: Handle | Opened) -> None: ...
+
+    def link_target(self, handle: Handle, entry: Entry) -> str:
+        """Where a symbolic link points, resolved, for the containment
+        decision about it. Never used to open anything."""
+        ...
+
+
+def _describe(kind: str) -> str:
+    """A kind as a refusal names it."""
+    return {
+        FILE: "a regular file",
+        DIRECTORY: "a directory",
+        SYMLINK: "a symbolic link",
+    }.get(kind, "a socket, a device or a named pipe")
+
+
+def _changed(path: str, was: str, now: str) -> SnapshotError:
+    """The refusal for every race, worded once."""
+    return SnapshotError(
+        f"{path} changed while the snapshot was being taken: the walk "
+        f"listed {was} and opened {now}. A tree being edited or swapped "
+        "under a walk is refused rather than read, because the record "
+        "could not say what it read. Take the snapshot again on a still "
+        "tree."
+    )
 
 
 def walk(
     *,
-    entries: Callable[[str], Iterable[tuple[str, bool, bool]]],
-    resolve: Callable[[str], str],
+    tree: Tree,
     patterns: Sequence[str],
     excludes: Sequence[str] = DEFAULT_EXCLUDES,
-) -> list[str]:
-    """Every file under the root that the patterns select, in order.
+) -> list[tuple[str, bytes]]:
+    """Every file under the root the patterns select, READ, in order.
 
-    THE FILESYSTEM ARRIVES AS TWO CALLABLES so this module keeps the
-    property extract has: no I/O, so every case is a value in and a
-    value out and the adversarial ones are ordinary tests rather than
-    fixtures on disk.
+    THE WALK RETURNS BYTES AND NOT PATHS, and that is the whole of the
+    fourteenth review's H1. A walk that returned paths for a door to
+    reopen by name had a window between its look and the door's open,
+    and a name is exactly the thing that can be made to point somewhere
+    else inside a window. Reading here, through the descriptor the walk
+    itself opened, closes it: the thing read is the thing listed, or
+    the snapshot is refused.
 
-    entries(dir) yields (name, is_directory, is_symlink) for every child
-    of one repo-relative directory, "" being the root. is_directory is
-    answered WITHOUT following links, which costs nothing to honour
-    because the link flag is checked first anyway. A child that is
-    neither a regular file nor a directory, a socket or a device or a
-    fifo, is the door's to refuse: deciding that is a stat, this module
-    does no I/O, and a walk that handed one to the caller's read would
-    hand it something that may never return.
-
-    resolve(path) is realpath: the fully resolved absolute path, with
-    resolve("") giving the root's own.
+    WHAT IS VERIFIED, AND WHEN. Every directory entry arrives with a
+    kind, an identity and a size from the listing. A directory is
+    descended through its parent's handle and the child's identity
+    must match the listing's, or a directory swapped for another before
+    descent is refused. A member is opened through its directory's
+    handle with no link followed and nothing blocked on, and after the
+    open its own descriptor must say regular file, the same identity,
+    and a size within the bound, or a file swapped for a link, a fifo
+    or a device is refused before a byte is read. The read itself is
+    bounded at the descriptor, so a file that grew after its stat is
+    refused rather than held. The reviewer's two swaps and the fifo are
+    tombstones in the tests, driven through a dict-backed tree, and the
+    same three are driven through the door's descriptor-backed tree
+    with the swap made on disk between the look and the open.
 
     SYMLINKS ARE NEVER FOLLOWED, and the rule has two halves that are
-    not the same rule.
+    not the same rule. One that resolves OUTSIDE the root refuses the
+    whole snapshot, naming the link and its target: this is the
+    containment law, and a link is exactly the construct that would let
+    a walk of an allowed root read a file in a disallowed one. One that
+    resolves INSIDE the root is skipped and does not refuse, because its
+    bytes are already in the snapshot under the target's own path, and
+    following it would put one file in twice under two names. The one
+    corner where that and "never drop silently" pull apart is a
+    contained link whose target is itself excluded; it resolves toward
+    the exclusion, because an exclusion is the caller's own instruction.
+    The target is resolved for the DECISION and the message only; it is
+    never opened.
 
-    One that resolves OUTSIDE the root refuses the whole snapshot,
-    naming the link and its target. This is the containment law and it
-    is why resolve exists: a root allowlist bounds what may be walked,
-    and a link is exactly the construct that would let a walk of an
-    allowed root read a file in a disallowed one. A directory link is
-    checked identically, because a snapshot that descended through one
-    would carry files from wherever it pointed.
+    ONE OPEN DIRECTORY PER LEVEL AND NO MORE. The traversal is a stack
+    of (handle, remaining entries), so a directory is closed the moment
+    its last child has been seen, and the number of descriptors held is
+    the depth and not the width. MAX_DEPTH bounds that.
 
-    One that resolves INSIDE the root is skipped and does not refuse,
-    because its bytes are already in the snapshot under the target's own
-    path. Following it would put the same content in twice under two
-    names, and a snapshot that carries a file twice is not a reading of
-    a tree. There is one corner where this and "never drop silently"
-    pull apart: a contained link whose target is itself excluded leaves
-    the content out entirely. It resolves toward the exclusion, because
-    an exclusion is the caller's own instruction and honouring it is not
-    a drop.
+    ENTRIES ARE COUNTED AS THEY STREAM, before they are kept, so a
+    directory wider than MAX_WALKED_ENTRIES is refused holding at most
+    that many of its children and not all of them; see the constant.
 
     Exclusions are applied to directories as well as files, so an
-    excluded tree is never traversed at all. That is most of what keeps
-    MAX_WALKED_ENTRIES from firing on an ordinary repository with a
-    node_modules in it.
+    excluded tree is never opened at all, which is most of what keeps
+    the ceiling from firing on an ordinary repository with a
+    node_modules in it. A name that is not valid UTF-8 is refused by
+    name and directory, because a path the snapshot could not spell in
+    its own header is a path it could not describe.
     """
     enforce_patterns(patterns)
-    root = resolve("")
-    selected: list[str] = []
+    root_real = tree.root_path()
     matched = dict.fromkeys(patterns, 0)
+    selected: list[tuple[str, bytes]] = []
+    largest: list[tuple[int, str]] = []
+    total = 0
     seen = 0
-    pending = [""]
-    while pending:
-        current = pending.pop()
-        for name, is_directory, is_symlink in sorted(entries(current)):
+
+    def listing(handle: Handle) -> Iterator[Entry]:
+        # Counted per streamed entry and refused before the entry is
+        # kept; see MAX_WALKED_ENTRIES for the measurement that put the
+        # count here rather than after the sort.
+        nonlocal seen
+        gathered: list[Entry] = []
+        for entry in tree.entries(handle):
             seen += 1
             if seen > MAX_WALKED_ENTRIES:
                 raise SnapshotError(
@@ -481,12 +702,37 @@ def walk(
                     "repository, so the root is almost certainly a parent "
                     "of one. Point it at the clone itself."
                 )
-            path = f"{current}/{name}" if current else name
+            try:
+                entry.name.encode("utf-8")
+            except UnicodeEncodeError:
+                raise SnapshotError(
+                    f"{handle.path or 'the snapshot root'} holds an entry "
+                    f"whose name is not valid UTF-8 ({entry.name!r}). A "
+                    "snapshot names every file in a header line, and a "
+                    "name it cannot spell is a file it cannot describe. "
+                    "Rename it, or exclude it by pattern."
+                ) from None
+            gathered.append(entry)
+        gathered.sort(key=lambda entry: entry.name.encode("utf-8"))
+        return iter(gathered)
+
+    root = tree.open_root()
+    stack: list[tuple[Handle, Iterator[Entry]]] = [(root, iter(()))]
+    try:
+        stack[0] = (root, listing(root))
+        while stack:
+            handle, remaining = stack[-1]
+            entry = next(remaining, None)
+            if entry is None:
+                stack.pop()
+                tree.close_handle(handle)
+                continue
+            path = f"{handle.path}/{entry.name}" if handle.path else entry.name
             if excluded(path, excludes) is not None:
                 continue
-            if is_symlink:
-                target = resolve(path)
-                if not contained(target, root):
+            if entry.kind == SYMLINK:
+                target = tree.link_target(handle, entry)
+                if not contained(target, root_real):
                     raise SnapshotError(
                         f"{path} is a symbolic link to {target}, which is "
                         "outside the snapshot root. A snapshot reads one "
@@ -495,14 +741,83 @@ def walk(
                         "the tree it points into instead."
                     )
                 continue
-            if is_directory:
-                pending.append(path)
+            if entry.kind == DIRECTORY:
+                if len(stack) >= MAX_DEPTH:
+                    raise SnapshotError(
+                        f"{path} is {MAX_DEPTH} directories deep, which is "
+                        "past what a snapshot will descend. The walk holds "
+                        "one open directory per level, and a tree this deep "
+                        "is not a source tree. Narrow the root or the "
+                        "patterns."
+                    )
+                child = tree.descend(handle, entry)
+                if child.identity != entry.identity:
+                    tree.close_handle(child)
+                    raise _changed(path, "a directory", "a different one")
+                try:
+                    inner = listing(child)
+                except BaseException:
+                    tree.close_handle(child)
+                    raise
+                stack.append((child, inner))
                 continue
-            for pattern in patterns:
-                if matches(path, pattern):
-                    matched[pattern] += 1
-                    selected.append(path)
-                    break
+            if entry.kind != FILE:
+                raise SnapshotError(
+                    f"{path} is not a regular file, so the bench will not "
+                    "open it. A socket, a device or a named pipe under a "
+                    "source tree is refused rather than read, because "
+                    "reading one can block with nothing to time out."
+                )
+            selector = next((p for p in patterns if matches(path, p)), None)
+            if selector is None:
+                continue
+            matched[selector] += 1
+            # Before the open, because a size is one integer and an open
+            # is a descriptor; the same bound is checked again from the
+            # descriptor's own stat below, which is the one that counts.
+            if entry.size > MAX_MEMBER_BYTES:
+                raise _too_large(path, entry.size)
+            opened = tree.open_member(handle, entry)
+            try:
+                if opened.kind != FILE:
+                    raise _changed(path, "a regular file", _describe(opened.kind))
+                if opened.identity != entry.identity:
+                    raise _changed(path, "a regular file", "a different file")
+                if opened.size > MAX_MEMBER_BYTES:
+                    raise _too_large(path, opened.size)
+                data = tree.read_member(opened, MAX_MEMBER_BYTES)
+            finally:
+                tree.close_handle(opened)
+            if len(data) > MAX_MEMBER_BYTES:
+                raise SnapshotError(
+                    f"{path} grew past {MAX_MEMBER_BYTES} bytes while it was "
+                    "being read. The read is bounded at the descriptor, so "
+                    "nothing past the bound was held; a file being written "
+                    "under a walk is refused rather than read part-way."
+                )
+            total += len(data)
+            # Largest first, ties by path, so the three named are the
+            # same three however the selection happened to be ordered.
+            largest = sorted(
+                largest + [(len(data), path)], key=lambda item: (-item[0], item[1])
+            )[:3]
+            if total > MAX_READ_BYTES:
+                named = ", ".join(f"{p} at {n} bytes" for n, p in largest)
+                raise SnapshotError(
+                    f"the selection passed {MAX_READ_BYTES} bytes and the "
+                    "bench stopped reading. Even at four bytes per character "
+                    f"that cannot compose under the {MAX_COMPOSED_CHARS} "
+                    "character ceiling, so narrow the patterns. The largest "
+                    f"files selected so far are {named}."
+                )
+            selected.append((path, data))
+    finally:
+        # Every directory still open is closed, deepest first, whether
+        # the walk finished or refused part-way. A refusal that leaked a
+        # descriptor per attempt would turn a person retrying into a
+        # process out of descriptors.
+        for handle, _ in reversed(stack):
+            tree.close_handle(handle)
     if not selected:
         empty = ", ".join(repr(p) for p in patterns if not matched[p])
         raise SnapshotError(
@@ -510,7 +825,16 @@ def walk(
             "repo-relative and do not recurse unless they say so, so "
             "'*.py' is the top level and '**/*.py' is every depth."
         )
-    return _ordered(selected)
+    selected.sort(key=lambda member: member[0].encode("utf-8"))
+    return selected
+
+
+def _too_large(path: str, size: int) -> SnapshotError:
+    return SnapshotError(
+        f"{path} is {size} bytes, over the {MAX_MEMBER_BYTES} limit for "
+        "one file in a snapshot, and is refused before it is read. Nothing "
+        "is truncated, so narrow the patterns around it."
+    )
 
 
 def _ordered(paths: Iterable[str]) -> list[str]:
@@ -522,6 +846,9 @@ def _ordered(paths: Iterable[str]) -> list[str]:
     produce one snapshot: entries() may hand back a directory in
     whatever order the filesystem felt like, and a snapshot whose digest
     depended on that would be a rendition that could not be reproduced.
+    walk sorts its members by the same key; this is compose's own
+    spelling of the law, applied again because the ordering belongs to
+    the composition and not to whoever handed it the list.
     """
     return sorted(paths, key=lambda path: path.encode("utf-8"))
 
@@ -546,6 +873,17 @@ def enforce_text(path: str, content: bytes) -> None:
     is not a proof of binary content and does not claim to be: it is the
     cheap check that separates source from object files, archives and
     images, and anything it lets through still has to decode.
+
+    WHAT IT DOES NOT CATCH, stated so nobody reads "binary is refused"
+    as a guarantee. A file whose bytes contain no NUL and happen to
+    decode as UTF-8 passes both checks and is composed as text: a
+    base64 blob, a hex dump, a minified bundle, a data file of ASCII
+    digits. Those are not what the check is for. It exists so a
+    pattern that swept up a .o or a PNG refuses by name instead of
+    composing a field of mojibake, and the strict decode is what stops
+    the mojibake case; anything that is genuinely text by every test a
+    byte can be given is text as far as this module can know, and the
+    header's size and digest still identify exactly what was sent.
     """
     for media, signature in IMAGE_SIGNATURES.items():
         if all(content[at : at + len(magic)] == magic for at, magic in signature):

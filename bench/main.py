@@ -4,6 +4,7 @@ import asyncio
 import base64
 import binascii
 import contextlib
+import errno
 import hashlib
 import hmac
 import ipaddress
@@ -18,7 +19,7 @@ import sqlite3
 import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -40,7 +41,6 @@ from bench.extract import (
     IMAGE_KIND,
     IMAGE_MODALITY,
     MAX_ATTACHMENTS,
-    MAX_COMPOSED_CHARS,
     SNAPSHOT_KIND,
     CompositionError,
     ExtractionError,
@@ -6484,110 +6484,186 @@ def enforce_snapshot_root(
     return real
 
 
-def _snapshot_filesystem(
-    root: str,
-) -> tuple[Callable[[str], list[tuple[str, bool, bool]]], Callable[[str], str]]:
-    """The two callables bench.snapshot's walk is expressed over.
+class DescriptorTree:
+    """bench.snapshot's Tree, over file descriptors.
 
-    Written here because this is where I/O belongs, which is the same
-    split extraction has: the edge decides what may be touched, the pure
-    module decides what is valid. is_dir is asked WITHOUT following
-    links because the walk checks the link flag first and refuses or
-    skips on it; answering it with links followed would classify an
-    escaping directory link as a directory and hide it behind the
-    descent.
+    CONTAINMENT BY DESCRIPTOR, and the reason it is not containment by
+    path. The first shape of this door checked every path by name and
+    then reopened it by name to read it: a stat with follow_symlinks
+    off, then Path.read_bytes, which follows. The fourteenth review
+    reproduced what that window permits, and so did this repository
+    before the fix, deterministically: a selected file replaced by a
+    link out of the root between the stat and the read was followed and
+    its target stored; a queued directory replaced by a link before
+    descent was listed through and its files stored; a file replaced by
+    a fifo hung the request; a file that grew after its stat was read
+    whole. 04254ca called the no-follow stat "the whole guard". It was
+    half of one, and the half that does not matter: a check by name
+    guards the name, and the name is the thing being swapped.
 
-    A directory that cannot be listed is a SnapshotError rather than a
-    500, because the person's next action is to fix a permission or
-    narrow a pattern, and a traceback tells them neither.
+    NOTHING HERE IS OPENED BY NAME BUT THE ROOT. The root is opened once
+    with O_DIRECTORY and O_NOFOLLOW; every child directory is opened
+    through its parent's descriptor with the same flags; every member is
+    opened through its directory's descriptor with O_NOFOLLOW and
+    O_NONBLOCK; every read goes through the member's own descriptor and
+    is bounded there. What the walk verifies against those descriptors
+    is bench.snapshot's business and is written there; what this class
+    promises is that the descriptor it hands back describes the object
+    that was opened and nothing else, because fstat on a descriptor
+    cannot be redirected by a rename.
+
+    O_NOFOLLOW turns a link swapped in for a file or a directory into
+    ELOOP at the open, before anything is read; O_DIRECTORY turns a file
+    swapped in for a directory into ENOTDIR; O_NONBLOCK makes opening a
+    fifo with no writer return instead of wait, so its fstat can say
+    what it is and the walk can refuse it. A device that opens is
+    refused the same way. Both flag sets are stated in the review's
+    words on purpose: "opened with no-follow flags and verified after
+    opening".
+
+    The one operation that resolves a NAME is link_target, and it never
+    opens anything: it reads where a link points so the walk can decide
+    whether the link leaves the root, and that decision is about a link
+    the walk will not follow either way.
     """
 
-    def entries(where: str) -> list[tuple[str, bool, bool]]:
+    def __init__(self, root: str) -> None:
+        self.root = root
+
+    def root_path(self) -> str:
+        return self.root
+
+    @staticmethod
+    def _could_not(path: str, verb: str, exc: OSError) -> snapshot.SnapshotError:
+        return snapshot.SnapshotError(
+            f"{path or 'the snapshot root'} could not be {verb}: {exc.strerror or exc}."
+        )
+
+    def _directory(self, path: str, name: str, dir_fd: int | None) -> snapshot.Handle:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
         try:
-            with os.scandir(os.path.join(root, where) if where else root) as listing:
-                return [
-                    (
-                        entry.name,
-                        entry.is_dir(follow_symlinks=False),
-                        entry.is_symlink(),
+            fd = os.open(name, flags, dir_fd=dir_fd)
+        except OSError as exc:
+            # ONE MESSAGE FOR BOTH ERRNOS, because the kernel does not
+            # say which. With O_DIRECTORY and O_NOFOLLOW together, Linux
+            # answers a symbolic link where a directory was with ENOTDIR
+            # rather than ELOOP (measured: the directory-swap tombstone
+            # at the door), so telling the two apart would take a
+            # by-name stat this class exists to not make. Either way the
+            # object is refused before it is opened, which is the
+            # property; the sentence names both shapes rather than
+            # guessing one.
+            if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                raise snapshot.SnapshotError(
+                    f"{path or 'the snapshot root'} was listed as a directory "
+                    "and is no longer one the walk may open: a symbolic "
+                    "link, or not a directory at all. A tree being edited "
+                    "or swapped under a walk is refused rather than read."
+                ) from None
+            raise self._could_not(path, "opened", exc) from None
+        try:
+            info = os.fstat(fd)
+        except OSError as exc:
+            os.close(fd)
+            raise self._could_not(path, "described", exc) from None
+        return snapshot.Handle(path, (info.st_dev, info.st_ino), fd)
+
+    def open_root(self) -> snapshot.Handle:
+        return self._directory("", self.root, None)
+
+    def entries(self, handle: snapshot.Handle) -> Iterator[snapshot.Entry]:
+        # A generator, so the walk counts each child as it arrives and a
+        # directory too wide is refused before it is materialised. The
+        # descriptor is the handle's; scandir does not close it.
+        try:
+            with os.scandir(handle.token) as listing:
+                for entry in listing:
+                    info = entry.stat(follow_symlinks=False)
+                    if entry.is_symlink():
+                        kind = snapshot.SYMLINK
+                    elif stat.S_ISDIR(info.st_mode):
+                        kind = snapshot.DIRECTORY
+                    elif stat.S_ISREG(info.st_mode):
+                        kind = snapshot.FILE
+                    else:
+                        kind = snapshot.OTHER
+                    yield snapshot.Entry(
+                        entry.name, kind, (info.st_dev, info.st_ino), info.st_size
                     )
-                    for entry in listing
-                ]
         except OSError as exc:
-            raise snapshot.SnapshotError(
-                f"{where or 'the snapshot root'} could not be listed: {exc.strerror}."
-            ) from None
+            raise self._could_not(handle.path, "listed", exc) from None
 
-    def resolve(where: str) -> str:
-        return os.path.realpath(os.path.join(root, where) if where else root)
+    def descend(
+        self, handle: snapshot.Handle, entry: snapshot.Entry
+    ) -> snapshot.Handle:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        return self._directory(path, entry.name, handle.token)
 
-    return entries, resolve
-
-
-def _snapshot_members(root: str, paths: list[str]) -> list[tuple[str, bytes]]:
-    """Read the selected files, refusing anything a snapshot may not hold.
-
-    THE OBLIGATION walk's DOCSTRING NAMES. That module does no I/O, so
-    it cannot tell a regular file from a socket, a device or a fifo, and
-    it says the door must. Opening a fifo can block forever, which is
-    the one failure here that no timeout in this process would end.
-
-    THE SIZE IS CHECKED BEFORE THE READ, and compose checks it again
-    afterwards. Not a duplicated rule but the same rule at the only two
-    places it can be applied: a pure function handed bytes cannot un-read
-    them, and a boundary that read first would have spent the memory
-    before asking. The running total is bounded by MAX_READ_BYTES, which
-    is four times the composed ceiling precisely so that stopping here
-    can never refuse a snapshot the composition would have accepted.
-
-    follow_symlinks=False ON THE STAT AND THE READ FOLLOWS THEM, which
-    is deliberate rather than an oversight. walk never returns a link, so
-    on a still tree the flag changes nothing; on a tree edited between
-    the walk and the read it is the whole guard. A file replaced by a
-    symlink in that window fails the regular-file check and is refused,
-    where a following stat would have reported the TARGET as a regular
-    file and the read would then have followed the link out of the root.
-    """
-    members: list[tuple[str, bytes]] = []
-    running = 0
-    for path in paths:
-        full = os.path.join(root, path)
+    def open_member(
+        self, handle: snapshot.Handle, entry: snapshot.Entry
+    ) -> snapshot.Opened:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
         try:
-            info = os.stat(full, follow_symlinks=False)
+            fd = os.open(entry.name, flags, dir_fd=handle.token)
         except OSError as exc:
-            raise snapshot.SnapshotError(
-                f"{path} could not be read: {exc.strerror}."
-            ) from None
-        if not stat.S_ISREG(info.st_mode):
-            raise snapshot.SnapshotError(
-                f"{path} is not a regular file, so the bench will not open "
-                "it. A socket, a device or a named pipe under a source "
-                "tree is refused rather than read, because reading one "
-                "can block with nothing to time out."
-            )
-        if info.st_size > snapshot.MAX_MEMBER_BYTES:
-            raise snapshot.SnapshotError(
-                f"{path} is {info.st_size} bytes, over the "
-                f"{snapshot.MAX_MEMBER_BYTES} limit for one file in a "
-                "snapshot, and is refused before it is read. Nothing is "
-                "truncated, so narrow the patterns around it."
-            )
-        running += info.st_size
-        if running > snapshot.MAX_READ_BYTES:
-            raise snapshot.SnapshotError(
-                f"the selection passed {snapshot.MAX_READ_BYTES} bytes at "
-                f"{path} and the bench stopped reading. Even at four bytes "
-                "per character that cannot compose under the "
-                f"{MAX_COMPOSED_CHARS} character ceiling, so "
-                "narrow the patterns."
-            )
+            if exc.errno == errno.ELOOP:
+                raise snapshot.SnapshotError(
+                    f"{path} was listed as a regular file and is now a "
+                    "symbolic link. A tree being edited or swapped under a "
+                    "walk is refused rather than read."
+                ) from None
+            raise self._could_not(path, "opened", exc) from None
         try:
-            members.append((path, Path(full).read_bytes()))
+            info = os.fstat(fd)
         except OSError as exc:
-            raise snapshot.SnapshotError(
-                f"{path} could not be read: {exc.strerror}."
-            ) from None
-    return members
+            os.close(fd)
+            raise self._could_not(path, "described", exc) from None
+        if stat.S_ISREG(info.st_mode):
+            kind = snapshot.FILE
+        elif stat.S_ISDIR(info.st_mode):
+            kind = snapshot.DIRECTORY
+        else:
+            kind = snapshot.OTHER
+        return snapshot.Opened(path, kind, (info.st_dev, info.st_ino), info.st_size, fd)
+
+    def read_member(self, opened: snapshot.Opened, limit: int) -> bytes:
+        # At most limit + 1 bytes, so the walk can tell "grew past the
+        # bound" from "exactly at it" without this holding the growth.
+        chunks: list[bytes] = []
+        got = 0
+        while got <= limit:
+            try:
+                chunk = os.read(opened.token, min(65536, limit + 1 - got))
+            except OSError as exc:
+                raise self._could_not(opened.path, "read", exc) from None
+            if not chunk:
+                break
+            chunks.append(chunk)
+            got += len(chunk)
+        return b"".join(chunks)
+
+    def close_handle(self, held: snapshot.Handle | snapshot.Opened) -> None:
+        try:
+            os.close(held.token)
+        except OSError:
+            # Best effort. A close that fails cannot un-read anything,
+            # and a refusal raised from inside a close would hide the
+            # refusal that was already on its way.
+            pass
+
+    def link_target(self, handle: snapshot.Handle, entry: snapshot.Entry) -> str:
+        path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+        try:
+            raw = os.readlink(entry.name, dir_fd=handle.token)
+        except OSError as exc:
+            raise self._could_not(path, "read as a link", exc) from None
+        # Resolved BY NAME, which is the one place in this class that
+        # is, and it is safe for the reason the docstring gives: the
+        # answer decides whether to refuse a link the walk will not
+        # follow in either case. A race here can change which refusal a
+        # person reads, never what is read.
+        return os.path.realpath(os.path.join(self.root, handle.path, raw))
 
 
 def _clone_state(root: str) -> tuple[str | None, bool | None]:
@@ -6665,30 +6741,30 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     is the same and INSERT OR IGNORE does the rest.
 
     SYNCHRONOUS ON THE EVENT LOOP, bounded rather than offloaded. The
-    walk stops at MAX_WALKED_ENTRIES and the read at MAX_READ_BYTES, so
-    the worst case is twenty thousand stat calls and eight hundred
-    kilobytes, which is the same order as the base64 decode and
-    extraction create_attachment already does inline.
+    walk stops at MAX_WALKED_ENTRIES entries, MAX_DEPTH open directories
+    and MAX_READ_BYTES read, so the worst case is twenty thousand stats,
+    a few thousand opens and eight hundred kilobytes, which is the same
+    order as the base64 decode and extraction create_attachment already
+    does inline.
 
-    THREE MOMENTS AND NOT ONE, said here because a manifest reads like a
-    photograph and is not. The walk, the reads and the git query happen
-    in that order and nothing locks the tree between them, so a file
-    edited mid-request can be selected and then read in its new state,
-    and a commit made mid-request can move under the flag. WHAT IS
-    ACTUALLY IDENTIFIED IS THE BYTES: every member's digest is computed
-    from the bytes that were read and the snapshot's own digest is over
-    the text those produced, so the record is exact about what the models
-    saw. The head and the dirty flag are the softer half of the
+    TWO MOMENTS AND NOT ONE, said here because a manifest reads like a
+    photograph and is not. The walk reads each file at the moment it
+    looks at it, through the descriptor it opened, and refuses if what
+    it opened is not what it listed; that is one moment per file and
+    it is exact about the bytes. The git query is a second moment,
+    after the walk, and nothing locks the tree between them, so a
+    commit made mid-request can move under the flag. WHAT IS IDENTIFIED
+    IS THE BYTES: every member's digest is computed from the bytes that
+    were read and the snapshot's own digest is over the text those
+    produced. The head and the dirty flag are the softer half of the
     provenance and are recorded as read locally rather than as a
     guarantee about the instant of the walk.
     """
     root = enforce_snapshot_root(
         body.root, app.state.repo_roots, resolve=_resolved_directory
     )
-    entries, resolve = _snapshot_filesystem(root)
     try:
-        paths = snapshot.walk(entries=entries, resolve=resolve, patterns=body.patterns)
-        members = _snapshot_members(root, paths)
+        members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
         head, dirty = _clone_state(root)
         built = snapshot.compose(
             members, patterns=body.patterns, head=head, dirty=dirty
