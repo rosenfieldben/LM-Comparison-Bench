@@ -15,6 +15,7 @@ digest ran the same tasks, and that is checkable rather than promised.
 import hashlib
 import json
 import re
+import reprlib
 from typing import Any
 
 from bench.extract import MAX_ATTACHMENTS
@@ -63,6 +64,10 @@ MAX_PATTERN_CHARS = 500
 # extract without reaching the boundary that imports it.
 PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind", "capture_id")
 PIN_KINDS = ("document", "image", "snapshot")
+# The largest capture id a pin may name: SQLite's rowid range, the bound
+# bench.main.MAX_SQLITE_ROWID puts on RenditionPin (a test holds the two
+# equal; importing it here would import the whole application).
+MAX_CAPTURE_ID = 2**63 - 1
 
 # THE FOUR A PIN MUST NAME, and the fifth it may. capture_id is the
 # fourteenth review's H2: which CAPTURE of a snapshot a pin means, a row
@@ -95,6 +100,24 @@ class DatasetError(RuntimeError):
     configuration errors: the caller's only sensible response is to show
     the message, and the message is written to be shown.
     """
+
+
+# A decoded value as a refusal quotes it, bounded in depth and length.
+# NOT repr(): json.loads decodes a list nested deeper than repr can walk
+# (about 45000 levels on CPython 3.14), and the refusal naming that
+# value then raised RecursionError, which escaped both doors as a 500 in
+# place of the line's sentence. A value the parser was never going to
+# accept is named, not reproduced.
+# Attributes and not keyword arguments, which Repr takes only from 3.12.
+_QUOTE = reprlib.Repr()
+_QUOTE.maxlevel = 2
+_QUOTE.maxlist = _QUOTE.maxdict = 4
+_QUOTE.maxstring = 60
+_QUOTE.maxlong = 40
+
+
+def _quoted(value: object) -> str:
+    return _QUOTE.repr(value)
 
 
 def _fail(line_no: int | None, message: str) -> None:
@@ -142,16 +165,23 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
     if kind not in SCORERS:
         _fail(
             line_no,
-            f"scorer kind {spec.get('kind')!r} is not one of {', '.join(SCORERS)}",
+            f"scorer kind {_quoted(spec.get('kind'))} is not one of "
+            f"{', '.join(SCORERS)}",
         )
     out: dict[str, Any] = {"kind": kind}
     if kind == "regex":
         pattern = _checked_text(
             spec.get("pattern"), line_no, "scorer.pattern", MAX_PATTERN_CHARS, True
         )
+        # Not only re.error: a repeat count past what the engine can hold
+        # ("a{4294967296}") raises OverflowError, incompatible global
+        # flags ("(?a)(?u)") raise a plain ValueError, and a few hundred
+        # nested groups raise RecursionError inside MAX_PATTERN_CHARS.
+        # Each escaped this function as a 500 in place of the line's
+        # refusal.
         try:
             re.compile(pattern or "")
-        except re.error as exc:
+        except (re.error, ValueError, OverflowError, RecursionError) as exc:
             _fail(line_no, f"scorer.pattern is not a valid regex: {exc}")
         out["pattern"] = pattern
     if kind == JUDGE_SCORER and "pass_threshold" in spec:
@@ -166,7 +196,12 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
                 line_no,
                 f"scorer.pass_threshold must be a number, got {type(raw).__name__}",
             )
-        threshold = float(raw)
+        # An int too large for a float raises OverflowError rather than
+        # becoming one; it is outside [0, 1] all the same.
+        try:
+            threshold = float(raw)
+        except OverflowError:
+            _fail(line_no, f"scorer.pass_threshold {_quoted(raw)} is outside [0, 1]")
         if not 0.0 <= threshold <= 1.0:
             _fail(line_no, f"scorer.pass_threshold {threshold} is outside [0, 1]")
         out["pass_threshold"] = threshold
@@ -287,17 +322,26 @@ def _checked_attachments(
         if kind not in PIN_KINDS:
             _fail(
                 line_no,
-                f"{at}.kind is {kind!r}, not one of {', '.join(PIN_KINDS)}",
+                f"{at}.kind is {_quoted(kind)}, not one of {', '.join(PIN_KINDS)}",
             )
         pin["kind"] = kind
         capture = entry.get("capture_id")
         if capture is not None:
             # A positive integer or nothing. bool is refused explicitly
             # because True is an int to isinstance and "capture_id: true"
-            # is a typo, not a row.
-            if isinstance(capture, bool) or not isinstance(capture, int) or capture < 1:
+            # is a typo, not a row. Bounded above by SQLite's rowid range,
+            # as RenditionPin is at the API boundary: past it the pin was
+            # stored here and then crashed the experiment doors that look
+            # the capture up.
+            if (
+                isinstance(capture, bool)
+                or not isinstance(capture, int)
+                or not 1 <= capture <= MAX_CAPTURE_ID
+            ):
                 _fail(
-                    line_no, f"{at}.capture_id is {capture!r}, not a positive integer"
+                    line_no,
+                    f"{at}.capture_id is {_quoted(capture)}, not a positive "
+                    "integer in SQLite's rowid range",
                 )
             if kind != "snapshot":
                 _fail(
@@ -333,9 +377,12 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
             continue
         if len(tasks) >= MAX_TASKS:
             _fail(line_no, f"more than {MAX_TASKS} tasks; split the file")
+        # RecursionError too: a line of arrays nested past the decoder's
+        # depth raises it rather than a ValueError, well inside the byte
+        # ceiling, and it escaped as a 500 in place of the line's refusal.
         try:
             row = json.loads(line)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             _fail(line_no, f"not valid JSON: {exc}")
         if not isinstance(row, dict):
             _fail(line_no, f"expected an object, got {type(row).__name__}")

@@ -8,6 +8,7 @@ not say which line is a refusal the author cannot act on.
 
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -360,6 +361,163 @@ def test_an_invalid_regex_is_refused_at_load():
     assert "not a valid regex" in str(exc.value)
 
 
+def test_a_repeat_count_the_engine_cannot_hold_is_refused_on_its_line():
+    """WINDOW: parse_dataset over a regex whose repeat count re.compile
+    raises OverflowError for, rather than re.error.
+
+    It escaped the parser as a 500, so the builder showed "HTTP 500" and
+    nothing beside the row. It is the line's refusal like any other bad
+    pattern."""
+    with pytest.raises(OverflowError):
+        re.compile("a{4294967296}")
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(id="t1", prompt="a"),
+                line(
+                    id="t2",
+                    prompt="a",
+                    scorer={"kind": "regex", "pattern": "a{4294967296}"},
+                ),
+            )
+        )
+
+    assert str(exc.value).startswith("line 2: scorer.pattern is not a valid regex")
+
+
+def test_a_line_nested_past_the_decoders_depth_is_refused_on_its_line():
+    """WINDOW: parse_dataset over a line of arrays nested deeper than
+    json.loads can decode, far inside the byte ceiling.
+
+    json.loads raises RecursionError there, not ValueError, and it
+    escaped the parser as a 500."""
+    deep = "[" * 100_000 + "]" * 100_000
+    with pytest.raises(RecursionError):
+        json.loads(deep)
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(id="t1", prompt="a"), deep))
+
+    assert str(exc.value).startswith("line 2: not valid JSON")
+
+
+def test_incompatible_regex_flags_are_refused_on_their_line():
+    """WINDOW: parse_dataset over a pattern whose global flags conflict.
+
+    re.compile raises a plain ValueError for "(?a)(?u)", neither re.error
+    nor OverflowError, and it escaped the parser as a 500."""
+    with pytest.raises(ValueError):
+        re.compile("(?a)(?u)")
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1", prompt="a", scorer={"kind": "regex", "pattern": "(?a)(?u)"}
+                )
+            )
+        )
+
+    assert str(exc.value).startswith("line 1: scorer.pattern is not a valid regex")
+
+
+def test_a_pattern_of_nested_groups_is_refused_on_its_line():
+    """WINDOW: parse_dataset over a pattern of MAX_PATTERN_CHARS open
+    groups, the longest pattern the parser takes.
+
+    On CPython 3.14 re.compile raises RecursionError for it rather than
+    re.error, which escaped the parser as a 500; whatever the engine
+    raises, the line is refused in the parser's words."""
+    from bench.datasets import MAX_PATTERN_CHARS
+
+    pattern = "(" * MAX_PATTERN_CHARS
+    with pytest.raises((re.error, RecursionError)):
+        re.compile(pattern)
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(id="t1", prompt="a", scorer={"kind": "regex", "pattern": pattern})
+            )
+        )
+
+    assert str(exc.value).startswith("line 1: scorer.pattern is not a valid regex")
+
+
+def test_a_refusal_quotes_a_large_value_in_brief():
+    """WINDOW: the sentences parse_dataset writes for a scorer kind that
+    is a long string, a long list and a huge integer, and for a threshold
+    that is a huge integer.
+
+    A refusal names the value it refuses, bounded in length: a 10000
+    character kind quoted whole would bury the sentence, and the quoting
+    is bounded by design (bench.datasets._QUOTE)."""
+    cases = [
+        {"kind": "k" * 10_000},
+        {"kind": list(range(10_000))},
+        {"kind": 10**1000},
+        {"kind": "judge", "pass_threshold": 10**1000},
+    ]
+    for scorer in cases:
+        with pytest.raises(DatasetError) as exc:
+            parse_dataset(dataset(line(id="t1", prompt="a", rubric="r", scorer=scorer)))
+        assert str(exc.value).startswith("line 1: scorer")
+        assert len(str(exc.value)) < 200, str(exc.value)[:120]
+
+
+def test_a_value_too_deep_to_repr_is_named_on_its_line():
+    """WINDOW: parse_dataset over lines whose scorer kind, pin kind or
+    capture id is a list nested deeper than repr() can walk but shallower
+    than json.loads refuses.
+
+    Each is refused, but the refusal quoted the value with repr(), which
+    raised RecursionError and escaped both doors as a 500. The value is
+    now quoted to a bounded depth."""
+    depth = 60_000
+    deep = "[" * depth + "]" * depth
+    # PRE-STATE: this depth decodes, and repr() of it overflows.
+    value = json.loads(deep)
+    with pytest.raises(RecursionError):
+        repr(value)
+    pin = (
+        '{"digest": "' + "a" * 64 + '", "extractor": "x", '
+        '"extractor_version": "1", "kind": '
+    )
+    lines = [
+        '{"id": "t", "prompt": "p", "scorer": {"kind": ' + deep + "}}",
+        '{"id": "t", "prompt": "p", "attachments": [' + pin + deep + "}]}",
+        '{"id": "t", "prompt": "p", "attachments": ['
+        + pin
+        + '"snapshot", "capture_id": '
+        + deep
+        + "}]}",
+    ]
+    for text in lines:
+        with pytest.raises(DatasetError) as exc:
+            parse_dataset(dataset(line(id="t0", prompt="a"), text))
+        assert str(exc.value).startswith("line 2: "), str(exc.value)[:80]
+        assert len(str(exc.value)) < 300
+
+
+def test_a_threshold_too_large_for_a_float_is_outside_the_range():
+    """WINDOW: parse_dataset over an integer pass_threshold of 400 digits.
+
+    float() raises OverflowError for it rather than returning a float,
+    and that escaped the parser as a 500; it is outside [0, 1] like any
+    other number past 1."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(
+            dataset(
+                line(
+                    id="t1",
+                    prompt="a",
+                    rubric="r",
+                    scorer={"kind": "judge", "pass_threshold": 10**400},
+                )
+            )
+        )
+
+    assert str(exc.value).startswith("line 1: scorer.pass_threshold 1000")
+    assert str(exc.value).endswith("is outside [0, 1]")
+
+
 def test_an_empty_file_is_refused():
     with pytest.raises(DatasetError) as exc:
         parse_dataset(b"\n\n")
@@ -657,7 +815,9 @@ def test_a_pin_capture_is_a_positive_integer_or_refused():
     A capture id is a row number and nothing else may stand in for one:
     a string, a bool (an int to isinstance, and "capture_id: true" is a
     typo), zero and a negative are all refused at the line that wrote
-    them.
+    them; so is one past SQLite's rowid range, which the parser stored
+    and the experiment doors then crashed looking up. The last id in the
+    range is a row number like any other.
     """
     from bench.datasets import DatasetError, parse_dataset
 
@@ -667,7 +827,7 @@ def test_a_pin_capture_is_a_positive_integer_or_refused():
         "extractor_version": "1",
         "kind": "snapshot",
     }
-    for bad in ("7", True, 0, -3):
+    for bad in ("7", True, 0, -3, 2**63, 10**30):
         raw = (
             json.dumps(
                 {
@@ -690,6 +850,28 @@ def test_a_pin_capture_is_a_positive_integer_or_refused():
         + "\n"
     ).encode()
     assert parse_dataset(good)["tasks"][0]["attachments"][0]["capture_id"] == 7
+    last = (
+        json.dumps(
+            {
+                "id": "t",
+                "prompt": "p",
+                "attachments": [{**snapshot, "capture_id": 2**63 - 1}],
+            }
+        )
+        + "\n"
+    ).encode()
+    assert parse_dataset(last)["tasks"][0]["attachments"][0]["capture_id"] == 2**63 - 1
+
+
+def test_the_capture_bound_is_the_api_boundarys():
+    """WINDOW: MAX_CAPTURE_ID against bench.main.MAX_SQLITE_ROWID.
+
+    The parser mirrors the bound RenditionPin puts on a capture id rather
+    than importing the application; the two must not drift apart."""
+    from bench import main
+    from bench.datasets import MAX_CAPTURE_ID
+
+    assert MAX_CAPTURE_ID == main.MAX_SQLITE_ROWID
 
 
 # ---- Phase N1: the two summaries a stored dataset records.
