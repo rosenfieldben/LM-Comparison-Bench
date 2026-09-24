@@ -165,6 +165,15 @@ CREATE TABLE IF NOT EXISTS snapshot_captures (
     excludes_json TEXT NOT NULL,
     captured_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS datasets (
+    digest TEXT PRIMARY KEY NOT NULL,
+    name TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    content BLOB NOT NULL,
+    task_count INTEGER NOT NULL,
+    scorers_json TEXT NOT NULL,
+    cites_documents INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS results (
     id INTEGER PRIMARY KEY,
     run_id INTEGER NOT NULL REFERENCES runs(id),
@@ -601,6 +610,32 @@ MIGRATIONS = [
     # below, and rows written before it are read as they are and
     # backfilled into it at boot (see connect).
     ("attachment_extractions", "manifest_json", "TEXT"),
+    # Phase N, stored datasets. NO ENTRY HERE, for the reason the Phase
+    # I, K and L tables needed none: `datasets` is a whole new table, and
+    # CREATE TABLE IF NOT EXISTS in SCHEMA creates it on any database,
+    # new or old, which is what makes it additive by construction.
+    # Proven against tests/fixtures/pre_n_schema.sql.
+    #
+    # KEYED BY DIGEST AND BY NOTHING ELSE. A stored dataset is cited the
+    # way an attachment is, by the sha256 of its bytes, so the identity a
+    # later record carries is the identity of the TASKS and not of a row
+    # that could be renamed. There is no id column to cite by mistake.
+    #
+    # "PRIMARY KEY NOT NULL" AND NOT "PRIMARY KEY" ALONE, which is an
+    # sqlite quirk rather than a belt: a non-INTEGER primary key admits
+    # NULL unless the column says otherwise, kept for compatibility with
+    # a bug in early versions (https://www.sqlite.org/lang_createtable.html,
+    # "According to the SQL standard, PRIMARY KEY should always imply NOT
+    # NULL. Unfortunately, due to a bug in some early versions, this is
+    # not the case in SQLite", read 2026-09-23). A dataset with no
+    # identity is the one row this table must never hold.
+    #
+    # THREE SUMMARIES BESIDE THE BYTES, each a fact the parser established
+    # when the bytes were stored: how many tasks, which scorer kinds, and
+    # whether any task cites a document. They are what a list can show
+    # and a browser can decide on without reading a body or parsing one;
+    # the content is authoritative and these never disagree with it,
+    # because they are computed from one parse of it in one statement.
 ]
 
 
@@ -2647,6 +2682,152 @@ def apply_reconciliation(
                 result_id,
             ),
         )
+
+
+# ---- Phase N: datasets, stored once by content digest.
+
+
+# Everything about a stored dataset except its body, named once for the
+# reason ATTACHMENT_COLUMNS is: the list and the detail are one shape,
+# and leaving the content out of the list is a decision recorded in one
+# place rather than a column list somebody has to remember not to extend.
+# A page of datasets is exactly the caller that must not load a page of
+# datasets' worth of tasks to show their names.
+DATASET_COLUMNS = (
+    "digest",
+    "name",
+    "created_at",
+    "task_count",
+    "scorers_json",
+    "cites_documents",
+)
+
+
+def _dataset_row(row: sqlite3.Row) -> dict[str, Any]:
+    """One datasets row decoded: scorers as a list, the flag as a bool.
+
+    Decoded here for the reason _experiment_row gives: this module is the
+    one place that knows how the summary is serialized. The content, when
+    the reader selected it, comes back as bytes, because the bytes are
+    what the digest is over and a str here would be a decode somebody
+    else chose.
+    """
+    out = dict(row)
+    out["scorers"] = json.loads(out.pop("scorers_json"))
+    out["cites_documents"] = bool(out["cites_documents"])
+    if "content" in out:
+        out["content"] = bytes(out["content"])
+    return out
+
+
+def save_dataset(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[str, Any]:
+    """Store one dataset, or return the row that already holds its bytes.
+
+    Content-addressed like an attachment and for the same reason: the
+    digest is the identity every experiment cites, so a second copy of
+    identical bytes would be a second row answering to one identity.
+
+    THE EARLIER NAME WINS on identical content, which is
+    save_attachment's rule. The row is keyed by what the tasks ARE, so
+    the name is only one of the names those bytes have had, and a second
+    name is not a second dataset. Keeping the first means the library
+    lists these tasks under the name every experiment created from them
+    so far recorded, since experiments.dataset_name copies the stored
+    name at creation; overwriting it would leave the library calling the
+    bytes one thing and those records calling them another. The caller
+    gets the stored row back, so a person who stored `eval-v2` and was
+    answered `eval` can see that the bench already had these tasks.
+
+    INSERT OR IGNORE and then a read inside the same transaction, because
+    the primary key is the thing that enforces this and a read-then-write
+    would leave a gap between the two. The read is also the proof that a
+    row exists at all: IGNORE swallows EVERY constraint failure and not
+    only the one it is here for, so a record missing a NOT NULL field is
+    silently not inserted, and the raise below turns that into an error
+    instead of a response describing nothing.
+    """
+    with conn:
+        conn.execute(
+            """INSERT OR IGNORE INTO datasets
+               (digest, name, created_at, content, task_count, scorers_json,
+                cites_documents)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (
+                record["digest"],
+                record["name"],
+                _now(),
+                record["content"],
+                record["task_count"],
+                json.dumps(record["scorers"]),
+                1 if record["cites_documents"] else 0,
+            ),
+        )
+        row = conn.execute(
+            f"SELECT {', '.join(DATASET_COLUMNS)} FROM datasets WHERE digest = ?",
+            (record["digest"],),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(
+                f"the datasets row for {record['digest'][:12]} was not "
+                "created. INSERT OR IGNORE suppresses every constraint "
+                "failure, so this is a record that violates one of the NOT "
+                "NULLs on the table rather than a duplicate."
+            )
+    return _dataset_row(row)
+
+
+def get_dataset(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
+    """One stored dataset, summary AND content, or None.
+
+    THE ONE READER THAT SELECTS THE BODY, and unlike attachment_content
+    it has callers that serve it: a dataset is the operator's own tasks,
+    and handing them back by digest is what makes a citation checkable.
+    An experiment records the digest; this is where the bytes behind it
+    can be read again, which is why the export can cite a dataset without
+    carrying one.
+    """
+    row = conn.execute(
+        f"SELECT {', '.join(DATASET_COLUMNS)}, content FROM datasets WHERE digest = ?",
+        (digest,),
+    ).fetchone()
+    return _dataset_row(row) if row is not None else None
+
+
+def dataset_bytes(conn: sqlite3.Connection, digest: str) -> dict[str, Any] | None:
+    """The name and content stored under one digest, and nothing else.
+
+    WHAT EVERY PARSE READS, split from get_dataset so the doors that turn
+    a stored dataset into tasks (create, start, score, the report and
+    the export) depend on the two columns the parser needs and on no
+    summary. The summary is derived and the content is authoritative;
+    reading the summary on the way to the parse would let a malformed
+    summary refuse a dataset whose tasks are perfectly readable.
+    """
+    row = conn.execute(
+        "SELECT name, content FROM datasets WHERE digest = ?", (digest,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {"name": row["name"], "content": bytes(row["content"])}
+
+
+def list_datasets(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any]]:
+    """Every stored dataset's summary, newest first, bounded, no content.
+
+    ORDERED BY created_at AND NOT BY rowid ALONE. This table has no
+    INTEGER PRIMARY KEY, and sqlite documents that VACUUM "may change the
+    ROWIDs of entries in any tables that do not have an explicit INTEGER
+    PRIMARY KEY" (https://www.sqlite.org/lang_vacuum.html, read
+    2026-09-23), which the README recommends running. The timestamp is
+    ISO 8601 in UTC to the microsecond, so text order is time order; the
+    rowid only breaks a tie inside one microsecond.
+    """
+    rows = conn.execute(
+        f"SELECT {', '.join(DATASET_COLUMNS)} FROM datasets"
+        " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [_dataset_row(row) for row in rows]
 
 
 # ---- Phase I: experiments as the aggregate above groups, and scores.

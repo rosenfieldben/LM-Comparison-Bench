@@ -17800,3 +17800,1340 @@ def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
         },
     )
     assert "Use native mode" in alone.json()["detail"]
+
+
+# =====================================================================
+# ---- Phase N1: the datasets door, and three doors that take a digest.
+#
+# Every test below names its window. The path workflow the README walks
+# through is proven unchanged by the tests that drive it, in this file
+# and the rest of the suite, none of them edited: the 1091 tests of the
+# suite before this section existed pass unmodified after it.
+# =====================================================================
+
+from bench.datasets import DatasetError, parse_dataset
+
+
+def dataset_text(*rows):
+    """The exact text write_dataset writes, so a stored dataset and a file
+    can hold identical bytes and the two doors can be compared on them."""
+    return "\n".join(json.dumps(r) for r in rows) + "\n"
+
+
+def store_dataset(client, name, *rows, content=None):
+    body = {
+        "name": name,
+        "content": dataset_text(*rows) if content is None else content,
+    }
+    return client.post("/datasets", json=body)
+
+
+def dataset_rows(client):
+    return client.app.state.db.execute("SELECT COUNT(*) c FROM datasets").fetchone()[
+        "c"
+    ]
+
+
+def digest_body(digest, **overrides):
+    """experiment_body with the digest door instead of the path door."""
+    body = experiment_body(None, **overrides)
+    body.pop("dataset_path")
+    body["dataset_digest"] = digest
+    return body
+
+
+def drain_progress(client, eid):
+    last = None
+    with client.stream("GET", f"/experiments/{eid}/progress") as resp:
+        assert resp.status_code == 200
+        for line in resp.iter_lines():
+            if line.startswith("data:"):
+                last = json.loads(line[5:])
+    return last
+
+
+def run_by_digest(client, eid, digest):
+    started = client.post(f"/experiments/{eid}/start", json={"dataset_digest": digest})
+    assert started.status_code == 202, started.text
+    return drain_progress(client, eid)
+
+
+def score_by_digest(client, eid, digest, judge_model=None, timeout_s=20.0):
+    body = {"dataset_digest": digest}
+    if judge_model is not None:
+        body["judge_model"] = judge_model
+    started = client.post(f"/experiments/{eid}/score", json=body)
+    assert started.status_code == 202, started.text
+    deadline = time.monotonic() + timeout_s
+    while client.app.state.scoring_run["active"] is not None:
+        assert time.monotonic() < deadline, "scoring pass did not finish"
+        client.get("/models")
+    assert client.app.state.scoring_run["error"] is None
+
+
+def judged_route():
+    """Trials stream the alpha reply; judge calls answer a 0.9."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+            if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+
+
+# The three rows the browser proof builds, one per scorer family.
+THREE_KINDS = (
+    {
+        "id": "e1",
+        "prompt": "say Hello",
+        "reference": "Hello",
+        "scorer": {"kind": "exact"},
+    },
+    {"id": "r1", "prompt": "say Hi", "scorer": {"kind": "regex", "pattern": "H"}},
+    {
+        "id": "j1",
+        "prompt": "be kind",
+        "rubric": "kindness",
+        "scorer": {"kind": "judge", "pass_threshold": 0.5},
+    },
+)
+
+
+# ---- the door itself
+
+
+def test_a_dataset_is_stored_under_the_digest_of_the_bytes_it_arrived_as(client):
+    """WINDOW: POST /datasets with a valid body, and the row it writes.
+
+    THE DIGEST IS THE SERVER'S: sha256 over content.encode("utf-8"), the
+    same bytes the row holds, and the response is the summary with no
+    content in it."""
+    content = dataset_text(*THREE_KINDS)
+
+    resp = store_dataset(client, "three kinds", content=content)
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert set(body) == {
+        "digest",
+        "name",
+        "created_at",
+        "task_count",
+        "scorers",
+        "cites_documents",
+    }
+    assert body["digest"] == hashlib.sha256(content.encode("utf-8")).hexdigest()
+    assert body["name"] == "three kinds"
+    assert body["task_count"] == 3
+    # Sorted and each once: the same list enforce_primary_metric checks
+    # a primary metric against, because it is the same function.
+    assert body["scorers"] == ["exact", "judge", "regex"]
+    assert body["cites_documents"] is False
+    row = client.app.state.db.execute(
+        "SELECT content FROM datasets WHERE digest = ?", (body["digest"],)
+    ).fetchone()
+    assert bytes(row["content"]) == content.encode("utf-8")
+
+
+def test_the_door_does_not_ask_whether_a_cited_document_exists(client):
+    """WINDOW: POST /datasets over a task citing a digest the bench does
+    not hold.
+
+    THE RULING, AS A TEST. A dataset references documents and never
+    carries them, and creation is where a citation is resolved; checking
+    here too would be two sentences about one fact that could disagree.
+    So the store accepts it, says the dataset cites a document, and
+    POST /experiments is the door that refuses it."""
+    missing = "a" * 64
+    # PRE-STATE: the bench really does not hold it, or the acceptance
+    # below would be an acceptance of nothing in particular.
+    assert client.get(f"/attachments/{missing}").status_code == 404
+
+    stored = store_dataset(
+        client, "cites", {"id": "t1", "prompt": "read it", "attachments": [missing]}
+    )
+
+    assert stored.status_code == 201, stored.text
+    assert stored.json()["cites_documents"] is True
+    created = client.post("/experiments", json=digest_body(stored.json()["digest"]))
+    assert created.status_code == 422
+    assert missing[:12] in created.json()["detail"]
+
+
+def test_identical_content_is_one_row_and_the_earlier_name_stands(client):
+    """WINDOW: two POSTs of byte-identical content under two names.
+
+    save_attachment's rule. A second name is not a second dataset, and
+    experiments created from the digest copy the row's name at creation,
+    so a renamed row would name the same tasks differently from the
+    records already made from it. The second caller is answered with
+    the first name, which is how they learn the bench had these tasks."""
+    content = dataset_text({"id": "t1", "prompt": "same"})
+
+    first = store_dataset(client, "first name", content=content)
+    second = store_dataset(client, "second name", content=content)
+
+    assert first.status_code == second.status_code == 201
+    assert first.json() == second.json()
+    assert second.json()["name"] == "first name"
+    assert dataset_rows(client) == 1
+    assert [d["name"] for d in client.get("/datasets").json()["datasets"]] == [
+        "first name"
+    ]
+
+
+def test_a_dataset_the_parser_refuses_is_refused_in_the_parsers_own_words(client):
+    """WINDOW: POST /datasets whose line 2 repeats line 1's id.
+
+    VERBATIM, NOT PARAPHRASED: the detail is exactly what parse_dataset
+    raises over the same bytes under the same name, line number and all,
+    because a browser shows this sentence beside the row it names and a
+    second wording would be a second validator. Nothing is stored."""
+    content = '{"id": "t1", "prompt": "a"}\n{"id": "t1", "prompt": "b"}\n'
+    with pytest.raises(DatasetError) as expected:
+        parse_dataset(content.encode("utf-8"), name="dup")
+
+    resp = store_dataset(client, "dup", content=content)
+
+    assert resp.status_code == 422
+    assert resp.json()["detail"] == str(expected.value)
+    assert resp.json()["detail"].startswith("line 2: ")
+    assert dataset_rows(client) == 0
+
+
+def test_an_empty_dataset_is_the_parsers_refusal_too(client):
+    """WINDOW: POST /datasets with empty and whitespace-only content.
+
+    No min_length on the field, so it is the parser that answers and the
+    answer is a sentence a page can print, naming the dataset."""
+    for content in ("", "\n\n   \n"):
+        resp = store_dataset(client, "nothing", content=content)
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == "nothing has no tasks"
+    assert dataset_rows(client) == 0
+
+
+def test_the_dataset_bound_is_derived_from_the_request_cap_and_is_tight():
+    """WINDOW: the constants, at import, against an envelope counted here
+    from first principles rather than read back from the module.
+
+    The worst spelling of each part: the name at twelve bytes per code
+    point (an astral character as an escaped surrogate pair), both keys
+    at six bytes per character, the thirteen bytes of braces, colons,
+    comma and quotes, and the 51 bytes of whitespace the scope allows.
+    Content at six bytes per stored byte fits under MAX_REQUEST_BYTES
+    beside that envelope, and one byte more would not: the second half is
+    what makes this a derivation rather than a number that happens to be
+    small enough. The first version of this test reused the module's own
+    envelope, six bytes a name character and no keys, so it could not
+    see that the envelope was wrong."""
+    name = 12 * main.MAX_DATASET_NAME_CHARS
+    keys = 6 * len("name") + 6 * len("content")
+    structure = len('{"":"","":""}')
+    whitespace = 51
+    envelope = name + keys + structure + whitespace
+    assert main.DATASET_ENVELOPE_BYTES == envelope
+    assert 6 * main.MAX_DATASET_BYTES + envelope <= main.MAX_REQUEST_BYTES
+    assert 6 * (main.MAX_DATASET_BYTES + 1) + envelope > main.MAX_REQUEST_BYTES
+
+
+def worst_spelling(text):
+    """Every code point at its longest legal JSON spelling: six bytes
+    for one in the Basic Multilingual Plane, twelve for one outside it as
+    an escaped surrogate pair. RFC 8259 section 7 allows both."""
+    out = []
+    for ch in text:
+        point = ord(ch)
+        if point > 0xFFFF:
+            point -= 0x10000
+            high, low = 0xD800 + (point >> 10), 0xDC00 + (point & 0x3FF)
+            out.append(f"\\u{high:04x}\\u{low:04x}")
+        else:
+            out.append(f"\\u{point:04x}")
+    return "".join(out)
+
+
+def test_the_largest_dataset_spelled_the_longest_way_is_stored_not_413(client):
+    """WINDOW: the ASGI body guard and POST /datasets, on the one body
+    that is at both limits at once.
+
+    A dataset of exactly MAX_DATASET_BYTES, sent with every character
+    escaped; a name of exactly MAX_DATASET_NAME_CHARS astral characters,
+    each an escaped surrogate pair; both keys escaped; and the whole 51
+    bytes of whitespace the scope allows. That is the heaviest body the
+    stated scope admits for the largest dataset this door takes, and it
+    must reach the parser and be stored. If the guard's 413 answered
+    first, the bound would be a promise the door cannot keep, which is
+    exactly what the first envelope was: this body is 1,486 bytes over
+    the cap under it."""
+    limit = main.MAX_DATASET_BYTES
+    lines = []
+    size = 0
+    index = 0
+    while size < limit:
+        head = '{"id": "t' + str(index) + '", "prompt": "'
+        tail = '"}\n'
+        room = min(90_000, limit - size - len(head) - len(tail))
+        assert room > 0
+        line = head + "x" * room + tail
+        lines.append(line)
+        size += len(line)
+        index += 1
+    content = "".join(lines)
+    assert len(content.encode("utf-8")) == limit
+    name = chr(0x1F600) * main.MAX_DATASET_NAME_CHARS
+    body = (
+        "{"
+        + " " * 51
+        + '"'
+        + worst_spelling("name")
+        + '":"'
+        + worst_spelling(name)
+        + '","'
+        + worst_spelling("content")
+        + '":"'
+        + worst_spelling(content)
+        + '"}'
+    ).encode("ascii")
+    # PRE-STATE: exactly the envelope the derivation counts, so this is the
+    # body at the edge and not one comfortably inside it; and under the
+    # previous constant, 1,913,097, the same shape would not have fitted.
+    assert len(body) == 6 * limit + main.DATASET_ENVELOPE_BYTES
+    assert len(body) <= main.MAX_REQUEST_BYTES
+    assert 6 * 1_913_097 + main.DATASET_ENVELOPE_BYTES > main.MAX_REQUEST_BYTES
+
+    resp = client.post(
+        "/datasets", content=body, headers={"content-type": "application/json"}
+    )
+
+    assert resp.status_code == 201, resp.text[:300]
+    assert resp.json()["digest"] == hashlib.sha256(content.encode()).hexdigest()
+    assert resp.json()["task_count"] == len(lines)
+    assert resp.json()["name"] == name
+
+
+def test_a_dataset_over_the_bound_is_refused_in_bytes_with_the_path_remedy(client):
+    """WINDOW: POST /datasets one byte past MAX_DATASET_BYTES, measured
+    two ways.
+
+    IN BYTES, NOT CHARACTERS. Two-byte characters make a body that is
+    under the bound as a count of characters and over it as the bytes
+    that would be stored and hashed, and bytes are what is stored. The
+    refusal names both numbers and the remedy, and it comes from the
+    door, not the parser: nothing is stored either way."""
+    limit = main.MAX_DATASET_BYTES
+    ascii_over = "x" * (limit + 1)
+    wide_over = "é" * (limit // 2 + 1)
+    # PRE-STATE: the wide one is under the bound in characters.
+    assert len(wide_over) <= limit < len(wide_over.encode("utf-8"))
+
+    for content in (ascii_over, wide_over):
+        resp = store_dataset(client, "big", content=content)
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert str(len(content.encode("utf-8"))) in detail
+        assert str(limit) in detail
+        assert "dataset_path" in detail
+    assert dataset_rows(client) == 0
+
+
+def test_review_repro_a_lone_surrogate_is_a_refusal_naming_its_line(client):
+    """WINDOW: POST /datasets whose content holds half a surrogate pair,
+    as JSON.stringify writes one, on a line the count has to work for.
+
+    JSON can spell U+D800 and UTF-8 cannot encode it, so encode() raises;
+    unhandled, that was a 500 from a body a browser can send (a paste
+    that split an emoji). It is a 422 naming the line, counted the way
+    the parser counts, and nothing is stored.
+
+    TWO SHAPES FOR THE COUNT. A CRLF and a blank line before the half
+    pair, which the parser numbers as lines of their own; and a half pair
+    that is the first character of its line, where counting the text
+    before it alone lands one line short."""
+
+    def body(text):
+        return json.dumps({"name": "half", "content": text}).encode()
+
+    after_blank = '{"id": "a", "prompt": "x"}\r\n\r\n{"id": "b", "prompt": "\ud800"}\n'
+    at_start = '{"id": "a", "prompt": "x"}\n\ud800{"id": "b", "prompt": "y"}\n'
+    for text, line in ((after_blank, 3), (at_start, 2)):
+        resp = client.post(
+            "/datasets",
+            content=body(text),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422
+        detail = resp.json()["detail"]
+        assert detail.startswith(f"line {line}: "), detail
+        assert "U+D800" in detail
+    assert dataset_rows(client) == 0
+
+
+def test_a_dataset_name_is_refused_where_it_would_break_a_listing(client):
+    """WINDOW: POST /datasets with each name the validator refuses, and
+    the longest one it takes.
+
+    A control character, either separator and only-whitespace answer in
+    this field's own sentences; past MAX_DATASET_NAME_CHARS the model
+    answers, which the list-shaped detail proves."""
+    row = {"id": "t1", "prompt": "p"}
+    for name, words in (
+        ("tab\there", "control character"),
+        ("a/b", "path separator"),
+        ("a\\b", "path separator"),
+        ("   ", "only whitespace"),
+    ):
+        resp = store_dataset(client, name, row)
+        assert resp.status_code == 422, name
+        assert words in json.dumps(resp.json()["detail"]), name
+    too_long = store_dataset(client, "n" * (main.MAX_DATASET_NAME_CHARS + 1), row)
+    assert too_long.status_code == 422
+    assert isinstance(too_long.json()["detail"], list)
+    assert dataset_rows(client) == 0
+
+    longest = store_dataset(client, "n" * main.MAX_DATASET_NAME_CHARS, row)
+    assert longest.status_code == 201
+
+
+def test_the_dataset_door_refuses_a_body_it_cannot_read(client):
+    """WINDOW: POST /datasets with an unknown field, and with every CORS
+    simple content type, before and after which the table is counted.
+
+    THE DIGEST CANNOT BE SENT: it is an unknown field like any other, so
+    a caller cannot name the identity its tasks will be cited by. The
+    three simple types and the bodyless POST are 415 from the guard,
+    before routing, so nothing is stored by any of them."""
+    valid = {"name": "d", "content": dataset_text({"id": "t1", "prompt": "p"})}
+    named = client.post("/datasets", json={**valid, "digest": "0" * 64})
+    assert named.status_code == 422
+    assert "digest" in json.dumps(named.json()["detail"])
+
+    for content_type, payload in {
+        "multipart/form-data; boundary=x": b"--x--",
+        "text/plain;charset=UTF-8": json.dumps(valid).encode(),
+        "application/x-www-form-urlencoded": b"name=d",
+    }.items():
+        resp = client.post(
+            "/datasets", content=payload, headers={"Content-Type": content_type}
+        )
+        assert resp.status_code == 415, content_type
+        assert resp.json()["detail"] == "POST bodies must be application/json"
+    assert client.post("/datasets").status_code == 415
+    assert dataset_rows(client) == 0
+
+
+def test_the_dataset_list_is_newest_first_bounded_and_never_content(client):
+    """WINDOW: GET /datasets after three stores, and with its limit.
+
+    The list entry is the detail minus the content, one shape; the limit
+    is bounded like the attachment list's."""
+    for index in range(3):
+        assert (
+            store_dataset(
+                client, f"d{index}", {"id": "t", "prompt": str(index)}
+            ).status_code
+            == 201
+        )
+
+    listed = client.get("/datasets").json()["datasets"]
+
+    assert [d["name"] for d in listed] == ["d2", "d1", "d0"]
+    for entry in listed:
+        detail = client.get(f"/datasets/{entry['digest']}").json()
+        assert "content" not in entry
+        assert {k: v for k, v in detail.items() if k != "content"} == entry
+    assert [d["name"] for d in client.get("/datasets?limit=2").json()["datasets"]] == [
+        "d2",
+        "d1",
+    ]
+    assert client.get("/datasets?limit=0").status_code == 422
+    assert client.get("/datasets?limit=501").status_code == 422
+
+
+def test_a_stored_dataset_reads_back_as_the_text_that_was_stored(client):
+    """WINDOW: GET /datasets/{digest} over content a careless round trip
+    would change: CRLF line ends, a non-ASCII prompt, trailing blank
+    lines.
+
+    Byte for byte, so the text served hashes to the digest it is served
+    under, which is the whole use of serving it. An unknown digest is a
+    404, not an empty dataset."""
+    content = '{"id": "t1", "prompt": "café"}\r\n{"id": "t2", "prompt": "b"}\r\n\r\n'
+    digest = store_dataset(client, "crlf", content=content).json()["digest"]
+
+    detail = client.get(f"/datasets/{digest}")
+
+    assert detail.status_code == 200
+    assert detail.json()["content"] == content
+    assert hashlib.sha256(detail.json()["content"].encode()).hexdigest() == digest
+    assert detail.json()["task_count"] == 2
+    missing = client.get(f"/datasets/{'0' * 64}")
+    assert missing.status_code == 404
+    assert missing.json()["detail"] == "no such dataset"
+
+
+def test_the_dataset_doors_are_not_stored_by_any_cache(client):
+    """WINDOW: the three dataset doors' responses. A dataset body is every
+    prompt in it, so it is in the private, no-store class."""
+    created = store_dataset(client, "d", {"id": "t1", "prompt": "hi"})
+
+    for resp in (
+        created,
+        client.get("/datasets"),
+        client.get(f"/datasets/{created.json()['digest']}"),
+    ):
+        assert resp.headers.get("cache-control") == "private, no-store"
+
+
+# ---- the widened doors: create, start, score
+
+
+def experiment_record(client, eid):
+    """An experiment's detail without the three fields two creations can
+    never share: its id, its timestamp, and the name its bytes were read
+    under."""
+    detail = client.get(f"/experiments/{eid}").json()
+    for key in ("id", "created_at", "dataset_name"):
+        detail.pop(key)
+    return detail
+
+
+def without_identity(value):
+    """A report or export line with what two honest runs of one declaration
+    cannot share removed, recursively: each row's own ids and timestamps,
+    the name the bytes were read under (dataset_name, and nothing else:
+    the experiment's own name is shared and is compared), and the
+    wall-clock VALUES of latency and time to first token, which are facts
+    about the network on the day. How many trials each was measured over
+    is kept, because that count is a claim. What is left must be
+    identical."""
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if k in (
+                "id",
+                "experiment_id",
+                "group_id",
+                "run_id",
+                "result_id",
+                "created_at",
+                "dataset_name",
+            ):
+                continue
+            if k in ("latency_ms", "ttft_ms"):
+                out[k] = v.get("n") if isinstance(v, dict) else v is None
+                continue
+            out[k] = without_identity(v)
+        return out
+    if isinstance(value, list):
+        return [without_identity(v) for v in value]
+    return value
+
+
+@respx.mock
+def test_the_digest_door_records_exactly_what_the_path_door_records(client, tmp_path):
+    """WINDOW: one dataset's bytes entering by both doors, followed from
+    creation through the run, the scoring pass, the report and the export.
+
+    DECLARATION TRANSPORT. dataset_digest is a declaration, and it has to
+    land everywhere a path-read digest lands and nowhere differently: the
+    experiment row equal in every field but dataset_name, the terminal
+    progress frame equal, the report and the export equal once each row's
+    own ids and timestamps are set aside. The two names are different on
+    purpose, so the one field allowed to differ does."""
+    judged_route()
+    path = write_dataset(tmp_path, *THREE_KINDS, name="on-disk.jsonl")
+    stored = store_dataset(client, "in-the-store", *THREE_KINDS).json()
+    # PRE-STATE: identical bytes, or this compares two datasets.
+    assert stored["digest"] == hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+    by_path = client.post(
+        "/experiments", json=experiment_body(path, lineup=["model/alpha"], repeats=2)
+    )
+    by_digest = client.post(
+        "/experiments",
+        json=digest_body(stored["digest"], lineup=["model/alpha"], repeats=2),
+    )
+    assert by_path.status_code == by_digest.status_code == 201
+    assert by_path.json()["projected_cost"] == by_digest.json()["projected_cost"]
+    path_eid, digest_eid = by_path.json()["id"], by_digest.json()["id"]
+
+    assert experiment_record(client, path_eid) == experiment_record(client, digest_eid)
+    assert (
+        client.get(f"/experiments/{path_eid}").json()["dataset_name"] == "on-disk.jsonl"
+    )
+    assert (
+        client.get(f"/experiments/{digest_eid}").json()["dataset_name"]
+        == "in-the-store"
+    )
+
+    path_frame = run_experiment_to_completion(client, path_eid, path)
+    digest_frame = run_by_digest(client, digest_eid, stored["digest"])
+    assert path_frame["status"] == "done"
+    # spend_usd is the PROCESS's accumulated spend, not this experiment's,
+    # so the second run's frame carries both runs' spend by construction.
+    # Every counter the experiment owns must agree.
+    path_frame.pop("spend_usd")
+    digest_frame.pop("spend_usd")
+    assert path_frame == digest_frame
+
+    score_experiment_to_completion(client, path_eid, path, judge_model="judge/one")
+    score_by_digest(client, digest_eid, stored["digest"], judge_model="judge/one")
+    assert experiment_record(client, path_eid) == experiment_record(client, digest_eid)
+
+    path_report = client.get(
+        f"/experiments/{path_eid}/report", params={"dataset_path": path}
+    ).json()
+    digest_report = client.get(
+        f"/experiments/{digest_eid}/report",
+        params={"dataset_digest": stored["digest"]},
+    ).json()
+    assert path_report["dataset_digest"] == digest_report["dataset_digest"]
+    assert path_report["thresholds_source"] == "dataset_file"
+    assert digest_report["thresholds_source"] == "dataset_store"
+    path_report.pop("thresholds_source")
+    digest_report.pop("thresholds_source")
+    assert without_identity(path_report) == without_identity(digest_report)
+
+    path_export = export_lines(client, path_eid, path)
+    digest_export = export_lines(client, digest_eid)
+    assert path_export[0]["dataset_digest"] == stored["digest"]
+    assert digest_export[0]["dataset_digest"] == stored["digest"]
+    assert without_identity(path_export[:-1]) == without_identity(digest_export[:-1])
+
+
+@respx.mock
+def test_the_exactly_one_rule_holds_at_create_start_and_score(client, tmp_path):
+    """WINDOW: create, start and score, each sent both fields and neither.
+
+    ONE SENTENCE AT ALL THREE, a string a page can print, and nothing
+    moves: no experiment is created, the one that exists stays created,
+    no runner and no scoring pass is started."""
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    digest = store_dataset(client, "d", {"id": "t1", "prompt": "hi"}).json()["digest"]
+    both = {"dataset_path": path, "dataset_digest": digest}
+
+    create_both = experiment_body(path) | {"dataset_digest": digest}
+    create_neither = experiment_body(path)
+    create_neither.pop("dataset_path")
+    for body in (create_both, create_neither):
+        resp = client.post("/experiments", json=body)
+        assert resp.status_code == 422
+        assert resp.json()["detail"] == main.ONE_DATASET
+    assert client.get("/experiments").json()["experiments"] == []
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    for body in (both, {}):
+        start = client.post(f"/experiments/{eid}/start", json=body)
+        assert start.status_code == 422
+        assert start.json()["detail"] == main.ONE_DATASET
+    assert client.app.state.experiment_run["active"] is None
+    assert client.get(f"/experiments/{eid}").json()["status"] == "created"
+
+    # Score is refused while created for its own reason, so a finished
+    # experiment is needed to reach the rule at that door.
+    client.app.state.db.execute(
+        "UPDATE experiments SET status = 'done' WHERE id = ?", (eid,)
+    )
+    client.app.state.db.commit()
+    for body in (both, {}):
+        score = client.post(f"/experiments/{eid}/score", json=body)
+        assert score.status_code == 422
+        assert score.json()["detail"] == main.ONE_DATASET
+    assert client.app.state.scoring_run["active"] is None
+
+
+@respx.mock
+def test_a_digest_the_bench_does_not_hold_is_refused_before_anything_moves(
+    client, tmp_path
+):
+    """WINDOW: create, start and score by a well-formed digest with no
+    stored row behind it.
+
+    At start the digest is the RIGHT one, the experiment's own, and the
+    bench simply does not hold those bytes: the door says so while the
+    experiment is still created, and the path door then starts it, which
+    is the pre-state that makes the refusal a refusal and not a wedge."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    unheld = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    assert client.get(f"/datasets/{unheld}").status_code == 404
+
+    created = client.post("/experiments", json=digest_body(unheld))
+    assert created.status_code == 422
+    assert f"no stored dataset has digest {unheld}" in created.json()["detail"]
+    assert client.get("/experiments").json()["experiments"] == []
+
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    start = client.post(f"/experiments/{eid}/start", json={"dataset_digest": unheld})
+    assert start.status_code == 422
+    assert "no stored dataset" in start.json()["detail"]
+    assert client.get(f"/experiments/{eid}").json()["status"] == "created"
+    assert client.app.state.experiment_run["active"] is None
+
+    assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+    score = client.post(f"/experiments/{eid}/score", json={"dataset_digest": unheld})
+    assert score.status_code == 422
+    assert "no stored dataset" in score.json()["detail"]
+    assert client.app.state.scoring_run["active"] is None
+
+
+def test_an_experiment_records_the_stored_digest_it_was_given_and_no_other(client):
+    """WINDOW: POST /experiments by digest with three datasets stored.
+
+    The middle one is named, so a lookup that took the newest row or the
+    oldest would record the wrong dataset, and each has a different task
+    count so the wrong one could not pass for the right one."""
+    stored = [
+        store_dataset(
+            client, f"d{n}", *({"id": f"t{i}", "prompt": "p"} for i in range(n))
+        ).json()
+        for n in (1, 2, 3)
+    ]
+    middle = stored[1]
+
+    eid = client.post("/experiments", json=digest_body(middle["digest"])).json()["id"]
+
+    detail = client.get(f"/experiments/{eid}").json()
+    assert detail["dataset_digest"] == middle["digest"]
+    assert detail["dataset_name"] == "d2"
+    assert detail["tasks_total"] == 2
+
+
+@respx.mock
+def test_review_repro_the_spec_said_start_refuses_drift_and_only_the_digest_door_does(
+    client, tmp_path
+):
+    """WINDOW: POST /experiments/{id}/start over the wrong dataset, once
+    by each door, and what follows each.
+
+    THE SPEC'S TABLE, TOMBSTONED RATHER THAN QUIETLY FIXED. Phase N's
+    commission described the start door as one that "Re-reads, re-checks
+    the digest, refuses 422 on drift." It never did. The path is stored
+    in the runner's state and read by the runner after the 202, so a
+    file that changed is a started experiment that FAILS, with the reason
+    in status_detail and no money spent. That is the code's behaviour and
+    it is unchanged here; the first half of this test pins it so a later
+    reader of the spec cannot mistake the sentence for the door.
+
+    THE DIGEST DOOR IS WHERE THE SENTENCE BECAME TRUE, because a digest
+    can be checked without reading anything: a different one is refused
+    422 at the door, the experiment is still created, no runner started,
+    and the right digest then starts it and it runs."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    # The path door: accepted, then failed by the runner, with nothing sent.
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "original"})
+    by_path = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    Path(path).write_text('{"id": "t1", "prompt": "edited"}\n', encoding="utf-8")
+    final = run_experiment_to_completion(client, by_path, path)
+    assert final["status"] == "failed"
+    assert "dataset changed since this experiment was created" in final["status_detail"]
+    assert respx.calls.call_count == 0
+
+    # The digest door: refused at the door, and nothing moved.
+    right = store_dataset(client, "right", {"id": "t1", "prompt": "r"}).json()
+    wrong = store_dataset(client, "wrong", {"id": "t1", "prompt": "w"}).json()
+    eid = client.post("/experiments", json=digest_body(right["digest"])).json()["id"]
+
+    refused = client.post(
+        f"/experiments/{eid}/start", json={"dataset_digest": wrong["digest"]}
+    )
+
+    assert refused.status_code == 422
+    detail = refused.json()["detail"]
+    assert f"dataset_digest {wrong['digest'][:12]} is not the dataset" in detail
+    assert right["digest"][:12] in detail
+    assert client.get(f"/experiments/{eid}").json()["status"] == "created"
+    assert client.app.state.experiment_run["active"] is None
+    assert respx.calls.call_count == 0
+
+    assert run_by_digest(client, eid, right["digest"])["status"] == "done"
+    assert respx.calls.call_count == 2
+
+
+@respx.mock
+def test_a_scoring_pass_by_digest_takes_its_own_dataset_and_no_other(client):
+    """WINDOW: POST /experiments/{id}/score by digest, the wrong one and
+    then the right one, on a finished experiment.
+
+    The wrong one is refused in the digest door's own sentence with the
+    scoring consequence, and no pass starts; the right one scores every
+    trial, judge included."""
+    judged_route()
+    right = store_dataset(client, "right", *THREE_KINDS).json()
+    wrong = store_dataset(client, "wrong", {"id": "e1", "prompt": "p"}).json()
+    eid = client.post(
+        "/experiments", json=digest_body(right["digest"], lineup=["model/alpha"])
+    ).json()["id"]
+    assert run_by_digest(client, eid, right["digest"])["status"] == "done"
+
+    refused = client.post(
+        f"/experiments/{eid}/score",
+        json={"dataset_digest": wrong["digest"], "judge_model": "judge/one"},
+    )
+    assert refused.status_code == 422
+    assert (
+        "is not the dataset this experiment was created over"
+        in refused.json()["detail"]
+    )
+    assert "attribute one rubric's verdict" in refused.json()["detail"]
+    assert client.app.state.scoring_run["active"] is None
+    assert scores_in(client, eid) == []
+
+    score_by_digest(client, eid, right["digest"], judge_model="judge/one")
+    assert sorted(s["scorer"] for s in scores_in(client, eid)) == [
+        "exact",
+        "judge",
+        "regex",
+    ]
+
+
+def test_a_stored_dataset_edited_by_hand_is_refused_rather_than_cited(client):
+    """WINDOW: POST /experiments by a digest whose row's bytes were
+    rewritten outside the bench.
+
+    The digest is the key, so this cannot happen through the application;
+    it can through sqlite3 and a person's own bench.db. Created anyway, the
+    experiment would record the digest it was asked for and run the tasks
+    it found, which is a record citing one dataset and containing another."""
+    digest = store_dataset(client, "d", {"id": "t1", "prompt": "real"}).json()["digest"]
+    client.app.state.db.execute(
+        "UPDATE datasets SET content = ? WHERE digest = ?",
+        (b'{"id": "t1", "prompt": "forged"}\n', digest),
+    )
+    client.app.state.db.commit()
+
+    resp = client.post("/experiments", json=digest_body(digest))
+
+    assert resp.status_code == 422
+    assert (
+        f"the bytes stored under digest {digest[:12]} hash to" in resp.json()["detail"]
+    )
+    assert client.get("/experiments").json()["experiments"] == []
+
+
+# ---- the fourth and fifth doors: report and export
+
+
+@respx.mock
+def test_review_repro_the_page_read_a_floor_where_curl_read_the_exact_report(
+    client, tmp_path
+):
+    """WINDOW: GET /experiments/{id}/report with no dataset named, before
+    and after the experiment's own bytes are stored.
+
+    THE RULING'S SHAPE. The page has no path to send, so every report it
+    opened was the score-rows floor while curl with the file got the
+    exact denominator: two reports under one name. threshold_experiment
+    makes the two differ (eligible 3 against 2). Before the bytes are
+    stored the pathless report is still the floor, which is the pre-state;
+    after, it reads them from the store and equals the path-resolved
+    report field for field except thresholds_source, which is the one
+    field whose job is to say which door the dataset came through."""
+    eid, path = threshold_experiment(client, tmp_path)
+    before = client.get(f"/experiments/{eid}/report").json()
+    assert before["thresholds_source"] == "score_rows"
+    assert before["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 2
+
+    stored = store_dataset(
+        client, "stored later", content=Path(path).read_text(encoding="utf-8")
+    ).json()
+    assert (
+        stored["digest"] == client.get(f"/experiments/{eid}").json()["dataset_digest"]
+    )
+
+    from_store = client.get(f"/experiments/{eid}/report").json()
+    from_file = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+
+    assert from_store["thresholds_source"] == "dataset_store"
+    assert from_file["thresholds_source"] == "dataset_file"
+    assert from_store["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 3
+    from_store.pop("thresholds_source")
+    from_file.pop("thresholds_source")
+    assert from_store == from_file
+
+
+@respx.mock
+def test_the_report_takes_a_digest_and_refuses_the_wrong_one_or_two_names(
+    client, tmp_path
+):
+    """WINDOW: GET /experiments/{id}/report with each shape of
+    dataset_digest: the recorded one, another stored one, both names, and
+    a malformed one.
+
+    The recorded digest reads from the store; another stored digest is
+    refused in the digest door's sentence with the reporting consequence;
+    both names are refused by the at-most-one rule; a malformed digest is
+    the query model's list-shaped refusal. Unrefused, none of these can
+    move the thresholds_source of the pathless report."""
+    eid, path = threshold_experiment(client, tmp_path)
+    recorded = store_dataset(
+        client, "recorded", content=Path(path).read_text(encoding="utf-8")
+    ).json()["digest"]
+    other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
+    url = f"/experiments/{eid}/report"
+
+    named = client.get(url, params={"dataset_digest": recorded})
+    assert named.status_code == 200
+    assert named.json()["thresholds_source"] == "dataset_store"
+
+    wrong = client.get(url, params={"dataset_digest": other})
+    assert wrong.status_code == 422
+    assert f"dataset_digest {other[:12]} is not the dataset" in wrong.json()["detail"]
+    assert "attribute one rubric's threshold" in wrong.json()["detail"]
+
+    both = client.get(url, params={"dataset_digest": recorded, "dataset_path": path})
+    assert both.status_code == 422
+    assert both.json()["detail"] == main.AT_MOST_ONE_DATASET
+
+    malformed = client.get(url, params={"dataset_digest": "XYZ"})
+    assert malformed.status_code == 422
+    assert isinstance(malformed.json()["detail"], list)
+
+
+@respx.mock
+def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/export.jsonl before and after the
+    recorded bytes are stored, and by each way of naming them after.
+
+    Before: thresholds_included false, the pre-state. After: the pathless
+    export reads the store and includes them, and the three ways of
+    asking (nothing, the path, the digest) produce one artifact byte for
+    byte, because each resolved the dataset the manifest cites. The
+    schema stays 7: no key was added, only a value became reachable."""
+    eid, path = threshold_experiment(client, tmp_path)
+    assert export_lines(client, eid)[0]["thresholds_included"] is False
+
+    digest = store_dataset(
+        client, "stored", content=Path(path).read_text(encoding="utf-8")
+    ).json()["digest"]
+
+    pathless = read_export(client, eid)
+    by_path = read_export(client, eid, dataset_path=path)
+    with client.stream(
+        "GET", f"/experiments/{eid}/export.jsonl", params={"dataset_digest": digest}
+    ) as resp:
+        assert resp.status_code == 200
+        by_digest = resp.read()
+
+    assert pathless == by_path == by_digest
+    manifest = json.loads(pathless.decode().splitlines()[0])
+    assert manifest["thresholds_included"] is True
+    assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
+    assert manifest["export_schema_version"] == 7
+
+    other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
+    refused = client.get(
+        f"/experiments/{eid}/export.jsonl", params={"dataset_digest": other}
+    )
+    assert refused.status_code == 422
+    assert "is not the dataset" in refused.json()["detail"]
+
+
+def point_at_an_unreadable_copy(client, eid):
+    """Point an experiment at a stored row this build refuses, as a later,
+    stricter parser would: bytes whose digest IS the recorded one cannot
+    be forged, so the row and the recorded digest are written together.
+    Returns the digest."""
+    unparseable = b'{"id": "t1"}\n'
+    forged = hashlib.sha256(unparseable).hexdigest()
+    client.app.state.db.execute(
+        """INSERT INTO datasets (digest, name, created_at, content, task_count,
+                                 scorers_json, cites_documents)
+           VALUES (?, 'old', '2026-09-01T00:00:00+00:00', ?, 1, '[]', 0)""",
+        (forged, unparseable),
+    )
+    client.app.state.db.execute(
+        "UPDATE experiments SET dataset_digest = ? WHERE id = ?", (forged, eid)
+    )
+    client.app.state.db.commit()
+    return forged
+
+
+@respx.mock
+def test_an_unreadable_stored_copy_gives_the_floor_and_says_why(client, tmp_path):
+    """WINDOW: GET the report and the export naming nothing, then naming
+    the digest, when the bench holds the recorded bytes and this build's
+    parser refuses them.
+
+    Reachable only across builds, or by a hand edit: POST /datasets parses
+    before it stores. REFUSING HERE WAS THE FIRST ANSWER AND IT WAS WRONG,
+    found by the review: the same bytes by path meet the same parser and
+    nothing can ask for the floor, so the experiment would have had no
+    readable report or export ever again. Naming nothing now gives the
+    floor under score_rows, which is true, with the parser's own sentence
+    in dataset_unreadable so the exact denominator it could not reach is
+    not silent; the export is obtainable, and says it carries no
+    thresholds. Naming the digest asks for exactly that dataset, and is
+    refused in the same sentence."""
+    eid, _path = scored_experiment(client, tmp_path)
+    # PRE-STATE: an ordinary report names no unreadable copy.
+    assert client.get(f"/experiments/{eid}/report").json()["dataset_unreadable"] is None
+    forged = point_at_an_unreadable_copy(client, eid)
+
+    report = client.get(f"/experiments/{eid}/report")
+    assert report.status_code == 200
+    assert report.json()["thresholds_source"] == "score_rows"
+    assert report.json()["dataset_unreadable"] == "line 1: prompt is required"
+
+    manifest = export_lines(client, eid)[0]
+    assert manifest["thresholds_included"] is False
+    assert manifest["dataset_digest"] == forged
+
+    named = client.get(f"/experiments/{eid}/report", params={"dataset_digest": forged})
+    assert named.status_code == 422
+    assert named.json()["detail"] == "line 1: prompt is required"
+
+
+def test_every_scorer_kind_a_stored_dataset_lists_is_a_primary_metric_creation_takes(
+    client,
+):
+    """WINDOW: POST /experiments by digest, once per kind the stored
+    summary lists and once for a kind it does not.
+
+    ONE DERIVATION, OBSERVED FROM BOTH ENDS. The summary a browser offers
+    a primary metric from and the list creation checks one against are
+    the same function, and this is the test that sees them disagree: a
+    kind the summary lists that creation refuses would be a choice the
+    page offers and the server rejects. The mutation battery found no
+    observer for this before it existed."""
+    stored = store_dataset(client, "kinds", *THREE_KINDS).json()
+    # PRE-STATE: all three families are listed, so each is asked.
+    assert stored["scorers"] == ["exact", "judge", "regex"]
+
+    for kind in stored["scorers"]:
+        resp = client.post(
+            "/experiments", json=digest_body(stored["digest"], primary_metric=kind)
+        )
+        assert resp.status_code == 201, (kind, resp.text)
+
+    unlisted = client.post(
+        "/experiments", json=digest_body(stored["digest"], primary_metric="contains")
+    )
+    assert unlisted.status_code == 422
+    assert "exact, judge, regex, human" in unlisted.json()["detail"]
+
+
+# ---- Phase N1 closing review: the observers it found missing.
+
+
+@respx.mock
+def test_the_pathless_report_reads_the_recorded_digest_and_not_the_newest(
+    client, tmp_path
+):
+    """WINDOW: GET the report and the export naming nothing, with the
+    recorded dataset stored FIRST and a different one stored after it.
+
+    Resolution is by the identity the row cites. A lookup that took the
+    newest stored row would read the other dataset's tasks here, and its
+    one task declares no threshold, so the eligible count would fall to
+    zero; the recorded one's is three."""
+    eid, path = threshold_experiment(client, tmp_path)
+    recorded = store_dataset(
+        client, "recorded", content=Path(path).read_text(encoding="utf-8")
+    ).json()["digest"]
+    newer = store_dataset(client, "newer", {"id": "t1", "prompt": "x"}).json()
+    # PRE-STATE: the other one really is the newest row.
+    assert client.get("/datasets").json()["datasets"][0]["digest"] == newer["digest"]
+    assert newer["digest"] != recorded
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["thresholds_source"] == "dataset_store"
+    assert report["dataset_digest"] == recorded
+    assert report["models"][0]["scorers"][0]["pass_rate"]["eligible"] == 3
+    assert set(export_lines(client, eid)[0]["thresholds"]) == {"t1", "t2", "t3"}
+
+
+@respx.mock
+def test_the_export_takes_at_most_one_name_and_only_a_held_digest(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/export.jsonl named both ways at once,
+    and by a well-formed digest the bench does not hold.
+
+    The fifth door's own observers, since the report's cannot see an
+    export that stopped asking report_tasks. Both names are the
+    at-most-one sentence; an unheld digest is a 422 and never a quiet
+    fallback to the floor. Nothing is streamed either way."""
+    eid, path = threshold_experiment(client, tmp_path)
+    recorded = client.get(f"/experiments/{eid}").json()["dataset_digest"]
+    url = f"/experiments/{eid}/export.jsonl"
+
+    both = client.get(url, params={"dataset_path": path, "dataset_digest": recorded})
+    assert both.status_code == 422
+    assert both.json()["detail"] == main.AT_MOST_ONE_DATASET
+
+    unheld = client.get(url, params={"dataset_digest": recorded})
+    assert unheld.status_code == 422
+    assert f"no stored dataset has digest {recorded}" in unheld.json()["detail"]
+    # The report answers the same unheld digest the same way.
+    report = client.get(
+        f"/experiments/{eid}/report", params={"dataset_digest": recorded}
+    )
+    assert report.status_code == 422
+    assert f"no stored dataset has digest {recorded}" in report.json()["detail"]
+
+
+@respx.mock
+def test_a_hand_edited_recorded_copy_is_held_to_its_key_on_the_pathless_read(
+    client, tmp_path
+):
+    """WINDOW: GET the report naming nothing, after the stored copy of the
+    recorded dataset was rewritten in sqlite with other tasks.
+
+    The pathless read goes through the same key check as every door: the
+    forged tasks are not read, the report is the floor, and the reason
+    says the bytes do not hash to their digest. A pathless read that
+    parsed the row without holding it to its key would publish the
+    forger's thresholds as dataset_store."""
+    eid, path = threshold_experiment(client, tmp_path)
+    recorded = store_dataset(
+        client, "recorded", content=Path(path).read_text(encoding="utf-8")
+    ).json()["digest"]
+    # PRE-STATE: before the edit the store is read.
+    assert client.get(f"/experiments/{eid}/report").json()["thresholds_source"] == (
+        "dataset_store"
+    )
+    client.app.state.db.execute(
+        "UPDATE datasets SET content = ? WHERE digest = ?",
+        (
+            b'{"id": "t1", "prompt": "a", "rubric": "g", "scorer": {"kind": "judge"}}\n',
+            recorded,
+        ),
+    )
+    client.app.state.db.commit()
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["thresholds_source"] == "score_rows"
+    assert (
+        f"the bytes stored under digest {recorded[:12]} hash to"
+        in report["dataset_unreadable"]
+    )
+
+
+@respx.mock
+def test_a_malformed_digest_is_refused_by_the_model_at_every_door(client, tmp_path):
+    """WINDOW: create, start, score, report and export, each sent a
+    dataset_digest that is not 64 lowercase hex characters.
+
+    The shape RenditionPin enforces, refused by the models before any
+    handler runs, which the list-shaped detail proves. Uppercase is the
+    case worth naming: it is a real sha256, spelled in the one way the
+    store never keys by, so accepting it would only ever find nothing."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+    eid = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    upper = hashlib.sha256(Path(path).read_bytes()).hexdigest().upper()
+    for bad in (upper, "a" * 63, "a" * 65, "g" * 64):
+        created = client.post("/experiments", json=digest_body(bad))
+        assert created.status_code == 422, bad
+        assert isinstance(created.json()["detail"], list), bad
+        start = client.post(f"/experiments/{eid}/start", json={"dataset_digest": bad})
+        assert isinstance(start.json()["detail"], list), bad
+    assert client.get(f"/experiments/{eid}").json()["status"] == "created"
+
+    assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+    for bad in (upper, "a" * 63):
+        score = client.post(f"/experiments/{eid}/score", json={"dataset_digest": bad})
+        assert isinstance(score.json()["detail"], list), bad
+        for door in ("report", "export.jsonl"):
+            read = client.get(
+                f"/experiments/{eid}/{door}", params={"dataset_digest": bad}
+            )
+            assert read.status_code == 422, (door, bad)
+            assert isinstance(read.json()["detail"], list), (door, bad)
+
+
+@respx.mock
+def test_the_digest_route_runs_end_to_end_with_every_file_read_refused(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /datasets, then create, start, score, report and
+    export by digest, with read_dataset and Path's readers raising and
+    the builtin open refusing every path, for the whole of it.
+
+    THE RUNTIME HALF OF "THE DATASETS DOOR READS NO FILE". The posture
+    walk sees a path operation written into a function; it cannot see a
+    call into a helper that already holds one, which is how the review's
+    mutation reached disk (create_dataset calling read_dataset) with the
+    walk green. sqlite does its own I/O below Python, so the database is
+    untouched by the refusal and everything the route does is exercised."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    rows = THREE_KINDS[:2]
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("the digest route read a file")
+
+    real_open = open
+
+    def open_descriptors_only(file, *args, **kwargs):
+        # A DESCRIPTOR IS NOT A FILE ANYBODY NAMED. The regex scorer's
+        # child process is spawned by multiprocessing, which opens its
+        # pipes by descriptor; only a path is a read from disk.
+        if isinstance(file, int):
+            return real_open(file, *args, **kwargs)
+        raise AssertionError(f"the digest route opened {file!r}")
+
+    monkeypatch.setattr(main, "read_dataset", refuse)
+    for reader in ("read_bytes", "read_text", "open"):
+        monkeypatch.setattr(Path, reader, refuse)
+    monkeypatch.setattr("builtins.open", open_descriptors_only)
+
+    stored = store_dataset(client, "no files", *rows)
+    assert stored.status_code == 201, stored.text
+    digest = stored.json()["digest"]
+    eid = client.post(
+        "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+    ).json()["id"]
+    assert run_by_digest(client, eid, digest)["status"] == "done"
+    score_by_digest(client, eid, digest)
+    assert len(scores_in(client, eid)) == 2
+    assert client.get(f"/experiments/{eid}/report").json()["thresholds_source"] == (
+        "dataset_store"
+    )
+    assert export_lines(client, eid)[0]["thresholds_included"] is True
+
+
+def test_a_lone_surrogate_the_model_refuses_is_a_422_at_every_door(client):
+    """WINDOW: POST /datasets with a lone surrogate in the name, in an
+    unknown field and in an over-long name; POST /attachments with one in
+    the filename.
+
+    THE REFUSAL ITSELF WAS THE 500. The models refuse each of these and
+    FastAPI's 422 echoes the input back, and a response echoing a lone
+    surrogate could not be encoded as UTF-8, so the refusal failed to be
+    written. Found at the datasets door, present at every door that
+    echoes: the attachment door is the second witness. Each is now a 422
+    whose echo is the same JSON value spelled in escapes, and nothing is
+    stored."""
+    content = json.dumps({"id": "a", "prompt": "x"})
+    for body in (
+        '{"name": "half\\ud800", "content": ' + json.dumps(content) + "}",
+        '{"name": "n", "content": ' + json.dumps(content) + ', "extra": "\\ud800"}',
+        '{"name": "' + "n" * 256 + '\\ud800", "content": ' + json.dumps(content) + "}",
+    ):
+        resp = client.post(
+            "/datasets",
+            content=body.encode(),
+            headers={"content-type": "application/json"},
+        )
+        assert resp.status_code == 422, body[:60]
+        assert isinstance(resp.json()["detail"], list)
+    assert dataset_rows(client) == 0
+
+    upload = client.post(
+        "/attachments",
+        content=(
+            '{"filename": "a\\ud800.txt", "content_base64": "' + b64(b"hi") + '"}'
+        ).encode(),
+        headers={"content-type": "application/json"},
+    )
+    assert upload.status_code == 422
+    assert (
+        client.app.state.db.execute("SELECT COUNT(*) c FROM attachments").fetchone()[
+            "c"
+        ]
+        == 0
+    )
+
+
+def test_the_422_every_body_could_already_carry_is_written_byte_for_byte_as_before(
+    client,
+):
+    """WINDOW: the raw bytes of an ordinary model refusal holding a
+    non-ASCII character, through the replaced handler.
+
+    The handler exists for bodies that could not be written; for every
+    body that could, it must write the bytes FastAPI's own handler wrote,
+    raw UTF-8 and compact separators, or it would change a response
+    nobody asked it to touch."""
+    resp = client.post(
+        "/datasets",
+        json={"name": "café", "content": "x", "digest": "é"},
+    )
+    assert resp.status_code == 422
+    assert "é".encode() in resp.content
+    assert b"\\u00e9" not in resp.content
+    assert b'{"detail":[' in resp.content
+
+
+def test_the_detail_door_holds_its_bytes_to_their_digest(client):
+    """WINDOW: GET /datasets/{digest} after the row was rewritten in
+    sqlite: once with other text, once with bytes that are not UTF-8
+    written under their own digest.
+
+    Serving text under a digest it does not hash to would answer a
+    citation with somebody else's tasks; bytes that are not UTF-8 have
+    no text to serve. Both are sentences, never a 500."""
+    digest = store_dataset(client, "d", {"id": "t1", "prompt": "real"}).json()["digest"]
+    client.app.state.db.execute(
+        "UPDATE datasets SET content = ? WHERE digest = ?", (b"forged\n", digest)
+    )
+    raw = b"\xff\xfe not utf-8\n"
+    own = hashlib.sha256(raw).hexdigest()
+    client.app.state.db.execute(
+        """INSERT INTO datasets (digest, name, created_at, content, task_count,
+                                 scorers_json, cites_documents)
+           VALUES (?, 'binary', '2026-09-01T00:00:00+00:00', ?, 1, '[]', 0)""",
+        (own, raw),
+    )
+    client.app.state.db.commit()
+
+    forged = client.get(f"/datasets/{digest}")
+    assert forged.status_code == 422
+    assert (
+        f"the bytes stored under digest {digest[:12]} hash to"
+        in forged.json()["detail"]
+    )
+    binary = client.get(f"/datasets/{own}")
+    assert binary.status_code == 422
+    assert "are not UTF-8" in binary.json()["detail"]
+
+
+@respx.mock
+def test_a_malformed_summary_does_not_block_the_tasks_behind_it(client):
+    """WINDOW: create, start and the pathless report by digest, after the
+    row's scorers_json was rewritten to something that is not JSON.
+
+    The summary is derived and the content is authoritative, so the doors
+    that turn a stored dataset into tasks read only the name and the
+    content. A summary edited into garbage breaks the list that shows it
+    and nothing that runs."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = store_dataset(client, "d", {"id": "t1", "prompt": "p"}).json()["digest"]
+    client.app.state.db.execute(
+        "UPDATE datasets SET scorers_json = 'not json' WHERE digest = ?", (digest,)
+    )
+    client.app.state.db.commit()
+
+    created = client.post("/experiments", json=digest_body(digest))
+    assert created.status_code == 201, created.text
+    eid = created.json()["id"]
+    assert run_by_digest(client, eid, digest)["status"] == "done"
+    assert client.get(f"/experiments/{eid}/report").json()["thresholds_source"] == (
+        "dataset_store"
+    )

@@ -472,11 +472,26 @@
       // the real thresholds when the scoring pass ran. It is the
       // DENOMINATOR that is incomplete, and that is the part a reader
       // would otherwise assume was whole.
+      //
+      // TWO WAYS TO GET HERE since Phase N, and the note says which. The
+      // bench holds no copy of the dataset, or it holds one this build
+      // could not read, and the server's own reason for the second is
+      // printed verbatim: the floor is honest either way, but a reader
+      // looking at it should know an exact denominator was sitting in
+      // the store.
+      const why =
+        typeof report.dataset_unreadable === "string"
+          ? "the stored dataset could not be read (" +
+            report.dataset_unreadable +
+            "), "
+          : "no dataset file given and the bench holds no copy of this " +
+            "experiment's dataset, ";
       note.textContent =
-        "no dataset file given, so the eligible count was recovered " +
-        "from the score rows and is a FLOOR: a task whose trials were " +
-        "never scored leaves no row to witness its threshold. Supply " +
-        "the file above for the full denominator.";
+        why +
+        "so the eligible count was recovered from the score rows and is " +
+        "a FLOOR: a task whose trials were never scored leaves no row to " +
+        "witness its threshold. Supply the file above for the full " +
+        "denominator.";
       el.append(note);
     }
     return el;
@@ -504,12 +519,13 @@
     input.id = "report-dataset-path";
     input.dataset.testid = "report-dataset-path";
     input.value = path;
-    input.placeholder = "leave blank for score means without pass rates";
+    input.placeholder = "leave blank to read the dataset the bench stored";
     input.title =
-      "Thresholds live in the dataset file, not the database, so pass " +
-      "rates need the file the experiment was created from. The digest " +
-      "is checked against the one recorded at creation and a mismatch " +
-      "is refused. Remembered for this tab only, never stored.";
+      "Thresholds live in the dataset. Blank reads the copy the bench " +
+      "stored under this experiment's digest, when it holds one; a path " +
+      "reads the file from disk instead. Either way the digest is checked " +
+      "against the one recorded at creation and a mismatch is refused. " +
+      "Remembered for this tab only, never stored.";
     const apply = document.createElement("button");
     apply.type = "submit";
     apply.dataset.testid = "report-dataset-apply";

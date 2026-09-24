@@ -26,7 +26,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -34,7 +36,12 @@ from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from bench import snapshot, store
-from bench.datasets import DatasetError, parse_dataset
+from bench.datasets import (
+    DatasetError,
+    cites_documents,
+    parse_dataset,
+    scorer_kinds,
+)
 from bench.experiments import plan_trials, seed_for_repeat
 from bench.extract import (
     DOCUMENT_KIND,
@@ -919,14 +926,147 @@ MAX_TRIALS = 5000
 PROGRESS_POLL_S = 0.25
 
 
+# The longest name a stored dataset may carry. The same bound
+# AttachmentCreate puts on a filename, since a dataset uploaded from the
+# browser arrives named by its file, and named once because the request
+# envelope below is sized from it.
+MAX_DATASET_NAME_CHARS = 255
+
+
+def _clean_dataset_name(value: str) -> str:
+    """A stored dataset's name, refused where it would break where it is shown.
+
+    THE THREE RULES _clean_filename applies, each for this field's own
+    reason. A control character: the name is printed in the dataset
+    library, on the experiment list and in every report through
+    experiments.dataset_name, and a newline or a NUL breaks each of
+    those. A path separator: the name is never a path, the bytes live in
+    bench.db and are never written to disk, and a name that reads like
+    one invites somebody to join it to a directory. Only whitespace: it
+    names nothing a person could pick out of a list.
+
+    Not trimmed and not normalized, for _clean_filename's reason: the
+    name is recorded as sent, and a rewritten one is a name nobody chose.
+    """
+    if any(ch < " " or ch == "\x7f" for ch in value):
+        raise ValueError(
+            "name contains a control character. It is printed in the "
+            "dataset library, on the experiment list and in every report, "
+            "and a name carrying a newline or a NUL breaks each of those."
+        )
+    if "/" in value or "\\" in value:
+        raise ValueError(
+            "name contains a path separator. A stored dataset's bytes live "
+            "in the bench's database and are never written to disk, so "
+            "the name is a label and a path is a claim it cannot honor."
+        )
+    if not value.strip():
+        raise ValueError("name is only whitespace, so it names nothing.")
+    return value
+
+
+class DatasetCreate(BaseModel):
+    """One dataset's JSONL, as text inside a JSON body.
+
+    JSON AND NOT A FORM, for exactly the reason AttachmentCreate gives. A
+    form or multipart POST is a CORS "simple" request that a hostile page
+    can fire at localhost with no preflight; requiring JSON forces every
+    cross-origin sender into a preflight this server never answers.
+
+    TEXT AND NOT BASE64, which is where it parts from an attachment. A
+    dataset is UTF-8 JSONL by definition, since parse_dataset refuses
+    anything else, so the text determines the bytes: the server stores
+    content.encode("utf-8") and hashes exactly that. A document can be
+    any bytes at all, which is why a document travels encoded.
+
+    NO DIGEST FIELD, and unknown fields refuse, so a caller cannot send
+    one. The server computes the digest from what it received; see
+    create_dataset.
+    """
+
+    # Unknown fields refused; see FORBID_UNKNOWN.
+    model_config = FORBID_UNKNOWN
+
+    name: str = Field(min_length=1, max_length=MAX_DATASET_NAME_CHARS)
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        return _clean_dataset_name(value)
+
+    # BOUNDED IN create_dataset AND NOT HERE, in bytes rather than
+    # characters, because bytes are what is stored and hashed and a
+    # max_length would count code points. The allocation is already
+    # bounded before this model ever sees the field, by MAX_REQUEST_BYTES
+    # at the guard; MAX_DATASET_BYTES says how much of that a dataset may
+    # use and why.
+    content: str
+
+
+class Dataset(BaseModel):
+    """What the bench says back about a stored dataset: identity and summary.
+
+    NO CONTENT on this shape, which is the one the list and the POST
+    answer with, for the reason store.DATASET_COLUMNS leaves it out. The
+    detail door adds it; see DatasetDetail.
+
+    scorers and cites_documents are facts the parser established when the
+    bytes were stored: which scorer kinds the tasks declare, and whether
+    any task cites a document. They are what a person choosing a dataset
+    needs to see and what a browser needs to decide which controls apply,
+    without anyone parsing JSONL a second time.
+    """
+
+    digest: str
+    name: str
+    created_at: str
+    task_count: int
+    scorers: list[str]
+    cites_documents: bool
+
+
+class DatasetDetail(Dataset):
+    """One stored dataset with its tasks, as the text that was stored.
+
+    THE CONTENT IS SERVED, and that is the difference from an attachment
+    rather than an inconsistency with one. A document is somebody's file,
+    and serving it back would make the bench a file host. A dataset is
+    the operator's own tasks, and an experiment cites it by digest; this
+    is where the bytes behind that citation can be read again, which is
+    what lets the export cite a dataset without carrying one.
+
+    Exactly the text that was stored, so content.encode("utf-8") hashes
+    to digest.
+    """
+
+    content: str
+
+
+class DatasetList(BaseModel):
+    """The datasets the bench holds, newest first, summaries only."""
+
+    datasets: list[Dataset]
+
+
 class ExperimentCreate(BaseModel):
     model_config = FORBID_UNKNOWN
 
     name: str = Field(min_length=1, max_length=200)
+    # WHERE THE TASKS COME FROM, named by exactly one of two fields; see
+    # load_dataset for why both and neither refuse.
+    #
     # A path the user names. Read by the boundary, not by the loader:
     # where the bench may read from is a question for the edge, and
     # bench.datasets stays a pure function over bytes.
-    dataset_path: str = Field(min_length=1, max_length=4096)
+    dataset_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    # Or the digest of a dataset stored through POST /datasets, whose
+    # bytes come from the store under that key. The same shape
+    # RenditionPin.digest enforces, because it is the same kind of
+    # identity: sha256, lowercase hex, and nothing a caller computed
+    # about bytes the bench does not hold.
+    dataset_digest: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     # Same shape and same bound as GroupCreate.models, since every trial
     # this experiment runs creates a group with exactly this lineup.
     lineup: list[str] = Field(min_length=1, max_length=MAX_POSITION + 1)
@@ -1032,30 +1172,47 @@ class ExperimentCreated(BaseModel):
 
 
 class ExperimentStart(BaseModel):
-    """The dataset to read at start time.
+    """The dataset to read at start time, named by exactly one of two fields.
 
     Asked for again rather than stored on the experiment row, and the
     asymmetry is deliberate: the row records the digest of what was read
     at creation, which is the claim about what the experiment IS. The path
     is where those bytes happened to live, which can change without the
-    experiment changing. Re-reading and re-checking the digest at start is
-    what turns "the file moved" into a refusal instead of a silent run
-    over different tasks.
+    experiment changing. Re-reading and re-checking the digest is what
+    turns "the file moved" into a failed experiment that never spent,
+    instead of a silent run over different tasks. This docstring said
+    "into a refusal" until Phase N, and Phase N's commission repeated
+    the claim in its table of doors; neither was ever true of the path,
+    and the tombstone for both is
+    test_review_repro_the_spec_said_start_refuses_drift_and_only_the_digest_door_does.
+
+    A PATH IS READ BY THE RUNNER, AFTER THE 202, and that is unchanged:
+    a file that moved or changed ends the experiment failed with the
+    reason in status_detail, and the start itself was accepted. A DIGEST
+    IS CHECKED AT THE DOOR, because checking it reads nothing: it is the
+    digest the row recorded or it is not, and a mismatch is refused 422
+    while the experiment is still created and can still be started with
+    the right one. The bytes behind a digest come from the store under
+    that key, so the drift a path is exposed to cannot happen to them.
     """
 
     model_config = FORBID_UNKNOWN
 
-    dataset_path: str = Field(min_length=1, max_length=4096)
+    dataset_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    dataset_digest: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
 
 
 class ScoringStart(BaseModel):
     """What a scoring pass needs: the tasks, and optionally a judge.
 
     The dataset is named again for the same reason the runner names it
-    again: the rubrics and references live in the file, the experiment row
-    records only the digest of what was read, and re-checking that digest
-    is what stops a pass from grading one rubric's trials against
-    another's.
+    again: the rubrics and references live in the dataset, the experiment
+    row records only the digest of what was read, and re-checking that
+    digest is what stops a pass from grading one rubric's trials against
+    another's. By path or by the digest of a stored dataset, exactly one;
+    both are checked here, before the pass begins.
 
     judge_model is optional because a dataset of deterministic scorers
     needs no judge, and requiring one would make the cheap case pay for
@@ -1064,7 +1221,10 @@ class ScoringStart(BaseModel):
 
     model_config = FORBID_UNKNOWN
 
-    dataset_path: str = Field(min_length=1, max_length=4096)
+    dataset_path: str | None = Field(default=None, min_length=1, max_length=4096)
+    dataset_digest: str | None = Field(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    )
     judge_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
@@ -1475,11 +1635,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # other's queueing. active is the running experiment's id or None,
     # task holds a strong reference so asyncio does not collect a running
     # task, and stop is the between-trials halt.
+    # dataset_path and dataset_digest are the start door's two ways of
+    # naming the tasks, exactly one of them set per start; the runner
+    # hands both to load_dataset, which is where the rule lives.
     app.state.experiment_run = {
         "active": None,
         "task": None,
         "stop": asyncio.Event(),
         "dataset_path": None,
+        "dataset_digest": None,
     }
     # The scoring pass, held separately from the trial runner. They are
     # separate because they are separately useful: a finished experiment
@@ -1671,6 +1835,54 @@ app = FastAPI(
     openapi_url=None,
 )
 
+
+class _SpellableJSON(JSONResponse):
+    """A JSON response that can always be written, byte-identical when it
+    already could be.
+
+    Starlette writes JSON as UTF-8 with ensure_ascii off, and a Python str
+    can hold a lone surrogate that UTF-8 cannot encode. JSON spells one
+    as an escape, JSON.stringify writes one for half of a pair, and a
+    refusal that echoes the request back then fails to be written at all:
+    the refusal became a 500. Only in that case is the body written again
+    with every non-ASCII character escaped, which is the same JSON value
+    in a spelling UTF-8 can carry; every body that could be written is
+    written exactly as before.
+    """
+
+    def render(self, content: Any) -> bytes:
+        try:
+            return super().render(content)
+        except UnicodeEncodeError:
+            return json.dumps(
+                content,
+                ensure_ascii=True,
+                allow_nan=False,
+                indent=None,
+                separators=(",", ":"),
+            ).encode("ascii")
+
+
+@app.exception_handler(RequestValidationError)
+async def refuse_malformed_request(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
+    """FastAPI's own 422 for a body the models refuse, written so it can
+    always be written.
+
+    The same status and the same list of error objects FastAPI answers
+    with by default (fastapi.exception_handlers.request_validation_
+    exception_handler, 0.141.1), through _SpellableJSON. Found at POST
+    /datasets, where a name holding a lone surrogate was refused by the
+    model and the refusal's echo of that name then failed to encode; it
+    is not particular to that door, since every model refusal echoes its
+    input, so it is fixed where every door shares it.
+    """
+    return _SpellableJSON(
+        status_code=422, content={"detail": jsonable_encoder(exc.errors())}
+    )
+
+
 # The bench is a localhost tool holding a paid API key, which makes it a
 # target for the two ways a browser gets turned against local servers.
 # First, cross-site "simple" POSTs: a malicious page can fire fetch() at
@@ -1777,9 +1989,57 @@ CONTENT_SECURITY_POLICY = (
 #
 # The attachment envelope plus a kilobyte, and the kilobyte is the
 # filename, the JSON braces and the key names. Every other body this
-# application takes is small by construction, so one number serves them
-# all and a per-route table would be a second thing to keep in step.
+# application takes is small by construction except a stored dataset,
+# and that one is sized FROM this number rather than beside it (see
+# MAX_DATASET_BYTES), so one number still serves them all and a
+# per-route table would be a second thing to keep in step.
 MAX_REQUEST_BYTES = MAX_ATTACHMENT_B64_CHARS + 1024
+
+# The largest dataset POST /datasets will store, in UTF-8 bytes.
+#
+# DERIVED FROM THE REQUEST CAP, NOT CHOSEN BESIDE IT, so the two cannot
+# disagree about one body. A dataset travels as a JSON string, and JSON
+# lets a sender spell any character as an escape. THE SIX IS THE LONGEST
+# SPELLING OF ONE STORED BYTE: \u00XX, the six-character escape RFC 8259
+# section 7 allows for any character in the Basic Multilingual Plane,
+# which is how an encoder that escapes everything writes "a" (\u0061).
+# Every other spelling costs less per stored byte: the two-character
+# escapes are two, a raw character is its own UTF-8 bytes, a two- or
+# three-byte character escapes to the same six, and a four-byte one to
+# twelve as a surrogate pair, three per stored byte. UTF-8 on the wire is
+# assumed because RFC 8259 section 8.1 requires it of "JSON text
+# exchanged between systems that are not part of a closed ecosystem".
+#
+# THE ENVELOPE COMES OFF FIRST, sized for its own worst spelling, and it
+# is the part the first statement of this rule got wrong twice. The name
+# is bounded in code points, and a code point outside the Basic
+# Multilingual Plane escapes to twelve bytes as a surrogate pair, so the
+# name costs twelve per character, not six. The two keys are JSON
+# strings too and escape like any other, six bytes for each of their
+# eleven characters. What remains of the 64 after the braces, the colons,
+# the comma and the eight quotes is 51 bytes of whitespace between
+# tokens. Dividing the whole cap by six left the largest legal body,
+# spelled the longest way, a kilobyte and a half over the cap; a
+# six-byte name and bare keys still left it over, measured at eleven
+# bytes with the keys escaped and at 1,486 with an escaped astral name.
+#
+# SO THE PROMISE HAS A SCOPE, stated rather than implied. A dataset under
+# this bound, sent as one name and one content, spelled any way JSON
+# allows, keys included, with up to 51 bytes of whitespace between
+# tokens, fits under MAX_REQUEST_BYTES, and the guard's 413 cannot answer
+# before this door does. JSON also permits unbounded whitespace and
+# repeated keys, and no finite envelope covers a sender who pads a body
+# without limit; that sender is answered by the guard.
+#
+# WHAT IT COSTS: about 1.8 MiB, against more than 320 million characters
+# of field content the parser's own bounds would admit (MAX_TASKS tasks,
+# each a MAX_PROMPT_CHARS prompt, three MAX_FIELD_CHARS fields, a pattern
+# and an id). A larger dataset goes by path, where the file is read from
+# disk and the parser's bounds are the only ones.
+DATASET_ENVELOPE_BYTES = (
+    12 * MAX_DATASET_NAME_CHARS + 6 * (len("name") + len("content")) + 64
+)
+MAX_DATASET_BYTES = (MAX_REQUEST_BYTES - DATASET_ENVELOPE_BYTES) // 6
 
 
 class _BodyTooLarge(Exception):
@@ -1941,7 +2201,8 @@ class LocalOnlyGuard:
                     f"{MAX_REQUEST_BYTES} byte limit and was refused "
                     "before it was read. An attachment may be at most "
                     f"{MAX_ATTACHMENT_BYTES} bytes; base64 costs a third "
-                    "on top of that."
+                    "on top of that. A stored dataset may be at most "
+                    f"{MAX_DATASET_BYTES} bytes; a larger one goes by path."
                 )
             },
             status_code=413,
@@ -4233,6 +4494,12 @@ def read_dataset(path: str) -> dict[str, Any]:
     Every failure is a 422 naming the file and the line, because the
     caller's next action is to fix the file and a 500 would tell them
     nothing about which line to open.
+
+    THE OTHER DOOR NEEDS NO PATH AT ALL. A dataset stored through POST
+    /datasets arrives in a request body and is read back from bench.db by
+    its digest, so the argument above never applies to it; see
+    create_dataset and stored_dataset. This function is still the only
+    place the bench reads a dataset from disk.
     """
     try:
         raw = Path(path).read_bytes()
@@ -4246,6 +4513,161 @@ def read_dataset(path: str) -> dict[str, Any]:
         raise HTTPException(422, str(exc)) from None
 
 
+# The rule for the three doors that must know which tasks they are
+# about: create, start and score. One sentence, because it is one rule
+# and a person who has met it at one door should recognize it at the
+# next.
+ONE_DATASET = (
+    "name the dataset exactly once: dataset_path for a file the bench "
+    "reads from disk, or dataset_digest for one stored through POST "
+    "/datasets. Both would be two claims about which tasks these are, "
+    "and neither is no claim at all."
+)
+
+# The report and the export may name neither, and then consult the
+# store; see report_tasks. Both is still two claims.
+AT_MOST_ONE_DATASET = (
+    "name the dataset at most once: dataset_path for a file, "
+    "dataset_digest for a stored one, or neither, and the bench looks "
+    "for the digest this experiment recorded in its own store. Both "
+    "would be two claims about where the thresholds come from."
+)
+
+
+def stored_dataset(digest: str) -> dict[str, Any]:
+    """A dataset stored through POST /datasets, parsed, or 422 with why.
+
+    THE STORE'S HALF OF read_dataset, and deliberately the same loader:
+    the stored bytes go through parse_dataset exactly as a file's do, so
+    a dataset read by digest and the same bytes read by path are one
+    parse with one result, differing only in the name each was read
+    under.
+
+    THE DIGEST IS CHECKED AGAINST THE BYTES, not trusted as a key. It is
+    the key, so the check cannot fail through anything this application
+    does; it can fail through a person editing bench.db by hand, and an
+    experiment created from those bytes would then cite one dataset and
+    contain another, which is the artifact every drift check in this
+    file exists to prevent.
+    """
+    row = store.dataset_bytes(app.state.db, digest)
+    if row is None:
+        raise HTTPException(
+            422,
+            f"no stored dataset has digest {digest}. Store it through POST "
+            "/datasets first, or name its file with dataset_path.",
+        )
+    return parsed_stored(row, digest)
+
+
+def parsed_stored(row: dict[str, Any], digest: str) -> dict[str, Any]:
+    """A datasets row already in hand, parsed and held to its key.
+
+    Split from stored_dataset so the report's store lookup, which has to
+    ask whether a row exists before it knows it will parse one, reads the
+    bytes once rather than twice. The checks are stored_dataset's and
+    are not repeated anywhere else.
+    """
+    try:
+        dataset = parse_dataset(row["content"], name=row["name"])
+    except DatasetError as exc:
+        raise HTTPException(422, str(exc)) from None
+    if dataset["digest"] != digest:
+        raise HTTPException(422, unkeyed_bytes(digest, dataset["digest"]))
+    return dataset
+
+
+def unkeyed_bytes(digest: str, actual: str) -> str:
+    """The sentence for bytes stored under a digest they do not hash to.
+
+    One sentence for the two doors that check: the parse, which would
+    otherwise cite one dataset and contain another, and the detail door,
+    which would otherwise serve text under a digest it does not have.
+    """
+    return (
+        f"the bytes stored under digest {digest[:12]} hash to {actual[:12]}: "
+        "the datasets table was edited outside the bench, and a record "
+        "citing the first would contain the second's tasks."
+    )
+
+
+def load_dataset(path: str | None, digest: str | None) -> dict[str, Any]:
+    """The dataset a create, start or score names, by exactly one door.
+
+    EXACTLY ONE, and the two refusals are one rule. Both is two claims
+    about which tasks an experiment is, and there is no answer to which
+    one wins that a person reading the record afterwards could recover.
+    Neither is no claim at all, and guessing one (the newest stored
+    dataset, say) would be the bench choosing an experiment's tasks.
+
+    Checked here, in the handler, rather than in the request models, so
+    the refusal is one sentence a page can print: a model validator
+    answers with a list of error objects, which is the right shape for a
+    malformed field and the wrong one for a rule about two of them.
+    """
+    if (path is None) == (digest is None):
+        raise HTTPException(422, ONE_DATASET)
+    if digest is not None:
+        return stored_dataset(digest)
+    assert path is not None
+    return read_dataset(path)
+
+
+def enforce_recorded_digest(
+    experiment: dict[str, Any], digest: str, consequence: str
+) -> None:
+    """A digest a caller names for an experiment must be the one it recorded.
+
+    Checked BEFORE the store is read, because the answer needs nothing
+    from it: the experiment row holds the digest of what it was created
+    over, and a different digest is a different dataset whether or not
+    the bench holds one. Its own sentence rather than the path's "dataset
+    changed since", because nothing changed: a different dataset was
+    named, and the remedy is to name the right one.
+    """
+    recorded = experiment["dataset_digest"]
+    if digest != recorded:
+        raise HTTPException(
+            422,
+            f"dataset_digest {digest[:12]} is not the dataset this "
+            f"experiment was created over, which is {recorded[:12]}. "
+            f"{consequence}",
+        )
+
+
+def cited_dataset(
+    experiment: dict[str, Any],
+    path: str | None,
+    digest: str | None,
+    consequence: str,
+) -> dict[str, Any]:
+    """The dataset a request names for an existing experiment, refused
+    unless it is the one that experiment was created over.
+
+    The run-start precedent, now with two doors. By path the file is read
+    and its digest compared, in the words every path door has used since
+    Phase I. By digest the comparison comes first and needs no read, and
+    the bytes then come from the store under the key that was compared.
+    Either way what is returned is the dataset the record cites, or
+    nothing is returned at all.
+    """
+    if (path is None) == (digest is None):
+        raise HTTPException(422, ONE_DATASET)
+    if digest is not None:
+        enforce_recorded_digest(experiment, digest, consequence)
+        return stored_dataset(digest)
+    assert path is not None
+    dataset = read_dataset(path)
+    if dataset["digest"] != experiment["dataset_digest"]:
+        raise HTTPException(
+            422,
+            "dataset changed since this experiment was created: recorded "
+            f"{experiment['dataset_digest'][:12]}, file is "
+            f"{dataset['digest'][:12]}. {consequence}",
+        )
+    return dataset
+
+
 def enforce_primary_metric(metric: str, dataset: dict[str, Any]) -> None:
     """A primary metric has to name something this experiment can produce.
 
@@ -4255,13 +4677,9 @@ def enforce_primary_metric(metric: str, dataset: dict[str, Any]) -> None:
     declares is a declaration that silently never applies, and the report
     would then rank every model on None and call it a ranking.
     """
-    declared = sorted(
-        {
-            kind
-            for task in dataset["tasks"]
-            if isinstance(kind := (task.get("scorer") or {}).get("kind"), str)
-        }
-    )
+    # The derivation a stored dataset's summary records too; see
+    # bench.datasets.scorer_kinds for why there is only one.
+    declared = scorer_kinds(dataset["tasks"])
     if metric in declared or metric == HUMAN_SCORER:
         return
     allowed = ", ".join([*declared, HUMAN_SCORER])
@@ -4747,7 +5165,12 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
     can change what they do. The projection rides on the 201 and is not
     stored; see CostProjection and the comment at the call.
     """
-    dataset = read_dataset(body.dataset_path)
+    # BY EITHER DOOR, AND THE REST OF THIS FUNCTION CANNOT TELL WHICH.
+    # A stored dataset and the same bytes on disk parse to one dataset
+    # with one digest, and everything below reads only that; the name is
+    # the one difference, and it is recorded as dataset_name because it
+    # is the name the bytes were read under.
+    dataset = load_dataset(body.dataset_path, body.dataset_digest)
     controls = request_controls(body.params)
     trials = len(dataset["tasks"]) * body.repeats * len(body.lineup)
     if trials > MAX_TRIALS:
@@ -5454,7 +5877,10 @@ async def run_experiment(experiment_id: int) -> None:
     # cleanup that will be forgotten on the next exit somebody adds.
     try:
         try:
-            dataset = read_dataset(state["dataset_path"])
+            # By whichever door the start named. A path is read here, for
+            # the first time since creation; a digest was checked at the
+            # door and its bytes come from the store under that key.
+            dataset = load_dataset(state["dataset_path"], state["dataset_digest"])
         except HTTPException as exc:
             # The file moved or became unreadable between creation and
             # start. Not a crash: the experiment records why it never ran.
@@ -5757,9 +6183,28 @@ async def start_experiment(experiment_id: int, body: ExperimentStart) -> dict[st
             "time: they share the upstream slots and the spend ceiling, "
             "so concurrent experiments would measure each other.",
         )
+    if (body.dataset_path is None) == (body.dataset_digest is None):
+        raise HTTPException(422, ONE_DATASET)
+    if body.dataset_digest is not None:
+        # AT THE DOOR, BEFORE ANY STATE MOVES, because a digest can be
+        # checked without reading anything and a path cannot. The path is
+        # still read by the runner after the 202, exactly as before; a
+        # wrong digest is refused here while the experiment is still
+        # created and can still be started with the right one. The store
+        # is read too, so a digest that is right but not held (or held
+        # and no longer parseable by this build) is refused in the same
+        # place rather than becoming a failed experiment.
+        enforce_recorded_digest(
+            experiment,
+            body.dataset_digest,
+            "Starting it over another dataset would produce a record "
+            "citing one set of tasks and containing another.",
+        )
+        stored_dataset(body.dataset_digest)
     state["active"] = experiment_id
     state["stop"] = asyncio.Event()
     state["dataset_path"] = body.dataset_path
+    state["dataset_digest"] = body.dataset_digest
     state["error"] = None
     # Held on app.state so the task is not garbage collected mid-run, and
     # so a stop can be issued against it. asyncio keeps only a weak
@@ -6023,15 +6468,13 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
         raise HTTPException(
             409, f"a scoring pass for experiment {state['active']} is running"
         )
-    dataset = read_dataset(body.dataset_path)
-    if dataset["digest"] != experiment["dataset_digest"]:
-        raise HTTPException(
-            422,
-            "dataset changed since this experiment was created: recorded "
-            f"{experiment['dataset_digest'][:12]}, file is "
-            f"{dataset['digest'][:12]}. Scoring against different tasks "
-            "would attribute one rubric's verdict to another's trial.",
-        )
+    dataset = cited_dataset(
+        experiment,
+        body.dataset_path,
+        body.dataset_digest,
+        "Scoring against different tasks would attribute one rubric's "
+        "verdict to another's trial.",
+    )
     state["active"] = experiment_id
     state["stop"] = asyncio.Event()
     state["error"] = None
@@ -7049,6 +7492,123 @@ async def get_attachment(digest: str) -> dict[str, Any]:
     return _attachment_detail(row)
 
 
+@app.post("/datasets", response_model=Dataset, status_code=201)
+async def create_dataset(body: DatasetCreate) -> dict[str, Any]:
+    """Validate one dataset and store it under the digest of its bytes.
+
+    NO PATH, AND THAT IS WHY IT NEEDS NO POSTURE. read_dataset reads a
+    file somebody named, and its docstring argues why that door has no
+    allowlist. This door reads nothing: the tasks arrive in the body, the
+    bytes stored are the bytes received, and nothing between the request
+    and the row touches the filesystem. Two tests hold it to that, each
+    catching what the other cannot: the posture walk in tests/test_api.py
+    sees any path operation written into this function, and a runtime
+    test drives this door and the digest route with every Python-level
+    file read raising, which is what catches a read reached through an
+    existing helper such as read_dataset.
+
+    THE SERVER VALIDATES, with the loader every other door uses:
+    parse_dataset over exactly the bytes that will be stored, refusing
+    422 in the parser's own sentence with the parser's own line number.
+    A browser composing a dataset shows that sentence; it does not carry
+    a second validator that could disagree with this one.
+
+    THE DIGEST IS THE SERVER'S, computed from those bytes and never
+    accepted from a caller. It is the identity every experiment created
+    from this dataset will cite, and a caller that could name its own
+    could make an experiment cite tasks it never stored.
+
+    Identical content returns the existing row, earlier name and all;
+    see store.save_dataset. 201 either way, as the attachment door
+    answers, because the dataset the caller asked to exist does.
+    """
+    try:
+        raw = body.content.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        # REACHABLE FROM A BROWSER, which is why the sentence names the
+        # line. JSON can spell a lone surrogate as an escape, and
+        # JSON.stringify writes one whenever a string holds half of a
+        # pair, which a paste can produce. No UTF-8 file can contain one,
+        # so there are no bytes to store, and a 500 would be the bench
+        # failing to say so. The line is counted the way parse_dataset
+        # counts, splitlines with blank lines numbered, so it points at
+        # the same row the parser would have named.
+        line_no = len((body.content[: exc.start] + "x").splitlines())
+        raise HTTPException(
+            422,
+            f"line {line_no}: content holds an unpaired surrogate "
+            f"(U+{ord(body.content[exc.start]):04X}), which JSON can "
+            "spell and UTF-8 cannot. A dataset is UTF-8 text, so there are "
+            "no bytes to store for it.",
+        ) from None
+    if len(raw) > MAX_DATASET_BYTES:
+        raise HTTPException(
+            422,
+            f"this dataset is {len(raw)} bytes as UTF-8, over the "
+            f"{MAX_DATASET_BYTES} byte limit for a stored one. A larger "
+            "dataset goes by path: name its file with dataset_path and "
+            "the bench reads it from disk.",
+        )
+    try:
+        dataset = parse_dataset(raw, name=body.name)
+    except DatasetError as exc:
+        raise HTTPException(422, str(exc)) from None
+    return store.save_dataset(
+        app.state.db,
+        {
+            "digest": dataset["digest"],
+            "name": body.name,
+            "content": raw,
+            "task_count": len(dataset["tasks"]),
+            "scorers": scorer_kinds(dataset["tasks"]),
+            "cites_documents": cites_documents(dataset["tasks"]),
+        },
+    )
+
+
+@app.get("/datasets", response_model=DatasetList)
+async def list_datasets(limit: int = Query(100, ge=1, le=500)) -> dict[str, Any]:
+    """Every stored dataset, newest first, summaries and never content.
+
+    Bounded like the attachment list and for the same reason, and flat
+    in the number of rows: one query with no body column, so a page of
+    datasets costs a page of summaries rather than a page of tasks.
+    """
+    return {"datasets": store.list_datasets(app.state.db, limit)}
+
+
+@app.get("/datasets/{digest}", response_model=DatasetDetail)
+async def get_dataset(digest: str) -> dict[str, Any]:
+    """One stored dataset: its summary and the text that was stored.
+
+    The content is served; see DatasetDetail for why a dataset is served
+    back and a document never is. The bytes are held to their key before
+    they are served, because the point of serving them is that the text
+    hashes to the digest it is served under, and text that does not
+    would be a citation answered with somebody else's tasks.
+
+    Bytes create_dataset wrote were encoded from a str, so they decode;
+    a row edited by hand might not, and is refused in a sentence rather
+    than as a 500.
+    """
+    row = store.get_dataset(app.state.db, digest)
+    if row is None:
+        raise HTTPException(404, "no such dataset")
+    actual = hashlib.sha256(row["content"]).hexdigest()
+    if actual != digest:
+        raise HTTPException(422, unkeyed_bytes(digest, actual))
+    try:
+        row["content"] = row["content"].decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            422,
+            f"the bytes stored under digest {digest[:12]} are not UTF-8 "
+            f"({exc.reason} at byte {exc.start}), so there is no text to "
+            "serve: the row was written outside the bench.",
+        ) from None
+    return row
+
+
 @app.delete("/prompts/{prompt_id}", status_code=204)
 async def remove_prompt(prompt_id: int) -> Response:
     ensure_rowid(prompt_id)
@@ -7528,7 +8088,11 @@ REPORT_SEED = 20260801
 
 @app.get("/experiments/{experiment_id}/report")
 async def experiment_report(
-    experiment_id: int, dataset_path: str | None = Query(default=None)
+    experiment_id: int,
+    dataset_path: str | None = Query(default=None),
+    dataset_digest: str | None = Query(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    ),
 ) -> dict[str, Any]:
     """Aggregates for one experiment, computed at read time.
 
@@ -7537,18 +8101,20 @@ async def experiment_report(
     outcome: a stored aggregate can disagree with the rows it came from,
     and the day it does there is no way to tell which is wrong.
 
-    dataset_path is optional and it changes how well the pass rate's
-    population is known, not whether there is one. Thresholds live in the
-    dataset file rather than in the database, so with the file the
-    eligible population is exact; without it the report recovers what it
-    can from the score rows, which is a floor rather than the full
-    denominator. Either way it publishes thresholds_source so the reader
-    knows which they are looking at. Degrading to no pass rate at all
-    was the older behavior and it threw away verdicts that were sitting
-    in the database, which is a different dishonesty from the one the
-    degrade was protecting against.
+    The dataset changes how well the pass rate's population is known,
+    not whether there is one. Thresholds live in the dataset rather than
+    in the experiment's rows, so with the dataset the eligible population
+    is exact; without it the report recovers what it can from the score
+    rows, which is a floor rather than the full denominator. Either way
+    it publishes thresholds_source so the reader knows which they are
+    looking at. Degrading to no pass rate at all was the older behavior
+    and it threw away verdicts that were sitting in the database, which
+    is a different dishonesty from the one the degrade was protecting
+    against.
 
-    When the file is given its digest is checked, because scoring one
+    The dataset may be named by path, by the digest of a stored one, or
+    not at all; see report_tasks for the three and for what "not at all"
+    now does. A named one has its digest checked, because scoring one
     dataset's trials against another's thresholds is the same
     misattribution the scoring pass refuses.
     """
@@ -7556,34 +8122,85 @@ async def experiment_report(
     experiment = store.get_experiment(app.state.db, experiment_id)
     if experiment is None:
         raise HTTPException(404, "no such experiment")
-    # None rather than an empty mapping when no path was given: build_report
-    # reads the difference between "nobody asked the file" and "the file
-    # said nothing is declared".
-    tasks = None if dataset_path is None else dataset_tasks(experiment, dataset_path)
-    return build_report(experiment, **_report_inputs(experiment_id, tasks))
+    tasks, source, unreadable = report_tasks(experiment, dataset_path, dataset_digest)
+    return build_report(
+        experiment, **_report_inputs(experiment_id, tasks, source, unreadable)
+    )
 
 
-def dataset_tasks(experiment: dict[str, Any], dataset_path: str) -> dict[str, Any]:
-    """The named file's tasks, refused unless it is the file that ran.
+# Why a report or an export refuses a dataset that is not the one an
+# experiment recorded. One sentence for both, since they are one read.
+REPORTING_CONSEQUENCE = (
+    "Reporting against different tasks would attribute one rubric's "
+    "threshold to another."
+)
 
-    The run-start precedent, and this is its third use: start, score, and
-    now the two read paths. One rule in one shape, so a caller who has
-    met it once has met it everywhere.
+
+def report_tasks(
+    experiment: dict[str, Any], dataset_path: str | None, dataset_digest: str | None
+) -> tuple[dict[str, Any] | None, str, str | None]:
+    """The tasks a report or an export takes its thresholds from, keyed by
+    id, and where they came from, as thresholds_source publishes it.
+
+    THREE SOURCES AND THE REPORT NAMES WHICH, because they are not equally
+    good and a reader comparing two reports has to know. dataset_file: a
+    path was supplied and its bytes are the ones recorded. dataset_store:
+    the bench holds the recorded bytes and read them from its store,
+    whether the caller named the digest or named nothing. score_rows:
+    there was no dataset to read, and the eligible population is the
+    floor the score rows witness.
+
+    NAMING NOTHING NOW CONSULTS THE STORE. When the bench holds the
+    dataset this experiment recorded, the report reads it, and that is not
+    a substitution: it resolves by the identity the row already cites,
+    so there is no second dataset it could have picked. It is what keeps
+    the page and curl from publishing two reports under one name, since
+    the page has no path to send and before this got the floor for every
+    experiment while a caller with the file got the exact denominator.
+    A named path or digest that is not the recorded one is still refused,
+    in the words every other door uses.
+
+    AN UNREADABLE STORED COPY FALLS BACK TO THE FLOOR, AND SAYS WHY, when
+    nothing was named. The bench can hold the recorded bytes and still be
+    unable to use them: a later build's stricter parser refuses what an
+    earlier one stored, or the row was edited by hand. Refusing there
+    would leave the experiment with no readable report or export at all,
+    since the same bytes by path meet the same parser and there is no
+    way to ask for the floor; so the report publishes the floor under
+    score_rows, which is true, and the reason in dataset_unreadable, so
+    the exact denominator it could not reach is never silent. A caller
+    who NAMES the digest asked for that dataset, and is refused.
+
+    None rather than an empty mapping when there was nothing to read, and
+    the difference matters: build_report reads None as "nobody asked a
+    dataset" and {} as "the dataset declared nothing". The third element
+    is the unreadable copy's reason, or None.
     """
-    dataset = read_dataset(dataset_path)
-    if dataset["digest"] != experiment["dataset_digest"]:
-        raise HTTPException(
-            422,
-            "dataset changed since this experiment was created: recorded "
-            f"{experiment['dataset_digest'][:12]}, file is "
-            f"{dataset['digest'][:12]}. Reporting against different "
-            "tasks would attribute one rubric's threshold to another.",
+    if dataset_path is not None and dataset_digest is not None:
+        raise HTTPException(422, AT_MOST_ONE_DATASET)
+    if dataset_path is not None or dataset_digest is not None:
+        dataset = cited_dataset(
+            experiment, dataset_path, dataset_digest, REPORTING_CONSEQUENCE
         )
-    return {t["id"]: t for t in dataset["tasks"]}
+        source = "dataset_file" if dataset_path is not None else "dataset_store"
+    else:
+        recorded = experiment["dataset_digest"]
+        row = store.dataset_bytes(app.state.db, recorded)
+        if row is None:
+            return None, "score_rows", None
+        try:
+            dataset = parsed_stored(row, recorded)
+        except HTTPException as exc:
+            return None, "score_rows", str(exc.detail)
+        source = "dataset_store"
+    return {t["id"]: t for t in dataset["tasks"]}, source, None
 
 
 def _report_inputs(
-    experiment_id: int, tasks_by_id: dict[str, Any] | None
+    experiment_id: int,
+    tasks_by_id: dict[str, Any] | None,
+    thresholds_source: str,
+    dataset_unreadable: str | None,
 ) -> dict[str, Any]:
     """Every row the report needs, read once.
 
@@ -7607,6 +8224,8 @@ def _report_inputs(
         "runs_by_group": runs_by_group,
         "scores_by_result": store.scores_for_results(db, result_ids),
         "tasks_by_id": tasks_by_id,
+        "thresholds_source": thresholds_source,
+        "dataset_unreadable": dataset_unreadable,
         "seed": REPORT_SEED,
         "captures": _captures_named(groups, experiment.get("task_attachments")),
     }
@@ -7740,22 +8359,30 @@ def threshold_slice(tasks_by_id: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/experiments/{experiment_id}/export.jsonl")
 async def experiment_export(
-    experiment_id: int, dataset_path: str | None = Query(default=None)
+    experiment_id: int,
+    dataset_path: str | None = Query(default=None),
+    dataset_digest: str | None = Query(
+        default=None, min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$"
+    ),
 ) -> StreamingResponse:
     """The whole experiment as JSONL: manifest, trials, digest.
 
-    dataset_path is optional and takes the same terms as start, score and
-    report: the digest is checked against the one recorded at creation
-    and a mismatch is refused before a single byte is streamed, since an
-    artifact half-written against the wrong file is worse than none.
+    The dataset takes the same terms as the report's, by path, by the
+    digest of a stored one, or not at all with the store consulted for
+    the recorded digest; see report_tasks. A named one has its digest
+    checked against the one recorded at creation and a mismatch is
+    refused before a single byte is streamed, since an artifact
+    half-written against the wrong file is worse than none.
 
-    Supplying it embeds the threshold slice in the manifest, which is
-    what makes the artifact self-sufficient for the pass rate rather than
-    only for the score mean. Without it the export still re-derives a
-    pass rate from its own score rows, but the eligible denominator is a
+    A dataset embeds the threshold slice in the manifest, which is what
+    makes the artifact self-sufficient for the pass rate rather than only
+    for the score mean. Without one the export still re-derives a pass
+    rate from its own score rows, but the eligible denominator is a
     floor. Either way the manifest carries thresholds_included, so the
     file states its own sufficiency instead of leaving a reader to assume
-    it.
+    it. Where the slice was read from is not in the artifact and does not
+    need to be: whichever door supplied it, it is the dataset whose
+    digest the manifest cites, checked against that digest.
 
     Streams rather than buffers, because a MAX_TRIALS export is thousands
     of lines carrying full prompts and full responses, and holding all of
@@ -7787,11 +8414,11 @@ async def experiment_export(
     # would already have sent 200 and a content-type, and the client
     # would be left holding a truncated artifact that looks like a whole
     # one.
-    thresholds = (
-        None
-        if dataset_path is None
-        else threshold_slice(dataset_tasks(experiment, dataset_path))
-    )
+    # The source and an unreadable copy's reason are the REPORT's to
+    # publish. The manifest already says whether thresholds are included,
+    # and a new key there would be a schema bump this phase does not make.
+    tasks, _source, _unreadable = report_tasks(experiment, dataset_path, dataset_digest)
+    thresholds = None if tasks is None else threshold_slice(tasks)
 
     # EVERY ROW READ BEFORE THE FIRST BYTE GOES OUT, inside one
     # transaction. The digest on the last line seals whatever the reader

@@ -423,3 +423,35 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
     if not tasks:
         raise DatasetError(f"{name} has no tasks")
     return {"name": name, "digest": digest, "tasks": tasks}
+
+
+def scorer_kinds(tasks: list[dict[str, Any]]) -> list[str]:
+    """The scorer kinds a parsed dataset's tasks declare, each once, sorted.
+
+    ONE DERIVATION FOR TWO READERS. A primary metric is checked against
+    this list at experiment creation, and a stored dataset records it as
+    the summary a browser offers a primary metric from; two derivations
+    would be two answers to "what can this dataset produce", and the
+    browser would eventually offer a metric the server refuses. A task
+    with no scorer contributes nothing, which is what it declares.
+    """
+    return sorted(
+        {
+            kind
+            for task in tasks
+            if isinstance(kind := (task.get("scorer") or {}).get("kind"), str)
+        }
+    )
+
+
+def cites_documents(tasks: list[dict[str, Any]]) -> bool:
+    """Whether any task in a parsed dataset cites a document.
+
+    The fact attachments_mode is a statement about. POST /experiments
+    refuses a mode declared over a dataset where no task cites one, and
+    a stored dataset records this answer so a browser can disable the
+    control there instead of offering a choice the server will refuse.
+    parse_dataset already refuses an empty list, so a present value is a
+    citation and None is its absence; there is no third spelling.
+    """
+    return any(task.get("attachments") for task in tasks)

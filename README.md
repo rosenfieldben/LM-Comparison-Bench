@@ -1004,7 +1004,8 @@ is tightened to 0600 at startup with a log line, because umask is
 not a policy. Deleting the file deletes all history; there is no
 other copy. Documents you attach are in there too, as bytes in a
 column rather than as files on disk, which is what keeps that last
-sentence true: see **Attachments**.
+sentence true: see **Attachments**. So are datasets you store through
+`POST /datasets`: see **Stored datasets**.
 
 Each row carries provenance, so a run stays interpretable after the
 code, the prices, or the lineup have moved on. A group records the
@@ -1827,7 +1828,61 @@ scoring) and `summarize.jsonl` (rubric scoring). Your own files live
 wherever you keep them; the bench reads the path you name. There is no
 path allowlist, deliberately: the bench answers only to loopback clients
 and runs as you, so restricting the path would defend you against yourself
-while blocking the ordinary case.
+while blocking the ordinary case. Or store the dataset in the bench and
+name it by digest instead, which needs no path at all.
+
+### Stored datasets
+
+A dataset can live in `bench.db` instead of on your disk, cited by the
+sha256 of its bytes exactly as a document is. `POST /datasets` takes the
+JSONL as text inside a JSON body, runs the same parser the path door runs,
+and stores the bytes under the digest it computes itself; it never
+accepts one from the caller. A refusal is the parser's own sentence,
+naming the line. Identical content is one row, and the name it was first
+stored under stands, as an attachment's does: a second name is not a
+second dataset, and experiments created from the digest record the name
+the row held when they were created, so renaming the row would leave the
+library and those records naming the same tasks two different things.
+
+```sh
+# 1. Store. The text goes into the body as a JSON string, byte for byte,
+#    and the body goes to curl on stdin, since a large one would be past
+#    the length the operating system allows a single argument.
+python3 -c 'import json, sys; print(json.dumps({"name": sys.argv[1],
+    "content": open(sys.argv[2], encoding="utf-8", newline="").read()}))' \
+    arithmetic bench-datasets/arithmetic.jsonl |
+  curl -s -X POST localhost:8000/datasets \
+    -H "Content-Type: application/json" --data-binary @-
+
+# 2. List them, newest first: digest, name, task count, the scorer kinds
+#    the tasks declare, and whether any task cites a document.
+curl -s localhost:8000/datasets
+
+# 3. Or read one back, tasks and all, as the text that was stored.
+curl -s localhost:8000/datasets/<digest>
+```
+
+Every experiment door that takes `dataset_path` also takes
+`dataset_digest`, and create, start and score take exactly one of the
+two: both are two claims about which tasks an experiment is, neither is
+no claim, and each is refused in one sentence. A stored dataset and the
+same bytes on disk are one dataset with one digest, and an experiment
+created from either records the same row except `dataset_name`, which is
+the name the bytes were read under.
+
+A stored dataset may be at most `MAX_DATASET_BYTES`, 1,912,831 bytes,
+derived rather than chosen: the request cap, less the worst spelling of
+the name and the keys, over six, because `\u00XX` is the longest JSON
+spelling of one byte, so a dataset under that bound sent with at most 51
+bytes of whitespace between tokens cannot be refused by the cap first; a
+larger dataset goes by path.
+
+The door reads no file, which is why it needs no allowlist. It does not
+check that a document a task cites exists, because creation does, at the
+point where it matters. There is no delete endpoint: experiments cite the
+digest, and a citation has to stay readable. And unlike a document, a
+stored dataset IS served back: it is your own tasks, and reading them by
+the digest an experiment records is what makes that citation checkable.
 
 ## Experiments
 
@@ -1849,6 +1904,9 @@ curl -X POST localhost:8000/experiments \
        "repeats": 3,
        "params": {"temperature": 0}}'
 ```
+
+For a stored dataset, send `"dataset_digest": "<digest>"` in place of
+`dataset_path`; exactly one of the two.
 
 The row is written complete before anything runs, exactly as a group row
 is written before its first upstream call: it is the declaration, and what
@@ -2048,7 +2106,12 @@ curl -X POST localhost:8000/experiments/1/stop -H "Content-Type: application/jso
 The path is given again at start, and the digest is re-checked against
 the one recorded at creation. A file that changed in between stops the
 experiment before it spends anything, because running would produce a
-record citing one dataset and containing another.
+record citing one dataset and containing another. The runner reads the
+path after the start is accepted, so that stop is the experiment ending
+`failed` with the reason in `status_detail`, not a refused start. A
+stored dataset is named again by `dataset_digest` instead, and there the
+door answers at once: a digest other than the recorded one is a 422, and
+the experiment is still created and can be started with the right one.
 
 One experiment runs at a time. They share the five upstream slots and the
 spend ceiling, so two at once would interleave through the same queue and
@@ -2193,6 +2256,9 @@ curl -X POST localhost:8000/experiments/1/score \
   -d '{"dataset_path": "bench-datasets/arithmetic.jsonl",
        "judge_model": "openai/gpt-4o-mini"}'
 ```
+
+`dataset_digest` in place of `dataset_path` scores against a stored
+dataset, checked against the recorded digest the same way.
 
 Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
 are pure functions over the stored response text. `normalized_exact` and
@@ -2478,13 +2544,28 @@ says passed, usable verdicts, and eligible trials. A pass rate over three
 verdicts out of forty eligible is not a pass rate anybody should act on,
 and the coverage figure is the only thing that says so.
 
-Thresholds live in the dataset file, so **the report says where it got
-the eligible population** in `thresholds_source`:
+Thresholds live in the dataset, so **the report says where it got the
+eligible population** in `thresholds_source`:
 
 - `dataset_file` when you passed `dataset_path`. The denominator is
   exact: the file names every task that declared a cutoff, including the
   ones nothing ever scored.
-- `score_rows` otherwise. `passed` is written from the task's own
+- `dataset_store` when the bench holds the dataset's bytes and read them
+  from its store. That happens when you pass `dataset_digest`, and also
+  when you pass nothing and the digest the experiment recorded is stored:
+  that resolves by the identity the row already cites, so there is no
+  other dataset it could be. Exact, like the file.
+- `score_rows` when there was no dataset to read. That includes the rare
+  case where the bench holds the recorded bytes and this build cannot use
+  them (a later, stricter parser, or a row edited by hand): the report
+  then gives the floor rather than no report at all, and says why in
+  `dataset_unreadable`, which is `null` in every other report. Naming the
+  digest explicitly in that case is refused, because you asked for it.
+
+A report rebuilt from an export says `dataset_file` whichever door its
+thresholds came through: the manifest carries the thresholds and not
+where they were read from, so there the value means only that a dataset
+was read. `passed` is written from the task's own
   threshold at scoring time and `judged_pass` returns null unless the
   author declared one, so **a judge row with a non-null `passed` is
   itself a record that a threshold existed**. The rate that comes out is
@@ -2536,10 +2617,15 @@ the one recorded at creation, and a mismatch is refused in the server's
 own words rather than as a status code, naming both digests so the reader
 knows which of the two was wrong. The box stays on screen through the
 refusal, because a path you cannot see is a path you cannot correct.
-Without a file the report degrades to score means and says so. The path
-is remembered in a variable for as long as the tab is open and nowhere
-else: it is a fact about the operator's filesystem, not about the
-experiment, which is why the row records the file's digest instead.
+Without a file the view sends nothing, and the report reads the dataset
+from the store when the bench holds it, so an experiment over a stored
+dataset reads exactly in the browser as it does to curl with the file;
+when the bench does not hold it, or holds a copy it cannot read, the
+report falls back to the score-row floor and the note under the banner
+says which. The path is remembered in a variable for as long as
+the tab is open and nowhere else: it is a fact about the operator's
+filesystem, not about the experiment, which is why the row records the
+file's digest instead.
 
 ## Export
 
@@ -2596,13 +2682,14 @@ two), so a mean that confused them would come out different. An export
 that flattened either axis would still match on an experiment where
 everything succeeded, which is why that is not the experiment used.
 
-**The artifact labels its own sufficiency.** `dataset_path` on the export
-takes the same terms as start, score and report: the digest is checked
-against the one recorded at creation, and a mismatch is refused before a
-single byte is streamed, because a file half-written against the wrong
-dataset is worse than none. Supplying it embeds the minimal threshold
-slice in the manifest, task id to scorer kind and cutoff, declared tasks
-only. Prompts, references and rubrics stay out: no published number
+**The artifact labels its own sufficiency.** The export names its
+dataset on the report's terms: `dataset_path`, `dataset_digest`, or
+neither, with the store consulted for the recorded digest. A named one
+has its digest checked against the one recorded at creation, and a
+mismatch is refused before a single byte is streamed, because a file
+half-written against the wrong dataset is worse than none. A dataset,
+from whichever door, embeds the minimal threshold slice in the manifest,
+task id to scorer kind and cutoff, declared tasks only. Prompts, references and rubrics stay out: no published number
 needs them, and the export already carries every prompt actually sent.
 
 The manifest always carries `thresholds_included`, so a reader holding an

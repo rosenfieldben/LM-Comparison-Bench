@@ -14,7 +14,13 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from bench.datasets import MAX_TASKS, DatasetError, parse_dataset
+from bench.datasets import (
+    MAX_TASKS,
+    DatasetError,
+    cites_documents,
+    parse_dataset,
+    scorer_kinds,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -684,3 +690,48 @@ def test_a_pin_capture_is_a_positive_integer_or_refused():
         + "\n"
     ).encode()
     assert parse_dataset(good)["tasks"][0]["attachments"][0]["capture_id"] == 7
+
+
+# ---- Phase N1: the two summaries a stored dataset records.
+
+
+def test_scorer_kinds_are_each_kind_once_sorted_and_nothing_for_no_scorer():
+    """WINDOW: scorer_kinds over a parsed dataset mixing kinds, repeats of
+    one kind, and a task with no scorer.
+
+    The list a stored dataset records AND the list a primary metric is
+    checked against, because enforce_primary_metric now calls this
+    function; a task with no scorer adds nothing, which is what it
+    declares."""
+    parsed = parse_dataset(
+        dataset(
+            line(id="a", prompt="p", reference="r", scorer={"kind": "exact"}),
+            line(id="b", prompt="p", scorer={"kind": "regex", "pattern": "x"}),
+            line(id="c", prompt="p", reference="r", scorer={"kind": "exact"}),
+            line(id="d", prompt="p"),
+            line(id="e", prompt="p", rubric="g", scorer={"kind": "judge"}),
+        )
+    )
+
+    assert scorer_kinds(parsed["tasks"]) == ["exact", "judge", "regex"]
+    assert scorer_kinds(parse_dataset(dataset(line(id="x", prompt="p")))["tasks"]) == []
+
+
+def test_cites_documents_is_true_exactly_when_some_task_cites_one():
+    """WINDOW: cites_documents over three parsed datasets: none, one of
+    two tasks, and every task.
+
+    The fact POST /experiments refuses attachments_mode over when it is
+    false, recorded so a browser can disable the control there."""
+    digest = "a" * 64
+    none = parse_dataset(dataset(line(id="a", prompt="p"), line(id="b", prompt="p")))
+    some = parse_dataset(
+        dataset(
+            line(id="a", prompt="p", attachments=[digest]), line(id="b", prompt="p")
+        )
+    )
+    every = parse_dataset(dataset(line(id="a", prompt="p", attachments=[digest])))
+
+    assert cites_documents(none["tasks"]) is False
+    assert cites_documents(some["tasks"]) is True
+    assert cites_documents(every["tasks"]) is True
