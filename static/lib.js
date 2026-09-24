@@ -461,6 +461,276 @@
     return "; try " + parts.join(" or ");
   }
 
+  // ---- Composing a dataset (Phase N2).
+  //
+  // THE BROWSER COMPOSES; THE SERVER VALIDATES. Everything below turns
+  // what a person typed into the JSONL the server's parser reads, counts
+  // what the page shows against the server's ceilings, and names the few
+  // omissions plain enough to grey Store. None of it decides whether a
+  // dataset is valid: bench/datasets.py's parse_dataset does, and its
+  // sentence is what the page prints.
+
+  // Mirrors of the server's bounds, for display and for the courtesy of
+  // greying Store before a refusal that would certainly come. They are
+  // the SERVER's numbers, never the page's: tests/test_api.py executes
+  // this file with node and asserts each equals the constant it names,
+  // because a mirror tighter than the server would refuse a dataset the
+  // door would store and blame the person for it.
+  const DATASET_LIMITS = {
+    maxTasks: 2000, // bench.datasets.MAX_TASKS
+    maxPromptChars: 100000, // bench.datasets.MAX_PROMPT_CHARS
+    maxDatasetBytes: 1912831, // bench.main.MAX_DATASET_BYTES
+    maxNameChars: 255, // bench.main.MAX_DATASET_NAME_CHARS
+  };
+
+  // The builder's own bound, which the server does not have: past this
+  // many rows a person composing by hand is better served pasting or
+  // uploading JSONL. Proposed at 50 in the commission, pending a ruling.
+  const BUILDER_MAX_ROWS = 50;
+
+  // bench.datasets.SCORERS, in its order; the same test holds the pair.
+  const DATASET_SCORERS = [
+    "exact",
+    "normalized_exact",
+    "contains",
+    "regex",
+    "judge",
+  ];
+  const COMPARING_SCORERS = ["exact", "normalized_exact", "contains"];
+
+  // Characters the way Python counts them, one per code point. The
+  // server's bounds are len() over a str, and a string's length in this
+  // language counts UTF-16 units, so an emoji is two here and one there;
+  // measuring with .length would call a legal prompt over the limit.
+  function codePoints(text) {
+    return Array.from(text).length;
+  }
+
+  // Bytes as the server will store them: UTF-8.
+  function utf8Length(text) {
+    return new TextEncoder().encode(text).length;
+  }
+
+  // Python's whitespace: exactly the characters for which str.isspace()
+  // is true, as the inside of a regular expression character class.
+  const PY_SPACE =
+    "\\t\\n\\v\\f\\r\\x1c-\\x1f \\x85\\xa0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+  const PY_BLANK = new RegExp("^[" + PY_SPACE + "]*$");
+
+  // Whether text is empty or whitespace as Python reads whitespace.
+  //
+  // NOT String.prototype.trim, which disagrees with str.strip in both
+  // directions: trim removes U+FEFF, which strip keeps, and strip removes
+  // U+001C to U+001F and U+0085, which trim keeps. Most checks that use
+  // this stand in for a strip() on the server: composeTask's and
+  // rowNudge's reference and rubric checks, datasetNudge's name and
+  // no-tasks checks, and the lines countLines skips. There a trim()
+  // would nudge a U+FEFF rubric the server takes, and a nudge must never
+  // grey Store on a dataset the server would store. composeTask's system
+  // and threshold checks are the page's own rule that blank is not sent;
+  // the server runs no strip() on either, and composeTask says what each
+  // does.
+  function isBlank(text) {
+    return PY_BLANK.test(text);
+  }
+
+  // A pass threshold that is a plain decimal numeral, with Python
+  // whitespace around it, capturing the numeral; see composeTask.
+  const DECIMAL = new RegExp(
+    "^[" +
+      PY_SPACE +
+      "]*([+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+)(?:[eE][+-]?\\d+)?)[" +
+      PY_SPACE +
+      "]*$",
+  );
+
+  // One task as one JSONL line.
+  //
+  // THREE CHARACTERS ARE ESCAPED THAT JSON.stringify WRITES RAW, and the
+  // reason is the server's parser rather than JSON. U+0085, U+2028 and
+  // U+2029 are legal unescaped inside a JSON string, and parse_dataset
+  // splits lines with Python's str.splitlines, which breaks on all
+  // three, so a prompt holding one pasted from somewhere would be cut in
+  // half and refused as "Unterminated string". Escaped, the line is the
+  // same JSON value and the parser reads it whole. Whether the parser
+  // should split on "\n" alone instead is a ruling the checkpoint asks
+  // for; until then the builder never writes a line it would break.
+  function jsonLine(value) {
+    return JSON.stringify(value).replace(
+      /[\u0085\u2028\u2029]/g,
+      (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"),
+    );
+  }
+
+  // One row of the builder as the task object it declares.
+  //
+  // RULE ONE: A KEY IS WRITTEN ONLY WHEN IT WAS SET. A blank id box is an
+  // empty id box and sends no id; the server then says the id is
+  // required, which is the truth. Only the chosen scorer's fields are
+  // written, so a reference typed before switching to regex does not ride
+  // along as a declaration nobody meant.
+  //
+  // WHAT COUNTS AS BLANK, field by field. id, prompt and pattern are
+  // blank only when empty, because "  " is a legal id, prompt and
+  // pattern to the parser. reference and rubric are blank when isBlank,
+  // which is the server's own test: the parser refuses a whitespace
+  // reference or rubric as missing, so leaving one out changes no
+  // verdict. system and threshold are blank when isBlank too, and that
+  // is the page's rule, not the server's. The parser keeps a whitespace
+  // system message, and for that task it would replace the experiment's
+  // system prompt; a system message of Python whitespace is not one
+  // anybody typed on purpose, so it is not sent and the experiment's own
+  // system prompt applies. (The controls panel reads its system prompt
+  // with trim(), so the two differ on U+FEFF, U+0085 and U+001C to
+  // U+001F; the builder follows the server's reading of whitespace.) A
+  // threshold of Python whitespace is not sent either, so the judge's
+  // score stands alone, as it does for an empty box.
+  //
+  // A PASS THRESHOLD IS SENT AS A NUMBER ONLY WHEN IT IS A PLAIN DECIMAL
+  // NUMERAL ("0.5", ".5", "1.", "+0.5", "5e-1"), Python whitespace around
+  // it aside, and as the typed text otherwise, so the server's sentence
+  // ("must be a number") is what a person sees for "0,5". NOT Number(),
+  // which reads "0x1" as 1 and a box holding only U+FEFF as 0: a page
+  // that stored a threshold nobody typed would pass trials nobody chose
+  // to pass. A numeral too large to be finite is sent as text too,
+  // because JSON.stringify writes Infinity as null. The grammar has one
+  // way to read each numeral, so a long run of digits is read in linear
+  // time on every keystroke rather than backtracked over.
+  function composeTask(row) {
+    const task = {};
+    if (row.id !== "") task.id = row.id;
+    if (row.prompt !== "") task.prompt = row.prompt;
+    if (!isBlank(row.system)) task.system = row.system;
+    const kind = row.scorer;
+    if (COMPARING_SCORERS.includes(kind) && !isBlank(row.reference)) {
+      task.reference = row.reference;
+    }
+    if (kind === "judge" && !isBlank(row.rubric)) task.rubric = row.rubric;
+    if (kind !== "") {
+      const scorer = { kind: kind };
+      if (kind === "regex" && row.pattern !== "") scorer.pattern = row.pattern;
+      if (kind === "judge" && !isBlank(row.threshold)) {
+        const numeral = DECIMAL.exec(row.threshold);
+        const value = numeral ? Number(numeral[1]) : Number.NaN;
+        scorer.pass_threshold = Number.isFinite(value) ? value : row.threshold;
+      }
+      task.scorer = scorer;
+    }
+    if (row.documents.length > 0) task.attachments = row.documents.slice();
+    return task;
+  }
+
+  // The builder's rows as the text Store sends: one line per row, in
+  // order, no blank lines, a newline after each. So row N is line N, and
+  // a refusal naming line N names row N.
+  function composeJsonl(rows) {
+    return rows.map((row) => jsonLine(composeTask(row)) + "\n").join("");
+  }
+
+  // Why this row greys Store, or null. A COURTESY AND NOT A RULE: every
+  // reason here is one the server would refuse anyway, which the
+  // nudge-subset test in tests/test_api.py proves by sending what each
+  // nudged row of its grid composes to POST /datasets, a prompt one code
+  // point past the ceiling included, and tests/browser/test_n.py proves
+  // again in the page. The server refuses more than this names (a
+  // pattern that does not compile, a threshold that is not a number or
+  // is outside 0 to 1), and the same grid asserts that a row whose only
+  // fault is one of those is not nudged and is refused by the server, in
+  // its own words. A duplicate id spans two rows, so it is the browser
+  // test of a refusal beside its row that leaves that one to the server.
+  function rowNudge(row) {
+    if (row.id === "") return "needs an id";
+    if (row.prompt === "") return "needs a prompt";
+    const chars = codePoints(row.prompt);
+    if (chars > DATASET_LIMITS.maxPromptChars) {
+      return (
+        "prompt is " +
+        chars +
+        " characters, over the " +
+        DATASET_LIMITS.maxPromptChars +
+        " limit"
+      );
+    }
+    if (COMPARING_SCORERS.includes(row.scorer) && isBlank(row.reference)) {
+      return "needs a reference for " + row.scorer;
+    }
+    if (row.scorer === "regex" && row.pattern === "") return "needs a pattern";
+    if (row.scorer === "judge" && isBlank(row.rubric)) {
+      return "needs a rubric for the judge";
+    }
+    return null;
+  }
+
+  // Why the dataset as a whole greys Store, or null. The same standing
+  // as rowNudge: each is a refusal the server would issue.
+  function datasetNudge(name, content) {
+    if (isBlank(name)) return "name the dataset";
+    const chars = codePoints(name);
+    if (chars > DATASET_LIMITS.maxNameChars) {
+      return (
+        "the name is " +
+        chars +
+        " characters, over the " +
+        DATASET_LIMITS.maxNameChars +
+        " limit"
+      );
+    }
+    if (isBlank(content)) return "there are no tasks to store";
+    const bytes = utf8Length(content);
+    if (bytes > DATASET_LIMITS.maxDatasetBytes) {
+      return (
+        "the dataset is " +
+        bytes +
+        " bytes, over the " +
+        DATASET_LIMITS.maxDatasetBytes +
+        " byte limit for a stored one; a larger dataset goes by path"
+      );
+    }
+    return null;
+  }
+
+  // The line a server refusal names, or null. parse_dataset writes
+  // "line N: " at the start of every sentence about a line, and the
+  // store door writes the same for a half surrogate pair.
+  function refusalLine(detail) {
+    if (typeof detail !== "string") return null;
+    const match = /^line (\d+): /.exec(detail);
+    return match ? Number(match[1]) : null;
+  }
+
+  // Where str.splitlines breaks a line: CR, LF and CRLF, and also \v,
+  // \f, U+001C to U+001E, U+0085, U+2028 and U+2029.
+  const PY_LINE_BREAK =
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: U+001C to U+001E are line breaks to str.splitlines.
+    /\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/;
+
+  // Lines holding anything, for a pasted or uploaded file's label and its
+  // task-line ceiling. SPLIT AND SKIPPED AS THE PARSER SPLITS AND SKIPS:
+  // parse_dataset reads lines with str.splitlines and skips one that is
+  // blank to str.strip, and counted any other way the label would
+  // disagree with the task count the server stores. A count and no more:
+  // the page does not parse what it did not compose.
+  function countLines(text) {
+    return text.split(PY_LINE_BREAK).filter((line) => !isBlank(line)).length;
+  }
+
+  // A refusal body as text. FastAPI answers a model violation with a LIST
+  // of error objects and this application's own refusals with a string,
+  // and assigning the list to textContent printed "[object Object]" at a
+  // person the server had told exactly what was wrong. Moved here from
+  // attach.js when a second control needed it, so there is one reading
+  // of a refusal rather than two.
+  function refusalText(detail, fallback) {
+    if (typeof detail === "string") return detail;
+    if (Array.isArray(detail)) {
+      const messages = detail
+        .map((item) => (item && typeof item.msg === "string" ? item.msg : ""))
+        .filter((msg) => msg !== "");
+      if (messages.length > 0) return messages.join("; ");
+    }
+    return fallback;
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -483,6 +753,19 @@
     routeCapFor,
     REASONING_SHARE_EXHAUSTED,
     DIFF_TOKEN_LIMIT,
+    DATASET_LIMITS,
+    BUILDER_MAX_ROWS,
+    DATASET_SCORERS,
+    isBlank,
+    codePoints,
+    utf8Length,
+    composeTask,
+    composeJsonl,
+    rowNudge,
+    datasetNudge,
+    refusalLine,
+    countLines,
+    refusalText,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;

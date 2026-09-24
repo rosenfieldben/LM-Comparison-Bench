@@ -26,6 +26,14 @@ const {
   routeCapFor,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
+  codePoints,
+  composeTask,
+  composeJsonl,
+  rowNudge,
+  datasetNudge,
+  refusalLine,
+  countLines,
+  refusalText,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -588,4 +596,267 @@ test("remedyFor reads the cap the run was sent, never a tier name", () => {
   // cannot say what extended would send gets no budget clause.
   assert.ok(!remedyFor(sameCap, {}).includes("extended budget"));
   assert.ok(!remedyFor({}, { extendedCap: 65536 }).includes("extended budget"));
+});
+
+// ---- Phase N2: composing a dataset. The browser composes and the
+// ---- server validates; these pin the composing half. The unit suite
+// ---- executes the same functions against the real door.
+
+function row(fields) {
+  return Object.assign(
+    {
+      id: "",
+      prompt: "",
+      system: "",
+      scorer: "",
+      reference: "",
+      pattern: "",
+      rubric: "",
+      threshold: "",
+      documents: [],
+    },
+    fields,
+  );
+}
+
+test("composeTask writes a key only when it was set", () => {
+  assert.deepEqual(composeTask(row({})), {});
+  assert.deepEqual(composeTask(row({ id: "t", prompt: "p", system: "  " })), {
+    id: "t",
+    prompt: "p",
+  });
+  // "  " is a legal id and prompt to the parser, so it is sent as typed.
+  assert.deepEqual(composeTask(row({ id: " ", prompt: " " })), {
+    id: " ",
+    prompt: " ",
+  });
+});
+
+test("composeTask sends only the chosen scorer's fields", () => {
+  const typed = row({
+    id: "t",
+    prompt: "p",
+    reference: "r",
+    pattern: "x",
+    rubric: "g",
+    threshold: "0.5",
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "exact" })), {
+    id: "t",
+    prompt: "p",
+    reference: "r",
+    scorer: { kind: "exact" },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "regex" })), {
+    id: "t",
+    prompt: "p",
+    scorer: { kind: "regex", pattern: "x" },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "judge" })), {
+    id: "t",
+    prompt: "p",
+    rubric: "g",
+    scorer: { kind: "judge", pass_threshold: 0.5 },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "" })), {
+    id: "t",
+    prompt: "p",
+  });
+});
+
+test("a threshold that is not a number is sent as typed, for the server to refuse", () => {
+  const task = composeTask(
+    row({
+      id: "t",
+      prompt: "p",
+      scorer: "judge",
+      rubric: "g",
+      threshold: "0,5",
+    }),
+  );
+  assert.equal(task.scorer.pass_threshold, "0,5");
+  assert.equal(
+    composeTask(
+      row({
+        id: "t",
+        prompt: "p",
+        scorer: "judge",
+        rubric: "g",
+        threshold: "0",
+      }),
+    ).scorer.pass_threshold,
+    0,
+  );
+});
+
+test("composeJsonl writes one line per row and escapes the three the parser splits on", () => {
+  const text = composeJsonl([
+    row({ id: "a", prompt: "x\u2028y\u2029z\u0085" }),
+    row({ id: "b", prompt: "two", documents: ["d".repeat(64)] }),
+  ]);
+  assert.equal(text.split("\n").length, 3);
+  assert.ok(text.endsWith("\n"));
+  assert.ok(!/[\u2028\u2029\u0085]/.test(text));
+  const lines = text
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(lines[0].prompt, "x\u2028y\u2029z\u0085");
+  assert.deepEqual(lines[1].attachments, ["d".repeat(64)]);
+  assert.equal(composeJsonl([]), "");
+});
+
+test("rowNudge names what the server would refuse, first reason first", () => {
+  assert.equal(rowNudge(row({})), "needs an id");
+  assert.equal(rowNudge(row({ id: "t" })), "needs a prompt");
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "contains", reference: " " })),
+    "needs a reference for contains",
+  );
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "regex" })),
+    "needs a pattern",
+  );
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "judge", rubric: "  " })),
+    "needs a rubric for the judge",
+  );
+  // A pattern of one space is a pattern; the parser takes it.
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "regex", pattern: " " })),
+    null,
+  );
+  // Counted in code points, so an emoji is one, as it is to the server.
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "\u{1F600}".repeat(100000) })),
+    null,
+  );
+  assert.match(
+    rowNudge(row({ id: "t", prompt: "p".repeat(100001) })),
+    /over the 100000 limit/,
+  );
+});
+
+test("datasetNudge greys Store for a name or a size the door refuses", () => {
+  const task = '{"id": "t", "prompt": "p"}\n';
+  assert.equal(datasetNudge("", task), "name the dataset");
+  assert.equal(datasetNudge("  ", task), "name the dataset");
+  assert.match(datasetNudge("n".repeat(256), task), /over the 255 limit/);
+  assert.equal(datasetNudge("n", " \n "), "there are no tasks to store");
+  assert.match(datasetNudge("n", "x".repeat(1912832)), /goes by path/);
+  assert.equal(datasetNudge("n", task), null);
+  assert.equal(codePoints("\u{1F600}"), 1);
+});
+
+test("refusalLine reads the line a server sentence names, and nothing else", () => {
+  assert.equal(refusalLine("line 12: duplicate task id 'a'"), 12);
+  assert.equal(refusalLine("nothing has no tasks"), null);
+  assert.equal(refusalLine(["line 1: no"]), null);
+  assert.equal(refusalLine(null), null);
+  // The number must be the whole prefix, as the server writes it.
+  assert.equal(refusalLine("line 2 of the file is odd"), null);
+});
+
+test("countLines counts lines holding anything, across line-end styles", () => {
+  assert.equal(countLines("a\r\n\r\nb\nc\rd"), 4);
+  assert.equal(countLines(""), 0);
+});
+
+test("refusalText reads both refusal shapes and falls back when it cannot", () => {
+  assert.equal(refusalText("plain", "fallback"), "plain");
+  assert.equal(
+    refusalText([{ msg: "one" }, { msg: "two" }, {}], "fallback"),
+    "one; two",
+  );
+  assert.equal(refusalText({ odd: true }, "fallback"), "fallback");
+  // A list with no message in it says nothing, so the fallback speaks.
+  assert.equal(refusalText([{}, { msg: "" }], "fallback"), "fallback");
+});
+
+test("a pass threshold is a number only when it is a plain decimal numeral", () => {
+  const judge = (threshold) =>
+    composeTask(
+      row({ id: "t", prompt: "p", scorer: "judge", rubric: "g", threshold }),
+    ).scorer.pass_threshold;
+  const feff = String.fromCharCode(0xfeff);
+  assert.strictEqual(judge("0.5"), 0.5);
+  assert.strictEqual(judge(".5"), 0.5);
+  assert.strictEqual(judge(" 0.5 "), 0.5);
+  assert.strictEqual(judge("5e-1"), 0.5);
+  // Strict, because 0.5 == "0.5": a loose assert cannot tell the number
+  // the page should send from the text it should not.
+  assert.strictEqual(judge("+0.5"), 0.5);
+  assert.strictEqual(judge("1."), 1);
+  assert.strictEqual(judge("1E0"), 1);
+  // Several digits in each part.
+  assert.strictEqual(judge("0.25"), 0.25);
+  assert.strictEqual(judge(".25"), 0.25);
+  assert.strictEqual(judge("0.125"), 0.125);
+  assert.strictEqual(judge("10e-1"), 1);
+  assert.strictEqual(judge("1e-10"), 1e-10);
+  // Number() reads each of these as a number nobody typed; JSON.stringify
+  // would write the last two as null.
+  assert.strictEqual(judge(feff), feff);
+  assert.strictEqual(judge("0x1"), "0x1");
+  assert.strictEqual(judge("0b1"), "0b1");
+  assert.strictEqual(judge("Infinity"), "Infinity");
+  assert.strictEqual(judge("1e999"), "1e999");
+});
+
+test("a threshold that is a long run of digits is read in linear time", () => {
+  // The grammar has one way to read each numeral. With two (\d+\.?\d*),
+  // a run of n digits that fails to match backtracks n squared times,
+  // and composeTask runs on every keystroke: 50000 digits took seconds.
+  const threshold = "1".repeat(50000) + "x";
+  const started = process.hrtime.bigint();
+  const task = composeTask(
+    row({ id: "t", prompt: "p", scorer: "judge", rubric: "g", threshold }),
+  );
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.strictEqual(task.scorer.pass_threshold, threshold);
+  assert.ok(ms < 500, "took " + ms + " ms");
+});
+
+test("datasetNudge calls a text empty only when Python would", () => {
+  const task = '{"id": "t", "prompt": "p"}\n';
+  // A line of U+FEFF is not blank to the parser: the server reads it as
+  // a line (and refuses it as JSON), so it is not "no tasks".
+  assert.strictEqual(datasetNudge("n", String.fromCharCode(0xfeff)), null);
+  assert.strictEqual(
+    datasetNudge("n", String.fromCharCode(0x85) + "\n"),
+    "there are no tasks to store",
+  );
+  assert.strictEqual(datasetNudge("n", task), null);
+});
+
+test("composeTask's blank is Python's: U+FEFF is kept and U+0085 is not", () => {
+  const feff = String.fromCharCode(0xfeff);
+  const nel = String.fromCharCode(0x85);
+  const typed = (value) =>
+    row({
+      id: "t",
+      prompt: "p",
+      system: value,
+      scorer: "judge",
+      rubric: value,
+    });
+  assert.deepEqual(composeTask(typed(feff)), {
+    id: "t",
+    prompt: "p",
+    system: feff,
+    rubric: feff,
+    scorer: { kind: "judge" },
+  });
+  assert.deepEqual(composeTask(typed(nel)), {
+    id: "t",
+    prompt: "p",
+    scorer: { kind: "judge" },
+  });
+});
+
+test("countLines breaks a line wherever str.splitlines does", () => {
+  for (const code of [0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029]) {
+    const mark = String.fromCharCode(code);
+    assert.equal(countLines("a" + mark + "b"), 2, code.toString(16));
+  }
 });

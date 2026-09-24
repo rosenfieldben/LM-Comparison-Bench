@@ -239,6 +239,66 @@
   <div id="diff-body" data-testid="diff-body"></div>
 </div>
 
+<!-- Datasets: compose one, store it, and select a stored one by its
+     digest. The browser composes and the server validates: nothing in
+     this panel decides whether a dataset is valid, and a refusal is the
+     server's own sentence, printed beside the row whose line it names.
+     Collapsed until opened, like the history and the experiments. -->
+<details id="datasets">
+  <summary data-testid="datasets-toggle">Datasets</summary>
+  <div id="dataset-builder" data-testid="dataset-builder">
+    <div id="dataset-head">
+      <label class="panel-label" for="dataset-name">Name</label>
+      <input id="dataset-name" data-testid="dataset-name" type="text"
+             autocomplete="off" placeholder="Name this dataset">
+      <div class="seg" id="dataset-mode" role="group" aria-label="How the tasks are composed">
+        <button type="button" data-value="rows" data-testid="dataset-mode-rows" aria-pressed="true">rows</button>
+        <button type="button" data-value="jsonl" data-testid="dataset-mode-jsonl" aria-pressed="false">JSONL</button>
+      </div>
+    </div>
+    <div id="dataset-rows-pane" data-testid="dataset-rows-pane">
+      <div id="dataset-rows" data-testid="dataset-rows"></div>
+      <div id="dataset-row-actions">
+        <button id="dataset-add-row" data-testid="dataset-add-row" type="button">+ Task</button>
+        <button id="dataset-from-prompts" data-testid="dataset-from-prompts" type="button"
+                aria-expanded="false" aria-controls="dataset-prompt-picker">+ From saved prompts</button>
+      </div>
+      <div id="dataset-prompt-picker" data-testid="dataset-prompt-picker" hidden></div>
+    </div>
+    <!-- Pasted or uploaded text is sent exactly as it is: the page counts
+         its lines for the label and parses nothing. An uploaded file is
+         held as the text its bytes decoded to rather than put in the
+         textarea, because a textarea normalizes CRLF to LF and the stored
+         digest would then not be the file's; the textarea is hidden while
+         a file is loaded, so the page never shows one dataset and stores
+         another. autocomplete="off" on this box and the name, or Back
+         would refill a draft nobody chose to keep. -->
+    <div id="dataset-jsonl-pane" data-testid="dataset-jsonl-pane" hidden>
+      <textarea id="dataset-jsonl" data-testid="dataset-jsonl" rows="6"
+                autocomplete="off" aria-label="Dataset as JSONL, one task per line"
+                placeholder="One task per line, as JSON: {&quot;id&quot;: &quot;t1&quot;, &quot;prompt&quot;: &quot;...&quot;}"></textarea>
+      <div id="dataset-file-row">
+        <label class="attach-btn" for="dataset-file">+ Upload JSONL</label>
+        <input id="dataset-file" data-testid="dataset-file" type="file"
+               accept=".jsonl,.json,.txt">
+        <span id="dataset-file-label" data-testid="dataset-file-label"></span>
+        <button id="dataset-file-clear" data-testid="dataset-file-clear" type="button" hidden>clear</button>
+      </div>
+    </div>
+    <div id="dataset-ceilings" data-testid="dataset-ceilings"></div>
+    <div id="dataset-store-row">
+      <button id="dataset-store" data-testid="dataset-store" type="button" disabled>Store</button>
+      <span id="dataset-nudge" data-testid="dataset-nudge" role="status"></span>
+    </div>
+    <div id="dataset-msg" data-testid="dataset-msg" role="status"></div>
+  </div>
+  <div id="dataset-library-head">
+    <span class="panel-label">Stored</span>
+    <span id="dataset-selected" data-testid="dataset-selected" role="status"></span>
+  </div>
+  <div id="dataset-library" data-testid="dataset-library" data-state="idle"></div>
+</details>
+
 <details id="experiments">
   <summary data-testid="experiments-toggle">Experiments</summary>
   <div id="experiment-list" data-testid="experiment-list" data-state="idle"></div>
@@ -270,6 +330,7 @@
 <script src="/static/stream.js"></script>
 <script src="/static/rating.js"></script>
 <script src="/static/experiments.js"></script>
+<script src="/static/datasets.js"></script>
 <script src="/static/history.js"></script>
 <script src="/static/boot.js"></script>
 </body>

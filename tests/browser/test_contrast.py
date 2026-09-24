@@ -16,10 +16,11 @@ AA_NORMAL = 4.5
 # text, sourced from the style rules in static/index.html: body and
 # history rows sit on bg-page, the command bar's stats on bg-bar,
 # panels/cards/race strip on bg-panel, the prompt field on bg-inset,
-# buttons on bg-btn, chips on bg-chip, the active segment on bg-seg-on
-# and the Run button's text on the accent itself.
+# buttons on bg-btn, chips on bg-chip (a pressed dataset document option
+# is --text there), the active segment on bg-seg-on and the Run button's
+# text on the accent itself.
 PAIRINGS = [
-    ("--text", ["--bg-page", "--bg-bar", "--bg-panel", "--bg-inset"]),
+    ("--text", ["--bg-page", "--bg-bar", "--bg-panel", "--bg-inset", "--bg-chip"]),
     ("--text-strong", ["--bg-bar", "--bg-panel", "--bg-btn"]),
     ("--text-body", ["--bg-page", "--bg-panel", "--bg-chip"]),
     ("--text-sec", ["--bg-page", "--bg-panel", "--bg-btn"]),

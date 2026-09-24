@@ -257,8 +257,9 @@ order is the dependency graph, so the order of those tags is
 load-bearing). `static/lib.js` holds the pure,
 DOM-free helpers, including the diff engine. The DOM logic is split by
 concern into small classic scripts, each assigning one `window.Bench*`
-namespace: `state`, `controls`, `render`, `diff`, `library`, `stream`,
-and `history`, with `boot.js` wiring them last. Cross-file access goes
+namespace: `state`, `controls`, `attach`, `render`, `diff`, `library`,
+`stream`, `rating`, `experiments` (the report), `datasets` and `history`,
+with `boot.js` wiring them last. Cross-file access goes
 through the namespaces, so a load-order mistake fails loudly rather than
 silently at click time; the script order in index.html is load-bearing.
 All are served from the `/static` mount.
@@ -1884,6 +1885,56 @@ digest, and a citation has to stay readable. And unlike a document, a
 stored dataset IS served back: it is your own tasks, and reading them by
 the digest an experiment records is what makes that citation checkable.
 
+**In the browser**, the **Datasets** panel composes one and stores it
+through the same door. **The browser composes and the server validates**:
+nothing in the panel decides whether a dataset is valid, and a refusal is
+the server's own sentence, printed beside the row whose line it names.
+There are three ways in:
+
+- **Rows.** `+ Task` adds one: an id, a prompt, a scorer, and then only
+  the fields that scorer uses (a reference for the comparing scorers, a
+  pattern for regex, a rubric and an optional pass threshold for the
+  judge), an optional system message, and optional documents picked from
+  what the bench already stores, which is how a repository snapshot
+  enters a task. Row N is line N of what Store sends. The builder holds
+  50 rows; past that, paste or upload.
+- **JSONL**, pasted or uploaded. It is sent exactly as it is: the page
+  counts its lines (split and skipped as the parser splits and skips)
+  against the 2000-task ceiling and parses nothing, and an uploaded file
+  is held as the text its bytes decoded to rather than put in the text
+  box, so its CRLFs survive and the stored digest is the file's. The box
+  is hidden while a file is loaded, so it never shows one dataset while
+  another is stored. A file that is not UTF-8 is said to be so and never
+  sent.
+- **From saved prompts.** Each checked prompt becomes one task with its
+  id and scorer left for you to set.
+
+**Nothing is pre-filled**: a new row's id box is empty, an imported task
+has no scorer, and a stored dataset is not selected until you select it.
+Store is greyed, with the reason beside it, only for what the server would
+certainly refuse (no name or a name over 255 characters, no tasks, a row
+with no id or prompt, a scorer missing the field it needs, a prompt past
+its character ceiling or a dataset past its byte ceiling, both shown
+above Store), and the test suite proves each of those is a refusal the
+server makes. The task-line count shown for pasted text is a count and
+greys nothing; past 2000 the server says so, on the line. A refusal is
+marked beside its row only while the rows would still send the text it
+was said about: after a change to that text it leaves the row and, while
+the panel's message line still holds the refusal, the line says the text
+has changed since; undo the change and the mark comes back. Anything the
+panel says afterwards (an import, a file loaded) takes the message line,
+and the mark then stands on its own. Three
+characters that a JSON encoder writes raw and the parser's line splitting
+breaks on (U+2028, U+2029, U+0085) are escaped when a row is composed, so
+a prompt holding one is stored whole.
+
+Stored datasets are listed newest first (the newest 500) with their task
+count, scorer kinds and digest. Selecting one marks it and shows the
+`dataset_digest` an experiment names it by, and loads nothing back into
+the builder: editing a stored dataset is storing a new one. No control on
+the page creates an experiment yet, so the selection is for reading the
+digest off; experiments are still created through the API below.
+
 ## Experiments
 
 An experiment is the aggregate above groups: one dataset, one lineup, one
@@ -3115,6 +3166,14 @@ picked up without restarts, and verify by eyeball after UI changes:
 - Queued state: run six or more models at once; the sixth card reads
   "queued" while five are in flight, then flips to "thinking" when a
   slot frees, and its counter restarts so its ttft excludes the wait.
+- Datasets: open the panel, name a dataset, add three rows (exact, regex,
+  judge) and watch each scorer show only its own fields. Leave a prompt
+  empty: Store greys and says which line. Give two rows the same id and
+  Store: the server's sentence appears under the second, and editing
+  that id clears it. Store twice under two names: the page says the
+  earlier name stands. Upload a CRLF file and compare the listed digest
+  with `sha256sum` of the file. Select a stored dataset and confirm the
+  builder did not change.
 
 ## License
 

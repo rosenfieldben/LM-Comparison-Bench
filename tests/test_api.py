@@ -2824,8 +2824,8 @@ def test_the_served_index_versions_every_asset_url(client):
     # it is asserted rather than derived on purpose: a new asset that the
     # transform failed to version would otherwise pass unnoticed, since
     # every OTHER url would still carry its rev.
-    # 14 since K4 added static/attach.js.
-    assert len(referenced) == 14, referenced
+    # 14 since K4 added static/attach.js; 15 since N2 added static/datasets.js.
+    assert len(referenced) == 15, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -19137,3 +19137,453 @@ def test_a_malformed_summary_does_not_block_the_tasks_behind_it(client):
     assert client.get(f"/experiments/{eid}/report").json()["thresholds_source"] == (
         "dataset_store"
     )
+
+
+# =====================================================================
+# ---- Phase N2: the builder's pure half, executed with node against the
+# ---- server it composes for.
+# =====================================================================
+
+import itertools
+import subprocess
+
+from bench import datasets as bench_datasets
+
+LIB_JS = Path(__file__).parent.parent / "static" / "lib.js"
+
+
+def run_lib(script, payload=None):
+    """Execute static/lib.js with node and return what the script printed,
+    parsed. EXECUTED, NOT SEARCHED FOR: the frontend's answers are asked
+    for, never read off its source text.
+
+    The payload goes in as JSON on stdin, where the script reads it as
+    INPUT, and not as an argument: a dataset one byte over the bound is
+    past what the operating system allows an argument list to hold."""
+    prelude = (
+        "const INPUT = JSON.parse(require('fs').readFileSync(0, 'utf8') || 'null');"
+    )
+    proc = subprocess.run(
+        ["node", "-e", prelude + script, str(LIB_JS)],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return json.loads(proc.stdout)
+
+
+def test_the_builders_mirrors_are_the_servers_numbers():
+    """WINDOW: DATASET_LIMITS, DATASET_SCORERS and BUILDER_MAX_ROWS as
+    node reads them out of static/lib.js, against the constants they name.
+
+    The ceilings the builder shows before Store and the bounds its nudges
+    grey Store on are the server's, mirrored the way index.html mirrors
+    ExperimentParams. A mirror tighter than the server would grey Store
+    on a dataset the door would take; a looser one would show a ceiling
+    the server does not have. BUILDER_MAX_ROWS is the builder's own bound
+    and has no server twin; it is pinned at the commission's proposal
+    until the checkpoint rules on it."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify({limits: l.DATASET_LIMITS,"
+        " scorers: l.DATASET_SCORERS, rows: l.BUILDER_MAX_ROWS}));"
+    )
+    assert js["limits"] == {
+        "maxTasks": bench_datasets.MAX_TASKS,
+        "maxPromptChars": bench_datasets.MAX_PROMPT_CHARS,
+        "maxDatasetBytes": main.MAX_DATASET_BYTES,
+        "maxNameChars": main.MAX_DATASET_NAME_CHARS,
+    }
+    assert js["scorers"] == list(bench_datasets.SCORERS)
+    assert js["rows"] == 50
+
+
+def test_the_builder_counts_characters_and_bytes_the_way_the_server_does():
+    """WINDOW: codePoints and utf8Length, executed, over strings whose
+    JavaScript length is not their Python length.
+
+    The server's bounds are len() over a str and the bytes of its UTF-8
+    encoding. A String's .length counts UTF-16 units, so an emoji is two
+    there and one here, and a ceiling measured with it would call a legal
+    prompt over the limit."""
+    samples = ["", "plain", "caf\u00e9", "\u6f22\u5b57", "\U0001f600" * 3, "e\u0301"]
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "const s = INPUT;"
+        "process.stdout.write(JSON.stringify(s.map((t) =>"
+        " [l.codePoints(t), l.utf8Length(t)])));",
+        samples,
+    )
+    assert js == [[len(t), len(t.encode("utf-8"))] for t in samples]
+    # PRE-STATE: at least one sample really does disagree on .length.
+    assert len("\U0001f600".encode("utf-16-le")) // 2 != len("\U0001f600")
+
+
+def builder_row(**fields):
+    row = {
+        "id": "",
+        "prompt": "",
+        "system": "",
+        "scorer": "",
+        "reference": "",
+        "pattern": "",
+        "rubric": "",
+        "threshold": "",
+        "documents": [],
+    }
+    row.update(fields)
+    return row
+
+
+# Characters the grid and the blank tests turn on, named rather than
+# escaped so each says why it is here.
+FEFF = chr(0xFEFF)  # blank to JavaScript's trim alone
+FS = chr(0x1C)  # blank to Python's strip alone, and a line break to splitlines
+NEL = chr(0x85)  # the same
+GRIN = chr(0x1F600)  # one code point, two UTF-16 units, four UTF-8 bytes
+PY_DECIMAL = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
+
+
+def py_compose(row):
+    """The task a builder row declares, written in Python from the rules
+    composeTask's comment states, independently of composeTask.
+
+    THE ORACLE THE GRID PINS COMPOSITION TO. Sorting the rows the page
+    does not nudge into stored and refused proves nothing about which is
+    which: a composeTask that dropped a field a person typed would move a
+    row from one bucket to the other and still pass. Compared key for key
+    with this, it fails. Blank here is str.strip()'s blank, because that
+    is the reading composeTask says it follows."""
+    task = {}
+    if row["id"] != "":
+        task["id"] = row["id"]
+    if row["prompt"] != "":
+        task["prompt"] = row["prompt"]
+    if row["system"].strip():
+        task["system"] = row["system"]
+    kind = row["scorer"]
+    if kind in ("exact", "normalized_exact", "contains") and row["reference"].strip():
+        task["reference"] = row["reference"]
+    if kind == "judge" and row["rubric"].strip():
+        task["rubric"] = row["rubric"]
+    if kind:
+        scorer = {"kind": kind}
+        if kind == "regex" and row["pattern"] != "":
+            scorer["pattern"] = row["pattern"]
+        if kind == "judge" and row["threshold"].strip():
+            numeral = row["threshold"].strip()
+            if PY_DECIMAL.fullmatch(numeral) and math.isfinite(float(numeral)):
+                scorer["pass_threshold"] = float(numeral)
+            else:
+                scorer["pass_threshold"] = row["threshold"]
+        task["scorer"] = scorer
+    if row["documents"]:
+        task["attachments"] = list(row["documents"])
+    return task
+
+
+# Faults the grid holds that only the server names.
+BAD_PATTERNS = ("(", "a{4294967296}")
+BAD_THRESHOLDS = ("x", "2", FEFF, "0x1", "1e999", FEFF + "0.5", "1" * 40 + "x")
+
+
+def builder_grid():
+    """Every row the builder can compose from a small alphabet per field:
+    empty, whitespace and a value for each text field, the characters
+    blank to one of trim() and strip() and not the other, and for each
+    scorer the fields it uses, including values the server refuses (a
+    pattern that does not compile or overflows the engine, a threshold
+    that is not a decimal numeral, is not finite or is out of range). A
+    value typed into a field the scorer does not use rides along on some
+    rows, so composing it is exercised too; and two prompts sit either
+    side of the prompt ceiling, counted in code points of a character
+    that is two UTF-16 units."""
+    texts = ("", " ", "v")
+    blanks = (*texts, FEFF, FS, NEL)
+    thresholds = ("", "0.5", "x", "2", FEFF, "0x1", " 0.5", ".5", "1e999")
+    # Each spelling the decimal grammar must read the way Python does, or
+    # refuse to read: whitespace alone (not sent), whitespace either side,
+    # a sign, a bare trailing point, both exponent cases, and a leading
+    # character blank to one of Python and JavaScript but not the other.
+    spellings = (" ", NEL, "0.5 ", "+0.5", "1.", "5e-1", "1E0", FS + "0.5")
+    spellings += (FEFF + "0.5", "1" * 40 + "x")
+    # Several digits in each part: fraction, integer and exponent.
+    spellings += ("0.25", ".25", "0.125", "10e-1", "00.5", "1e-10", "25e-02")
+    rows = []
+    for task_id, prompt in itertools.product(texts, texts):
+        base = {"id": task_id, "prompt": prompt}
+        rows.append(builder_row(**base))
+        rows.append(builder_row(**base, system=" ", reference="stray"))
+        for system in (FEFF, NEL):
+            rows.append(builder_row(**base, system=system))
+        for kind in ("exact", "normalized_exact", "contains"):
+            for reference in blanks:
+                rows.append(builder_row(**base, scorer=kind, reference=reference))
+        for pattern in ("", " ", "(", "x", "a{4294967296}"):
+            rows.append(builder_row(**base, scorer="regex", pattern=pattern))
+        for rubric, threshold in itertools.product(blanks, thresholds):
+            rows.append(
+                builder_row(**base, scorer="judge", rubric=rubric, threshold=threshold)
+            )
+        if task_id == prompt == "v":
+            for threshold in spellings:
+                rows.append(
+                    builder_row(**base, scorer="judge", rubric="v", threshold=threshold)
+                )
+    limit = bench_datasets.MAX_PROMPT_CHARS
+    rows.append(builder_row(id="at", prompt=GRIN * limit))
+    rows.append(builder_row(id="over", prompt="p" * (limit + 1)))
+    return rows
+
+
+def test_every_nudge_is_a_refusal_the_server_would_make_and_not_the_reverse(client):
+    """WINDOW: rowNudge and composeJsonl executed over the whole builder
+    grid, py_compose over the same rows, and POST /datasets over what
+    each row composes.
+
+    THE NUDGE-SUBSET PROOF THE COMMISSION ASKS FOR, at unit scale over
+    the whole grid; tests/browser/test_n.py repeats it in the page. A
+    nudge greys Store, which is a courtesy and not a rule, so it must
+    never grey Store on a dataset the server would take: every row the
+    page nudges is sent anyway, as the page would have composed it, and
+    the server refuses every one. STRICT, NOT EQUAL: some rows the page
+    does not nudge are refused too (a pattern that does not compile, a
+    threshold that is not a number), which is the server's to say, in
+    its own words; and some are stored, or the grid would prove nothing
+    about acceptance. WHICH rows are stored is pinned by composing each
+    one as composeTask says it composes, so a composition that dropped
+    what a person typed fails here rather than moving a row between
+    buckets."""
+    rows = builder_grid()
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "const rows = INPUT;"
+        "process.stdout.write(JSON.stringify(rows.map((r) =>"
+        " [l.rowNudge(r), l.composeJsonl([r])])));",
+        rows,
+    )
+    nudged_refused = strict = accepted = left_to_server = 0
+    for row, (nudge, jsonl) in zip(rows, js, strict=True):
+        assert jsonl.endswith("\n")
+        assert json.loads(jsonl) == py_compose(row), row
+        resp = client.post("/datasets", json={"name": "grid", "content": jsonl})
+        # A row whose ONLY fault is one the server words (a pattern that
+        # does not compile, a threshold that is not a number or is out of
+        # range) is not nudged: that sentence is the server's to say.
+        if row["id"] == row["prompt"] == "v" and (
+            (row["scorer"] == "regex" and row["pattern"] in BAD_PATTERNS)
+            or (
+                row["scorer"] == "judge"
+                and row["rubric"] == "v"
+                and row["threshold"] in BAD_THRESHOLDS
+            )
+        ):
+            assert nudge is None, row
+            assert resp.status_code == 422, row
+            left_to_server += 1
+        if nudge is not None:
+            assert resp.status_code == 422, (row, nudge, jsonl)
+            nudged_refused += 1
+        elif resp.status_code == 422:
+            strict += 1
+        else:
+            assert resp.status_code == 201, resp.text
+            accepted += 1
+    assert nudged_refused > 0
+    assert strict > 0
+    assert accepted > 0
+    assert left_to_server == len(BAD_PATTERNS) + len(BAD_THRESHOLDS)
+    # The two prompts at the ceiling: one code point over is nudged, and
+    # exactly the ceiling in a character .length counts twice is not.
+    assert js[-2][0] is None
+    assert "over the 100000 limit" in js[-1][0]
+
+
+def exactly(total):
+    """A valid dataset of multi-byte prompts, exactly total UTF-8 bytes
+    long, every prompt inside MAX_PROMPT_CHARS."""
+    lines, size, i = [], 0, 0
+    while True:
+        line = json.dumps({"id": f"t{i}", "prompt": GRIN * 20000}, ensure_ascii=False)
+        line += "\n"
+        if size + len(line.encode()) > total - 1000:
+            break
+        lines.append(line)
+        size += len(line.encode())
+        i += 1
+    head = json.dumps({"id": f"t{i}", "prompt": ""}, ensure_ascii=False)
+    pad = total - size - len(head.encode()) - 1
+    lines.append(json.dumps({"id": f"t{i}", "prompt": "x" * pad}) + "\n")
+    text = "".join(lines)
+    assert len(text.encode()) == total
+    return text
+
+
+def test_every_dataset_nudge_is_a_refusal_too(client):
+    """WINDOW: datasetNudge executed over names and contents at and past
+    each bound, and POST /datasets over each.
+
+    The dataset-level half of the subset proof, in both directions. PAST
+    a bound (a blank name, a name one code point over, no tasks, one byte
+    over MAX_DATASET_BYTES in ASCII and in multi-byte text) the page
+    nudges and the server refuses. AT a bound, counted the server's way
+    (255 code points of a character that is two UTF-16 units, and exactly
+    MAX_DATASET_BYTES of multi-byte text), the page does not nudge and
+    the server stores: a nudge measured with .length, or with >= where
+    the server has >, would grey Store there. And a name the page does
+    not nudge but the server refuses (a separator) is left to the
+    server."""
+    names = main.MAX_DATASET_NAME_CHARS
+    size = main.MAX_DATASET_BYTES
+
+    def task(i):
+        return json.dumps({"id": f"t{i}", "prompt": "p"}) + "\n"
+
+    refused = [
+        ["", task(0)],
+        ["   ", task(1)],
+        [GRIN * (names + 1), task(2)],
+        ["n", ""],
+        ["n", " \n "],
+        ["n", "x" * (size + 1)],
+        ["n", exactly(size + 1)],
+    ]
+    stored = [
+        ["n" * names, task(3)],
+        [GRIN * names, task(4)],
+        ["n", exactly(size)],
+        ["n", task(5)],
+    ]
+    server_only = [["a/b", task(6)]]
+    cases = refused + stored + server_only
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map(([n, c]) =>"
+        " l.datasetNudge(n, c))));",
+        cases,
+    )
+    for (name, content), nudge in zip(cases, js, strict=True):
+        resp = client.post("/datasets", json={"name": name, "content": content})
+        if [name, content] in refused:
+            assert nudge is not None, name[:20]
+            assert resp.status_code == 422, (name[:20], nudge)
+        elif [name, content] in stored:
+            assert nudge is None, (name[:20], nudge)
+            assert resp.status_code == 201, (name[:20], resp.text[:200])
+        else:
+            # Not nudged, refused by the server: the subset is strict here too.
+            assert nudge is None
+            assert resp.status_code == 422
+
+
+def test_the_builder_counts_lines_the_way_the_parser_reads_them(client):
+    """WINDOW: countLines executed over text broken by every separator
+    str.splitlines knows, and POST /datasets over the same text.
+
+    The JSONL label and its task-line ceiling count what the parser will
+    read as tasks, so they must split where str.splitlines splits and
+    skip what str.strip calls blank. Split on CR and LF alone, a file of
+    tasks separated by U+2028 read as one line to the page and as two to
+    the server. The trailing line of each is U+001F, which str.strip
+    calls blank and trim() does not and which is not a line break, so a
+    count that skipped lines the trim() way, or split on it, is caught;
+    and whitespace that is not a line break leaves a line whole."""
+    breaks = ["\r\n", "\n", "\r", "\v", "\f", FS, chr(0x1D), chr(0x1E), NEL]
+    breaks += [chr(0x2028), chr(0x2029)]
+    # PRE-STATE: each really is a line break to the parser.
+    for mark in breaks:
+        assert len(("a" + mark + "b").splitlines()) == 2
+    texts = []
+    for i, mark in enumerate(breaks):
+        first = json.dumps({"id": f"a{i}", "prompt": "p"})
+        second = json.dumps({"id": f"b{i}", "prompt": "q"})
+        # The trailing line is blank to strip alone, so it is skipped.
+        texts.append(first + mark + second + mark + chr(0x1F) + "\n")
+    counts = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((t) => l.countLines(t))));",
+        texts,
+    )
+    for text, count in zip(texts, counts, strict=True):
+        assert count == len([line for line in text.splitlines() if line.strip()])
+        resp = client.post("/datasets", json={"name": "lines", "content": text})
+        assert resp.status_code == 201, resp.text
+        assert resp.json()["task_count"] == count == 2
+    # Whitespace that is not a line break, a line of U+FEFF (not blank to
+    # strip), CR before CRLF: counted without sending, against Python.
+    odd = ["a\tb", "a" + chr(0x1F) + "b", "a" + chr(0x3000) + "b", FEFF]
+    odd += ["a\r\r\nb", "\n\r", "a" + chr(0x1F) + "\n" + chr(0x3000)]
+    odd_counts = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((t) => l.countLines(t))));",
+        odd,
+    )
+    assert odd_counts == [
+        len([line for line in t.splitlines() if line.strip()]) for t in odd
+    ]
+    assert odd_counts[:4] == [1, 1, 1, 1]
+
+
+def test_the_refusal_line_the_page_reads_is_the_line_the_server_names(client):
+    """WINDOW: refusalLine executed over the sentences POST /datasets
+    actually returns, for a parse refusal and a half surrogate pair.
+
+    The page places a refusal beside a row by the number at the start of
+    the server's sentence. Reading it from the server's real sentences,
+    rather than from sentences written here, is what keeps the two from
+    drifting apart."""
+    parse = client.post(
+        "/datasets",
+        json={
+            "name": "n",
+            "content": '{"id": "a", "prompt": "x"}\n{"id": "a", "prompt": "y"}\n',
+        },
+    ).json()["detail"]
+    half = client.post(
+        "/datasets",
+        content=(b'{"name": "n", "content": "{}\\n{}\\n\\ud800"}'),
+        headers={"content-type": "application/json"},
+    ).json()["detail"]
+    sentences = [parse, half, "nothing has no tasks", None, ["a list"]]
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT"
+        ".map((d) => l.refusalLine(d))));",
+        sentences,
+    )
+    assert js == [2, 3, None, None, None]
+
+
+def test_the_builder_reads_blank_as_python_strip_does(client):
+    """WINDOW: isBlank executed over every code point outside the
+    surrogates, and datasetNudge and POST /datasets over two names, each
+    blank to one reading alone.
+
+    Most of the builder's blank checks stand in for a str.strip() on the
+    server, so isBlank must agree with str.isspace() on every character,
+    not only the ones a grid happens to hold. U+FEFF is blank to
+    JavaScript's trim alone: a name of it is not blank to the server and
+    is stored, so the page must not nudge it. U+0085 is blank to strip
+    alone: the server refuses a name of it, and the page nudges it."""
+    points = [c for c in range(0x110000) if not 0xD800 <= c <= 0xDFFF]
+    task = json.dumps({"id": "t", "prompt": "p"}) + "\n"
+    blank, feff, nel = run_lib(
+        "const l = require(process.argv[1]);"
+        "const out = [];"
+        "for (const c of INPUT.points)"
+        "  if (l.isBlank(String.fromCodePoint(c))) out.push(c);"
+        "process.stdout.write(JSON.stringify([out,"
+        " l.datasetNudge(INPUT.feff, INPUT.task),"
+        " l.datasetNudge(INPUT.nel, INPUT.task)]));",
+        {"points": points, "feff": FEFF, "nel": NEL, "task": task},
+    )
+    assert blank == [c for c in points if chr(c).isspace()]
+    # PRE-STATE: the two names really do split the readings.
+    assert FEFF.strip() == FEFF and NEL.strip() == ""
+    assert feff is None
+    resp = client.post("/datasets", json={"name": FEFF, "content": task})
+    assert resp.status_code == 201, resp.text
+    assert nel == "name the dataset"
+    resp = client.post("/datasets", json={"name": NEL, "content": task})
+    assert resp.status_code == 422
