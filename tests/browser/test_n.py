@@ -43,7 +43,7 @@ STORE_TIMEOUT = 10_000
 # why it is here.
 FEFF = chr(0xFEFF)  # blank to JavaScript's trim alone
 NEL = chr(0x85)  # blank to Python's strip alone
-LS = chr(0x2028)  # a line break to str.splitlines, raw in JSON.stringify
+LS = chr(0x2028)  # raw in JSON.stringify; not a line end to the parser
 GRIN = chr(0x1F600)  # one code point, two UTF-16 units, four UTF-8 bytes
 
 # Chromium's console line for a response the server refused, which every
@@ -714,10 +714,9 @@ def test_a_line_separator_in_a_prompt_is_stored_whole(page, bench, bench_url):
     """WINDOW: a prompt holding U+2028, through the rows way in, to the
     stored line.
 
-    JSON.stringify writes U+2028 raw and the server's parser splits lines
-    on it, so written raw the prompt would be cut in two and refused as
-    an unterminated string. The builder escapes it, the dataset is
-    stored, and the stored prompt is the one typed."""
+    JSON.stringify writes U+2028 raw, and JSON allows it raw. The parser
+    ends a line at "\n" alone, so the line is one task and the prompt is
+    stored as typed, the character itself and not an escape of it."""
     bench(["stub/fast"])
     open_datasets(page)
     name = unique("separator")
@@ -728,8 +727,7 @@ def test_a_line_separator_in_a_prompt_is_stored_whole(page, bench, bench_url):
     assert store(page).startswith("stored as " + name)
 
     served = stored(page, bench_url, digest_of(page, name))["content"]
-    assert LS not in served
-    assert "\\u2028" in served
+    assert LS in served
     assert json.loads(served)["prompt"] == prompt
 
 

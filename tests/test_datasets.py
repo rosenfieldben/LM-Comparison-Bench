@@ -917,3 +917,130 @@ def test_cites_documents_is_true_exactly_when_some_task_cites_one():
     assert cites_documents(none["tasks"]) is False
     assert cites_documents(some["tasks"]) is True
     assert cites_documents(every["tasks"]) is True
+
+
+# ---- Lines end at "\n": the parser's line splitting.
+
+# The characters str.splitlines breaks a line at besides "\n": a lone CR,
+# \v, \f, U+001C to U+001E, U+0085, U+2028 and U+2029.
+SPLITLINES_ONLY = ["\r", "\v", "\f", "\x1c", "\x1d", "\x1e"]
+SPLITLINES_ONLY += [chr(0x85), chr(0x2028), chr(0x2029)]
+
+
+def as_splitlines_read(raw: bytes) -> bytes:
+    """The same text rejoined at the lines str.splitlines finds in it.
+
+    Parsing this is parsing the original the way parse_dataset did
+    before lines ended at "\\n" alone: the pieces hold no line break of
+    either kind, so the two readings of the rejoined text agree, and they
+    are the pieces the old parser read. The digest differs, since the
+    bytes do; the tasks and the refusals are what it reproduces."""
+    return "\n".join(raw.decode("utf-8").splitlines()).encode("utf-8")
+
+
+def test_review_repro_a_prompt_holding_a_line_separator_is_one_task():
+    """WINDOW: parse_dataset over one task whose prompt holds U+2028,
+    U+2029 and U+0085 written raw, as JSON allows and as JSON.stringify
+    writes them.
+
+    THE DEFECT. The parser read lines with str.splitlines, which breaks
+    at all three, so this valid task was cut in two and refused as an
+    unterminated string; the builder escaped the three in every line it
+    composed to get past it. PRE-STATE: read the old way, it refuses.
+    Now it is one task, and its prompt is the one written."""
+    prompt = "before" + chr(0x2028) + "middle" + chr(0x2029) + "after" + chr(0x85)
+    raw = (
+        json.dumps({"id": "t1", "prompt": prompt}, ensure_ascii=False) + "\n"
+    ).encode()
+    with pytest.raises(DatasetError) as before:
+        parse_dataset(as_splitlines_read(raw))
+    assert str(before.value).startswith("line 1: not valid JSON: Unterminated string")
+
+    out = parse_dataset(raw)
+
+    assert [task["prompt"] for task in out["tasks"]] == [prompt]
+
+
+def committed_datasets():
+    """Every dataset the repository ships as data or as documentation:
+    the files in bench-datasets/ and the README's JSON blocks that are
+    tasks (the ones with a prompt)."""
+    found = {
+        path.name: path.read_bytes()
+        for path in sorted((REPO_ROOT / "bench-datasets").glob("*.jsonl"))
+    }
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    for n, block in enumerate(readme.split("```")):
+        if block.startswith("json\n") and '"prompt"' in block:
+            found[f"README block {n}"] = block[len("json\n") :].encode("utf-8")
+    return found
+
+
+def test_every_committed_dataset_parses_as_it_did_before():
+    """WINDOW: parse_dataset over every committed dataset, read the new
+    way and the old way (as_splitlines_read).
+
+    Ending lines at "\\n" alone changes what the parser accepts only for a
+    file that holds one of the characters splitlines alone breaks at;
+    every dataset the repository ships parses to the same tasks both
+    ways. PRE-STATE: the set is not empty and includes both example files
+    and the README's blocks, so the loop proves something."""
+    datasets = committed_datasets()
+    assert {"arithmetic.jsonl", "summarize.jsonl"} <= set(datasets)
+    assert sum(name.startswith("README") for name in datasets) >= 3
+
+    for name, raw in datasets.items():
+        now = parse_dataset(raw, name)["tasks"]
+        before = parse_dataset(as_splitlines_read(raw), name)["tasks"]
+        assert now == before, name
+        assert now
+
+
+def test_a_separator_the_format_does_not_have_is_refused_on_its_line():
+    """WINDOW: parse_dataset over two tasks separated by each character
+    str.splitlines breaks at besides "\\n".
+
+    A DELIBERATE CHANGE OF WHAT THE PARSER ACCEPTS. Read the old way,
+    each of these files was two tasks (PRE-STATE, below); now each is one
+    line holding two JSON values, and it is refused on line 1. JSONL is
+    newline-delimited, and a parser that also split at U+2028 to keep
+    accepting these would cut the valid prompt in the test above in two.
+    A person with such a file is told which line, in the parser's words,
+    and the fix is a newline."""
+    for mark in SPLITLINES_ONLY:
+        raw = (
+            json.dumps({"id": "a", "prompt": "p"})
+            + mark
+            + json.dumps({"id": "b", "prompt": "q"})
+            + "\n"
+        ).encode()
+        before = parse_dataset(as_splitlines_read(raw))
+        assert [task["id"] for task in before["tasks"]] == ["a", "b"], repr(mark)
+
+        with pytest.raises(DatasetError) as exc:
+            parse_dataset(raw)
+
+        assert str(exc.value).startswith("line 1: not valid JSON"), repr(mark)
+
+
+def test_a_crlf_file_reads_as_its_lf_twin():
+    """WINDOW: parse_dataset over the same tasks with LF and with CRLF
+    line ends, and with a blank CRLF line between them.
+
+    The CR left at the end of each line is whitespace to the JSON decoder
+    and to the blank-line check, so a file saved on Windows reads as the
+    same tasks, numbered the same; the digests differ, because the bytes
+    do, and the digest is of the bytes."""
+    rows = [
+        json.dumps({"id": "a", "prompt": "p"}),
+        json.dumps({"id": "b", "prompt": "q"}),
+    ]
+    lf = ("\n".join(rows) + "\n").encode()
+    crlf = ("\r\n\r\n".join(rows) + "\r\n").encode()
+
+    assert parse_dataset(crlf)["tasks"] == parse_dataset(lf)["tasks"]
+    assert parse_dataset(crlf)["digest"] != parse_dataset(lf)["digest"]
+    bad = (rows[0] + "\r\n" + '{"id": "a", "prompt": "again"}' + "\r\n").encode()
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(bad)
+    assert str(exc.value) == "line 2: duplicate task id 'a'"

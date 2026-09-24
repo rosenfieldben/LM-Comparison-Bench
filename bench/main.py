@@ -7531,9 +7531,9 @@ async def create_dataset(body: DatasetCreate) -> dict[str, Any]:
         # pair, which a paste can produce. No UTF-8 file can contain one,
         # so there are no bytes to store, and a 500 would be the bench
         # failing to say so. The line is counted the way parse_dataset
-        # counts, splitlines with blank lines numbered, so it points at
-        # the same row the parser would have named.
-        line_no = len((body.content[: exc.start] + "x").splitlines())
+        # counts (lines end at "\n", blank lines numbered), so it points
+        # at the same row the parser would have named.
+        line_no = body.content[: exc.start].count("\n") + 1
         raise HTTPException(
             422,
             f"line {line_no}: content holds an unpaired surrogate "

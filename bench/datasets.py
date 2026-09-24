@@ -363,6 +363,19 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
 
     Blank lines are skipped, because a trailing newline is not an error
     and refusing one would be pedantry the user has to work around.
+
+    A LINE ENDS AT "\n" AND NOWHERE ELSE. A CRLF file needs nothing more
+    to read as its LF twin: the "\r" left at the end of each line is
+    whitespace to json.loads after the value and to str.strip on a blank
+    line, so it changes no task and no line number. Not str.splitlines,
+    which also breaks at \v, \f, U+001C to U+001E, U+0085, U+2028,
+    U+2029 and a lone \r: a JSON string may hold U+2028, U+2029 and
+    U+0085 unescaped, so splitlines cut a valid task in two and refused
+    both halves. The price is deliberate: a file that used one of those
+    characters (or a lone CR) as a record separator, which splitlines
+    read as separate lines, is now one line and is refused on it. JSONL
+    is newline-delimited; a separator the format does not have is not
+    one the parser should guess at.
     """
     digest = hashlib.sha256(raw).hexdigest()
     try:
@@ -372,7 +385,7 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
 
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    for line_no, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         if len(tasks) >= MAX_TASKS:

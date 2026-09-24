@@ -544,24 +544,6 @@
       "]*$",
   );
 
-  // One task as one JSONL line.
-  //
-  // THREE CHARACTERS ARE ESCAPED THAT JSON.stringify WRITES RAW, and the
-  // reason is the server's parser rather than JSON. U+0085, U+2028 and
-  // U+2029 are legal unescaped inside a JSON string, and parse_dataset
-  // splits lines with Python's str.splitlines, which breaks on all
-  // three, so a prompt holding one pasted from somewhere would be cut in
-  // half and refused as "Unterminated string". Escaped, the line is the
-  // same JSON value and the parser reads it whole. Whether the parser
-  // should split on "\n" alone instead is a ruling the checkpoint asks
-  // for; until then the builder never writes a line it would break.
-  function jsonLine(value) {
-    return JSON.stringify(value).replace(
-      /[\u0085\u2028\u2029]/g,
-      (ch) => "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0"),
-    );
-  }
-
   // One row of the builder as the task object it declares.
   //
   // RULE ONE: A KEY IS WRITTEN ONLY WHEN IT WAS SET. A blank id box is an
@@ -622,9 +604,12 @@
 
   // The builder's rows as the text Store sends: one line per row, in
   // order, no blank lines, a newline after each. So row N is line N, and
-  // a refusal naming line N names row N.
+  // a refusal naming line N names row N. JSON.stringify escapes every
+  // "\n" inside a value, and the parser ends a line at "\n" and nowhere
+  // else, so a prompt holding U+2028 (which JSON.stringify writes raw) is
+  // one line and is stored as it was typed.
   function composeJsonl(rows) {
-    return rows.map((row) => jsonLine(composeTask(row)) + "\n").join("");
+    return rows.map((row) => JSON.stringify(composeTask(row)) + "\n").join("");
   }
 
   // Why this row greys Store, or null. A COURTESY AND NOT A RULE: every
@@ -698,20 +683,16 @@
     return match ? Number(match[1]) : null;
   }
 
-  // Where str.splitlines breaks a line: CR, LF and CRLF, and also \v,
-  // \f, U+001C to U+001E, U+0085, U+2028 and U+2029.
-  const PY_LINE_BREAK =
-    // biome-ignore lint/suspicious/noControlCharactersInRegex: U+001C to U+001E are line breaks to str.splitlines.
-    /\r\n|[\n\v\f\r\x1c-\x1e\x85\u2028\u2029]/;
-
   // Lines holding anything, for a pasted or uploaded file's label and its
   // task-line ceiling. SPLIT AND SKIPPED AS THE PARSER SPLITS AND SKIPS:
-  // parse_dataset reads lines with str.splitlines and skips one that is
-  // blank to str.strip, and counted any other way the label would
-  // disagree with the task count the server stores. A count and no more:
-  // the page does not parse what it did not compose.
+  // parse_dataset ends a line at "\n" and nowhere else (the "\r" a CRLF
+  // file leaves at a line's end is whitespace there, and a line of it
+  // alone is blank) and skips one that is blank to str.strip, and
+  // counted any other way the
+  // label would disagree with the task count the server stores. A count
+  // and no more: the page does not parse what it did not compose.
   function countLines(text) {
-    return text.split(PY_LINE_BREAK).filter((line) => !isBlank(line)).length;
+    return text.split("\n").filter((line) => !isBlank(line)).length;
   }
 
   // A refusal body as text. FastAPI answers a model violation with a LIST

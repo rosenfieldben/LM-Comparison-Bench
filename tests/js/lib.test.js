@@ -689,19 +689,25 @@ test("a threshold that is not a number is sent as typed, for the server to refus
   );
 });
 
-test("composeJsonl writes one line per row and escapes the three the parser splits on", () => {
+test("composeJsonl writes one line per row, U+2028 and its kin as typed", () => {
+  const kin =
+    String.fromCharCode(0x2028) +
+    String.fromCharCode(0x2029) +
+    String.fromCharCode(0x85);
   const text = composeJsonl([
-    row({ id: "a", prompt: "x\u2028y\u2029z\u0085" }),
+    row({ id: "a", prompt: "x" + kin + "y" }),
     row({ id: "b", prompt: "two", documents: ["d".repeat(64)] }),
   ]);
   assert.equal(text.split("\n").length, 3);
   assert.ok(text.endsWith("\n"));
-  assert.ok(!/[\u2028\u2029\u0085]/.test(text));
+  // Written raw: the parser ends a line at "\n" alone, so nothing needs
+  // escaping, and a workaround left in place would outlive its defect.
+  assert.ok(text.includes(kin));
   const lines = text
     .trimEnd()
     .split("\n")
     .map((line) => JSON.parse(line));
-  assert.equal(lines[0].prompt, "x\u2028y\u2029z\u0085");
+  assert.equal(lines[0].prompt, "x" + kin + "y");
   assert.deepEqual(lines[1].attachments, ["d".repeat(64)]);
   assert.equal(composeJsonl([]), "");
 });
@@ -757,8 +763,9 @@ test("refusalLine reads the line a server sentence names, and nothing else", () 
   assert.equal(refusalLine("line 2 of the file is odd"), null);
 });
 
-test("countLines counts lines holding anything, across line-end styles", () => {
-  assert.equal(countLines("a\r\n\r\nb\nc\rd"), 4);
+test("countLines counts lines holding anything, LF and CRLF alike", () => {
+  // "c\rd" is one line: a lone CR is not a line end to the parser.
+  assert.equal(countLines("a\r\n\r\nb\nc\rd"), 3);
   assert.equal(countLines(""), 0);
 });
 
@@ -854,9 +861,14 @@ test("composeTask's blank is Python's: U+FEFF is kept and U+0085 is not", () => 
   });
 });
 
-test("countLines breaks a line wherever str.splitlines does", () => {
-  for (const code of [0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029]) {
+test("countLines ends a line at a newline and at nothing else", () => {
+  // Each of these is a line break to str.splitlines, and none is to the
+  // parser, which reads lines at "\n" alone.
+  for (const code of [
+    0x0d, 0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029,
+  ]) {
     const mark = String.fromCharCode(code);
-    assert.equal(countLines("a" + mark + "b"), 2, code.toString(16));
+    assert.equal(countLines("a" + mark + "b"), 1, code.toString(16));
   }
+  assert.equal(countLines("a\nb"), 2);
 });

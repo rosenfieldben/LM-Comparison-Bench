@@ -19239,7 +19239,7 @@ def builder_row(**fields):
 # Characters the grid and the blank tests turn on, named rather than
 # escaped so each says why it is here.
 FEFF = chr(0xFEFF)  # blank to JavaScript's trim alone
-FS = chr(0x1C)  # blank to Python's strip alone, and a line break to splitlines
+FS = chr(0x1C)  # blank to strip alone; a line break to splitlines, not the parser
 NEL = chr(0x85)  # the same
 GRIN = chr(0x1F600)  # one code point, two UTF-16 units, four UTF-8 bytes
 PY_DECIMAL = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?", re.ASCII)
@@ -19478,50 +19478,62 @@ def test_every_dataset_nudge_is_a_refusal_too(client):
 
 
 def test_the_builder_counts_lines_the_way_the_parser_reads_them(client):
-    """WINDOW: countLines executed over text broken by every separator
-    str.splitlines knows, and POST /datasets over the same text.
+    """WINDOW: countLines executed over two tasks separated by "\\n", by
+    CRLF, and by each other character str.splitlines breaks at, and POST
+    /datasets over the same text.
 
     The JSONL label and its task-line ceiling count what the parser will
-    read as tasks, so they must split where str.splitlines splits and
-    skip what str.strip calls blank. Split on CR and LF alone, a file of
-    tasks separated by U+2028 read as one line to the page and as two to
-    the server. The trailing line of each is U+001F, which str.strip
-    calls blank and trim() does not and which is not a line break, so a
-    count that skipped lines the trim() way, or split on it, is caught;
-    and whitespace that is not a line break leaves a line whole."""
-    breaks = ["\r\n", "\n", "\r", "\v", "\f", FS, chr(0x1D), chr(0x1E), NEL]
-    breaks += [chr(0x2028), chr(0x2029)]
-    # PRE-STATE: each really is a line break to the parser.
-    for mark in breaks:
+    read as tasks, so they end a line where parse_dataset does, at "\\n"
+    alone, and skip what str.strip calls blank (a CRLF file's CR is blank).
+    Separated by "\\n" or CRLF, the two tasks are two lines to both and
+    are stored as two. Separated by anything else splitlines knows (a
+    lone CR, U+2028), they are one line to both, and the server refuses
+    that line. The trailing line of each is U+001F, which str.strip calls
+    blank and trim() does not, so a count that skipped lines the trim()
+    way is caught."""
+    breaks = ["\n", "\r\n"]
+    others = ["\r", "\v", "\f", FS, chr(0x1D), chr(0x1E), NEL]
+    others += [chr(0x2028), chr(0x2029)]
+    # PRE-STATE: each of the others really is a line break to splitlines,
+    # so a count that split the old way would say two here.
+    for mark in others:
         assert len(("a" + mark + "b").splitlines()) == 2
+    marks = breaks + others
     texts = []
-    for i, mark in enumerate(breaks):
+    for i, mark in enumerate(marks):
         first = json.dumps({"id": f"a{i}", "prompt": "p"})
         second = json.dumps({"id": f"b{i}", "prompt": "q"})
-        # The trailing line is blank to strip alone, so it is skipped.
-        texts.append(first + mark + second + mark + chr(0x1F) + "\n")
+        texts.append(first + mark + second + "\n" + chr(0x1F) + "\n")
     counts = run_lib(
         "const l = require(process.argv[1]);"
         "process.stdout.write(JSON.stringify(INPUT.map((t) => l.countLines(t))));",
         texts,
     )
-    for text, count in zip(texts, counts, strict=True):
-        assert count == len([line for line in text.splitlines() if line.strip()])
+    for mark, text, count in zip(marks, texts, counts, strict=True):
         resp = client.post("/datasets", json={"name": "lines", "content": text})
-        assert resp.status_code == 201, resp.text
-        assert resp.json()["task_count"] == count == 2
+        if mark in breaks:
+            assert count == 2, repr(mark)
+            assert resp.status_code == 201, resp.text
+            assert resp.json()["task_count"] == 2
+        else:
+            assert count == 1, repr(mark)
+            assert resp.status_code == 422, repr(mark)
+            assert resp.json()["detail"].startswith("line 1: not valid JSON")
+
+    def parser_count(text):
+        return len([line for line in text.split("\n") if line.strip()])
+
     # Whitespace that is not a line break, a line of U+FEFF (not blank to
-    # strip), CR before CRLF: counted without sending, against Python.
+    # strip), CR before CRLF: counted without sending, against the
+    # parser's reading.
     odd = ["a\tb", "a" + chr(0x1F) + "b", "a" + chr(0x3000) + "b", FEFF]
-    odd += ["a\r\r\nb", "\n\r", "a" + chr(0x1F) + "\n" + chr(0x3000)]
+    odd += ["a\r\r\nb", "\n\r", "a" + chr(0x1F) + "\n" + chr(0x3000), "\r\n\r\n"]
     odd_counts = run_lib(
         "const l = require(process.argv[1]);"
         "process.stdout.write(JSON.stringify(INPUT.map((t) => l.countLines(t))));",
         odd,
     )
-    assert odd_counts == [
-        len([line for line in t.splitlines() if line.strip()]) for t in odd
-    ]
+    assert odd_counts == [parser_count(t) for t in odd]
     assert odd_counts[:4] == [1, 1, 1, 1]
 
 

@@ -1601,6 +1601,12 @@ A dataset is a JSONL file, one task per line:
 {"id": "add-1", "prompt": "What is 17 + 25? Reply with the number only.", "reference": "42", "scorer": {"kind": "normalized_exact"}}
 ```
 
+A line ends at a newline and nowhere else; a trailing carriage return is
+ignored, so a file saved with CRLF reads as the same tasks. Characters
+that some line readers also treat as breaks (U+2028, U+2029, U+0085, a
+lone carriage return) are text here, so a prompt may hold them raw, and
+a file that used one as a record separator is refused on that line.
+
 `id` and `prompt` are required and every other field is optional. `system`
 is sent as that task's system message. `reference` is the expected answer
 for the comparing scorers. `rubric` is the scoring instruction for the
@@ -1923,10 +1929,7 @@ was said about: after a change to that text it leaves the row and, while
 the panel's message line still holds the refusal, the line says the text
 has changed since; undo the change and the mark comes back. Anything the
 panel says afterwards (an import, a file loaded) takes the message line,
-and the mark then stands on its own. Three
-characters that a JSON encoder writes raw and the parser's line splitting
-breaks on (U+2028, U+2029, U+0085) are escaped when a row is composed, so
-a prompt holding one is stored whole.
+and the mark then stands on its own.
 
 Stored datasets are listed newest first (the newest 500) with their task
 count, scorer kinds and digest. Selecting one marks it and shows the
