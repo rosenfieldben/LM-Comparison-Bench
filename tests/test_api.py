@@ -18451,6 +18451,59 @@ def test_the_dataset_doors_are_not_stored_by_any_cache(client):
 # ---- the widened doors: create, start, score
 
 
+@respx.mock
+def test_the_strict_declarations_cross_both_doors_unchanged(client, tmp_path):
+    """WINDOW: the experiment row created by each door over identical
+    bytes whose last task cites an uploaded document, with the
+    declarations the page does not send all set: estimand_mode
+    underlying_model, provider_pins and quantizations; and attachments_mode,
+    beside the frozen reading of the cited document.
+
+    The companion to
+    test_the_digest_door_records_exactly_what_the_path_door_records, which
+    follows a pair from creation to the export but leaves these at their
+    defaults, so a digest door that dropped them would pass it (the
+    review's L1). The browser suite watches params and the page's own
+    declarations on the digest door; these it cannot send. PRE-STATE: the
+    path row holds each value set, not a default, so the equality compares
+    something."""
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": []}}
+    )
+    document = upload(client, "cited.txt", b"the words it says").json()["digest"]
+    tasks = (
+        *THREE_KINDS,
+        {"id": "c1", "prompt": "what does it say?", "attachments": [document]},
+    )
+    path = write_dataset(tmp_path, *tasks, name="on-disk.jsonl")
+    stored = store_dataset(client, "in-the-store", *tasks).json()
+    assert stored["digest"] == hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    declared = {
+        "lineup": ["model/alpha"],
+        "estimand_mode": "underlying_model",
+        "provider_pins": {"model/alpha": "Together"},
+        "quantizations": ["fp8", "bf16"],
+        "attachments_mode": "inline",
+    }
+
+    by_path = client.post("/experiments", json=experiment_body(path, **declared))
+    by_digest = client.post(
+        "/experiments", json=digest_body(stored["digest"], **declared)
+    )
+
+    assert by_path.status_code == by_digest.status_code == 201, (
+        by_path.text,
+        by_digest.text,
+    )
+    row = experiment_record(client, by_path.json()["id"])
+    assert row["estimand_mode"] == "underlying_model"
+    assert row["provider_pins"] == {"model/alpha": "together"}
+    assert row["quantizations"] == ["fp8", "bf16"]
+    assert row["attachments_mode"] == "inline"
+    assert list(row["task_attachments"]) == ["c1"], row["task_attachments"]
+    assert row == experiment_record(client, by_digest.json()["id"])
+
+
 def experiment_record(client, eid):
     """An experiment's detail without the three fields two creations can
     never share: its id, its timestamp, and the name its bytes were read
