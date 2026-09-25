@@ -7717,13 +7717,25 @@ async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
 # request may name is decided in bench/clones.py; what follows is the
 # process, the directory and the record.
 
-# How long one clone may take from its first git to its last, and how
-# much it may put on disk: regular-file bytes and entries under its
-# directory, .git included, because disk is disk. The commission
-# proposed the first two and the operator rules on them at the
-# checkpoint; MAX_CLONE_ENTRIES is this phase's own proposal, put to the
-# same ruling, because a tree of empty files weighs nothing in bytes
-# and still costs an inode each.
+# THE CLONE DOOR'S THREE CEILINGS, named here and nowhere else, as the
+# operator ratified them at the O2 checkpoint.
+#
+# MAX_CLONE_SECONDS bounds one clone from its first git to its last,
+# measured once: the network is the one thing here the bench does not
+# control, and a clone that has not finished in two minutes is killed,
+# git and everything it started, and removed.
+#
+# MAX_CLONE_BYTES and MAX_CLONE_ENTRIES bound what one clone may put on
+# disk under its directory, .git included, because disk is disk, and
+# they are TWO CEILINGS BECAUSE EACH IS BLIND TO WHAT THE OTHER
+# MEASURES. Bytes are the sizes of regular files: they bound the
+# download and the space it takes, and they cannot see an entry that
+# holds nothing. A tree of a million empty files weighs zero bytes, yet
+# it costs an inode each to check out, a stat each to measure, and
+# every later walk of it (the snapshot walk stops at MAX_WALKED_ENTRIES
+# for the same reason). Entries count the files and directories: they
+# bound that cost and cannot see how large each is. Either ceiling
+# alone passes the case the other exists for.
 MAX_CLONE_SECONDS = 120
 MAX_CLONE_BYTES = 200_000_000
 MAX_CLONE_ENTRIES = 100_000
@@ -8096,9 +8108,11 @@ _FETCH_FAILURES = (
     ),
     (
         ("returned error: 30",),
-        "the host answered with a redirect, which a clone does not follow, "
-        "since it could lead to a host nobody listed. A renamed or moved "
-        "repository is cloned from the URL it has now",
+        # The operator's words at the checkpoint. A redirect could lead
+        # to a host nobody listed, so none is followed, and a renamed or
+        # moved repository refuses here.
+        "the host answered with a redirect, and redirects are not "
+        "followed; clone it from its current URL",
     ),
     (
         (
@@ -8289,6 +8303,15 @@ async def _clone(url: str, ref: str, clone_root: str) -> dict[str, Any]:
         raise
     finally:
         await asyncio.to_thread(_remove_tree, home)
+    # THE SWAP. Both renames stay inside BENCH_CLONE_ROOT, so on one
+    # filesystem, where a rename is atomic: the clone's name names the
+    # old tree or the new one, never a half of either, and nothing awaits
+    # between them. A walk already in flight on the old tree would keep
+    # its descriptors and finish on what it opened, which is what
+    # containment by descriptor was for (none can be in flight here: a
+    # walk runs synchronously on this loop, and refuse_while_cloning
+    # turns one away while the slot is held). The old tree is removed
+    # only after the new one has its name.
     replaced = os.path.lexists(final)
     if replaced:
         os.rename(final, old)

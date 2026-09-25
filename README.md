@@ -1978,8 +1978,8 @@ any helper that could. A private repository is therefore refused rather
 than cloned through a helper you forgot was configured, and so is one
 that does not exist on a host that answers both the same way. git also
 runs with `http.followRedirects=false`, so a listed host cannot hand the
-fetch to one nobody listed (a renamed repository is cloned from its new
-URL), `http.emptyAuth=false`, so no Kerberos ticket is offered to a
+fetch to one nobody listed (redirects are not followed, so a renamed
+repository is cloned from its current URL), `http.emptyAuth=false`, so no Kerberos ticket is offered to a
 Negotiate challenge, and `protocol.allow=never` with only `https`
 allowed. **No proxy is used and only the system's certificates are
 trusted**: a proxy is a host `BENCH_CLONE_HOSTS` does not list, so a
@@ -1991,8 +1991,10 @@ trust; it is a test seam, like `OPENROUTER_URL`, not a feature.)
 tags, no submodules, no LFS content (a pointer file is checked out as
 the pointer). The whole clone has `MAX_CLONE_SECONDS` (120), and its
 directory, `.git` included, may hold `MAX_CLONE_BYTES` (200,000,000
-bytes of files) in `MAX_CLONE_ENTRIES` (100,000 entries); all three are
-proposed values the operator rules on. The size is measured while the
+bytes of files) in `MAX_CLONE_ENTRIES` (100,000 entries), as the
+operator ratified them; bytes and entries are two ceilings because each
+is blind to what the other measures (a tree of empty files weighs
+nothing). The size is measured while the
 fetch arrives, counted from the fetched tree before anything is checked
 out, and measured again after; past any ceiling, or past the time, git
 and everything it started are killed, what was fetched is removed, and

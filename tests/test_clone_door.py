@@ -573,15 +573,20 @@ def test_a_redirect_is_refused_and_its_target_never_asked(request, bench, stub):
     """WINDOW: POST /clones of a path the stub redirects to another
     repository it serves.
 
-    Refused naming the redirect, and the target receives no request, so
-    a listed host cannot hand the fetch to one nobody listed. PRE-STATE:
-    the target is a repository the stub would serve."""
+    Refused saying redirects are not followed, and the target receives
+    no request, so a listed host cannot hand the fetch to one nobody
+    listed. PRE-STATE: the target is a repository the stub would
+    serve."""
     target, _ = repo_for(request, stub)
     stub.redirects[f"/{OWNER}/moved.git"] = f"https://{stub.host}/{OWNER}/{target}.git"
     before = sum(1 for s in stub.seen if f"/{target}.git" in s.path)
     resp = bench.post("/clones", json={"url": stub.url(OWNER, "moved"), "ref": "main"})
     assert resp.status_code == 422
-    assert "redirect" in resp.json()["detail"]
+    # The operator's words, ruled at the O2 checkpoint.
+    assert (
+        "redirects are not followed; clone it from its current URL"
+        in (resp.json()["detail"])
+    )
     assert sum(1 for s in stub.seen if f"/{target}.git" in s.path) == before
     assert os.listdir(clone_root(bench)) == []
 

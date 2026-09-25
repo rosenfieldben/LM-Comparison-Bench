@@ -656,9 +656,15 @@ MIGRATIONS = [
     # place the URL is recorded: never in a composed text, a manifest or
     # an export, because a URL is not a fact about the reading. The row
     # is the clone's working tree as it is now, so head_sha, root and
-    # updated_at move when a clone is replaced; what a snapshot read is
-    # recorded on its capture, which never moves. A row is never deleted
+    # updated_at move when a clone is replaced. A row is never deleted
     # (see record_clone).
+    #
+    # WHY THE ROW MAY MOVE, and why an append-only log of fetches was not
+    # needed (the O2 store critique's preference; the operator's ruling
+    # at the checkpoint): a clone row points at a working tree; the
+    # record of a reading is the capture, and the capture already carries
+    # the head sha it was taken at, so nothing about a reading is lost
+    # when the pointer moves.
     #
     # Phase O, O2: WHICH CLONE A CAPTURE WALKED, as the id of its clones
     # row, so an export can be traced to a URL through the clones table

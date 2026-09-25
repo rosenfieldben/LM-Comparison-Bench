@@ -284,3 +284,15 @@ a23b257).
   "Deleting a clone from the page. The operator removes directories;
   backlog entry (disk hygiene) with the reason that a delete door on
   working trees needs the same containment proofs the walk has."
+
+## Proxy support for the clone door
+
+- **What:** cloning through an HTTP(S) proxy, where today the clone
+  door's git runs with no proxy and the system's certificates only, so
+  a bench behind a mandatory proxy cannot clone.
+- **Deferred by:** Phase O, at the O2 checkpoint.
+- **Reason:** honoring proxy variables widens the scrubbed environment
+  that the no-credential proof depends on, so proxy support is a change
+  to that proof, not a setting.
+- **First written:** the operator's ruling at the O2 checkpoint, in
+  those words; recorded in the commit that adds this entry.
