@@ -751,7 +751,9 @@
   }
 
   /* ==== History strip: flat, no panel chrome ==== */
-  #history summary {
+  #history summary,
+  #datasets summary,
+  #experiments summary {
     list-style: none;
     cursor: pointer;
     display: flex;
@@ -764,9 +766,15 @@
     text-transform: uppercase;
     color: var(--text-dim);
   }
-  #history summary::-webkit-details-marker { display: none; }
-  #history summary::before { content: "▸"; color: var(--text-ghost); }
-  #history[open] summary::before { content: "▾"; }
+  #history summary::-webkit-details-marker,
+  #datasets summary::-webkit-details-marker,
+  #experiments summary::-webkit-details-marker { display: none; }
+  #history summary::before,
+  #datasets summary::before,
+  #experiments summary::before { content: "▸"; color: var(--text-ghost); }
+  #history[open] summary::before,
+  #datasets[open] summary::before,
+  #experiments[open] summary::before { content: "▾"; }
   #history-tools { display: flex; align-items: center; gap: 10px; padding: 0 2px 8px; }
   #history-filter {
     flex: 1;
@@ -1099,3 +1107,176 @@
 }
 #report-panel td.report-model { color: var(--text); }
 #report-panel td.report-flags { color: var(--text-faint); }
+
+/* ---- Datasets: the builder and the stored library (Phase N2). The
+   builder sits on the panel surface, and its text is --text-faint,
+   --text-sec, --text and --err there; the document chips and picker
+   options are --text-body, --text-dim and --text on --bg-chip; the
+   library below is the history strip's flat rows on the page, so a
+   stored dataset reads like any other record, under a "Stored" label in
+   --text-dim, because the panel label's --accent-label is checked only
+   on a panel and is below AA on the page in the light theme. Every one
+   of those pairings is in tests/browser/test_contrast.py, and
+   tests/browser/test_n.py measures the builder's own on the live page. A selected entry is
+   marked by the accent bar alone and keeps the page behind its text: a
+   tint under the row's faint time and count took them below AA. */
+#dataset-builder {
+  display: grid;
+  gap: 8px;
+  margin: 0 2px 10px;
+  padding: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+#dataset-head,
+#dataset-row-actions,
+#dataset-store-row,
+#dataset-file-row,
+#dataset-library-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+#dataset-head .panel-label,
+#dataset-library-head .panel-label { margin: 0; }
+#dataset-library-head .panel-label { color: var(--text-dim); }
+#dataset-name { flex: 1; min-width: 160px; max-width: 420px; }
+#dataset-rows { display: grid; gap: 8px; }
+.ds-row {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+/* A row the server refused reads as refused at a glance, and the
+   sentence beside it says why. */
+.ds-row[data-state="refused"] { border-color: var(--err); }
+.ds-row-head { display: flex; gap: 8px; align-items: flex-end; }
+.ds-row-head .ds-cap-id { flex: 1; min-width: 80px; }
+.ds-line { font-size: 10.5px; color: var(--text-faint); white-space: nowrap; padding-bottom: 6px; }
+/* A visible caption per field, because a placeholder is ghost text
+   below the contrast floor and is gone once something is typed. */
+.ds-cap { display: grid; gap: 2px; }
+.ds-cap-text { font-size: 10.5px; color: var(--text-faint); }
+.ds-field { width: 100%; }
+.ds-fields { display: grid; gap: 6px; }
+.ds-fields:empty { display: none; }
+.ds-docs { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ds-picker { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.ds-option { cursor: pointer; font: 11px var(--mono); }
+.ds-option[aria-pressed="true"] { border-color: var(--accent); color: var(--text); }
+/* A cited document: the composer chip's shape, in --text-dim rather than
+   the history chip's --text-faint, which is below AA on --bg-chip in
+   the dark theme. */
+.ds-doc { min-height: 24px; padding: 0 2px 0 8px; font-size: 10.5px; color: var(--text-dim); }
+.ds-doc .chip-x { color: var(--text-dim); }
+.ds-picker-note { font-size: 11px; color: var(--text-faint); flex-basis: 100%; }
+.ds-row-msg { font-size: 11px; color: var(--text-faint); }
+.ds-row-msg:empty { display: none; }
+.ds-row-msg[data-state="refused"] { color: var(--err); }
+#dataset-prompt-picker { display: grid; gap: 4px; font-size: 11px; color: var(--text); }
+.ds-prompt-option { display: flex; gap: 6px; align-items: center; }
+#dataset-jsonl-pane { display: grid; gap: 6px; }
+#dataset-jsonl { width: 100%; font: 11px var(--mono); }
+/* Replaced by its label, as the composer's file input is and for the
+   same reason: the input stays focusable. */
+#dataset-file {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  pointer-events: none;
+}
+#dataset-file-row:has(#dataset-file:focus-visible) .attach-btn {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+#dataset-file-label,
+#dataset-ceilings,
+#dataset-nudge { font-size: 11px; color: var(--text-faint); }
+#dataset-msg { font-size: 11px; color: var(--text-sec); }
+#dataset-msg:empty { display: none; }
+#dataset-msg[data-state="refused"] { color: var(--err); }
+#dataset-library-head { padding: 0 2px 4px; }
+#dataset-selected { font-size: 11px; color: var(--text-sec); }
+#dataset-library { font-size: 11px; color: var(--text-faint); padding-bottom: 8px; }
+.ds-entry[aria-pressed="true"] { box-shadow: inset 2px 0 0 var(--accent); }
+.ds-library-note { padding: 6px 2px 0; color: var(--text-faint); }
+
+/* ---- Experiments: the form, the selected experiment and the list
+   (Phase N3). The form and the selected experiment sit on the panel
+   surface, as the dataset builder does, and their text is --text-faint,
+   --text-sec, --text and --err there; the list below is the history
+   strip's flat rows on the page, its "Recorded" label in --text-dim for
+   the reason the datasets library gives. A selected row is marked by
+   the accent bar alone. Every pairing is in tests/browser/test_contrast.py,
+   and tests/browser/test_n3.py measures the panel's own text on the live
+   page. The Score row (Phase N4) uses the same four colours. */
+#experiment-create,
+#experiment-selected {
+  display: grid;
+  gap: 8px;
+  margin: 0 2px 10px;
+  padding: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+#experiment-head,
+#experiment-create-row,
+#experiment-start-row,
+#experiment-score-row,
+#experiment-list-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+#experiment-head .panel-label,
+#experiment-list-head .panel-label { margin: 0; }
+#experiment-list-head .panel-label { color: var(--text-dim); }
+/* The captioned judge select sits beside Score, so the row lines up on
+   the controls' baseline rather than their middle; its notes take a line
+   of their own below. */
+#experiment-score-row { align-items: flex-end; }
+#experiment-score-notes { display: grid; gap: 2px; flex-basis: 100%; }
+#experiment-name { flex: 1; min-width: 160px; max-width: 420px; }
+#experiment-sources { display: grid; gap: 2px; font-size: 11px; color: var(--text-sec); }
+#experiment-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.xp-cap { display: grid; gap: 2px; }
+.xp-cap-text { font-size: 10.5px; color: var(--text-faint); }
+.xp-cap input[type="number"] { width: 150px; }
+.xp-check { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--text-sec); }
+#experiment-notes { display: grid; gap: 2px; }
+#experiment-estimand-note,
+#experiment-attachments-note,
+#experiment-create-nudge,
+#experiment-projection,
+#experiment-start-note,
+#experiment-counters,
+#experiment-dataset,
+#experiment-stream,
+#experiment-score-nudge,
+#experiment-judge-note,
+#experiment-score-note { font-size: 11px; color: var(--text-faint); }
+#experiment-estimand-note:empty,
+#experiment-attachments-note:empty,
+#experiment-start-note:empty,
+#experiment-judge-note:empty,
+#experiment-score-note:empty { display: none; }
+#experiment-title { font-size: 12px; color: var(--text); }
+#experiment-status { font-size: 11px; color: var(--text-sec); }
+#experiment-create-msg,
+#experiment-action-msg { font-size: 11px; color: var(--text-sec); }
+#experiment-create-msg:empty,
+#experiment-action-msg:empty,
+#experiment-stream:empty { display: none; }
+#experiment-create-msg[data-state="refused"],
+#experiment-action-msg[data-state="refused"] { color: var(--err); }
+#experiment-list-head { padding: 0 2px 4px; }
+#experiment-list-note { font-size: 11px; color: var(--text-faint); }
+#experiment-list { font-size: 11px; color: var(--text-faint); padding-bottom: 8px; }
+.xp-entry[aria-pressed="true"] { box-shadow: inset 2px 0 0 var(--accent); }

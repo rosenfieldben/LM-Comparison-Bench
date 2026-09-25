@@ -37,6 +37,7 @@ from typing import Any
 # only consumer. Importing it rather than re-deriving "the last row" is
 # the whole point of J4: a correct helper with no call sites is a rule
 # nothing obeys.
+from bench.datasets import JUDGE_SCORER
 from bench.models import as_flag
 from bench.scoring import latest_per_key
 
@@ -580,15 +581,31 @@ def build_report(
     tasks_by_id: dict[str, dict[str, Any]] | None,
     seed: int,
     captures: dict[str, dict[str, Any]] | None = None,
+    thresholds_source: str | None = None,
+    dataset_unreadable: str | None = None,
 ) -> dict[str, Any]:
     """One experiment's aggregates, per model.
 
-    tasks_by_id carries the dataset file's tasks, and None means no file
-    was supplied. None is not the same as an empty mapping: an empty one
-    means a file WAS read and declared no thresholds, which is an answer,
-    while None means nobody asked the file anything and the pass rate's
-    population has to be recovered from the score rows instead. The
-    report says which of the two it did, in thresholds_source.
+    tasks_by_id carries the dataset's tasks, and None means no dataset
+    was read. None is not the same as an empty mapping: an empty one
+    means a dataset WAS read and declared no thresholds, which is an
+    answer, while None means nobody asked a dataset anything and the pass
+    rate's population has to be recovered from the score rows instead.
+    The report says which of the two it did, in thresholds_source.
+
+    thresholds_source names WHERE a read dataset came from when the
+    caller knows: "dataset_file" for a path, "dataset_store" for the
+    bench's own store. Left out, it is derived as it always was, and that
+    is what a rebuild from an export gets: an export carries the
+    thresholds and not where they were read from, so a rebuilt report
+    says "dataset_file" for either door. There it means only that a
+    dataset was read, which is all the artifact can say.
+
+    dataset_unreadable is the reason the store's copy of the recorded
+    dataset was NOT read when the caller named nothing and the bench
+    holds one that this build cannot use, or None. Published so the
+    floor that follows is never silent about the exact denominator it
+    could not reach.
 
     Pure: every row it needs is handed in, so the whole report can be
     rebuilt from an export without a database. That is not a stylistic
@@ -754,11 +771,27 @@ def build_report(
             "cells_recorded": len(groups),
         },
         # Where the pass rate's population came from. Said out loud
-        # because the two are not equally good: score_rows is a floor,
+        # because the sources are not equally good: score_rows is a floor,
         # since a declared task nobody scored leaves no row to witness
         # its threshold, and a reader comparing two reports has to know
         # which one had the file.
-        "thresholds_source": "score_rows" if tasks_by_id is None else "dataset_file",
+        #
+        # A THIRD VALUE SINCE PHASE N. dataset_store is the recorded
+        # dataset read from the bench's own store, which is as exact as
+        # the file and is named apart from it so a reader can see which
+        # door the denominator came through. score_rows is still and only
+        # the case where no dataset was read at all.
+        "thresholds_source": (
+            "score_rows" if tasks_by_id is None else thresholds_source or "dataset_file"
+        ),
+        # WHY THE STORE WAS NOT READ, when it held the recorded dataset and
+        # this build could not use it: a stricter parser than the one
+        # that stored it, or bytes edited by hand. None in every other
+        # report, including every one whose source is score_rows because
+        # nothing was held. Present rather than omitted, for
+        # thresholds_included's reason: a reader must be able to tell "no
+        # reason" from "this report predates the field".
+        "dataset_unreadable": dataset_unreadable,
         # The documents these numbers were produced over, as provenance
         # and not as content. Every model in a cell read the same
         # documents, so this is a property of the experiment rather than
@@ -968,6 +1001,13 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     # alone let the caller take whichever series came first, which sorts
     # judgeless before judged, so the ranking named `judge` and ordered
     # every model on the gap row's empty mean.
+    #
+    # The ordering is on each arm's mean (min_ranks in build_report),
+    # whatever else the series publishes: a judge series with a pass
+    # threshold has a pass rate beside its mean, and the ranking does not
+    # use it. The reason says which figure it used; whether primary_metric
+    # should be able to name the pass rate is in BACKLOG.md.
+    reason += ", ordered on the mean"
     return _ranking(metric, judges[0] if judges else None, reason, available, models)
 
 
@@ -1279,14 +1319,15 @@ def rows_declaring_thresholds(
 ) -> dict[str, set[str]]:
     """scorer -> task ids whose score rows witness a declared threshold.
 
-    The fallback that keeps pass rates alive when the dataset file is
-    gone. Thresholds live in the file and nowhere else, so a report built
-    without it used to publish no pass rate at all, even with every
-    verdict sitting in the database. The verdicts are the evidence: I3
-    writes `passed` from judged_pass, which returns None unless the
-    task's author declared a cutoff, so a judge row with a non-None
-    `passed` IS a record that a threshold existed when that row was
-    written.
+    The fallback that keeps pass rates alive when no dataset can be
+    read. Thresholds live in the dataset, as a file on disk or as bytes
+    the bench stored through POST /datasets, and not in the experiment's
+    rows, so a report built without either used to publish no pass rate
+    at all, even with every verdict sitting in the database. The
+    verdicts are the evidence: I3 writes `passed` from judged_pass, which
+    returns None unless the task's author declared a cutoff, so a judge
+    row with a non-None `passed` IS a record that a threshold existed
+    when that row was written.
 
     A JUDGE row, specifically, which is why judge_model gates the
     witness. A deterministic scorer's `passed` is its own score restated
@@ -1304,9 +1345,9 @@ def rows_declaring_thresholds(
     neighbour for the same task.
 
     THE HONEST LIMIT: a task nobody ever scored leaves no row to witness
-    its declaration, so what this returns is a FLOOR. The dataset file
-    remains the only way to get the full denominator, and the report
-    labels which of the two it used.
+    its declaration, so what this returns is a FLOOR. Reading the dataset,
+    from its file or from the store, remains the only way to get the full
+    denominator, and the report labels which it used.
     """
     declared: dict[str, set[str]] = {}
     for by_task in trials_by_arm.values():
@@ -1621,12 +1662,25 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _judge_cost(scores_by_result: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
-    """What the judging itself cost, over every score row that was billed.
+    """What the judging itself cost, over every score row that was billed,
+    and how many judge rows that figure cannot speak for.
 
     Every row, not the latest per key: a re-scoring pass paid for its
     call whether or not its verdict is the one the report now uses, and
     superseded spend is still spend. That is the same rule the trial
     totals follow, one level up.
+
+    A TOTAL IS ONLY AS COMPLETE AS ITS ROWS. A judge row with no billing
+    figure is not a free call. unpriced_calls counts the rows that hold a
+    generation id and no figure: the call went out and its reply carried
+    no price. rows_without_figure counts every judge row with no figure,
+    whatever the reason (a reply with no price, a call that timed out
+    after it was sent, one refused before it was), so the unpriced calls
+    are among them. It is the count that is true from what the row
+    stores, and it keeps the spend line from reading as the whole cost of
+    judging when it may not be. Telling a call that timed out after it
+    was sent from one never sent needs a fact the score row does not
+    record; BACKLOG.md has why that waits.
     """
     charges = [
         row["judge_billed_cost_usd"]
@@ -1634,7 +1688,20 @@ def _judge_cost(scores_by_result: dict[int, list[dict[str, Any]]]) -> dict[str, 
         for row in rows
         if row.get("judge_billed_cost_usd") is not None
     ]
-    return {"total_usd": sum(charges), "billed_calls": len(charges)}
+    bare = [
+        row
+        for rows in scores_by_result.values()
+        for row in rows
+        if row["scorer"] == JUDGE_SCORER and row.get("judge_billed_cost_usd") is None
+    ]
+    return {
+        "total_usd": sum(charges),
+        "billed_calls": len(charges),
+        "unpriced_calls": sum(
+            1 for row in bare if row.get("judge_generation_id") is not None
+        ),
+        "rows_without_figure": len(bare),
+    }
 
 
 def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
@@ -1905,12 +1972,14 @@ def export_manifest(
     of how it was produced.
 
     thresholds is the dataset's declared cutoffs, present when the
-    exporter was given the file. It is the difference between an artifact
+    export read a dataset: a file it was given, or the bytes the bench
+    stored under the recorded digest. It is the difference between an artifact
     that can re-derive the pass rate exactly and one that can only floor
     its denominator, so the manifest states which it is rather than
     leaving the reader to infer it from an empty mapping. None and {} are
     different facts here, exactly as they are in build_report: the first
-    means nobody supplied the file, the second means the file declared
+    means the export read no dataset (none named and none stored, or the
+    stored copy unreadable), the second means the dataset declared
     nothing.
 
     export_schema_change states, in the artifact, what the version
@@ -1940,8 +2009,9 @@ def export_manifest(
         "thresholds": {} if thresholds is None else thresholds,
         # The artifact labels its own sufficiency. Without this a reader
         # holding an export with no thresholds cannot tell a dataset that
-        # declared none from an export nobody handed the file to, and
-        # those licence different claims about the pass rate inside.
+        # declared none from an export that read no dataset (none named
+        # and none stored, or the stored copy unreadable), and those
+        # licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
         # Whether ANYTHING in this artifact cites a document, which
         # since version 5 means the trial lines or the manifest's own

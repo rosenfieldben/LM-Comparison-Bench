@@ -19,7 +19,7 @@
   </div>
   <div id="stats">
     <div class="stat" id="stat-runs"><span class="k">runs</span><span class="v">00</span></div>
-    <div class="stat" id="stat-spend"><span class="k">session spend</span><span class="v" data-testid="stat-spend" title="nothing priced yet this session">~$0.0000</span></div>
+    <div class="stat" id="stat-spend"><span class="k">composer spend</span><span class="v" data-testid="stat-spend" title="no composer run priced yet this session. The composer&#39;s runs only: an experiment&#39;s cost is in its report">~$0.0000</span></div>
     <div class="stat" id="stat-ttft"><span class="k">avg ttft</span><span class="v">—</span></div>
     <div class="stat" id="stat-lineup"><span class="k">lineup</span><span class="v">—</span></div>
     <!-- Shown only when BENCH_DATA_POLICY is not standard, so a session
@@ -239,8 +239,206 @@
   <div id="diff-body" data-testid="diff-body"></div>
 </div>
 
+<!-- Datasets: compose one, store it, and select a stored one by its
+     digest. The browser composes and the server validates: nothing in
+     this panel decides whether a dataset is valid, and a refusal is the
+     server's own sentence, printed beside the row whose line it names.
+     Collapsed until opened, like the history and the experiments. -->
+<details id="datasets">
+  <summary data-testid="datasets-toggle">Datasets</summary>
+  <div id="dataset-builder" data-testid="dataset-builder">
+    <div id="dataset-head">
+      <label class="panel-label" for="dataset-name">Name</label>
+      <input id="dataset-name" data-testid="dataset-name" type="text"
+             autocomplete="off" placeholder="Name this dataset">
+      <div class="seg" id="dataset-mode" role="group" aria-label="How the tasks are composed">
+        <button type="button" data-value="rows" data-testid="dataset-mode-rows" aria-pressed="true">rows</button>
+        <button type="button" data-value="jsonl" data-testid="dataset-mode-jsonl" aria-pressed="false">JSONL</button>
+      </div>
+    </div>
+    <div id="dataset-rows-pane" data-testid="dataset-rows-pane">
+      <div id="dataset-rows" data-testid="dataset-rows"></div>
+      <div id="dataset-row-actions">
+        <button id="dataset-add-row" data-testid="dataset-add-row" type="button">+ Task</button>
+        <button id="dataset-from-prompts" data-testid="dataset-from-prompts" type="button"
+                aria-expanded="false" aria-controls="dataset-prompt-picker">+ From saved prompts</button>
+      </div>
+      <div id="dataset-prompt-picker" data-testid="dataset-prompt-picker" hidden></div>
+    </div>
+    <!-- Pasted or uploaded text is sent exactly as it is: the page counts
+         its lines for the label and parses nothing. An uploaded file is
+         held as the text its bytes decoded to rather than put in the
+         textarea, because a textarea normalizes CRLF to LF and the stored
+         digest would then not be the file's; the textarea is hidden while
+         a file is loaded, so the page never shows one dataset and stores
+         another. autocomplete="off" on this box and the name, or Back
+         would refill a draft nobody chose to keep. -->
+    <div id="dataset-jsonl-pane" data-testid="dataset-jsonl-pane" hidden>
+      <textarea id="dataset-jsonl" data-testid="dataset-jsonl" rows="6"
+                autocomplete="off" aria-label="Dataset as JSONL, one task per line"
+                placeholder="One task per line, as JSON: {&quot;id&quot;: &quot;t1&quot;, &quot;prompt&quot;: &quot;...&quot;}"></textarea>
+      <div id="dataset-file-row">
+        <label class="attach-btn" for="dataset-file">+ Upload JSONL</label>
+        <input id="dataset-file" data-testid="dataset-file" type="file"
+               accept=".jsonl,.json,.txt">
+        <span id="dataset-file-label" data-testid="dataset-file-label"></span>
+        <button id="dataset-file-clear" data-testid="dataset-file-clear" type="button" hidden>clear</button>
+      </div>
+    </div>
+    <div id="dataset-ceilings" data-testid="dataset-ceilings"></div>
+    <div id="dataset-store-row">
+      <button id="dataset-store" data-testid="dataset-store" type="button" disabled>Store</button>
+      <span id="dataset-nudge" data-testid="dataset-nudge" role="status"></span>
+    </div>
+    <div id="dataset-msg" data-testid="dataset-msg" role="status"></div>
+  </div>
+  <div id="dataset-library-head">
+    <span class="panel-label">Stored</span>
+    <span id="dataset-selected" data-testid="dataset-selected" role="status"></span>
+  </div>
+  <div id="dataset-library" data-testid="dataset-library" data-state="idle"></div>
+</details>
+
+<!-- Experiments: create one over a stored dataset, start it, watch it,
+     stop it, score it, and open its report. Money moves on Start, and on
+     Score when a judge grades; Create is free and says so, and Score says
+     which it is. The lineup, budget and controls are the composer's own,
+     read when Create is pressed, so there is one of each on the page. -->
 <details id="experiments">
   <summary data-testid="experiments-toggle">Experiments</summary>
+  <div id="experiment-create" data-testid="experiment-create">
+    <div id="experiment-head">
+      <label class="panel-label" for="experiment-name">Name</label>
+      <input id="experiment-name" data-testid="experiment-name" type="text"
+             autocomplete="off" placeholder="Name this experiment">
+    </div>
+    <div id="experiment-sources" data-testid="experiment-sources">
+      <span id="experiment-source-dataset" data-testid="experiment-source-dataset"></span>
+      <span id="experiment-source-lineup" data-testid="experiment-source-lineup"></span>
+      <span id="experiment-source-budget" data-testid="experiment-source-budget"></span>
+      <span id="experiment-source-controls" data-testid="experiment-source-controls"></span>
+    </div>
+    <!-- The min and max below mirror ExperimentCreate in bench/main.py
+         (repeats 1 to MAX_REPEATS, the task order seed 0 to MAX_SEED),
+         which is what enforces them. They exist so the browser can say a
+         value is out of range before a 422; tests/test_api.py holds the
+         two equal, because a markup bound tighter than the model's would
+         refuse a legal value. -->
+    <div id="experiment-fields">
+      <label class="xp-cap">
+        <span class="xp-cap-text">repeats · blank runs each task once</span>
+        <input id="experiment-repeats" data-testid="experiment-repeats"
+               type="number" min="1" max="20" step="1" autocomplete="off">
+      </label>
+      <label class="xp-cap">
+        <span class="xp-cap-text">task order seed · blank keeps file order</span>
+        <input id="experiment-seed" data-testid="experiment-seed"
+               type="number" min="0" max="9007199254740991" step="1" autocomplete="off">
+      </label>
+      <!-- Each select is named by its caption through aria-labelledby, and
+           not by a wrapping label: the wrapper would hold the sel-wrap,
+           whose drawn arrow would then be read as part of the name. The
+           notes below describe the two whose choice needs a sentence.
+           autocomplete="off" on every control here, or Back refills a
+           choice nobody made on this page. -->
+      <div class="xp-cap">
+        <span class="xp-cap-text" id="experiment-estimand-caption">estimand</span>
+        <span class="sel-wrap">
+          <select id="experiment-estimand" data-testid="experiment-estimand"
+                  autocomplete="off" aria-labelledby="experiment-estimand-caption"
+                  aria-describedby="experiment-estimand-note">
+            <option value="routed_service">routed service</option>
+            <option value="underlying_model">underlying model</option>
+          </select>
+        </span>
+      </div>
+      <div class="xp-cap">
+        <span class="xp-cap-text" id="experiment-attachments-caption">attachments</span>
+        <span class="sel-wrap">
+          <select id="experiment-attachments" data-testid="experiment-attachments"
+                  autocomplete="off" aria-labelledby="experiment-attachments-caption"
+                  aria-describedby="experiment-attachments-note">
+            <option value="inline">inline</option>
+            <option value="native">native</option>
+          </select>
+        </span>
+      </div>
+      <div class="xp-cap">
+        <span class="xp-cap-text" id="experiment-metric-caption">primary metric</span>
+        <span class="sel-wrap">
+          <select id="experiment-metric" data-testid="experiment-metric"
+                  autocomplete="off" aria-labelledby="experiment-metric-caption">
+            <option value="">none declared</option>
+          </select>
+        </span>
+      </div>
+      <label class="xp-check">
+        <input id="experiment-halt" data-testid="experiment-halt" type="checkbox"
+               autocomplete="off" checked>
+        <span>halt on refusal</span>
+      </label>
+    </div>
+    <div id="experiment-notes">
+      <span id="experiment-estimand-note" data-testid="experiment-estimand-note"></span>
+      <span id="experiment-attachments-note" data-testid="experiment-attachments-note"></span>
+    </div>
+    <div id="experiment-create-row">
+      <button id="experiment-create-button" data-testid="experiment-create-button"
+              type="button" disabled>Create · free</button>
+      <span id="experiment-create-nudge" data-testid="experiment-create-nudge" role="status"></span>
+    </div>
+    <div id="experiment-create-msg" data-testid="experiment-create-msg" role="status"></div>
+  </div>
+  <div id="experiment-selected" data-testid="experiment-selected" hidden>
+    <div id="experiment-title" data-testid="experiment-title"></div>
+    <div id="experiment-status" data-testid="experiment-status" role="status"></div>
+    <div id="experiment-counters" data-testid="experiment-counters"></div>
+    <div id="experiment-stream" data-testid="experiment-stream" role="status"></div>
+    <div id="experiment-dataset" data-testid="experiment-dataset"></div>
+    <div id="experiment-start-row">
+      <button id="experiment-start" data-testid="experiment-start" type="button"
+              aria-describedby="experiment-projection experiment-start-note" disabled>Start</button>
+      <span id="experiment-projection" data-testid="experiment-projection"></span>
+      <span id="experiment-start-note" data-testid="experiment-start-note"></span>
+      <button id="experiment-stop" data-testid="experiment-stop" type="button" hidden>Stop</button>
+    </div>
+    <!-- Scoring, for a finished experiment only: absent while it is
+         created or running, when the door would refuse it. The judge
+         select is the whole catalog, filtered by nothing, and is shown
+         only when the experiment's recorded dataset has judge tasks. -->
+    <div id="experiment-score-row" data-testid="experiment-score-row" hidden>
+      <div class="xp-cap" id="experiment-judge-field">
+        <span class="xp-cap-text" id="experiment-judge-caption">judge</span>
+        <span class="sel-wrap">
+          <select id="experiment-judge" data-testid="experiment-judge"
+                  autocomplete="off" aria-labelledby="experiment-judge-caption"
+                  aria-describedby="experiment-judge-note">
+            <option value="">choose a judge</option>
+          </select>
+        </span>
+      </div>
+      <button id="experiment-score" data-testid="experiment-score" type="button"
+              aria-describedby="experiment-score-nudge experiment-score-note" disabled>Score</button>
+      <span id="experiment-score-nudge" data-testid="experiment-score-nudge" role="status"></span>
+      <!-- Present only when reading the experiment's dataset failed: it
+           asks the store again now. Selecting an experiment with that
+           digest asks again too, as does any reload of the list (the
+           panel reopened, a Create, a Start or a Stop), since a failed
+           question is forgotten; Retry is the way to ask without
+           waiting for one of those. -->
+      <button id="experiment-score-retry" data-testid="experiment-score-retry" type="button"
+              aria-describedby="experiment-score-nudge" hidden>Retry</button>
+      <div id="experiment-score-notes">
+        <span id="experiment-judge-note" data-testid="experiment-judge-note"></span>
+        <span id="experiment-score-note" data-testid="experiment-score-note"></span>
+      </div>
+    </div>
+    <div id="experiment-action-msg" data-testid="experiment-action-msg" role="status"></div>
+  </div>
+  <div id="experiment-list-head">
+    <span class="panel-label">Recorded</span>
+    <span id="experiment-list-note" data-testid="experiment-list-note"></span>
+  </div>
   <div id="experiment-list" data-testid="experiment-list" data-state="idle"></div>
 </details>
 
@@ -270,6 +468,8 @@
 <script src="/static/stream.js"></script>
 <script src="/static/rating.js"></script>
 <script src="/static/experiments.js"></script>
+<script src="/static/datasets.js"></script>
+<script src="/static/lifecycle.js"></script>
 <script src="/static/history.js"></script>
 <script src="/static/boot.js"></script>
 </body>

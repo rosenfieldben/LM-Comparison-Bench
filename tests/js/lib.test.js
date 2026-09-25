@@ -26,6 +26,25 @@ const {
   routeCapFor,
   REASONING_SHARE_EXHAUSTED,
   DIFF_TOKEN_LIMIT,
+  codePoints,
+  composeTask,
+  composeJsonl,
+  rowNudge,
+  datasetNudge,
+  refusalLine,
+  countLines,
+  refusalText,
+  hasControls,
+  experimentFinished,
+  experimentBody,
+  experimentNudge,
+  projectionText,
+  experimentRowMeta,
+  datasetHeld,
+  judgeTasks,
+  scoreBody,
+  scoreNudge,
+  scoreLabel,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -588,4 +607,590 @@ test("remedyFor reads the cap the run was sent, never a tier name", () => {
   // cannot say what extended would send gets no budget clause.
   assert.ok(!remedyFor(sameCap, {}).includes("extended budget"));
   assert.ok(!remedyFor({}, { extendedCap: 65536 }).includes("extended budget"));
+});
+
+// ---- Phase N2: composing a dataset. The browser composes and the
+// ---- server validates; these pin the composing half. The unit suite
+// ---- executes the same functions against the real door.
+
+function row(fields) {
+  return Object.assign(
+    {
+      id: "",
+      prompt: "",
+      system: "",
+      scorer: "",
+      reference: "",
+      pattern: "",
+      rubric: "",
+      threshold: "",
+      documents: [],
+    },
+    fields,
+  );
+}
+
+test("composeTask writes a key only when it was set", () => {
+  assert.deepEqual(composeTask(row({})), {});
+  assert.deepEqual(composeTask(row({ id: "t", prompt: "p", system: "  " })), {
+    id: "t",
+    prompt: "p",
+  });
+  // "  " is a legal id and prompt to the parser, so it is sent as typed.
+  assert.deepEqual(composeTask(row({ id: " ", prompt: " " })), {
+    id: " ",
+    prompt: " ",
+  });
+});
+
+test("composeTask sends only the chosen scorer's fields", () => {
+  const typed = row({
+    id: "t",
+    prompt: "p",
+    reference: "r",
+    pattern: "x",
+    rubric: "g",
+    threshold: "0.5",
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "exact" })), {
+    id: "t",
+    prompt: "p",
+    reference: "r",
+    scorer: { kind: "exact" },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "regex" })), {
+    id: "t",
+    prompt: "p",
+    scorer: { kind: "regex", pattern: "x" },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "judge" })), {
+    id: "t",
+    prompt: "p",
+    rubric: "g",
+    scorer: { kind: "judge", pass_threshold: 0.5 },
+  });
+  assert.deepEqual(composeTask(Object.assign({}, typed, { scorer: "" })), {
+    id: "t",
+    prompt: "p",
+  });
+});
+
+test("a threshold that is not a number is sent as typed, for the server to refuse", () => {
+  const task = composeTask(
+    row({
+      id: "t",
+      prompt: "p",
+      scorer: "judge",
+      rubric: "g",
+      threshold: "0,5",
+    }),
+  );
+  assert.equal(task.scorer.pass_threshold, "0,5");
+  assert.equal(
+    composeTask(
+      row({
+        id: "t",
+        prompt: "p",
+        scorer: "judge",
+        rubric: "g",
+        threshold: "0",
+      }),
+    ).scorer.pass_threshold,
+    0,
+  );
+});
+
+test("composeJsonl writes one line per row, U+2028 and its kin as typed", () => {
+  const kin =
+    String.fromCharCode(0x2028) +
+    String.fromCharCode(0x2029) +
+    String.fromCharCode(0x85);
+  const text = composeJsonl([
+    row({ id: "a", prompt: "x" + kin + "y" }),
+    row({ id: "b", prompt: "two", documents: ["d".repeat(64)] }),
+  ]);
+  assert.equal(text.split("\n").length, 3);
+  assert.ok(text.endsWith("\n"));
+  // Written raw: the parser ends a line at "\n" alone, so nothing needs
+  // escaping, and a workaround left in place would outlive its defect.
+  assert.ok(text.includes(kin));
+  const lines = text
+    .trimEnd()
+    .split("\n")
+    .map((line) => JSON.parse(line));
+  assert.equal(lines[0].prompt, "x" + kin + "y");
+  assert.deepEqual(lines[1].attachments, ["d".repeat(64)]);
+  assert.equal(composeJsonl([]), "");
+});
+
+test("rowNudge names what the server would refuse, first reason first", () => {
+  assert.equal(rowNudge(row({})), "needs an id");
+  assert.equal(rowNudge(row({ id: "t" })), "needs a prompt");
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "contains", reference: " " })),
+    "needs a reference for contains",
+  );
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "regex" })),
+    "needs a pattern",
+  );
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "judge", rubric: "  " })),
+    "needs a rubric for the judge",
+  );
+  // A pattern of one space is a pattern; the parser takes it.
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "p", scorer: "regex", pattern: " " })),
+    null,
+  );
+  // Counted in code points, so an emoji is one, as it is to the server.
+  assert.equal(
+    rowNudge(row({ id: "t", prompt: "\u{1F600}".repeat(100000) })),
+    null,
+  );
+  assert.match(
+    rowNudge(row({ id: "t", prompt: "p".repeat(100001) })),
+    /over the 100000 limit/,
+  );
+});
+
+test("datasetNudge greys Store for a name or a size the door refuses", () => {
+  const task = '{"id": "t", "prompt": "p"}\n';
+  assert.equal(datasetNudge("", task), "name the dataset");
+  assert.equal(datasetNudge("  ", task), "name the dataset");
+  assert.match(datasetNudge("n".repeat(256), task), /over the 255 limit/);
+  assert.equal(datasetNudge("n", " \n "), "there are no tasks to store");
+  assert.match(datasetNudge("n", "x".repeat(1912832)), /goes by path/);
+  assert.equal(datasetNudge("n", task), null);
+  assert.equal(codePoints("\u{1F600}"), 1);
+});
+
+test("refusalLine reads the line a server sentence names, and nothing else", () => {
+  assert.equal(refusalLine("line 12: duplicate task id 'a'"), 12);
+  assert.equal(refusalLine("nothing has no tasks"), null);
+  assert.equal(refusalLine(["line 1: no"]), null);
+  assert.equal(refusalLine(null), null);
+  // The number must be the whole prefix, as the server writes it.
+  assert.equal(refusalLine("line 2 of the file is odd"), null);
+});
+
+test("countLines counts lines holding anything, LF and CRLF alike", () => {
+  // "c\rd" is one line: a lone CR is not a line end to the parser.
+  assert.equal(countLines("a\r\n\r\nb\nc\rd"), 3);
+  assert.equal(countLines(""), 0);
+});
+
+test("refusalText reads both refusal shapes and falls back when it cannot", () => {
+  assert.equal(refusalText("plain", "fallback"), "plain");
+  assert.equal(
+    refusalText([{ msg: "one" }, { msg: "two" }, {}], "fallback"),
+    "one; two",
+  );
+  assert.equal(refusalText({ odd: true }, "fallback"), "fallback");
+  // A list with no message in it says nothing, so the fallback speaks.
+  assert.equal(refusalText([{}, { msg: "" }], "fallback"), "fallback");
+});
+
+test("a pass threshold is a number only when it is a plain decimal numeral", () => {
+  const judge = (threshold) =>
+    composeTask(
+      row({ id: "t", prompt: "p", scorer: "judge", rubric: "g", threshold }),
+    ).scorer.pass_threshold;
+  const feff = String.fromCharCode(0xfeff);
+  assert.strictEqual(judge("0.5"), 0.5);
+  assert.strictEqual(judge(".5"), 0.5);
+  assert.strictEqual(judge(" 0.5 "), 0.5);
+  assert.strictEqual(judge("5e-1"), 0.5);
+  // Strict, because 0.5 == "0.5": a loose assert cannot tell the number
+  // the page should send from the text it should not.
+  assert.strictEqual(judge("+0.5"), 0.5);
+  assert.strictEqual(judge("1."), 1);
+  assert.strictEqual(judge("1E0"), 1);
+  // Several digits in each part.
+  assert.strictEqual(judge("0.25"), 0.25);
+  assert.strictEqual(judge(".25"), 0.25);
+  assert.strictEqual(judge("0.125"), 0.125);
+  assert.strictEqual(judge("10e-1"), 1);
+  assert.strictEqual(judge("1e-10"), 1e-10);
+  // Number() reads each of these as a number nobody typed; JSON.stringify
+  // would write the last two as null.
+  assert.strictEqual(judge(feff), feff);
+  assert.strictEqual(judge("0x1"), "0x1");
+  assert.strictEqual(judge("0b1"), "0b1");
+  assert.strictEqual(judge("Infinity"), "Infinity");
+  assert.strictEqual(judge("1e999"), "1e999");
+});
+
+test("a threshold that is a long run of digits is read in linear time", () => {
+  // The grammar has one way to read each numeral. With two (\d+\.?\d*),
+  // a run of n digits that fails to match backtracks n squared times,
+  // and composeTask runs on every keystroke: 50000 digits took seconds.
+  const threshold = "1".repeat(50000) + "x";
+  const started = process.hrtime.bigint();
+  const task = composeTask(
+    row({ id: "t", prompt: "p", scorer: "judge", rubric: "g", threshold }),
+  );
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.strictEqual(task.scorer.pass_threshold, threshold);
+  assert.ok(ms < 500, "took " + ms + " ms");
+});
+
+test("datasetNudge calls a text empty only when Python would", () => {
+  const task = '{"id": "t", "prompt": "p"}\n';
+  // A line of U+FEFF is not blank to the parser: the server reads it as
+  // a line (and refuses it as JSON), so it is not "no tasks".
+  assert.strictEqual(datasetNudge("n", String.fromCharCode(0xfeff)), null);
+  assert.strictEqual(
+    datasetNudge("n", String.fromCharCode(0x85) + "\n"),
+    "there are no tasks to store",
+  );
+  assert.strictEqual(datasetNudge("n", task), null);
+});
+
+test("composeTask's blank is Python's: U+FEFF is kept and U+0085 is not", () => {
+  const feff = String.fromCharCode(0xfeff);
+  const nel = String.fromCharCode(0x85);
+  const typed = (value) =>
+    row({
+      id: "t",
+      prompt: "p",
+      system: value,
+      scorer: "judge",
+      rubric: value,
+    });
+  assert.deepEqual(composeTask(typed(feff)), {
+    id: "t",
+    prompt: "p",
+    system: feff,
+    rubric: feff,
+    scorer: { kind: "judge" },
+  });
+  assert.deepEqual(composeTask(typed(nel)), {
+    id: "t",
+    prompt: "p",
+    scorer: { kind: "judge" },
+  });
+});
+
+test("countLines ends a line at a newline and at nothing else", () => {
+  // Each of these is a line break to str.splitlines, and none is to the
+  // parser, which reads lines at "\n" alone.
+  for (const code of [
+    0x0d, 0x0b, 0x0c, 0x1c, 0x1d, 0x1e, 0x85, 0x2028, 0x2029,
+  ]) {
+    const mark = String.fromCharCode(code);
+    assert.equal(countLines("a" + mark + "b"), 1, code.toString(16));
+  }
+  assert.equal(countLines("a\nb"), 2);
+});
+
+// ---- Phase N3: the experiment form. The unit suite executes the same
+// ---- functions against the real door; these pin the composing half.
+
+function form(fields) {
+  return Object.assign(
+    {
+      name: "n",
+      digest: "d".repeat(64),
+      lineup: ["a/b"],
+      budget: "standard",
+      params: {},
+      repeats: "",
+      seed: "",
+      estimand: "routed_service",
+      attachments: null,
+      metric: "",
+      halt: true,
+      invalid: [],
+    },
+    fields,
+  );
+}
+
+test("hasControls is false for no controls and an empty set", () => {
+  assert.strictEqual(hasControls(null), false);
+  assert.strictEqual(hasControls(undefined), false);
+  assert.strictEqual(hasControls({}), false);
+  assert.strictEqual(hasControls({ temperature: 0 }), true);
+});
+
+test("experimentBody writes a key only when it was set", () => {
+  assert.deepStrictEqual(experimentBody(form({})), {
+    name: "n",
+    dataset_digest: "d".repeat(64),
+    lineup: ["a/b"],
+    budget: "standard",
+    estimand_mode: "routed_service",
+    halt_on_refusal: true,
+  });
+  const set = experimentBody(
+    form({
+      params: { top_p: 1 },
+      repeats: "3",
+      seed: "0",
+      attachments: "inline",
+      metric: "judge",
+      halt: false,
+    }),
+  );
+  assert.deepStrictEqual(set.params, { top_p: 1 });
+  assert.strictEqual(set.repeats, 3);
+  // Zero is a seed, not a blank: Number("") is 0 as well.
+  assert.strictEqual(set.task_order_seed, 0);
+  assert.strictEqual(set.attachments_mode, "inline");
+  assert.strictEqual(set.primary_metric, "judge");
+  assert.strictEqual(set.halt_on_refusal, false);
+  // Read as the number box means it: "1e1" is ten, as Chromium validates
+  // it, not the one parseInt would read.
+  assert.strictEqual(experimentBody(form({ repeats: "1e1" })).repeats, 10);
+  // Past what JavaScript holds exactly, the text goes for the server to
+  // refuse in its own words.
+  assert.strictEqual(
+    experimentBody(form({ seed: "9007199254740993" })).task_order_seed,
+    "9007199254740993",
+  );
+});
+
+test("experimentBody sends a copy of the lineup, never the live array", () => {
+  const lineup = ["a/b"];
+  const body = experimentBody(form({ lineup }));
+  lineup.push("c/d");
+  assert.deepStrictEqual(body.lineup, ["a/b"]);
+});
+
+test("experimentNudge names what the server would refuse, first first", () => {
+  assert.strictEqual(
+    experimentNudge(form({ name: "" })),
+    "name the experiment",
+  );
+  assert.match(
+    experimentNudge(form({ name: String.fromCodePoint(0x1f600).repeat(201) })),
+    /201 characters, over the 200 limit/,
+  );
+  assert.strictEqual(
+    experimentNudge(form({ name: String.fromCodePoint(0x1f600).repeat(200) })),
+    null,
+  );
+  // A name of spaces is legal to the server.
+  assert.strictEqual(experimentNudge(form({ name: "   " })), null);
+  assert.strictEqual(
+    experimentNudge(form({ digest: null })),
+    "select a stored dataset in Datasets above",
+  );
+  assert.strictEqual(
+    experimentNudge(form({ lineup: [] })),
+    "check a model in the lineup above",
+  );
+  assert.strictEqual(
+    experimentNudge(form({ invalid: ["temperature", "repeats"] })),
+    "check temperature, repeats",
+  );
+});
+
+test("projectionText says every shape the door returns", () => {
+  assert.strictEqual(projectionText(null), "");
+  assert.strictEqual(
+    projectionText({
+      input_usd: 0.000008,
+      output_usd: 0.262144,
+      total_usd: 0.262152,
+      unpriced: [],
+    }),
+    "output at most $0.26 (a ceiling on tokens, not on the bill) · " +
+      "input about $0.000008 (an estimate) · total $0.26",
+  );
+  // Native mode: the output stands, nobody is unpriced, and there is no
+  // input estimate and so no total.
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: 0.032768,
+      total_usd: null,
+      unpriced: [],
+    }),
+    "output at most $0.033 (a ceiling on tokens, not on the bill) · " +
+      "no input estimate, so no total",
+  );
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: ["x/y (charges request)"],
+    }),
+    "unpriced: x/y (charges request). No figure is given, because a total " +
+      "missing one arm would read as the whole comparison's total.",
+  );
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: [],
+    }),
+    "no projection: the figures could not be computed",
+  );
+  // Every unpriced member is named, in the door's order.
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: ["a/b", "c/d"],
+    }),
+    "unpriced: a/b, c/d. No figure is given, because a total missing one " +
+      "arm would read as the whole comparison's total.",
+  );
+  // A real zero is a figure, not an absence, in each place it can stand.
+  assert.strictEqual(
+    projectionText({
+      input_usd: 0,
+      output_usd: 0,
+      total_usd: 0,
+      unpriced: [],
+    }),
+    "output at most $0 (a ceiling on tokens, not on the bill) · " +
+      "input about $0 (an estimate) · total $0",
+  );
+});
+
+test("experimentFinished is every status but created and running", () => {
+  for (const status of ["created", "running"]) {
+    assert.strictEqual(experimentFinished(status), false);
+  }
+  for (const status of [
+    "done",
+    "stopped",
+    "halted_on_refusal",
+    "interrupted",
+    "failed",
+  ]) {
+    assert.strictEqual(experimentFinished(status), true);
+  }
+});
+
+test("experimentRowMeta counts every finished trial and names the trouble", () => {
+  const row = (fields) => ({
+    status: "done",
+    trials_total: 6,
+    trials_done: 0,
+    trials_failed: 0,
+    trials_refused: 0,
+    ...fields,
+  });
+  assert.strictEqual(
+    experimentRowMeta(row({ trials_done: 6 })),
+    "done · 6/6 trials",
+  );
+  assert.strictEqual(
+    experimentRowMeta(
+      row({ status: "halted_on_refusal", trials_done: 2, trials_refused: 1 }),
+    ),
+    "halted_on_refusal · 3/6 trials (1 refused)",
+  );
+  assert.strictEqual(
+    experimentRowMeta(
+      row({ trials_done: 3, trials_failed: 2, trials_refused: 1 }),
+    ),
+    "done · 6/6 trials (2 failed, 1 refused)",
+  );
+  assert.strictEqual(
+    experimentRowMeta(row({ status: "running", trials_total: 1 })),
+    "running · 0/1 trials",
+  );
+});
+
+test("datasetHeld is a summary object and nothing else", () => {
+  assert.strictEqual(
+    datasetHeld({ scorers: [], cites_documents: false }),
+    true,
+  );
+  for (const value of [undefined, null, false, true]) {
+    assert.strictEqual(datasetHeld(value), false);
+  }
+});
+
+test("scoreBody names the recorded digest, and a judge only for judge tasks", () => {
+  const judged = { scorers: ["exact", "judge"], cites_documents: false };
+  const plain = { scorers: ["exact", "regex"], cites_documents: false };
+  assert.deepStrictEqual(scoreBody("d", judged, "stub/j"), {
+    dataset_digest: "d",
+    judge_model: "stub/j",
+  });
+  // Blank is not sent: the door's min_length would refuse "".
+  assert.deepStrictEqual(scoreBody("d", judged, ""), { dataset_digest: "d" });
+  // The door would accept a judge here and record nothing of it; only
+  // this rule keeps it off the wire.
+  assert.deepStrictEqual(scoreBody("d", plain, "stub/j"), {
+    dataset_digest: "d",
+  });
+  assert.deepStrictEqual(scoreBody("d", { scorers: [] }, "stub/j"), {
+    dataset_digest: "d",
+  });
+});
+
+test("scoreNudge says why Score waits, in every summary state", () => {
+  const judged = { scorers: ["judge"], cites_documents: false };
+  const plain = { scorers: ["exact"], cites_documents: false };
+  assert.strictEqual(
+    scoreNudge(null, ""),
+    "reading which scorers its dataset declares",
+  );
+  assert.strictEqual(
+    scoreNudge(undefined, "stub/j"),
+    "its dataset could not be read; Retry asks the store again",
+  );
+  assert.match(
+    scoreNudge(false, "stub/j"),
+    /^its dataset was read from a file/,
+  );
+  assert.strictEqual(
+    scoreNudge(judged, ""),
+    "choose a judge, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
+  );
+  assert.strictEqual(scoreNudge(judged, "stub/j"), null);
+  assert.strictEqual(scoreNudge(plain, ""), null);
+  assert.strictEqual(scoreNudge({ scorers: [] }, ""), null);
+});
+
+test("scoreLabel says what a press spends, and nothing until it knows", () => {
+  assert.strictEqual(
+    scoreLabel({ scorers: ["exact", "judge"] }),
+    "Score · pays the judge",
+  );
+  assert.strictEqual(scoreLabel({ scorers: ["regex"] }), "Score · free");
+  assert.strictEqual(scoreLabel({ scorers: [] }), "Score · free");
+  for (const unknown of [undefined, null, false]) {
+    assert.strictEqual(scoreLabel(unknown), "Score");
+  }
+  assert.strictEqual(judgeTasks({ scorers: ["judge"] }), true);
+  assert.strictEqual(judgeTasks(false), false);
+});
+
+test("scoreNudge follows the catalog and shows the door's sentence as given", () => {
+  const judged = { scorers: ["judge"], cites_documents: false };
+  assert.strictEqual(
+    scoreNudge(judged, "", "pending"),
+    "choose a judge once the catalog has loaded, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
+  );
+  assert.strictEqual(
+    scoreNudge(judged, "", "unavailable"),
+    "no judge can be chosen here, because the catalog is not available; " +
+      "score it through the API with judge_model",
+  );
+  assert.strictEqual(
+    scoreNudge(judged, "", "loaded"),
+    "choose a judge, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
+  );
+  // The catalog changes nothing once a judge is chosen, or where none is
+  // needed.
+  assert.strictEqual(scoreNudge(judged, "stub/j", "unavailable"), null);
+  assert.strictEqual(scoreNudge({ scorers: ["exact"] }, "", "pending"), null);
+  // A refusal of the stored bytes is the door's sentence, as it is.
+  const refused = "the bytes stored under digest d hash to e: edited by hand";
+  assert.strictEqual(scoreNudge(refused, "stub/j", "loaded"), refused);
+  assert.strictEqual(scoreLabel(refused), "Score");
+  assert.deepStrictEqual(scoreBody("d", refused, "stub/j"), {
+    dataset_digest: "d",
+  });
 });

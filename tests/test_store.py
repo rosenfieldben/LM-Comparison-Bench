@@ -3703,3 +3703,167 @@ def test_the_pin_decoder_carries_an_integer_capture_and_refuses_a_wrong_type():
     )
     assert store._decoded_renditions(json.dumps([{**pin, "capture_id": "7"}])) is None
     assert store._decoded_renditions(json.dumps([{**pin, "capture_id": True}])) is None
+
+
+# ---- Phase N1: stored datasets.
+
+
+def dataset_record(digest, name, content=b'{"id": "t1", "prompt": "p"}\n', **overrides):
+    record = {
+        "digest": digest,
+        "name": name,
+        "content": content,
+        "task_count": 1,
+        "scorers": [],
+        "cites_documents": False,
+    }
+    record.update(overrides)
+    return record
+
+
+def test_save_dataset_keeps_one_row_per_digest_and_the_first_name(db):
+    """WINDOW: save_dataset twice under one digest, then both readers.
+
+    INSERT OR IGNORE on the primary key, so the second save is a no-op
+    that answers with the stored row; the name, the summary and the
+    timestamp are the first save's, since rewriting any of them would
+    relabel experiments already created from these bytes."""
+    first = store.save_dataset(
+        db, dataset_record("ab" * 32, "first", scorers=["exact"], cites_documents=True)
+    )
+    second = store.save_dataset(db, dataset_record("ab" * 32, "second"))
+
+    assert second == first
+    assert first["name"] == "first"
+    assert first["scorers"] == ["exact"]
+    assert first["cites_documents"] is True
+    assert "content" not in first
+    assert db.execute("SELECT COUNT(*) c FROM datasets").fetchone()["c"] == 1
+    held = store.get_dataset(db, "ab" * 32)
+    assert held["content"] == b'{"id": "t1", "prompt": "p"}\n'
+    assert isinstance(held["content"], bytes)
+    assert store.get_dataset(db, "cd" * 32) is None
+
+
+def test_save_dataset_refuses_a_record_the_table_would_silently_skip(db):
+    """WINDOW: save_dataset with a NULL name, inside its own transaction.
+
+    IGNORE swallows the NOT NULL failure as readily as the duplicate it
+    is there for, so without the read-back the call would answer with a
+    row that was never written. It raises, and nothing is left behind."""
+    with pytest.raises(RuntimeError, match="was not created"):
+        store.save_dataset(db, dataset_record("ef" * 32, None))
+
+    assert db.execute("SELECT COUNT(*) c FROM datasets").fetchone()["c"] == 0
+
+
+def test_the_datasets_list_is_ordered_by_time_not_by_rowid(db):
+    """WINDOW: list_datasets over rows whose rowids run against their
+    timestamps, as they can after VACUUM on a table with no INTEGER
+    PRIMARY KEY.
+
+    Written directly so the two orders disagree: rowid order would read
+    old, middle, new backwards. The list is newest first by created_at,
+    and no row carries its content."""
+    for digest, name, at in (
+        ("11" * 32, "new", "2026-09-03T00:00:00.000000+00:00"),
+        ("22" * 32, "old", "2026-09-01T00:00:00.000000+00:00"),
+        ("33" * 32, "middle", "2026-09-02T00:00:00.000000+00:00"),
+    ):
+        db.execute(
+            """INSERT INTO datasets (digest, name, created_at, content,
+                                     task_count, scorers_json, cites_documents)
+               VALUES (?, ?, ?, x'00', 1, '[]', 0)""",
+            (digest, name, at),
+        )
+    db.commit()
+    # PRE-STATE: rowid order really is different from time order.
+    by_rowid = [
+        r["name"] for r in db.execute("SELECT name FROM datasets ORDER BY rowid DESC")
+    ]
+    assert by_rowid == ["middle", "old", "new"]
+
+    listed = store.list_datasets(db, 10)
+
+    assert [d["name"] for d in listed] == ["new", "middle", "old"]
+    assert all("content" not in d for d in listed)
+    assert [d["name"] for d in store.list_datasets(db, 2)] == ["new", "middle"]
+
+
+def test_a_dataset_digest_cannot_be_null(db):
+    """WINDOW: a direct INSERT with a NULL digest.
+
+    sqlite admits NULL in a non-INTEGER primary key unless the column says
+    NOT NULL, a documented compatibility quirk; this table says it."""
+    with pytest.raises(sqlite3.IntegrityError):
+        db.execute(
+            """INSERT INTO datasets (digest, name, created_at, content,
+                                     task_count, scorers_json, cites_documents)
+               VALUES (NULL, 'n', 't', x'00', 1, '[]', 0)"""
+        )
+
+
+PRE_N_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_n_schema.sql"
+).read_text()
+
+
+def test_the_pre_n_fixture_is_the_schema_as_it_stood_before_phase_n():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: taken from the SCHEMA
+    string at f3eeebc, the Phase L merge. The right era and not merely an
+    old one: it has Phase L's captures table and not Phase N's."""
+    assert "CREATE TABLE IF NOT EXISTS snapshot_captures (" in PRE_N_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS datasets" not in PRE_N_SCHEMA
+    assert "git show f3eeebc:bench/store.py" in PRE_N_SCHEMA
+
+
+def test_migration_onto_pre_n_database_adds_the_table_and_touches_nothing(tmp_path):
+    """WINDOW: a database whose schema is exactly f3eeebc's, through
+    connect(), from the pre-state to the post-state and a second boot.
+
+    A WHOLE NEW TABLE, created by CREATE TABLE IF NOT EXISTS with no
+    MIGRATIONS entry. The existing experiment survives with every field
+    as it was, the new table starts empty, and a dataset written onto the
+    migrated database reads back; a second connect disturbs nothing."""
+    db_path = tmp_path / "pre_n.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_N_SCHEMA)
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('old', '2026-09-01T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.commit()
+    tables = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    # The pre-state, asserted: without it this could pass against a
+    # fixture that already had the table.
+    assert "datasets" not in tables
+    legacy.row_factory = sqlite3.Row
+    before = dict(legacy.execute("SELECT * FROM experiments").fetchone())
+    legacy.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        assert store.list_datasets(conn, 10) == []
+        assert dict(conn.execute("SELECT * FROM experiments").fetchone()) == before
+        store.save_dataset(conn, dataset_record("cd" * 32, "new"))
+        assert store.get_dataset(conn, "cd" * 32)["name"] == "new"
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        assert [d["name"] for d in store.list_datasets(again, 10)] == ["new"]
+        assert dict(again.execute("SELECT * FROM experiments").fetchone()) == before
+    finally:
+        again.close()

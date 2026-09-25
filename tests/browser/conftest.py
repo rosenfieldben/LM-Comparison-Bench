@@ -59,6 +59,13 @@ def stub_url():
     thread.join(timeout=5)
 
 
+# Each booted bench's database file, by its URL. A proof that has to meet
+# a row edited outside the bench (the refusal a forged stored dataset
+# earns) edits it here, as a person with sqlite would, because a mocked
+# answer cannot prove the door refuses.
+BENCH_DBS = {}
+
+
 @contextmanager
 def boot_bench(stub_url, tmp_path_factory, extra_env=None):
     """One bench subprocess against the stub, with its own database.
@@ -71,10 +78,11 @@ def boot_bench(stub_url, tmp_path_factory, extra_env=None):
     """
     port = free_port()
     env = os.environ.copy()
+    db_path = tmp_path_factory.mktemp("browser-db") / "bench.db"
     env.update(
         {
             "OPENROUTER_API_KEY": "test-key",
-            "BENCH_DB": str(tmp_path_factory.mktemp("browser-db") / "bench.db"),
+            "BENCH_DB": str(db_path),
             "OPENROUTER_URL": stub_url + "/api/v1/chat/completions",
             "MODELS_URL": stub_url + "/api/v1/models",
         }
@@ -106,6 +114,7 @@ def boot_bench(stub_url, tmp_path_factory, extra_env=None):
         try:
             # Host must be localhost or the bench's own guard rejects us.
             wait_for(f"http://localhost:{port}/models")
+            BENCH_DBS[f"http://localhost:{port}"] = db_path
             yield f"http://localhost:{port}"
         finally:
             proc.terminate()
@@ -291,3 +300,40 @@ def snapshot_bench(page, snapshot_bench_url):
         return page
 
     return open_bench
+
+
+# ---- The experiment runner and the scoring slot (Phases N3 and N4).
+# Shared here so test_n3.py and test_n4.py take the same fixtures; the
+# helpers they call live in test_n3.py beside the tests that made them.
+
+
+@pytest.fixture
+def runs(page, bench_url):
+    """Experiments a test started, stopped and drained afterwards whatever
+    the test's outcome, so the session's one runner is free for the next
+    test. Tests append ids; nothing here asserts."""
+    from test_n3 import drain
+
+    started = []
+    yield started
+    for eid in started:
+        drain(page, bench_url, eid)
+
+
+@pytest.fixture
+def scorings(page, bench_url):
+    """For a test that scores: the idle probe readied while the runner is
+    free, and after the test, pass or fail, a wait for the bench's one
+    scoring slot to be free, so the next test's Score does not meet this
+    one's pass. The wait fails loudly if the slot never frees."""
+    from test_n3 import probe_target, wait_scoring_idle
+
+    probe_target(page, bench_url)
+    yield
+    wait_scoring_idle(page, bench_url)
+
+
+@pytest.fixture
+def bench_db(bench_url):
+    """The session bench's database file, for editing a row by hand."""
+    return BENCH_DBS[bench_url]

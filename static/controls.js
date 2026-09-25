@@ -66,8 +66,25 @@
     experimentParams,
     setExperimentParams,
     reuseExperiment,
+    // Read by the experiment form, which sends the same lineup, budget
+    // and controls the composer does and refuses to Create while a
+    // control fails the check that refuses a Run.
+    invalidControls,
+    // Read by the experiment panel's judge select, which offers the
+    // catalog the '+ model' picker searches, unfiltered.
+    catalogIds,
+    onChange,
     init,
   };
+
+  // Everything that wants to know when the lineup, the budget or a
+  // control changed. updateRunState is the one function every such
+  // change reaches, so it tells these after it has settled the Run
+  // button; the button keeps its single owner and a listener only reads.
+  const changeListeners = [];
+  function onChange(listener) {
+    changeListeners.push(listener);
+  }
 
   const promptEl = document.getElementById("prompt");
   const modelsEl = document.getElementById("models");
@@ -268,6 +285,10 @@
   // Snapshot of GET /models; fetched=false switches the picker to the
   // exact-id fallback so the bench stays usable on an offline boot.
   let catalog = { fetched: false, models: [] };
+  // Whether GET /models has answered at all. Before it has, the catalog
+  // above reads exactly like an offline boot, and "not yet" is not "not
+  // available".
+  let catalogSettled = false;
 
   // ---- UI prefs: theme override (auto follows the OS), motion, density.
   const THEMES = ["auto", "dark", "light"];
@@ -455,6 +476,7 @@
     lineupLabel.textContent = "Lineup " + checked + "/" + C.lineup.length;
     renderLinked();
     updateEstimate();
+    for (const listener of changeListeners) listener();
   }
 
   async function loadCatalog() {
@@ -465,6 +487,7 @@
     } catch (err) {
       catalog = { fetched: false, models: [] };
     }
+    catalogSettled = true;
     // The data policy rides this response. A failed catalog load leaves it
     // undefined, which setDataPolicy treats as standard: a badge is a claim
     // about where prompts go, and a failed fetch is not evidence for one.
@@ -483,6 +506,16 @@
     window.BenchAttach.refresh();
     // Pricing just arrived (or didn't): refresh the run estimate.
     updateRunState();
+  }
+
+  // The catalog's model ids in the catalog's order, filtered by nothing,
+  // and which of three states it is in: "pending" until GET /models has
+  // answered, "unavailable" when it failed or the bench booted offline,
+  // "loaded" otherwise. A copy, so a reader cannot edit the picker's list.
+  function catalogIds() {
+    if (!catalogSettled) return { state: "pending", ids: [] };
+    if (!catalog.fetched) return { state: "unavailable", ids: [] };
+    return { state: "loaded", ids: catalog.models.map((m) => m.id) };
   }
 
   function clearSearch() {

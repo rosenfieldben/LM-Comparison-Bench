@@ -781,6 +781,38 @@ def test_nothing_scored_is_its_own_answer():
     assert out["reason"] == "nothing has been scored"
 
 
+def test_a_ranking_says_it_orders_on_the_mean():
+    """WINDOW: ranking.reason from choose_metric for a single scorer and a
+    declared one, both ranked, and for every case that withholds the
+    ranking.
+
+    The ordering is min_ranks over each arm's score mean, whatever else
+    the series publishes (a judge series with a pass threshold has a pass
+    rate beside its mean), so a ranking says which figure it used. A
+    withheld ranking orders nothing and names no figure."""
+    single = choose_metric(None, [{"scorers": [section("contains")]}])
+    declared_judge = choose_metric(
+        "judge", [{"scorers": [section("contains"), section("judge", "j/1")]}]
+    )
+
+    assert single["reason"] == "the only scorer in this experiment, ordered on the mean"
+    assert declared_judge["reason"] == (
+        "declared as the experiment's primary metric, ordered on the mean"
+    )
+    withheld = [
+        choose_metric(None, [{"scorers": []}]),
+        choose_metric(None, [{"scorers": [section("contains"), section("judge")]}]),
+        choose_metric(None, [{"scorers": [section("contains", measured=0)]}]),
+        choose_metric(
+            "judge",
+            [{"scorers": [section("judge", "a/1"), section("judge", "b/1")]}],
+        ),
+    ]
+    for out in withheld:
+        assert out["metric"] is None
+        assert "ordered on" not in out["reason"]
+
+
 # ---- The per-outcome matrix: every outcome's treatment, locked.
 
 

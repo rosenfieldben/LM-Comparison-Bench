@@ -15,6 +15,7 @@ digest ran the same tasks, and that is checkable rather than promised.
 import hashlib
 import json
 import re
+import reprlib
 from typing import Any
 
 from bench.extract import MAX_ATTACHMENTS
@@ -63,6 +64,10 @@ MAX_PATTERN_CHARS = 500
 # extract without reaching the boundary that imports it.
 PIN_FIELDS = ("digest", "extractor", "extractor_version", "kind", "capture_id")
 PIN_KINDS = ("document", "image", "snapshot")
+# The largest capture id a pin may name: SQLite's rowid range, the bound
+# bench.main.MAX_SQLITE_ROWID puts on RenditionPin (a test holds the two
+# equal; importing it here would import the whole application).
+MAX_CAPTURE_ID = 2**63 - 1
 
 # THE FOUR A PIN MUST NAME, and the fifth it may. capture_id is the
 # fourteenth review's H2: which CAPTURE of a snapshot a pin means, a row
@@ -97,6 +102,24 @@ class DatasetError(RuntimeError):
     """
 
 
+# A decoded value as a refusal quotes it, bounded in depth and length.
+# NOT repr(): json.loads decodes a list nested deeper than repr can walk
+# (about 45000 levels on CPython 3.14), and the refusal naming that
+# value then raised RecursionError, which escaped both doors as a 500 in
+# place of the line's sentence. A value the parser was never going to
+# accept is named, not reproduced.
+# Attributes and not keyword arguments, which Repr takes only from 3.12.
+_QUOTE = reprlib.Repr()
+_QUOTE.maxlevel = 2
+_QUOTE.maxlist = _QUOTE.maxdict = 4
+_QUOTE.maxstring = 60
+_QUOTE.maxlong = 40
+
+
+def _quoted(value: object) -> str:
+    return _QUOTE.repr(value)
+
+
 def _fail(line_no: int | None, message: str) -> None:
     where = f"line {line_no}: " if line_no is not None else ""
     raise DatasetError(f"{where}{message}")
@@ -119,6 +142,20 @@ def _checked_text(
     if text is None:
         _fail(line_no, f"{field} must be a string, got {type(value).__name__}")
         return None  # unreachable; _fail raises. Keeps mypy honest.
+    # JSON can spell half a surrogate pair as an escape, "\ud83d", and
+    # JSON.stringify writes one for a string holding half of a pair, so a
+    # line the builder composed from a paste can decode to text UTF-8
+    # cannot encode. Taken, it would fail later and somewhere worse: a
+    # run that paid for the trials before it, a judge call before the
+    # write, a stored row nobody can export. Refused here, on its line.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        _fail(
+            line_no,
+            f"{field} holds an unpaired surrogate (U+{ord(text[exc.start]):04X}), "
+            "which JSON can spell and UTF-8 cannot",
+        )
     if required and text == "":
         _fail(line_no, f"{field} must not be empty")
     if len(text) > limit:
@@ -142,16 +179,23 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
     if kind not in SCORERS:
         _fail(
             line_no,
-            f"scorer kind {spec.get('kind')!r} is not one of {', '.join(SCORERS)}",
+            f"scorer kind {_quoted(spec.get('kind'))} is not one of "
+            f"{', '.join(SCORERS)}",
         )
     out: dict[str, Any] = {"kind": kind}
     if kind == "regex":
         pattern = _checked_text(
             spec.get("pattern"), line_no, "scorer.pattern", MAX_PATTERN_CHARS, True
         )
+        # Not only re.error: a repeat count past what the engine can hold
+        # ("a{4294967296}") raises OverflowError, incompatible global
+        # flags ("(?a)(?u)") raise a plain ValueError, and a few hundred
+        # nested groups raise RecursionError inside MAX_PATTERN_CHARS.
+        # Each escaped this function as a 500 in place of the line's
+        # refusal.
         try:
             re.compile(pattern or "")
-        except re.error as exc:
+        except (re.error, ValueError, OverflowError, RecursionError) as exc:
             _fail(line_no, f"scorer.pattern is not a valid regex: {exc}")
         out["pattern"] = pattern
     if kind == JUDGE_SCORER and "pass_threshold" in spec:
@@ -166,7 +210,12 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
                 line_no,
                 f"scorer.pass_threshold must be a number, got {type(raw).__name__}",
             )
-        threshold = float(raw)
+        # An int too large for a float raises OverflowError rather than
+        # becoming one; it is outside [0, 1] all the same.
+        try:
+            threshold = float(raw)
+        except OverflowError:
+            _fail(line_no, f"scorer.pass_threshold {_quoted(raw)} is outside [0, 1]")
         if not 0.0 <= threshold <= 1.0:
             _fail(line_no, f"scorer.pass_threshold {threshold} is outside [0, 1]")
         out["pass_threshold"] = threshold
@@ -186,7 +235,13 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
         allowed.add("pass_threshold")
     extra = sorted(set(spec) - allowed)
     if extra:
-        _fail(line_no, f"scorer has unknown keys: {', '.join(extra)}")
+        # Quoted, as every value a refusal repeats back is: a key is text
+        # the caller wrote, and one holding half a surrogate pair would
+        # otherwise make the refusal itself impossible to write.
+        _fail(
+            line_no,
+            f"scorer has unknown keys: {', '.join(_quoted(k) for k in extra)}",
+        )
     return out
 
 
@@ -271,7 +326,10 @@ def _checked_attachments(
             )
         unknown = sorted(set(entry) - set(PIN_FIELDS))
         if unknown:
-            _fail(line_no, f"{at} has unknown keys: {', '.join(unknown)}")
+            _fail(
+                line_no,
+                f"{at} has unknown keys: {', '.join(_quoted(k) for k in unknown)}",
+            )
         digest = entry.get("digest")
         if not isinstance(digest, str) or not DIGEST_PATTERN.match(digest):
             _fail(
@@ -287,17 +345,26 @@ def _checked_attachments(
         if kind not in PIN_KINDS:
             _fail(
                 line_no,
-                f"{at}.kind is {kind!r}, not one of {', '.join(PIN_KINDS)}",
+                f"{at}.kind is {_quoted(kind)}, not one of {', '.join(PIN_KINDS)}",
             )
         pin["kind"] = kind
         capture = entry.get("capture_id")
         if capture is not None:
             # A positive integer or nothing. bool is refused explicitly
             # because True is an int to isinstance and "capture_id: true"
-            # is a typo, not a row.
-            if isinstance(capture, bool) or not isinstance(capture, int) or capture < 1:
+            # is a typo, not a row. Bounded above by SQLite's rowid range,
+            # as RenditionPin is at the API boundary: past it the pin was
+            # stored here and then crashed the experiment doors that look
+            # the capture up.
+            if (
+                isinstance(capture, bool)
+                or not isinstance(capture, int)
+                or not 1 <= capture <= MAX_CAPTURE_ID
+            ):
                 _fail(
-                    line_no, f"{at}.capture_id is {capture!r}, not a positive integer"
+                    line_no,
+                    f"{at}.capture_id is {_quoted(capture)}, not a positive "
+                    "integer in SQLite's rowid range",
                 )
             if kind != "snapshot":
                 _fail(
@@ -319,6 +386,19 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
 
     Blank lines are skipped, because a trailing newline is not an error
     and refusing one would be pedantry the user has to work around.
+
+    A LINE ENDS AT "\n" AND NOWHERE ELSE. A CRLF file needs nothing more
+    to read as its LF twin: the "\r" left at the end of each line is
+    whitespace to json.loads after the value and to str.strip on a blank
+    line, so it changes no task and no line number. Not str.splitlines,
+    which also breaks at \v, \f, U+001C to U+001E, U+0085, U+2028,
+    U+2029 and a lone \r: a JSON string may hold U+2028, U+2029 and
+    U+0085 unescaped, so splitlines cut a valid task in two and refused
+    both halves. The price is deliberate: a file that used one of those
+    characters (or a lone CR) as a record separator, which splitlines
+    read as separate lines, is now one line and is refused on it. JSONL
+    is newline-delimited; a separator the format does not have is not
+    one the parser should guess at.
     """
     digest = hashlib.sha256(raw).hexdigest()
     try:
@@ -328,14 +408,17 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
 
     tasks: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for line_no, line in enumerate(text.splitlines(), start=1):
+    for line_no, line in enumerate(text.split("\n"), start=1):
         if not line.strip():
             continue
         if len(tasks) >= MAX_TASKS:
             _fail(line_no, f"more than {MAX_TASKS} tasks; split the file")
+        # RecursionError too: a line of arrays nested past the decoder's
+        # depth raises it rather than a ValueError, well inside the byte
+        # ceiling, and it escaped as a 500 in place of the line's refusal.
         try:
             row = json.loads(line)
-        except ValueError as exc:
+        except (ValueError, RecursionError) as exc:
             _fail(line_no, f"not valid JSON: {exc}")
         if not isinstance(row, dict):
             _fail(line_no, f"expected an object, got {type(row).__name__}")
@@ -383,7 +466,7 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
         }
         unknown = sorted(set(row) - known)
         if unknown:
-            _fail(line_no, f"unknown keys: {', '.join(unknown)}")
+            _fail(line_no, f"unknown keys: {', '.join(_quoted(k) for k in unknown)}")
         # A judge scorer with no rubric cannot be run: the rubric IS the
         # scoring instruction, and a judge asked to score against nothing
         # would return an opinion about something nobody specified.
@@ -423,3 +506,35 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
     if not tasks:
         raise DatasetError(f"{name} has no tasks")
     return {"name": name, "digest": digest, "tasks": tasks}
+
+
+def scorer_kinds(tasks: list[dict[str, Any]]) -> list[str]:
+    """The scorer kinds a parsed dataset's tasks declare, each once, sorted.
+
+    ONE DERIVATION FOR TWO READERS. A primary metric is checked against
+    this list at experiment creation, and a stored dataset records it as
+    the summary a browser offers a primary metric from; two derivations
+    would be two answers to "what can this dataset produce", and the
+    browser would eventually offer a metric the server refuses. A task
+    with no scorer contributes nothing, which is what it declares.
+    """
+    return sorted(
+        {
+            kind
+            for task in tasks
+            if isinstance(kind := (task.get("scorer") or {}).get("kind"), str)
+        }
+    )
+
+
+def cites_documents(tasks: list[dict[str, Any]]) -> bool:
+    """Whether any task in a parsed dataset cites a document.
+
+    The fact attachments_mode is a statement about. POST /experiments
+    refuses a mode declared over a dataset where no task cites one, and
+    a stored dataset records this answer so a browser can disable the
+    control there instead of offering a choice the server will refuse.
+    parse_dataset already refuses an empty list, so a present value is a
+    citation and None is its absence; there is no third spelling.
+    """
+    return any(task.get("attachments") for task in tasks)

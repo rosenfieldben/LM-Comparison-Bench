@@ -452,6 +452,42 @@
           ")" +
           composition;
     el.append(ranking);
+    // What the judging cost, on its own line beside the ranking, as the
+    // payload keeps it on its own key (report.judge_cost). It is the
+    // bench's instrument cost, money spent measuring, and is never added
+    // into a model's cost cell, whose total is what that model was paid.
+    // A call whose reply carried no price is named as unpriced rather
+    // than left out, and every judge row with no billing figure is
+    // counted after the spend (the unpriced calls among them), so the
+    // line never reads as the whole cost of judging when it may not be.
+    const spend = report.judge_cost;
+    const unpriced = spend.unpriced_calls;
+    const bare = spend.rows_without_figure;
+    const judgeSpend = document.createElement("span");
+    judgeSpend.dataset.testid = "report-judge-spend";
+    judgeSpend.className = "report-note";
+    judgeSpend.textContent =
+      (spend.billed_calls > 0
+        ? "judge spend: $" +
+          spend.total_usd.toFixed(4) +
+          " over " +
+          spend.billed_calls +
+          (spend.billed_calls === 1 ? " billed call" : " billed calls") +
+          (unpriced > 0 ? ", " + unpriced + " unpriced" : "")
+        : "judge spend: none billed" +
+          (unpriced > 0
+            ? ", " +
+              unpriced +
+              (unpriced === 1 ? " call unpriced" : " calls unpriced")
+            : "")) +
+      (bare > 0
+        ? "; " +
+          bare +
+          (bare === 1
+            ? " judge row carries no billing figure"
+            : " judge rows carry no billing figure")
+        : "");
+    el.append(judgeSpend);
     if (report.arm_caveat) {
       // Present only when it was earned, so a reader who sees it knows
       // something specific happened rather than that the bench hedges by
@@ -472,24 +508,45 @@
       // the real thresholds when the scoring pass ran. It is the
       // DENOMINATOR that is incomplete, and that is the part a reader
       // would otherwise assume was whole.
+      //
+      // TWO WAYS TO GET HERE since Phase N, and the note says which. The
+      // bench holds no copy of the dataset, or it holds one this build
+      // could not read, and the server's own reason for the second is
+      // printed verbatim: the floor is honest either way, but a reader
+      // looking at it should know an exact denominator was sitting in
+      // the store.
+      const why =
+        typeof report.dataset_unreadable === "string"
+          ? "the stored dataset could not be read (" +
+            report.dataset_unreadable +
+            "), "
+          : "no dataset file given and the bench holds no copy of this " +
+            "experiment's dataset, ";
       note.textContent =
-        "no dataset file given, so the eligible count was recovered " +
-        "from the score rows and is a FLOOR: a task whose trials were " +
-        "never scored leaves no row to witness its threshold. Supply " +
-        "the file above for the full denominator.";
+        why +
+        "so the eligible count was recovered from the score rows and is " +
+        "a FLOOR: a task whose trials were never scored leaves no row to " +
+        "witness its threshold. Supply the file above for the full " +
+        "denominator.";
       el.append(note);
     }
     return el;
   }
 
-  // The dataset path the operator last typed, held in a variable for as
-  // long as the tab is open and nowhere else. Not in localStorage and
-  // not sent anywhere to be stored: it is a path on their own machine,
-  // which is a fact about their filesystem rather than about the
-  // experiment, and the experiment row deliberately records the file's
-  // digest instead. The same reasoning the prompt library follows for
-  // what it will and will not keep.
-  let rememberedPath = "";
+  // The dataset path the operator last applied, and the experiment it was
+  // applied for, held in a variable for as long as the tab is open and
+  // nowhere else. Not in localStorage and not sent anywhere to be stored:
+  // it is a path on their own machine, which is a fact about their
+  // filesystem rather than about the experiment, and the experiment row
+  // deliberately records the file's digest instead. The same reasoning
+  // the prompt library follows for what it will and will not keep.
+  //
+  // ONE EXPERIMENT'S, NEVER ANOTHER'S. A path names the file one
+  // experiment was read from; sent with another experiment's report it
+  // carried one experiment's input into another's request, and the
+  // server refused it as drift, so a stored experiment opened on a false
+  // "dataset changed".
+  let remembered = { id: null, path: "" };
 
   function datasetForm(experimentId, path) {
     const form = document.createElement("form");
@@ -504,20 +561,21 @@
     input.id = "report-dataset-path";
     input.dataset.testid = "report-dataset-path";
     input.value = path;
-    input.placeholder = "leave blank for score means without pass rates";
+    input.placeholder = "leave blank to read the dataset the bench stored";
     input.title =
-      "Thresholds live in the dataset file, not the database, so pass " +
-      "rates need the file the experiment was created from. The digest " +
-      "is checked against the one recorded at creation and a mismatch " +
-      "is refused. Remembered for this tab only, never stored.";
+      "Thresholds live in the dataset. Blank reads the copy the bench " +
+      "stored under this experiment's digest, when it holds one; a path " +
+      "reads the file from disk instead. Either way the digest is checked " +
+      "against the one recorded at creation and a mismatch is refused. " +
+      "Remembered for this experiment in this tab only, never stored.";
     const apply = document.createElement("button");
     apply.type = "submit";
     apply.dataset.testid = "report-dataset-apply";
     apply.textContent = "apply";
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      rememberedPath = input.value.trim();
-      show(experimentId, rememberedPath);
+      remembered = { id: experimentId, path: input.value.trim() };
+      show(experimentId, remembered.path);
     });
     form.append(label, input, apply);
     return form;
@@ -548,11 +606,25 @@
     throw new Error(detail);
   }
 
+  // Each show() is numbered, and a report whose fetch returns after a
+  // newer show() began is dropped: the experiment panel opens reports on
+  // its own (after Create, when a watched run finishes) as well as on a
+  // click, and a late answer appended under a newer one stacked two
+  // experiments' reports in one panel.
+  let showVersion = 0;
+
   async function show(experimentId, datasetPath) {
-    // Undefined means "whatever the operator last applied", which is how
-    // opening a second experiment keeps their file. An explicit empty
-    // string means they cleared it, and that has to survive.
-    const path = datasetPath === undefined ? rememberedPath : datasetPath;
+    const version = ++showVersion;
+    // Undefined means "the path last applied for this experiment", which
+    // is how reopening its report keeps their file; any other experiment
+    // gets none and reads the store. An explicit empty string means they
+    // cleared it, and that has to survive.
+    const path =
+      datasetPath !== undefined
+        ? datasetPath
+        : remembered.id === experimentId
+          ? remembered.path
+          : "";
     panel.replaceChildren();
     panel.hidden = false;
     panel.dataset.state = "loading";
@@ -568,6 +640,7 @@
     try {
       report = await fetchReport(experimentId, path);
     } catch (err) {
+      if (version !== showVersion) return;
       // Same rule as every other load in this app: the failure is on the
       // page and on the console, never only in a variable.
       console.error("report load failed", err);
@@ -576,6 +649,7 @@
       panel.dataset.state = "error";
       return;
     }
+    if (version !== showVersion) return;
     note.remove();
     panel.append(banner(report));
     // Above the tables, because the documents changed what every model
@@ -591,92 +665,8 @@
     panel.dataset.state = "ready";
   }
 
-  // ---- The list, so the report has a way in.
-
-  const listEl = document.getElementById("experiment-list");
-  const detailsEl = document.getElementById("experiments");
-
-  // Same state discipline as the history panel, and for the same reason:
-  // an empty list means two different things while a fetch is in flight,
-  // so the panel names its own state rather than leaving a blank to be
-  // read as "none".
-  function setState(state, message) {
-    listEl.dataset.state = state;
-    listEl.textContent = message;
-  }
-
-  async function loadExperiments() {
-    setState("loading", "loading experiments");
-    let data;
-    try {
-      const resp = await fetch("/experiments");
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      data = await resp.json();
-    } catch (err) {
-      console.error("experiment list load failed", err);
-      setState("error", "failed to load experiments: " + err.message);
-      return;
-    }
-    if (data.experiments.length === 0) {
-      setState("empty", "no experiments yet");
-      return;
-    }
-    setState("ready", "");
-    for (const experiment of data.experiments) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "hrow";
-      row.dataset.testid = "experiment-row";
-      const time = document.createElement("span");
-      time.className = "htime";
-      time.textContent =
-        experiment.created_at.slice(0, 19).replace("T", " ") + " UTC";
-      const name = document.createElement("span");
-      name.className = "hprompt";
-      name.textContent = experiment.name;
-      const meta = document.createElement("span");
-      meta.className = "hcount";
-      // Progress is trials FINISHED, which is the three disjoint buckets
-      // added up. Showing trials_done alone would leave an experiment
-      // whose trials are failing looking stuck rather than failing, and
-      // the two are the opposite of each other to act on.
-      const finished =
-        experiment.trials_done +
-        experiment.trials_failed +
-        experiment.trials_refused;
-      const trouble = [];
-      if (experiment.trials_failed > 0)
-        trouble.push(experiment.trials_failed + " failed");
-      if (experiment.trials_refused > 0)
-        trouble.push(experiment.trials_refused + " refused");
-      meta.textContent =
-        experiment.status +
-        " · " +
-        finished +
-        "/" +
-        experiment.trials_total +
-        " trials" +
-        (trouble.length ? " (" + trouble.join(", ") + ")" : "");
-      row.append(time, name, meta);
-      row.addEventListener("click", () => show(experiment.id));
-      listEl.append(row);
-    }
-  }
-
-  function init() {
-    detailsEl.addEventListener("click", (event) => {
-      // The synchronous claim, exactly as the history panel makes it:
-      // toggle is dispatched asynchronously, so without this the panel
-      // still reads the previous load's terminal state when the click
-      // lands. See static/history.js for the incident that taught it.
-      if (!detailsEl.open && event.target.closest("summary")) {
-        setState("loading", "loading experiments");
-      }
-    });
-    detailsEl.addEventListener("toggle", () => {
-      if (detailsEl.open) loadExperiments();
-    });
-  }
-
-  window.BenchReport = { show, init };
+  // The list the report is opened from lives in static/lifecycle.js,
+  // with the rest of the experiment panel: selecting a row there calls
+  // show.
+  window.BenchReport = { show };
 })();

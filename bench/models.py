@@ -3077,7 +3077,9 @@ async def fetch_generation(
 # judge's own price. Large enough that a reasoning model's preamble plus
 # the verdict fits; nowhere near large enough to pay for an essay.
 # A JUDGE ROUTE MUST NOT HAVE MANDATORY REASONING, which is a
-# constraint on choosing one rather than a setting. The pinned formula
+# constraint on choosing one rather than a setting, and nothing enforces
+# it: the Score door takes any judge_model (BACKLOG.md says why). The
+# pinned formula
 # budget_tokens = max(min(max_tokens * {effort_ratio}, 128000), 1024)
 # floors every ratio on the ladder to 1024 at this budget, and the
 # companion rule requires the outer budget to be STRICTLY higher than

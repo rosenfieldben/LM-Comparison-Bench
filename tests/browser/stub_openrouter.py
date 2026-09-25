@@ -15,7 +15,9 @@ pass reads.
 
 /_test/requests exposes every recorded /chat/completions payload; it
 exists for test assertions (budget clamping) and is not part of the
-OpenRouter surface being stubbed.
+OpenRouter surface being stubbed. /_test/judge-gate is the same kind of
+thing: it holds the judge calls of one reserved model id until a test
+releases them, so a scoring pass can be kept open on purpose.
 """
 
 import asyncio
@@ -239,6 +241,17 @@ HTML_DELTAS = ["<img src=x onerror=alert(1)>", " and ", "<b>bold?</b>"]
 # report which keeps series apart from one that merges them.
 JUDGE_SCORES = {"stub/fast": 0.9, "stub/slow": 0.4}
 
+# A judge whose calls wait at a gate a test arms and releases, so a
+# scoring pass can be held open for as long as a proof needs the one
+# scoring slot busy, and ended when it says so. No door can stop a pass,
+# which is why the hold is a gate rather than a sleep: a sleep either
+# ends before the proof has looked or keeps the shared bench busy for
+# the tests after it. It is off the catalog, so no page offers it, and
+# the cap keeps a gate nobody released under the bench's own judge
+# timeout (JUDGE_TIMEOUT_S, 60 s), so the pass still ends.
+HELD_JUDGE = "stub/judge-held"
+JUDGE_GATE_CAP_S = 20
+
 
 def sse(obj) -> bytes:
     return f"data: {json.dumps(obj)}\n\n".encode()
@@ -305,6 +318,10 @@ def build_app() -> Starlette:
         # to be able to cross a boundary within ONE card, and asserting on
         # two separate cards never proves the first one was cleaned up.
         "exhausted_once_spent": False,
+        # The held judge's gate: None when nothing holds it, otherwise
+        # the event its calls wait on. Released is a latch, so the calls
+        # after the first go straight through.
+        "judge_gate": None,
     }
 
     async def models(request):
@@ -623,25 +640,37 @@ def build_app() -> Starlette:
         (scorer, judge) pair rather than a scorer, and a stub where both
         judges returned the same number could not tell a report that
         keeps them apart from one that merges them.
+
+        The usage is the judge's own personality, as a trial's is: a
+        judge named stub/nousage replies with a generation id and no
+        usage at all, which is a call that went out and came back with
+        no price, and the report has to say so rather than count it as
+        nothing spent.
         """
         score = JUDGE_SCORES.get(model, 0.5)
-        return JSONResponse(
-            {
-                "id": f"gen-judge-{model.split('/')[-1]}",
-                "provider": PROVIDER,
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": json.dumps(
-                                {"score": score, "reason": f"graded by {model}"}
-                            ),
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": USAGE,
-            },
+        body = {
+            "id": f"gen-judge-{model.split('/')[-1]}",
+            "provider": PROVIDER,
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {"score": score, "reason": f"graded by {model}"}
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        usage = usage_for(model)
+        if usage is not None:
+            body["usage"] = usage
+        # allow_nan for non_stream_body's reason: a poisoned personality
+        # puts a bare NaN on the wire.
+        return Response(
+            json.dumps(body, allow_nan=True),
+            media_type="application/json",
             headers=headers,
         )
 
@@ -656,6 +685,12 @@ def build_app() -> Starlette:
         # exact case the header exists to cover.
         headers = {GENERATION_ID_HEADER: f"gen-hdr-{model.split('/')[-1]}"}
         if is_judge_request(payload):
+            gate = state["judge_gate"]
+            if model == HELD_JUDGE and gate is not None:
+                try:
+                    await asyncio.wait_for(gate.wait(), JUDGE_GATE_CAP_S)
+                except TimeoutError:
+                    pass
             return judge_body(model, headers)
         if payload.get("stream"):
             return StreamingResponse(
@@ -692,11 +727,23 @@ def build_app() -> Starlette:
     async def recorded_requests(request):
         return JSONResponse({"requests": state["requests"]})
 
+    async def judge_gate(request):
+        """Arm the held judge's gate, or release it. Created here, inside
+        the stub's own loop, which is where its waiters run."""
+        action = (await request.json())["action"]
+        if action == "arm":
+            state["judge_gate"] = asyncio.Event()
+        elif state["judge_gate"] is not None:
+            state["judge_gate"].set()
+            state["judge_gate"] = None
+        return JSONResponse({"armed": state["judge_gate"] is not None})
+
     return Starlette(
         routes=[
             Route("/api/v1/models", models),
             Route("/api/v1/chat/completions", completions, methods=["POST"]),
             Route("/api/v1/generation", generation),
             Route("/_test/requests", recorded_requests),
+            Route("/_test/judge-gate", judge_gate, methods=["POST"]),
         ]
     )

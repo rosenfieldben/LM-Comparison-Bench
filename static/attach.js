@@ -24,7 +24,7 @@
 // is what makes reuse and replay able to name a document at all, and it
 // is the reason the note under this control says where the file went.
 (function () {
-  const { fmtBytes, shortDigest, approxTokens } = window.BenchLib;
+  const { fmtBytes, shortDigest, approxTokens, refusalText } = window.BenchLib;
 
   const rowEl = document.getElementById("attach-row");
   const listEl = document.getElementById("attachments");
@@ -677,22 +677,6 @@
   // ---- here: it can be switched off at the server, and its refusals
   // ---- are about a root and a pattern rather than about a file.
 
-  // A refusal body as text. FastAPI answers a model violation with a
-  // LIST of error objects and this application's own refusals with a
-  // string, and a control that assigned the list to textContent printed
-  // "[object Object]" at the person: the server said exactly what was
-  // wrong and the page threw it away.
-  function refusalText(detail) {
-    if (typeof detail === "string") return detail;
-    if (Array.isArray(detail)) {
-      const messages = detail
-        .map((item) => (item && typeof item.msg === "string" ? item.msg : ""))
-        .filter((msg) => msg !== "");
-      if (messages.length > 0) return messages.join("; ");
-    }
-    return "the snapshot was refused and the reason could not be read";
-  }
-
   // Why the control cannot be used, or "" when it can.
   //
   // THREE DIFFERENT FACTS, and they are three sentences rather than one
@@ -825,7 +809,10 @@
       if (!resp.ok) {
         said(
           body
-            ? refusalText(body.detail)
+            ? refusalText(
+                body.detail,
+                "the snapshot was refused and the reason could not be read",
+              )
             : "the snapshot was refused (HTTP " + resp.status + ")",
         );
         return;
@@ -1015,6 +1002,10 @@
 
   A.busy = busy;
   A.blockingReason = blockingReason;
+  // What a document is called in a sentence or on a chip, shared with the
+  // dataset builder's document picker so a snapshot is "repository
+  // snapshot" there too and never its derived filename.
+  A.docLabel = docLabel;
   A.forgetSnapshot = forgetSnapshot;
   // Repaint on new facts from outside, currently the data policy landing
   // with the catalog. Named refresh rather than exposing render, because

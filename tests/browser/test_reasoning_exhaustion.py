@@ -462,19 +462,25 @@ def test_review_repro_the_reservation_reaches_the_wire_in_a_browser_run(
     page = bench(["stub/exhausted", "stub/fast"])
     check_all_chips(page)
     run(page, "gate on the wire")
-    for i in range(2):
-        expect(status_of(cards(page).nth(i))).not_to_have_text(
-            "working", timeout=DONE_TIMEOUT
-        )
 
-    recorded = httpx.get(stub_url + "/_test/requests", trust_env=False).json()[
-        "requests"
-    ]
-    sent = {
-        r["model"]: r
-        for r in recorded
-        if r["messages"][0]["content"] == "gate on the wire"
-    }
+    # The stub's own log is the witness, so the wait is for the log: both
+    # payloads recorded. A wait on the cards read "not working", which a
+    # card already says while "thinking", before its request is sent; the
+    # log was then read before the payloads landed, and at f6d3f92 this
+    # failed one run in three with a KeyError on the model not yet there.
+    sent = {}
+    for _ in range(300):
+        recorded = httpx.get(stub_url + "/_test/requests", trust_env=False).json()[
+            "requests"
+        ]
+        sent = {
+            r["model"]: r
+            for r in recorded
+            if r["messages"][0]["content"] == "gate on the wire"
+        }
+        if {"stub/exhausted", "stub/fast"} <= set(sent):
+            break
+        page.wait_for_timeout(50)
 
     # VOUCHED: mandatory, budget support, parameter advertised. The cap
     # rides, and it is half the budget this run was actually sent.

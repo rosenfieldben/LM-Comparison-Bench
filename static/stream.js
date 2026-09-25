@@ -23,15 +23,6 @@
     }
   }
 
-  // Whether a controls object holds anything at all. Rule one lives here on
-  // the client side: an empty controls set must produce a body with no
-  // params key, not a body carrying an empty object, because the server
-  // stores the two identically but the wire should not have to be trusted
-  // to collapse them.
-  function hasControls(controls) {
-    return controls != null && Object.keys(controls).length > 0;
-  }
-
   const promptEl = document.getElementById("prompt");
   const resultsEl = document.getElementById("results");
   const runLabelEl = document.getElementById("run-label");
@@ -362,7 +353,7 @@
           // before any upstream call, is the record; this is the claim being
           // checked against it. Omitted entirely when nothing was set, which
           // is what keeps a blank run's body what it always was.
-          ...(hasControls(controls) ? { params: controls } : {}),
+          ...(BenchLib.hasControls(controls) ? { params: controls } : {}),
           // The documents this member brings, which the server checks
           // against the group's declaration before composing anything: a
           // member that disagrees with its group is refused rather than
@@ -555,7 +546,7 @@
           // which is what makes the group row the thing later runs are
           // checked against rather than a claim assembled after the money
           // moved.
-          ...(hasControls(controls) ? { params: controls } : {}),
+          ...(BenchLib.hasControls(controls) ? { params: controls } : {}),
           // The documents, declared here with everything else the group
           // fixes before its first call. This is where the composed size
           // and, in native mode, every model's image capability are
