@@ -4652,6 +4652,11 @@ def cited_dataset(
     the bytes then come from the store under the key that was compared.
     Either way what is returned is the dataset the record cites, or
     nothing is returned at all.
+
+    SYNCHRONOUS ON PURPOSE. start_scoring calls this between its check
+    that the one scoring slot is free and its claim of it; an await here
+    would let a second request pass that check before the claim, and two
+    passes would share the slot. See the comment at that check.
     """
     if (path is None) == (digest is None):
         raise HTTPException(422, ONE_DATASET)
@@ -6468,6 +6473,13 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
             "once its trials have finished, so the pass sees every result",
         )
     state = app.state.scoring_run
+    # ONE PASS AT A TIME HOLDS ONLY BECAUSE NOTHING FROM THIS CHECK TO THE
+    # CLAIM BELOW AWAITS. The check and state["active"] = experiment_id run
+    # in one step of the event loop, so no second request can be served
+    # between them and find the slot free too. cited_dataset is synchronous,
+    # and that is what keeps it so: make it (or anything else between here
+    # and the claim) await, and two requests can both pass this check and
+    # start two passes over the one slot.
     if state["active"] is not None:
         raise HTTPException(
             409, f"a scoring pass for experiment {state['active']} is running"

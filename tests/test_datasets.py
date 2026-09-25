@@ -6,8 +6,10 @@ message is the whole product of a validation error: a refusal that does
 not say which line is a refusal the author cannot act on.
 """
 
+import functools
 import hashlib
 import json
+import platform
 import re
 from pathlib import Path
 
@@ -462,38 +464,158 @@ def test_a_refusal_quotes_a_large_value_in_brief():
         assert len(str(exc.value)) < 200, str(exc.value)[:120]
 
 
-def test_a_value_too_deep_to_repr_is_named_on_its_line():
-    """WINDOW: parse_dataset over lines whose scorer kind, pin kind or
-    capture id is a list nested deeper than repr() can walk but shallower
-    than json.loads refuses.
+# THE DEPTHS ARE THE INTERPRETER'S, NOT THE TEST'S. How deep json.loads
+# decodes and how deep repr() walks are limits of the running Python, and
+# they differ by version and operating system. Measured with bare lists:
+# on macOS, 3.11 decodes 993 and prints 995, 3.12 9997 and 9996, 3.13
+# 9998 and 9997, 3.14 74663 and 43553; on ubuntu, 3.12 prints every depth
+# json.loads decodes (the operator's N4 pass) and 3.11 refuses to decode
+# 60000 (CI run 36092459473). A proof that named one depth held only
+# where that depth sat in the window (a line decodes, repr overflows), so
+# these measure the running interpreter by bisection instead.
+DEPTH_CAP = 1 << 18
+# The parser's own frames sit above the test's, so a line that decodes
+# here by a hair could fail to decode inside parse_dataset and be refused
+# as JSON, never reaching the field the proof is about.
+DEPTH_MARGIN = 50
 
-    Each is refused, but the refusal quoted the value with repr(), which
-    raised RecursionError and escaped both doors as a 500. The value is
-    now quoted to a bounded depth."""
-    depth = 60_000
+
+def _nested(depth: int) -> list:
+    value: list = []
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+def _deepest(ok) -> int:
+    """The largest depth up to DEPTH_CAP for which ok holds, by bisection
+    (ok holds at 0 and, past its limit, at no greater depth)."""
+    if ok(DEPTH_CAP):
+        return DEPTH_CAP
+    low, high = 0, DEPTH_CAP
+    while high - low > 1:
+        mid = (low + high) // 2
+        if ok(mid):
+            low = mid
+        else:
+            high = mid
+    return low
+
+
+def _decodes(depth: int) -> bool:
+    try:
+        json.loads("[" * depth + "]" * depth)
+    except RecursionError:
+        return False
+    return True
+
+
+def _prints(depth: int) -> bool:
+    try:
+        repr(_nested(depth))
+    except RecursionError:
+        return False
+    return True
+
+
+@functools.cache
+def _depth_limits() -> tuple[int, int]:
+    """(deepest json.loads decodes, deepest repr() prints) here."""
+    return _deepest(_decodes), _deepest(_prints)
+
+
+def _deep_lines(depth: int) -> list[tuple[str, str]]:
+    """The three lines whose quoted value is a list nested `depth` deep,
+    each with the field its refusal names. Each line nests the value up
+    to three levels deeper than the value itself."""
     deep = "[" * depth + "]" * depth
-    # PRE-STATE: this depth decodes, and repr() of it overflows.
-    value = json.loads(deep)
-    with pytest.raises(RecursionError):
-        repr(value)
     pin = (
         '{"digest": "' + "a" * 64 + '", "extractor": "x", '
         '"extractor_version": "1", "kind": '
     )
-    lines = [
-        '{"id": "t", "prompt": "p", "scorer": {"kind": ' + deep + "}}",
-        '{"id": "t", "prompt": "p", "attachments": [' + pin + deep + "}]}",
-        '{"id": "t", "prompt": "p", "attachments": ['
-        + pin
-        + '"snapshot", "capture_id": '
-        + deep
-        + "}]}",
+    return [
+        ('{"id": "t", "prompt": "p", "scorer": {"kind": ' + deep + "}}", "scorer kind"),
+        (
+            '{"id": "t", "prompt": "p", "attachments": [' + pin + deep + "}]}",
+            ".kind is",
+        ),
+        (
+            '{"id": "t", "prompt": "p", "attachments": ['
+            + pin
+            + '"snapshot", "capture_id": '
+            + deep
+            + "}]}",
+            ".capture_id is",
+        ),
     ]
-    for text in lines:
+
+
+def _refusals_are_bounded(depth: int) -> None:
+    for text, field in _deep_lines(depth):
+        # PRE-STATE: the line decodes, so what is refused is the field.
+        json.loads(text)
         with pytest.raises(DatasetError) as exc:
             parse_dataset(dataset(line(id="t0", prompt="a"), text))
-        assert str(exc.value).startswith("line 2: "), str(exc.value)[:80]
-        assert len(str(exc.value)) < 300
+        message = str(exc.value)
+        assert message.startswith("line 2: "), message[:80]
+        assert field in message, message[:120]
+        assert len(message) < 300, message[:120]
+
+
+def test_a_value_as_deep_as_the_decoder_takes_is_quoted_in_bounded_words():
+    """WINDOW: parse_dataset over lines whose scorer kind, pin kind or
+    capture id is a list nested as deep as json.loads decodes on the
+    running interpreter (found by bisection, less a margin for the
+    parser's own frames).
+
+    PLATFORM-INDEPENDENT. Each is refused on its line, naming the field,
+    in a sentence under 300 characters: the value is quoted to a bounded
+    depth (_quoted). Plain repr() of the same value is thousands of
+    characters where repr() can walk it and a RecursionError where it
+    cannot (PRE-STATE), and either fails here, so a parser that went back
+    to repr() fails on every interpreter in the CI matrix."""
+    decodes, _ = _depth_limits()
+    depth = decodes - 3 - DEPTH_MARGIN
+    assert depth > 500, (platform.python_version(), decodes)
+    try:
+        plain = repr(_nested(depth))
+    except RecursionError:
+        pass
+    else:
+        assert len(plain) > 300
+
+    _refusals_are_bounded(depth)
+
+
+def test_a_value_too_deep_to_repr_is_named_on_its_line():
+    """WINDOW: parse_dataset over lines whose scorer kind, pin kind or
+    capture id is a list nested deeper than repr() can walk but shallow
+    enough that json.loads decodes the line, on an interpreter where such
+    a depth exists.
+
+    Each was refused, but the refusal quoted the value with repr(), which
+    raised RecursionError and escaped both doors as a 500 (224d488). The
+    value is now quoted to a bounded depth. THE WINDOW IS PLATFORM-BOUND:
+    it exists where the decoder takes lists deeper than repr() walks
+    (macOS 3.14, measured) and not where repr() walks every depth the
+    decoder takes (ubuntu 3.12, and 3.11 to 3.13 on macOS once a line
+    nests the value), so this runs only where the running interpreter
+    has it, and is skipped with both measured depths where it does not.
+    The platform-independent proof is the one above."""
+    decodes, prints = _depth_limits()
+    depth = decodes - 3 - DEPTH_MARGIN
+    if depth <= prints:
+        pytest.skip(
+            f"no window on {platform.system()} Python {platform.python_version()}: "
+            f"json.loads decodes lists nested {decodes} deep and repr() prints "
+            f"{prints}, so no line the decoder takes holds a value repr() cannot "
+            "print"
+        )
+    # PRE-STATE: repr() of this value overflows.
+    with pytest.raises(RecursionError):
+        repr(_nested(depth))
+
+    _refusals_are_bounded(depth)
 
 
 def test_a_threshold_too_large_for_a_float_is_outside_the_range():
