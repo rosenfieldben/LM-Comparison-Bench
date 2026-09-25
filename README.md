@@ -886,7 +886,10 @@ or a test rather than by this list alone.
   1024)`, and `max_tokens` must be strictly higher than the reasoning
   budget. Sending nothing does not rescue it: omission hands the
   decision to the provider, and a mandatory route cannot decide zero.
-  Derived from the contract's arithmetic, not measured.
+  Derived from the contract's arithmetic, not measured. It is a rule for
+  whoever chooses the judge, and nothing enforces it: the Score door
+  takes any `judge_model`, and the page's judge select is not filtered
+  (see `BACKLOG.md`).
 - **2026-08-13. `is_byok` is a boolean in both documents, and the two
   were read by different rules.** The in-band usage object required a
   real boolean; the generation endpoint reached for the SQLite decoder

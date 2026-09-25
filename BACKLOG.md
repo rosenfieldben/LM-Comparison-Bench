@@ -207,3 +207,20 @@ a23b257).
   with `primary_judge` when that is designed.
 - **First written:** no commit to cite. Noticed at the N2 checkpoint; the
   reason was written by the commissioner in the N3 checkpoint exchange.
+
+## Refusing a judge route with mandatory reasoning
+
+- **What:** the Score door refusing a `judge_model` whose route has
+  mandatory reasoning, the rule the README states under Pinned
+  observations (2026-08-13, derived from the contract's arithmetic, not
+  measured). Nothing enforces it today: the door accepts any judge id,
+  and the page's judge select is the whole catalog, unfiltered, with a
+  note that says so.
+- **Deferred by:** Phase N (N4), ruled at the operator's N4 pass.
+- **Reason:** Enforcing the rule at the Score door needs the catalog to
+  carry the reasoning field it currently drops, which is a change to the
+  catalog contract and not to the Score door, so it belongs with
+  whichever phase next touches the catalog. The commission's claim that
+  the rule is 'enforced where it lives' was false; N4 tombstoned it.
+- **First written:** the question in the N4 commit body, 7c19c2b
+  (restatement 5); the reason in the operator's words at the N4 pass.
