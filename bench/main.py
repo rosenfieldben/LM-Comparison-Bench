@@ -6288,8 +6288,10 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
     never be recovered without paying for the model call again, so
     halting protects the budget for a decision the user should make. A
     refused score can be filled in by a later pass over the same stored
-    text at no extra model cost, so stopping the whole pass for one would
-    trade a complete scoring run for nothing.
+    text with no model under test called again, so stopping the whole
+    pass for one would trade a complete scoring run for nothing. That
+    later pass sends every judge result that has response text to the
+    judge again, not only the gaps, and pays for each call.
     """
     db = app.state.db
     experiment = store.get_experiment(db, experiment_id)

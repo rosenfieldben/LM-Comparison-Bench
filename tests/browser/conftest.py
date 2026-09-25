@@ -291,3 +291,34 @@ def snapshot_bench(page, snapshot_bench_url):
         return page
 
     return open_bench
+
+
+# ---- The experiment runner and the scoring slot (Phases N3 and N4).
+# Shared here so test_n3.py and test_n4.py take the same fixtures; the
+# helpers they call live in test_n3.py beside the tests that made them.
+
+
+@pytest.fixture
+def runs(page, bench_url):
+    """Experiments a test started, stopped and drained afterwards whatever
+    the test's outcome, so the session's one runner is free for the next
+    test. Tests append ids; nothing here asserts."""
+    from test_n3 import drain
+
+    started = []
+    yield started
+    for eid in started:
+        drain(page, bench_url, eid)
+
+
+@pytest.fixture
+def scorings(page, bench_url):
+    """For a test that scores: the idle probe readied while the runner is
+    free, and after the test, pass or fail, a wait for the bench's one
+    scoring slot to be free, so the next test's Score does not meet this
+    one's pass. The wait fails loudly if the slot never frees."""
+    from test_n3 import probe_target, wait_scoring_idle
+
+    probe_target(page, bench_url)
+    yield
+    wait_scoring_idle(page, bench_url)

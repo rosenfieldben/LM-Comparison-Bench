@@ -5172,9 +5172,10 @@ def test_a_ceiling_refusal_during_scoring_records_the_gap_and_the_pass_goes_on(
     runner's default on purpose. A refused trial can only be recovered by
     paying for the model call again, so halting protects the budget for a
     decision the user should make. A refused score can be filled in by a
-    later pass over the same stored text at no extra model cost, so
-    stopping the whole pass for one would trade a complete scoring run
-    for nothing.
+    later pass over the same stored text with no model under test called
+    again, so stopping the whole pass for one would trade a complete
+    scoring run for nothing. That later pass sends every judge result
+    that has response text to the judge again, and pays for each call.
     """
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
@@ -19842,3 +19843,196 @@ def test_the_projection_text_says_what_the_door_returned(client):
         "unpriced: model/beta. No figure is given, because a total missing one "
         "arm would read as the whole comparison's total."
     )
+
+
+# ---- Phase N4: the Score button's helpers, executed against the door.
+
+
+def wait_scoring_done(client, timeout_s=20.0):
+    deadline = time.monotonic() + timeout_s
+    while client.app.state.scoring_run["active"] is not None:
+        assert time.monotonic() < deadline, "scoring pass did not finish"
+        client.get("/models")
+    assert client.app.state.scoring_run["error"] is None
+
+
+@respx.mock
+def test_every_score_nudge_is_named_and_every_body_is_what_the_door_takes(
+    client, tmp_path
+):
+    """WINDOW: scoreNudge and scoreBody executed in node over each state of
+    a finished experiment's dataset summary, and POST
+    /experiments/{id}/score sent the body the page would compose in each,
+    with the pass waited out after every 202 so the next answer is not the
+    busy slot's.
+
+    ONE NUDGE IS A REFUSAL AND THREE ARE NOT, and both halves are proved.
+    The unstored digest the page greys Score for, sent anyway, is refused
+    in the door's words. The three greyed although the door accepts them
+    (the summary being read, the summary unknown after a failed question,
+    a judge dataset with no judge chosen) are ACCEPTED, which is why
+    scoreNudge's comment names them; the judge-less one records "no judge
+    model was given" for the judge task, for good, which is why the page
+    waits. Un-nudged: a judge dataset with a judge chosen sends it and its
+    judge rows carry it; a dataset with no judge tasks sends no judge
+    although one is chosen, and its rows carry none."""
+    judged_route()
+    judged = store_dataset(client, "judged", *THREE_KINDS).json()
+    plain = store_dataset(client, "plain", THREE_KINDS[0]).json()
+
+    def finished_over(digest):
+        eid = client.post(
+            "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+        ).json()["id"]
+        assert run_by_digest(client, eid, digest)["status"] == "done"
+        return eid
+
+    ej = finished_over(judged["digest"])
+    ep = finished_over(plain["digest"])
+    path = tmp_path / "by-path.jsonl"
+    # Bytes of its own: the same bytes as `plain` would be a stored digest.
+    path.write_text(
+        dataset_text({**THREE_KINDS[0], "prompt": "read from a file only"}),
+        encoding="utf-8",
+    )
+    ex = client.post(
+        "/experiments", json=experiment_body(str(path), lineup=["model/alpha"])
+    ).json()["id"]
+    assert (
+        client.post(
+            f"/experiments/{ex}/start", json={"dataset_path": str(path)}
+        ).status_code
+        == 202
+    )
+    drain_progress(client, ex)
+    unstored = client.get(f"/experiments/{ex}").json()["dataset_digest"]
+
+    def summary(stored):
+        return {"scorers": stored["scorers"], "cites_documents": False}
+
+    # (name, experiment, digest, summary as the page holds it, judge, door)
+    cases = [
+        ("reading", ej, judged["digest"], None, "", 202),
+        ("unknown", ej, judged["digest"], "UNKNOWN", "", 202),
+        ("no judge chosen", ej, judged["digest"], summary(judged), "", 202),
+        ("unstored", ex, unstored, False, "judge/one", 422),
+        ("judge chosen", ej, judged["digest"], summary(judged), "judge/one", 202),
+        ("no judge tasks", ep, plain["digest"], summary(plain), "judge/one", 202),
+    ]
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map(([d, s, j]) => {"
+        " const summary = s === 'UNKNOWN' ? undefined : s;"
+        " return [l.scoreNudge(summary, j), l.scoreBody(d, summary, j)]; })));",
+        [[digest, held, judge] for _, _, digest, held, judge, _ in cases],
+    )
+    nudged = {"reading", "unknown", "no judge chosen", "unstored"}
+    for (name, eid, digest, _, judge, door), (nudge, body) in zip(
+        cases, js, strict=True
+    ):
+        assert (nudge is not None) == (name in nudged), (name, nudge)
+        before = len(scores_in(client, eid))
+        resp = client.post(f"/experiments/{eid}/score", json=body)
+        assert resp.status_code == door, (name, resp.text)
+        if door == 422:
+            assert resp.json()["detail"].startswith(
+                f"no stored dataset has digest {unstored}"
+            )
+            assert client.app.state.scoring_run["active"] is None
+            continue
+        wait_scoring_done(client)
+        added = scores_in(client, eid)[before:]
+        judges = {(s["scorer"], s["judge_model"]) for s in added}
+        if name == "judge chosen":
+            assert body == {"dataset_digest": digest, "judge_model": "judge/one"}
+            # The mocked judge's own verdict, so the row is a grading and
+            # not a trial that never reached a model.
+            assert [
+                (s["judge_model"], s["score"], s["detail"])
+                for s in added
+                if s["scorer"] == "judge"
+            ] == [("judge/one", 0.9, None)]
+        elif name == "no judge tasks":
+            assert body == {"dataset_digest": digest}
+            assert judges == {("exact", None)}
+        else:
+            assert body == {"dataset_digest": digest}, name
+            gap = [s for s in added if s["scorer"] == "judge"]
+            assert [s["detail"] for s in gap] == [
+                "no judge model was given for this scoring pass"
+            ], name
+
+
+@respx.mock
+def test_another_scoring_pass_is_refused_in_the_doors_words(client):
+    """WINDOW: a scoring pass on experiment A held open by a judge call
+    that waits on a gate, POST /experiments/{id}/score for B and for A
+    while it is held, and a press on B once the gate opens and the pass
+    has ended.
+
+    The bench has one scoring slot. While A's pass holds it, the door
+    refuses B and a second press on A alike with "a scoring pass for
+    experiment A is running", word for word (the page prints it and the
+    browser suite's idle probe reads it), and starts nothing: the slot is
+    still A's and B has no new rows. Once the pass ends, the same press
+    on B is taken. PRE-STATE: the slot is free before A's pass."""
+    gate = asyncio.Event()
+
+    async def route(request):
+        if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS:
+            await gate.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    judged = store_dataset(client, "judged", *THREE_KINDS).json()["digest"]
+    plain = store_dataset(client, "plain", THREE_KINDS[0]).json()["digest"]
+    ids = {}
+    for label, digest in (("a", judged), ("b", plain)):
+        eid = client.post(
+            "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+        ).json()["id"]
+        assert run_by_digest(client, eid, digest)["status"] == "done"
+        ids[label] = eid
+    a, b = ids["a"], ids["b"]
+    assert client.app.state.scoring_run["active"] is None
+
+    started = client.post(
+        f"/experiments/{a}/score",
+        json={"dataset_digest": judged, "judge_model": "judge/one"},
+    )
+    assert started.status_code == 202
+    assert client.app.state.scoring_run["active"] == a
+    before_b = len(scores_in(client, b))
+
+    for eid, digest in ((b, plain), (a, judged)):
+        refused = client.post(
+            f"/experiments/{eid}/score", json={"dataset_digest": digest}
+        )
+        assert refused.status_code == 409
+        assert (
+            refused.json()["detail"] == f"a scoring pass for experiment {a} is running"
+        )
+        assert client.app.state.scoring_run["active"] == a
+    assert len(scores_in(client, b)) == before_b
+
+    gate.set()
+    wait_scoring_done(client)
+    assert (
+        client.post(
+            f"/experiments/{b}/score", json={"dataset_digest": plain}
+        ).status_code
+        == 202
+    )
+    wait_scoring_done(client)

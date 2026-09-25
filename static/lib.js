@@ -889,6 +889,87 @@
     return parts.join(" · ");
   }
 
+  // ---- Scoring (Phase N4).
+
+  // A dataset summary as the experiment panel holds it for an
+  // experiment's RECORDED digest, never for the Datasets selection: the
+  // summary object GET /datasets/{digest} served (held), false when the
+  // store answered 404 (the experiment was read from a file by path), a
+  // string when the door refused the bytes it holds with a sentence (they
+  // no longer hash to their digest, or are not UTF-8; the Score door
+  // would refuse them the same way), null while the question is out,
+  // undefined when it is not known (the question failed and is asked
+  // again at the next selection).
+  function datasetHeld(summary) {
+    return summary !== null && typeof summary === "object";
+  }
+
+  function judgeTasks(summary) {
+    return datasetHeld(summary) && summary.scorers.includes("judge");
+  }
+
+  // The body POST /experiments/{id}/score is sent. RULE ONE: a key only
+  // when set. The dataset is named by the digest the experiment recorded,
+  // and judge_model is sent only when that dataset has judge tasks AND a
+  // judge was chosen. The door accepts a judge for a dataset with no judge
+  // tasks and records nothing of it, so the page keeps one off the wire:
+  // the select is hidden for such a dataset and the choice is cleared
+  // when the selection moves, and this rule holds the body to it whatever
+  // state the page is in.
+  function scoreBody(digest, summary, judge) {
+    const body = { dataset_digest: digest };
+    if (judgeTasks(summary) && judge !== "") body.judge_model = judge;
+    return body;
+  }
+
+  // Why Score is greyed, or null. TWO OF THESE ARE REFUSALS AND THREE ARE
+  // NOT, which is the opposite of the Create nudges and is deliberate.
+  // The door refuses the unstored digest and bytes it cannot cite, in its
+  // own words, and the second is its sentence as the dataset door gave
+  // it. It accepts the other three (reading, not known, no judge chosen),
+  // and a pass it accepts cannot be taken back: a judge-less pass over
+  // judge tasks records "no judge model was given" for every one of
+  // them, for good, since records never rewrite. Without the summary the
+  // page cannot tell whether a judge is needed, so it waits rather than
+  // guess; the commission rules the judge required. catalogState is
+  // BenchControls.catalogIds().state, so the page does not ask for a
+  // judge it cannot offer.
+  function scoreNudge(summary, judge, catalogState) {
+    if (summary === null) return "reading which scorers its dataset declares";
+    if (summary === undefined) {
+      return "its dataset could not be read; select the experiment again to ask again";
+    }
+    if (typeof summary === "string") return summary;
+    if (summary === false) {
+      return (
+        "its dataset was read from a file and is not stored here, so the " +
+        "page cannot name it; score it through the API with its " +
+        "dataset_path, and judge_model if any of its tasks is judged"
+      );
+    }
+    if (judgeTasks(summary) && judge === "") {
+      if (catalogState === "pending") {
+        return "choose a judge once the catalog has loaded: its dataset has judge tasks";
+      }
+      if (catalogState === "unavailable") {
+        return (
+          "no judge can be chosen here, because the catalog is not " +
+          "available; score it through the API with judge_model"
+        );
+      }
+      return "choose a judge: its dataset has judge tasks";
+    }
+    return null;
+  }
+
+  // What Score's label says it spends. A judge's calls are billed against
+  // the same ceiling as trials; a pass of deterministic scorers calls no
+  // model. Plain "Score" until the summary says which it is.
+  function scoreLabel(summary) {
+    if (!datasetHeld(summary)) return "Score";
+    return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -931,6 +1012,11 @@
     experimentNudge,
     projectionText,
     experimentRowMeta,
+    datasetHeld,
+    judgeTasks,
+    scoreBody,
+    scoreNudge,
+    scoreLabel,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;

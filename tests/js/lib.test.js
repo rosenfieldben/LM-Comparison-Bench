@@ -40,6 +40,11 @@ const {
   experimentNudge,
   projectionText,
   experimentRowMeta,
+  datasetHeld,
+  judgeTasks,
+  scoreBody,
+  scoreNudge,
+  scoreLabel,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -1093,4 +1098,99 @@ test("experimentRowMeta counts every finished trial and names the trouble", () =
     experimentRowMeta(row({ status: "running", trials_total: 1 })),
     "running · 0/1 trials",
   );
+});
+
+test("datasetHeld is a summary object and nothing else", () => {
+  assert.strictEqual(
+    datasetHeld({ scorers: [], cites_documents: false }),
+    true,
+  );
+  for (const value of [undefined, null, false, true]) {
+    assert.strictEqual(datasetHeld(value), false);
+  }
+});
+
+test("scoreBody names the recorded digest, and a judge only for judge tasks", () => {
+  const judged = { scorers: ["exact", "judge"], cites_documents: false };
+  const plain = { scorers: ["exact", "regex"], cites_documents: false };
+  assert.deepStrictEqual(scoreBody("d", judged, "stub/j"), {
+    dataset_digest: "d",
+    judge_model: "stub/j",
+  });
+  // Blank is not sent: the door's min_length would refuse "".
+  assert.deepStrictEqual(scoreBody("d", judged, ""), { dataset_digest: "d" });
+  // The door would accept a judge here and record nothing of it; only
+  // this rule keeps it off the wire.
+  assert.deepStrictEqual(scoreBody("d", plain, "stub/j"), {
+    dataset_digest: "d",
+  });
+  assert.deepStrictEqual(scoreBody("d", { scorers: [] }, "stub/j"), {
+    dataset_digest: "d",
+  });
+});
+
+test("scoreNudge says why Score waits, in every summary state", () => {
+  const judged = { scorers: ["judge"], cites_documents: false };
+  const plain = { scorers: ["exact"], cites_documents: false };
+  assert.strictEqual(
+    scoreNudge(null, ""),
+    "reading which scorers its dataset declares",
+  );
+  assert.strictEqual(
+    scoreNudge(undefined, "stub/j"),
+    "its dataset could not be read; select the experiment again to ask again",
+  );
+  assert.match(
+    scoreNudge(false, "stub/j"),
+    /^its dataset was read from a file/,
+  );
+  assert.strictEqual(
+    scoreNudge(judged, ""),
+    "choose a judge: its dataset has judge tasks",
+  );
+  assert.strictEqual(scoreNudge(judged, "stub/j"), null);
+  assert.strictEqual(scoreNudge(plain, ""), null);
+  assert.strictEqual(scoreNudge({ scorers: [] }, ""), null);
+});
+
+test("scoreLabel says what a press spends, and nothing until it knows", () => {
+  assert.strictEqual(
+    scoreLabel({ scorers: ["exact", "judge"] }),
+    "Score · pays the judge",
+  );
+  assert.strictEqual(scoreLabel({ scorers: ["regex"] }), "Score · free");
+  assert.strictEqual(scoreLabel({ scorers: [] }), "Score · free");
+  for (const unknown of [undefined, null, false]) {
+    assert.strictEqual(scoreLabel(unknown), "Score");
+  }
+  assert.strictEqual(judgeTasks({ scorers: ["judge"] }), true);
+  assert.strictEqual(judgeTasks(false), false);
+});
+
+test("scoreNudge follows the catalog and shows the door's sentence as given", () => {
+  const judged = { scorers: ["judge"], cites_documents: false };
+  assert.strictEqual(
+    scoreNudge(judged, "", "pending"),
+    "choose a judge once the catalog has loaded: its dataset has judge tasks",
+  );
+  assert.strictEqual(
+    scoreNudge(judged, "", "unavailable"),
+    "no judge can be chosen here, because the catalog is not available; " +
+      "score it through the API with judge_model",
+  );
+  assert.strictEqual(
+    scoreNudge(judged, "", "loaded"),
+    "choose a judge: its dataset has judge tasks",
+  );
+  // The catalog changes nothing once a judge is chosen, or where none is
+  // needed.
+  assert.strictEqual(scoreNudge(judged, "stub/j", "unavailable"), null);
+  assert.strictEqual(scoreNudge({ scorers: ["exact"] }, "", "pending"), null);
+  // A refusal of the stored bytes is the door's sentence, as it is.
+  const refused = "the bytes stored under digest d hash to e: edited by hand";
+  assert.strictEqual(scoreNudge(refused, "stub/j", "loaded"), refused);
+  assert.strictEqual(scoreLabel(refused), "Score");
+  assert.deepStrictEqual(scoreBody("d", refused, "stub/j"), {
+    dataset_digest: "d",
+  });
 });

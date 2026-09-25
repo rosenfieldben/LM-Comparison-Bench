@@ -1214,7 +1214,7 @@
    the reason the datasets library gives. A selected row is marked by
    the accent bar alone. Every pairing is in tests/browser/test_contrast.py,
    and tests/browser/test_n3.py measures the panel's own text on the live
-   page. */
+   page. The Score row (Phase N4) uses the same four colours. */
 #experiment-create,
 #experiment-selected {
   display: grid;
@@ -1228,6 +1228,7 @@
 #experiment-head,
 #experiment-create-row,
 #experiment-start-row,
+#experiment-score-row,
 #experiment-list-head {
   display: flex;
   flex-wrap: wrap;
@@ -1237,6 +1238,11 @@
 #experiment-head .panel-label,
 #experiment-list-head .panel-label { margin: 0; }
 #experiment-list-head .panel-label { color: var(--text-dim); }
+/* The captioned judge select sits beside Score, so the row lines up on
+   the controls' baseline rather than their middle; its notes take a line
+   of their own below. */
+#experiment-score-row { align-items: flex-end; }
+#experiment-score-notes { display: grid; gap: 2px; flex-basis: 100%; }
 #experiment-name { flex: 1; min-width: 160px; max-width: 420px; }
 #experiment-sources { display: grid; gap: 2px; font-size: 11px; color: var(--text-sec); }
 #experiment-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
@@ -1252,10 +1258,15 @@
 #experiment-start-note,
 #experiment-counters,
 #experiment-dataset,
-#experiment-stream { font-size: 11px; color: var(--text-faint); }
+#experiment-stream,
+#experiment-score-nudge,
+#experiment-judge-note,
+#experiment-score-note { font-size: 11px; color: var(--text-faint); }
 #experiment-estimand-note:empty,
 #experiment-attachments-note:empty,
-#experiment-start-note:empty { display: none; }
+#experiment-start-note:empty,
+#experiment-judge-note:empty,
+#experiment-score-note:empty { display: none; }
 #experiment-title { font-size: 12px; color: var(--text); }
 #experiment-status { font-size: 11px; color: var(--text-sec); }
 #experiment-create-msg,

@@ -300,10 +300,10 @@
 </details>
 
 <!-- Experiments: create one over a stored dataset, start it, watch it,
-     stop it, and open its report. Money moves on Start and on nothing
-     else; Create is free and says so. The lineup, budget and controls are
-     the composer's own, read when Create is pressed, so there is one of
-     each on the page. -->
+     stop it, score it, and open its report. Money moves on Start, and on
+     Score when a judge grades; Create is free and says so, and Score says
+     which it is. The lineup, budget and controls are the composer's own,
+     read when Create is pressed, so there is one of each on the page. -->
 <details id="experiments">
   <summary data-testid="experiments-toggle">Experiments</summary>
   <div id="experiment-create" data-testid="experiment-create">
@@ -401,6 +401,29 @@
       <span id="experiment-projection" data-testid="experiment-projection"></span>
       <span id="experiment-start-note" data-testid="experiment-start-note"></span>
       <button id="experiment-stop" data-testid="experiment-stop" type="button" hidden>Stop</button>
+    </div>
+    <!-- Scoring, for a finished experiment only: absent while it is
+         created or running, when the door would refuse it. The judge
+         select is the whole catalog, filtered by nothing, and is shown
+         only when the experiment's recorded dataset has judge tasks. -->
+    <div id="experiment-score-row" data-testid="experiment-score-row" hidden>
+      <div class="xp-cap" id="experiment-judge-field">
+        <span class="xp-cap-text" id="experiment-judge-caption">judge</span>
+        <span class="sel-wrap">
+          <select id="experiment-judge" data-testid="experiment-judge"
+                  autocomplete="off" aria-labelledby="experiment-judge-caption"
+                  aria-describedby="experiment-judge-note">
+            <option value="">choose a judge</option>
+          </select>
+        </span>
+      </div>
+      <button id="experiment-score" data-testid="experiment-score" type="button"
+              aria-describedby="experiment-score-nudge experiment-score-note" disabled>Score</button>
+      <span id="experiment-score-nudge" data-testid="experiment-score-nudge" role="status"></span>
+      <div id="experiment-score-notes">
+        <span id="experiment-judge-note" data-testid="experiment-judge-note"></span>
+        <span id="experiment-score-note" data-testid="experiment-score-note"></span>
+      </div>
     </div>
     <div id="experiment-action-msg" data-testid="experiment-action-msg" role="status"></div>
   </div>

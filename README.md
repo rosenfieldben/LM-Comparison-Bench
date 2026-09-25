@@ -1965,8 +1965,9 @@ For a stored dataset, send `"dataset_digest": "<digest>"` in place of
 `dataset_path`; exactly one of the two.
 
 **In the browser**, the **Experiments** panel creates an experiment over
-a stored dataset, starts it, watches it, stops it, and opens its report.
-Money moves on Start and on nothing else.
+a stored dataset, starts it, watches it, stops it, scores it, and opens
+its report. Money moves on Start, and on Score when a judge grades; each
+button says which it is.
 
 - **Create** reads the dataset selected in the Datasets panel and the
   composer's own checked lineup, budget and `+ Controls`, at the moment
@@ -1992,6 +1993,10 @@ Money moves on Start and on nothing else.
   counters; the stream is closed when the experiment finishes.
 - **Stop** is present while it runs, and the trial in flight finishes
   first.
+- **Score** is present once the trials have finished, and absent while
+  the experiment is created or running, when the door would refuse it.
+  It sends the digest the experiment recorded, and a judge only when that
+  dataset has judge tasks; see Scoring below.
 - Selecting a row marks it and opens its report, as it always has.
 
 The strict-mode fields are not set from the page: see Estimands below.
@@ -2356,6 +2361,36 @@ curl -X POST localhost:8000/experiments/1/score \
 `dataset_digest` in place of `dataset_path` scores against a stored
 dataset, checked against the recorded digest the same way.
 
+**In the browser**, the Experiments panel's **Score** button does this for
+the selected experiment once its trials have finished. It asks the store
+what the experiment's recorded dataset declares and waits until it knows:
+
+- With no judge tasks the label reads "Score · free", since deterministic
+  scorers call no model, and no judge is sent: the door would accept one
+  and record nothing of it.
+- With judge tasks it reads "Score · pays the judge". A judge select
+  appears, holding the whole catalog, filtered by nothing, and Score waits
+  until a judge is chosen. The door would accept a pass without a judge,
+  but that pass records "no judge model was given" for every judge task,
+  and records never rewrite. The choice is cleared when another
+  experiment is selected. The bench does not check the judge: the rule
+  under Pinned observations (2026-08-13) that a judge route must not have
+  mandatory reasoning is enforced by no door, and the note beside the
+  select says so. While the catalog is loading, or when it is not
+  available, no judge can be chosen here and Score says so.
+- An experiment whose dataset was read from a file by path, and never
+  stored, is scored through the API with its `dataset_path`, and the
+  panel says so.
+
+The pass runs on the server after the door's 202, and no door says when
+it ends, so the report opened then shows what has been scored by that
+moment; select the experiment again to read more. A refusal, such as
+another pass holding the bench's one scoring slot, is the door's
+sentence, and Score stays live, because the server knows when the other
+pass ends. **Every press scores every trial again**, judged ones
+included; each trial of a judge task that has response text is sent to
+the judge, and each call is paid.
+
 Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
 are pure functions over the stored response text. `normalized_exact` and
 `contains` fold case and collapse whitespace; `exact` strips only the
@@ -2424,9 +2459,11 @@ failure and the pass continues.** This is the opposite of the trial
 runner's default, deliberately. A refused trial can only be recovered by
 paying for the model call again, so halting protects the budget for a
 decision you should make. A refused score can be filled in by a later
-pass over the same stored text at no extra model cost, so stopping the
-whole pass for one would trade a complete scoring run for nothing. Re-run
-the pass and the gaps fill in.
+pass over the same stored text with no model under test called again, so
+stopping the whole pass for one would trade a complete scoring run for
+nothing. Re-run the pass and the gaps fill in; the pass sends every
+judge trial that has response text to the judge again, not only the
+gaps, and pays for each call.
 
 ## Reports
 
@@ -3227,7 +3264,11 @@ picked up without restarts, and verify by eyeball after UI changes:
   Start and nothing is spent. Start it: the counters climb to the total
   and the report opens. Start another over several tasks with a slow
   model and press Stop partway: the status reads "stopped between
-  trials" and the report counts the trials that never ran.
+  trials" and the report counts the trials that never ran. On a finished
+  experiment whose dataset has a judge task, Score reads "Score · pays
+  the judge" and waits for a judge; choose one and press it: the report
+  is read again, and selecting the row again once the pass has ended
+  shows the judge's rows beside the deterministic ones.
 
 ## License
 

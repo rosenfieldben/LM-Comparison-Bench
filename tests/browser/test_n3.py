@@ -1,16 +1,19 @@
 """Phase N3 browser tests: the experiment lifecycle from the page.
 
 Create over a stored dataset, Start, watch the progress door, Stop, and
-the list the report opens from, driven through the panel a person uses
+the list the report opens from (and, since N4, the critical path's Score
+and the Score row's place in the status walk; the rest of Score is in
+test_n4.py), driven through the panel a person uses
 against the real doors and the stub. What the server RECORDED is read
 back through GET /experiments and compared, never what the page believed
 it sent: a page that agreed only with itself would pass every proof here
 while creating something else.
 
-MONEY MOVES ON START AND ON NOTHING ELSE, so Start is the door these
-proofs lean on hardest: it is live for a created experiment and for
-nothing else, it sends the digest the experiment recorded, and a greyed
-button is proved to be a courtesy by sending the request anyway.
+MONEY MOVES ON START (and, since N4, on Score when a judge grades), so
+Start is the door these proofs lean on hardest: it is live for a created
+experiment and for nothing else, it sends the digest the experiment
+recorded, and a greyed button is proved to be a courtesy by sending the
+request anyway.
 
 ONE EXPERIMENT RUNS AT A TIME PER BENCH, and the browser suite shares one
 bench for the whole session, so every test that starts an experiment
@@ -29,7 +32,7 @@ import uuid
 import pytest
 from playwright.sync_api import expect
 from test_contrast import composite, contrast
-from test_i4 import check_all_chips
+from test_i4 import check_all_chips, column_texts
 from test_n import (
     ABORTED_RESOURCE,
     REFUSED_RESOURCE,
@@ -67,17 +70,6 @@ def collectors(page):
     assert [e for e in errors if not e.startswith(tuple(allowed))] == []
 
 
-@pytest.fixture
-def runs(page, bench_url):
-    """Experiments a test started, stopped and drained afterwards whatever
-    the test's outcome, so the session's one runner is free for the next
-    test. Tests append ids; nothing here asserts."""
-    started = []
-    yield started
-    for eid in started:
-        drain(page, bench_url, eid)
-
-
 def drain(page, bench_url, eid):
     """Stop an experiment while it runs and wait until it has finished."""
     for _ in range(400):
@@ -87,6 +79,61 @@ def drain(page, bench_url, eid):
         if status == "running":
             page.request.post(f"{bench_url}/experiments/{eid}/stop", data={})
         page.wait_for_timeout(100)
+
+
+# THE BENCH HAS ONE SCORING SLOT AND NO DOOR SAYS WHEN A PASS ENDS, nor
+# can any door stop one. A test that scores waits for the slot to be free
+# by asking the Score door itself, with a body that can never start a
+# pass: a digest no experiment records, sent to a finished experiment.
+# The door checks the slot before the dataset, so a busy slot answers
+# 409 with its sentence and a free one 422 naming the probe's digest
+# (enforce_recorded_digest's, or stored_dataset's if that check were
+# gone). Anything else fails loudly rather than being read as either.
+# IDLE MEANS THE SLOT IS FREE, NOT THAT THE PASS SCORED ANYTHING: a pass
+# that raised is idle too, so every wait for scores is followed by an
+# assertion on the report.
+PROBE_DIGEST = "0" * 64
+_probe_targets = {}
+
+
+def probe_target(page, bench_url):
+    """The finished experiment the idle probe asks, made once per bench.
+    Its own scoring history does not matter: the slot is the bench's."""
+    if bench_url not in _probe_targets:
+        _, digest = stored_digest(page, bench_url, [{"id": "probe"}])
+        eid = api_experiment(page, bench_url, digest, ["stub/fast"], unique("probe"))
+        assert page.request.post(
+            f"{bench_url}/experiments/{eid}/start", data={"dataset_digest": digest}
+        ).ok
+        assert wait_status(page, bench_url, eid)["status"] == "done"
+        _probe_targets[bench_url] = eid
+    return _probe_targets[bench_url]
+
+
+def scoring_busy(page, bench_url):
+    eid = probe_target(page, bench_url)
+    resp = page.request.post(
+        f"{bench_url}/experiments/{eid}/score", data={"dataset_digest": PROBE_DIGEST}
+    )
+    detail = resp.json().get("detail")
+    if (
+        resp.status == 409
+        and isinstance(detail, str)
+        and re.fullmatch(r"a scoring pass for experiment \d+ is running", detail)
+    ):
+        return True
+    if resp.status == 422 and isinstance(detail, str) and PROBE_DIGEST[:12] in detail:
+        return False
+    raise AssertionError(f"the idle probe got {resp.status}: {resp.text()}")
+
+
+def wait_scoring_idle(page, bench_url, timeout_s=60):
+    """Poll the probe until the scoring slot is free; raise if it never is."""
+    for _ in range(timeout_s * 10):
+        if not scoring_busy(page, bench_url):
+            return
+        page.wait_for_timeout(100)
+    raise AssertionError(f"a scoring pass still held the slot after {timeout_s}s")
 
 
 def stored_digest(page, bench_url, rows, name=None):
@@ -208,17 +255,26 @@ def closed(log, eid):
 # ---- The critical path.
 
 
-def test_review_repro_rows_to_a_report_through_the_panel(page, bench, bench_url, runs):
+def test_review_repro_rows_to_a_report_through_the_panel(
+    page, bench, bench_url, runs, scorings
+):
     """WINDOW: the builder's rows, Store, the Datasets selection, Create,
-    Start, the progress door and the report, all through the page.
+    Start, the progress door, Score with a judge and the report, all
+    through the page.
 
-    THE COMMISSION'S CRITICAL PATH, up to the report (scoring is N4's).
-    Three tasks by rows, one each of exact, regex and judge; stored;
-    created over the stored digest with two stub models; started; the
-    counters watched to the total; the report opened again once the run
-    finished, now saying done. The record carries exactly the digest
-    stored, the lineup checked and the budget shown, and the projection
-    beside Start is the text of the projection Create's answer carried."""
+    THE COMMISSION'S CRITICAL PATH. Three tasks by rows, one each of
+    exact, regex and judge; stored; created over the stored digest with
+    two stub models; started; the counters watched to the total; the
+    report opened again once the run finished, now saying done. The
+    record carries exactly the digest stored, the lineup checked and the
+    budget shown, and the projection beside Start is the text of the
+    projection Create's answer carried. Then, WITHOUT selecting the row
+    again (so the Score row reads what the store answered when Create
+    selected the new experiment, while it was still created),
+    Score waits for a judge, is labelled as paying one, sends exactly the
+    recorded digest and the judge chosen, and the report is read again
+    after the 202; once the pass has ended, the report has three series
+    on each of the two arms, the judge named on the judge rows only."""
     bench(["stub/fast", "stub/slow"])
     check_all_chips(page)
     open_datasets(page)
@@ -283,6 +339,37 @@ def test_review_repro_rows_to_a_report_through_the_panel(page, bench, bench_url,
         "done", timeout=DONE_TIMEOUT
     )
     expect(report.get_by_test_id("report-row")).to_have_count(2)
+    expect(report.get_by_test_id("report-score-row")).to_have_count(0)
+
+    score = page.get_by_test_id("experiment-score")
+    expect(page.get_by_test_id("experiment-score-row")).to_be_visible()
+    expect(score).to_have_text("Score · pays the judge")
+    expect(score).to_be_disabled()
+    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(
+        "Score waits: choose a judge: its dataset has judge tasks"
+    )
+    # A catalog model outside the lineup, so no row is self-judged.
+    page.get_by_test_id("experiment-judge").select_option("stub/html")
+    expect(score).to_be_enabled()
+    with page.expect_request(
+        lambda r: r.url.endswith(f"/experiments/{eid}/report") and r.method == "GET"
+    ):
+        with page.expect_request(
+            lambda r: r.url.endswith(f"/experiments/{eid}/score")
+        ) as sent:
+            score.click()
+    assert json.loads(sent.value.post_data) == {
+        "dataset_digest": digest,
+        "judge_model": "stub/html",
+    }
+    expect(page.get_by_test_id("experiment-action-msg")).to_have_text(
+        re.compile(r"^a scoring pass was started at \d\d:\d\d:\d\d UTC; ")
+    )
+    wait_scoring_idle(page, bench_url)
+    row_for(page, eid).click()
+    judges = column_texts(page, "report-scores", "report-judge", 6)
+    none = chr(0x2014)  # the report's cell for a series with no judge
+    assert sorted(judges) == ["stub/html", "stub/html", none, none, none, none]
 
 
 # ---- Create sends what was set and nothing else.
@@ -847,14 +934,25 @@ def test_a_refusal_at_create_is_the_servers_sentence(page, bench, bench_url):
 # ---- Contrast.
 
 
-def test_start_and_stop_follow_every_status(page, bench, bench_url, tmp_path, runs):
-    """WINDOW: the Start and Stop controls for experiments that are
-    created, running, stopped, done and failed.
+def test_start_stop_and_score_follow_every_status(
+    page, bench, bench_url, tmp_path, runs, collectors
+):
+    """WINDOW: the Start and Stop controls and the Score row for
+    experiments that are done, created, failed, running, and stopped from
+    the page, in that order.
 
     Start is live for created and for nothing else, and Stop is present
     while running and at no other time; a rule written as "not done"
     would pass a finished-only proof and offer Start on a running,
-    stopped or failed experiment."""
+    stopped or failed experiment. The Score row (N4) is present for every
+    finished status and absent while created or running, and the walk
+    starts on done so absent is measured against a row that renders; it
+    appears on the stopped frame without the experiment being selected
+    again, so it follows the progress door and not only a selection. The
+    failed experiment was read from a file by path, so its dataset is not
+    stored: its row is present with Score greyed and the reason. The
+    store's 404 for that digest is a console line caused on purpose."""
+    collectors.append(MISSING_RESOURCE)
     _, digest = stored_digest(page, bench_url, [{"id": f"s{n}"} for n in range(4)])
     created = api_experiment(page, bench_url, digest, ["stub/fast"], unique("created"))
     done = api_experiment(page, bench_url, digest, ["stub/fast"], unique("done"))
@@ -889,27 +987,43 @@ def test_start_and_stop_follow_every_status(page, bench, bench_url, tmp_path, ru
     open_experiments(page)
     start = page.get_by_test_id("experiment-start")
     stop = page.get_by_test_id("experiment-stop")
+    score_row = page.get_by_test_id("experiment-score-row")
+    score = page.get_by_test_id("experiment-score")
 
+    row_for(page, done).click()
+    expect(page.get_by_test_id("experiment-status")).to_have_text("done")
+    expect(start).to_be_disabled()
+    expect(stop).to_be_hidden()
+    expect(score_row).to_be_visible()
+    expect(score).to_have_text("Score · free")
+    expect(score).to_be_enabled()
     row_for(page, created).click()
     expect(start).to_be_enabled()
     expect(stop).to_be_hidden()
-    for eid in (done, failed):
-        row_for(page, eid).click()
-        expect(page.get_by_test_id("experiment-status")).to_have_text(
-            re.compile("^(done|failed)")
-        )
-        expect(start).to_be_disabled()
-        expect(stop).to_be_hidden()
+    expect(score_row).to_be_hidden()
+    row_for(page, failed).click()
+    expect(page.get_by_test_id("experiment-status")).to_have_text(re.compile("^failed"))
+    expect(start).to_be_disabled()
+    expect(stop).to_be_hidden()
+    expect(score_row).to_be_visible()
+    expect(score).to_be_disabled()
+    expect(page.get_by_test_id("experiment-score-nudge")).to_contain_text(
+        "is not stored here"
+    )
     row_for(page, running).click()
     expect(page.get_by_test_id("experiment-status")).to_have_text("running")
     expect(start).to_be_disabled()
     expect(stop).to_be_visible()
+    expect(score_row).to_be_hidden()
     stop.click()
     expect(page.get_by_test_id("experiment-status")).to_have_text(
         "stopped · stopped between trials", timeout=DONE_TIMEOUT
     )
     expect(start).to_be_disabled()
     expect(stop).to_be_hidden()
+    expect(score_row).to_be_visible()
+    expect(score).to_have_text("Score · free")
+    expect(score).to_be_enabled()
 
 
 def test_start_is_pressed_once_and_a_started_experiment_stays_started(
