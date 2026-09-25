@@ -51,7 +51,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install --require-hashes -r requirements-dev.txt
-      - run: pytest
+      - run: pytest -rs
 
   # Pure-function frontend tests. static/lib.js is DOM-free and has a
   # CommonJS guard, so node requires it directly: no build step, no npm

@@ -398,18 +398,28 @@ def test_a_line_nested_past_the_decoders_depth_is_refused_on_its_line():
     escaped the parser as a 500. THE DEPTH IS THE INTERPRETER'S: 100000
     was past the decoder on macOS and on ubuntu 3.11 to 3.13, and not on
     ubuntu 3.14, where this test's pre-state failed (CI run 36093009840),
-    so the depth is measured. Where the decoder takes every depth that
-    fits in MAX_DATASET_BYTES, no line the door accepts can reach it, and
-    the test is skipped, naming the platform and the depth measured."""
+    so the depth is measured. The line must nest DEPTH_MARGIN past the
+    measured depth and still fit the body door's byte ceiling
+    (MAX_DATASET_BYTES), so where the decoder takes lists nested to
+    within DEPTH_MARGIN of the deepest line that fits, the test is
+    skipped, naming the platform, the depth measured (or that the
+    measurement reached the ceiling), the ceiling's depth and the margin.
+    The ceiling is the body door's; a line read by path has none."""
     from bench.main import MAX_DATASET_BYTES
 
     fits = (MAX_DATASET_BYTES - 64) // 2
-    decodes = _deepest(_decodes, cap=fits)
+    decodes, capped = _deepest(_decodes, cap=fits)
     if decodes + DEPTH_MARGIN >= fits:
+        measured = (
+            f"at least {decodes} deep (the measurement stopped there)"
+            if capped
+            else f"{decodes} deep"
+        )
         pytest.skip(
             f"no such line on {platform.system()} Python "
             f"{platform.python_version()}: json.loads decodes lists nested "
-            f"{fits} deep, the deepest a line inside the byte ceiling can be"
+            f"{measured}, and a line nested DEPTH_MARGIN ({DEPTH_MARGIN}) past "
+            f"that is deeper than the {fits} the body door's byte ceiling allows"
         )
     depth = decodes + DEPTH_MARGIN
     deep = "[" * depth + "]" * depth
@@ -615,11 +625,13 @@ def _nested(depth: int) -> list:
     return value
 
 
-def _deepest(ok, cap: int = DEPTH_CAP) -> int:
+def _deepest(ok, cap: int = DEPTH_CAP) -> tuple[int, bool]:
     """The largest depth up to cap for which ok holds, by bisection (ok
-    holds at 0 and, past its limit, at no greater depth)."""
+    holds at 0 and, past its limit, at no greater depth), and whether the
+    measurement stopped at cap. A capped depth is a floor and not a limit:
+    ok may hold deeper than anything measured."""
     if ok(cap):
-        return cap
+        return cap, True
     low, high = 0, cap
     while high - low > 1:
         mid = (low + high) // 2
@@ -627,7 +639,7 @@ def _deepest(ok, cap: int = DEPTH_CAP) -> int:
             low = mid
         else:
             high = mid
-    return low
+    return low, False
 
 
 def _decodes(depth: int) -> bool:
@@ -647,9 +659,14 @@ def _prints(depth: int) -> bool:
 
 
 @functools.cache
-def _depth_limits() -> tuple[int, int]:
-    """(deepest json.loads decodes, deepest repr() prints) here."""
-    return _deepest(_decodes), _deepest(_prints)
+def _depth_limits() -> tuple[int, bool, int]:
+    """The deepest json.loads decodes here, whether that measurement
+    stopped at DEPTH_CAP, and the deepest repr() prints. A capped repr()
+    depth needs no flag: repr() walks everything measured, and a window
+    needs it to fail somewhere the decoder succeeds."""
+    decodes, capped = _deepest(_decodes)
+    prints, _ = _deepest(_prints)
+    return decodes, capped, prints
 
 
 def _deep_lines(depth: int) -> list[tuple[str, str]]:
@@ -702,7 +719,7 @@ def test_a_value_as_deep_as_the_decoder_takes_is_quoted_in_bounded_words():
     characters where repr() can walk it and a RecursionError where it
     cannot (PRE-STATE), and either fails here, so a parser that went back
     to repr() fails on every interpreter in the CI matrix."""
-    decodes, _ = _depth_limits()
+    decodes, _, _ = _depth_limits()
     depth = decodes - 3 - DEPTH_MARGIN
     assert depth > 500, (platform.python_version(), decodes)
     try:
@@ -726,11 +743,23 @@ def test_a_value_too_deep_to_repr_is_named_on_its_line():
     value is now quoted to a bounded depth. THE WINDOW IS PLATFORM-BOUND:
     it exists where the decoder takes lists deeper than repr() walks
     (macOS 3.14, measured) and not where repr() walks every depth the
-    decoder takes (ubuntu 3.12, and 3.11 to 3.13 on macOS once a line
-    nests the value), so this runs only where the running interpreter
-    has it, and is skipped with both measured depths where it does not.
-    The platform-independent proof is the one above."""
-    decodes, prints = _depth_limits()
+    decoder takes: ubuntu 3.11 to 3.14 (CI runs 36093009840, 36093701419
+    and 36095227959) and macOS 3.11 to 3.13 once a line nests the value.
+    SO THIS PROOF RUNS IN NO CI JOB. It runs only where the running
+    interpreter has the window, and is skipped with both measured depths
+    where it does not, or as undetermined where the decoder's depth
+    reached DEPTH_CAP, since a capped depth is a floor and not a limit.
+    The platform-independent proof is the one above, and it catches a
+    return to plain repr(); only this one catches a repr() cut short after
+    it is computed, which still recurses."""
+    decodes, capped, prints = _depth_limits()
+    if capped:
+        pytest.skip(
+            f"undetermined on {platform.system()} Python "
+            f"{platform.python_version()}: json.loads decodes lists nested at "
+            f"least {decodes} deep (DEPTH_CAP, where the measurement stops), so "
+            f"where its limit lies against repr()'s {prints} is not measured"
+        )
     depth = decodes - 3 - DEPTH_MARGIN
     if depth <= prints:
         pytest.skip(
