@@ -13,6 +13,10 @@ The rules for this file:
 - **An entry is removed by the phase that builds it**, and the removal is
   named in that phase's commit body, so it stands as a tombstone rather
   than a line that quietly went missing.
+- **An entry a later commit makes false is corrected in that commit**, as
+  far as the new fact requires and no further, and the correction is
+  named in that commit's body. An entry in the operator's words keeps
+  them everywhere the fact did not move.
 - **The order is the order entries were added, and nothing more.** This
   is not a priority list. Priority is decided when a phase is
   commissioned, not by where an item sits here.
@@ -198,10 +202,9 @@ a23b257).
 - **What:** the ranking at bench/report.py:744 orders on `score.mean`. A
   judge series with a declared pass threshold publishes both a mean and
   a pass rate, and the ranking uses the mean whether or not a threshold
-  was declared. Since the commit after N3, `ranking.reason` says so
-  ("ordered on the mean"). Decide whether `primary_metric` should be able
-  to name the pass rate, and if it can, have `ranking.reason` state which
-  figure the ordering used.
+  was declared. Since f6d3f92, `ranking.reason` says so ("ordered on the
+  mean"). Decide whether `primary_metric` should be able to name the pass
+  rate, and have `ranking.reason` state which figure the ordering used.
 - **Deferred by:** Phase N, in the N3 checkpoint exchange.
 - **Reason:** it is a declaration question, not a defect, and it belongs
   with `primary_judge` when that is designed.
