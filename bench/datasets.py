@@ -142,6 +142,20 @@ def _checked_text(
     if text is None:
         _fail(line_no, f"{field} must be a string, got {type(value).__name__}")
         return None  # unreachable; _fail raises. Keeps mypy honest.
+    # JSON can spell half a surrogate pair as an escape, "\ud83d", and
+    # JSON.stringify writes one for a string holding half of a pair, so a
+    # line the builder composed from a paste can decode to text UTF-8
+    # cannot encode. Taken, it would fail later and somewhere worse: a
+    # run that paid for the trials before it, a judge call before the
+    # write, a stored row nobody can export. Refused here, on its line.
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        _fail(
+            line_no,
+            f"{field} holds an unpaired surrogate (U+{ord(text[exc.start]):04X}), "
+            "which JSON can spell and UTF-8 cannot",
+        )
     if required and text == "":
         _fail(line_no, f"{field} must not be empty")
     if len(text) > limit:
@@ -221,7 +235,13 @@ def _checked_scorer(spec: object, line_no: int) -> dict[str, Any] | None:
         allowed.add("pass_threshold")
     extra = sorted(set(spec) - allowed)
     if extra:
-        _fail(line_no, f"scorer has unknown keys: {', '.join(extra)}")
+        # Quoted, as every value a refusal repeats back is: a key is text
+        # the caller wrote, and one holding half a surrogate pair would
+        # otherwise make the refusal itself impossible to write.
+        _fail(
+            line_no,
+            f"scorer has unknown keys: {', '.join(_quoted(k) for k in extra)}",
+        )
     return out
 
 
@@ -306,7 +326,10 @@ def _checked_attachments(
             )
         unknown = sorted(set(entry) - set(PIN_FIELDS))
         if unknown:
-            _fail(line_no, f"{at} has unknown keys: {', '.join(unknown)}")
+            _fail(
+                line_no,
+                f"{at} has unknown keys: {', '.join(_quoted(k) for k in unknown)}",
+            )
         digest = entry.get("digest")
         if not isinstance(digest, str) or not DIGEST_PATTERN.match(digest):
             _fail(
@@ -443,7 +466,7 @@ def parse_dataset(raw: bytes, name: str = "dataset") -> dict[str, Any]:
         }
         unknown = sorted(set(row) - known)
         if unknown:
-            _fail(line_no, f"unknown keys: {', '.join(unknown)}")
+            _fail(line_no, f"unknown keys: {', '.join(_quoted(k) for k in unknown)}")
         # A judge scorer with no rubric cannot be run: the rubric IS the
         # scoring instruction, and a judge asked to score against nothing
         # would return an opinion about something nobody specified.

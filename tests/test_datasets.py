@@ -154,7 +154,7 @@ def test_a_task_without_attachments_parses_exactly_as_before():
         ([DIGEST] * 5, "limit is 4"),
         (["nope"], "not a sha256 digest"),
         ([{"digest": DIGEST, "extractor": "pypdf"}], "missing extractor_version, kind"),
-        ([{**FULL_PIN, "extra": 1}], "unknown keys: extra"),
+        ([{**FULL_PIN, "extra": 1}], "unknown keys: 'extra'"),
         ([{**FULL_PIN, "kind": "spreadsheet"}], "not one of document, image"),
         ([{**FULL_PIN, "digest": "short"}], "not a sha256 digest"),
         ([{**FULL_PIN, "extractor": ""}], "must not be empty"),
@@ -275,7 +275,7 @@ def test_unknown_task_keys_are_refused():
     with pytest.raises(DatasetError) as exc:
         parse_dataset(dataset(line(id="t1", prompt="a", temperature=0.5)))
 
-    assert "unknown keys: temperature" in str(exc.value)
+    assert "unknown keys: 'temperature'" in str(exc.value)
 
 
 def test_an_unknown_scorer_kind_lists_the_known_ones():
@@ -300,7 +300,7 @@ def test_unknown_scorer_keys_are_refused():
             )
         )
 
-    assert "unknown keys: ignore_case" in str(exc.value)
+    assert "unknown keys: 'ignore_case'" in str(exc.value)
 
 
 def test_a_reference_scorer_without_a_reference_is_refused():
@@ -461,6 +461,113 @@ def test_a_pattern_of_nested_groups_is_refused_on_its_line():
         )
 
     assert str(exc.value).startswith("line 1: scorer.pattern is not a valid regex")
+
+
+# The first half of an emoji's surrogate pair, alone. json.dumps writes
+# it as the six-character escape JSON.stringify writes for it, which is
+# the form the dataset builder composes from a paste that split a pair.
+HALF_PAIR = chr(0xD83D)
+ESCAPED_HALF_PAIR = chr(92) + "ud83d"
+PIN_WITH = {
+    "digest": "a" * 64,
+    "extractor": "x",
+    "extractor_version": "1",
+    "kind": "document",
+}
+
+
+@pytest.mark.parametrize(
+    "fields,field",
+    [
+        ({"id": "t" + HALF_PAIR, "prompt": "p"}, "id"),
+        ({"id": "t", "prompt": "p" + HALF_PAIR}, "prompt"),
+        ({"id": "t", "prompt": "p", "system": HALF_PAIR}, "system"),
+        (
+            {
+                "id": "t",
+                "prompt": "p",
+                "reference": "r" + HALF_PAIR,
+                "scorer": {"kind": "exact"},
+            },
+            "reference",
+        ),
+        (
+            {
+                "id": "t",
+                "prompt": "p",
+                "rubric": "grade" + HALF_PAIR,
+                "scorer": {"kind": "judge"},
+            },
+            "rubric",
+        ),
+        (
+            {
+                "id": "t",
+                "prompt": "p",
+                "scorer": {"kind": "regex", "pattern": HALF_PAIR},
+            },
+            "scorer.pattern",
+        ),
+        (
+            {
+                "id": "t",
+                "prompt": "p",
+                "attachments": [{**PIN_WITH, "extractor": "x" + HALF_PAIR}],
+            },
+            "task 't': attachments[0].extractor",
+        ),
+    ],
+)
+def test_review_repro_an_escaped_half_pair_is_refused_on_its_line(fields, field):
+    """WINDOW: parse_dataset over a line whose text field holds half a
+    surrogate pair spelled as JSON's escape, one case per text field.
+
+    JSON can spell U+D83D and UTF-8 cannot encode it. The dataset door
+    catches the raw form in the request, but the escaped form inside a
+    line encodes fine there and decodes to a lone surrogate only here,
+    where it was taken: Store, Create and Start accepted it, and the run
+    failed after paying for the trials before it. Every text field goes
+    through one gate, which refuses it on its line. PRE-STATE: the line
+    is ASCII and holds the escape, and json.loads turns it into the lone
+    surrogate."""
+    text = line(**fields)
+    assert HALF_PAIR not in text and ESCAPED_HALF_PAIR in text
+    assert HALF_PAIR in json.dumps(json.loads(text), ensure_ascii=False)
+
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(id="t0", prompt="a"), text))
+
+    assert str(exc.value).startswith(
+        f"line 2: {field} holds an unpaired surrogate (U+D83D)"
+    ), str(exc.value)
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"id": "t", "prompt": "p", "x" + HALF_PAIR: 1},
+        {"id": "t", "prompt": "p", "scorer": {"kind": "exact", "x" + HALF_PAIR: 1}},
+        {"id": "t", "prompt": "p", "attachments": [{**PIN_WITH, "x" + HALF_PAIR: 1}]},
+    ],
+)
+def test_an_unknown_key_holding_a_half_pair_is_quoted_in_a_refusal_utf8_can_carry(
+    fields,
+):
+    """WINDOW: parse_dataset over a line with an unknown key holding half a
+    surrogate pair, at the task, the scorer and a pin, and the refusal's
+    text encoded as UTF-8.
+
+    The refusal repeats the key back. Joined raw, it held the lone
+    surrogate, and the door's answer could not be written: a 500 in place
+    of the line's refusal, at POST /datasets and at the path door. The
+    key is quoted as every repeated value is, escape and all."""
+    with pytest.raises(DatasetError) as exc:
+        parse_dataset(dataset(line(**fields)))
+
+    message = str(exc.value)
+    assert message.startswith("line 1: ") and "unknown keys: 'x" in message
+    assert message.encode("utf-8")
+    assert HALF_PAIR not in message and ESCAPED_HALF_PAIR in message
 
 
 def test_a_refusal_quotes_a_large_value_in_brief():
@@ -807,7 +914,7 @@ def test_a_pass_threshold_on_a_deterministic_scorer_is_refused():
             )
         )
 
-    assert "unknown keys: pass_threshold" in str(exc.value)
+    assert "unknown keys: 'pass_threshold'" in str(exc.value)
 
 
 def test_a_pattern_on_a_non_regex_scorer_is_refused():
@@ -826,7 +933,7 @@ def test_a_pattern_on_a_non_regex_scorer_is_refused():
             )
         )
 
-    assert "unknown keys: pattern" in str(exc.value)
+    assert "unknown keys: 'pattern'" in str(exc.value)
 
 
 # ---- Phase M4: the README's worked example is a contract, not prose.

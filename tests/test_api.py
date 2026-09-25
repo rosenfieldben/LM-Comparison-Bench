@@ -18183,6 +18183,58 @@ def test_review_repro_a_lone_surrogate_is_a_refusal_naming_its_line(client):
     assert dataset_rows(client) == 0
 
 
+def test_review_repro_the_builders_escaped_half_pair_is_refused_at_both_doors(
+    client, tmp_path
+):
+    """WINDOW: the dataset builder's own composition (composeJsonl executed
+    in node) of a row whose prompt holds half a surrogate pair, and one
+    whose rubric does, sent to POST /datasets; and a file whose line has
+    an unknown key holding one, named at the path door.
+
+    JSON.stringify writes the half pair as an escape, so the content
+    encodes as UTF-8 at the door and the lone surrogate appears only when
+    the parser decodes the line. It was stored, created and started, and
+    the run failed after its first paid trial. Now each is refused on its
+    line in the parser's words and nothing is stored; and an unknown key
+    holding one is refused with a 422, not the 500 its unwritable refusal
+    was. PRE-STATE: what the builder composes is ASCII holding the
+    escape."""
+    half = chr(0xD83D)
+    rows = [
+        builder_row(id="a", prompt="x"),
+        builder_row(id="b", prompt="y" + half),
+    ]
+    judged = [builder_row(id="j", prompt="p", scorer="judge", rubric="kind" + half)]
+    composed = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((r) => l.composeJsonl(r))));",
+        [rows, judged],
+    )
+    for jsonl in composed:
+        assert half not in jsonl and chr(92) + "ud83d" in jsonl
+    for jsonl, expected in zip(
+        composed,
+        (
+            "line 2: prompt holds an unpaired surrogate (U+D83D)",
+            "line 1: rubric holds an unpaired surrogate (U+D83D)",
+        ),
+        strict=True,
+    ):
+        resp = client.post("/datasets", json={"name": "half", "content": jsonl})
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"].startswith(expected), resp.json()["detail"]
+    assert dataset_rows(client) == 0
+
+    key_line = json.dumps({"id": "t", "prompt": "p", "x" + half: 1}) + "\n"
+    stored = client.post("/datasets", json={"name": "key", "content": key_line})
+    path = tmp_path / "key.jsonl"
+    path.write_text(key_line, encoding="utf-8")
+    by_path = client.post("/experiments", json=experiment_body(str(path)))
+    for resp in (stored, by_path):
+        assert resp.status_code == 422, resp.text
+        assert resp.json()["detail"].startswith("line 1: unknown keys: 'x")
+
+
 def test_a_dataset_name_is_refused_where_it_would_break_a_listing(client):
     """WINDOW: POST /datasets with each name the validator refuses, and
     the longest one it takes.

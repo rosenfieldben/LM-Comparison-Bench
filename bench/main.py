@@ -7542,11 +7542,14 @@ async def create_dataset(body: DatasetCreate) -> dict[str, Any]:
         raw = body.content.encode("utf-8")
     except UnicodeEncodeError as exc:
         # REACHABLE FROM A BROWSER, which is why the sentence names the
-        # line. JSON can spell a lone surrogate as an escape, and
-        # JSON.stringify writes one whenever a string holds half of a
-        # pair, which a paste can produce. No UTF-8 file can contain one,
-        # so there are no bytes to store, and a 500 would be the bench
-        # failing to say so. The line is counted the way parse_dataset
+        # line. This catches the RAW form: the request's JSON escaped a
+        # lone surrogate into the content string itself, so the content
+        # has no UTF-8 bytes to store, and a 500 would be the bench
+        # failing to say so. The ESCAPED form (the six characters of
+        # "\ud83d" inside a line, which JSON.stringify writes for half a
+        # pair) encodes fine here and decodes to a lone surrogate only
+        # inside the parser, which refuses it on its line there
+        # (bench.datasets._checked_text). The line is counted the way parse_dataset
         # counts (lines end at "\n", blank lines numbered), so it points
         # at the same row the parser would have named.
         line_no = body.content[: exc.start].count("\n") + 1
