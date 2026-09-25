@@ -2280,6 +2280,47 @@ def test_a_late_report_does_not_stack_under_a_newer_one(page, bench, bench_url):
     expect(banner).to_contain_text(names[1])
 
 
+def test_a_late_failed_report_does_not_mark_a_newer_one(
+    page, bench, bench_url, tmp_path, collectors
+):
+    """WINDOW: A's report asked for again with a dataset path that cannot
+    be read, that request held; B's row clicked and its report drawn;
+    A's answer, the door's real 422, then released.
+
+    A report load that fails after a newer one was asked for is dropped,
+    as a late success is: the panel stays ready with one banner, B's, and
+    no loading or error note, and the page says nothing on the console
+    beyond Chromium's line for the 422. PRE-STATE: B's banner is drawn
+    and the panel is ready before A's answer is released."""
+    _, digest = stored_digest(page, bench_url, [{"id": "s1"}])
+    names = [unique("failing report"), unique("newer report")]
+    ids = [api_experiment(page, bench_url, digest, ["stub/fast"], n) for n in names]
+    bench(["stub/fast"])
+    open_experiments(page)
+    panel = page.get_by_test_id("report-panel")
+    banner = page.get_by_test_id("report-banner")
+    row_for(page, ids[0]).click()
+    expect(panel).to_have_attribute("data-state", "ready")
+    page.get_by_test_id("report-dataset-path").fill(str(tmp_path / "missing.jsonl"))
+    held = hold(page, re.compile(rf"/experiments/{ids[0]}/report\?"), "GET")
+    page.get_by_test_id("report-dataset-apply").click()
+    wait_held(page, held)
+    row_for(page, ids[1]).click()
+    expect(banner).to_contain_text(names[1])
+    expect(panel).to_have_attribute("data-state", "ready")
+
+    route = held.pop()
+    with page.expect_response(lambda r: r.url == route.request.url) as late:
+        route.continue_()
+    assert late.value.status == 422
+    page.evaluate("() => new Promise((done) => setTimeout(done, 50))")
+
+    expect(panel).to_have_attribute("data-state", "ready")
+    expect(banner).to_have_count(1)
+    expect(banner).to_contain_text(names[1])
+    expect(page.get_by_test_id("report-state")).to_have_count(0)
+
+
 def test_the_list_names_its_own_state_while_loading(page, bench, bench_url):
     """WINDOW: the list's data-state read in the same task as the summary
     click, and in the same task as a reload started with the panel open.
