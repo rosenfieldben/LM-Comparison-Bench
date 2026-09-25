@@ -4663,7 +4663,8 @@ def cited_dataset(
     SYNCHRONOUS ON PURPOSE. start_scoring calls this between its check
     that the one scoring slot is free and its claim of it; an await here
     would let a second request pass that check before the claim, and two
-    passes would share the slot. See the comment at that check.
+    passes would share the slot. See the comment at that check, and
+    test_two_scores_sent_at_once_start_one_pass, which sends two at once.
     """
     if (path is None) == (digest is None):
         raise HTTPException(422, ONE_DATASET)
@@ -6195,6 +6196,12 @@ async def start_experiment(experiment_id: int, body: ExperimentStart) -> dict[st
             "experiment runs once. Create another to run it again.",
         )
     state = app.state.experiment_run
+    # ONE RUN AT A TIME HOLDS ONLY BECAUSE NOTHING FROM THIS CHECK TO THE
+    # CLAIM BELOW AWAITS, as at start_scoring's: enforce_recorded_digest
+    # and stored_dataset are synchronous, so the check and the claim run in
+    # one step of the event loop and no second request can find the slot
+    # free between them. test_two_starts_sent_at_once_start_one_run sends
+    # two at once.
     if state["active"] is not None:
         raise HTTPException(
             409,
@@ -6498,7 +6505,8 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
     # between them and find the slot free too. cited_dataset is synchronous,
     # and that is what keeps it so: make it (or anything else between here
     # and the claim) await, and two requests can both pass this check and
-    # start two passes over the one slot.
+    # start two passes over the one slot, one graded against the other's
+    # tasks. test_two_scores_sent_at_once_start_one_pass sends two at once.
     if state["active"] is not None:
         raise HTTPException(
             409, f"a scoring pass for experiment {state['active']} is running"

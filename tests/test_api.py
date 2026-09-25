@@ -20346,6 +20346,153 @@ def test_another_scoring_pass_is_refused_in_the_doors_words(client):
     wait_scoring_done(client)
 
 
+def race(client, sends):
+    """Send requests at once, on the app's own event loop, and return the
+    answers in order: an AsyncClient over the app, gathered inside the
+    test client's portal, so each request's handler is scheduled against
+    the other's and a check-then-claim that awaited would be seen."""
+
+    async def gathered():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://localhost",
+            trust_env=False,
+        ) as racer:
+            return await asyncio.gather(
+                *(racer.post(url, json=body) for url, body in sends)
+            )
+
+    return client.portal.call(gathered)
+
+
+@respx.mock
+def test_two_scores_sent_at_once_start_one_pass(client):
+    """WINDOW: POST /experiments/{id}/score for A and for B sent at once, on
+    the app's event loop, while neither pass has begun; the winner's pass
+    held on a judge gate while the slot is read, then released.
+
+    ONE SCORING SLOT, and the door's check-then-claim is what keeps it one:
+    nothing between the check and the claim awaits. The two datasets
+    share task ids and differ in e1's reference, so two passes over the
+    one slot would grade one experiment against the other's tasks. One is
+    taken and one refused in the door's sentence; the slot holds the
+    winner and the winner's tasks; the loser gets no rows; and the
+    winner's exact score is its own reference's. PRE-STATE: the slot is
+    free and each experiment is done with no rows."""
+    gate = asyncio.Event()
+
+    async def route(request):
+        if json.loads(request.content)["max_tokens"] == JUDGE_MAX_TOKENS:
+            await gate.wait()
+            return httpx.Response(
+                200,
+                json={
+                    "id": "g",
+                    "choices": [
+                        {
+                            "message": {"content": '{"score": 0.9}'},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+            )
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    judge_task = {"id": "j1", "prompt": "p", "rubric": "r", "scorer": {"kind": "judge"}}
+    references = {}
+    digests = {}
+    for label, reference in (("a", "Hello"), ("b", "Goodbye")):
+        exact = {
+            "id": "e1",
+            "prompt": "say it",
+            "reference": reference,
+            "scorer": {"kind": "exact"},
+        }
+        digest = store_dataset(client, label, exact, judge_task).json()["digest"]
+        eid = client.post(
+            "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+        ).json()["id"]
+        assert run_by_digest(client, eid, digest)["status"] == "done"
+        references[eid], digests[eid] = reference, digest
+    a, b = digests
+    assert client.app.state.scoring_run["active"] is None
+    assert scores_in(client, a) == scores_in(client, b) == []
+
+    answers = race(
+        client,
+        [
+            (
+                f"/experiments/{eid}/score",
+                {"dataset_digest": digests[eid], "judge_model": "judge/one"},
+            )
+            for eid in (a, b)
+        ],
+    )
+
+    assert sorted(r.status_code for r in answers) == [202, 409], [
+        r.text for r in answers
+    ]
+    winner, loser = (a, b) if answers[0].status_code == 202 else (b, a)
+    refused = next(r for r in answers if r.status_code == 409)
+    assert refused.json()["detail"] == (
+        f"a scoring pass for experiment {winner} is running"
+    )
+    state = client.app.state.scoring_run
+    assert state["active"] == winner
+    assert state["tasks"]["e1"]["reference"] == references[winner]
+    gate.set()
+    wait_scoring_done(client)
+    assert scores_in(client, loser) == []
+    exact = [s["score"] for s in scores_in(client, winner) if s["scorer"] == "exact"]
+    assert exact == [1.0 if references[winner] == "Hello" else 0.0]
+
+
+@respx.mock
+def test_two_starts_sent_at_once_start_one_run(client):
+    """WINDOW: POST /experiments/{id}/start for A and for B, both created
+    over one stored dataset, sent at once on the app's event loop.
+
+    ONE RUN AT A TIME, held the way the scoring slot is: nothing between
+    start_experiment's check and its claim awaits, the digest route's
+    checks included. One Start is taken and one refused in the door's
+    sentence naming the winner; the loser stays created and ran nothing,
+    and the winner runs to done. PRE-STATE: the runner slot is free and
+    both experiments are created."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = store_dataset(client, "plain", THREE_KINDS[0]).json()["digest"]
+    a, b = (
+        client.post(
+            "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+        ).json()["id"]
+        for _ in range(2)
+    )
+    assert client.app.state.experiment_run["active"] is None
+    assert {client.get(f"/experiments/{e}").json()["status"] for e in (a, b)} == {
+        "created"
+    }
+
+    answers = race(
+        client,
+        [(f"/experiments/{eid}/start", {"dataset_digest": digest}) for eid in (a, b)],
+    )
+
+    assert sorted(r.status_code for r in answers) == [202, 409], [
+        r.text for r in answers
+    ]
+    winner, loser = (a, b) if answers[0].status_code == 202 else (b, a)
+    refused = next(r for r in answers if r.status_code == 409)
+    assert refused.json()["detail"].startswith(
+        f"experiment {winner} is already running. One at a time"
+    ), refused.text
+    assert drain_progress(client, winner)["status"] == "done"
+    lost = client.get(f"/experiments/{loser}").json()
+    assert lost["status"] == "created", lost
+    assert lost["trials_done"] + lost["trials_failed"] + lost["trials_refused"] == 0
+
+
 @pytest.mark.parametrize(
     "where", ["get_experiment", "experiment_groups"], ids=["first read", "loop"]
 )
