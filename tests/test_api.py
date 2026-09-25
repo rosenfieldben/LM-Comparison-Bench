@@ -18,7 +18,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from bench import main, report
+from bench import clones, main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import (
@@ -977,6 +977,10 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
             # sentence is the door's own rather than a second wording.
             "snapshots_enabled": False,
             "snapshots_off_reason": main.SNAPSHOTS_OFF,
+            # Phase O, the same pair for the clone door, off here because
+            # BENCH_CLONE_ROOT is unset: its own sentence, verbatim.
+            "clones_enabled": False,
+            "clones_off_reason": clones.CLONES_OFF,
         }
 
         with respx.mock:
@@ -17262,6 +17266,42 @@ FILESYSTEM_CALLS = {
         "os.stat",
     },
     ("store.py", "connect"): {"sqlite3.connect"},
+    #
+    # ---- The clone door. Every path is BENCH_CLONE_ROOT, from the
+    # ---- operator's environment at boot, or a name under it the door
+    # ---- made itself: <16 hex> for a clone, .<16 hex>.partial and .old
+    # ---- for its work, never a string from a request. The URL and the
+    # ---- ref choose the hex (a sha256) and nothing else.
+    #
+    # The test seam's certificate bundle, checked at boot.
+    ("main.py", "_parse_clone_cainfo"): {"os.path.isfile"},
+    # git, run with its tree pinned by --git-dir and --work-tree to the
+    # clone's own new directory, so it never searches upward.
+    ("main.py", "_git_clone"): {"asyncio.create_subprocess_exec"},
+    # The new directory made, and the URL git wrote into FETCH_HEAD
+    # removed from it.
+    ("main.py", "_fetch_into"): {"os.mkdir", "os.unlink"},
+    # The swap: the old clone renamed aside and the new one renamed in.
+    ("main.py", "_clone"): {"os.path.lexists", "os.rename"},
+    # A clone's directories removed (a failed one's new directory, a
+    # replaced one's old, its empty HOME), and that HOME made.
+    ("main.py", "_remove_tree"): {"shutil.rmtree"},
+    ("main.py", "_empty_home"): {"tempfile.mkdtemp"},
+    # The door's own leftovers, by its own naming, directly under the
+    # clone root: a directory removed as a tree, anything else unlinked,
+    # no link followed.
+    ("main.py", "_sweep_clone_work"): {"entry.is_dir", "os.scandir", "os.unlink"},
+    # A clone's size, counted without following a link.
+    ("main.py", "_measure_clone"): {
+        "entry.is_dir",
+        "entry.is_file",
+        "entry.stat",
+        "os.scandir",
+    },
+    # Whether a snapshot root and a clone's directory overlap, by device
+    # and inode up the ancestors of a root already resolved and matched
+    # against BENCH_REPO_ROOTS.
+    ("main.py", "_same_or_under"): {"os.stat"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
@@ -17278,6 +17318,7 @@ FILESYSTEM_TOUCHERS = {
     "os.fstat",
     "os.listdir",
     "os.makedirs",
+    "os.mkdir",
     "os.open",
     "os.read",
     "os.readlink",
@@ -17290,10 +17331,17 @@ FILESYSTEM_TOUCHERS = {
     "os.path.abspath",
     "os.path.exists",
     "os.path.isdir",
+    "os.path.isfile",
+    "os.path.lexists",
     "os.path.realpath",
     "open",
     "sqlite3.connect",
     "subprocess.run",
+    # A process's working tree is a path operation, whatever the command;
+    # the clone runner names its tree in its argv (--git-dir, --work-tree).
+    "asyncio.create_subprocess_exec",
+    "shutil.rmtree",
+    "tempfile.mkdtemp",
     "StaticFiles",
     # pathlib and DirEntry methods, matched on the method name.
     "read_bytes",
@@ -17339,6 +17387,16 @@ PURE_OS_CALLS = {
 }
 
 
+# os calls that name a PROCESS and touch no path: the clone runner's
+# group kill and the check that the group is its own. A third class
+# rather than a pure one, because signalling is not computing on
+# strings; tests/test_network_posture.py keys them with the runner.
+PROCESS_OS_CALLS = {
+    "os.getpgid",
+    "os.killpg",
+}
+
+
 def _dotted(node):
     if isinstance(node, ast.Name):
         return node.id
@@ -17370,14 +17428,23 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
     StaticFiles) are in the list because this rule and the next would
     now refuse a tree without them.
 
+    The os rule has a third class since Phase O, PROCESS_OS_CALLS: the
+    clone runner's group kill names a process and touches no path, and
+    the network walk (tests/test_network_posture.py, this walk's
+    sibling) keys it with the runner.
+
     The non-os half is complete BY ENUMERATION and says so: builtins
     open, the pathlib and DirEntry methods this codebase calls,
-    sqlite3.connect, subprocess.run for its working directory,
-    Starlette's StaticFiles for the directory it serves, and the Tree
-    protocol's operations so the pure walk's injected calls appear under
-    the function that makes them. A NEW library that reaches disk under
-    a name not in that list would not be seen, and that is the limit of
-    what an AST scan of call names can promise.
+    sqlite3.connect, subprocess.run and asyncio.create_subprocess_exec
+    for the tree a process works in, shutil.rmtree and tempfile.mkdtemp
+    for the clone door's directories, Starlette's StaticFiles for the
+    directory it serves, and the Tree protocol's operations so the pure
+    walk's injected calls appear under the function that makes them. A
+    NEW library that reaches disk under a name not in that list would
+    not be seen, nor would a toucher handed to another function as a
+    value (the clone door names its rmtree and mkdtemp in functions of
+    their own for that reason), and that is the limit of what an AST
+    scan of call names can promise.
 
     A NEW ENTRY FAILS THIS TEST, which is the point. Adding a read or a
     stat anywhere in bench/ now requires saying which posture it sits in:
@@ -17436,7 +17503,7 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
             if name.startswith("os."):
                 if name in FILESYSTEM_TOUCHERS:
                     found.setdefault(key, set()).add(name)
-                elif name not in PURE_OS_CALLS:
+                elif name not in PURE_OS_CALLS | PROCESS_OS_CALLS:
                     unclassified.add((path.name, key[1], name))
                 continue
             if (

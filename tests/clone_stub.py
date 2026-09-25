@@ -35,7 +35,7 @@ import shutil
 import ssl
 import subprocess
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -114,6 +114,9 @@ class Stub:
     seen: list[Seen] = field(default_factory=list)
     stall_reached: threading.Event = field(default_factory=threading.Event)
     release: threading.Event = field(default_factory=threading.Event)
+    # Called on the stub's thread when a stall is reached, before it
+    # holds: a test's look at the world at that moment.
+    on_stall: Callable[[], None] | None = None
 
     @property
     def host(self) -> str:
@@ -195,8 +198,15 @@ def _handler(stub: Stub) -> type[http.server.BaseHTTPRequestHandler]:
             )
             body = _read_body(self)
             if repo in stub.stalled and self.command == "POST":
+                if stub.on_stall is not None:
+                    stub.on_stall()
                 stub.stall_reached.set()
-                stub.release.wait(timeout=600)
+                # Bounded, and once: a door that failed to time out
+                # fails its test in half a minute, and git's retry of
+                # the request is served rather than held again.
+                stub.release.wait(timeout=30)
+                stub.stalled.discard(repo)
+                self.close_connection = True
                 return
             if repo in stub.redirects:
                 location = stub.redirects[repo] + path[len(repo) :]

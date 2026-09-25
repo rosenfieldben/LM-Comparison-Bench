@@ -88,11 +88,11 @@ def boot_bench(stub_url, tmp_path_factory, extra_env=None):
         }
     )
     env.update(extra_env or {})
-    # The app subprocess keeps trust_env on (real operators may reach
-    # OpenRouter through a proxy), so a developer proxy in the environment
-    # would route its real localhost call to the stub OpenRouter through
-    # that proxy and hang the harness. Scrub the proxy vars from this
-    # subprocess rather than making the app degrade its own behavior.
+    # The app's client reads no proxy variable (its explicit transport
+    # makes httpx skip them; see the lifespan), and the clone door builds
+    # git's environment from nothing. The scrub stays as a guard: should
+    # either ever read one, a developer proxy would route the app's
+    # localhost calls through itself and hang the harness.
     for proxy_var in (
         "HTTP_PROXY",
         "HTTPS_PROXY",

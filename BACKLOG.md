@@ -82,20 +82,6 @@ a23b257).
 - **First written:** bench/main.py, the comment on the attachment window
   check ("a named deferral and stays one"), commit 8f02dc6.
 
-## GitHub
-
-### Clone door
-
-- **What:** connecting a repository by URL and cloning it from the
-  bench, rather than walking a clone already on disk.
-- **Deferred by:** Phase L, and again by Phase N's non-goals ("Connecting
-  a repository is the phase after this one").
-- **Reason:** the snapshot door fetches nothing, and a fetching door is a
-  change to the single-outbound-destination posture that needs its own
-  phase.
-- **First written:** commit 661df53 ("IT FETCHES NOTHING");
-  docs/phases/phase-n-prompt.md, "Non-goals".
-
 ## Composed-size checks in native mode
 
 - **What:** the per-task composed-size and context-window refusals that
@@ -272,3 +258,29 @@ a23b257).
   at all, its end included; the error is one field of the read door
   that would, and that door was outside N4's scope.
 - **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)".
+
+## Private repositories and tokens
+
+- **What:** cloning a repository that needs a credential: a token, a
+  credential helper, an SSH key or any other identity.
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** the clone door's secrets posture is that no credential
+  exists on its path; a private repository is refused rather than cloned
+  through a helper the operator forgot was configured.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals", "Private
+  repositories and tokens. The secrets posture is that no credential
+  exists on this path."
+
+## Deleting a clone from the page
+
+- **What:** a door that removes a clone's directory, where today the
+  operator removes it by hand (its clones row stays, and a later clone of
+  the same repository and ref reuses it).
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** a delete door on working trees needs the same containment
+  proofs the walk has; and it would remove trees, never rows, since a
+  snapshot's capture may cite the row.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals",
+  "Deleting a clone from the page. The operator removes directories;
+  backlog entry (disk hygiene) with the reason that a delete door on
+  working trees needs the same containment proofs the walk has."

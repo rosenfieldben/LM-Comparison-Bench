@@ -232,8 +232,11 @@ The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
 SIL Open Font License in `static/fonts/OFL.txt`) rather than fetched
 from a CDN, so the page makes no external request. The offline story
-is complete: only the model calls reach the network, through
-OpenRouter.
+is complete: two things reach the network, and only to hosts the
+operator named. The model calls go to OpenRouter; a clone (`POST
+/clones`, below) comes from a host listed in `BENCH_CLONE_HOSTS`, and
+only when `BENCH_CLONE_ROOT` is set. Nothing leaves the machine to a
+host the operator did not name.
 
 ## Interface
 
@@ -1735,11 +1738,16 @@ and `static/*.js` composes past the total. Snapshotting this repository
 means naming modules rather than directories, which is what the rule
 says and not a defect in it.
 
-**It fetches nothing.** The single-outbound-destination posture is
-untouched. The bench reads the local filesystem and the local git, and
-the only thing that leaves the machine is the composed prompt, through
-the door every other comparison uses. Remote repositories, diffs between
-snapshots and agentic file browsing are all deliberately out.
+**It fetches nothing.** The composer reads the local filesystem and the
+local git, and the only thing that leaves the machine is the composed
+prompt, through the door every other comparison uses. Fetching a
+repository is the clone door's, a separate door with its own posture
+(see Cloning a repository), and the bench's outbound posture is two
+named destinations: OpenRouter, and the clone hosts the operator
+listed. Nothing leaves the machine to a host the operator did not name,
+and the network posture walk (`tests/test_network_posture.py`) checks
+that no other door reaches either. Diffs between snapshots and agentic
+file browsing are deliberately out.
 
 Default exclusions apply and are recorded in every snapshot's manifest:
 version control and dependency trees (`.git`, `node_modules`, `.venv`,
@@ -1905,6 +1913,107 @@ path allowlist, deliberately: the bench answers only to loopback clients
 and runs as you, so restricting the path would defend you against yourself
 while blocking the ordinary case. Or store the dataset in the bench and
 name it by digest instead, which needs no path at all.
+
+### Cloning a repository
+
+**`POST /clones` puts a public repository where a snapshot can walk
+it.** It takes a URL and a ref, fetches that one commit into a
+directory the operator named, and answers with the directory as a
+`root` the snapshot doors accept:
+
+```sh
+curl -s -X POST localhost:8000/clones \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://github.com/owner/repo", "ref": "main"}'
+```
+
+**It is off until you name where clones go.** `BENCH_CLONE_ROOT` is one
+absolute directory, and it must also be one of `BENCH_REPO_ROOTS`: the
+allowlist stays the one list of trees the snapshot doors may walk, and
+the clone door does not get to extend it by putting clones somewhere
+else. Unset, the door refuses naming the variable; set but not among the
+roots, it refuses naming both. `BENCH_CLONE_HOSTS` is a comma-separated
+list of the hosts a clone may come from, default `github.com`; an entry
+may carry a port (`host:8443`), and a port is allowed exactly where an
+entry names one. A relative or missing clone root, or a malformed host
+entry, fails boot naming the variable.
+
+**The URL is parsed, not matched.** It must be `https`, its host one of
+`BENCH_CLONE_HOSTS`, its path `/owner/repo` or `/owner/repo.git`, with
+no user or token before the host, no query, no fragment, no
+percent-escape and nothing around it. What git is given is rebuilt from
+the parts that passed. **No refusal repeats the URL**, not even a
+refusal of a body that forgot its ref, because a URL can carry a token
+and a refusal is shown, logged and reported. The ref is a branch or tag
+name under git's own rules (`git check-ref-format`, which a test holds
+it to) or a 40-character commit, with three rules of the door's: it
+may not start with `-` (git would read an option) or `+` (fetch's force
+flag, which would fetch the name after it), and may not be `@` alone
+(git reads that as HEAD). A ref is named in its refusal only when it
+is spelled like one.
+
+**Public only, and no identity.** git runs in an environment built from
+nothing: `PATH`, an empty temporary `HOME`, `GIT_TERMINAL_PROMPT=0` and
+`GIT_CONFIG_NOSYSTEM=1`. No gitconfig of yours, no credential helper,
+no askpass, no `GIT_CONFIG_*` and none of the bench's own variables
+(its API key included) reach it, and `-c credential.helper=` clears
+any helper that could. A private repository is therefore refused rather
+than cloned through a helper you forgot was configured, and so is one
+that does not exist on a host that answers both the same way. git also
+runs with `http.followRedirects=false`, so a listed host cannot hand the
+fetch to one nobody listed (a renamed repository is cloned from its new
+URL), `http.emptyAuth=false`, so no Kerberos ticket is offered to a
+Negotiate challenge, and `protocol.allow=never` with only `https`
+allowed. **No proxy is used and only the system's certificates are
+trusted**: a proxy is a host `BENCH_CLONE_HOSTS` does not list, so a
+bench behind a mandatory proxy cannot clone, and says the host could not
+be reached. (`BENCH_CLONE_CAINFO` names a certificate bundle for git to
+trust; it is a test seam, like `OPENROUTER_URL`, not a feature.)
+
+**Bounded, and nothing half-made is kept.** One commit at depth one, no
+tags, no submodules, no LFS content (a pointer file is checked out as
+the pointer). The whole clone has `MAX_CLONE_SECONDS` (120), and its
+directory, `.git` included, may hold `MAX_CLONE_BYTES` (200,000,000
+bytes of files) in `MAX_CLONE_ENTRIES` (100,000 entries); all three are
+proposed values the operator rules on. The size is measured while the
+fetch arrives, counted from the fetched tree before anything is checked
+out, and measured again after; past any ceiling, or past the time, git
+and everything it started are killed, what was fetched is removed, and
+the refusal names the ceiling and the figure measured. One clone runs at
+a time; a second is refused with `409` until the first has answered.
+
+**One repository at one ref has one place.** The directory is
+`BENCH_CLONE_ROOT/<first 16 hex of sha256("url\nref")>`, where the url
+is the repository's identity: the checked URL without a trailing `.git`,
+so both spellings are one clone. Other spellings are not folded: owner
+and repository case, and a ref named two ways (`main`,
+`refs/heads/main`), are two clones, because whether they coincide is
+the host's business. A second request for the same repository and ref
+**replaces** the clone: the commit is fetched fresh into a new directory
+beside the old one, which is swapped in only when everything has
+succeeded, and the answer says `updated` (with `200`) rather than
+`cloned` (`201`). A failed update leaves the old clone exactly as it
+was. No git ever runs in a directory the door did not just make, so no
+hook, lock or config inside an old clone is ever read. While a clone is
+being made or replaced, the snapshot doors refuse a root at it, inside
+it or around it with `409`: a walk of a tree mid-checkout would store two
+commits under one capture.
+
+**The URL is recorded once.** A `clones` table holds each repository and
+ref: the id, the URL, the ref, the commit checked out now, the
+directory, and when it was made and last replaced. That row is the only
+place the URL is kept. It is never in a composed text, a manifest, a
+report or an export, because a URL is not a fact about the reading; git
+writes it into the clone's `.git/FETCH_HEAD`, and the door removes that
+file, and git's reflog, which would name you and your machine, is off.
+The row describes the directory as it is now; what a snapshot read is on
+its capture, which never changes.
+
+**Removing a clone is yours.** There is no delete door: remove the
+directory yourself. Its row stays, and a later clone of the same
+repository and ref lands in the same place under the same row. The
+bench removes only its own half-made directories (`.<hex>.partial`,
+`.<hex>.old`), at boot and before each clone.
 
 ### Stored datasets
 

@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     extracted_chars INTEGER,
     UNIQUE (digest, extractor, extractor_version)
 );
+CREATE TABLE IF NOT EXISTS clones (
+    id INTEGER PRIMARY KEY,
+    url TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    root TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (url, ref)
+);
 CREATE TABLE IF NOT EXISTS snapshot_captures (
     id INTEGER PRIMARY KEY,
     digest TEXT NOT NULL,
@@ -636,6 +646,18 @@ MIGRATIONS = [
     # and a browser can decide on without reading a body or parsing one;
     # the content is authoritative and these never disagree with it,
     # because they are computed from one parse of it in one statement.
+    #
+    # Phase O, the clones POST /clones made. NO ENTRY HERE, for Phase N's
+    # reason: a whole new table, created on any database by CREATE TABLE
+    # IF NOT EXISTS. Proven against tests/fixtures/pre_o_schema.sql.
+    #
+    # ONE ROW PER REPOSITORY AND REF, the clone's identity, and the ONE
+    # place the URL is recorded: never in a composed text, a manifest or
+    # an export, because a URL is not a fact about the reading. The row
+    # is the clone's working tree as it is now, so head_sha, root and
+    # updated_at move when a clone is replaced; what a snapshot read is
+    # recorded on its capture, which never moves. A row is never deleted
+    # (see record_clone).
 ]
 
 
@@ -1453,6 +1475,45 @@ def record_capture(
     found = capture(conn, int(cur.lastrowid or 0))
     assert found is not None
     return found
+
+
+def record_clone(
+    conn: sqlite3.Connection, *, url: str, ref: str, head_sha: str, root: str
+) -> dict[str, Any]:
+    """The clones row for this repository and ref, made or brought up to
+    date, as it now stands.
+
+    ONE STATEMENT FOR BOTH CASES, an upsert on the identity, because
+    whether the directory existed and whether the row did are two facts
+    that can disagree: an operator removes a clone's directory (the
+    README says that is how clones are removed) and the row stays; a
+    database is restored beside a clone root it never recorded. Either
+    way this is one row with one id, and a snapshot's clone id keeps
+    naming it.
+
+    NEVER INSERT OR REPLACE and never a delete. REPLACE is a delete and
+    an insert: it would give the repository a new id, and under foreign
+    keys it is refused outright once a capture cites the row.
+    """
+    now = _now()
+    with conn:
+        row = conn.execute(
+            """INSERT INTO clones
+               (url, ref, head_sha, root, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (url, ref) DO UPDATE SET
+                   head_sha = excluded.head_sha,
+                   root = excluded.root,
+                   updated_at = excluded.updated_at
+               RETURNING id, url, ref, head_sha, root, created_at, updated_at""",
+            (url, ref, head_sha, root, now, now),
+        ).fetchone()
+    return dict(row)
+
+
+def list_clones(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every clones row, oldest first."""
+    return [dict(r) for r in conn.execute("SELECT * FROM clones ORDER BY id")]
 
 
 def _capture_view(row: sqlite3.Row) -> dict[str, Any]:
