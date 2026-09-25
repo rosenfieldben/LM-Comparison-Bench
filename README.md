@@ -2447,7 +2447,11 @@ modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
 experiment's tier, because a verdict is a number and a sentence and a
 judge inheriting an extended budget would buy headroom no rubric needs,
 once per scored trial. Judge payloads carry the boot data policy like
-every other request.
+every other request. The report carries what the judging cost as
+`judge_cost`, on its own key, and the browser report states it on its
+own line beside the ranking ("judge spend: $X.XXXX over N billed calls",
+or "judge spend: none billed"), never added into a model's cost: that
+is the bench's instrument cost, not what any model under test was paid.
 
 **If the judge model is in the experiment's lineup**, every score it
 produces is flagged `self_judged` and the flag is surfaced in the report.

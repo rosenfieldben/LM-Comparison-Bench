@@ -40,7 +40,7 @@ from datetime import datetime
 import httpx
 import pytest
 from playwright.sync_api import expect
-from test_i4 import check_all_chips
+from test_i4 import check_all_chips, column_texts
 from test_n import (
     ABORTED_RESOURCE,
     REFUSED_RESOURCE,
@@ -1086,6 +1086,63 @@ def test_a_selection_no_reload_asked_about_is_asked_when_it_is_listed(
         page.wait_for_timeout(50)
     assert len(asked) == 1
     page.unroute("**/experiments")
+
+
+def test_the_report_states_judge_spend_on_its_own_line(
+    page, bench, bench_url, scorings
+):
+    """WINDOW: the report banner's judge-spend line and the providers
+    table's cost cells, for an experiment scored with a judge (the stub
+    bills every judge call) and for one scored with deterministic scorers
+    only, each read against GET /experiments/{id}/report.
+
+    The payload keeps the judge's cost on its own key (report.judge_cost),
+    the bench's instrument cost, and the page does the same: one line
+    beside the ranking, "judge spend: $X.XXXX over N billed calls", or
+    "judge spend: none billed" when no call was billed; and never added
+    into a model's cost cell, whose total is what that model was paid.
+    The expected text is built here from the payload's numbers, not by
+    the page's own code. PRE-STATE: the judged pass billed its calls (two:
+    one judge task on two arms), and each model's cell would read
+    differently with the judge's spend folded in, so a page that folded
+    it would fail here."""
+    judged, j_digest = finished(
+        page, bench_url, JUDGED, lineup=("stub/fast", "stub/slow")
+    )
+    plain, p_digest = finished(page, bench_url, PLAIN)
+    for eid, body in (
+        (judged, {"dataset_digest": j_digest, "judge_model": "stub/html"}),
+        (plain, {"dataset_digest": p_digest}),
+    ):
+        started = page.request.post(f"{bench_url}/experiments/{eid}/score", data=body)
+        assert started.status == 202, started.text()
+        wait_scoring_idle(page, bench_url)
+    report = page.request.get(f"{bench_url}/experiments/{judged}/report").json()
+    spend = report["judge_cost"]
+    assert spend["billed_calls"] == 2, spend
+    models = report["models"]
+    for model in models:
+        own = f"${model['cost']['total_usd']:.4f}"
+        folded = f"${model['cost']['total_usd'] + spend['total_usd']:.4f}"
+        assert own != folded, (model["label"], own, folded)
+    bench(["stub/fast"])
+    open_experiments(page)
+
+    row_for(page, judged).click()
+
+    line = page.get_by_test_id("report-judge-spend")
+    expect(line).to_have_text(
+        f"judge spend: ${spend['total_usd']:.4f} over "
+        f"{spend['billed_calls']} billed calls"
+    )
+    costs = column_texts(page, "report-providers", "report-cost", len(models))
+    for model, text in zip(models, costs, strict=True):
+        assert text.startswith(f"${model['cost']['total_usd']:.4f} ("), (
+            model["label"],
+            text,
+        )
+    row_for(page, plain).click()
+    expect(line).to_have_text("judge spend: none billed")
 
 
 # ---- Names, notes and contrast.

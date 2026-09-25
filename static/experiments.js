@@ -452,6 +452,23 @@
           ")" +
           composition;
     el.append(ranking);
+    // What the judging cost, on its own line beside the ranking, as the
+    // payload keeps it on its own key (report.judge_cost). It is the
+    // bench's instrument cost, money spent measuring, and is never added
+    // into a model's cost cell, whose total is what that model was paid.
+    const spend = report.judge_cost;
+    const judgeSpend = document.createElement("span");
+    judgeSpend.dataset.testid = "report-judge-spend";
+    judgeSpend.className = "report-note";
+    judgeSpend.textContent =
+      spend.billed_calls > 0
+        ? "judge spend: $" +
+          spend.total_usd.toFixed(4) +
+          " over " +
+          spend.billed_calls +
+          (spend.billed_calls === 1 ? " billed call" : " billed calls")
+        : "judge spend: none billed";
+    el.append(judgeSpend);
     if (report.arm_caveat) {
       // Present only when it was earned, so a reader who sees it knows
       // something specific happened rather than that the bench hedges by
