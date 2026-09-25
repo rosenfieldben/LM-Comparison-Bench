@@ -1706,6 +1706,17 @@ to a provider, and one mistyped root is the difference between sharing a
 module and sharing whatever happened to be under a parent directory. The
 allowlist bounds what a typo can gather.
 
+**A root inside version control is refused.** The exclusions below match
+paths under the root, so a root of `<repo>/.git` would walk the very
+directory they skip, and the pattern `config` would compose a remote URL
+with a token in it into a prompt. Both snapshot doors therefore refuse,
+with `403`, any root whose path below its `BENCH_REPO_ROOTS` entry passes
+through `.git`, `.hg` or `.svn` (compared without regard to case, since a
+disk that folds case reaches `.git` as `.GIT` too); the refusal names the
+rule and not the path. It is measured from the deepest entry holding the
+root, so an entry you name inside `.git` yourself is walked. This was
+possible from Phase L until Phase O.
+
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
 
@@ -2015,8 +2026,8 @@ file, and git's reflog, which would name you and your machine, is off.
 The row describes the directory as it is now; what a snapshot read is on
 its capture, which never changes. **A snapshot of a clone names it**: its
 capture carries the clone's id (`clone_id`), found by what the
-directories are rather than how they are spelled, from the root, a
-directory inside the clone or its `.git`; a root that holds clones
+directories are rather than how they are spelled, from the clone's
+root or a directory inside it; a root that holds clones
 rather than sitting in one (`BENCH_CLONE_ROOT` itself) names none. The
 id travels wherever the capture does (the snapshot's response, the
 history, the report and the export), so a reader asks "which

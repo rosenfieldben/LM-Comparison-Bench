@@ -974,13 +974,15 @@ def test_the_url_is_in_the_clones_row_and_in_no_other_record(
     """WINDOW: a clone, a snapshot of it, a comparison citing the
     snapshot, and a second clone replacing the first, then every row of
     every table but clones, every body the bench answered, the request
-    it sent upstream, every byte under the clone including .git, a
-    snapshot of the clone's .git, and the log.
+    it sent upstream, every byte under the clone including .git, the
+    refusal of a snapshot of the clone's .git, and the log.
 
     The URL, its host and its owner/repo pair appear nowhere but the
     clones row: git writes the URL into .git/FETCH_HEAD and the door
-    removes it; the reflog, which would name the operator, is off.
-    PRE-STATE: the clones row holds the URL, so the search can find it."""
+    removes it; the reflog, which would name the operator, is off; and
+    since O3 a snapshot root inside .git is refused outright
+    (ROOT_IN_VCS), so the files are searched where they lie. PRE-STATE:
+    the clones row holds the URL, so the search can find it."""
     repo, _ = repo_for(request, stub, {"a.py": b"ANSWER = 42\n"})
     needles = [f"{OWNER}/{repo}", stub.host, f"127.0.0.1:{stub.port}"]
     route = respx.post(OPENROUTER_URL).mock(
@@ -1017,7 +1019,8 @@ def test_the_url_is_in_the_clones_row_and_in_no_other_record(
             "patterns": ["HEAD", "config", "shallow", "*HEAD*"],
         },
     )
-    assert gitdir.status_code == 201, gitdir.text
+    assert gitdir.status_code == 403, gitdir.text
+    assert gitdir.json()["detail"] == main.ROOT_IN_VCS
     # The two clone responses carry the URL to the caller who sent it,
     # which is the door's answer and not a record; everything else is
     # searched.
@@ -1060,10 +1063,11 @@ def test_a_snapshot_names_the_clone_its_root_is_in(request, bench, stub):
     """WINDOW: POST /snapshots at five roots, and the clone_id on each
     capture it returns.
 
-    The clone's own directory, a directory inside it, and its .git name
-    the clone; BENCH_CLONE_ROOT itself, which holds every clone and is in
-    none, names nothing; and so does a root beside the clones. PRE-STATE:
-    the clone is recorded and each root is allowed."""
+    The clone's own directory and a directory inside it name the clone;
+    BENCH_CLONE_ROOT itself, which holds every clone and is in none,
+    names nothing; and so does a root beside the clones. The clone's
+    .git is refused as a root since O3 (ROOT_IN_VCS). PRE-STATE: the
+    clone is recorded and each root but .git is allowed."""
     repo, _ = repo_for(request, stub, {"a.py": b"x\n", "sub/b.py": b"y\n"})
     made = clone_of(bench, stub, repo).json()
     beside = clone_root(bench) / "beside"
@@ -1073,10 +1077,13 @@ def test_a_snapshot_names_the_clone_its_root_is_in(request, bench, stub):
     cases = [
         (made["root"], ["*.py"], made["id"]),
         (f"{made['root']}/sub", ["*.py"], made["id"]),
-        (f"{made['root']}/.git", ["HEAD"], made["id"]),
         (str(clone_root(bench)), ["**/*.py"], None),
         (str(beside), ["*.py"], None),
     ]
+    gitdir = bench.post(
+        "/snapshots", json={"root": f"{made['root']}/.git", "patterns": ["HEAD"]}
+    )
+    assert gitdir.status_code == 403
     for root, patterns, expected in cases:
         resp = bench.post("/snapshots", json={"root": root, "patterns": patterns})
         assert resp.status_code == 201, (root, resp.text)

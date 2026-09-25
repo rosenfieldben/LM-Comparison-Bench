@@ -1633,6 +1633,19 @@ SNAPSHOTS_OFF = (
 )
 
 
+# What either snapshot door says to a root inside a version control
+# directory. It names the rule and not the path: the path is the
+# person's own, and the refusal is about where it points.
+ROOT_IN_VCS = (
+    "a snapshot root may not be inside a version control directory "
+    "(.git, .hg or .svn) below its BENCH_REPO_ROOTS entry. Those hold a "
+    "repository's history and configuration, a remote URL with a token "
+    "in it among them, and the walk excludes them so that none of it "
+    "reaches a prompt; a root inside one would walk what the exclusion "
+    "keeps out. Name the repository's own directory instead."
+)
+
+
 def _resolved_directory(path: str) -> str | None:
     """The fully resolved path, if it is a directory, else None.
 
@@ -7238,16 +7251,21 @@ def enforce_snapshot_root(
 ) -> str:
     """The resolved root a request may walk, or a refusal saying why not.
 
-    THREE REFUSALS AND TWO CODES. No allowlist at all and a root outside
-    it are both 403: the request is well formed and the bench's policy
-    says no, which is the same answer LocalOnlyGuard gives a non-loopback
-    client and for the same reason. A root that is not a directory is
-    422, because that one is about what the caller wrote.
+    THREE REFUSALS AND TWO CODES (and a fourth since Phase O, below).
+    No allowlist at all and a root outside it are both 403: the request
+    is well formed and the bench's policy says no, which is the same
+    answer LocalOnlyGuard gives a non-loopback client and for the same
+    reason. A root that is not a directory is 422, because that one is
+    about what the caller wrote.
 
     The allowed roots are named back on refusal. They are the operator's
     own configuration and the caller is that operator on loopback, so
     listing them is the difference between "no" and "no, and here is
     what you meant to type".
+
+    A FOURTH REFUSAL, 403, since Phase O: a root inside .git, .hg or
+    .svn below its allowlist entry (snapshot.vcs_below), which would walk
+    what the exclusions keep out. It names the rule and not the path.
 
     THE RESOLVER IS INJECTED RATHER THAN THE RESOLUTION, and the
     difference is an ordering rather than a style. A resolved path passed
@@ -7269,7 +7287,8 @@ def enforce_snapshot_root(
             "walks a clone root, so this wants the directory the "
             "repository was cloned into.",
         )
-    if not any(snapshot.contained(real, allowed) for allowed in roots):
+    holding = [allowed for allowed in roots if snapshot.contained(real, allowed)]
+    if not holding:
         # Each path spelled as a response can carry it: a root resolved
         # through a link to a name UTF-8 cannot spell, or an allowlist
         # entry read from such an environment, would otherwise put a raw
@@ -7283,6 +7302,10 @@ def enforce_snapshot_root(
             "so which trees may be walked is an explicit allowlist "
             "rather than whatever path a request names.",
         )
+    # Below the deepest entry holding it, which is the one the operator
+    # named most exactly: an entry named inside .git is theirs to walk.
+    if snapshot.vcs_below(real, max(holding, key=len)):
+        raise HTTPException(403, ROOT_IN_VCS)
     return real
 
 

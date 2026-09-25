@@ -18520,6 +18520,132 @@ def test_the_listing_door_is_on_the_loop_like_the_composer():
 
 
 # =====================================================================
+# ---- Phase O, O3: a root inside version control. Pre-existing since
+# ---- Phase L; refused at both snapshot doors from here. Every test
+# ---- names its window.
+# =====================================================================
+
+# A token no sentence of the bench's could hold by accident.
+VCS_TOKEN = "ghp_Zq9x7Wv3Kp2Jm8"
+
+
+def repo_with_a_token(tmp_path):
+    """A repository, made by git, whose remote URL carries a token, so
+    the token sits in its .git/config exactly where a clone puts one."""
+    repo = tmp_path / "zqrepo"
+    clone(repo, {"a.py": b"A = 1\n"})
+    home = tmp_path / "git-home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    url = f"https://u:{VCS_TOKEN}@github.com/o/r.git"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", url], env=env, check=True
+    )
+    return repo
+
+
+def holds_no_part_of(text, secret, shortest=5):
+    return not any(
+        secret[i : i + shortest] in text for i in range(len(secret) - shortest + 1)
+    )
+
+
+@pytest.mark.parametrize("door", ["/snapshots", "/snapshots/listing"])
+def test_a_root_inside_git_is_refused_and_its_token_stays_out(client, tmp_path, door):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on <repo>/.git
+    with the pattern "config", where .git/config names a remote whose URL
+    carries a token.
+
+    Refused, 403, with the rule and not the path, and no part of the
+    token in the sentence; nothing is stored. PRE-STATE, the control:
+    the same file copied out of .git is selected by the same pattern and
+    its token composed, so the plant is live and the composer carries
+    whatever it is given; before this rule, <repo>/.git composed the
+    same way."""
+    repo = repo_with_a_token(tmp_path)
+    config = (repo / ".git" / "config").read_text()
+    assert VCS_TOKEN in config
+    copied = repo / "copied"
+    copied.mkdir()
+    (copied / "config").write_text(config)
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+
+    control = client.post(door, json={"root": str(copied), "patterns": ["config"]})
+    if door == "/snapshots":
+        assert control.status_code == 201, control.text
+        text = db.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = ?",
+            (control.json()["digest"],),
+        ).fetchone()[0]
+        assert VCS_TOKEN in text
+    else:
+        assert control.status_code == 200
+        assert control.json()["would_compose"] is True
+        assert ("config", len(config.encode())) in selected_rows(control.json())
+
+    stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
+    resp = client.post(door, json={"root": str(repo / ".git"), "patterns": ["config"]})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == main.ROOT_IN_VCS
+    assert holds_no_part_of(resp.text, VCS_TOKEN)
+    assert "zqrepo" not in resp.text and str(tmp_path) not in resp.text
+    assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
+
+
+def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_path):
+    """WINDOW: POST /snapshots/listing on roots at, inside and around
+    version control directories, and on names that only look like one.
+
+    Refused: a root deeper inside .git, inside .hg and .svn, inside a
+    directory spelled .GIT (on a disk that folds case, the repository's
+    .git itself), and a link into .git, which resolves to it. Answered:
+    the repository, .github, git, x.git. And only BELOW the entry: an
+    entry the operator named inside .git is walked, while the same
+    directory reached from an entry above it is refused, because the
+    deepest entry holding a root is the one it is measured from.
+    PRE-STATE: every root is a directory under an allowed entry."""
+    repo = repo_with_a_token(tmp_path)
+    for name in (
+        ".git/objects",
+        ".hg/store",
+        ".svn/pristine",
+        ".github",
+        "git",
+        "x.git",
+    ):
+        (repo / name).mkdir(parents=True, exist_ok=True)
+    other = tmp_path / "other"
+    (other / ".GIT").mkdir(parents=True)
+    (repo / "link").symlink_to(repo / ".git")
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+
+    def status(root):
+        assert Path(root).is_dir()
+        return client.post(
+            "/snapshots/listing", json={"root": str(root), "patterns": ["*"]}
+        ).status_code
+
+    for refused in (".git", ".git/objects", ".hg/store", ".svn/pristine", "link"):
+        assert status(repo / refused) == 403, refused
+    assert status(other / ".GIT") == 403
+    for answered in ("", ".github", "git", "x.git"):
+        assert status(repo / answered) == 200, answered
+
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    client.app.state.repo_roots = (str(tmp_path.resolve()), str(hooks.resolve()))
+    assert status(hooks) == 200
+    assert status(repo / ".git") == 403
+
+
+# =====================================================================
 # ---- Phase N1: the datasets door, and three doors that take a digest.
 #
 # Every test below names its window. The path workflow the README walks

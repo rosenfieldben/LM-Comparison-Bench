@@ -47,6 +47,7 @@ import os.path
 from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
 from contextlib import closing
 from dataclasses import dataclass
+from pathlib import PurePath
 from typing import Any, NamedTuple, Protocol
 
 from bench.extract import (
@@ -85,6 +86,7 @@ __all__ = [
     "SNAPSHOT_KIND",
     "SNAPSHOT_VERSION",
     "SYMLINK",
+    "VCS_DIRECTORIES",
     "Entry",
     "Handle",
     "Opened",
@@ -104,6 +106,7 @@ __all__ = [
     "list_members",
     "matches",
     "printable",
+    "vcs_below",
     "walk",
 ]
 
@@ -144,6 +147,13 @@ UTF8_BOM = b"\xef\xbb\xbf"
 # root and include patterns; adding an exclusion override would make the
 # secret group opt-out, and an opt-out default is not a default. A
 # caller who genuinely needs a .pem in a comparison can paste it.
+# The three version control directories: a repository's history and
+# configuration rather than its source, and the configuration is where a
+# remote URL with a token in it lives. The walk excludes them (they open
+# the first group below); a ROOT inside one is refused outright
+# (vcs_below), since the exclusions match paths below the root.
+VCS_DIRECTORIES = (".git", ".hg", ".svn")
+
 # THE GROUPS HAVE NAMES because the member listing reports which one
 # excluded an entry, and a name only a comment knew could not be
 # reported. The names are the README's. DEFAULT_EXCLUDES is their
@@ -155,9 +165,7 @@ EXCLUDE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     (
         "version control and dependency trees",
         (
-            ".git",
-            ".hg",
-            ".svn",
+            *VCS_DIRECTORIES,
             "node_modules",
             ".venv",
             "venv",
@@ -522,6 +530,34 @@ def contained(real: str, root: str) -> bool:
     except ValueError:
         return False
     return os.path.normcase(common) == os.path.normcase(os.path.normpath(root))
+
+
+def vcs_below(real: str, entry: str) -> bool:
+    """Whether a root passes through a version control directory below
+    the allowlist entry it sits under.
+
+    THE EXCLUSIONS CANNOT SEE ABOVE THE ROOT. They match a member's path
+    relative to the root, so a root of <repo>/.git walks the directory
+    the first group exists to skip, and <repo>/.git with the pattern
+    "config" composes a remote URL that may carry a token: the thing the
+    secrets group exists to keep out of a prompt. Found in Phase O; the
+    door has allowed it since Phase L.
+
+    ONLY BELOW THE ENTRY. An entry the operator named inside .git is
+    their explicit choice and is walked; a root at the entry itself is
+    never refused by this rule.
+
+    FOLDED FOR CASE: on a disk that folds case, <repo>/.GIT is the same
+    directory as <repo>/.git and a realpath keeps the spelling it was
+    given. On one that does not, a directory named .GIT is refused too,
+    which costs nothing anybody meant. A value in, a value out: both
+    paths are already resolved, and nothing here touches a disk.
+    """
+    below = PurePath(real).parts[len(PurePath(entry).parts) :]
+    return any(part.casefold() in _VCS_FOLDED for part in below)
+
+
+_VCS_FOLDED = frozenset(name.casefold() for name in VCS_DIRECTORIES)
 
 
 # The kinds a directory entry can be, as the walk tells them apart. Four
