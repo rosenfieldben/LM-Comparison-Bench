@@ -388,12 +388,32 @@ def test_a_repeat_count_the_engine_cannot_hold_is_refused_on_its_line():
 
 
 def test_a_line_nested_past_the_decoders_depth_is_refused_on_its_line():
-    """WINDOW: parse_dataset over a line of arrays nested deeper than
-    json.loads can decode, far inside the byte ceiling.
+    """WINDOW: parse_dataset over a line of arrays nested DEPTH_MARGIN
+    levels past the deepest json.loads decodes on the running interpreter
+    (found by bisection; the margin because the limit counts the caller's
+    own frames on 3.11, and this call sits shallower than the bisection's),
+    inside the dataset door's byte ceiling.
 
     json.loads raises RecursionError there, not ValueError, and it
-    escaped the parser as a 500."""
-    deep = "[" * 100_000 + "]" * 100_000
+    escaped the parser as a 500. THE DEPTH IS THE INTERPRETER'S: 100000
+    was past the decoder on macOS and on ubuntu 3.11 to 3.13, and not on
+    ubuntu 3.14, where this test's pre-state failed (CI run 36093009840),
+    so the depth is measured. Where the decoder takes every depth that
+    fits in MAX_DATASET_BYTES, no line the door accepts can reach it, and
+    the test is skipped, naming the platform and the depth measured."""
+    from bench.main import MAX_DATASET_BYTES
+
+    fits = (MAX_DATASET_BYTES - 64) // 2
+    decodes = _deepest(_decodes, cap=fits)
+    if decodes + DEPTH_MARGIN >= fits:
+        pytest.skip(
+            f"no such line on {platform.system()} Python "
+            f"{platform.python_version()}: json.loads decodes lists nested "
+            f"{fits} deep, the deepest a line inside the byte ceiling can be"
+        )
+    depth = decodes + DEPTH_MARGIN
+    deep = "[" * depth + "]" * depth
+    # PRE-STATE: the decoder refuses this line with RecursionError.
     with pytest.raises(RecursionError):
         json.loads(deep)
     with pytest.raises(DatasetError) as exc:
@@ -469,8 +489,9 @@ def test_a_refusal_quotes_a_large_value_in_brief():
 # they differ by version and operating system. Measured with bare lists:
 # on macOS, 3.11 decodes 993 and prints 995, 3.12 9997 and 9996, 3.13
 # 9998 and 9997, 3.14 74663 and 43553; on ubuntu, 3.12 prints every depth
-# json.loads decodes (the operator's N4 pass) and 3.11 refuses to decode
-# 60000 (CI run 36092459473). A proof that named one depth held only
+# json.loads decodes (the operator's N4 pass), 3.11 refuses to decode
+# 60000 (CI run 36092459473), and 3.14 decodes 100000 (CI run
+# 36093009840). A proof that named one depth held only
 # where that depth sat in the window (a line decodes, repr overflows), so
 # these measure the running interpreter by bisection instead.
 DEPTH_CAP = 1 << 18
@@ -487,12 +508,12 @@ def _nested(depth: int) -> list:
     return value
 
 
-def _deepest(ok) -> int:
-    """The largest depth up to DEPTH_CAP for which ok holds, by bisection
-    (ok holds at 0 and, past its limit, at no greater depth)."""
-    if ok(DEPTH_CAP):
-        return DEPTH_CAP
-    low, high = 0, DEPTH_CAP
+def _deepest(ok, cap: int = DEPTH_CAP) -> int:
+    """The largest depth up to cap for which ok holds, by bisection (ok
+    holds at 0 and, past its limit, at no greater depth)."""
+    if ok(cap):
+        return cap
+    low, high = 0, cap
     while high - low > 1:
         mid = (low + high) // 2
         if ok(mid):
