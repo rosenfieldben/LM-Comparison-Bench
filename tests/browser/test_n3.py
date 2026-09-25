@@ -174,7 +174,14 @@ def create(page, name):
     expect(button).to_be_enabled()
     button.click()
     msg = page.get_by_test_id("experiment-create-msg")
-    expect(msg).to_have_text(re.compile(r"^created experiment \d+\."))
+    # The whole sentence, pinned here because every Create passes through:
+    # the money law it states is the one the page's buttons are labelled by.
+    expect(msg).to_have_text(
+        re.compile(
+            r"^created experiment \d+\. Creating spent nothing; money moves on "
+            r"Start, and on Score when a judge grades\.$"
+        )
+    )
     return int(re.search(r"\d+", msg.inner_text()).group())
 
 

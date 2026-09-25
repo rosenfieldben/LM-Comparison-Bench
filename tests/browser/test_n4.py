@@ -525,8 +525,9 @@ def test_an_unavailable_catalog_offers_no_judge_and_says_where_to_go(
     The page offers only the blank choice, says the catalog is not
     available and that the API takes a judge_model, and Score waits,
     saying why (not asking for a judge it cannot offer), rather than
-    sending a judge-less pass the door would accept and record as
-    unscored for good."""
+    sending a judge-less pass the door would accept, which records every
+    judge task as a scoring failure ("no judge model was given"), a
+    record that does not rewrite."""
     collectors.append(SERVER_ERROR)
     a, _ = finished(page, bench_url, JUDGED)
     page.route("**/models", lambda route: route.fulfill(status=500, body="down"))

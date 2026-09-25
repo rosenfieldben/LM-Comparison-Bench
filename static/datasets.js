@@ -779,6 +779,16 @@
   // THE BOX IS HIDDEN WHILE A FILE IS LOADED. Store sends the file, and a
   // box still showing text typed before it would show one dataset while
   // another was stored.
+  //
+  // A FILE PAST THE BYTE CEILING IS REFUSED HERE, BEFORE IT IS READ, IN
+  // THE PAGE'S OWN WORDS. The comparison is the door's: a file's bytes
+  // are what Store would send, and the ">" is the server's. The sentence
+  // is not, because the door's would not reliably come back: a file far
+  // enough past the ceiling is past the request cap too, and is refused
+  // as a body before the door reads it, and reading any size of file into
+  // the tab only to be refused is a cost of its own. It is one of the
+  // page's own refusals (see said()), and it names the route a larger
+  // dataset takes, since the page cannot create an experiment by path.
   async function loadFile(file) {
     if (file.size > DATASET_LIMITS.maxDatasetBytes) {
       said(
@@ -789,7 +799,7 @@
           DATASET_LIMITS.maxDatasetBytes +
           " byte limit for a stored dataset. A larger dataset goes by " +
           "path: name its file with dataset_path when the experiment is " +
-          "created.",
+          "created through the API.",
         "refused",
       );
       return;
@@ -826,7 +836,8 @@
   // ---- Store.
 
   // The panel's answer line. state is "refused" for a refusal, the
-  // server's or the page's own ("nothing was added", "not valid UTF-8"),
+  // server's or the page's own ("nothing was added", "not valid UTF-8",
+  // a file over the byte limit),
   // so it reads as one; and "" otherwise, including an answer the page
   // could not read or never got, whose outcome it leaves to the list
   // below.
@@ -1051,8 +1062,9 @@
       note.textContent =
         "The newest " +
         LIST_LIMIT +
-        " are listed; older ones stay stored, and an experiment names " +
-        "one by its digest.";
+        " are listed and can be selected; older ones stay stored, and an " +
+        "experiment over one is created through the API with its " +
+        "dataset_digest.";
       libraryEl.append(note);
     }
     renderSelected();

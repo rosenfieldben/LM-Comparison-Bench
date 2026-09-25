@@ -421,8 +421,11 @@
               aria-describedby="experiment-score-nudge experiment-score-note" disabled>Score</button>
       <span id="experiment-score-nudge" data-testid="experiment-score-nudge" role="status"></span>
       <!-- Present only when reading the experiment's dataset failed: it
-           asks the store again, which is the only thing that clears that
-           state short of selecting the experiment again. -->
+           asks the store again now. Selecting an experiment with that
+           digest asks again too, as does any reload of the list (the
+           panel reopened, a Create, a Start or a Stop), since a failed
+           question is forgotten; Retry is the way to ask without
+           waiting for one of those. -->
       <button id="experiment-score-retry" data-testid="experiment-score-retry" type="button"
               aria-describedby="experiment-score-nudge" hidden>Retry</button>
       <div id="experiment-score-notes">

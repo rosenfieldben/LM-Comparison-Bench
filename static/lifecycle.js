@@ -379,7 +379,8 @@
         createMsgEl,
         "created experiment " +
           data.id +
-          ". Creating spent nothing; money moves on Start.",
+          ". Creating spent nothing; money moves on Start, and on Score " +
+          "when a judge grades.",
         "",
       );
       await loadList();
@@ -464,7 +465,8 @@
       console.error("bench: checking a stored dataset failed", err);
     }
     // A failed question is no answer: it is forgotten, so the next
-    // selection asks again.
+    // selection asks again, as does the next reload of the list (see
+    // loadList) and a press on Retry.
     if (summary === undefined) datasetSummaries.delete(digest);
     else datasetSummaries.set(digest, summary);
     renderExperiment();
@@ -1014,8 +1016,10 @@
     }
     renderListSelection();
     // A selection made while an older reload was superseded (Create's
-    // own select finding nothing yet) was never asked about; ask now,
-    // rather than let its Score row read a question that never failed.
+    // own select finding nothing yet) was never asked about, and one
+    // whose question failed has been forgotten; ask now, rather than let
+    // its Score row read a question that never failed or stay on one
+    // that did.
     const shown = selectedExperiment();
     if (shown !== null && !datasetSummaries.has(shown.dataset_digest)) {
       void learnDataset(shown.dataset_digest);

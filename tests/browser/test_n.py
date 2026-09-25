@@ -1546,9 +1546,10 @@ def test_a_file_exactly_at_the_byte_ceiling_is_sent_and_one_over_is_not(
     """WINDOW: two files chosen in the JSONL picker, one exactly
     MAX_DATASET_BYTES of multi-byte text and one a byte longer.
 
-    The page refuses a file over the ceiling before reading it, and the
-    comparison must be the server's: at the ceiling the file is sent and
-    stored, and a >= in place of > would refuse it."""
+    The page refuses a file over the ceiling before reading it, in its
+    own sentence, which names the API as the route a larger dataset
+    takes; and the comparison must be the server's: at the ceiling the
+    file is sent and stored, and a >= in place of > would refuse it."""
     at = tmp_path / "at.jsonl"
     at.write_bytes(exactly(main.MAX_DATASET_BYTES).encode())
     over = tmp_path / "over.jsonl"
@@ -1566,7 +1567,8 @@ def test_a_file_exactly_at_the_byte_ceiling_is_sent_and_one_over_is_not(
         + " bytes, over the "
         + str(main.MAX_DATASET_BYTES)
         + " byte limit for a stored dataset. A larger dataset goes by path: "
-        "name its file with dataset_path when the experiment is created."
+        "name its file with dataset_path when the experiment is created "
+        "through the API."
     )
     expect(msg).to_have_attribute("data-state", "refused")
 
@@ -1671,8 +1673,9 @@ def test_a_full_library_says_it_lists_only_the_newest(page, bench):
 
     expect(page.get_by_test_id("dataset-entry")).to_have_count(500)
     expect(page.get_by_test_id("dataset-library-note")).to_have_text(
-        "The newest 500 are listed; older ones stay stored, and an experiment "
-        "names one by its digest."
+        "The newest 500 are listed and can be selected; older ones stay stored, "
+        "and an experiment over one is created through the API with its "
+        "dataset_digest."
     )
     answer["body"] = json.dumps({"datasets": entries[:499]})
     page.get_by_test_id("datasets-toggle").click()

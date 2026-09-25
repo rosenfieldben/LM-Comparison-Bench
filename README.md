@@ -1921,7 +1921,10 @@ There are three ways in:
   box, so its CRLFs survive and the stored digest is the file's. The box
   is hidden while a file is loaded, so it never shows one dataset while
   another is stored. A file that is not UTF-8 is said to be so and never
-  sent.
+  sent, and a file over the byte ceiling is refused by the page before
+  it is read, in the page's own sentence (the server's comparison, since
+  a file far past the ceiling would meet the request cap before the
+  door's sentence): a larger dataset goes by path, through the API.
 - **From saved prompts.** Each checked prompt becomes one task with its
   id and scorer left for you to set.
 
@@ -1942,9 +1945,10 @@ panel says afterwards (an import, a file loaded) takes the message line,
 and the mark then stands on its own.
 
 Stored datasets are listed newest first (the newest 500) with their task
-count, scorer kinds and digest. Selecting one marks it for the
-experiment form in the Experiments panel and loads nothing back into the
-builder: editing a stored dataset is storing a new one.
+count, scorer kinds and digest; an experiment over an older one is
+created through the API with its `dataset_digest`. Selecting one marks
+it for the experiment form in the Experiments panel and loads nothing
+back into the builder: editing a stored dataset is storing a new one.
 
 ## Experiments
 
@@ -2721,17 +2725,20 @@ eligible population** in `thresholds_source`:
   `dataset_unreadable`, which is `null` in every other report. Naming the
   digest explicitly in that case is refused, because you asked for it.
 
+  `passed` is written from the task's own threshold at scoring time and
+  `judged_pass` returns null unless the author declared one, so **a
+  judge row with a non-null `passed` is itself a record that a threshold
+  existed**. The rate that comes out is exact, because those verdicts
+  were computed against the real cutoff. The eligible count is a
+  **floor**: a declared task whose trials were never scored leaves no
+  row to witness it. Name the dataset, by `dataset_path` or by a stored
+  `dataset_digest`, for the full denominator; a stored copy this build
+  cannot read is named in `dataset_unreadable`.
+
 A report rebuilt from an export says `dataset_file` whichever door its
 thresholds came through: the manifest carries the thresholds and not
 where they were read from, so there the value means only that a dataset
-was read. `passed` is written from the task's own
-  threshold at scoring time and `judged_pass` returns null unless the
-  author declared one, so **a judge row with a non-null `passed` is
-  itself a record that a threshold existed**. The rate that comes out is
-  exact, because those verdicts were computed against the real cutoff.
-  The eligible count is a **floor**: a declared task whose trials were
-  never scored leaves no row to witness it. Supply the file for the full
-  denominator.
+was read.
 
 Only judge rows witness. A deterministic scorer writes `passed`
 unconditionally, since it is the score restated rather than a cutoff
@@ -2854,7 +2861,8 @@ needs them, and the export already carries every prompt actually sent.
 
 The manifest always carries `thresholds_included`, so a reader holding an
 export with no thresholds can tell a dataset that declared none from an
-export nobody handed the file to. Those license different claims about
+export that read no dataset (none named and none stored, or the stored
+copy unreadable). Those license different claims about
 the pass rate inside: with the slice the artifact re-derives the exact
 eligible denominator, without it the same floor the pathless report
 publishes. Both modes are byte-identical across two exports; the two

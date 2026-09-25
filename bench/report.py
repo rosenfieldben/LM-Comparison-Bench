@@ -1978,7 +1978,8 @@ def export_manifest(
     its denominator, so the manifest states which it is rather than
     leaving the reader to infer it from an empty mapping. None and {} are
     different facts here, exactly as they are in build_report: the first
-    means nobody supplied the file, the second means the file declared
+    means the export read no dataset (none named and none stored, or the
+    stored copy unreadable), the second means the dataset declared
     nothing.
 
     export_schema_change states, in the artifact, what the version
@@ -2008,8 +2009,9 @@ def export_manifest(
         "thresholds": {} if thresholds is None else thresholds,
         # The artifact labels its own sufficiency. Without this a reader
         # holding an export with no thresholds cannot tell a dataset that
-        # declared none from an export nobody handed the file to, and
-        # those licence different claims about the pass rate inside.
+        # declared none from an export that read no dataset (none named
+        # and none stored, or the stored copy unreadable), and those
+        # licence different claims about the pass rate inside.
         "thresholds_included": thresholds is not None,
         # Whether ANYTHING in this artifact cites a document, which
         # since version 5 means the trial lines or the manifest's own
