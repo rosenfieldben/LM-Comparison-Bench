@@ -37,6 +37,7 @@ from typing import Any
 # only consumer. Importing it rather than re-deriving "the last row" is
 # the whole point of J4: a correct helper with no call sites is a rule
 # nothing obeys.
+from bench.datasets import JUDGE_SCORER
 from bench.models import as_flag
 from bench.scoring import latest_per_key
 
@@ -1661,12 +1662,25 @@ def _cost_totals(results: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _judge_cost(scores_by_result: dict[int, list[dict[str, Any]]]) -> dict[str, Any]:
-    """What the judging itself cost, over every score row that was billed.
+    """What the judging itself cost, over every score row that was billed,
+    and how many judge rows that figure cannot speak for.
 
     Every row, not the latest per key: a re-scoring pass paid for its
     call whether or not its verdict is the one the report now uses, and
     superseded spend is still spend. That is the same rule the trial
     totals follow, one level up.
+
+    A TOTAL IS ONLY AS COMPLETE AS ITS ROWS. A judge row with no billing
+    figure is not a free call. unpriced_calls counts the rows that hold a
+    generation id and no figure: the call went out and its reply carried
+    no price. rows_without_figure counts every judge row with no figure,
+    whatever the reason (a reply with no price, a call that timed out
+    after it was sent, one refused before it was), so the unpriced calls
+    are among them. It is the count that is true from what the row
+    stores, and it keeps the spend line from reading as the whole cost of
+    judging when it may not be. Telling a call that timed out after it
+    was sent from one never sent needs a fact the score row does not
+    record; BACKLOG.md has why that waits.
     """
     charges = [
         row["judge_billed_cost_usd"]
@@ -1674,7 +1688,20 @@ def _judge_cost(scores_by_result: dict[int, list[dict[str, Any]]]) -> dict[str, 
         for row in rows
         if row.get("judge_billed_cost_usd") is not None
     ]
-    return {"total_usd": sum(charges), "billed_calls": len(charges)}
+    bare = [
+        row
+        for rows in scores_by_result.values()
+        for row in rows
+        if row["scorer"] == JUDGE_SCORER and row.get("judge_billed_cost_usd") is None
+    ]
+    return {
+        "total_usd": sum(charges),
+        "billed_calls": len(charges),
+        "unpriced_calls": sum(
+            1 for row in bare if row.get("judge_generation_id") is not None
+        ),
+        "rows_without_figure": len(bare),
+    }
 
 
 def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:

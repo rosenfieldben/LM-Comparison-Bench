@@ -640,25 +640,37 @@ def build_app() -> Starlette:
         (scorer, judge) pair rather than a scorer, and a stub where both
         judges returned the same number could not tell a report that
         keeps them apart from one that merges them.
+
+        The usage is the judge's own personality, as a trial's is: a
+        judge named stub/nousage replies with a generation id and no
+        usage at all, which is a call that went out and came back with
+        no price, and the report has to say so rather than count it as
+        nothing spent.
         """
         score = JUDGE_SCORES.get(model, 0.5)
-        return JSONResponse(
-            {
-                "id": f"gen-judge-{model.split('/')[-1]}",
-                "provider": PROVIDER,
-                "choices": [
-                    {
-                        "message": {
-                            "role": "assistant",
-                            "content": json.dumps(
-                                {"score": score, "reason": f"graded by {model}"}
-                            ),
-                        },
-                        "finish_reason": "stop",
-                    }
-                ],
-                "usage": USAGE,
-            },
+        body = {
+            "id": f"gen-judge-{model.split('/')[-1]}",
+            "provider": PROVIDER,
+            "choices": [
+                {
+                    "message": {
+                        "role": "assistant",
+                        "content": json.dumps(
+                            {"score": score, "reason": f"graded by {model}"}
+                        ),
+                    },
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        usage = usage_for(model)
+        if usage is not None:
+            body["usage"] = usage
+        # allow_nan for non_stream_body's reason: a poisoned personality
+        # puts a bare NaN on the wire.
+        return Response(
+            json.dumps(body, allow_nan=True),
+            media_type="application/json",
             headers=headers,
         )
 

@@ -2457,6 +2457,14 @@ every other request. The report carries what the judging cost as
 own line beside the ranking ("judge spend: $X.XXXX over N billed calls",
 or "judge spend: none billed"), never added into a model's cost: that
 is the bench's instrument cost, not what any model under test was paid.
+A judge reply that came back with no price is named as unpriced rather
+than counted as nothing spent (", K unpriced", or "none billed, K calls
+unpriced"), and when any judge row carries no billing figure the line
+says how many ("; M judge rows carry no billing figure"), whatever the
+reason: a reply with no price, a call that timed out after it was sent,
+a pass with no judge to call. The unpriced calls are among those M. A
+score row does not record whether a call that got no reply was sent, so
+the count cannot be split further; BACKLOG.md says why that waits.
 
 **If the judge model is in the experiment's lineup**, every score it
 produces is flagged `self_judged` and the flag is surfaced in the report.

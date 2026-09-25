@@ -1156,6 +1156,72 @@ def test_the_report_states_judge_spend_on_its_own_line(
     expect(line).to_have_text("judge spend: none billed")
 
 
+def test_the_judge_spend_line_counts_what_it_cannot_price(
+    page, bench, bench_url, scorings
+):
+    """WINDOW: the report banner's judge-spend line for two judged
+    experiments, each read against GET /experiments/{id}/report: A, two
+    arms judged by stub/nousage, whose replies carry a generation id and
+    no usage; B, one arm judged by stub/html (billed), then by
+    stub/nousage, then scored with no judge.
+
+    A reply with no price is a call that went out, so the line names it
+    as unpriced rather than reading "none billed" as if nothing had been
+    spent; and every judge row with no billing figure is counted after
+    the spend, whatever the reason (a reply with no price, a pass with no
+    judge to call), the unpriced call among them, so the line never
+    reads as the whole cost of judging when it may not be. The expected
+    text is built here from the payload's numbers, not by the page's own
+    code. PRE-STATE: A's payload holds two unpriced calls and nothing
+    billed, and B's one billed call, one unpriced and two rows with no
+    figure, so each count the line states is one the rows hold."""
+    a, a_digest = finished(page, bench_url, JUDGED, lineup=("stub/fast", "stub/slow"))
+    b, b_digest = finished(page, bench_url, JUDGED)
+    for eid, body in (
+        (a, {"dataset_digest": a_digest, "judge_model": "stub/nousage"}),
+        (b, {"dataset_digest": b_digest, "judge_model": "stub/html"}),
+        (b, {"dataset_digest": b_digest, "judge_model": "stub/nousage"}),
+        (b, {"dataset_digest": b_digest}),
+    ):
+        started = page.request.post(f"{bench_url}/experiments/{eid}/score", data=body)
+        assert started.status == 202, started.text()
+        wait_scoring_idle(page, bench_url)
+    a_spend = page.request.get(f"{bench_url}/experiments/{a}/report").json()[
+        "judge_cost"
+    ]
+    b_spend = page.request.get(f"{bench_url}/experiments/{b}/report").json()[
+        "judge_cost"
+    ]
+    assert a_spend == {
+        "total_usd": 0,
+        "billed_calls": 0,
+        "unpriced_calls": 2,
+        "rows_without_figure": 2,
+    }, a_spend
+    assert (
+        b_spend["billed_calls"],
+        b_spend["unpriced_calls"],
+        b_spend["rows_without_figure"],
+    ) == (1, 1, 2), b_spend
+    bench(["stub/fast"])
+    open_experiments(page)
+    line = page.get_by_test_id("report-judge-spend")
+
+    row_for(page, a).click()
+
+    expect(line).to_have_text(
+        f"judge spend: none billed, {a_spend['unpriced_calls']} calls unpriced; "
+        f"{a_spend['rows_without_figure']} judge rows carry no billing figure"
+    )
+    row_for(page, b).click()
+    expect(line).to_have_text(
+        f"judge spend: ${b_spend['total_usd']:.4f} over "
+        f"{b_spend['billed_calls']} billed call, "
+        f"{b_spend['unpriced_calls']} unpriced; "
+        f"{b_spend['rows_without_figure']} judge rows carry no billing figure"
+    )
+
+
 # ---- Names, notes and contrast.
 
 

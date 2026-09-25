@@ -224,3 +224,28 @@ a23b257).
   the rule is 'enforced where it lives' was false; N4 tombstoned it.
 - **First written:** the question in the N4 commit body, 7c19c2b
   (restatement 5); the reason in the operator's words at the N4 pass.
+
+## Recording that a judge request went out
+
+- **What:** a judge score row holds a generation id only when a reply
+  came back, so a judge call that timed out after it was sent leaves a
+  row that cannot be told from one never sent. The review's M3 finding
+  on draft PR #74 at 0abbb99: "The judge-spend line says 'none billed'
+  for judge calls that went out and came back without a billed figure",
+  with "Transport errors after the request was sent can be covered too
+  if the row records that the call went out." The report now counts
+  what the rows support: `unpriced_calls` (a generation id and no
+  figure) and `rows_without_figure` (every judge row with no figure,
+  whatever the reason). Recording the fact would split the second count
+  into unpriced versus unsent. Not to be guessed from the detail string.
+- **Deferred by:** Phase N, at the merge-readiness review's fixes, ruled
+  by the operator.
+- **Reason:** recording a "the request went out" fact on the score row
+  is the change that would split that count into unpriced versus
+  unsent, and it is a stored-schema change with a hash-pinned migration
+  and an era fixture. It is not done inside a medium fix at the end of a
+  phase with no external re-round, because an additive migration landing
+  without a review lens on it is exactly the shape L's INSERT OR IGNORE
+  defect took.
+- **First written:** no commit to cite. The finding is the review's M3;
+  the reason is the operator's ruling on it.

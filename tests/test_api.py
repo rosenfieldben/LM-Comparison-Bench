@@ -5042,6 +5042,93 @@ def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_pat
 
 
 @respx.mock
+def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/report's judge_cost after two scoring
+    passes over three trials of a judge task and a contains task: one
+    with a judge whose first call is billed, whose second replies with a
+    generation id and no usage, and whose third times out after it was
+    sent; one with no judge at all.
+
+    The spend was the billed call alone, and the line built from it read
+    as the whole cost of judging. A reply with no price is an unpriced
+    call, not a free one, and a judge row with no billing figure (the
+    unpriced reply, the timeout, the pass that had no judge to call) is
+    counted whatever the reason, the unpriced call among them. The contains
+    rows carry no figure either and are not judge rows, so they are not
+    counted. PRE-STATE: the three rows the first pass wrote are the three
+    shapes, as stored: a figure; a generation id and no figure; neither.
+    """
+    judged = {"n": 0}
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] != "judge/one":
+            return httpx.Response(200, stream=alpha_stream())
+        judged["n"] += 1
+        if judged["n"] == 3:
+            raise httpx.ReadTimeout("sent, and no reply", request=request)
+        reply = {
+            "id": f"gen-judge-{judged['n']}",
+            "choices": [
+                {
+                    "message": {"content": '{"score": 0.5, "reason": "partial"}'},
+                    "finish_reason": "stop",
+                }
+            ],
+        }
+        if judged["n"] == 1:
+            reply["usage"] = {
+                "prompt_tokens": 30,
+                "completion_tokens": 9,
+                "cost": 0.00002,
+            }
+        return httpx.Response(200, json=reply)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    path = write_dataset(
+        tmp_path,
+        {"id": "t1", "prompt": "a", "rubric": "score it", "scorer": {"kind": "judge"}},
+        {
+            "id": "t2",
+            "prompt": "b",
+            "reference": "Hello",
+            "scorer": {"kind": "contains"},
+        },
+    )
+    eid = client.post(
+        "/experiments",
+        json=experiment_body(path, lineup=["model/alpha", "model/beta", "model/gamma"]),
+    ).json()["id"]
+    run_experiment_to_completion(client, eid, path)
+
+    score_experiment_to_completion(client, eid, path, judge_model="judge/one")
+
+    judge_rows = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    shapes = sorted(
+        (r["judge_generation_id"] is not None, r["judge_billed_cost_usd"] is not None)
+        for r in judge_rows
+    )
+    assert shapes == [(False, False), (True, False), (True, True)], judge_rows
+    timed_out = next(r for r in judge_rows if r["judge_generation_id"] is None)
+    assert timed_out["detail"] == "judge request failed: ReadTimeout"
+    score_experiment_to_completion(client, eid, path)
+    rows = scores_in(client, eid)
+    assert len(rows) == 12
+    assert all(
+        r["judge_billed_cost_usd"] is None for r in rows if r["scorer"] != "judge"
+    )
+
+    report = client.get(f"/experiments/{eid}/report").json()
+
+    assert report["judge_cost"] == {
+        "total_usd": pytest.approx(0.00002),
+        "billed_calls": 1,
+        "unpriced_calls": 1,
+        "rows_without_figure": 5,
+    }
+
+
+@respx.mock
 def test_no_judge_payload_ever_carries_a_lineup_identity(client, tmp_path):
     """The blind-by-construction claim, asserted at the wire rather than
     at the function boundary: whatever the pass does, no request that
@@ -7377,7 +7464,12 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
     assert sum(c["total_usd"] for c in totals.values()) == pytest.approx(0.5)
     assert sum(c["billed_trials"] for c in totals.values()) == 2
     # And judge spend is its own line rather than folded in.
-    assert report["judge_cost"] == {"total_usd": 0, "billed_calls": 0}
+    assert report["judge_cost"] == {
+        "total_usd": 0,
+        "billed_calls": 0,
+        "unpriced_calls": 0,
+        "rows_without_figure": 0,
+    }
 
 
 @respx.mock
