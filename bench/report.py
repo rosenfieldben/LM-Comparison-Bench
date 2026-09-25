@@ -1000,6 +1000,13 @@ def choose_metric(declared: str | None, models: list[dict[str, Any]]) -> dict[st
     # alone let the caller take whichever series came first, which sorts
     # judgeless before judged, so the ranking named `judge` and ordered
     # every model on the gap row's empty mean.
+    #
+    # The ordering is on each arm's mean (min_ranks in build_report),
+    # whatever else the series publishes: a judge series with a pass
+    # threshold has a pass rate beside its mean, and the ranking does not
+    # use it. The reason says which figure it used; whether primary_metric
+    # should be able to name the pass rate is in BACKLOG.md.
+    reason += ", ordered on the mean"
     return _ranking(metric, judges[0] if judges else None, reason, available, models)
 
 

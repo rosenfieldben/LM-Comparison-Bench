@@ -2563,7 +2563,10 @@ from any report built with a dataset path.
 did better, and that means nothing until somebody says better AT WHAT. The
 report ranks when `primary_metric` is declared, or when exactly one scorer
 exists and there is no choice to make. Otherwise it publishes every
-scorer's section in full and **no cross-scorer ranking**, and says why.
+scorer's section in full and **no cross-scorer ranking**, and says why. A
+ranking orders on each arm's mean and its reason says so: a judge series
+with a pass threshold publishes a pass rate beside its mean, and the
+ranking does not use it (`BACKLOG.md` holds that question).
 
 The previous rule ranked on the first scorer alphabetically, so an
 experiment scored by `contains` and `judge` was ordered by `contains`
