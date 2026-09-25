@@ -19788,32 +19788,44 @@ def test_the_experiment_forms_mirrors_are_the_servers_numbers():
     way index.html mirrors ExperimentParams; `listed` is the default limit
     GET /experiments passes to the store, which the list's "newest N"
     note names. A mirror tighter than the server would refuse a legal
-    value, and a looser one would promise a range the door refuses."""
+    value, and a looser one would promise a range the door refuses. The
+    bounds are read off ExperimentCreate's own fields, the thing that
+    enforces them, and not off the constants those fields name: a field
+    that lost its bound would still match a constant."""
     js = run_lib(
         "const l = require(process.argv[1]);"
         "process.stdout.write(JSON.stringify(l.EXPERIMENT_LIMITS));"
     )
-    name_bound = next(
-        c.max_length
-        for c in main.ExperimentCreate.model_fields["name"].metadata
-        if type(c).__name__ == "MaxLen"
-    )
+
+    def bound(field, kind):
+        found = [
+            getattr(c, kind)
+            for c in main.ExperimentCreate.model_fields[field].metadata
+            if hasattr(c, kind)
+        ]
+        assert len(found) == 1, (field, kind, found)
+        return found[0]
+
     listed = inspect.signature(bench_store.list_experiments).parameters["limit"]
     assert js == {
-        "maxNameChars": name_bound,
-        "maxRepeats": main.MAX_REPEATS,
-        "maxSeed": main.MAX_SEED,
+        "maxNameChars": bound("name", "max_length"),
+        "maxRepeats": bound("repeats", "le"),
+        "maxSeed": bound("task_order_seed", "le"),
         "listed": listed.default,
     }
     html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
     repeats = _input_attrs(html, "experiment-repeats")
     seed = _input_attrs(html, "experiment-seed")
     assert (repeats["min"], repeats["max"], repeats["step"]) == (
-        "1",
-        str(main.MAX_REPEATS),
+        str(bound("repeats", "ge")),
+        str(bound("repeats", "le")),
         "1",
     )
-    assert (seed["min"], seed["max"], seed["step"]) == ("0", str(main.MAX_SEED), "1")
+    assert (seed["min"], seed["max"], seed["step"]) == (
+        str(bound("task_order_seed", "ge")),
+        str(bound("task_order_seed", "le")),
+        "1",
+    )
     assert _select_values(html, "experiment-estimand") == list(main.ESTIMAND_MODES)
     assert _select_values(html, "experiment-attachments") == list(
         typing.get_args(
@@ -19893,16 +19905,26 @@ def test_the_forms_body_is_what_the_door_records_and_blank_is_absent(client):
 
 
 def test_every_create_nudge_is_a_refusal_and_not_the_reverse(client):
-    """WINDOW: experimentNudge executed over forms at and past each bound,
-    and POST /experiments over each form's body.
+    """WINDOW: experimentNudge and experimentBody executed over forms at
+    and past each bound, with the invalid list the page's validity checks
+    would give, and POST /experiments over each form's body.
 
     The nudge-subset rule for the form: every form the page greys Create
     for, sent anyway, is refused (an empty name, a name one code point
-    over, no dataset, no model); and forms at the bounds, counted the
-    server's way, are not greyed and are created (a name of spaces, which
-    the server takes, and 200 characters that are two UTF-16 units
-    each). The invalid-controls nudge is the composer's own gate and has
-    its browser proof in tests/browser/test_n3.py."""
+    over, no dataset, no model; repeats 21, 0 and 1.5; a task order seed
+    of -1, 1.5 and MAX_SEED + 1; temperature 5; top_p 1.5), and the body
+    refused carries the value typed, so the refusal is the door's and not
+    a dropped key; and forms at the bounds, counted the server's way, are
+    not greyed and are created (a name of spaces, which the server takes,
+    and 200 characters that are two UTF-16 units each).
+
+    ONE NUDGE IS DECLARED THE PAGE'S OWN. A box whose text is not a number
+    at all ("1e") reads as empty and is marked invalid; the body then
+    carries no key for it and the door creates (201), which is why the
+    page waits instead: it would create something other than what was
+    typed. tests/browser/test_n3.py types "1e" to show the page's side.
+    PRE-STATE: each greyed form's nudge is non-null, and each page-only
+    form's body lacks the key its box would set."""
     digest = store_dataset(client, "nudge", {"id": "t1", "prompt": "p"}).json()[
         "digest"
     ]
@@ -19913,25 +19935,76 @@ def test_every_create_nudge_is_a_refusal_and_not_the_reverse(client):
         form_state(digest=None),
         form_state(digest=digest, lineup=[]),
     ]
+    # (form, the body key the typed value rides on, the value typed)
+    out_of_range = [
+        *(
+            (
+                form_state(digest=digest, repeats=typed, invalid=["repeats"]),
+                "repeats",
+                typed,
+            )
+            for typed in ("21", "0", "1.5")
+        ),
+        *(
+            (
+                form_state(digest=digest, seed=typed, invalid=["task order seed"]),
+                "task_order_seed",
+                typed,
+            )
+            for typed in ("-1", "1.5", str(main.MAX_SEED + 1))
+        ),
+        *(
+            (
+                form_state(digest=digest, params={name: value}, invalid=[name]),
+                "params",
+                {name: value},
+            )
+            for name, value in (("temperature", 5), ("top_p", 1.5))
+        ),
+    ]
+    page_only = [
+        (form_state(digest=digest, invalid=["repeats"]), "repeats"),
+        (form_state(digest=digest, invalid=["task order seed"]), "task_order_seed"),
+        (form_state(digest=digest, invalid=["temperature"]), "params"),
+    ]
     created = [
         form_state(digest=digest, name="   "),
         form_state(digest=digest, name=grin * 200),
     ]
-    forms = refused + created
+    typed_forms = [form for form, _, _ in out_of_range]
+    blank_forms = [form for form, _ in page_only]
+    forms = refused + typed_forms + blank_forms + created
     js = run_lib(
         "const l = require(process.argv[1]);"
         "process.stdout.write(JSON.stringify(INPUT.map((f) =>"
         " [l.experimentNudge(f), l.experimentBody(f)])));",
         forms,
     )
-    for form, (nudge, body) in zip(forms, js, strict=True):
-        resp = client.post("/experiments", json=body)
-        if form in refused:
+    answers = {}
+    for index, (form, (nudge, body)) in enumerate(zip(forms, js, strict=True)):
+        answers[index] = (nudge, body, client.post("/experiments", json=body))
+    for index, form in enumerate(forms):
+        nudge, body, resp = answers[index]
+        if form in refused or form in typed_forms:
             assert nudge is not None, form["name"][:10]
             assert resp.status_code == 422, (nudge, resp.text[:200])
+        elif form in blank_forms:
+            assert nudge is not None, form["invalid"]
+            assert resp.status_code == 201, resp.text[:200]
         else:
             assert nudge is None, nudge
             assert resp.status_code == 201, resp.text[:200]
+    offset = len(refused)
+    for index, (_, key, typed) in enumerate(out_of_range, start=offset):
+        _, body, resp = answers[index]
+        sent = body[key] if key == "params" else str(body[key])
+        assert sent == typed, (key, body)
+        assert resp.json()["detail"][0]["loc"][:2] == ["body", key], resp.text[:300]
+    offset += len(out_of_range)
+    for index, (form, key) in enumerate(page_only, start=offset):
+        nudge, body, _ = answers[index]
+        assert nudge == "check " + form["invalid"][0], nudge
+        assert key not in body, body
 
 
 def test_the_projection_text_says_what_the_door_returned(client):

@@ -797,12 +797,15 @@
   }
 
   // Why Create is greyed, or null. A COURTESY AND NOT A RULE, as the
-  // builder's nudges are: each is a request the server would refuse (an
-  // empty name, a name over its bound, no dataset, no model), or one the
-  // composer already refuses to send (a control or box its own validity
-  // check fails, whose typed value would otherwise be dropped from the
-  // body without a word). A name of spaces is legal to the server and is
-  // not nudged.
+  // builder's nudges are, and of two kinds. Most are a request the server
+  // would refuse: an empty name, a name over its bound, no dataset, no
+  // model, and a control or box out of its range, whose typed value the
+  // body carries and the door refuses. One is the page's own: a box whose
+  // text is not a number at all ("1e") reads as empty, so the body would
+  // drop what was typed without a word and the server would create
+  // without it; the page waits rather than create something other than
+  // what was typed. A name of spaces is legal to the server and is not
+  // nudged.
   function experimentNudge(form) {
     if (form.name === "") return "name the experiment";
     const chars = codePoints(form.name);

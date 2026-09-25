@@ -503,11 +503,12 @@ def test_nothing_is_prefilled_and_create_waits_for_what_the_server_needs(
     NOTHING IS PRE-FILLED: the name, repeats and the seed are empty, the
     selects stand on the server's defaults, halt on refusal is checked as
     the server's default is, and no metric is declared. Create is greyed
-    for a missing name, dataset or model, each a request the server would
-    refuse, and for a control or a box whose own validity check fails
-    (a typed value it would otherwise drop); the nudge says which, and
-    supplying it moves to the next. The lineup line lists the checked
-    models and no other."""
+    for a missing name, dataset or model, and for a control or box out of
+    its range, each a request the server would refuse; and for a box
+    whose text is not a number at all ("1e"), which reads as empty and
+    would be dropped from the body without a word, the page's own rule.
+    The nudge says which, and supplying it moves to the next. The lineup
+    line lists the checked models and no other."""
     name, _ = stored_digest(page, bench_url, [{"id": "n1"}])
     bench(["stub/fast", "stub/slow"])
     open_experiments(page)
@@ -548,6 +549,14 @@ def test_nothing_is_prefilled_and_create_waits_for_what_the_server_needs(
         expect(nudge).to_have_text("Create waits: check task order seed")
         expect(create_button).to_be_disabled()
     page.get_by_test_id("experiment-seed").fill("7")
+    expect(nudge).to_have_text("")
+    # Typed key by key, since fill refuses text a number box cannot hold:
+    # the box then reads as empty, which is what the body would send.
+    page.get_by_test_id("experiment-repeats").press_sequentially("1e")
+    expect(page.get_by_test_id("experiment-repeats")).to_have_value("")
+    expect(nudge).to_have_text("Create waits: check repeats")
+    expect(create_button).to_be_disabled()
+    page.get_by_test_id("experiment-repeats").fill("")
     expect(nudge).to_have_text("")
 
 
