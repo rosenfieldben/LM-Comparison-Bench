@@ -338,6 +338,12 @@
     return out;
   }
 
+  // A cited document on a line. NO WALK ON THIS CHIP, though the picker's
+  // option names one (Phase O, ratified at the operator's pass at
+  // 9c920e5): the line sends a bare digest, and a bare citation records
+  // the digest's latest capture when the experiment is created, not the
+  // one the option showed when it was pressed. A capture printed here
+  // would be a claim the record might not keep.
   function documentChip(index, doc) {
     const chip = document.createElement("span");
     chip.className = "attach-chip ds-doc";
@@ -472,8 +478,9 @@
       // that composed identical bytes are one option naming the newest,
       // and a bare citation freezes the latest when the experiment is
       // created, not when this option is pressed. Nothing on the cited
-      // chip below: the line sends a bare digest, so the chip cannot say
-      // which walk the experiment will record.
+      // chip (documentChip, which says why): the line sends a bare
+      // digest, so the chip cannot say which walk the experiment will
+      // record.
       const walk = captureLine(doc.capture);
       option.title =
         label +
