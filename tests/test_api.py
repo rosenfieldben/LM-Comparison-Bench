@@ -1,9 +1,13 @@
 import ast
 import base64
+import builtins
+import contextlib
+import io
 import json
 import math
 import re
 import sqlite3
+import subprocess
 import threading
 import typing
 from pathlib import Path
@@ -19119,12 +19123,18 @@ def test_the_digest_route_runs_end_to_end_with_every_file_read_refused(
     export by digest, with read_dataset and Path's readers raising and
     the builtin open refusing every path, for the whole of it.
 
-    THE RUNTIME HALF OF "THE DATASETS DOOR READS NO FILE". The posture
-    walk sees a path operation written into a function; it cannot see a
-    call into a helper that already holds one, which is how the review's
-    mutation reached disk (create_dataset calling read_dataset) with the
-    walk green. sqlite does its own I/O below Python, so the database is
-    untouched by the refusal and everything the route does is exercised."""
+    A RUNTIME HALF OF "THE DATASETS DOOR READS NO FILE", over the whole
+    digest route. The posture walk sees a listed call written into a
+    function; it cannot see a call into a helper that already holds one,
+    which is how the review's mutation reached disk (create_dataset
+    calling read_dataset) with the walk green. It refuses by raising, so
+    a broad except in a route would swallow it, and it refuses only the
+    readers named; the recording window
+    (test_the_datasets_door_takes_no_path_in_a_recording_window) is what
+    sees a stat, a descriptor read and a swallowed refusal at the
+    datasets door. sqlite does its own I/O below Python, so the database
+    is untouched by the refusal and everything the route does is
+    exercised."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
@@ -19161,6 +19171,84 @@ def test_the_digest_route_runs_end_to_end_with_every_file_read_refused(
         "dataset_store"
     )
     assert export_lines(client, eid)[0]["thresholds_included"] is True
+
+
+# Every call that takes a path, by module and name: the os half by the
+# calls that name a file, a directory or a link, and the three ways the
+# codebase opens or spawns. A descriptor is not a path anybody named.
+PATH_TAKERS = (
+    (os, "stat"),
+    (os, "lstat"),
+    (os, "open"),
+    (os, "scandir"),
+    (os, "listdir"),
+    (os, "readlink"),
+    (io, "open"),
+    (builtins, "open"),
+    (subprocess, "run"),
+)
+
+
+def test_the_datasets_door_takes_no_path_in_a_recording_window(client, monkeypatch):
+    """WINDOW: POST /datasets (a dataset stored, and one refused on its
+    line), GET /datasets and GET /datasets/{digest}, each route warmed
+    once before the window opens, with every call in PATH_TAKERS that is
+    given a path recorded.
+
+    THE RECORDING HALF OF "THE DATASETS DOOR READS NO FILE", written after
+    the review's M6 found five changes to create_dataset that the posture
+    walk and the refusing runtime test both passed: a Path lstat, a call
+    into _resolved_directory, a Path is_mount, a descriptor walk through
+    snapshot.walk that read 15 files, and read_dataset inside a broad
+    except. The walk matches call names on its list, and those names are
+    not on it; the runtime test refuses by raising, and an except in the
+    route swallows a raise. A record cannot be swallowed: each call goes
+    through to the real function and is written down, and the record must
+    be empty when the window closes.
+
+    WARMED, because FastAPI's first request to a route reads the
+    endpoint's source (inspect.getsourcelines, whose linecache stats
+    bench/main.py). That is the framework reading the app's own file, not
+    the door reading a path a caller named, and a cold route would put it
+    in the record. PRE-STATE: inside the window a Path lstat, a Path
+    exists and a Path read_bytes of "x" are each recorded under "x"."""
+    first = store_dataset(client, "warm", {"id": "w1", "prompt": "warm"})
+    assert first.status_code == 201, first.text
+    assert client.get("/datasets").status_code == 200
+    assert client.get(f"/datasets/{first.json()['digest']}").status_code == 200
+    calls = []
+
+    def recording(name, real):
+        def call(*args, **kwargs):
+            target = args[0] if args else kwargs.get("path", kwargs.get("file", "."))
+            if name == "subprocess.run":
+                calls.append((name, repr(target)))
+            elif not isinstance(target, int):
+                calls.append((name, os.fsdecode(target)))
+            return real(*args, **kwargs)
+
+        return call
+
+    with monkeypatch.context() as window:
+        for module, attr in PATH_TAKERS:
+            name = f"{module.__name__}.{attr}"
+            window.setattr(module, attr, recording(name, getattr(module, attr)))
+        for probe in (Path("x").lstat, Path("x").exists, Path("x").read_bytes):
+            with contextlib.suppress(OSError):
+                probe()
+            assert calls and {path for _, path in calls} == {"x"}, (probe, calls)
+            calls.clear()
+
+        stored = store_dataset(client, "recorded", {"id": "r1", "prompt": "rec"})
+        refused = client.post(
+            "/datasets", json={"name": "bad", "content": "not json\n"}
+        )
+        listed = client.get("/datasets")
+        detail = client.get(f"/datasets/{stored.json()['digest']}")
+
+    assert (stored.status_code, refused.status_code) == (201, 422)
+    assert (listed.status_code, detail.status_code) == (200, 200)
+    assert calls == []
 
 
 def test_a_lone_surrogate_the_model_refuses_is_a_422_at_every_door(client):

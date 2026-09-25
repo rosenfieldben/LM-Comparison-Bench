@@ -7535,12 +7535,22 @@ async def create_dataset(body: DatasetCreate) -> dict[str, Any]:
     file somebody named, and its docstring argues why that door has no
     allowlist. This door reads nothing: the tasks arrive in the body, the
     bytes stored are the bytes received, and nothing between the request
-    and the row touches the filesystem. Two tests hold it to that, each
-    catching what the other cannot: the posture walk in tests/test_api.py
-    sees any path operation written into this function, and a runtime
-    test drives this door and the digest route with every Python-level
-    file read raising, which is what catches a read reached through an
-    existing helper such as read_dataset.
+    and the row touches the filesystem. Three tests in tests/test_api.py
+    hold it to that, each catching what the others cannot, and none of
+    them everything:
+    - the posture walk sees a call written into this function whose name
+      is on its list, the os module's completely and the rest by
+      enumeration;
+    - a runtime test drives this door and the digest route end to end
+      with read_dataset, Path's readers and the builtin open refusing a
+      path;
+    - a recording window over this door and the two datasets reads writes
+      down every os call given a path (stat, lstat, open, scandir,
+      listdir, readlink), the builtin and io open, and subprocess.run,
+      and requires the record empty. That is what catches a stat, a
+      descriptor read reached through a helper, and a refusal swallowed
+      by a broad except, which the first two do not.
+    A library reaching disk below those names would pass all three.
 
     THE SERVER VALIDATES, with the loader every other door uses:
     parse_dataset over exactly the bytes that will be stored, refusing
