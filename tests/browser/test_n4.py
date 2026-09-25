@@ -66,6 +66,7 @@ from test_n3 import (
     record,
     row_for,
     scoring_busy,
+    select_dataset,
     stored_digest,
     swept,
     wait_scoring_idle,
@@ -1015,6 +1016,70 @@ def test_a_dataset_the_store_cannot_cite_is_the_doors_sentence(
         refused = page.request.post(f"{bench_url}/experiments/{a}/score", data=body)
         assert (refused.status, refused.json()["detail"]) == (422, sentence)
     assert score_series(page, bench_url, a) == []
+
+
+def test_a_garbled_summary_leaves_score_to_the_content(
+    page, bench, bench_url, bench_db, scorings
+):
+    """WINDOW: a finished judge-task experiment whose stored dataset's
+    summary (scorers_json) is then garbled by hand in the session bench's
+    own database; the Datasets list, the Create form's metric select over
+    that dataset, and the experiment's Score row read in the page; Score
+    pressed with a judge.
+
+    The summary is derived and the content is the record. The list serves
+    the row marked (scorers null) rather than failing the whole library,
+    and the page's row says the kinds are unreadable and offers no metric
+    from them. The detail door derives the summary from the content, so
+    Score waits for a judge as it does for any judge dataset, and once one
+    is chosen it is pressed and the pass grades. Before, the list and the
+    detail door both answered 500, and Score was greyed behind a Retry
+    that could never succeed. PRE-STATE: the list and the detail door
+    answer 200 with the judge kind before the edit."""
+    a, digest = finished(page, bench_url, JUDGED)
+    detail = page.request.get(f"{bench_url}/datasets/{digest}")
+    assert (detail.status, detail.json()["scorers"]) == (200, ["judge"])
+    listed = page.request.get(f"{bench_url}/datasets")
+    assert listed.status == 200
+    assert next(
+        d["scorers"] for d in listed.json()["datasets"] if d["digest"] == digest
+    ) == ["judge"]
+    name = detail.json()["name"]
+    with sqlite3.connect(bench_db) as db:
+        db.execute(
+            "UPDATE datasets SET scorers_json = 'not json' WHERE digest = ?",
+            (digest,),
+        )
+    listed = page.request.get(f"{bench_url}/datasets")
+    assert listed.status == 200, listed.text()
+    assert (
+        next(d["scorers"] for d in listed.json()["datasets"] if d["digest"] == digest)
+        is None
+    )
+    detail = page.request.get(f"{bench_url}/datasets/{digest}")
+    assert (detail.status, detail.json()["scorers"]) == (200, ["judge"])
+    bench(["stub/fast"])
+
+    select_dataset(page, name)
+
+    expect(entry_for(page, name).get_by_test_id("dataset-entry-meta")).to_contain_text(
+        "1 task · scorer kinds unreadable · sha256 "
+    )
+    expect(page.get_by_test_id("experiment-metric").locator("option")).to_have_text(
+        ["none declared"]
+    )
+    open_experiments(page)
+    row_for(page, a).click()
+    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(WAITS_FOR_JUDGE)
+    page.get_by_test_id("experiment-judge").select_option("stub/fast")
+    score = page.get_by_test_id("experiment-score")
+    expect(score).to_be_enabled()
+    score.click()
+    expect(page.get_by_test_id("experiment-action-msg")).to_contain_text(
+        "a scoring pass was started at "
+    )
+    wait_scoring_idle(page, bench_url)
+    assert ("judge", "stub/fast") in score_series(page, bench_url, a)
 
 
 def test_a_lost_score_answer_reads_the_report_again(

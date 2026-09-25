@@ -1017,13 +1017,18 @@ class Dataset(BaseModel):
     any task cites a document. They are what a person choosing a dataset
     needs to see and what a browser needs to decide which controls apply,
     without anyone parsing JSONL a second time.
+
+    scorers is None when the summary stored beside the bytes cannot be
+    read, which only a row edited outside the bench can be: the list
+    serves that row marked so rather than failing. The detail door never
+    answers None; see get_dataset.
     """
 
     digest: str
     name: str
     created_at: str
     task_count: int
-    scorers: list[str]
+    scorers: list[str] | None
     cites_documents: bool
 
 
@@ -7646,6 +7651,15 @@ async def get_dataset(digest: str) -> dict[str, Any]:
     Bytes create_dataset wrote were encoded from a str, so they decode;
     a row edited by hand might not, and is refused in a sentence rather
     than as a 500.
+
+    THE SUMMARY IS THE CONTENT'S, derived here from the bytes just held
+    to their key, with the parser and the derivations create_dataset used
+    to write it, and not read from the stored summary. The page decides
+    from this answer whether a scoring pass needs a judge, so a summary
+    edited outside the bench would otherwise decide it: garbled, it
+    greyed Score behind a Retry that could never succeed, and emptied, it
+    let a pass go without the judge its tasks need. Bytes that hash to
+    their key and do not parse are refused in the parser's sentence.
     """
     row = store.get_dataset(app.state.db, digest)
     if row is None:
@@ -7654,7 +7668,7 @@ async def get_dataset(digest: str) -> dict[str, Any]:
     if actual != digest:
         raise HTTPException(422, unkeyed_bytes(digest, actual))
     try:
-        row["content"] = row["content"].decode("utf-8")
+        text = row["content"].decode("utf-8")
     except UnicodeDecodeError as exc:
         raise HTTPException(
             422,
@@ -7662,6 +7676,14 @@ async def get_dataset(digest: str) -> dict[str, Any]:
             f"({exc.reason} at byte {exc.start}), so there is no text to "
             "serve: the row was written outside the bench.",
         ) from None
+    try:
+        dataset = parse_dataset(row["content"], name=row["name"])
+    except DatasetError as exc:
+        raise HTTPException(422, str(exc)) from None
+    row["content"] = text
+    row["task_count"] = len(dataset["tasks"])
+    row["scorers"] = scorer_kinds(dataset["tasks"])
+    row["cites_documents"] = cites_documents(dataset["tasks"])
     return row
 
 

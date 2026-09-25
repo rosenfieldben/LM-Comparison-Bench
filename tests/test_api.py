@@ -19354,8 +19354,9 @@ def test_a_malformed_summary_does_not_block_the_tasks_behind_it(client):
 
     The summary is derived and the content is authoritative, so the doors
     that turn a stored dataset into tasks read only the name and the
-    content. A summary edited into garbage breaks the list that shows it
-    and nothing that runs."""
+    content. A summary edited into garbage breaks nothing that runs; what
+    the list and the detail door make of it is
+    test_a_garbled_summary_is_marked_in_the_list_and_derived_in_the_detail."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
@@ -19371,6 +19372,71 @@ def test_a_malformed_summary_does_not_block_the_tasks_behind_it(client):
     assert run_by_digest(client, eid, digest)["status"] == "done"
     assert client.get(f"/experiments/{eid}/report").json()["thresholds_source"] == (
         "dataset_store"
+    )
+
+
+def test_a_garbled_summary_is_marked_in_the_list_and_derived_in_the_detail(client):
+    """WINDOW: GET /datasets and GET /datasets/{digest} after a judge
+    dataset's scorers_json was rewritten by hand to text that is not JSON,
+    to JSON of the wrong shape ({}, null, "x", [1]) and to an empty list;
+    then the detail door over a row whose bytes hash to their key and do
+    not parse.
+
+    The summary is derived and the content is the record. The list serves
+    a summary it cannot read as scorers None, marked, rather than failing
+    the whole library with a 500; an empty list is readable and served as
+    it is. The detail door never reads the stored summary: it derives
+    scorers, cites_documents and task_count from the content it has just
+    held to its key, so every garbling leaves it answering the tasks' own
+    kinds, and the page's Score row, which asks it, is decided by the
+    content. Bytes that hash to their key and do not parse are refused in
+    the parser's sentence. PRE-STATE: both doors answer 200 with the kinds
+    before any edit."""
+    digest = store_dataset(client, "kinds", *THREE_KINDS).json()["digest"]
+    kinds = ["exact", "judge", "regex"]
+
+    def listed():
+        resp = client.get("/datasets")
+        assert resp.status_code == 200, resp.text[:200]
+        return next(d for d in resp.json()["datasets"] if d["digest"] == digest)
+
+    def detail():
+        resp = client.get(f"/datasets/{digest}")
+        assert resp.status_code == 200, resp.text[:200]
+        body = resp.json()
+        return (body["scorers"], body["cites_documents"], body["task_count"])
+
+    assert listed()["scorers"] == kinds
+    assert detail() == (kinds, False, 3)
+
+    for garbled, served in (
+        ("not json", None),
+        ("{}", None),
+        ("null", None),
+        ('"x"', None),
+        ("[1]", None),
+        ("[]", []),
+    ):
+        client.app.state.db.execute(
+            "UPDATE datasets SET scorers_json = ? WHERE digest = ?", (garbled, digest)
+        )
+        client.app.state.db.commit()
+        assert listed()["scorers"] == served, garbled
+        assert detail() == (kinds, False, 3), garbled
+
+    content = b"not json\n"
+    keyed = hashlib.sha256(content).hexdigest()
+    client.app.state.db.execute(
+        """INSERT INTO datasets (digest, name, created_at, content, task_count,
+                                 scorers_json, cites_documents)
+           VALUES (?, 'hand', '2026-09-25T00:00:00+00:00', ?, 1, '[]', 0)""",
+        (keyed, content),
+    )
+    client.app.state.db.commit()
+    unparsed = client.get(f"/datasets/{keyed}")
+    assert unparsed.status_code == 422
+    assert unparsed.json()["detail"] == (
+        "line 1: not valid JSON: Expecting value: line 1 column 1 (char 0)"
     )
 
 

@@ -2713,7 +2713,20 @@ def _dataset_row(row: sqlite3.Row) -> dict[str, Any]:
     else chose.
     """
     out = dict(row)
-    out["scorers"] = json.loads(out.pop("scorers_json"))
+    # READ DEFENSIVELY, because the summary is derived and the content is
+    # the record. create_dataset writes a JSON list of scorer kinds here,
+    # and only a row edited outside the bench holds anything else; such a
+    # row is served with scorers None, a summary nobody can read, rather
+    # than failing the whole library with a 500. The detail door derives
+    # its summary from the content instead, so nothing that runs reads
+    # this column.
+    try:
+        scorers = json.loads(out.pop("scorers_json"))
+    except (TypeError, ValueError):
+        scorers = None
+    if not (isinstance(scorers, list) and all(isinstance(k, str) for k in scorers)):
+        scorers = None
+    out["scorers"] = scorers
     out["cites_documents"] = bool(out["cites_documents"])
     if "content" in out:
         out["content"] = bytes(out["content"])

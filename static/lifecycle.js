@@ -291,8 +291,10 @@
     const dataset = window.BenchDatasets.selected();
     // The kinds the dataset uses, and blank for none declared. The server
     // also accepts "human", a scorer no file declares; the select offers
-    // what this dataset produces and nothing else.
-    const kinds = dataset ? dataset.scorers : [];
+    // what this dataset produces and nothing else, and nothing when the
+    // list could not read the stored summary (scorers null), since a kind
+    // it cannot read is not one it can offer.
+    const kinds = dataset?.scorers ?? [];
     const was = metricEl.value;
     metricEl.replaceChildren(new Option("none declared", ""));
     for (const kind of kinds) metricEl.append(new Option(kind, kind));

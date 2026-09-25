@@ -1869,10 +1869,13 @@ python3 -c 'import json, sys; print(json.dumps({"name": sys.argv[1],
     -H "Content-Type: application/json" --data-binary @-
 
 # 2. List them, newest first: digest, name, task count, the scorer kinds
-#    the tasks declare, and whether any task cites a document.
+#    the tasks declare, and whether any task cites a document. The kinds
+#    are null for a row whose stored summary cannot be read, which only
+#    an edit outside the bench makes.
 curl -s localhost:8000/datasets
 
-# 3. Or read one back, tasks and all, as the text that was stored.
+# 3. Or read one back, tasks and all, as the text that was stored, with
+#    its summary derived from that text rather than read from the row.
 curl -s localhost:8000/datasets/<digest>
 ```
 

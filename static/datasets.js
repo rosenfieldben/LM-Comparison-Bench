@@ -1022,7 +1022,13 @@
       const bits = [
         dataset.task_count + (dataset.task_count === 1 ? " task" : " tasks"),
       ];
-      if (dataset.scorers.length > 0) bits.push(dataset.scorers.join(", "));
+      // Null is the server saying the summary stored beside the bytes
+      // cannot be read (a row edited outside the bench), and the page
+      // says so rather than guessing at the kinds.
+      if (dataset.scorers === null) bits.push("scorer kinds unreadable");
+      else if (dataset.scorers.length > 0) {
+        bits.push(dataset.scorers.join(", "));
+      }
       if (dataset.cites_documents) bits.push("cites documents");
       bits.push("sha256 " + shortDigest(dataset.digest));
       meta.textContent = bits.join(" · ");
