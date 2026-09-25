@@ -3,6 +3,7 @@ import base64
 import json
 import math
 import re
+import sqlite3
 import threading
 import typing
 from pathlib import Path
@@ -20182,6 +20183,114 @@ def test_another_scoring_pass_is_refused_in_the_doors_words(client):
         == 202
     )
     wait_scoring_done(client)
+
+
+@pytest.mark.parametrize(
+    "where", ["get_experiment", "experiment_groups"], ids=["first read", "loop"]
+)
+@respx.mock
+def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
+    client, monkeypatch, where
+):
+    """WINDOW: a scoring pass whose store read raises once it holds the
+    slot, either the pass's first read of its experiment or its read of
+    the experiment's groups, then POST /experiments/{id}/score sent again
+    for the same experiment.
+
+    The bench has one scoring slot, and the pass's finally is the only
+    thing that frees it. A raise the finally does not cover would hold the
+    slot for good, and every later Score, on every experiment, would be
+    refused "a scoring pass for experiment N is running" until a restart.
+    Wherever the pass raises, the slot frees, the error is recorded where
+    the pass keeps it (no door reads it; BACKLOG.md), and the next Score
+    is taken and scores. PRE-STATE: the first Score was accepted, the
+    read raised exactly once, and that pass wrote no rows."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = store_dataset(client, "plain", THREE_KINDS[0]).json()["digest"]
+    eid = client.post(
+        "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+    ).json()["id"]
+    assert run_by_digest(client, eid, digest)["status"] == "done"
+    real = getattr(store, where)
+    armed = {"left": 1}
+
+    def raising(*args, **kwargs):
+        # Only once the slot is claimed, so the door's own read before the
+        # claim is served and the raise is the pass's.
+        if client.app.state.scoring_run["active"] is not None and armed["left"]:
+            armed["left"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, where, raising)
+    before = len(scores_in(client, eid))
+    started = client.post(f"/experiments/{eid}/score", json={"dataset_digest": digest})
+    assert started.status_code == 202
+    deadline = time.monotonic() + 20
+    while client.app.state.scoring_run["active"] is not None:
+        assert time.monotonic() < deadline, "a pass that raised still held the slot"
+        client.get("/models")
+    assert armed["left"] == 0
+    assert client.app.state.scoring_run["error"] == "OperationalError: disk I/O error"
+    assert len(scores_in(client, eid)) == before
+
+    again = client.post(f"/experiments/{eid}/score", json={"dataset_digest": digest})
+
+    assert again.status_code == 202, again.text
+    wait_scoring_done(client)
+    assert [s["scorer"] for s in scores_in(client, eid)[before:]] == ["exact"]
+
+
+@respx.mock
+def test_a_runner_that_raises_on_its_first_read_frees_the_slot(client, monkeypatch):
+    """WINDOW: POST /experiments/{id}/start for A with the runner's first
+    read of A raising once the slot is claimed, then POST start for B.
+
+    The scoring pass's twin, in the trial runner: its first read of its
+    own experiment sat above the try whose finally is the only thing
+    that frees the one runner slot, so a raise there left A "created"
+    and every later Start refused "experiment A is already running" until
+    a restart. Now A fails with the raise as its detail, the slot frees,
+    and B's Start is taken and runs. PRE-STATE: A's Start was accepted
+    and the read raised exactly once."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    digest = store_dataset(client, "plain", THREE_KINDS[0]).json()["digest"]
+    a, b = (
+        client.post(
+            "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+        ).json()["id"]
+        for _ in range(2)
+    )
+    real = store.get_experiment
+    armed = {"left": 1}
+
+    def raising(*args, **kwargs):
+        # Only once the slot is claimed, so the door's own read before the
+        # claim is served and the raise is the runner's.
+        if client.app.state.experiment_run["active"] is not None and armed["left"]:
+            armed["left"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "get_experiment", raising)
+    started = client.post(f"/experiments/{a}/start", json={"dataset_digest": digest})
+    assert started.status_code == 202
+    deadline = time.monotonic() + 20
+    while client.app.state.experiment_run["active"] is not None:
+        assert time.monotonic() < deadline, "a runner that raised still held the slot"
+        client.get("/models")
+    assert armed["left"] == 0
+    failed = client.get(f"/experiments/{a}").json()
+    assert (failed["status"], failed["status_detail"]) == (
+        "failed",
+        "OperationalError: disk I/O error",
+    ), failed
+
+    assert run_by_digest(client, b, digest)["status"] == "done"
 
 
 @respx.mock

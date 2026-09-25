@@ -872,7 +872,8 @@
         id,
         "a scoring pass was started at " +
           utcTime() +
-          "; no door says when it ends, so select the experiment again to " +
+          "; no door says when it ends or whether it failed, so select the " +
+          "experiment again to " +
           "read what it has scored since",
         "",
       );

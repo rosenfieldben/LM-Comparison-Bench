@@ -249,3 +249,39 @@ a23b257).
   defect took.
 - **First written:** no commit to cite. The finding is the review's M3;
   the reason is the operator's ruling on it.
+
+## Stopping a scoring pass at shutdown
+
+- **What:** the lifespan stops and awaits the trial runner and nothing
+  else. A scoring pass is neither asked to stop nor awaited, so teardown
+  cancels it wherever it is: a judge call already sent is paid for and
+  writes no score row, and `judge_cost` cannot see it. Nothing sets
+  `scoring_run["stop"]`, so the pass's check of it never fires. Present
+  at f3eeebc, before Phase N. A judge call sent at shutdown with no row
+  and a judge call that timed out after it was sent are the same missing
+  fact, "the request went out", and the schema change that records it
+  ("Recording that a judge request went out", above) closes both.
+- **Deferred by:** Phase N, N4, where it was found outside N4's scope;
+  put on this list at the merge-readiness review.
+- **Reason:** one reason, two entries pointing at it: the row a stopped
+  call would write needs the fact "Recording that a judge request went
+  out" defers, for that entry's reason.
+- **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)";
+  the cross-link is the operator's ruling at the merge-readiness review.
+
+## Reporting a failed scoring pass
+
+- **What:** a pass that raises records the error in `scoring_run["error"]`
+  and the server log, and no door reads either: the page and curl see a
+  pass that ended, and on a re-score a failed pass cannot be told from a
+  finished one (a first pass's unscored trials do show in the report's
+  coverage). The slot itself is freed wherever the pass raises: its
+  finally clears `scoring_run["active"]`, and since the review's L8 fix
+  that covers the pass's first read too. Present at f3eeebc, before
+  Phase N.
+- **Deferred by:** Phase N, N4, where it was found outside N4's scope;
+  put on this list at the merge-readiness review.
+- **Reason:** the error reaches no door because no door reports a pass
+  at all, its end included; the error is one field of the read door
+  that would, and that door was outside N4's scope.
+- **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)".

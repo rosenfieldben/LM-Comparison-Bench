@@ -2388,8 +2388,11 @@ store again):
   panel says so.
 
 The pass runs on the server after the door's 202, and no door says when
-it ends, so the report opened then shows what has been scored by that
-moment; select the experiment again to read more. A refusal, such as
+it ends or whether it failed, so the report opened then shows what has
+been scored by that moment; select the experiment again to read more.
+Stopping the bench does not wait for a pass: a judge call in flight then
+is paid for and records no score. BACKLOG.md holds both gaps. A pass that
+fails does free the bench's one scoring slot. A refusal, such as
 another pass holding the bench's one scoring slot, is the door's
 sentence, and Score stays live, because the server knows when the other
 pass ends. **Every press scores every trial again**, judged ones

@@ -5858,23 +5858,7 @@ async def run_experiment(experiment_id: int) -> None:
     H1.2 already wrote rather than a promise this workstream makes.
     """
     db = app.state.db
-    experiment = store.get_experiment(db, experiment_id)
-    assert experiment is not None
     state = app.state.experiment_run
-    lineup = experiment["lineup"]
-    controls_base = experiment["params"] or {}
-    # THE MANIFEST IS THE DECLARATION, and the runner reads it rather
-    # than the dataset file. The dataset says which digests a task
-    # cites; the experiment record says which READING of each was
-    # frozen at creation, and a parser upgrade between creation and
-    # start moves the first and cannot move the second. Absent on a
-    # pre-M experiment and on one whose dataset declared no document,
-    # which are the two eras that share the NULL.
-    task_pins = experiment["task_attachments"] or {}
-    # "inline" rather than None, because that is the mode a comparison
-    # with no documents has always been checked under and rule one says
-    # this phase changes nothing for those runs.
-    attachments_mode = experiment["attachments_mode"] or "inline"
     status, detail = "done", None
     # Set by the cancellation handler around each trial, and read once
     # that trial has been counted. Declared out here rather than per cell
@@ -5882,14 +5866,35 @@ async def run_experiment(experiment_id: int) -> None:
     # once it is true the run is over.
     interrupted = False
     # EVERY exit through the one finally, including the two that happen
-    # before a single trial runs. They used to sit above the try, so each
-    # needed its own copy of the release and its own status write, and
-    # the digest branch was written without either: one changed dataset
-    # left `active` set, and every later start answered "an experiment is
-    # already running" naming an experiment that had already failed,
-    # until the process was restarted. A cleanup duplicated per exit is a
-    # cleanup that will be forgotten on the next exit somebody adds.
+    # before a single trial runs, and the runner's first read of its own
+    # experiment. They used to sit above the try, so each needed its own
+    # copy of the release and its own status write, and the digest branch
+    # was written without either: one changed dataset left `active` set,
+    # and every later start answered "an experiment is already running"
+    # naming an experiment that had already failed, until the process was
+    # restarted. The first read stayed above it until Phase N's review,
+    # which found the scoring pass's twin; a raise there held the slot the
+    # same way. A cleanup duplicated per exit is a cleanup that will be
+    # forgotten on the next exit somebody adds. The missing row is an
+    # explicit raise and not an assert, which python -O strips.
     try:
+        experiment = store.get_experiment(db, experiment_id)
+        if experiment is None:
+            raise LookupError(f"experiment {experiment_id} is not in the store")
+        lineup = experiment["lineup"]
+        controls_base = experiment["params"] or {}
+        # THE MANIFEST IS THE DECLARATION, and the runner reads it rather
+        # than the dataset file. The dataset says which digests a task
+        # cites; the experiment record says which READING of each was
+        # frozen at creation, and a parser upgrade between creation and
+        # start moves the first and cannot move the second. Absent on a
+        # pre-M experiment and on one whose dataset declared no document,
+        # which are the two eras that share the NULL.
+        task_pins = experiment["task_attachments"] or {}
+        # "inline" rather than None, because that is the mode a comparison
+        # with no documents has always been checked under and rule one says
+        # this phase changes nothing for those runs.
+        attachments_mode = experiment["attachments_mode"] or "inline"
         try:
             # By whichever door the start named. A path is read here, for
             # the first time since creation; a digest was checked at the
@@ -6306,10 +6311,17 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
     judge again, not only the gaps, and pays for each call.
     """
     db = app.state.db
-    experiment = store.get_experiment(db, experiment_id)
-    assert experiment is not None
     state = app.state.scoring_run
+    # EVERYTHING THE PASS DOES IS INSIDE THE TRY, its first read included.
+    # The finally below is the only thing that ever frees the one scoring
+    # slot, so a statement that could raise before it would leave the slot
+    # held and every later Score, on every experiment, refused with a 409
+    # until the server restarted. The missing row is an explicit raise and
+    # not an assert, which python -O strips.
     try:
+        experiment = store.get_experiment(db, experiment_id)
+        if experiment is None:
+            raise LookupError(f"experiment {experiment_id} is not in the store")
         # Self-judging is recorded, not prevented. A judge grading its own
         # output has a documented tendency toward itself, and the honest
         # response is to flag every affected row and surface the flag in

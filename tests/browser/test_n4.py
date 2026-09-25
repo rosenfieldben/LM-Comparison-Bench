@@ -712,7 +712,7 @@ def test_the_report_is_read_again_after_the_202(page, bench, bench_url, scorings
     After scoring, the report opens: select() had already opened it, so
     the proof is a NEW read of the report, made after the answer and not
     before it, and the line beside Score says when the pass started and
-    that no door says when it ends."""
+    that no door says when it ends or whether it failed."""
     eid, _ = finished(page, bench_url, PLAIN)
     bench(["stub/fast"])
     open_experiments(page)
@@ -732,8 +732,9 @@ def test_the_report_is_read_again_after_the_202(page, bench, bench_url, scorings
 
     expect(page.get_by_test_id("experiment-action-msg")).to_have_text(
         re.compile(
-            rf"^a scoring pass was started at {UTC}; no door says when it ends, "
-            r"so select the experiment again to read what it has scored since$"
+            rf"^a scoring pass was started at {UTC}; no door says when it ends "
+            r"or whether it failed, so select the experiment again to read what "
+            r"it has scored since$"
         )
     )
 
