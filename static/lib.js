@@ -922,6 +922,12 @@
     return body;
   }
 
+  // The reason the page waits for a judge, said where it waits: the door
+  // would accept the pass, and what it would record cannot be taken back.
+  const JUDGE_LESS_PASS =
+    "because a pass without one records every judge task as a scoring " +
+    "failure, and that record does not rewrite";
+
   // Why Score is greyed, or null. TWO OF THESE ARE REFUSALS AND THREE ARE
   // NOT, which is the opposite of the Create nudges and is deliberate.
   // The door refuses the unstored digest and bytes it cannot cite, in its
@@ -937,7 +943,7 @@
   function scoreNudge(summary, judge, catalogState) {
     if (summary === null) return "reading which scorers its dataset declares";
     if (summary === undefined) {
-      return "its dataset could not be read; select the experiment again to ask again";
+      return "its dataset could not be read; Retry asks the store again";
     }
     if (typeof summary === "string") return summary;
     if (summary === false) {
@@ -949,7 +955,7 @@
     }
     if (judgeTasks(summary) && judge === "") {
       if (catalogState === "pending") {
-        return "choose a judge once the catalog has loaded: its dataset has judge tasks";
+        return "choose a judge once the catalog has loaded, " + JUDGE_LESS_PASS;
       }
       if (catalogState === "unavailable") {
         return (
@@ -957,7 +963,7 @@
           "available; score it through the API with judge_model"
         );
       }
-      return "choose a judge: its dataset has judge tasks";
+      return "choose a judge, " + JUDGE_LESS_PASS;
     }
     return null;
   }

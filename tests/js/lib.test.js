@@ -1138,7 +1138,7 @@ test("scoreNudge says why Score waits, in every summary state", () => {
   );
   assert.strictEqual(
     scoreNudge(undefined, "stub/j"),
-    "its dataset could not be read; select the experiment again to ask again",
+    "its dataset could not be read; Retry asks the store again",
   );
   assert.match(
     scoreNudge(false, "stub/j"),
@@ -1146,7 +1146,7 @@ test("scoreNudge says why Score waits, in every summary state", () => {
   );
   assert.strictEqual(
     scoreNudge(judged, ""),
-    "choose a judge: its dataset has judge tasks",
+    "choose a judge, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
   );
   assert.strictEqual(scoreNudge(judged, "stub/j"), null);
   assert.strictEqual(scoreNudge(plain, ""), null);
@@ -1171,7 +1171,7 @@ test("scoreNudge follows the catalog and shows the door's sentence as given", ()
   const judged = { scorers: ["judge"], cites_documents: false };
   assert.strictEqual(
     scoreNudge(judged, "", "pending"),
-    "choose a judge once the catalog has loaded: its dataset has judge tasks",
+    "choose a judge once the catalog has loaded, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
   );
   assert.strictEqual(
     scoreNudge(judged, "", "unavailable"),
@@ -1180,7 +1180,7 @@ test("scoreNudge follows the catalog and shows the door's sentence as given", ()
   );
   assert.strictEqual(
     scoreNudge(judged, "", "loaded"),
-    "choose a judge: its dataset has judge tasks",
+    "choose a judge, because a pass without one records every judge task as a scoring failure, and that record does not rewrite",
   );
   // The catalog changes nothing once a judge is chosen, or where none is
   // needed.

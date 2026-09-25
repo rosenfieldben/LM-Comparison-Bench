@@ -79,6 +79,18 @@ SERVER_ERROR = "Failed to load resource: the server responded with a status of 5
 PLAIN = [{"id": "e1", "reference": "x", "scorer": {"kind": "exact"}}]
 JUDGED = [{"id": "j1", "rubric": "grade it", "scorer": {"kind": "judge"}}]
 UTC = r"\d\d:\d\d:\d\d UTC"
+# Why Score waits, as the page says it (BenchLib.scoreNudge).
+JUDGE_LESS_PASS = (
+    "because a pass without one records every judge task as a scoring failure, "
+    "and that record does not rewrite"
+)
+WAITS_FOR_JUDGE = "Score waits: choose a judge, " + JUDGE_LESS_PASS
+WAITS_FOR_CATALOG = "Score waits: choose a judge once the catalog has loaded, " + (
+    JUDGE_LESS_PASS
+)
+WAITS_FOR_READ = (
+    "Score waits: its dataset could not be read; Retry asks the store again"
+)
 PAGE_ZONE_OFFSET = -330  # Date.getTimezoneOffset() in Asia/Kolkata
 
 
@@ -331,9 +343,7 @@ def test_score_sends_the_recorded_dataset_and_a_judge_only_for_judge_tasks(
     expect(score).to_have_text("Score · pays the judge")
     expect(judge_field).to_be_visible()
     expect(score).to_be_disabled()
-    expect(nudge).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
-    )
+    expect(nudge).to_have_text(WAITS_FOR_JUDGE)
     entry_for(page, j_name).click()
     expect(score).to_have_text("Score · pays the judge")
     entry_for(page, p_name).click()
@@ -390,9 +400,7 @@ def test_a_judge_is_chosen_for_one_experiment_only(page, bench, bench_url, scori
 
     expect(judge_field).to_have_value("")
     expect(score).to_be_disabled()
-    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
-    )
+    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(WAITS_FOR_JUDGE)
     row_for(page, a).click()
     expect(judge_field).to_have_value("")
     expect(score).to_be_disabled()
@@ -488,10 +496,7 @@ def test_the_judge_note_follows_the_catalog_from_loading_to_loaded(
     nudge = page.get_by_test_id("experiment-score-nudge")
     options = page.get_by_test_id("experiment-judge").locator("option")
     expect(note).to_have_text("the catalog is still loading")
-    expect(nudge).to_have_text(
-        "Score waits: choose a judge once the catalog has loaded: its dataset "
-        "has judge tasks"
-    )
+    expect(nudge).to_have_text(WAITS_FOR_CATALOG)
     expect(options).to_have_count(1)
 
     held.pop().continue_()
@@ -502,9 +507,7 @@ def test_the_judge_note_follows_the_catalog_from_loading_to_loaded(
         "mandatory reasoning (derived, not measured); such a judge may give "
         "verdicts, be refused, or be billed for none"
     )
-    expect(nudge).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
-    )
+    expect(nudge).to_have_text(WAITS_FOR_JUDGE)
     ids = [m["id"] for m in page.request.get(bench_url + "/models").json()["models"]]
     expect(options).to_have_count(len(ids) + 1)
     assert [o.get_attribute("value") for o in options.all()] == ["", *ids]
@@ -593,9 +596,7 @@ def test_a_run_that_finishes_under_the_watch_learns_its_dataset(
     expect(page.get_by_test_id("experiment-score")).to_have_text(
         "Score · pays the judge"
     )
-    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
-    )
+    expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(WAITS_FOR_JUDGE)
     assert len(asked) == 1
 
 
@@ -603,23 +604,26 @@ def test_score_waits_while_the_dataset_is_being_read_and_after_a_failure(
     page, bench, bench_url, collectors, scorings
 ):
     """WINDOW: a finished judge-task experiment selected while GET
-    /datasets/{digest} is held, then answered 500, then asked again on a
-    later selection and answered by the store.
+    /datasets/{digest} is held, then answered 500; Retry pressed from the
+    keyboard with the question held again, then answered by the store;
+    and what has focus after Retry.
 
     Score's body and label depend on the scorers, so unlike Start it
     WAITS while they are unknown: plain "Score", greyed, saying it is
-    reading; then saying the read failed and that selecting again asks
-    again; and a later selection asks, and the Score row reads the
-    answer. Pressing without the scorers could send a judge-less pass
-    over judge tasks, which the door accepts and records for good."""
+    reading (no Retry: nothing has failed); then saying the read failed,
+    with Retry beside it; Retry asks the store the same question again,
+    hides while it is out and puts focus on the experiment's row, and the
+    Score row then reads the answer. Pressing without the scorers could
+    send a judge-less pass over judge tasks, which the door accepts and
+    records for good."""
     collectors.extend([SERVER_ERROR, "bench: checking a stored dataset failed"])
     a, digest = finished(page, bench_url, JUDGED)
-    other, _ = finished(page, bench_url, PLAIN)
     bench(["stub/fast"])
     held = hold(page, f"**/datasets/{digest}", "GET")
     open_experiments(page)
     score = page.get_by_test_id("experiment-score")
     nudge = page.get_by_test_id("experiment-score-nudge")
+    retry = page.get_by_test_id("experiment-score-retry")
 
     row_for(page, a).click()
     wait_held(page, held)
@@ -629,19 +633,23 @@ def test_score_waits_while_the_dataset_is_being_read_and_after_a_failure(
     expect(nudge).to_have_text(
         "Score waits: reading which scorers its dataset declares"
     )
+    expect(retry).to_be_hidden()
     held.pop().fulfill(status=500, body="no")
-    expect(nudge).to_have_text(
-        "Score waits: its dataset could not be read; select the experiment again "
-        "to ask again"
-    )
+    expect(nudge).to_have_text(WAITS_FOR_READ)
     expect(score).to_be_disabled()
-    page.unroute(f"**/datasets/{digest}")
-    row_for(page, other).click()
-    row_for(page, a).click()
-    expect(score).to_have_text("Score · pays the judge")
+    expect(retry).to_be_visible()
+    retry.focus()
+    page.keyboard.press("Enter")
+    wait_held(page, held)
     expect(nudge).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
+        "Score waits: reading which scorers its dataset declares"
     )
+    expect(retry).to_be_hidden()
+    assert page.evaluate("() => document.activeElement.dataset.id") == str(a)
+    held.pop().continue_()
+    expect(score).to_have_text("Score · pays the judge")
+    expect(nudge).to_have_text(WAITS_FOR_JUDGE)
+    expect(retry).to_be_hidden()
 
 
 def test_a_dataset_read_from_a_file_is_scored_through_the_api(
@@ -1190,9 +1198,7 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
     expect(nudge).to_have_text("")
     assert nudge.evaluate("el => getComputedStyle(el).display") != "none"
     page.get_by_test_id("experiment-judge").select_option("")
-    expect(nudge).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
-    )
+    expect(nudge).to_have_text(WAITS_FOR_JUDGE)
     for testid in ("experiment-judge-note", "experiment-score-note"):
         assert page.get_by_test_id(testid).get_attribute("role") is None
 

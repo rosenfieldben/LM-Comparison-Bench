@@ -2363,16 +2363,18 @@ dataset, checked against the recorded digest the same way.
 
 **In the browser**, the Experiments panel's **Score** button does this for
 the selected experiment once its trials have finished. It asks the store
-what the experiment's recorded dataset declares and waits until it knows:
+what the experiment's recorded dataset declares and waits until it knows
+(if that read fails, Score says so with a Retry beside it that asks the
+store again):
 
 - With no judge tasks the label reads "Score · free", since deterministic
   scorers call no model, and no judge is sent: the door would accept one
   and record nothing of it.
 - With judge tasks it reads "Score · pays the judge". A judge select
   appears, holding the whole catalog, filtered by nothing, and Score waits
-  until a judge is chosen. The door would accept a pass without a judge,
-  but that pass records "no judge model was given" for every judge task,
-  and records never rewrite. The choice is cleared when another
+  until a judge is chosen, and says why: the door would accept a pass
+  without a judge, but that pass records every judge task as a scoring
+  failure ("no judge model was given"), and records never rewrite. The choice is cleared when another
   experiment is selected. The bench does not check the judge: the rule
   under Pinned observations (2026-08-13) that a judge route must not have
   mandatory reasoning is enforced by no door, and the note beside the

@@ -420,6 +420,11 @@
       <button id="experiment-score" data-testid="experiment-score" type="button"
               aria-describedby="experiment-score-nudge experiment-score-note" disabled>Score</button>
       <span id="experiment-score-nudge" data-testid="experiment-score-nudge" role="status"></span>
+      <!-- Present only when reading the experiment's dataset failed: it
+           asks the store again, which is the only thing that clears that
+           state short of selecting the experiment again. -->
+      <button id="experiment-score-retry" data-testid="experiment-score-retry" type="button"
+              aria-describedby="experiment-score-nudge" hidden>Retry</button>
       <div id="experiment-score-notes">
         <span id="experiment-judge-note" data-testid="experiment-judge-note"></span>
         <span id="experiment-score-note" data-testid="experiment-score-note"></span>

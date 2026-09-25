@@ -88,6 +88,7 @@
   const judgeEl = document.getElementById("experiment-judge");
   const scoreEl = document.getElementById("experiment-score");
   const scoreNudgeEl = document.getElementById("experiment-score-nudge");
+  const retryEl = document.getElementById("experiment-score-retry");
   const judgeNoteEl = document.getElementById("experiment-judge-note");
   const scoreNoteEl = document.getElementById("experiment-score-note");
 
@@ -531,6 +532,8 @@
     scoreEl.disabled = scoring.has(experiment.id) || reason !== null;
     setText(scoreEl, scoreLabel(summary));
     setText(scoreNudgeEl, reason === null ? "" : "Score waits: " + reason);
+    // Retry only while the read has failed and nothing is being asked.
+    retryEl.hidden = summary !== undefined;
     setText(judgeNoteEl, judged ? judgeNote() : "");
     setText(
       scoreNoteEl,
@@ -803,6 +806,20 @@
     }
   }
 
+  // Retry beside "its dataset could not be read": the same question the
+  // selection asked, asked again. Retry hides while it is out, so a
+  // keyboard user's focus is put on the experiment's row rather than
+  // left on a control that is gone.
+  function retryDatasetRead() {
+    const experiment = selectedExperiment();
+    if (experiment === null) return;
+    const hadFocus = document.activeElement === retryEl;
+    if (hadFocus) retryEl.blur();
+    void learnDataset(experiment.dataset_digest);
+    renderExperiment();
+    if (hadFocus) focusRow(experiment.id);
+  }
+
   // The clock time of an answer, in UTC and saying so: Score's words
   // describe a pass on the server that no door reports on, so they are
   // stamped rather than worded as if still current.
@@ -1049,6 +1066,7 @@
       void score();
     });
     judgeEl.addEventListener("change", renderExperiment);
+    retryEl.addEventListener("click", retryDatasetRead);
     window.BenchControls.onChange(refreshForm);
     window.BenchControls.onChange(renderJudgeOptions);
     window.BenchDatasets.onSelect(() => {

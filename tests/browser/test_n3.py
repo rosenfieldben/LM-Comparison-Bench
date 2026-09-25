@@ -346,7 +346,8 @@ def test_review_repro_rows_to_a_report_through_the_panel(
     expect(score).to_have_text("Score · pays the judge")
     expect(score).to_be_disabled()
     expect(page.get_by_test_id("experiment-score-nudge")).to_have_text(
-        "Score waits: choose a judge: its dataset has judge tasks"
+        "Score waits: choose a judge, because a pass without one records every "
+        "judge task as a scoring failure, and that record does not rewrite"
     )
     # A catalog model outside the lineup, so no row is self-judged.
     page.get_by_test_id("experiment-judge").select_option("stub/html")
