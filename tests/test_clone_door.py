@@ -1051,3 +1051,164 @@ def test_the_url_is_in_the_clones_row_and_in_no_other_record(
     assert not (Path(made["root"]) / ".git" / "FETCH_HEAD").exists()
     assert not (Path(made["root"]) / ".git" / "logs").exists()
     assert not any(n in caplog.text for n in needles)
+
+
+# ----- which clone a snapshot read (the clone id on the capture) ------------
+
+
+def test_a_snapshot_names_the_clone_its_root_is_in(request, bench, stub):
+    """WINDOW: POST /snapshots at five roots, and the clone_id on each
+    capture it returns.
+
+    The clone's own directory, a directory inside it, and its .git name
+    the clone; BENCH_CLONE_ROOT itself, which holds every clone and is in
+    none, names nothing; and so does a root beside the clones. PRE-STATE:
+    the clone is recorded and each root is allowed."""
+    repo, _ = repo_for(request, stub, {"a.py": b"x\n", "sub/b.py": b"y\n"})
+    made = clone_of(bench, stub, repo).json()
+    beside = clone_root(bench) / "beside"
+    beside.mkdir()
+    (beside / "c.py").write_text("z\n")
+    assert [c["id"] for c in main.store.list_clones(bench.app.state.db)] == [made["id"]]
+    cases = [
+        (made["root"], ["*.py"], made["id"]),
+        (f"{made['root']}/sub", ["*.py"], made["id"]),
+        (f"{made['root']}/.git", ["HEAD"], made["id"]),
+        (str(clone_root(bench)), ["**/*.py"], None),
+        (str(beside), ["*.py"], None),
+    ]
+    for root, patterns, expected in cases:
+        resp = bench.post("/snapshots", json={"root": root, "patterns": patterns})
+        assert resp.status_code == 201, (root, resp.text)
+        assert resp.json()["capture"]["clone_id"] == expected, root
+
+
+def test_a_clone_is_named_under_any_spelling_of_its_directory(request, bench, stub):
+    """WINDOW: POST /snapshots at the clone's directory spelled in capitals.
+
+    On a disk that folds case the capitals are the same directory and
+    name the same clone; on one that does not, they name nothing and the
+    door says so. PRE-STATE: which disk this is decides which half
+    asserts."""
+    repo, _ = repo_for(request, stub)
+    made = clone_of(bench, stub, repo).json()
+    upper = str(Path(made["root"]).parent / Path(made["root"]).name.upper())
+    assert upper != made["root"]
+    resp = bench.post("/snapshots", json={"root": upper, "patterns": ["*.py"]})
+    if os.path.exists(upper):
+        assert resp.json()["capture"]["clone_id"] == made["id"]
+    else:
+        assert resp.status_code == 422
+
+
+@respx.mock
+def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
+    request, bench_env, stub, monkeypatch, tmp_path
+):
+    """WINDOW: one tree snapshotted twice, as a clone and as a byte-copy of
+    it (.git included) under a second allowlisted root; each snapshot then
+    compared by hand in a group and cited by an experiment that ran; the
+    capture as POST /snapshots, GET /runs/{id}, GET /groups/{id}, GET
+    /runs (the group's entry), the report and the export each carry it.
+
+    DECLARATION TRANSPORT, the house law's test. On every surface the two
+    captures differ in clone_id (the clone's id, and a present null) and
+    in nothing else but the id and captured_at any two captures differ
+    in: the same digest, head, dirty flag, patterns and exclusions.
+    PRE-STATE: the copy is git-identical, so head and dirty agree and a
+    difference in them would be the bug."""
+    import shutil
+
+    from test_api import (
+        TEST_CATALOG,
+        experiment_body,
+        read_export,
+        response_for,
+        run_experiment_to_completion,
+        write_dataset,
+    )
+
+    async def catalog(client):
+        return json.loads(json.dumps(TEST_CATALOG))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", catalog)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    monkeypatch.setenv(
+        "BENCH_REPO_ROOTS",
+        os.pathsep.join([bench_env["BENCH_CLONE_ROOT"], str(elsewhere)]),
+    )
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, json=response_for("model/alpha", "ok"))
+    )
+    repo, _ = repo_for(request, stub, {"a.py": b"ANSWER = 42\n"})
+    with TestClient(main.app, base_url="http://localhost") as client:
+        made = clone_of(client, stub, repo).json()
+        plain = elsewhere / "copy"
+        shutil.copytree(made["root"], plain, symlinks=True)
+
+        surfaces = {}
+        for label, root in (("clone", made["root"]), ("plain", str(plain))):
+            snap = client.post("/snapshots", json={"root": root, "patterns": ["*.py"]})
+            assert snap.status_code == 201, snap.text
+            digest, capture = snap.json()["digest"], snap.json()["capture"]
+            gid = client.post(
+                "/groups",
+                json={
+                    "budget": "standard",
+                    "prompt": "read",
+                    "models": ["model/alpha"],
+                    "attachments": [digest],
+                },
+            ).json()["id"]
+            run_id = client.post(
+                "/compare",
+                json={
+                    "prompt": "read",
+                    "models": ["model/alpha"],
+                    "attachments": [digest],
+                    "group_id": gid,
+                },
+            ).json()["run_id"]
+            path = write_dataset(
+                tmp_path,
+                {"id": "t1", "prompt": "read", "attachments": [digest]},
+                name=f"{label}.jsonl",
+            )
+            eid = client.post(
+                "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+            ).json()["id"]
+            run_experiment_to_completion(client, eid, path)
+            report = client.get(
+                f"/experiments/{eid}/report", params={"dataset_path": path}
+            )
+            export = json.loads(read_export(client, eid).decode().splitlines()[0])
+            listed = [
+                r
+                for r in client.get("/runs").json()["runs"]
+                if r.get("type") == "group" and r["id"] == gid
+            ]
+            surfaces[label] = {
+                "digest": digest,
+                "POST /snapshots": capture,
+                "GET /runs/{id}": client.get(f"/runs/{run_id}").json()["attachments"][
+                    0
+                ]["capture"],
+                "GET /groups/{id}": client.get(f"/groups/{gid}").json()["attachments"][
+                    0
+                ]["capture"],
+                "GET /runs": listed[0]["attachments"][0]["capture"],
+                "report": report.json()["captures"][str(capture["id"])],
+                "export": export["captures"][str(capture["id"])],
+            }
+
+    clone, plain_ = surfaces.pop("clone"), surfaces.pop("plain")
+    assert clone.pop("digest") == plain_.pop("digest")
+    assert clone["POST /snapshots"]["head"] is not None
+    assert clone["POST /snapshots"]["dirty"] is False
+    for surface in clone:
+        a, b = clone[surface], plain_[surface]
+        assert a["clone_id"] == made["id"], surface
+        assert "clone_id" in b and b["clone_id"] is None, surface
+        differing = {key for key in a.keys() | b.keys() if a.get(key) != b.get(key)}
+        assert differing == {"id", "captured_at", "clone_id"}, surface

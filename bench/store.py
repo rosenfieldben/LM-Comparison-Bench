@@ -173,7 +173,8 @@ CREATE TABLE IF NOT EXISTS snapshot_captures (
     dirty INTEGER,
     patterns_json TEXT NOT NULL,
     excludes_json TEXT NOT NULL,
-    captured_at TEXT NOT NULL
+    captured_at TEXT NOT NULL,
+    clone_id INTEGER REFERENCES clones(id)
 );
 CREATE TABLE IF NOT EXISTS datasets (
     digest TEXT PRIMARY KEY NOT NULL,
@@ -658,6 +659,22 @@ MIGRATIONS = [
     # updated_at move when a clone is replaced; what a snapshot read is
     # recorded on its capture, which never moves. A row is never deleted
     # (see record_clone).
+    #
+    # Phase O, O2: WHICH CLONE A CAPTURE WALKED, as the id of its clones
+    # row, so an export can be traced to a URL through the clones table
+    # (the operator's ruling at the checkpoint). NULL is every capture of
+    # a root no clone the door made contains, and every capture recorded
+    # before this column, the Phase L backfill in connect() included:
+    # nothing derives it, because which clone a past walk read was never
+    # recorded and a guess from a path would be a record of a guess. In
+    # SCHEMA too, so the next era fixture has it.
+    #
+    # A PLAIN REFERENCE WITH NO ON DELETE ACTION: ON DELETE SET NULL would
+    # rewrite a capture, and nothing deletes a clones row (record_clone).
+    # A NULL default, because sqlite refuses a REFERENCES column with a
+    # non-NULL default on a table that has rows, which is every database
+    # holding one snapshot.
+    ("snapshot_captures", "clone_id", "INTEGER REFERENCES clones(id)"),
 ]
 
 
@@ -1024,6 +1041,8 @@ def connect(path: str) -> sqlite3.Connection:
         if not isinstance(recorded, dict) or "patterns" not in recorded:
             continue
         dirty = recorded.get("dirty")
+        # clone_id is left NULL: a Phase L walk predates the clone door,
+        # and which clone it read was never recorded.
         conn.execute(
             """INSERT INTO snapshot_captures
                (digest, extractor, extractor_version, head, dirty,
@@ -1441,6 +1460,7 @@ def record_capture(
     dirty: bool | None,
     patterns: list[str],
     excludes: list[str],
+    clone_id: int | None,
 ) -> dict[str, Any]:
     """One CAPTURE: the moment a tree was walked into this rendition.
 
@@ -1459,8 +1479,8 @@ def record_capture(
         cur = conn.execute(
             """INSERT INTO snapshot_captures
                (digest, extractor, extractor_version, head, dirty,
-                patterns_json, excludes_json, captured_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                patterns_json, excludes_json, captured_at, clone_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 digest,
                 extractor,
@@ -1470,6 +1490,7 @@ def record_capture(
                 json.dumps(list(patterns)),
                 json.dumps(list(excludes)),
                 _now(),
+                clone_id,
             ),
         )
     found = capture(conn, int(cur.lastrowid or 0))
@@ -1527,6 +1548,7 @@ def _capture_view(row: sqlite3.Row) -> dict[str, Any]:
         "patterns": json.loads(row["patterns_json"]),
         "excludes": json.loads(row["excludes_json"]),
         "captured_at": row["captured_at"],
+        "clone_id": row["clone_id"],
     }
 
 

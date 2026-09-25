@@ -1413,7 +1413,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 7**. Each trial line carries the ordered
+An **export is schema version 8**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1424,10 +1424,14 @@ declaration nowhere in the file. Version 6 let a pin's `kind` be
 `snapshot`. Version 7 lets a pin name a `capture_id` and adds `captures`
 to the manifest, the records those ids name, so a reader can say which
 *walk* of a repository each snapshot cell read and not merely which
-bytes. The manifest states the reason for the current bump in the file
-itself, and it names every field the earlier versions added, because a
-reader holding a v7 artifact and a v2 parser needs the whole list from
-the file in their hand.
+bytes. Version 8 adds `clone_id` to each of those capture records: the
+clones row the walked root was in, null when it was in none, so a
+reader holding this bench's database can say which repository and ref a
+snapshot was of; the URL itself stays out of the file. The manifest
+states the reason for the current bump in the file itself, and it names
+every field the earlier versions added, because a reader holding a v8
+artifact and a v2 parser needs the whole list from the file in their
+hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1832,7 +1836,9 @@ clear, the blind view), since each is a path in somebody's repository.
 the content half: every member's path, byte size and digest, and the
 encoding rule. Beside it rides the **capture**, which is the walk's
 half: the clone's HEAD commit, whether its tree was modified, the
-patterns that selected and the exclusions that were in force, and when.
+patterns that selected and the exclusions that were in force, when, and
+which clone the clone door made it was (`clone_id`, null for a tree the
+door did not make).
 Never any content, which is the promise every attachment response
 makes. The list endpoint omits both deliberately, since a page of
 snapshots carrying theirs would be a page of bodies.
@@ -2007,7 +2013,14 @@ report or an export, because a URL is not a fact about the reading; git
 writes it into the clone's `.git/FETCH_HEAD`, and the door removes that
 file, and git's reflog, which would name you and your machine, is off.
 The row describes the directory as it is now; what a snapshot read is on
-its capture, which never changes.
+its capture, which never changes. **A snapshot of a clone names it**: its
+capture carries the clone's id (`clone_id`), found by what the
+directories are rather than how they are spelled, from the root, a
+directory inside the clone or its `.git`; a root that holds clones
+rather than sitting in one (`BENCH_CLONE_ROOT` itself) names none. The
+id travels wherever the capture does (the snapshot's response, the
+history, the report and the export), so a reader asks "which
+repository was this" of the clones table and finds the URL there.
 
 **Removing a clone is yours.** There is no delete door: remove the
 directory yourself. Its row stays, and a later clone of the same

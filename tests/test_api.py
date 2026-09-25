@@ -6431,14 +6431,19 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[7]
-    # Version 7 is the fourteenth review's H2: pins may name a capture
-    # and the manifest carries the captures those ids name, so a reader
-    # holding only the file can say which walk a snapshot cell read.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[8]
+    # Version 8 is Phase O's clone id: each capture record names the
+    # clones row its walked root was in, and the URL stays out of the
+    # file.
+    assert "clone_id" in manifest["export_schema_change"]
+    assert "URL is deliberately not in the artifact" in manifest["export_schema_change"]
+    # Version 7's, carried: pins may name a capture and the manifest
+    # carries the captures those ids name, so a reader holding only the
+    # file can say which walk a snapshot cell read.
     assert "capture_id" in manifest["export_schema_change"]
     assert "captures" in manifest["export_schema_change"]
     # Present and empty on an experiment with no snapshot in it, so a
@@ -17125,7 +17130,7 @@ def test_a_missing_snapshot_reading_is_refused_with_a_remedy_that_exists(
 
 
 @respx.mock
-def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
+def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
     """WINDOW: the export manifest and trial lines of an experiment whose
     task cited a snapshot.
 
@@ -17150,7 +17155,7 @@ def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -17170,6 +17175,8 @@ def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
     named = manifest["captures"][str(built["capture"]["id"])]
     assert named["patterns"] == ["**/*.py"]
     assert named["head"] is None and named["dirty"] is None
+    # A root no clone the door made contains: present and null.
+    assert named["clone_id"] is None
 
 
 # ---- Phase L closing: the filesystem posture, enumerated.
@@ -17302,6 +17309,9 @@ FILESYSTEM_CALLS = {
     # and inode up the ancestors of a root already resolved and matched
     # against BENCH_REPO_ROOTS.
     ("main.py", "_same_or_under"): {"os.stat"},
+    # Which clone a snapshot root is in, the same way: each clones row's
+    # recorded directory, and the root's ancestors, stat'd.
+    ("main.py", "_clone_for"): {"os.stat"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
@@ -19550,7 +19560,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(

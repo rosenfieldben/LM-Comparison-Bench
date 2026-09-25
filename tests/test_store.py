@@ -3659,6 +3659,7 @@ def test_a_capture_is_recorded_per_walk_and_read_back_by_id_and_by_latest(tmp_pa
             dirty=False,
             patterns=["*.py"],
             excludes=[".git"],
+            clone_id=None,
         )
         second = store.record_capture(
             conn,
@@ -3669,6 +3670,7 @@ def test_a_capture_is_recorded_per_walk_and_read_back_by_id_and_by_latest(tmp_pa
             dirty=True,
             patterns=["*.py"],
             excludes=[".git"],
+            clone_id=None,
         )
         assert first["id"] != second["id"]
         assert store.latest_capture(conn, "ab", "repo-walk", "1")["id"] == second["id"]
@@ -3949,11 +3951,19 @@ def test_migration_onto_pre_o_database_adds_clones_and_touches_nothing(tmp_path)
     }
     assert len(before["snapshot_captures"]) == 1
     legacy.close()
+    # The capture gains one column, clone_id, NULL on a walk that
+    # predates the clone door; every field it had is as it was.
+    after = {
+        "experiments": before["experiments"],
+        "snapshot_captures": [
+            {**r, "clone_id": None} for r in before["snapshot_captures"]
+        ],
+    }
 
     conn = store.connect(str(db_path))
     try:
         assert store.list_clones(conn) == []
-        for table, rows in before.items():
+        for table, rows in after.items():
             assert [dict(r) for r in conn.execute(f"SELECT * FROM {table}")] == rows
         made = store.record_clone(
             conn, url="https://h/o/r", ref="main", head_sha="f" * 40, root="/c/x"
@@ -3965,7 +3975,7 @@ def test_migration_onto_pre_o_database_adds_clones_and_touches_nothing(tmp_path)
     again = store.connect(str(db_path))
     try:
         assert [c["url"] for c in store.list_clones(again)] == ["https://h/o/r"]
-        for table, rows in before.items():
+        for table, rows in after.items():
             assert [dict(r) for r in again.execute(f"SELECT * FROM {table}")] == rows
     finally:
         again.close()
@@ -3994,3 +4004,73 @@ def test_a_clone_row_is_one_per_repository_and_ref_and_never_replaced(db):
     assert second["updated_at"] >= first["updated_at"]
     assert (second["head_sha"], second["root"]) == ("c" * 40, "/d/1")
     assert [c["id"] for c in store.list_clones(db)] == [first["id"], other["id"]]
+
+
+def test_a_capture_names_its_clone_and_only_a_clone_that_exists(db):
+    """WINDOW: record_capture with a clone id, read back by capture(), and
+    with an id no clones row has.
+
+    The id travels on the capture record as head does, and the foreign
+    key holds: a capture cannot name a clone the table never had.
+    PRE-STATE: foreign keys are on for this connection, and the clone is
+    recorded."""
+    assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    clone = store.record_clone(
+        db, url="https://h/o/r", ref="main", head_sha="a" * 40, root="/c/x"
+    )
+    walk = dict(head="a" * 40, dirty=False, patterns=["*.py"], excludes=[".git"])
+    named = store.record_capture(
+        db, "ab", "snapshot", "1", **walk, clone_id=clone["id"]
+    )
+    assert store.capture(db, named["id"])["clone_id"] == clone["id"]
+    plain = store.record_capture(db, "ab", "snapshot", "1", **walk, clone_id=None)
+    assert store.capture(db, plain["id"])["clone_id"] is None
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_capture(
+            db, "ab", "snapshot", "1", **walk, clone_id=clone["id"] + 99
+        )
+
+
+def test_migration_onto_pre_o_database_adds_clone_id_null_and_enforced(tmp_path):
+    """WINDOW: a database whose schema is d1d792d's, holding a capture,
+    through connect() twice.
+
+    The column arrives by MIGRATIONS on a table that has rows, which is
+    where a NOT NULL or a non-NULL default would have failed boot: the
+    old capture reads clone_id None and is otherwise untouched, a new
+    capture may name a clone, one naming no clone is refused, and a
+    second boot changes nothing. PRE-STATE: the column is absent and the
+    capture is there."""
+    db_path = tmp_path / "pre_o.db"
+    legacy = _pre_o_database(db_path)
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(snapshot_captures)")]
+    assert "clone_id" not in columns
+    legacy.row_factory = sqlite3.Row
+    before = dict(legacy.execute("SELECT * FROM snapshot_captures").fetchone())
+    legacy.close()
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            row = dict(
+                conn.execute("SELECT * FROM snapshot_captures WHERE id = 1").fetchone()
+            )
+            assert row == {**before, "clone_id": None}
+            assert store.capture(conn, 1)["clone_id"] is None
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        clone = store.record_clone(
+            conn, url="https://h/o/r", ref="main", head_sha="f" * 40, root="/c/x"
+        )
+        walk = dict(head=None, dirty=None, patterns=["*"], excludes=[])
+        made = store.record_capture(
+            conn, "cd", "snapshot", "1", **walk, clone_id=clone["id"]
+        )
+        assert store.capture(conn, made["id"])["clone_id"] == clone["id"]
+        with pytest.raises(sqlite3.IntegrityError):
+            store.record_capture(conn, "cd", "snapshot", "1", **walk, clone_id=999)
+    finally:
+        conn.close()

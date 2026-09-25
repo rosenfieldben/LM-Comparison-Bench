@@ -308,6 +308,13 @@ class SnapshotCapture(BaseModel):
     patterns: list[str]
     excludes: list[str]
     captured_at: str
+    # Phase O: the clones row whose directory the walked root is in, so
+    # "which repository was this" is answered from the record, through
+    # the clones table, where the URL is kept and nowhere else. Null for
+    # a root no clone the door made contains, and for every capture
+    # recorded before the column. No default: present on every capture,
+    # so a null is said rather than implied.
+    clone_id: int | None
 
 
 class CompareRequest(BaseModel):
@@ -6978,6 +6985,7 @@ def _capture_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
         "patterns": record["patterns"],
         "excludes": record["excludes"],
         "captured_at": record["captured_at"],
+        "clone_id": record["clone_id"],
     }
 
 
@@ -7630,6 +7638,7 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
         dirty=dirty,
         patterns=list(body.patterns),
         excludes=list(manifest["excludes"]),
+        clone_id=_clone_for(root),
     )
     return _attachment_detail(stored, capture=recorded)
 
@@ -8342,6 +8351,38 @@ def _same_or_under(inner: str, outer: str) -> bool:
         if (seen.st_dev, seen.st_ino) == (target.st_dev, target.st_ino):
             return True
     return False
+
+
+def _clone_for(root: str) -> int | None:
+    """The id of the clones row whose directory holds this snapshot root,
+    or None.
+
+    BY WHAT THE DIRECTORIES ARE, not how they are spelled: each row's
+    directory is compared by device and inode with the root and each of
+    its ancestors, the root's own first, so the deepest clone holding it
+    wins and a case-folding disk's other spelling is the same clone. A
+    root that holds clones rather than sitting in one (BENCH_CLONE_ROOT
+    itself) is in none, and a row whose directory is gone matches
+    nothing.
+    """
+    rows: dict[tuple[int, int], int] = {}
+    for row in store.list_clones(app.state.db):
+        try:
+            seen = os.stat(row["root"])
+        except OSError:
+            continue
+        rows[(seen.st_dev, seen.st_ino)] = row["id"]
+    if not rows:
+        return None
+    for ancestor in (root, *map(str, Path(root).parents)):
+        try:
+            seen = os.stat(ancestor)
+        except OSError:
+            continue
+        found = rows.get((seen.st_dev, seen.st_ino))
+        if found is not None:
+            return found
+    return None
 
 
 def refuse_while_cloning(root: str) -> None:
