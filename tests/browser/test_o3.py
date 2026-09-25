@@ -16,6 +16,7 @@ session's. Every proof names its window.
 
 import hashlib
 import json
+import re
 
 import pytest
 from playwright.sync_api import expect
@@ -93,6 +94,17 @@ def press(page, testid, path):
 def outer(page):
     """The page as markup: every element's text and every attribute."""
     return page.evaluate("document.documentElement.outerHTML")
+
+
+# The page is read through expect, which waits, and never by a bare read
+# after a press: expect_response returns when the answer arrives, before
+# the page's handler has read its body.
+ANY = re.compile(".")
+
+
+def within(text):
+    """An attribute value holding text anywhere."""
+    return re.compile(re.escape(text))
 
 
 def held_route(page, pattern):
@@ -174,7 +186,7 @@ def test_the_clone_step_says_why_it_cannot_clone_only_while_open(
     }[posture]
     reason = page.get_by_test_id("clone-reason")
     expect(page.get_by_test_id("snapshot-open")).to_be_enabled()
-    assert reason.text_content() == ""
+    expect(reason).to_have_text("")
 
     open_panel(page)
     expect(reason).to_have_text(expected)
@@ -182,13 +194,13 @@ def test_the_clone_step_says_why_it_cannot_clone_only_while_open(
         expect(page.get_by_test_id(testid)).to_be_disabled()
 
     page.get_by_test_id("snapshot-open").click()
-    assert reason.text_content() == ""
+    expect(reason).to_have_text("")
     assert "Zq9" not in outer(page)
     open_panel(page)
     expect(reason).to_have_text(expected)
     page.evaluate("window.BenchAttach.forgetSnapshot()")
     expect(page.get_by_test_id("snapshot-panel")).to_be_hidden()
-    assert reason.text_content() == ""
+    expect(reason).to_have_text("")
     assert "Zq9" not in outer(page)
     if posture == "naming paths":
         group = blind_group(page, snapshot_bench_url)
@@ -281,8 +293,7 @@ def test_a_public_repository_goes_from_a_url_to_an_experiment(
     capture = composed["capture"]
     walk = f"capture #{capture['id']} at {sha[:7]}, clean"
     chip = page.get_by_test_id("attachment-chip")
-    expect(chip).to_have_count(1)
-    assert walk in chip.get_attribute("title")
+    expect(chip).to_have_attribute("title", within(walk))
     expect(root).to_have_value("")
     expect(page.get_by_test_id("clone-url")).to_have_value(url)
     expect(page.get_by_test_id("clone-ref")).to_have_value("main")
@@ -297,8 +308,7 @@ def test_a_public_repository_goes_from_a_url_to_an_experiment(
     option = row(page, 0).locator(
         f"[data-testid=dataset-document-option][data-digest='{composed['digest']}']"
     )
-    expect(option).to_have_count(1)
-    assert "\nlatest " + walk in option.get_attribute("title")
+    expect(option).to_have_attribute("title", within("\nlatest " + walk))
     option.click()
     assert store(page).startswith("stored as " + dataset)
     entry_for(page, dataset).click()
@@ -344,15 +354,26 @@ def test_an_update_forgets_the_old_listing_and_the_picker_tells_heads_apart(
     made = press_clone(page, url).json()
     patterns = page.get_by_test_id("snapshot-patterns")
 
-    def compose(pattern):
+    def compose(pattern, attached=False):
         """Compose one pattern from the clone, cloning again first when a
-        Compose has forgotten the root (it keeps the URL and the ref)."""
+        Compose has forgotten the root (it keeps the URL and the ref).
+        attached: the bytes are a snapshot already attached, which the
+        page says and does not attach twice."""
         if page.get_by_test_id("snapshot-panel").is_hidden():
             open_panel(page)
         if page.get_by_test_id("snapshot-root").input_value() == "":
             assert press_clone(page, url).ok
         patterns.fill(pattern)
-        return press(page, "snapshot-compose", "/snapshots").json()
+        composed = press(page, "snapshot-compose", "/snapshots").json()
+        # The page acts once it has read the answer, not when it arrives:
+        # a new snapshot closes the panel, one already attached is said.
+        if attached:
+            expect(page.get_by_test_id("snapshot-msg")).to_contain_text(
+                "already attached"
+            )
+        else:
+            expect(page.get_by_test_id("snapshot-panel")).to_be_hidden()
+        return composed
 
     d1 = compose("*.py")
     e1 = compose("*.md")
@@ -361,7 +382,7 @@ def test_an_update_forgets_the_old_listing_and_the_picker_tells_heads_apart(
     patterns.fill("*.py")
     assert press(page, "snapshot-list", "/snapshots/listing").ok
     member_rows = page.get_by_test_id("snapshot-member")
-    assert member_rows.count() > 0
+    expect(member_rows).not_to_have_count(0)
 
     second = clone_remote.repository(
         OWNER, name, {"a.py": b"A = 'moved'\n", "b.md": b"# two heads\n"}
@@ -374,30 +395,34 @@ def test_an_update_forgets_the_old_listing_and_the_picker_tells_heads_apart(
     )
     expect(page.get_by_test_id("snapshot-root")).to_have_value(made["root"])
     expect(member_rows).to_have_count(0)
-    assert page.get_by_test_id("snapshot-listing-summary").text_content() == ""
+    expect(page.get_by_test_id("snapshot-listing-summary")).to_have_text("")
 
     d2 = compose("*.py")
-    e2 = compose("*.md")
+    e2 = compose("*.md", attached=True)
     assert e1["digest"] == e2["digest"] and d1["digest"] != d2["digest"]
 
     open_datasets(page)
     add_task(page, "h1", "two heads")
     row(page, 0).get_by_test_id("dataset-row-add-document").click()
 
-    def title(digest):
-        options = row(page, 0).locator(
+    def option(digest):
+        found = row(page, 0).locator(
             f"[data-testid=dataset-document-option][data-digest='{digest}']"
         )
-        expect(options).to_have_count(1)
-        return options.get_attribute("title")
+        expect(found).to_have_count(1)
+        return found
 
-    assert f"at {first[:7]}, clean" in title(d1["digest"])
-    assert f"at {second[:7]}, clean" in title(d2["digest"])
-    assert first[:7] not in title(d2["digest"])
-    assert f"latest capture #{e2['capture']['id']} at {second[:7]}" in title(
-        e1["digest"]
+    expect(option(d1["digest"])).to_have_attribute(
+        "title", within(f"at {first[:7]}, clean")
     )
-    assert first[:7] not in title(e1["digest"])
+    expect(option(d2["digest"])).to_have_attribute(
+        "title", within(f"at {second[:7]}, clean")
+    )
+    expect(option(d2["digest"])).not_to_have_attribute("title", within(first[:7]))
+    expect(option(e1["digest"])).to_have_attribute(
+        "title", within(f"latest capture #{e2['capture']['id']} at {second[:7]}")
+    )
+    expect(option(e1["digest"])).not_to_have_attribute("title", within(first[:7]))
 
 
 # ----- refusals: the server's words, the root kept, nothing repeated --------
@@ -454,11 +479,11 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     refused = press_clone(page, typed)
     assert refused.status == 403
     expect(message).to_have_text(refused.json()["detail"])
-    assert page.get_by_test_id("clone-url").input_value() == typed
+    expect(page.get_by_test_id("clone-url")).to_have_value(typed)
     assert runs(page.get_by_test_id("clone-url").input_value())
     expect(root).to_have_value(made["root"])
     expect(outcome).to_have_text("")
-    assert outcome.get_attribute("title") in ("", None)
+    expect(outcome).not_to_have_attribute("title", ANY)
     others = page.evaluate(
         "[...document.querySelectorAll('input, textarea, select')]"
         ".filter(el => el.id !== 'clone-url').map(el => el.value).join('\\n')"
@@ -521,7 +546,7 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     page.get_by_test_id("snapshot-patterns").fill("*.py")
     assert press(page, "snapshot-compose", "/snapshots").ok
     for testid in ("clone-url", "clone-ref", "snapshot-root"):
-        assert page.get_by_test_id(testid).input_value() == "", testid
+        expect(page.get_by_test_id(testid)).to_have_value("")
     open_panel(page)
 
     for testid in ("clone-url", "clone-ref", "snapshot-root", "snapshot-patterns"):
@@ -534,7 +559,7 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     page.go_back()
     expect(page.get_by_test_id("snapshot-open")).to_be_enabled()
     for testid in ("clone-url", "clone-ref", "snapshot-root", "snapshot-patterns"):
-        assert page.get_by_test_id(testid).input_value() == "", testid
+        expect(page.get_by_test_id(testid)).to_have_value("")
 
 
 def test_blank_is_not_sent(request, page, clone_bench, clone_remote):
@@ -616,7 +641,7 @@ def test_a_clone_answered_after_the_panel_forgot_fills_nothing(
     for testid in ("clone-run", "snapshot-list", "snapshot-compose"):
         expect(page.get_by_test_id(testid)).to_be_disabled()
     for testid in ("clone-url", "clone-ref", "snapshot-root"):
-        assert page.get_by_test_id(testid).evaluate("el => el.readOnly")
+        expect(page.get_by_test_id(testid)).to_have_js_property("readOnly", True)
 
     forget(page, how, group)
     open_panel(page)
@@ -625,15 +650,17 @@ def test_a_clone_answered_after_the_panel_forgot_fills_nothing(
     expect(page.get_by_test_id("clone-outcome")).to_have_text(EARLIER)
     expect(page.get_by_test_id("clone-run")).to_be_disabled()
     expect(page.get_by_test_id("snapshot-list")).to_be_enabled()
-    assert not page.get_by_test_id("snapshot-root").evaluate("el => el.readOnly")
+    expect(page.get_by_test_id("snapshot-root")).to_have_js_property("readOnly", False)
     with page.expect_response(lambda r: r.url.endswith("/clones")) as late:
         held.pop().continue_()
     assert late.value.status == 201
     late_root = late.value.json()["root"]
-    page.wait_for_timeout(100)
 
-    expect(page.get_by_test_id("snapshot-root")).to_have_value("")
+    # The outcome goes from the earlier-clone line to nothing only in the
+    # answer's finally, so the page has read the answer before anything
+    # below is looked at.
     expect(page.get_by_test_id("clone-outcome")).to_have_text("")
+    expect(page.get_by_test_id("snapshot-root")).to_have_value("")
     expect(page.get_by_test_id("snapshot-msg")).to_have_text("")
     assert late_root not in outer(page)
     if how == "blind view":
@@ -739,7 +766,7 @@ def test_the_outcome_goes_when_it_stops_describing_the_boxes(
     page.get_by_test_id("clone-run").click()
     wait_held(page, held)
     expect(outcome).to_have_text(CLONING)
-    assert outcome.get_attribute("title") in ("", None)
+    expect(outcome).not_to_have_attribute("title", ANY)
     page.get_by_test_id("snapshot-open").click()
     expect(page.get_by_test_id("snapshot-panel")).to_be_hidden()
     with page.expect_response(lambda r: r.url.endswith("/clones")):
@@ -807,11 +834,11 @@ def test_a_page_restored_from_the_back_forward_cache_forgets_the_step(
     assert press_clone(page, clone_remote.url(OWNER, name)).ok
     page.get_by_test_id("clone-url").fill(f"https://{USER}:{TOKEN}@example/o/r")
     for testid in ("clone-url", "clone-ref", "snapshot-root"):
-        assert page.get_by_test_id(testid).input_value() != ""
+        expect(page.get_by_test_id(testid)).not_to_have_value("")
 
     page.evaluate(
         "window.dispatchEvent(new PageTransitionEvent('pageshow', {persisted: true}))"
     )
 
     for testid in ("clone-url", "clone-ref", "snapshot-root"):
-        assert page.get_by_test_id(testid).input_value() == "", testid
+        expect(page.get_by_test_id(testid)).to_have_value("")

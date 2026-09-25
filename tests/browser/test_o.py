@@ -11,6 +11,7 @@ Every proof names its window.
 """
 
 import json
+import os
 
 import pytest
 from playwright.sync_api import expect
@@ -205,7 +206,7 @@ def test_checked_rows_write_the_patterns_compose_sends(snapshot_bench, listing_r
         page.get_by_test_id("snapshot-compose").click()
     assert json.loads(sent.value.post_data)["patterns"] == ["src/a.py"]
     expect(page.get_by_test_id("attachment-chip")).to_have_count(1)
-    assert "1 file" in page.get_by_test_id("attachment-meta").inner_text()
+    expect(page.get_by_test_id("attachment-meta")).to_contain_text("1 file")
 
 
 @pytest.mark.parametrize(
@@ -342,6 +343,8 @@ def test_a_walk_that_stopped_offers_nothing_to_check(snapshot_bench, listing_roo
     no row can be checked, since what stopped it does not depend on the
     patterns. PRE-STATE: the listing selects a.py, reached before the
     stop."""
+    if os.geteuid() == 0:
+        pytest.skip("root opens a directory with no permission bits")
     page = snapshot_bench(["stub/fast"])
     open_panel(page, listing_root / "stopped", "**/*.py")
     listing = press_list(page)
@@ -417,7 +420,7 @@ def test_every_row_goes_when_the_panel_forgets_its_root(
     expect(rows(page)).to_have_count(0)
     text = page.locator("#attach-row").evaluate("el => el.textContent")
     assert "src/a.py" not in text
-    assert page.get_by_test_id("snapshot-listing-summary").text_content() == ""
+    expect(page.get_by_test_id("snapshot-listing-summary")).to_have_text("")
 
 
 def test_the_blind_view_holds_no_listing_and_no_listed_refusal(
@@ -555,7 +558,13 @@ def test_a_listing_answered_after_the_panel_forgot_is_dropped(
     with page.expect_response(lambda r: r.url.endswith("/snapshots/listing")) as late:
         held.pop().continue_()
     assert late.value.ok
-    page.wait_for_timeout(100)
+    if how == "another root":
+        # Compose waits for the listing until its answer's finally, so the
+        # page has read the answer before anything below is looked at.
+        expect(page.get_by_test_id("snapshot-compose")).to_be_enabled()
+    else:
+        # The blind view shows nothing that moves when the answer is read.
+        page.wait_for_timeout(100)
 
     expect(rows(page)).to_have_count(0)
-    assert page.get_by_test_id("snapshot-listing-summary").text_content() == ""
+    expect(page.get_by_test_id("snapshot-listing-summary")).to_have_text("")

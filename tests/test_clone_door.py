@@ -14,11 +14,15 @@ platform's git is shown in tests/test_clone_stub.py.
 """
 
 import asyncio
+import contextlib
+import ctypes
 import hashlib
 import json
 import os
+import signal
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -89,6 +93,129 @@ def clone_root(bench) -> Path:
 
 def work_left(bench) -> list[str]:
     return sorted(n for n in os.listdir(clone_root(bench)) if n.startswith("."))
+
+
+# ----- a process group, by what in it still runs -----------------------------
+#
+# A killed process stays a zombie until its parent reaps it, and a killed
+# git's children are orphans, reaped by whatever adopts them: init on a
+# host, but a PID 1 that does not reap (a container without an init) keeps
+# them as zombies, in their group, for good. A group of zombies still
+# answers os.killpg(pgid, 0), so "the group answers no signal" is not
+# "every git is dead"; the proofs count what in the group still RUNS.
+
+PR_SET_CHILD_SUBREAPER = 36
+
+
+def proc_table() -> list[tuple[int, int, int, str]]:
+    """(pid, ppid, pgrp, state) of every process: /proc/<pid>/stat where
+    there is a /proc, ps where there is not (macOS)."""
+    if not os.path.isdir("/proc/self"):
+        out = subprocess.run(
+            ["ps", "-A", "-o", "pid=,ppid=,pgid=,stat="],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        return [
+            (int(pid), int(ppid), int(pgrp), state[0])
+            for pid, ppid, pgrp, state in (line.split() for line in out.splitlines())
+        ]
+    table = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat_line = f.read()
+        except OSError:  # it ended between the listing and the read
+            continue
+        # "pid (comm) state ppid pgrp ...": comm may hold spaces and
+        # parentheses, so the fields are counted from its LAST ")".
+        state, ppid, pgrp = stat_line[stat_line.rindex(")") + 2 :].split()[:3]
+        table.append((int(entry), int(ppid), int(pgrp), state))
+    return table
+
+
+def live_in_group(pgid: int) -> list[int]:
+    """The pids in process group pgid that are not zombies (Z) or dead
+    (X)."""
+    return [
+        pid
+        for pid, _, pgrp, state in proc_table()
+        if pgrp == pgid and state not in "ZX"
+    ]
+
+
+def running_after(pgid: int, seconds: float = 5.0) -> list[int]:
+    """live_in_group once it is empty, or at the deadline: killpg sends a
+    SIGKILL, which lands after it returns, not in it. A git the runner
+    did not kill runs for as long as the stub holds (30 s)."""
+    deadline = time.monotonic() + seconds
+    while (live := live_in_group(pgid)) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    return live
+
+
+@pytest.fixture
+def groups():
+    """The process groups a test's gits ran in, which it appends to. On
+    Linux, while the test runs, the test process adopts every orphan
+    below it and reaps none (PR_SET_CHILD_SUBREAPER), as a PID 1 without
+    an init does: a killed git's children stay zombies in their group,
+    the host the operator's pass at 9c920e5 ran on. Afterwards what it
+    adopted in those groups is reaped. macOS has no way to adopt an
+    orphan, and there the test runs as it always did."""
+    recorded: list[int] = []
+    adopting = sys.platform == "linux"
+    if adopting:
+        libc = ctypes.CDLL(None, use_errno=True)
+        assert libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0
+    try:
+        yield recorded
+    finally:
+        if adopting:
+            libc.prctl(PR_SET_CHILD_SUBREAPER, 0, 0, 0, 0)
+            for pid, ppid, pgrp, state in proc_table():
+                if ppid == os.getpid() and pgrp in recorded:
+                    with contextlib.suppress(ProcessLookupError, ChildProcessError):
+                        if state not in "ZX":
+                            os.kill(pid, signal.SIGKILL)
+                        os.waitpid(pid, 0)
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="only Linux lets a process adopt orphans (PR_SET_CHILD_SUBREAPER)",
+)
+def test_a_group_whose_killed_orphans_are_not_reaped_answers_but_runs_nothing(
+    groups,
+):
+    """WINDOW: the operator's probe under the fixture's adopting parent
+    that does not reap, made certain: in its own session, a subshell
+    starts a sleep and exits, so that sleep is an orphan the test process
+    adopts, and sh becomes a second sleep; the group is SIGKILLed and
+    the second sleep waited for. (With "sleep 30 & wait", sh can reap
+    its sleep in the instant before its own SIGKILL lands.)
+
+    The orphan is a zombie in the group, so the group still answers
+    os.killpg(pgid, 0), the check the kill proofs made before 9c920e5's
+    pass; nothing in it runs, which is what they check now. PRE-STATE:
+    before the kill both sleeps run in the group."""
+    proc = subprocess.Popen(
+        ["sh", "-c", "(sleep 30 &); exec sleep 30"], start_new_session=True
+    )
+    groups.append(proc.pid)
+    deadline = time.monotonic() + 5
+    while len(live_in_group(proc.pid)) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(live_in_group(proc.pid)) == 2
+    os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
+    assert running_after(proc.pid) == []
+    os.killpg(proc.pid, 0)
+    left = [(ppid, state) for _, ppid, pgrp, state in proc_table() if pgrp == proc.pid]
+    assert left == [(os.getpid(), "Z")]
 
 
 # ----- refused in order, before anything is fetched ---------------------
@@ -639,7 +766,7 @@ def test_a_host_that_cannot_be_reached_is_a_502_naming_no_url(bench, monkeypatch
 
 
 def test_a_clone_past_max_clone_seconds_is_killed_and_removed(
-    request, bench, stub, monkeypatch
+    request, bench, stub, monkeypatch, groups
 ):
     """WINDOW: POST /clones of a path whose upload-pack the stub holds,
     with MAX_CLONE_SECONDS shortened.
@@ -648,15 +775,15 @@ def test_a_clone_past_max_clone_seconds_is_killed_and_removed(
     lets go (the stub holds for 30 s: a runner that waited for git to
     end on its own would answer then); the stall was reached with the
     new directory on disk, and after the refusal the directory is gone
-    and every git of the clone is dead; the next clone is accepted.
-    PRE-STATE: the clone root is empty."""
+    and nothing of the clone's gits still runs (on Linux, under the
+    groups fixture's parent that reaps nothing); the next clone is
+    accepted. PRE-STATE: the clone root is empty."""
     repo, _ = repo_for(request, stub)
     stub.stalled.add(f"/{OWNER}/{repo}.git")
     stub.stall_reached.clear()
     monkeypatch.setattr(main, "MAX_CLONE_SECONDS", 1.5)
     at_stall = []
     stub.on_stall = lambda: at_stall.append(work_left(bench))
-    groups = []
     real = asyncio.create_subprocess_exec
 
     async def recording(*args, **kw):
@@ -679,9 +806,9 @@ def test_a_clone_past_max_clone_seconds_is_killed_and_removed(
     assert stub.stall_reached.is_set()
     assert at_stall and at_stall[0] and at_stall[0][0].endswith(".partial")
     assert os.listdir(clone_root(bench)) == []
+    assert groups
     for pgid in groups:
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+        assert running_after(pgid) == [], pgid
     assert clone_of(bench, stub, repo).status_code == 201
 
 
@@ -838,19 +965,19 @@ def test_the_slot_is_free_after_a_clone_that_raised(
 
 
 def test_a_cancelled_clone_kills_its_git_and_removes_what_it_fetched(
-    request, bench, stub, monkeypatch
+    request, bench, stub, monkeypatch, groups
 ):
     """WINDOW: the clone worker cancelled while its fetch is held by the
     stub, as a request is when its client goes or the bench shuts down.
 
-    Every git of the clone is dead and the new directory is gone, soon
-    after the cancellation and not when the remote lets go (the stub
+    Nothing of the clone's gits still runs (on Linux, under the groups
+    fixture's parent that reaps nothing) and the new directory is gone,
+    soon after the cancellation and not when the remote lets go (the stub
     holds for 30 s). PRE-STATE: the stall was reached with the directory
     on disk."""
     repo, _ = repo_for(request, stub)
     stub.stalled.add(f"/{OWNER}/{repo}.git")
     stub.stall_reached.clear()
-    groups = []
     real = asyncio.create_subprocess_exec
 
     async def recording(*args, **kw):
@@ -880,8 +1007,7 @@ def test_a_cancelled_clone_kills_its_git_and_removes_what_it_fetched(
     assert os.listdir(clone_root(bench)) == []
     assert groups
     for pgid in groups:
-        with pytest.raises(ProcessLookupError):
-            os.killpg(pgid, 0)
+        assert running_after(pgid) == [], pgid
 
 
 # ----- the snapshot doors and a clone in progress ---------------------------
