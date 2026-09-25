@@ -2152,6 +2152,101 @@ def test_an_unreadable_create_answer_reloads_the_list(page, bench, bench_url):
     expect(page.get_by_test_id("experiment-row").filter(has_text=name)).to_have_count(1)
 
 
+def test_a_dataset_path_applied_for_one_report_stays_with_it(
+    page, bench, bench_url, tmp_path, runs, collectors
+):
+    """WINDOW: the report requests the page makes for A (created from a
+    file by path, the path applied in the report's box), then for B (over
+    a stored dataset), then for C (created in the page over a stored
+    dataset), then for A again, and what each answered.
+
+    A path is the file ONE experiment was read from. Applied for A it is
+    sent with A's report and never with another's: B's and C's are asked
+    for with no path and read their dataset from the store, where sending
+    A's path carried A's input into their requests and opened them on a
+    false "dataset changed" refusal. A, opened again, keeps its own.
+    PRE-STATE: A's read carries the path. A was read from a file, so the
+    store answers 404 when the page asks about its dataset, a console
+    line caused on purpose."""
+    collectors.append(MISSING_RESOURCE)
+    path = tmp_path / "by-path.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "id": "t1",
+                "prompt": uuid.uuid4().hex,
+                "reference": "x",
+                "scorer": {"kind": "exact"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    a = page.request.post(
+        bench_url + "/experiments",
+        data={
+            "name": unique("by path"),
+            "dataset_path": str(path),
+            "lineup": ["stub/fast"],
+            "budget": "standard",
+        },
+    ).json()["id"]
+    runs.append(a)
+    assert page.request.post(
+        f"{bench_url}/experiments/{a}/start", data={"dataset_path": str(path)}
+    ).ok
+    wait_status(page, bench_url, a)
+    b_name, b_digest = stored_digest(
+        page, bench_url, [{"id": "s1", "reference": "x", "scorer": {"kind": "exact"}}]
+    )
+    b = api_experiment(page, bench_url, b_digest, ["stub/fast"], unique("stored"))
+    runs.append(b)
+    assert page.request.post(
+        f"{bench_url}/experiments/{b}/start", data={"dataset_digest": b_digest}
+    ).ok
+    wait_status(page, bench_url, b)
+    bench(["stub/fast"])
+    check_all_chips(page)
+    open_experiments(page)
+    panel = page.get_by_test_id("report-panel")
+
+    def report_for(matches, act):
+        with page.expect_response(
+            lambda r: r.request.method == "GET" and matches(r.url)
+        ) as answer:
+            act()
+        expect(panel).to_have_attribute("data-state", "ready")
+        return answer.value
+
+    def of(eid):
+        return lambda url: f"/experiments/{eid}/report" in url
+
+    def of_another(url):
+        return "/report" in url and not of(a)(url) and not of(b)(url)
+
+    row_for(page, a).click()
+    expect(panel).to_have_attribute("data-state", "ready")
+    page.get_by_test_id("report-dataset-path").fill(str(path))
+    applied = report_for(
+        of(a), lambda: page.get_by_test_id("report-dataset-apply").click()
+    )
+    assert "dataset_path=" in applied.url
+    assert applied.json()["thresholds_source"] == "dataset_file"
+
+    stored = report_for(of(b), lambda: row_for(page, b).click())
+
+    assert "dataset_path" not in stored.url
+    assert stored.json()["thresholds_source"] == "dataset_store"
+    expect(page.get_by_test_id("report-dataset-path")).to_have_value("")
+    select_dataset(page, b_name)
+    created = report_for(of_another, lambda: create(page, unique("created")))
+    assert "dataset_path" not in created.url
+    assert created.json()["thresholds_source"] == "dataset_store"
+    again = report_for(of(a), lambda: row_for(page, a).click())
+    assert "dataset_path=" in again.url
+    expect(page.get_by_test_id("report-dataset-path")).to_have_value(str(path))
+
+
 def test_a_late_report_does_not_stack_under_a_newer_one(page, bench, bench_url):
     """WINDOW: a row clicked with its report request held, another row
     clicked, and the first report's answer released.

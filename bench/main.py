@@ -8181,8 +8181,9 @@ def report_tasks(
     a substitution: it resolves by the identity the row already cites,
     so there is no second dataset it could have picked. It is what keeps
     the page and curl from publishing two reports under one name, since
-    the page has no path to send and before this got the floor for every
-    experiment while a caller with the file got the exact denominator.
+    the page sends a path only for the experiment a person applied one to,
+    and before this got the floor for every other experiment while a
+    caller with the file got the exact denominator.
     A named path or digest that is not the recorded one is still refused,
     in the words every other door uses.
 

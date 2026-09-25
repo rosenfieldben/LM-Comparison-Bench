@@ -2768,9 +2768,10 @@ dataset reads exactly in the browser as it does to curl with the file;
 when the bench does not hold it, or holds a copy it cannot read, the
 report falls back to the score-row floor and the note under the banner
 says which. The path is remembered in a variable for as long as
-the tab is open and nowhere else: it is a fact about the operator's
-filesystem, not about the experiment, which is why the row records the
-file's digest instead.
+the tab is open and nowhere else, and only for the experiment it was
+applied to: it is a fact about the operator's filesystem, not about the
+experiment, which is why the row records the file's digest instead, and
+another experiment's report is asked for without it.
 
 ## Export
 

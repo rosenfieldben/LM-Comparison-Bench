@@ -514,14 +514,20 @@
     return el;
   }
 
-  // The dataset path the operator last typed, held in a variable for as
-  // long as the tab is open and nowhere else. Not in localStorage and
-  // not sent anywhere to be stored: it is a path on their own machine,
-  // which is a fact about their filesystem rather than about the
-  // experiment, and the experiment row deliberately records the file's
-  // digest instead. The same reasoning the prompt library follows for
-  // what it will and will not keep.
-  let rememberedPath = "";
+  // The dataset path the operator last applied, and the experiment it was
+  // applied for, held in a variable for as long as the tab is open and
+  // nowhere else. Not in localStorage and not sent anywhere to be stored:
+  // it is a path on their own machine, which is a fact about their
+  // filesystem rather than about the experiment, and the experiment row
+  // deliberately records the file's digest instead. The same reasoning
+  // the prompt library follows for what it will and will not keep.
+  //
+  // ONE EXPERIMENT'S, NEVER ANOTHER'S. A path names the file one
+  // experiment was read from; sent with another experiment's report it
+  // carried one experiment's input into another's request, and the
+  // server refused it as drift, so a stored experiment opened on a false
+  // "dataset changed".
+  let remembered = { id: null, path: "" };
 
   function datasetForm(experimentId, path) {
     const form = document.createElement("form");
@@ -542,15 +548,15 @@
       "stored under this experiment's digest, when it holds one; a path " +
       "reads the file from disk instead. Either way the digest is checked " +
       "against the one recorded at creation and a mismatch is refused. " +
-      "Remembered for this tab only, never stored.";
+      "Remembered for this experiment in this tab only, never stored.";
     const apply = document.createElement("button");
     apply.type = "submit";
     apply.dataset.testid = "report-dataset-apply";
     apply.textContent = "apply";
     form.addEventListener("submit", (event) => {
       event.preventDefault();
-      rememberedPath = input.value.trim();
-      show(experimentId, rememberedPath);
+      remembered = { id: experimentId, path: input.value.trim() };
+      show(experimentId, remembered.path);
     });
     form.append(label, input, apply);
     return form;
@@ -590,10 +596,16 @@
 
   async function show(experimentId, datasetPath) {
     const version = ++showVersion;
-    // Undefined means "whatever the operator last applied", which is how
-    // opening a second experiment keeps their file. An explicit empty
-    // string means they cleared it, and that has to survive.
-    const path = datasetPath === undefined ? rememberedPath : datasetPath;
+    // Undefined means "the path last applied for this experiment", which
+    // is how reopening its report keeps their file; any other experiment
+    // gets none and reads the store. An explicit empty string means they
+    // cleared it, and that has to survive.
+    const path =
+      datasetPath !== undefined
+        ? datasetPath
+        : remembered.id === experimentId
+          ? remembered.path
+          : "";
     panel.replaceChildren();
     panel.hidden = false;
     panel.dataset.state = "loading";
