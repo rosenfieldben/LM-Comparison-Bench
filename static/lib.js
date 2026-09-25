@@ -896,7 +896,7 @@
   // summary object GET /datasets/{digest} served (held), false when the
   // store answered 404 (the experiment was read from a file by path), a
   // string when the door refused the bytes it holds with a sentence (they
-  // no longer hash to their digest, or are not UTF-8; the Score door
+  // no longer hash to their digest; the Score door
   // would refuse them the same way), null while the question is out,
   // undefined when it is not known (the question failed and is asked
   // again at the next selection).

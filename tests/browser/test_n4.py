@@ -32,8 +32,10 @@ it stays busy; a pass is held open only by the stub's judge gate, which
 the `judge_gate` fixture always releases before that wait.
 """
 
+import hashlib
 import json
 import re
+import sqlite3
 from datetime import UTC as UTC_ZONE
 from datetime import datetime
 
@@ -960,57 +962,58 @@ def test_start_and_stop_answers_return_focus_only_to_the_row_still_chosen(
 
 
 def test_a_dataset_the_store_cannot_cite_is_the_doors_sentence(
-    page, bench, bench_url, scorings
+    page, bench, bench_url, bench_db, collectors, scorings
 ):
-    """WINDOW: a finished judge-task experiment selected while GET
-    /datasets/{digest} is held, the answer released as the door's 422 for
-    bytes that no longer hash to their digest, and the experiment
-    selected again.
+    """WINDOW: a finished judge-task experiment whose stored dataset row
+    is then edited by hand in the session bench's own database (to other
+    bytes that still parse), selected in the page, selected again, and
+    Score's request sent anyway.
 
-    The door's sentence is shown as it is, beside a greyed Score, and not
-    as a failure to try again: asking again gets the same answer until
-    someone repairs the row, and it does. The Score door would refuse
-    those bytes in the same words. Pre-state: the reading nudge while the
-    question is out."""
+    The detail door refuses the row in the key's words, with 12-character
+    digests, and the page shows that sentence as it is beside a greyed
+    Score, not as a failure to try again: asking again gets the same
+    answer until someone repairs the row, and it does. The greyed Score
+    is a courtesy: the Score door refuses those bytes in the same words,
+    and nothing is scored. No answer here is mocked; the row is edited as
+    a person with sqlite would. PRE-STATE: the detail door serves the row
+    before the edit."""
     a, digest = finished(page, bench_url, JUDGED)
     other, _ = finished(page, bench_url, PLAIN)
+    assert page.request.get(f"{bench_url}/datasets/{digest}").status == 200
+    forged = (
+        json.dumps(
+            {"id": "j1", "prompt": "forged", "rubric": "r", "scorer": {"kind": "judge"}}
+        )
+        + "\n"
+    ).encode()
+    with sqlite3.connect(bench_db) as db:
+        db.execute("UPDATE datasets SET content = ? WHERE digest = ?", (forged, digest))
     sentence = (
-        f"the bytes stored under digest {digest} hash to {'e' * 64}: the "
-        "datasets table was edited outside the bench, and a record citing the "
-        "first would contain the second's tasks."
+        f"the bytes stored under digest {digest[:12]} hash to "
+        f"{hashlib.sha256(forged).hexdigest()[:12]}: the datasets table was edited "
+        "outside the bench, and a record citing the first would contain the "
+        "second's tasks."
     )
     bench(["stub/fast"])
-    held = hold(page, f"**/datasets/{digest}", "GET")
     open_experiments(page)
     nudge = page.get_by_test_id("experiment-score-nudge")
     score = page.get_by_test_id("experiment-score")
-    row_for(page, a).click()
-    wait_held(page, held)
-    expect(nudge).to_have_text(
-        "Score waits: reading which scorers its dataset declares"
-    )
 
-    held.pop().fulfill(
-        status=422,
-        content_type="application/json",
-        body=json.dumps({"detail": sentence}),
-    )
+    row_for(page, a).click()
 
     expect(nudge).to_have_text("Score waits: " + sentence)
     expect(score).to_be_disabled()
     expect(score).to_have_text("Score")
-    page.unroute(f"**/datasets/{digest}")
-    page.route(
-        f"**/datasets/{digest}",
-        lambda route: route.fulfill(
-            status=422,
-            content_type="application/json",
-            body=json.dumps({"detail": sentence}),
-        ),
-    )
     row_for(page, other).click()
     row_for(page, a).click()
     expect(nudge).to_have_text("Score waits: " + sentence)
+    for body in (
+        {"dataset_digest": digest},
+        {"dataset_digest": digest, "judge_model": "stub/fast"},
+    ):
+        refused = page.request.post(f"{bench_url}/experiments/{a}/score", data=body)
+        assert (refused.status, refused.json()["detail"]) == (422, sentence)
+    assert score_series(page, bench_url, a) == []
 
 
 def test_a_lost_score_answer_reads_the_report_again(

@@ -453,7 +453,7 @@
         }
       } else if (resp.status < 500 && typeof data?.detail === "string") {
         // The door's sentence about the bytes it holds (they no longer
-        // hash to their digest, or are not UTF-8): asking again gets the
+        // hash to their digest): asking again gets the
         // same answer until someone repairs the row, so it is shown as
         // it is rather than as a question to repeat.
         summary = refusalText(data.detail, "");

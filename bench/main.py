@@ -4563,20 +4563,27 @@ def stored_dataset(digest: str) -> dict[str, Any]:
 
 
 def parsed_stored(row: dict[str, Any], digest: str) -> dict[str, Any]:
-    """A datasets row already in hand, parsed and held to its key.
+    """A datasets row already in hand, held to its key, then parsed.
 
     Split from stored_dataset so the report's store lookup, which has to
     ask whether a row exists before it knows it will parse one, reads the
     bytes once rather than twice. The checks are stored_dataset's and
     are not repeated anywhere else.
+
+    HELD TO ITS KEY BEFORE IT IS PARSED, as the detail door holds it, so
+    a row edited by hand is refused in the one sentence every door gives
+    (unkeyed_bytes), whether or not the edited bytes still parse: parsed
+    first, bytes that no longer parse were refused in the parser's words
+    here and in the key's at the detail door. parse_dataset's digest is
+    the same sha256 over the same bytes.
     """
+    actual = hashlib.sha256(row["content"]).hexdigest()
+    if actual != digest:
+        raise HTTPException(422, unkeyed_bytes(digest, actual))
     try:
-        dataset = parse_dataset(row["content"], name=row["name"])
+        return parse_dataset(row["content"], name=row["name"])
     except DatasetError as exc:
         raise HTTPException(422, str(exc)) from None
-    if dataset["digest"] != digest:
-        raise HTTPException(422, unkeyed_bytes(digest, dataset["digest"]))
-    return dataset
 
 
 def unkeyed_bytes(digest: str, actual: str) -> str:

@@ -19918,7 +19918,9 @@ def test_every_score_nudge_is_named_and_every_body_is_what_the_door_takes(
     with the pass waited out after every 202 so the next answer is not the
     busy slot's.
 
-    ONE NUDGE IS A REFUSAL AND THREE ARE NOT, and both halves are proved.
+    TWO NUDGES ARE REFUSALS AND THREE ARE NOT; this proves the unstored one
+    and the three, and the forged stored copy has its own proof
+    (test_review_repro_score_refuses_a_forged_stored_copy_by_its_key).
     The unstored digest the page greys Score for, sent anyway, is refused
     in the door's words. The three greyed although the door accepts them
     (the summary being read, the summary unknown after a failed question,
@@ -20088,3 +20090,62 @@ def test_another_scoring_pass_is_refused_in_the_doors_words(client):
         == 202
     )
     wait_scoring_done(client)
+
+
+@respx.mock
+def test_review_repro_score_refuses_a_forged_stored_copy_by_its_key(client):
+    """WINDOW: a finished judged experiment by digest, its stored row then
+    edited by hand twice (to other bytes that still parse, and to bytes
+    that do not), and for each: the detail door, the Score nudge built
+    from the detail door's answer, POST /experiments/{id}/score sent
+    anyway with and without a judge, and the report and export naming the
+    digest.
+
+    THE PAGE GREYS SCORE HERE AND THE DOOR MUST REFUSE ON ITS OWN. A
+    stored copy that no longer hashes to its digest would cite one
+    dataset and contain another; scored, its verdicts would be graded
+    against forged tasks, for good. Every door refuses it in one sentence
+    (unkeyed_bytes, with 12-character digests), the slot stays free and
+    nothing is written. Parsed before it was hashed, the unparseable
+    forgery was refused in the parser's words at Score and in the key's
+    at the detail door. PRE-STATE: before the edit the detail door
+    serves the row."""
+    judged_route()
+    digest = store_dataset(client, "to forge", *THREE_KINDS).json()["digest"]
+    eid = client.post(
+        "/experiments", json=digest_body(digest, lineup=["model/alpha"])
+    ).json()["id"]
+    assert run_by_digest(client, eid, digest)["status"] == "done"
+    assert client.get(f"/datasets/{digest}").status_code == 200
+    before = len(scores_in(client, eid))
+    parseable = dataset_text(
+        {"id": "e1", "prompt": "forged", "reference": "x", "scorer": {"kind": "exact"}}
+    ).encode()
+
+    for forged in (parseable, b"forged\n"):
+        client.app.state.db.execute(
+            "UPDATE datasets SET content = ? WHERE digest = ?", (forged, digest)
+        )
+        client.app.state.db.commit()
+        sentence = main.unkeyed_bytes(digest, hashlib.sha256(forged).hexdigest())
+        detail = client.get(f"/datasets/{digest}")
+        assert (detail.status_code, detail.json()["detail"]) == (422, sentence)
+        nudge, body = run_lib(
+            "const l = require(process.argv[1]);"
+            "process.stdout.write(JSON.stringify(["
+            " l.scoreNudge(INPUT.summary, '', 'loaded'),"
+            " l.scoreBody(INPUT.digest, INPUT.summary, 'judge/one')]));",
+            {"summary": detail.json()["detail"], "digest": digest},
+        )
+        assert nudge == sentence
+        for sent in (body, {**body, "judge_model": "judge/one"}):
+            resp = client.post(f"/experiments/{eid}/score", json=sent)
+            assert (resp.status_code, resp.json()["detail"]) == (422, sentence)
+            assert client.app.state.scoring_run["active"] is None
+        assert len(scores_in(client, eid)) == before
+        for url in (
+            f"/experiments/{eid}/report?dataset_digest={digest}",
+            f"/experiments/{eid}/export.jsonl?dataset_digest={digest}",
+        ):
+            resp = client.get(url)
+            assert (resp.status_code, resp.json()["detail"]) == (422, sentence), url
