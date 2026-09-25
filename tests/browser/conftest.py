@@ -274,7 +274,62 @@ def snapshot_root(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root):
+def listing_root(tmp_path_factory):
+    """The trees the member listing is proved over (Phase O), under a
+    SECOND allowlist entry of the snapshot bench.
+
+    Kept apart from snapshot_root on purpose: a socket, a pipe or a link
+    out of the root refuses every snapshot of the tree it sits in,
+    whatever the patterns, so one placed there would refuse every Compose
+    the Phase L tests make. Each subtree here is a root of its own.
+    """
+    root = tmp_path_factory.mktemp("listing-clones")
+    files = {
+        # Selected, excluded (a secret and a dependency tree), and a file
+        # over the member bound, which refuses.
+        "mixed/src/a.py": b"A = 1\n",
+        "mixed/src/b.py": b"B = 2\n",
+        "mixed/README.md": b"readme\n",
+        "mixed/.env": b"KEY=secret\n",
+        "mixed/node_modules/x/index.js": b"x\n",
+        "mixed/big.txt": b"x" * 250_000,
+        # Names a pattern equal to the path would get wrong: a leading
+        # space the panel's trim would strip onto a sibling, and a
+        # bracket fnmatch reads as a class that matches the sibling.
+        "odd/ a.py": b"LEADING\n",
+        "odd/a.py": b"PLAIN\n",
+        "odd/[x].py": b"BRACKET\n",
+        "odd/x.py": b"X\n",
+        # A name no pattern the panel can send spells exactly.
+        "odd/back\\slash.py": b"BACKSLASH\n",
+        # One more file than a request may carry patterns.
+        **{f"many/f{n:02d}.py": f"F{n} = {n}\n".encode() for n in range(21)},
+        # A tree a pipe refuses whatever the patterns select.
+        "refusing/a.py": b"a\n",
+        # A tree with a link out of the root, whose refusal names an
+        # absolute path, and a tree whose walk stops at a directory the
+        # bench cannot open.
+        "linked/a.py": b"a\n",
+        "stopped/a.py": b"a\n",
+        "stopped/locked/b.py": b"b\n",
+    }
+    for name, body in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    os.mkfifo(root / "refusing" / "pipe")
+    elsewhere = tmp_path_factory.mktemp("listing-elsewhere")
+    (root / "linked" / "out").symlink_to(elsewhere)
+    locked = root / "stopped" / "locked"
+    locked.chmod(0)
+    yield root
+    # Given back, or pytest cannot remove the tree afterwards and every
+    # later run warns while it fails to.
+    locked.chmod(0o755)
+
+
+@pytest.fixture(scope="session")
+def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root, listing_root):
     """A third bench, the only one with BENCH_REPO_ROOTS set.
 
     Its own process for the reason the zdr bench has one: the allowlist
@@ -282,9 +337,8 @@ def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root):
     on" are two servers rather than two requests, and the default bench
     stays the one that proves the off state.
     """
-    with boot_bench(
-        stub_url, tmp_path_factory, {"BENCH_REPO_ROOTS": str(snapshot_root)}
-    ) as url:
+    roots = os.pathsep.join([str(snapshot_root), str(listing_root)])
+    with boot_bench(stub_url, tmp_path_factory, {"BENCH_REPO_ROOTS": roots}) as url:
         yield url
 
 

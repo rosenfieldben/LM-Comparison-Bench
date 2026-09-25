@@ -979,6 +979,154 @@
     return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
   }
 
+  // ---- The member listing (Phase O): what a snapshot would select,
+  // ---- and patterns written from the rows a person checks.
+
+  // Mirrors of the snapshot's bounds, the server's numbers: a test
+  // executes this file and asserts each equals the constant it names.
+  const SNAPSHOT_LIMITS = {
+    maxPatterns: 20, // bench.snapshot.MAX_PATTERNS
+    maxComposedChars: 200000, // bench.extract.MAX_COMPOSED_CHARS
+  };
+
+  // The characters a pattern must not begin or end with, because one
+  // side or the other strips them. The panel trims each line it sends
+  // with String.prototype.trim, which removes JavaScript's whitespace
+  // (U+FEFF among it), and the server refuses a pattern that str.strip
+  // would change, which removes Python's (U+001C to U+001F and U+0085
+  // among it). The union, written out as a character class; a test holds
+  // it equal to the two sets over every code point. Either set alone
+  // lets a checked " a.py" be sent as "a.py" and compose a sibling.
+  const PATTERN_TRIMMED = "\\s\\x1c-\\x1f\\x85";
+  const TRIMMED = new RegExp("^[" + PATTERN_TRIMMED + "]$", "u");
+
+  // A pattern that selects exactly one listed file, or null when no
+  // pattern the panel can send could.
+  //
+  // THE PATH ITSELF WHEN IT HOLDS NOTHING THE MATCHER READS AS A GLOB,
+  // and the commission's "a pattern equal to its path" is then literal.
+  // The server matches each segment with fnmatch, so '*', '?' and '['
+  // are written as the one-character classes [*], [?] and [[], which
+  // match only themselves; and a first or last character either side
+  // would strip is written as its own class, which neither strips. A
+  // path holding a backslash (the server refuses one in any pattern) or
+  // a line break (the box is split into lines, and the browser turns a
+  // carriage return into one) has no exact pattern, and null says so.
+  function patternFor(path) {
+    if (/[\\\r\n]/.test(path)) return null;
+    const chars = Array.from(path);
+    return chars
+      .map((ch, i) => {
+        if (ch === "*" || ch === "?" || ch === "[") return "[" + ch + "]";
+        const end = i === 0 || i === chars.length - 1;
+        return end && TRIMMED.test(ch) ? "[" + ch + "]" : ch;
+      })
+      .join("");
+  }
+
+  // The sentence for more include patterns than a request may carry,
+  // naming the constant and its value, or null within it. Said by the
+  // page before it sends, since the server's own refusal of a longer
+  // list is the request model's, which names neither.
+  function tooManyPatterns(count) {
+    if (count <= SNAPSHOT_LIMITS.maxPatterns) return null;
+    return (
+      count +
+      " include patterns, over the " +
+      SNAPSHOT_LIMITS.maxPatterns +
+      " pattern limit (MAX_PATTERNS). A selection that needs more is one " +
+      "a glob can say, such as 'src/**/*.py'."
+    );
+  }
+
+  // The same limit, met by checking rows: one pattern per checked file.
+  function tooManyChecked(count) {
+    if (count <= SNAPSHOT_LIMITS.maxPatterns) return null;
+    return (
+      count +
+      " files checked, over the " +
+      SNAPSHOT_LIMITS.maxPatterns +
+      " pattern limit (MAX_PATTERNS): one pattern per checked file cannot " +
+      "name that many. The last check was undone; write a glob that " +
+      "covers them instead."
+    );
+  }
+
+  // The refused row no choice of patterns can clear, or null: the row a
+  // stopped walk ends on (the entry ceiling, a name it cannot spell, a
+  // tree that changed), or else the first refused row that is not a file
+  // (a link out of the root, a socket or pipe, a directory too deep),
+  // which the walk refuses whatever the patterns select. Looked for among
+  // ALL the rows and not only at the first refusal: the first may be one
+  // narrowing clears (a file over the bound) while a later one never is.
+  function unfixableRow(listing) {
+    if (!listing.complete) return listing.members[listing.members.length - 1];
+    return (
+      listing.members.find(
+        (m) => m.status === "refused" && m.kind !== "file",
+      ) || null
+    );
+  }
+
+  // The listing's line, from its facts and its own sentences.
+  function listingSummary(listing) {
+    const max = SNAPSHOT_LIMITS.maxComposedChars;
+    if (!listing.would_compose) {
+      const stuck = unfixableRow(listing);
+      let clause = "";
+      if (stuck !== null && stuck.reason === listing.refusal) {
+        clause =
+          " No choice of patterns changes this: it is the tree or the root " +
+          "that has to change.";
+      } else if (stuck !== null) {
+        clause =
+          " And past that, " +
+          (stuck.path === "" ? "the snapshot root" : stuck.path) +
+          " is refused whatever the patterns select (see its row), so no " +
+          "choice of patterns makes this tree compose.";
+      }
+      return "Compose would refuse: " + listing.refusal + clause;
+    }
+    const count = listing.members.filter((m) => m.status === "selected").length;
+    const bound = listing.composed_chars_at_most;
+    const chars =
+      bound <= max
+        ? "at most " +
+          bound +
+          " characters composed, at or under the " +
+          max +
+          " character ceiling"
+        : "up to " +
+          bound +
+          " characters composed, over the " +
+          max +
+          " character ceiling: text of one byte per character this long " +
+          "is refused, and multibyte text may fit";
+    return (
+      "Compose would read " +
+      count +
+      (count === 1 ? " file, " : " files, ") +
+      listing.selected_bytes +
+      " bytes, " +
+      chars +
+      ". File contents are checked only when it composes: images, NUL " +
+      "bytes and UTF-8."
+    );
+  }
+
+  // The line once checked rows have written the patterns.
+  function checkedSummary(count, bytes) {
+    return (
+      count +
+      (count === 1 ? " file" : " files") +
+      " checked, " +
+      bytes +
+      " bytes: the patterns now name exactly " +
+      (count === 1 ? "it" : "these") +
+      ". List again to see what Compose makes of them."
+    );
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -1026,6 +1174,14 @@
     scoreBody,
     scoreNudge,
     scoreLabel,
+    SNAPSHOT_LIMITS,
+    PATTERN_TRIMMED,
+    patternFor,
+    tooManyPatterns,
+    tooManyChecked,
+    unfixableRow,
+    listingSummary,
+    checkedSummary,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;

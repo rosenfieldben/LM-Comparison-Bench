@@ -96,22 +96,6 @@ a23b257).
 - **First written:** commit 661df53 ("IT FETCHES NOTHING");
   docs/phases/phase-n-prompt.md, "Non-goals".
 
-### Member listing
-
-- **What:** a dry run of the snapshot composer. Same root, same include
-  patterns, same ceilings; it returns the paths and sizes it would have
-  composed and the refusals it would have raised, without composing. It
-  is a snapshot-side endpoint that does not need the clone door, and it
-  is useful on a local clone today.
-- **Deferred by:** Phase L, which ruled that a snapshot's ceiling is the
-  one a set of attachments has.
-- **Reason:** under that ceiling a real repository refuses often, so a
-  selection has to be made from fact before it is composed.
-- **First written:** the ruling and its select-from-fact reason are in
-  the README, "A repository snapshot" ("The ceiling is the same one a set
-  of attachments has"), commit f239cac. The member listing itself was not
-  written in the repository before this file.
-
 ## Composed-size checks in native mode
 
 - **What:** the per-task composed-size and context-window refusals that

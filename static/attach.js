@@ -24,7 +24,18 @@
 // is what makes reuse and replay able to name a document at all, and it
 // is the reason the note under this control says where the file went.
 (function () {
-  const { fmtBytes, shortDigest, approxTokens, refusalText } = window.BenchLib;
+  const {
+    fmtBytes,
+    shortDigest,
+    approxTokens,
+    refusalText,
+    patternFor,
+    tooManyPatterns,
+    tooManyChecked,
+    listingSummary,
+    checkedSummary,
+    unfixableRow,
+  } = window.BenchLib;
 
   const rowEl = document.getElementById("attach-row");
   const listEl = document.getElementById("attachments");
@@ -38,6 +49,27 @@
   const snapPatternsEl = document.getElementById("snapshot-patterns");
   const snapComposeEl = document.getElementById("snapshot-compose");
   const snapMsgEl = document.getElementById("snapshot-msg");
+  const snapListEl = document.getElementById("snapshot-list");
+  const snapListingEl = document.getElementById("snapshot-listing");
+  const snapSummaryEl = document.getElementById("snapshot-listing-summary");
+  const snapRowsEl = document.getElementById("snapshot-member-rows");
+
+  // The member listing the table shows, or null: the patterns text it
+  // was made with, the text the panel last wrote into the patterns box,
+  // the listing itself, and one entry per row a person can check (the
+  // pattern that names exactly its file, its listed bytes, and its
+  // checkbox).
+  let listed = null;
+  // Moved by every List press and by every forget (another root typed,
+  // a composed snapshot, a reuse, a clear, the blind view), so an answer
+  // that lands after either is dropped. Typing another root moves no
+  // epoch at all, and a listing still in flight for the old root must
+  // not draw its rows under the new one.
+  let listToken = 0;
+  // Listings in flight. Their own count and never inFlight, which is
+  // the attachment count's: a listing is not a document, and counting it
+  // there would block Run and use a slot.
+  let listsInFlight = 0;
 
   // Mirrors MAX_ATTACHMENTS in bench/main.py. A client-side cap is a
   // convenience over the server's and never an authority: the refusal
@@ -727,13 +759,39 @@
   function forgetSnapshot() {
     snapRootEl.value = "";
     snapPatternsEl.value = "";
+    // The message line too, which sits outside the panel: a refusal can
+    // carry an absolute path (a root outside the allowlist, a link's
+    // target), and the blind view's rule is that it shows none.
+    said("");
+    forgetListing();
     closeSnapshotPanel();
+    // The answer is gone, so the standing reason (snapshots off, the
+    // document bound, a catalog not yet answered) is shown again: none of
+    // those carries a path, and a disabled + Snapshot with no reason on
+    // the page is a reason no keyboard user reads.
+    renderSnapshotControl();
+  }
+
+  // Empty the member table and its line. Every row is a path in
+  // somebody's repository, so the table goes wherever the root goes.
+  function clearListing() {
+    listed = null;
+    snapRowsEl.replaceChildren();
+    snapSummaryEl.textContent = "";
+    snapListingEl.hidden = true;
+  }
+
+  // Clear it and drop any listing still in flight.
+  function forgetListing() {
+    listToken += 1;
+    clearListing();
   }
 
   // A message this control produced in ANSWER to something the person
-  // did, as opposed to one it is merely restating. Set by every path in
-  // composeSnapshot, cleared when a snapshot lands or the staged set is
-  // replaced.
+  // did, as opposed to one it is merely restating. Set by composeSnapshot
+  // and listSnapshot on every path that is not a success, and by a check
+  // the panel undoes; cleared when a snapshot lands, a listing lands, a
+  // check writes the patterns, and whenever the panel forgets its root.
   function said(text) {
     snapMsgEl.textContent = text;
     snapMsgEl.dataset.said = text === "" ? "" : "1";
@@ -742,7 +800,10 @@
   function renderSnapshotControl() {
     const blocker = snapshotBlocker();
     snapOpenEl.disabled = blocker !== "";
-    snapComposeEl.disabled = blocker !== "" || busy();
+    // Each waits for the other, so an answer never lands on a panel the
+    // other has just changed.
+    snapComposeEl.disabled = blocker !== "" || busy() || listsInFlight > 0;
+    snapListEl.disabled = blocker !== "" || busy() || listsInFlight > 0;
     if (blocker !== "") closeSnapshotPanel();
     // AN ANSWER OUTRANKS A RESTATEMENT. render() runs on every staging
     // change, so without this rule the specific thing a person just
@@ -759,31 +820,48 @@
     snapMsgEl.textContent = blocker;
   }
 
-  async function composeSnapshot() {
-    const root = snapRootEl.value.trim();
-    // ONE PER LINE, NEVER SPLIT ON COMMAS: the fourteenth review's
-    // medium. The server accepts a comma literally in a pattern and
-    // inside a character class, so "a,b.py" is one pattern naming one
-    // file, and a comma split sent "a" and "b.py" and could have
-    // selected two different files from what was typed. A newline can
-    // never be part of a pattern, so it is the one safe separator.
-    const patterns = snapPatternsEl.value
+  // The include patterns as the box holds them.
+  //
+  // ONE PER LINE, NEVER SPLIT ON COMMAS: the fourteenth review's
+  // medium. The server accepts a comma literally in a pattern and
+  // inside a character class, so "a,b.py" is one pattern naming one
+  // file, and a comma split sent "a" and "b.py" and could have
+  // selected two different files from what was typed. A newline can
+  // never be part of a pattern, so it is the one safe separator.
+  function typedPatterns() {
+    return snapPatternsEl.value
       .split("\n")
       .map((pattern) => pattern.trim())
       .filter((pattern) => pattern !== "");
+  }
+
+  // Why the panel cannot send its inputs yet, or "" when it can. Blank
+  // is not sent, and a list longer than a request may carry is said
+  // with the constant's name rather than sent for the request model to
+  // refuse in words that name neither.
+  function inputsBlocker(root, patterns) {
     if (root === "") {
-      said(
+      return (
         "Name the clone root to walk: an absolute path under one of the " +
-          "server's BENCH_REPO_ROOTS entries.",
+        "server's BENCH_REPO_ROOTS entries."
       );
-      return;
     }
     if (patterns.length === 0) {
-      said(
+      return (
         "Name at least one include pattern. Patterns are repo-relative " +
-          "and do not recurse unless they say so, so '*.py' is the top " +
-          "level and '**/*.py' is every depth.",
+        "and do not recurse unless they say so, so '*.py' is the top " +
+        "level and '**/*.py' is every depth."
       );
+    }
+    return tooManyPatterns(patterns.length) || "";
+  }
+
+  async function composeSnapshot() {
+    const root = snapRootEl.value.trim();
+    const patterns = typedPatterns();
+    const blocked = inputsBlocker(root, patterns);
+    if (blocked !== "") {
+      said(blocked);
       return;
     }
     // Both epochs, the same discipline addFiles follows: a snapshot that
@@ -866,6 +944,171 @@
     }
   }
 
+  // POST /snapshots/listing with the body Compose would send, and the
+  // answer as a table. The listing composes nothing and stores nothing;
+  // its sentences are the server's, word for word.
+  async function listSnapshot() {
+    const root = snapRootEl.value.trim();
+    const patterns = typedPatterns();
+    const blocked = inputsBlocker(root, patterns);
+    if (blocked !== "") {
+      said(blocked);
+      return;
+    }
+    listToken += 1;
+    const token = listToken;
+    const epoch = window.BenchState.viewEpoch;
+    const staging = stagingEpoch;
+    const text = snapPatternsEl.value;
+    listsInFlight += 1;
+    renderSnapshotControl();
+    try {
+      const resp = await fetch("/snapshots/listing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root: root, patterns: patterns }),
+      });
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (err) {
+        body = null;
+      }
+      if (token !== listToken || stale(epoch, staging)) return;
+      if (!resp.ok) {
+        clearListing();
+        said(
+          body
+            ? refusalText(
+                body.detail,
+                "the listing was refused and the reason could not be read",
+              )
+            : "the listing was refused (HTTP " + resp.status + ")",
+        );
+        return;
+      }
+      if (body === null || !Array.isArray(body.members)) {
+        clearListing();
+        said(
+          "the bench answered " +
+            resp.status +
+            " with a listing this page could not read.",
+        );
+        return;
+      }
+      said("");
+      showListing(text, body);
+    } catch (err) {
+      if (token !== listToken || stale(epoch, staging)) return;
+      said("the listing request could not be sent: " + err.message);
+    } finally {
+      listsInFlight -= 1;
+      renderSnapshotControl();
+    }
+  }
+
+  function cell(text, name) {
+    const td = document.createElement("td");
+    td.className = name;
+    td.dataset.testid = name;
+    // textContent: every path and sentence here is somebody's repository
+    // or the server's words about it, and neither is markup.
+    td.textContent = text;
+    return td;
+  }
+
+  function showListing(text, listing) {
+    clearListing();
+    const narrowable = unfixableRow(listing) === null;
+    listed = { text, written: text, listing, rows: [] };
+    for (const member of listing.members) {
+      const tr = document.createElement("tr");
+      tr.className = "member-" + member.status;
+      tr.dataset.testid = "snapshot-member";
+      tr.dataset.status = member.status;
+      const use = cell("", "member-use");
+      // A row can be checked only when checking it can help: a selected
+      // file whose path a pattern can name exactly, in a listing no
+      // refusal outside the patterns' reach holds (a walk that stopped,
+      // a link out of the root, a pipe, a directory too deep), since no
+      // narrowing makes that listing compose.
+      if (member.status === "selected" && narrowable) {
+        const pattern = patternFor(member.path);
+        if (pattern === null) {
+          use.textContent = "no exact pattern";
+          use.title =
+            "This name holds a backslash or a line break, which no pattern " +
+            "the panel can send spells exactly; a glob can still select it.";
+        } else {
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.dataset.testid = "snapshot-member-use";
+          // In quotes: an accessible name has its whitespace collapsed,
+          // so " a.py" and "a.py" would be read out as the same file.
+          box.setAttribute("aria-label", JSON.stringify(member.path));
+          box.addEventListener("change", () => narrow(box));
+          use.append(box);
+          listed.rows.push({ pattern, bytes: member.bytes, box });
+        }
+      }
+      tr.append(
+        use,
+        cell(
+          member.path === "" ? "(the snapshot root)" : member.path,
+          "member-path",
+        ),
+        cell(member.bytes === null ? "" : String(member.bytes), "member-bytes"),
+        cell(member.status, "member-status"),
+        cell(member.reason || "", "member-reason"),
+      );
+      snapRowsEl.append(tr);
+    }
+    snapSummaryEl.textContent = listingSummary(listing);
+    snapListingEl.hidden = false;
+  }
+
+  // Checked rows write the patterns: one per checked file, in the
+  // table's order, each naming exactly that file. None checked puts
+  // back the patterns the listing was made with.
+  function narrow(box) {
+    if (listed === null) return;
+    // HAND EDITS ARE NOT OVERWRITTEN. A box that no longer holds what the
+    // panel last wrote has been edited, and the listing no longer
+    // describes it, so the check is undone and the person is told.
+    if (snapPatternsEl.value !== listed.written) {
+      box.checked = !box.checked;
+      said(
+        "The patterns were edited after this listing, so it no longer " +
+          "describes them. List again to narrow from them.",
+      );
+      return;
+    }
+    const checked = listed.rows.filter((row) => row.box.checked);
+    // PAST THE LIMIT THE CHECK IS UNDONE, so the checked rows and the box
+    // always agree: a box left holding the first twenty while a
+    // twenty-first stood checked would compose a selection nobody made.
+    const over = tooManyChecked(checked.length);
+    if (over !== null) {
+      box.checked = false;
+      said(over);
+      return;
+    }
+    const text =
+      checked.length === 0
+        ? listed.text
+        : checked.map((row) => row.pattern).join("\n");
+    snapPatternsEl.value = text;
+    listed.written = text;
+    said("");
+    snapSummaryEl.textContent =
+      checked.length === 0
+        ? listingSummary(listed.listing)
+        : checkedSummary(
+            checked.length,
+            checked.reduce((sum, row) => sum + row.bytes, 0),
+          );
+  }
+
   function init() {
     inputEl.addEventListener("change", async () => {
       // COPIED, and the copy is the whole point rather than a style
@@ -892,6 +1135,17 @@
     });
     snapComposeEl.addEventListener("click", () => {
       void composeSnapshot();
+    });
+    snapListEl.addEventListener("click", () => {
+      void listSnapshot();
+    });
+    // A listing describes one root: typing another empties the table,
+    // rather than leave checkboxes that would write one tree's paths as
+    // patterns for another. Always, and not only when a table is shown:
+    // a listing still in flight for the old root must be dropped too,
+    // and nothing else moves its token.
+    snapRootEl.addEventListener("input", () => {
+      forgetListing();
     });
     render();
   }

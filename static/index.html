@@ -98,8 +98,35 @@
       <textarea id="snapshot-patterns" data-testid="snapshot-patterns" rows="2"
                 aria-label="Include patterns, one per line"
                 placeholder="Include patterns, one per line: bench/**/*.py then README.md"></textarea>
+      <!-- List before Compose: the same body to POST /snapshots/listing,
+           which answers what Compose would select, exclude and refuse
+           without reading a file. -->
+      <button id="snapshot-list" data-testid="snapshot-list"
+              type="button">List members</button>
       <button id="snapshot-compose" data-testid="snapshot-compose"
               type="button">Compose snapshot</button>
+      <!-- After Compose in document order, so a keyboard reaches Compose
+           without passing every row. Inside the panel, so closing the
+           panel hides it; emptied whenever the panel forgets its inputs,
+           since every row is a path in somebody's repository. -->
+      <div id="snapshot-listing" data-testid="snapshot-listing" hidden>
+        <div id="snapshot-listing-summary" data-testid="snapshot-listing-summary"
+             role="status"></div>
+        <table id="snapshot-members" data-testid="snapshot-members">
+          <caption>What Compose would select, exclude and refuse, by path.
+            Check files to make the patterns name exactly them.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Use</th>
+              <th scope="col">Path</th>
+              <th scope="col">Bytes</th>
+              <th scope="col">Status</th>
+              <th scope="col">Reason</th>
+            </tr>
+          </thead>
+          <tbody id="snapshot-member-rows" data-testid="snapshot-member-rows"></tbody>
+        </table>
+      </div>
     </div>
     <!-- Outside the panel on purpose. When BENCH_REPO_ROOTS is unset the
          panel never opens, and the server's own sentence has to be

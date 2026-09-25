@@ -6,6 +6,13 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const {
+  SNAPSHOT_LIMITS,
+  patternFor,
+  tooManyPatterns,
+  tooManyChecked,
+  unfixableRow,
+  listingSummary,
+  checkedSummary,
   shortName,
   fmtCost,
   fmtBilled,
@@ -1193,4 +1200,135 @@ test("scoreNudge follows the catalog and shows the door's sentence as given", ()
   assert.deepStrictEqual(scoreBody("d", refused, "stub/j"), {
     dataset_digest: "d",
   });
+});
+
+// ---- The member listing (Phase O).
+
+test("patternFor is the path itself unless the matcher or a trim would misread it", () => {
+  assert.strictEqual(patternFor("src/main.py"), "src/main.py");
+  assert.strictEqual(patternFor("a..b.py"), "a..b.py");
+  assert.strictEqual(patternFor("a[1].py"), "a[[]1].py");
+  assert.strictEqual(patternFor("src/**/x?"), "src/[*][*]/x[?]");
+  assert.strictEqual(patternFor(" a.py"), "[ ]a.py");
+  assert.strictEqual(patternFor("a.py\t"), "a.py[\t]");
+  assert.strictEqual(patternFor("\ufeffa.py"), "[\ufeff]a.py");
+  assert.strictEqual(patternFor("\u0085a.py"), "[\u0085]a.py");
+  // A space inside a name is left alone: only the ends are trimmed.
+  assert.strictEqual(patternFor("my file.py"), "my file.py");
+  for (const path of ["a\\b.py", "a\nb.py", "a\rb.py"]) {
+    assert.strictEqual(patternFor(path), null, JSON.stringify(path));
+  }
+});
+
+test("more patterns than a request may carry name the constant", () => {
+  const max = SNAPSHOT_LIMITS.maxPatterns;
+  assert.strictEqual(tooManyPatterns(max), null);
+  assert.strictEqual(
+    tooManyPatterns(max + 1),
+    `${max + 1} include patterns, over the ${max} pattern limit (MAX_PATTERNS). ` +
+      "A selection that needs more is one a glob can say, such as 'src/**/*.py'.",
+  );
+  assert.strictEqual(tooManyChecked(max), null);
+  assert.match(
+    tooManyChecked(max + 1),
+    /over the 20 pattern limit \(MAX_PATTERNS\)/,
+  );
+});
+
+test("a listing's line says what Compose would do, in the listing's own words", () => {
+  const row = (path, status, reason = null, kind = "file") => ({
+    path,
+    bytes: status === "selected" ? 10 : null,
+    kind,
+    status,
+    reason,
+  });
+  const composes = {
+    members: [row("a.py", "selected"), row("b.py", "selected")],
+    selected_bytes: 20,
+    would_compose: true,
+    refusal: null,
+    complete: true,
+    composed_chars_at_most: 700,
+  };
+  assert.strictEqual(
+    listingSummary(composes),
+    "Compose would read 2 files, 20 bytes, at most 700 characters composed, " +
+      "at or under the 200000 character ceiling. File contents are checked " +
+      "only when it composes: images, NUL bytes and UTF-8.",
+  );
+  // At the ceiling exactly, which compose's '>' does not refuse.
+  assert.match(
+    listingSummary({ ...composes, composed_chars_at_most: 200000 }),
+    /at most 200000 characters composed, at or under the 200000/,
+  );
+  assert.match(
+    listingSummary({ ...composes, composed_chars_at_most: 250000 }),
+    /up to 250000 characters composed, over the 200000 character ceiling/,
+  );
+  // Refusals narrowing CAN clear get no clause: a file over the bound,
+  // and the two refusals with no row at all.
+  const tooBig = "big.py is 250000 bytes, over the 200000 limit";
+  const refuses = (members, refusal) => ({
+    ...composes,
+    members,
+    would_compose: false,
+    refusal,
+  });
+  for (const listing of [
+    refuses([row("big.py", "refused", tooBig)], tooBig),
+    refuses([], "no file under the root matched '*.md'. Patterns are ..."),
+    refuses([row("a.py", "selected")], "the selection passed 800000 bytes"),
+  ]) {
+    assert.strictEqual(unfixableRow(listing), null, listing.refusal);
+    assert.strictEqual(
+      listingSummary(listing),
+      "Compose would refuse: " + listing.refusal,
+    );
+  }
+  // A refusal no pattern clears, when it is the first.
+  const pipe = "pipe is not a regular file";
+  const stuck = refuses([row("pipe", "refused", pipe, "other")], pipe);
+  assert.strictEqual(unfixableRow(stuck).path, "pipe");
+  assert.strictEqual(
+    listingSummary(stuck),
+    "Compose would refuse: " +
+      pipe +
+      " No choice of patterns changes this: it is the tree or the root " +
+      "that has to change.",
+  );
+  // And when a clearable refusal comes first, the later one is named.
+  const both = refuses(
+    [row("big.py", "refused", tooBig), row("pipe", "refused", pipe, "other")],
+    tooBig,
+  );
+  assert.strictEqual(
+    listingSummary(both),
+    "Compose would refuse: " +
+      tooBig +
+      " And past that, pipe is refused whatever the patterns select (see " +
+      "its row), so no choice of patterns makes this tree compose.",
+  );
+  // A walk that stopped ends on its stopping row, whatever came first.
+  const ceiling = "the walk passed 20000 directory entries";
+  const stopped = {
+    ...refuses(
+      [
+        row("big.py", "refused", tooBig),
+        row("", "refused", ceiling, "directory"),
+      ],
+      tooBig,
+    ),
+    complete: false,
+  };
+  assert.strictEqual(unfixableRow(stopped).reason, ceiling);
+  assert.match(
+    listingSummary(stopped),
+    /past that, the snapshot root is refused/,
+  );
+  assert.strictEqual(
+    checkedSummary(1, 6),
+    "1 file checked, 6 bytes: the patterns now name exactly it. List again " +
+      "to see what Compose makes of them.",
+  );
 });

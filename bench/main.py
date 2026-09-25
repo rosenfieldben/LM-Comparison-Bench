@@ -722,6 +722,65 @@ class SnapshotCreate(BaseModel):
     patterns: list[str] = Field(min_length=1, max_length=snapshot.MAX_PATTERNS)
 
 
+class SnapshotListingMember(BaseModel):
+    """One row of a member listing: an entry the walk has something to say
+    about, and what.
+
+    `bytes` is the listed size of a file and null for anything else,
+    including an EXCLUDED file: the listing does not report the size of
+    what it will not read, which for the secrets group would say how long
+    a key is. `path` is repo-relative and "" for the root itself, which a
+    refusal about the traversal can stop at. `reason` is null for a
+    selected file, and otherwise the sentence: the exclusion that applied,
+    naming its group; for a link inside the root that a pattern matched,
+    why it is not followed and what it names; or the composer's own
+    refusal, word for word.
+    """
+
+    path: str
+    bytes: int | None
+    kind: Literal["file", "directory", "symlink", "other"]
+    status: Literal["selected", "excluded", "refused"]
+    reason: str | None
+
+
+class SnapshotListing(BaseModel):
+    """What POST /snapshots would select and refuse on the same body.
+
+    `would_compose` is true exactly when the composer's walk would reach
+    composition on the facts the tree shows, and `refusal` is the
+    sentence the composer would raise first when it would not. `counted`
+    is the directory entries the walk counted against its ceiling
+    (MAX_WALKED_ENTRIES, excluded entries included and the contents of
+    excluded directories not); past the ceiling means the listing
+    stopped there. `complete` is false when a refusal about the
+    traversal itself stopped it, as it stops the composer, and that
+    refusal is then the last row whatever its path; the other rows are
+    sorted by path. `selected_bytes` is the selection's listed size.
+
+    WHAT IT CANNOT SEE, AND SAYS SO. `text_checked` is always false:
+    whether a file is an image or holds a NUL byte, and whether it is
+    UTF-8, are properties of the bytes, and the composed-character ceiling
+    is a count of decoded characters, so each stays a refusal only Compose
+    can make.
+    `composed_chars_at_most` bounds the last from the sizes: at or under
+    the ceiling it cannot refuse; over it, text of one byte per character
+    is refused and multibyte text may fit. A file the process cannot
+    open, or one that changes between the listing and the composition,
+    is refused only by Compose, which opens and reads what the listing
+    only looked at.
+    """
+
+    members: list[SnapshotListingMember]
+    counted: int
+    selected_bytes: int
+    would_compose: bool
+    refusal: str | None
+    complete: bool
+    text_checked: bool
+    composed_chars_at_most: int | None
+
+
 class AttachmentRef(BaseModel):
     """A document a comparison declared, as the history views describe it.
 
@@ -7124,10 +7183,15 @@ def enforce_snapshot_root(
             "repository was cloned into.",
         )
     if not any(snapshot.contained(real, allowed) for allowed in roots):
+        # Each path spelled as a response can carry it: a root resolved
+        # through a link to a name UTF-8 cannot spell, or an allowlist
+        # entry read from such an environment, would otherwise put a raw
+        # surrogate in the refusal and the refusal would be a 500.
+        allowed_roots = ", ".join(snapshot.printable(r) for r in roots)
         raise HTTPException(
             403,
-            f"{named!r} resolves to {real}, which is not under any entry "
-            f"of BENCH_REPO_ROOTS ({', '.join(roots)}). A snapshot "
+            f"{named!r} resolves to {snapshot.printable(real)}, which is not "
+            f"under any entry of BENCH_REPO_ROOTS ({allowed_roots}). A snapshot "
             "composes a tree's files into a prompt sent to a provider, "
             "so which trees may be walked is an explicit allowlist "
             "rather than whatever path a request names.",
@@ -7486,6 +7550,48 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
         excludes=list(manifest["excludes"]),
     )
     return _attachment_detail(stored, capture=recorded)
+
+
+@app.post("/snapshots/listing", response_model=SnapshotListing, status_code=200)
+async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
+    """What POST /snapshots would select and refuse on this body, composing
+    nothing, storing nothing and reading no file.
+
+    THE SAME DOOR IN FRONT OF THE SAME WALK. The body is SnapshotCreate,
+    the root goes through enforce_snapshot_root with the same allowlist
+    and the same refusals, and the tree is the same DescriptorTree. The
+    walk is the composer's own traversal (snapshot.Survey), iterated
+    without a reader: directories are opened and listed and link
+    targets resolved, as the composer does, and no member is opened or
+    read. So the listing and the composer agree by construction about
+    what is selected, excluded and refused; the tests hold the rewrite
+    to walk as it stood before it, and hold the two doors to each other.
+
+    A REFUSAL OF THE REQUEST IS AN HTTP ERROR, THE SAME AT BOTH DOORS: no
+    allowlist (403), a root outside it (403) or not a directory (422), a
+    malformed pattern (422) and more than MAX_PATTERNS of them (422, from
+    the model). A refusal about the tree is a fact the listing reports
+    in a 200: would_compose false, with the composer's sentence.
+
+    NO RECORD. A listing is a look, not a capture: nothing is written,
+    and the head and dirty flag are not read, since no capture is made.
+
+    SYNCHRONOUS ON THE EVENT LOOP, bounded rather than offloaded, for the
+    reason create_snapshot gives; it does strictly less, never opening a
+    member. It does go on past a refusal about one entry, where the
+    composer stops, so it resolves every symbolic link the walk reaches
+    rather than stopping at the first that leaves the root. At the entry
+    ceiling that is at most MAX_WALKED_ENTRIES resolutions.
+    """
+    root = enforce_snapshot_root(
+        body.root, app.state.repo_roots, resolve=_resolved_directory
+    )
+    try:
+        return snapshot.list_members(tree=DescriptorTree(root), patterns=body.patterns)
+    except snapshot.SnapshotError as exc:
+        # Only a malformed pattern reaches here: every refusal about the
+        # tree is reported in the listing rather than raised.
+        raise HTTPException(422, str(exc)) from None
 
 
 @app.get("/attachments", response_model=AttachmentList)

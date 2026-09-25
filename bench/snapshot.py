@@ -44,7 +44,8 @@ changes under the walk is refused, not read.
 import fnmatch
 import hashlib
 import os.path
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Generator, Iterable, Iterator, Sequence
+from contextlib import closing
 from dataclasses import dataclass
 from typing import Any, NamedTuple, Protocol
 
@@ -68,6 +69,8 @@ __all__ = [
     "DEFAULT_EXCLUDES",
     "DIRECTORY",
     "ENCODING_RULE",
+    "EXCLUDED",
+    "EXCLUDE_GROUPS",
     "FILE",
     "MAX_DEPTH",
     "MAX_MEMBER_BYTES",
@@ -75,6 +78,9 @@ __all__ = [
     "MAX_PATTERNS",
     "MAX_WALKED_ENTRIES",
     "OTHER",
+    "REFUSED",
+    "SECRETS_GROUP",
+    "SELECTED",
     "SNAPSHOT_EXTRACTOR",
     "SNAPSHOT_KIND",
     "SNAPSHOT_VERSION",
@@ -82,15 +88,22 @@ __all__ = [
     "Entry",
     "Handle",
     "Opened",
+    "Reader",
+    "Sighting",
     "SnapshotError",
+    "Survey",
     "Tree",
     "compose",
+    "composed_chars_at_most",
     "contained",
     "digest_of",
     "enforce_patterns",
     "enforce_text",
     "excluded",
+    "exclusion_reason",
+    "list_members",
     "matches",
+    "printable",
     "walk",
 ]
 
@@ -131,59 +144,87 @@ UTF8_BOM = b"\xef\xbb\xbf"
 # root and include patterns; adding an exclusion override would make the
 # secret group opt-out, and an opt-out default is not a default. A
 # caller who genuinely needs a .pem in a comparison can paste it.
-DEFAULT_EXCLUDES: tuple[str, ...] = (
-    # Version control and dependency trees.
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    ".venv",
-    "venv",
-    # The one entry in this group that could name real source rather
-    # than somebody else's. It is here because when it is not source it
-    # is a Go or Composer dependency tree and is enormous, and because
-    # the exclusions are recorded in every snapshot's manifest, so a
-    # person whose vendor/ was their own can see that it was skipped.
-    "vendor",
-    # Build output, caches and the bench's own database.
-    "__pycache__",
-    ".mypy_cache",
-    ".pytest_cache",
-    ".ruff_cache",
-    # Found by walking this repository rather than by listing what a
-    # cache directory is usually called: "**/*" over the clone refused
-    # on .hypothesis/examples/04e6b34.../e270cb2..., which is a binary
-    # blob a property test wrote. Its siblings are here for the same
-    # reason before they are found the same way.
-    ".hypothesis",
-    ".coverage",
-    "htmlcov",
-    ".tox",
-    "dist",
-    "build",
-    "*.egg-info",
-    "*.pyc",
-    "*.pyo",
-    "*.so",
-    "*.dylib",
-    "*.dll",
-    "*.db",
-    "*.db-wal",
-    "*.db-shm",
-    ".DS_Store",
-    # Secrets. See above for why this group is here at all.
-    ".env",
-    ".env.*",
-    "*.pem",
-    "*.key",
-    "*.p12",
-    "*.pfx",
-    "id_rsa*",
-    "id_ed25519*",
-    ".netrc",
-    ".npmrc",
-    ".pypirc",
+# THE GROUPS HAVE NAMES because the member listing reports which one
+# excluded an entry, and a name only a comment knew could not be
+# reported. The names are the README's. DEFAULT_EXCLUDES is their
+# concatenation in this order, and tests/test_listing.py pins it
+# against the literal tuple it was before the groups were named: the
+# tuple is what every manifest records and what SNAPSHOT_VERSION's
+# rule is about, so naming the groups must not move one entry.
+EXCLUDE_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "version control and dependency trees",
+        (
+            ".git",
+            ".hg",
+            ".svn",
+            "node_modules",
+            ".venv",
+            "venv",
+            # The one entry in this group that could name real source
+            # rather than somebody else's. It is here because when it is
+            # not source it is a Go or Composer dependency tree and is
+            # enormous, and because the exclusions are recorded in every
+            # snapshot's manifest, so a person whose vendor/ was their own
+            # can see that it was skipped.
+            "vendor",
+        ),
+    ),
+    (
+        "build output and caches",
+        (
+            "__pycache__",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            # Found by walking this repository rather than by listing what
+            # a cache directory is usually called: "**/*" over the clone
+            # refused on .hypothesis/examples/04e6b34.../e270cb2..., which
+            # is a binary blob a property test wrote. Its siblings are here
+            # for the same reason before they are found the same way.
+            ".hypothesis",
+            ".coverage",
+            "htmlcov",
+            ".tox",
+            "dist",
+            "build",
+            "*.egg-info",
+            "*.pyc",
+            "*.pyo",
+            "*.so",
+            "*.dylib",
+            "*.dll",
+            # The bench's own database files, which are build output in
+            # the sense that matters here: generated, large, and nothing
+            # a person means by source.
+            "*.db",
+            "*.db-wal",
+            "*.db-shm",
+            ".DS_Store",
+        ),
+    ),
+    (
+        # See above for why this group is here at all.
+        "secrets",
+        (
+            ".env",
+            ".env.*",
+            "*.pem",
+            "*.key",
+            "*.p12",
+            "*.pfx",
+            "id_rsa*",
+            "id_ed25519*",
+            ".netrc",
+            ".npmrc",
+            ".pypirc",
+        ),
+    ),
 )
+DEFAULT_EXCLUDES: tuple[str, ...] = tuple(
+    pattern for _, group in EXCLUDE_GROUPS for pattern in group
+)
+SECRETS_GROUP = "secrets"
 
 # How many include patterns one request may carry. Twenty is past any
 # real selection and keeps the per-file matching loop bounded by a
@@ -386,8 +427,8 @@ def excluded(path: str, excludes: Sequence[str]) -> str | None:
     point of splitting on the character that is already visible.
 
     Returns the pattern rather than a bool so the caller can say WHICH
-    exclusion applied. Nothing in the walk needs that today; the
-    refusals a later phase writes will.
+    exclusion applied. The walk needs only whether; the member listing
+    names which, through exclusion_reason.
     """
     segments = path.split("/")
     for pattern in excludes:
@@ -618,6 +659,416 @@ def _changed(path: str, was: str, now: str) -> SnapshotError:
     )
 
 
+# What a survey says about an entry. Three statuses, the member
+# listing's vocabulary, and the composer acts on the same three.
+SELECTED = "selected"
+EXCLUDED = "excluded"
+REFUSED = "refused"
+
+
+@dataclass(frozen=True)
+class Sighting:
+    """One entry the survey has something to say about.
+
+    path is repo-relative, "" for the root (a refusal can stop the
+    survey at the root itself). size is the listed byte size of a file
+    and None for everything else, for a refusal that stopped the survey,
+    and for an excluded file: the
+    listing does not report the size of what it will not read, which
+    for the secrets group would say how long a key is. reason is the
+    sentence: the exclusion that applied, or the composer's own refusal.
+    error is that refusal as the composer raises it. final marks a
+    refusal that stopped the survey, after which nothing further is
+    seen. data is the member's bytes when the survey was given a reader,
+    which only the composer gives it.
+    """
+
+    path: str
+    kind: str
+    size: int | None
+    status: str
+    reason: str | None = None
+    error: SnapshotError | None = None
+    final: bool = False
+    data: bytes | None = None
+
+
+# How a consumer reads a selected member while the survey holds its
+# directory open: the directory's handle, the listed entry and the
+# member's path, in; its bytes, out.
+Reader = Callable[[Handle, Entry, str], bytes]
+
+
+class Survey:
+    """ONE TRAVERSAL, TWO DOORS. The walk of a tree under a set of patterns
+    and exclusions, as a sequence of sightings, which the composer and
+    the member listing both iterate.
+
+    WHY ONE TRAVERSAL AND NOT ONE CALL. The commission asks that the
+    listing and the composer call the same walk with the same arguments
+    and agree by construction. The composer cannot be handed a list of
+    paths to read afterwards: it reads each member through the handle of
+    the directory it was listed in, and a directory is closed the moment
+    its last child is seen (the H1 law and "one open directory per level"
+    together). So the traversal is this one object: every check, in the
+    order the walk has always made them, runs here, and a consumer that
+    wants the bytes passes a reader, which the survey calls while the
+    member's directory is still open. walk passes one; list_members does
+    not, so the listing never holds a member open and never reads one.
+
+    ORDER, AS walk HAS ALWAYS HELD IT, per entry:
+      1. excluded by a pattern: skipped, its subtree never listed. An
+         excluded directory is reported; an excluded file, link or other
+         entry is reported only when an include pattern matches it, so a
+         '*.py' listing does not report every .DS_Store.
+      2. a symbolic link: resolved for the decision and never opened. A
+         link out of the root is REFUSED whatever the patterns say. One
+         that stays inside is skipped, and reported only when a pattern
+         matches it, since the composer drops it without a word.
+      3. a directory: past MAX_DEPTH it is REFUSED and not descended;
+         otherwise descended through its parent's handle, identity
+         checked, and listed.
+      4. anything but a regular file: REFUSED whatever the patterns say.
+      5. a regular file no pattern matches: skipped, not reported.
+      6. a matched file over MAX_MEMBER_BYTES by its listed size: REFUSED,
+         never opened.
+      7. otherwise SELECTED, read first when there is a reader.
+
+    TWO KINDS OF REFUSAL. The four above are facts about one entry, so
+    the survey reports them and goes on: the composer stops at the first
+    (it raises it), and the listing records every one. A refusal about
+    the traversal itself stops the survey: the entry ceiling, a name the
+    snapshot cannot spell, a directory that changed before descent, any
+    refusal a tree operation raises, and any the reader raises. Each is
+    reported once, as a final sighting at the directory or entry it was
+    raised at, and the traversal ends there, as the composer's does.
+
+    Single use: a survey counts entries against MAX_WALKED_ENTRIES as it
+    goes, and a second iteration would count them twice.
+    """
+
+    def __init__(
+        self,
+        *,
+        tree: Tree,
+        patterns: Sequence[str],
+        excludes: Sequence[str] = DEFAULT_EXCLUDES,
+        read: Reader | None = None,
+    ) -> None:
+        # Before any tree operation: a malformed pattern is a refusal of
+        # the request, the same at both doors, and not a fact about the
+        # tree.
+        enforce_patterns(patterns)
+        self._tree = tree
+        self._patterns = tuple(patterns)
+        self._excludes = tuple(excludes)
+        self._read = read
+        self._used = False
+        # Directory entries counted against MAX_WALKED_ENTRIES, excluded
+        # ones included and the contents of excluded directories not. It
+        # passes the ceiling by one when the ceiling is what stopped it.
+        self.seen = 0
+        # How many selected files each pattern was the first to match,
+        # for the empty-selection sentence.
+        self.matched = dict.fromkeys(self._patterns, 0)
+
+    def __iter__(self) -> Generator[Sighting, None, None]:
+        if self._used:
+            raise RuntimeError("a Survey is iterated once")
+        self._used = True
+        return self._sightings()
+
+    def nothing_matched(self) -> SnapshotError:
+        """The refusal for a selection of no files, naming the patterns
+        that selected nothing."""
+        empty = ", ".join(repr(p) for p in self._patterns if not self.matched[p])
+        return SnapshotError(
+            f"no file under the root matched {empty}. Patterns are "
+            "repo-relative and do not recurse unless they say so, so "
+            "'*.py' is the top level and '**/*.py' is every depth."
+        )
+
+    def _sightings(self) -> Generator[Sighting, None, None]:
+        tree = self._tree
+        patterns = self._patterns
+        excludes = self._excludes
+        root_real = tree.root_path()
+        # Where the traversal is, for the sighting a stopping refusal is
+        # reported at.
+        at, at_kind = "", DIRECTORY
+
+        def selects(path: str) -> bool:
+            return any(matches(path, p) for p in patterns)
+
+        def listing(handle: Handle) -> Iterator[Entry]:
+            # Counted per streamed entry and refused before the entry is
+            # kept; see MAX_WALKED_ENTRIES for the measurement that put
+            # the count here rather than after the sort.
+            gathered: list[Entry] = []
+            for entry in tree.entries(handle):
+                self.seen += 1
+                if self.seen > MAX_WALKED_ENTRIES:
+                    raise SnapshotError(
+                        f"the walk passed {MAX_WALKED_ENTRIES} directory "
+                        "entries without finishing. That is far larger than "
+                        "a repository, so the root is almost certainly a "
+                        "parent of one. Point it at the clone itself."
+                    )
+                try:
+                    entry.name.encode("utf-8")
+                except UnicodeEncodeError:
+                    raise SnapshotError(
+                        f"{handle.path or 'the snapshot root'} holds an "
+                        f"entry whose name is not valid UTF-8 "
+                        f"({entry.name!r}). A snapshot names every file in a "
+                        "header line, and a name it cannot spell is a file it "
+                        "cannot describe. Rename it, or exclude it by pattern."
+                    ) from None
+                gathered.append(entry)
+            gathered.sort(key=lambda entry: entry.name.encode("utf-8"))
+            return iter(gathered)
+
+        stack: list[tuple[Handle, Iterator[Entry]]] = []
+        try:
+            try:
+                root = tree.open_root()
+                stack.append((root, iter(())))
+                stack[0] = (root, listing(root))
+                while stack:
+                    handle, remaining = stack[-1]
+                    entry = next(remaining, None)
+                    if entry is None:
+                        stack.pop()
+                        tree.close_handle(handle)
+                        continue
+                    path = f"{handle.path}/{entry.name}" if handle.path else entry.name
+                    at, at_kind = path, entry.kind
+                    size = entry.size if entry.kind == FILE else None
+                    if excluded(path, excludes) is not None:
+                        if entry.kind == DIRECTORY or selects(path):
+                            yield Sighting(
+                                path,
+                                entry.kind,
+                                None,
+                                EXCLUDED,
+                                exclusion_reason(path, excludes),
+                            )
+                        continue
+                    if entry.kind == SYMLINK:
+                        target = tree.link_target(handle, entry)
+                        if not contained(target, root_real):
+                            refusal = SnapshotError(
+                                f"{path} is a symbolic link to "
+                                f"{printable(target)}, which is outside the "
+                                "snapshot root. A snapshot reads one tree, so "
+                                "a link that leaves it is refused rather than "
+                                "followed or ignored. Exclude it, or snapshot "
+                                "the tree it points into instead."
+                            )
+                            yield Sighting(
+                                path, SYMLINK, None, REFUSED, str(refusal), refusal
+                            )
+                        elif selects(path):
+                            yield Sighting(
+                                path,
+                                SYMLINK,
+                                None,
+                                EXCLUDED,
+                                _inside_link(path, target, root_real, excludes),
+                            )
+                        continue
+                    if entry.kind == DIRECTORY:
+                        if len(stack) >= MAX_DEPTH:
+                            refusal = SnapshotError(
+                                f"{path} is {MAX_DEPTH} directories deep, "
+                                "which is past what a snapshot will descend. "
+                                "The walk holds one open directory per level, "
+                                "and a tree this deep is not a source tree. "
+                                "Narrow the root or the patterns."
+                            )
+                            yield Sighting(
+                                path, DIRECTORY, None, REFUSED, str(refusal), refusal
+                            )
+                            continue
+                        child = tree.descend(handle, entry)
+                        if child.identity != entry.identity:
+                            tree.close_handle(child)
+                            raise _changed(path, "a directory", "a different one")
+                        try:
+                            inner = listing(child)
+                        except BaseException:
+                            tree.close_handle(child)
+                            raise
+                        stack.append((child, inner))
+                        continue
+                    if entry.kind != FILE:
+                        refusal = SnapshotError(
+                            f"{path} is not a regular file, so the bench will "
+                            "not open it. A socket, a device or a named pipe "
+                            "under a source tree is refused rather than read, "
+                            "because reading one can block with nothing to "
+                            "time out."
+                        )
+                        yield Sighting(
+                            path, entry.kind, None, REFUSED, str(refusal), refusal
+                        )
+                        continue
+                    selector = next((p for p in patterns if matches(path, p)), None)
+                    if selector is None:
+                        continue
+                    self.matched[selector] += 1
+                    # Before any open, because a size is one integer and an
+                    # open is a descriptor; a reader checks the same bound
+                    # again from the descriptor's own stat, which is the one
+                    # that counts.
+                    if entry.size > MAX_MEMBER_BYTES:
+                        refusal = _too_large(path, entry.size)
+                        yield Sighting(path, FILE, size, REFUSED, str(refusal), refusal)
+                        continue
+                    data = self._read(handle, entry, path) if self._read else None
+                    yield Sighting(path, FILE, size, SELECTED, data=data)
+            except SnapshotError as stopped:
+                yield Sighting(at, at_kind, None, REFUSED, str(stopped), stopped, True)
+        finally:
+            # Every directory still open is closed, deepest first, whether
+            # the survey finished, stopped, or its consumer stopped
+            # iterating it. A refusal that leaked a descriptor per attempt
+            # would turn a person retrying into a process out of
+            # descriptors.
+            for handle, _ in reversed(stack):
+                tree.close_handle(handle)
+
+
+class _ReadBudget:
+    """MAX_READ_BYTES over a selection, and the three largest files so far.
+
+    Shared so both doors word the refusal once. The composer spends what
+    it actually READ, len(data), which is the bound the constant exists
+    for: a file listed small that grew before its read is counted at the
+    size it was read at. The listing reads nothing and spends the listed
+    size, which on a still tree is the same number.
+    """
+
+    def __init__(self) -> None:
+        self.total = 0
+        self.largest: list[tuple[int, str]] = []
+
+    def spend(self, path: str, size: int) -> SnapshotError | None:
+        self.total += size
+        # Largest first, ties by path, so the three named are the same
+        # three however the selection happened to be ordered.
+        self.largest = sorted(
+            self.largest + [(size, path)], key=lambda item: (-item[0], item[1])
+        )[:3]
+        if self.total <= MAX_READ_BYTES:
+            return None
+        named = ", ".join(f"{p} at {n} bytes" for n, p in self.largest)
+        return SnapshotError(
+            f"the selection passed {MAX_READ_BYTES} bytes and the "
+            "bench stopped reading. Even at four bytes per character "
+            f"that cannot compose under the {MAX_COMPOSED_CHARS} "
+            "character ceiling, so narrow the patterns. The largest "
+            f"files selected so far are {named}."
+        )
+
+
+def _read_member(tree: Tree, handle: Handle, entry: Entry, path: str) -> bytes:
+    """A selected member's bytes, read through its directory's handle.
+
+    The composer's reader: opened with no link followed and nothing
+    blocked on, verified against the listing through its own descriptor,
+    and read bounded at the descriptor. See walk for what each check
+    closes.
+    """
+    opened = tree.open_member(handle, entry)
+    try:
+        if opened.kind != FILE:
+            raise _changed(path, "a regular file", _describe(opened.kind))
+        if opened.identity != entry.identity:
+            raise _changed(path, "a regular file", "a different file")
+        if opened.size > MAX_MEMBER_BYTES:
+            raise _too_large(path, opened.size)
+        data = tree.read_member(opened, MAX_MEMBER_BYTES)
+    finally:
+        tree.close_handle(opened)
+    if len(data) > MAX_MEMBER_BYTES:
+        raise SnapshotError(
+            f"{path} grew past {MAX_MEMBER_BYTES} bytes while it was "
+            "being read. The read is bounded at the descriptor, so "
+            "nothing past the bound was held; a file being written "
+            "under a walk is refused rather than read part-way."
+        )
+    return data
+
+
+def printable(text: str) -> str:
+    """A path as a sentence can carry it: itself when it is valid UTF-8,
+    its repr otherwise. A link target is resolved from bytes on disk, so
+    it can hold a byte UTF-8 cannot spell, and a refusal carrying the raw
+    surrogate could not be written to a response at all."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return repr(text)
+    return text
+
+
+def _inside_link(path: str, target: str, root: str, excludes: Sequence[str]) -> str:
+    """Why a link inside the root that a pattern matched is not a member.
+
+    Two cases the sentence tells apart. A target the walk would read is a
+    member only under its own path, if a pattern selects it. A target a
+    default exclusion covers is never a member at all, whatever the
+    patterns, and the sentence says which exclusion, since "if a pattern
+    selects it" would be a promise no pattern can keep.
+    """
+    inside = target[len(root) :].lstrip("/") if target != root else ""
+    if not inside:
+        return (
+            f"{path} is a symbolic link to the snapshot root itself, and is "
+            "not followed."
+        )
+    named = printable(inside)
+    shut = excluded(inside, excludes)
+    if shut is not None:
+        return (
+            f"{path} is a symbolic link to {named}, inside the snapshot root, "
+            f"and is not followed; {named} is itself excluded by {shut!r}, so "
+            "no pattern can make it a member."
+        )
+    return (
+        f"{path} is a symbolic link to {named}, inside the snapshot root, "
+        "and is not followed: a snapshot reads each file once, under its "
+        "own path, so the file or directory it names is read only if a "
+        "pattern selects that path."
+    )
+
+
+def exclusion_reason(path: str, excludes: Sequence[str]) -> str | None:
+    """The sentence the listing reports for an excluded path, or None.
+
+    Names the pattern and, for a default exclusion, its group. SECRETS
+    FIRST when any secrets pattern matches, because excluded() returns
+    the first match in tuple order and would file '.env.db' under the
+    build group's '*.db'; a key file is called what it is. Which pattern
+    is named changes nothing about whether the path is skipped.
+    """
+    applied = excluded(path, excludes)
+    if applied is None:
+        return None
+    groups = dict(EXCLUDE_GROUPS)
+    secret = excluded(path, [p for p in groups[SECRETS_GROUP] if p in excludes])
+    pattern = secret if secret is not None else applied
+    group = next((name for name, members in EXCLUDE_GROUPS if pattern in members), None)
+    if group is None:
+        return f"{path} is excluded by {pattern!r}, so the walk never reads it."
+    return (
+        f"{path} is excluded by {pattern!r}, one of the default exclusions "
+        f"({group}), so the walk never reads it; a request cannot turn a "
+        "default exclusion off."
+    )
+
+
 def walk(
     *,
     tree: Tree,
@@ -633,6 +1084,12 @@ def walk(
     else inside a window. Reading here, through the descriptor the walk
     itself opened, closes it: the thing read is the thing listed, or
     the snapshot is refused.
+
+    THE TRAVERSAL IS Survey's, and the member listing iterates the same
+    one; see Survey for the order of the checks. walk is the consumer
+    that reads: it passes _read_member, stops at the first refusal the
+    survey reports (raising it, as the walk always has), and holds the
+    selection to MAX_READ_BYTES on the bytes actually read.
 
     WHAT IS VERIFIED, AND WHEN. Every directory entry arrives with a
     kind, an identity and a size from the listing. A directory is
@@ -654,14 +1111,15 @@ def walk(
     whole snapshot, naming the link and its target: this is the
     containment law, and a link is exactly the construct that would let
     a walk of an allowed root read a file in a disallowed one. One that
-    resolves INSIDE the root is skipped and does not refuse, because its
-    bytes are already in the snapshot under the target's own path, and
-    following it would put one file in twice under two names. The one
-    corner where that and "never drop silently" pull apart is a
-    contained link whose target is itself excluded; it resolves toward
-    the exclusion, because an exclusion is the caller's own instruction.
-    The target is resolved for the DECISION and the message only; it is
-    never opened.
+    resolves INSIDE the root is skipped and does not refuse: following
+    it would put one file in twice under two names when a pattern also
+    selects the target, and the member listing names it when a pattern
+    matched it, since the file it names is a member only under its own
+    path. The one corner where that and "never drop silently" pull
+    apart is a contained link whose target is itself excluded; it
+    resolves toward the exclusion, because an exclusion is the caller's
+    own instruction. The target is resolved for the DECISION and the
+    message only; it is never opened.
 
     ONE OPEN DIRECTORY PER LEVEL AND NO MORE. The traversal is a stack
     of (handle, remaining entries), so a directory is closed the moment
@@ -679,154 +1137,125 @@ def walk(
     name and directory, because a path the snapshot could not spell in
     its own header is a path it could not describe.
     """
-    enforce_patterns(patterns)
-    root_real = tree.root_path()
-    matched = dict.fromkeys(patterns, 0)
+    survey = Survey(
+        tree=tree,
+        patterns=patterns,
+        excludes=excludes,
+        read=lambda handle, entry, path: _read_member(tree, handle, entry, path),
+    )
+    budget = _ReadBudget()
     selected: list[tuple[str, bytes]] = []
-    largest: list[tuple[int, str]] = []
-    total = 0
-    seen = 0
-
-    def listing(handle: Handle) -> Iterator[Entry]:
-        # Counted per streamed entry and refused before the entry is
-        # kept; see MAX_WALKED_ENTRIES for the measurement that put the
-        # count here rather than after the sort.
-        nonlocal seen
-        gathered: list[Entry] = []
-        for entry in tree.entries(handle):
-            seen += 1
-            if seen > MAX_WALKED_ENTRIES:
-                raise SnapshotError(
-                    f"the walk passed {MAX_WALKED_ENTRIES} directory "
-                    "entries without finishing. That is far larger than a "
-                    "repository, so the root is almost certainly a parent "
-                    "of one. Point it at the clone itself."
+    with closing(iter(survey)) as sightings:
+        for sighting in sightings:
+            if sighting.error is not None:
+                raise sighting.error
+            if sighting.status != SELECTED:
+                continue
+            if sighting.data is None:
+                # Not an assert, which python -O strips: a selected file
+                # the reader returned nothing for would be dropped here
+                # and the snapshot refused as matching nothing.
+                raise RuntimeError(
+                    "a survey given a reader yields every member's bytes"
                 )
-            try:
-                entry.name.encode("utf-8")
-            except UnicodeEncodeError:
-                raise SnapshotError(
-                    f"{handle.path or 'the snapshot root'} holds an entry "
-                    f"whose name is not valid UTF-8 ({entry.name!r}). A "
-                    "snapshot names every file in a header line, and a "
-                    "name it cannot spell is a file it cannot describe. "
-                    "Rename it, or exclude it by pattern."
-                ) from None
-            gathered.append(entry)
-        gathered.sort(key=lambda entry: entry.name.encode("utf-8"))
-        return iter(gathered)
-
-    root = tree.open_root()
-    stack: list[tuple[Handle, Iterator[Entry]]] = [(root, iter(()))]
-    try:
-        stack[0] = (root, listing(root))
-        while stack:
-            handle, remaining = stack[-1]
-            entry = next(remaining, None)
-            if entry is None:
-                stack.pop()
-                tree.close_handle(handle)
-                continue
-            path = f"{handle.path}/{entry.name}" if handle.path else entry.name
-            if excluded(path, excludes) is not None:
-                continue
-            if entry.kind == SYMLINK:
-                target = tree.link_target(handle, entry)
-                if not contained(target, root_real):
-                    raise SnapshotError(
-                        f"{path} is a symbolic link to {target}, which is "
-                        "outside the snapshot root. A snapshot reads one "
-                        "tree, so a link that leaves it is refused rather "
-                        "than followed or ignored. Exclude it, or snapshot "
-                        "the tree it points into instead."
-                    )
-                continue
-            if entry.kind == DIRECTORY:
-                if len(stack) >= MAX_DEPTH:
-                    raise SnapshotError(
-                        f"{path} is {MAX_DEPTH} directories deep, which is "
-                        "past what a snapshot will descend. The walk holds "
-                        "one open directory per level, and a tree this deep "
-                        "is not a source tree. Narrow the root or the "
-                        "patterns."
-                    )
-                child = tree.descend(handle, entry)
-                if child.identity != entry.identity:
-                    tree.close_handle(child)
-                    raise _changed(path, "a directory", "a different one")
-                try:
-                    inner = listing(child)
-                except BaseException:
-                    tree.close_handle(child)
-                    raise
-                stack.append((child, inner))
-                continue
-            if entry.kind != FILE:
-                raise SnapshotError(
-                    f"{path} is not a regular file, so the bench will not "
-                    "open it. A socket, a device or a named pipe under a "
-                    "source tree is refused rather than read, because "
-                    "reading one can block with nothing to time out."
-                )
-            selector = next((p for p in patterns if matches(path, p)), None)
-            if selector is None:
-                continue
-            matched[selector] += 1
-            # Before the open, because a size is one integer and an open
-            # is a descriptor; the same bound is checked again from the
-            # descriptor's own stat below, which is the one that counts.
-            if entry.size > MAX_MEMBER_BYTES:
-                raise _too_large(path, entry.size)
-            opened = tree.open_member(handle, entry)
-            try:
-                if opened.kind != FILE:
-                    raise _changed(path, "a regular file", _describe(opened.kind))
-                if opened.identity != entry.identity:
-                    raise _changed(path, "a regular file", "a different file")
-                if opened.size > MAX_MEMBER_BYTES:
-                    raise _too_large(path, opened.size)
-                data = tree.read_member(opened, MAX_MEMBER_BYTES)
-            finally:
-                tree.close_handle(opened)
-            if len(data) > MAX_MEMBER_BYTES:
-                raise SnapshotError(
-                    f"{path} grew past {MAX_MEMBER_BYTES} bytes while it was "
-                    "being read. The read is bounded at the descriptor, so "
-                    "nothing past the bound was held; a file being written "
-                    "under a walk is refused rather than read part-way."
-                )
-            total += len(data)
-            # Largest first, ties by path, so the three named are the
-            # same three however the selection happened to be ordered.
-            largest = sorted(
-                largest + [(len(data), path)], key=lambda item: (-item[0], item[1])
-            )[:3]
-            if total > MAX_READ_BYTES:
-                named = ", ".join(f"{p} at {n} bytes" for n, p in largest)
-                raise SnapshotError(
-                    f"the selection passed {MAX_READ_BYTES} bytes and the "
-                    "bench stopped reading. Even at four bytes per character "
-                    f"that cannot compose under the {MAX_COMPOSED_CHARS} "
-                    "character ceiling, so narrow the patterns. The largest "
-                    f"files selected so far are {named}."
-                )
-            selected.append((path, data))
-    finally:
-        # Every directory still open is closed, deepest first, whether
-        # the walk finished or refused part-way. A refusal that leaked a
-        # descriptor per attempt would turn a person retrying into a
-        # process out of descriptors.
-        for handle, _ in reversed(stack):
-            tree.close_handle(handle)
+            crossed = budget.spend(sighting.path, len(sighting.data))
+            if crossed is not None:
+                raise crossed
+            selected.append((sighting.path, sighting.data))
     if not selected:
-        empty = ", ".join(repr(p) for p in patterns if not matched[p])
-        raise SnapshotError(
-            f"no file under the root matched {empty}. Patterns are "
-            "repo-relative and do not recurse unless they say so, so "
-            "'*.py' is the top level and '**/*.py' is every depth."
-        )
+        raise survey.nothing_matched()
     selected.sort(key=lambda member: member[0].encode("utf-8"))
     return selected
+
+
+def list_members(
+    *,
+    tree: Tree,
+    patterns: Sequence[str],
+    excludes: Sequence[str] = DEFAULT_EXCLUDES,
+) -> dict[str, Any]:
+    """What POST /snapshots would select and refuse, without reading a file.
+
+    THE SAME SURVEY THE COMPOSER ITERATES, given no reader: every
+    selection, exclusion and refusal below is the one the composer's
+    walk makes, and nothing is opened but directories (and link targets
+    resolved, never opened). Every sighting is a member row; unmatched
+    files and links inside the root that no pattern matches are not
+    members, and are counted in `counted`.
+
+    `refusal` is the one the composer would raise FIRST, in its order:
+    the first refused entry, or the read ceiling crossing on the listed
+    sizes, whichever the traversal reaches first, and otherwise the
+    empty-selection sentence. The rows are sorted by path, so the first
+    refused row is not always the refusal; the page shows `refusal`.
+    `would_compose` is true exactly when the composer's walk would reach
+    composition on the facts the tree shows. `complete` is false when a
+    refusal about the traversal stopped it, as it stops the composer,
+    and that refusal is then the last row whatever its path.
+
+    WHAT IT CANNOT SEE, and says so. `text_checked` is always false:
+    whether a file is an image or holds a NUL byte, and whether it is
+    UTF-8, are properties of the bytes, and the composed-character
+    ceiling is a count of decoded characters, so all of them stay
+    compose-time refusals. `composed_chars_at_most` bounds the last from
+    the listed sizes (a character is at least one byte, and a leading
+    byte-order mark is removed): at or under MAX_COMPOSED_CHARS the
+    ceiling cannot refuse, and over it, text of one byte per character
+    is refused while multibyte text may fit. A file the process cannot
+    open, or one that changes between the listing and the composition,
+    is refused only by the composer, which opens and reads what the
+    listing only looked at.
+    """
+    survey = Survey(tree=tree, patterns=patterns, excludes=excludes)
+    budget = _ReadBudget()
+    members: list[dict[str, Any]] = []
+    selected: list[tuple[str, int]] = []
+    refusal: str | None = None
+    complete = True
+    with closing(iter(survey)) as sightings:
+        for sighting in sightings:
+            members.append(
+                {
+                    "path": sighting.path,
+                    "bytes": sighting.size,
+                    "kind": sighting.kind,
+                    "status": sighting.status,
+                    "reason": sighting.reason,
+                }
+            )
+            if sighting.status == REFUSED:
+                if refusal is None:
+                    refusal = sighting.reason
+                if sighting.final:
+                    complete = False
+            elif sighting.status == SELECTED and sighting.size is not None:
+                selected.append((sighting.path, sighting.size))
+                crossed = budget.spend(sighting.path, sighting.size)
+                if crossed is not None and refusal is None:
+                    refusal = str(crossed)
+    if refusal is None and not selected:
+        refusal = str(survey.nothing_matched())
+    # Sorted by path, which is the manifest's order, and a refusal that
+    # stopped the walk LAST, whatever its path: the walk reaches siblings
+    # in name order, so a sort alone would put a stop at 'a-b' before the
+    # rows under 'a' it came after ('-' sorts below '/'), and a stop at
+    # the root before everything.
+    stop = members.pop() if not complete else None
+    members.sort(key=lambda member: member["path"].encode("utf-8"))
+    if stop is not None:
+        members.append(stop)
+    return {
+        "members": members,
+        "counted": survey.seen,
+        "selected_bytes": sum(size for _, size in selected),
+        "would_compose": refusal is None,
+        "refusal": refusal,
+        "complete": complete,
+        "text_checked": False,
+        "composed_chars_at_most": (
+            composed_chars_at_most(selected) if selected else None
+        ),
+    }
 
 
 def _too_large(path: str, size: int) -> SnapshotError:
@@ -1061,3 +1490,41 @@ def compose(
             "encoding": ENCODING_RULE,
         },
     }
+
+
+def composed_chars_at_most(members: Sequence[tuple[str, int]]) -> int:
+    """The most characters compose could produce for members of these
+    (path, byte size), from the sizes alone.
+
+    compose's own layout, counted rather than built: the intro, then per
+    member in path byte order its header, its text and its footer,
+    joined by one newline each. The header's digest is always twelve
+    hex characters, so it is counted without the bytes. A file's text is
+    at most its byte size in characters, since UTF-8 spends at least one
+    byte on each and a byte-order mark is removed, so the figure is an
+    upper bound, and exact for text of one byte per character with no
+    mark. The member listing reports it because the composed-character
+    ceiling is the one compose refusal a size can bound.
+    """
+    by_path = _ordered(path for path, _ in members)
+    sizes = dict(members)
+    total = len(by_path)
+    length = len(
+        SNAPSHOT_INTRO.format(
+            count=total, plural=_plural(total), encoding=ENCODING_RULE
+        )
+    )
+    for index, path in enumerate(by_path, start=1):
+        length += len(
+            SNAPSHOT_HEADER.format(
+                index=index,
+                total=total,
+                path=path,
+                size=sizes[path],
+                short="0" * 12,
+            )
+        )
+        length += sizes[path]
+        length += len(SNAPSHOT_FOOTER.format(index=index, total=total))
+    # One block for the intro and three per member, joined by newlines.
+    return length + 3 * total

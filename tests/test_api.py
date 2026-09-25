@@ -17208,16 +17208,28 @@ FILESYSTEM_CALLS = {
     # being called, which is the whole reason the module can be tested
     # as a value in and a value out, and the reason the review's races
     # are deterministic tests there.
-    ("snapshot.py", "walk"): {
+    #
+    # THE TRAVERSAL IS Survey's, which the composer and the member
+    # listing both iterate. It lists, descends, resolves links and
+    # closes; it never opens or reads a member itself.
+    ("snapshot.py", "Survey._sightings"): {
         "tree.close_handle",
         "tree.descend",
         "tree.link_target",
-        "tree.open_member",
         "tree.open_root",
-        "tree.read_member",
         "tree.root_path",
     },
-    ("snapshot.py", "listing"): {"tree.entries"},
+    ("snapshot.py", "Survey._sightings.listing"): {"tree.entries"},
+    # The one place a member is opened and read: the composer's reader,
+    # which walk hands the survey and list_members does not. That the
+    # listing never reaches it is proved at runtime (the FakeTree ledger
+    # and the door's recording window), not by this table, which sees
+    # only the calls a function makes itself.
+    ("snapshot.py", "_read_member"): {
+        "tree.close_handle",
+        "tree.open_member",
+        "tree.read_member",
+    },
     #
     # ---- Outside it, each on its own posture.
     #
@@ -17378,26 +17390,42 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
     test anchored to an offset in a seven-thousand-line file breaks on
     every unrelated edit and gets deleted. A method is keyed as
     Class.method so the descriptor tree's eight operations read as its.
+
+    A NESTED FUNCTION IS KEYED BY ITS WHOLE ENCLOSING PATH
+    (Survey._sightings.listing), and no two definitions may share a key.
+    Keyed by its bare name, as it was until Phase O, a nested function
+    merged with any other function of that name, so a helper named walk
+    inside the member listing could have opened a member under the
+    composer's entry and the table would not have moved.
     """
     found = {}
     unclassified = set()
+    defined = {}
     for path in sorted(Path("bench").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         parents = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 parents[id(child)] = node
+
+        def qualified(node, parents=parents):
+            names = [node.name]
+            parent = parents.get(id(node))
+            while parent is not None:
+                if isinstance(
+                    parent, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+                ):
+                    names.append(parent.name)
+                parent = parents.get(id(parent))
+            return ".".join(reversed(names))
+
         scope = {}
         # Breadth-first, so an inner function's assignment lands after
         # its enclosing function's and the innermost name wins.
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                parent = parents.get(id(node))
-                name = (
-                    f"{parent.name}.{node.name}"
-                    if isinstance(parent, ast.ClassDef)
-                    else node.name
-                )
+                name = qualified(node)
+                defined[(path.name, name)] = defined.get((path.name, name), 0) + 1
                 for child in ast.walk(node):
                     scope[id(child)] = name
         for node in ast.walk(tree):
@@ -17421,6 +17449,7 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
         "os calls that are neither touchers nor pure: classify them in "
         f"FILESYSTEM_TOUCHERS or PURE_OS_CALLS: {sorted(unclassified)}"
     )
+    assert [key for key, count in defined.items() if count > 1] == []
     assert found == FILESYSTEM_CALLS
 
 
@@ -17899,6 +17928,518 @@ def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
         },
     )
     assert "Use native mode" in alone.json()["detail"]
+
+
+# =====================================================================
+# ---- Phase O, O1: the member listing, the composer's walk without its
+# ---- reads. Every test names its window.
+# =====================================================================
+
+
+def listing_of(client, root, patterns=("**/*.py",)):
+    """POST /snapshots/listing against an allowlisted root."""
+    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    return client.post(
+        "/snapshots/listing", json={"root": str(root), "patterns": list(patterns)}
+    )
+
+
+def selected_rows(listing):
+    return [
+        (m["path"], m["bytes"]) for m in listing["members"] if m["status"] == "selected"
+    ]
+
+
+def _deep(root, levels):
+    here = root
+    for n in range(levels):
+        here = here / f"d{n}"
+    clone(here, {"deep.py": b"x = 1\n"})
+
+
+# (name, the tree, the patterns, ceilings shrunk in bench.snapshot)
+DOOR_TREES = [
+    (
+        "clean",
+        lambda r: clone(
+            r, {"pkg/a.py": b"A = 1\n", "pkg/b.py": b"B = 2\n", "notes.md": b"n\n"}
+        ),
+        ["**/*.py"],
+        {},
+    ),
+    (
+        "excluded",
+        lambda r: clone(
+            r,
+            {
+                "src/a.py": b"a\n",
+                ".git/config": b"c\n",
+                "node_modules/x.js": b"x\n",
+                ".env": b"KEY=1\n",
+                "pkg/__pycache__/a.cpython.pyc": b"p",
+            },
+        ),
+        ["**/*"],
+        {},
+    ),
+    (
+        "link out",
+        lambda r: (clone(r, {"a.py": b"a\n"}), os.symlink("/etc", r / "out")),
+        ["*.py"],
+        {},
+    ),
+    (
+        "link in",
+        lambda r: (
+            clone(r, {"a.py": b"a\n", "b.md": b"b\n"}),
+            os.symlink(r / "b.md", r / "c.py"),
+        ),
+        ["*.py"],
+        {},
+    ),
+    (
+        "fifo",
+        lambda r: (clone(r, {"a.py": b"a\n"}), os.mkfifo(r / "pipe")),
+        ["*.py"],
+        {},
+    ),
+    (
+        "oversized",
+        lambda r: clone(r, {"a.py": b"a\n", "big.py": b"x" * 250_000}),
+        ["*.py"],
+        {},
+    ),
+    ("nothing matched", lambda r: clone(r, {"a.py": b"a\n"}), ["*.md", "docs/**"], {}),
+    (
+        "read budget",
+        lambda r: clone(r, {f"f{n}.py": b"x" * 40 for n in range(5)}),
+        ["*.py"],
+        {"MAX_READ_BYTES": 100},
+    ),
+    ("depth", lambda r: _deep(r, 4), ["**/*.py"], {"MAX_DEPTH": 3}),
+    (
+        "entry ceiling",
+        lambda r: clone(r, {f"f{n}.py": b"x\n" for n in range(9)}),
+        ["*.py"],
+        {"MAX_WALKED_ENTRIES": 5},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("build", "patterns", "ceilings"),
+    [pytest.param(b, p, c, id=name) for name, b, p, c in DOOR_TREES],
+)
+def test_the_listing_is_what_the_composer_does_through_both_doors(
+    client, tmp_path, monkeypatch, build, patterns, ceilings
+):
+    """WINDOW: POST /snapshots/listing, then POST /snapshots, over one real
+    tree on disk through the door's own DescriptorTree: a clean tree, one
+    with every exclusion group, a link out of the root, a link inside it,
+    a fifo, a file over the member bound, a selection of nothing, and
+    (with the ceilings shrunk) the read ceiling, the depth ceiling and the
+    entry ceiling.
+
+    ONE WALK, TWO DOORS, AT THE DOOR. When the composer stores a snapshot
+    the listing said it would compose, its selected rows are the
+    manifest's members, path and size, and its bound on the composed
+    characters is the stored text's length (these files are ASCII). When
+    the composer refuses, the listing said it would not, with the
+    composer's sentence word for word. PRE-STATE: the listing ran first,
+    on a store with no snapshot in it."""
+    for name, value in ceilings.items():
+        monkeypatch.setattr(bench_snapshot, name, value)
+    root = tmp_path / "clone"
+    root.mkdir()
+    build(root)
+    assert client.get("/attachments").json()["attachments"] == []
+    listed = listing_of(client, root, patterns)
+    assert listed.status_code == 200, listed.text
+    listing = listed.json()
+    composed = snapshot_of(client, root, patterns)
+    if composed.status_code == 201:
+        assert listing["would_compose"] is True
+        assert listing["refusal"] is None
+        body = composed.json()
+        assert selected_rows(listing) == [
+            (f["path"], f["size"]) for f in body["manifest"]["files"]
+        ]
+        assert listing["composed_chars_at_most"] == body["extracted_chars"]
+    else:
+        assert composed.status_code == 422, composed.text
+        assert listing["would_compose"] is False
+        assert listing["refusal"] == composed.json()["detail"]
+
+
+def test_a_selection_past_the_character_ceiling_is_bounded_not_promised(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots/listing and POST /snapshots over two ASCII
+    files of 150,000 bytes, which the walk reads (300,000 is under the
+    read ceiling) and compose refuses (over 200,000 characters): the
+    README's own example of a selection that does not fit has this shape.
+
+    would_compose is the walk's answer, and here the walk reaches
+    composition; the character ceiling is a count of decoded characters,
+    which the listing cannot make without reading. What it can say, it
+    says: composed_chars_at_most, over the ceiling, and on ASCII text
+    exactly the figure compose refuses with. PRE-STATE: each file is
+    within the member bound."""
+    root = clone(tmp_path / "clone", {"a.py": b"a" * 150_000, "b.py": b"b" * 150_000})
+    listing = listing_of(client, root, ["*.py"]).json()
+    assert listing["would_compose"] is True
+    assert listing["text_checked"] is False
+    bound = listing["composed_chars_at_most"]
+    assert bound > bench_snapshot.MAX_COMPOSED_CHARS
+    refused = snapshot_of(client, root, ["*.py"])
+    assert refused.status_code == 422
+    assert refused.json()["detail"].startswith(
+        f"the snapshot composes to {bound} characters"
+    )
+
+
+def test_a_file_the_bench_cannot_open_is_refused_only_by_the_composer(client, tmp_path):
+    """WINDOW: POST /snapshots/listing and POST /snapshots over a tree
+    holding a file with no read permission.
+
+    A DISCLOSED DIVERGENCE, pinned. The listing opens no file, so it
+    cannot know one will not open: it reports the file selected and the
+    walk reaching composition, and the composer refuses it at the open.
+    The listing's docstring and the README say so. PRE-STATE: the file
+    lists as an ordinary regular file of its size."""
+    if os.geteuid() == 0:
+        pytest.skip("root opens a file with no permission bits")
+    root = clone(tmp_path / "clone", {"a.py": b"a\n", "b.py": b"bb\n"})
+    (root / "b.py").chmod(0)
+    try:
+        listing = listing_of(client, root, ["*.py"]).json()
+        assert ("b.py", 3) in selected_rows(listing)
+        assert listing["would_compose"] is True
+        refused = snapshot_of(client, root, ["*.py"])
+    finally:
+        (root / "b.py").chmod(0o644)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == "b.py could not be opened: Permission denied."
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["off", "outside", "not a directory", "bad pattern", "too many", "unknown field"],
+)
+def test_a_refused_request_is_the_same_refusal_at_both_doors(client, tmp_path, case):
+    """WINDOW: POST /snapshots and POST /snapshots/listing with the same
+    refused body: no allowlist, a root outside it, a root that is not a
+    directory, a malformed pattern, more patterns than MAX_PATTERNS, and
+    a field neither door takes.
+
+    A refusal of the request is an HTTP error, the same status and the
+    same detail at both doors; only a refusal about the tree is a fact
+    the listing reports in a 200. PRE-STATE: with the same root and a
+    good pattern the listing answers 200."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    elsewhere = clone(tmp_path / "elsewhere", {"b.py": b"b\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+    good = {"root": str(root), "patterns": ["*.py"]}
+    assert client.post("/snapshots/listing", json=good).status_code == 200
+    body = dict(good)
+    if case == "off":
+        client.app.state.repo_roots = ()
+    elif case == "outside":
+        body["root"] = str(elsewhere)
+    elif case == "not a directory":
+        body["root"] = str(root / "a.py")
+    elif case == "bad pattern":
+        body["patterns"] = ["/src/"]
+    elif case == "too many":
+        body["patterns"] = [f"p{n}.py" for n in range(bench_snapshot.MAX_PATTERNS + 1)]
+    else:
+        body["excludes"] = []
+    composer = client.post("/snapshots", json=body)
+    listing = client.post("/snapshots/listing", json=body)
+    assert composer.status_code in (403, 422), composer.text
+    assert (listing.status_code, listing.json()) == (
+        composer.status_code,
+        composer.json(),
+    )
+
+
+def test_a_link_target_utf8_cannot_spell_is_a_422_at_both_doors(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing over a tree
+    holding a link out of the root to a path with a byte that is not
+    UTF-8.
+
+    The refusal named the target raw, a surrogate escape no response can
+    carry, and the composer answered 500 rather than its own sentence.
+    Both doors now name it by its repr. PRE-STATE: the link exists and
+    its target does not decode."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    try:
+        os.symlink(b"/elsewhere/caf\xe9", bytes(root / "l"))
+    except OSError as exc:
+        pytest.skip(f"this filesystem will not hold such a link target: {exc}")
+    assert os.readlink(bytes(root / "l")) == b"/elsewhere/caf\xe9"
+    composer = snapshot_of(client, root, ["*.py"])
+    assert composer.status_code == 422, composer.status_code
+    assert "is a symbolic link to '" in composer.json()["detail"]
+    listing = listing_of(client, root, ["*.py"]).json()
+    assert listing["refusal"] == composer.json()["detail"]
+
+
+def test_a_root_resolving_to_a_name_utf8_cannot_spell_is_a_403_at_both_doors(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing with a root that
+    resolves, through a link, outside the allowlist to a path holding a
+    byte UTF-8 cannot spell (os.path.realpath's surrogate escape, the
+    resolver stood in for since APFS will not hold such a name).
+
+    The 403 named the resolved path raw, and a response carrying the raw
+    surrogate could not be written: both doors answered 500 where they
+    promise a 403 naming the allowlist. The path is now named by its
+    repr. PRE-STATE: the resolved path cannot be encoded."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    resolved = "/elsewhere/caf" + chr(0xDCE9)
+    with pytest.raises(UnicodeEncodeError):
+        resolved.encode("utf-8")
+    client.app.state.repo_roots = (str(root.resolve()),)
+    monkeypatch.setattr(main, "_resolved_directory", lambda path: resolved)
+    body = {"root": str(root / "w"), "patterns": ["*.py"]}
+    for door in ("/snapshots", "/snapshots/listing"):
+        refused = client.post(door, json=body)
+        assert refused.status_code == 403, (door, refused.status_code)
+        assert (
+            f"resolves to {resolved!r}, which is not under" in refused.json()["detail"]
+        )
+
+
+def test_the_listing_door_reads_no_file_and_writes_nothing(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing over a tree of source files, a
+    Markdown file and an excluded .env, the route warmed first, with every
+    call in PATH_TAKERS that is given a path recorded, and os.read,
+    os.pread and os.readv recorded whatever they are given.
+
+    "READS NO FILE CONTENTS" AT THE DOOR. The door opens directories, and
+    only directories: every os.open it makes carries O_DIRECTORY. The
+    only calls that name a path are the allowlist's resolution of the
+    root (os.path.realpath's lstat of each component, and isdir's stat),
+    the same the composer makes, and none names a member. It reads no
+    byte (no os.read of any kind), opens no path through io or the
+    builtin open, spawns nothing (no git: a listing is not a capture),
+    and writes no row. PRE-STATE: inside the window a Path
+    read_bytes, an os.read and an os.open of a file are each recorded,
+    so the recorder sees the calls that would be a read."""
+    root = clone(
+        tmp_path / "clone",
+        {
+            "pkg/a.py": b"A = 1\n",
+            "pkg/b.py": b"B = 2\n",
+            "notes.md": b"n\n",
+            ".env": b"K=1\n",
+        },
+    )
+    assert listing_of(client, root, ["**/*.py"]).status_code == 200
+    changes = client.app.state.db.total_changes
+    calls = []
+    real_open = os.open
+
+    def recording(name, real):
+        def call(*args, **kwargs):
+            if name in ("os.read", "os.pread", "os.readv"):
+                calls.append((name, None))
+            elif name == "os.open":
+                flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+                calls.append((name, bool(flags & os.O_DIRECTORY)))
+            else:
+                target = (
+                    args[0] if args else kwargs.get("path", kwargs.get("file", "."))
+                )
+                if name == "subprocess.run":
+                    calls.append((name, repr(target)))
+                elif not isinstance(target, int):
+                    calls.append((name, os.fsdecode(target)))
+            return real(*args, **kwargs)
+
+        return call
+
+    takers = [*PATH_TAKERS, (os, "read"), (os, "pread"), (os, "readv")]
+    with monkeypatch.context() as window:
+        for module, attr in takers:
+            window.setattr(
+                module,
+                attr,
+                recording(f"{module.__name__}.{attr}", getattr(module, attr)),
+            )
+        (tmp_path / "probe").write_bytes(b"p")
+        calls.clear()
+        Path(tmp_path / "probe").read_bytes()
+        fd = real_open(tmp_path / "probe", os.O_RDONLY)
+        os.read(fd, 1)
+        os.close(fd)
+        os.close(os.open(tmp_path / "probe", os.O_RDONLY))
+        assert {name for name, _ in calls} == {"io.open", "os.read", "os.open"}, calls
+        calls.clear()
+
+        listed = listing_of(client, root, ["**/*.py"])
+
+    assert listed.status_code == 200
+    assert selected_rows(listed.json()) == [("pkg/a.py", 6), ("pkg/b.py", 6)]
+    resolved = root.resolve()
+    the_root = {str(resolved), *map(str, resolved.parents), str(root)}
+    opens = [flag for name, flag in calls if name == "os.open"]
+    by_name = [(name, target) for name, target in calls if name != "os.open"]
+    assert opens and all(opens), calls
+    assert all(
+        name in ("os.lstat", "os.stat") and target in the_root
+        for name, target in by_name
+    ), by_name
+    assert client.app.state.db.total_changes == changes
+
+
+def test_the_listings_mirrors_are_the_servers_numbers():
+    """WINDOW: SNAPSHOT_LIMITS as node reads it out of static/lib.js,
+    against the constants it names.
+
+    The page says the pattern limit with its value before it sends, and
+    reads a listing's bound against the composed ceiling; both are the
+    server's numbers. PRE-STATE: the page's object names both keys."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(l.SNAPSHOT_LIMITS));"
+    )
+    assert set(js) == {"maxPatterns", "maxComposedChars"}
+    assert js == {
+        "maxPatterns": bench_snapshot.MAX_PATTERNS,
+        "maxComposedChars": bench_snapshot.MAX_COMPOSED_CHARS,
+    }
+
+
+def test_the_pages_trim_set_is_both_sides_trim_sets_over_every_code_point():
+    """WINDOW: PATTERN_TRIMMED, the class patternFor wraps at a pattern's
+    ends, over every code point outside the surrogates, against what
+    node's String.prototype.trim removes and what Python's str.strip
+    removes.
+
+    The panel trims each line it sends and the server refuses a pattern
+    str.strip would change, so a character either side strips must be
+    wrapped. The two sets differ (trim removes U+FEFF, strip removes
+    U+001C to U+001F and U+0085), and the class is their union exactly.
+    PRE-STATE: each side's set has a member the other lacks."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "const cls = new RegExp('^[' + l.PATTERN_TRIMMED + ']$', 'u');"
+        "const inClass = [], trimmed = [];"
+        "for (let c = 0; c <= 0x10ffff; c++) {"
+        "  if (c >= 0xd800 && c <= 0xdfff) continue;"
+        "  const ch = String.fromCodePoint(c);"
+        "  if (cls.test(ch)) inClass.push(c);"
+        "  if (('x' + ch).trim() !== 'x' + ch) trimmed.push(c);"
+        "}"
+        "process.stdout.write(JSON.stringify({inClass, trimmed}));"
+    )
+    stripped = {
+        c
+        for c in range(0x110000)
+        if not 0xD800 <= c <= 0xDFFF and ("x" + chr(c)).strip() != "x" + chr(c)
+    }
+    trimmed = set(js["trimmed"])
+    assert 0xFEFF in trimmed - stripped
+    assert {0x1C, 0x85} <= stripped - trimmed
+    assert set(js["inClass"]) == trimmed | stripped
+
+
+def test_a_pattern_the_page_writes_selects_exactly_its_file():
+    """WINDOW: patternFor executed with node over adversarial file names
+    (every ASCII punctuation character, brackets and classes, '**' as a
+    segment, runs of dots, whitespace of each kind either side strips at
+    either end, nested paths), each answer then held to the server's own
+    matcher in Python.
+
+    A checked row's pattern must select that file and no other: the
+    server's enforce_patterns accepts it, matches() takes it for its own
+    path and for no other name in the set, and the panel's trim leaves it
+    as it is. It is null exactly for a name holding a backslash, a
+    carriage return or a line feed, which no pattern the panel can send
+    spells. PRE-STATE: most names in the set are misread when used as
+    their own pattern."""
+    ends = [" ", "\t", chr(0x85), chr(0xFEFF), chr(0x1C), chr(0x3000), chr(0xA0)]
+    names = {f"a{c}b.py" for c in "!\"#$%&'()*+,-.:;<=>?@[]^_`{|}~"}
+    names |= {
+        "[x].py",
+        "x.py",
+        "[!]x",
+        "[a-z].py",
+        "a.py",
+        "**",
+        "*",
+        "?",
+        "a..b.py",
+        "...",
+        "..x",
+        "src/**/x.py",
+        "src/[a]/b.py",
+        "my file.py",
+        "a\\b.py",
+        "a\nb.py",
+        "a\rb.py",
+    }
+    for c in ends:
+        names |= {f"{c}a.py", f"a.py{c}", f"src/{c}x.py", f"src/x.py{c}"}
+    names = sorted(names)
+    patterns = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((p) => {"
+        "  const q = l.patternFor(p);"
+        "  return [q, q === null ? null : q.trim() === q];"
+        "})));",
+        names,
+    )
+
+    def misread(name):
+        """Whether a name used as its own pattern goes wrong: refused, or
+        stripped on the way, or matching itself not at all or not alone."""
+        try:
+            bench_snapshot.enforce_patterns([name])
+        except bench_snapshot.SnapshotError:
+            return True
+        return (
+            name != name.strip()
+            or not bench_snapshot.matches(name, name)
+            or any(bench_snapshot.matches(o, name) for o in names if o != name)
+        )
+
+    assert len([n for n in names if misread(n)]) > 10
+    for name, (pattern, survives_trim) in zip(names, patterns, strict=True):
+        if any(c in name for c in "\\\r\n"):
+            assert pattern is None, name
+            continue
+        assert pattern is not None, name
+        assert survives_trim, (name, pattern)
+        bench_snapshot.enforce_patterns([pattern])
+        assert bench_snapshot.matches(name, pattern), (name, pattern)
+        others = [n for n in names if n != name and bench_snapshot.matches(n, pattern)]
+        assert others == [], (name, pattern, others)
+        # THE PATH ITSELF WHEN NOTHING WOULD MISREAD IT: no glob character,
+        # and nothing at either end that either side strips.
+        plain = (
+            not any(c in name for c in "*?[")
+            and name == name.strip()
+            and not name.startswith(chr(0xFEFF))
+            and not name.endswith(chr(0xFEFF))
+        )
+        if plain:
+            assert pattern == name, (name, pattern)
+
+
+def test_the_listing_door_is_on_the_loop_like_the_composer():
+    """WINDOW: the two route functions, as the app registers them.
+
+    Bounded rather than offloaded, for create_snapshot's reason: a plain
+    def route would be moved to FastAPI's thread pool. PRE-STATE: the
+    composer's route is itself a coroutine function."""
+    assert inspect.iscoroutinefunction(main.create_snapshot)
+    assert inspect.iscoroutinefunction(main.list_snapshot)
 
 
 # =====================================================================

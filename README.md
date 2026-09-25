@@ -1749,6 +1749,52 @@ version control and dependency trees (`.git`, `node_modules`, `.venv`,
 overridable by a request, because an exclusion list a request could
 replace would make it opt-out, and an opt-out default is not a default.
 
+**List before you compose.** `POST /snapshots/listing` takes the same
+body as `POST /snapshots`, behind the same allowlist, and answers what
+the composer would select and refuse without composing, storing or
+reading a file:
+
+```sh
+curl -s -X POST localhost:8000/snapshots/listing \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/home/you/code/myproject", "patterns": ["**/*.py"]}'
+```
+
+It is the composer's own walk, the same traversal in the same order,
+iterated without reading: directories are opened and listed and link
+targets resolved, and no file is opened. Each row is `{path, bytes,
+kind, status, reason}`, sorted by path. `selected` is a file the
+composer would read; `excluded` names the exclusion and its group
+(`bytes` is null, since the listing does not report the size of what it
+will not read, which for a secret would say how long a key is), and a
+link inside the root that a pattern matches is reported the same way,
+because the composer skips it: what it names is read only under its own
+path, if a pattern selects that, and never if an exclusion covers it;
+`refused` carries the composer's sentence word for word. A file no
+pattern matches is not a row. A link out of the root, a socket, device
+or pipe, and a directory past the depth ceiling refuse the snapshot
+whatever the patterns select, and the line above the table says when
+the refusal is one of those, which narrowing cannot fix.
+
+`would_compose` is true exactly when the composer's walk would reach
+composition, and `refusal` is the sentence it would raise first (in its
+walk order, which is not always the first refused row). `counted` is
+the directory entries the walk counted against its twenty-thousand
+ceiling, and `complete` is false when a refusal about the walk itself
+stopped it there, that refusal being the last row whatever its path.
+**`text_checked` is always false**: whether a file is an image or holds
+a NUL byte, and whether it is UTF-8, are properties of the bytes, so
+they stay refusals only Compose can make. So does the composed-character
+ceiling, since it counts decoded characters; `composed_chars_at_most`
+bounds it from the sizes, a character being at least one byte (and a
+leading byte-order mark, which is removed, making the text shorter). At or
+under 200,000 the ceiling cannot refuse; over it, plain ASCII of that
+length is refused and multibyte text may fit. A file the bench cannot
+open, and a tree that changes between the listing and the composition,
+are refused only by Compose, which opens and reads what the listing
+only looked at. A listing is a look and not a pin: nothing is recorded,
+and Compose walks the tree again.
+
 **In the composer**, `+ Snapshot` opens a root and a pattern box beside
 `+ Attach`, and a composed snapshot becomes one chip like any other
 document, reading `repository snapshot` with the number of files it
@@ -1758,6 +1804,21 @@ door the server would refuse and the sentence you read there is the
 sentence a `403` would carry. No view ever shows the clone root: the
 stored name is derived from the digest, which is the filename rule
 extended from a file to a tree.
+
+**List members** sends the same root and patterns to the listing door
+and shows its rows as a table, the reasons in the server's own words.
+Checking rows writes the patterns: one per checked file, naming exactly
+that file, which is the path itself unless a character would be misread
+(a `*`, `?` or `[` becomes a one-character class like `[*]`, and a space
+or other stripped character at either end is bracketed the same way,
+since the panel trims each line and the server refuses surrounding
+whitespace). A name holding a backslash or a line break has no exact
+pattern and gets no checkbox. More than twenty checked files is refused
+on the page, naming `MAX_PATTERNS`, and so is typing more than twenty
+patterns. A box edited by hand after the listing is never overwritten
+by a check, typing another root empties the table, and every row goes
+whenever the panel forgets its root (a composed snapshot, a reuse, a
+clear, the blind view), since each is a path in somebody's repository.
 
 `GET /attachments/{digest}` serves the snapshot's **manifest**, which is
 the content half: every member's path, byte size and digest, and the
