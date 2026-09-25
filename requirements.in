@@ -12,7 +12,7 @@
 fastapi==0.141.1
 uvicorn==0.52.4
 httpx==0.28.1
-pydantic==2.13.4
+pydantic==2.13.5
 # PDF text extraction for attachments, and the only dependency Phase K
 # adds. docx extraction needs none: zipfile and xml.etree over the w:t
 # runs is the whole of it, and txt and md need nothing at all. A parser
