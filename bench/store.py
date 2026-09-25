@@ -1802,10 +1802,25 @@ def list_attachments(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any
     Newest first, because the reason to list is usually to find what was
     just uploaded and cite it. Bounded by the caller, for the reason the
     history list is: this stays cheap as bench.db grows.
+
+    AND THE ID OF EACH ROW'S LATEST CAPTURE (Phase O), latest_capture_id:
+    the newest capture of the row's OWN reading, keyed on digest,
+    extractor and version exactly as latest_capture keys it, and null for
+    a reading that has none (every document and image). A correlated
+    MAX over the covering index idx_snapshot_captures_rendition, so one
+    seek per listed row and still one query; the captures themselves are
+    read by id in one more (captures_for). Keyed on digest alone it would
+    name a capture of another reading of the same bytes, one a bare
+    citation never resolves to.
     """
     rows = conn.execute(
-        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments"
-        " ORDER BY id DESC LIMIT ?",
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)},"
+        " (SELECT MAX(s.id) FROM snapshot_captures s"
+        "  WHERE s.digest = attachments.digest"
+        "  AND s.extractor = attachments.extractor"
+        "  AND s.extractor_version = attachments.extractor_version)"
+        " AS latest_capture_id"
+        " FROM attachments ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [dict(row) for row in rows]

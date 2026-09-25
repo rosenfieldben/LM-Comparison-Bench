@@ -10629,15 +10629,16 @@ def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client)
     # snapshot of two thousand files carries two thousand rows, and a
     # page of five hundred attachments carrying those would undo what
     # K1.5 bought when it stopped this reader loading bodies. The list
-    # answers Attachment, the two single-attachment doors answer
+    # answers ListedAttachment, the two single-attachment doors answer
     # AttachmentDetail, and neither shape has to be read as "sometimes
-    # populated".
+    # populated". Since Phase O the capture is NOT an exception (it used
+    # to be): the list carries each row's latest capture, the same record
+    # the detail serves, so the one exception left is the manifest.
     detail = client.get(f"/attachments/{third}").json()
     assert listed[0] == {
-        key: value
-        for key, value in detail.items()
-        if key not in ("manifest", "capture")
+        key: value for key, value in detail.items() if key != "manifest"
     }
+    assert listed[0]["capture"] is None
     assert detail["manifest"] is None
     assert "manifest" not in listed[0]
     # NEVER CONTENT, on this endpoint as on every other. The bodies are
@@ -16462,10 +16463,11 @@ def test_composing_one_tree_twice_returns_the_first_row(client, tmp_path):
 
     The MANIFEST is the first walk's, and that is the interesting half.
     It is not a function of the rendition key, so two walks a commit
-    apart whose selected files did not change are one row, and the head
-    recorded is the earlier one. That is a true statement about these
-    bytes rather than a stale one, and rewriting it would relabel a
-    record every existing comparison already cites.
+    apart whose selected files did not change are one row and one
+    manifest. That is a true statement about these bytes rather than a
+    stale one, and rewriting it would relabel a record every existing
+    comparison already cites. (Each walk's head is its own capture's,
+    since the fourteenth review's H2; the doors answer the latest.)
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
 
@@ -16492,7 +16494,9 @@ def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
     The LIST does not carry it, and the split is deliberate: a snapshot
     of two thousand files carries two thousand manifest rows, and a page
     of five hundred attachments carrying those would undo what K1.5
-    bought when it stopped this reader loading bodies.
+    bought when it stopped this reader loading bodies. The CAPTURE, a
+    walk's facts and not a body, the list does carry since Phase O, and
+    it is the same record the detail serves.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
     created = snapshot_of(client, root, ["*.py"]).json()
@@ -16502,6 +16506,7 @@ def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
 
     listed = client.get("/attachments").json()["attachments"]
     assert "manifest" not in listed[0]
+    assert listed[0]["capture"] == fetched["capture"] == created["capture"]
     # And never the content, on either door, which is the promise every
     # attachment response makes.
     assert "x = 1" not in json.dumps(fetched)
@@ -18643,6 +18648,64 @@ def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_
     client.app.state.repo_roots = (str(tmp_path.resolve()), str(hooks.resolve()))
     assert status(hooks) == 200
     assert status(repo / ".git") == 403
+
+
+def test_the_list_carries_each_rows_latest_capture_as_the_detail_does(client, tmp_path):
+    """WINDOW: GET /attachments against GET /attachments/{digest}, row for
+    row, over a document and three snapshots of one repository at two
+    heads.
+
+    The list's capture is the detail's, field for field. The snapshot
+    whose selected bytes did not change between the heads (b.md) is one
+    row, and both doors name its LATEST walk; the two whose bytes did are
+    two rows, each at its own head; the document's is null. PRE-STATE:
+    the heads differ, and b.md's first walk was at the first."""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    repo = clone(tmp_path / "heads", {"a.py": b"A = 1\n", "b.md": b"# b\n"})
+
+    def commit():
+        for args in (["add", "-A"], ["commit", "-q", "-m", "c"]):
+            subprocess.run(["git", "-C", str(repo), *args], env=env, check=True)
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    first = commit()
+    document = upload(client, "doc.txt", b"a document").json()["digest"]
+    d1 = snapshot_of(client, repo, ["*.py"]).json()
+    e1 = snapshot_of(client, repo, ["*.md"]).json()
+    (repo / "a.py").write_bytes(b"A = 2\n")
+    second = commit()
+    assert first != second
+    d2 = snapshot_of(client, repo, ["*.py"]).json()
+    e2 = snapshot_of(client, repo, ["*.md"]).json()
+    assert e1["digest"] == e2["digest"] and e1["capture"]["head"] == first
+
+    listed = {
+        row["digest"]: row for row in client.get("/attachments").json()["attachments"]
+    }
+    for digest in (document, d1["digest"], d2["digest"], e1["digest"]):
+        detail = client.get(f"/attachments/{digest}").json()
+        assert listed[digest]["capture"] == detail["capture"], digest
+    assert listed[document]["capture"] is None
+    assert listed[d1["digest"]]["capture"]["head"] == first
+    assert listed[d2["digest"]]["capture"]["head"] == second
+    assert listed[e1["digest"]]["capture"] == e2["capture"]
+    assert listed[e1["digest"]]["capture"]["head"] == second
 
 
 # =====================================================================

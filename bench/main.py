@@ -618,15 +618,32 @@ class Attachment(BaseModel):
     created_at: str
 
 
+class ListedAttachment(Attachment):
+    """One row of GET /attachments: the metadata, and the latest capture
+    of the row's own reading.
+
+    THE CAPTURE TRAVELS ON THE LIST (Phase O) so the dataset builder can
+    tell two snapshots of one repository apart by the walk each was: the
+    same SnapshotCapture record GET /attachments/{digest} serves, head
+    and clone id included, and null for a reading with no capture (every
+    document and image). It is the latest when the list was read; a
+    snapshot cited by bare digest freezes the latest at the experiment's
+    creation, which a walk in between can move. THE MANIFEST DOES NOT
+    TRAVEL here, for AttachmentDetail's reason: it is body-sized.
+    """
+
+    capture: SnapshotCapture | None = None
+
+
 class AttachmentList(BaseModel):
     """The documents the bench holds, as metadata and nothing else.
 
-    THE SAME Attachment SHAPE the detail endpoint serves, so a caller
-    that can read one can read a page of them. No content field on
-    either, for the reason Attachment gives.
+    THE DETAIL SHAPE LESS ITS MANIFEST, so a caller that can read one can
+    read a page of them. No content field on either, for the reason
+    Attachment gives.
     """
 
-    attachments: list[Attachment]
+    attachments: list[ListedAttachment]
 
 
 # The longest root path a request may name. Linux caps a path at
@@ -678,16 +695,18 @@ class SnapshotManifest(BaseModel):
     encoding: str
 
 
-class AttachmentDetail(Attachment):
+class AttachmentDetail(ListedAttachment):
     """One attachment, with the manifest when it has one.
 
-    A SEPARATE MODEL FROM Attachment RATHER THAN A FIELD ON IT, and the
+    A SEPARATE MODEL FROM THE LIST'S RATHER THAN A FIELD ON IT, and the
     split is about the LIST. A member manifest is body-sized: a snapshot
     of two thousand files carries two thousand rows, and a page of five
     hundred attachments carrying those would undo exactly what K1.5
     bought when it stopped the list reader from loading bodies. The list
-    answers Attachment, the two single-attachment doors answer this, and
-    neither shape has to be read as "sometimes populated".
+    answers ListedAttachment (this less the manifest; the capture, a
+    walk's facts and not a body, travels on both since Phase O), the two
+    single-attachment doors answer this, and neither shape has to be
+    read as "sometimes populated".
 
     None is every rendition of a single file, which is every rendition
     but a snapshot's. It is not a missing value; see the migration entry
@@ -702,7 +721,6 @@ class AttachmentDetail(Attachment):
     """
 
     manifest: SnapshotManifest | None = None
-    capture: SnapshotCapture | None = None
 
 
 class SnapshotCreate(BaseModel):
@@ -7533,12 +7551,17 @@ def _attachment_detail(
     It matters here because the manifest is NOT a function of the
     rendition key. Two walks of one clone at two commits compose
     byte-identical text whenever the selected files did not change, so
-    they are one rendition with one row, and the head recorded is the
+    they are one rendition with one row and one stored manifest, the
     first walk's. That is a true statement about these bytes rather than
     a stale one: the snapshot IS its content, and the earlier commit
     produced exactly this content. Rule two's forward-only law does the
     rest, since rewriting the manifest would relabel a record every
-    existing comparison already cites.
+    existing comparison already cites. The WALKS' facts, the head and
+    the dirty flag among them, are not on the manifest: each walk is its
+    own capture, and this answers the one it is handed (POST's own) or
+    the latest (GET's). GET /attachments answers the same latest by its
+    own query (store.list_attachments' latest_capture_id), which must
+    stay keyed as latest_capture is.
     """
     view = _attachment_view(row)
     stored = store.extraction_for(
@@ -8471,9 +8494,14 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     look up is a citation nobody can check. Upload, list, cite, create.
 
     Bounded like the history list and for the same reason, and flat in
-    the number of rows: one query, no body columns, so a page of a
-    thousand documents costs a page of metadata rather than a page of
-    documents.
+    the number of rows: two queries (the rows, each with its latest
+    capture's id, then those captures by id), no body columns, so a page
+    of a thousand documents costs a page of metadata rather than a page
+    of documents.
+
+    EACH ROW CARRIES ITS LATEST CAPTURE since Phase O (ListedAttachment),
+    the same record GET /attachments/{digest} answers, so the dataset
+    builder can name the walk a snapshot option was.
 
     THE BASE ROW'S OWN READING, exactly as GET /attachments/{digest}
     answers it. This endpoint says what is STORED under these bytes; it
@@ -8483,9 +8511,22 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     it means a batched per-digest rendition reader with its own bound,
     and this phase does not build it.
     """
+    rows = store.list_attachments(app.state.db, limit)
+    captures = store.captures_for(
+        app.state.db,
+        [
+            row["latest_capture_id"]
+            for row in rows
+            if row["latest_capture_id"] is not None
+        ],
+    )
     return {
         "attachments": [
-            _attachment_view(row) for row in store.list_attachments(app.state.db, limit)
+            {
+                **_attachment_view(row),
+                "capture": _capture_view(captures.get(row["latest_capture_id"])),
+            }
+            for row in rows
         ]
     }
 

@@ -6,6 +6,12 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const {
+  captureLine,
+  CLONE_OUTCOMES,
+  cloneInputsBlocker,
+  cloneBody,
+  cloneOutcomeLine,
+  readableClone,
   SNAPSHOT_LIMITS,
   patternFor,
   tooManyPatterns,
@@ -1331,4 +1337,99 @@ test("a listing's line says what Compose would do, in the listing's own words", 
     "1 file checked, 6 bytes: the patterns now name exactly it. List again " +
       "to see what Compose makes of them.",
   );
+});
+
+const HEAD = "0123456789abcdef0123456789abcdef01234567";
+
+test("captureLine names the walk, and nothing for no capture", () => {
+  assert.equal(captureLine(null), "");
+  assert.equal(captureLine(undefined), "");
+  assert.equal(captureLine({ id: "3", head: HEAD, dirty: false }), "");
+  assert.equal(
+    captureLine({ id: 3, head: HEAD, dirty: false }),
+    "capture #3 at 0123456, clean",
+  );
+  assert.equal(
+    captureLine({ id: 4, head: HEAD, dirty: true }),
+    "capture #4 at 0123456, dirty",
+  );
+  assert.equal(
+    captureLine({ id: 5, head: null, dirty: null }),
+    "capture #5 at no commit, unknown",
+  );
+});
+
+test("a clone is not sent blank, and nothing else is decided here", () => {
+  assert.equal(
+    cloneInputsBlocker("", "main"),
+    "Name the public repository to clone: an https URL of a host this " +
+      "bench lists.",
+  );
+  assert.equal(
+    cloneInputsBlocker("", ""),
+    cloneInputsBlocker("", "main"),
+    "the URL is asked for first",
+  );
+  assert.equal(
+    cloneInputsBlocker("https://github.com/o/r", ""),
+    "Name the branch, tag or 40-character commit to clone.",
+  );
+  // Every other rule is the server's, shown in its words.
+  for (const [url, ref] of [
+    ["http://github.com/o/r", "main"],
+    ["https://u:t@github.com/o/r", "main"],
+    ["https://github.com/o/r", "+main"],
+    ["not a url", "a..b"],
+  ]) {
+    assert.equal(cloneInputsBlocker(url, ref), null);
+  }
+});
+
+test("the clone body is the URL and the ref and nothing else", () => {
+  assert.deepStrictEqual(cloneBody("https://h/o/r", "main"), {
+    url: "https://h/o/r",
+    ref: "main",
+  });
+  assert.deepStrictEqual(Object.keys(cloneBody("u", "r")), ["url", "ref"]);
+});
+
+test("the outcome line says which and at what, and nothing it cannot read", () => {
+  assert.deepStrictEqual(CLONE_OUTCOMES, ["cloned", "updated"]);
+  const record = {
+    id: 1,
+    url: "https://h/o/r",
+    ref: "main",
+    head_sha: HEAD,
+    root: "/clones/abcdef0123456789",
+    outcome: "cloned",
+  };
+  assert.equal(cloneOutcomeLine(record), "cloned at 0123456");
+  assert.equal(
+    cloneOutcomeLine({ ...record, outcome: "updated" }),
+    "updated to 0123456",
+  );
+  for (const bad of [
+    null,
+    { ...record, outcome: "copied" },
+    { ...record, head_sha: "0123456" },
+    { ...record, head_sha: HEAD.toUpperCase() },
+    { ...record, head_sha: 7 },
+  ]) {
+    assert.equal(cloneOutcomeLine(bad), "");
+  }
+  // Never the URL, the root or the ref.
+  const line = cloneOutcomeLine(record);
+  for (const part of ["h/o/r", "clones", "abcdef", "main"]) {
+    assert.ok(!line.includes(part), part);
+  }
+});
+
+test("a clone answer is readable only with an outcome and a root", () => {
+  const record = { head_sha: HEAD, root: "/c/x", outcome: "cloned" };
+  assert.equal(readableClone(record), true);
+  assert.equal(readableClone({ ...record, root: "" }), false);
+  assert.equal(readableClone({ ...record, root: 3 }), false);
+  assert.equal(readableClone({ head_sha: HEAD, outcome: "cloned" }), false);
+  assert.equal(readableClone({ ...record, outcome: "made" }), false);
+  assert.equal(readableClone(null), false);
 });

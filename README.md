@@ -1824,9 +1824,14 @@ document, reading `repository snapshot` with the number of files it
 selected. When `BENCH_REPO_ROOTS` is unset the button is disabled and the
 server's own refusal is printed beside it, so the page never offers a
 door the server would refuse and the sentence you read there is the
-sentence a `403` would carry. No view ever shows the clone root: the
-stored name is derived from the digest, which is the filename rule
-extended from a file to a tree.
+sentence a `403` would carry. No chip, stored snapshot, report or export
+ever shows the clone root: the stored name is derived from the digest,
+which is the filename rule extended from a file to a tree. The clones
+row and `POST /clones`'s answer hold it; the root box holds one only
+while you work (typed, or filled by Clone) and is emptied whenever the
+panel forgets its root (a composed snapshot, a reuse, a clear, the blind
+view); and the Clone step's off sentence can name `BENCH_CLONE_ROOT`, so
+it is shown only inside the open panel.
 
 **List members** sends the same root and patterns to the listing door
 and shows its rows as a table, the reasons in the server's own words.
@@ -1851,8 +1856,11 @@ patterns that selected and the exclusions that were in force, when, and
 which clone the clone door made it was (`clone_id`, null for a tree the
 door did not make).
 Never any content, which is the promise every attachment response
-makes. The list endpoint omits both deliberately, since a page of
-snapshots carrying theirs would be a page of bodies.
+makes. The list endpoint omits the manifest deliberately, since a page of
+snapshots carrying theirs would be a page of bodies; each row does carry
+its reading's latest capture (since Phase O), the same record the detail
+serves, a walk's facts and not a body, so the dataset builder can tell two
+snapshots of one repository apart.
 
 **Content dedupes; captures do not.** Composing the same unchanged tree
 twice composes identical text, so the digest matches and the
@@ -2035,6 +2043,27 @@ id travels wherever the capture does (the snapshot's response, the
 history, the report and the export), so a reader asks "which
 repository was this" of the clones table and finds the URL there.
 
+**In the snapshot panel**, the Clone step sits above the root box: a
+URL, a ref and **Clone**. When the door is off, its own sentence is shown
+there, inside the open panel (one of the door's two off sentences names
+`BENCH_CLONE_ROOT` and every allowed root, so it is never left on the page
+while the panel is closed). On success the root box is
+filled with the directory the clone went to, and "cloned at" or "updated
+to" and the commit are shown beside it; List and Compose then work on it
+as on any root. Every refusal is the door's sentence, word for word, and
+none of them holds the URL you typed. While a clone the panel still
+waits for runs, the step says so, List and Compose wait for it, and the
+URL, ref and root boxes are read-only. A clone the panel forgets (a
+reuse, a clear, the blind view) fills nothing when it lands and holds
+only Clone, since the server makes one at a time; until it answers, the
+snapshot doors refuse its directory with `409`. Cloning waits while a
+blind rating is open, since a clone writes a path. A composed snapshot
+keeps the URL and ref only when they made the root. Blank is not sent. Nothing is
+remembered across loads: the four boxes are off to autocomplete and
+spell checking, and a page restored from the back/forward cache forgets
+the panel. A clone is not a comparison: the page sends the URL and the
+ref and nothing else, and stages nothing.
+
 **Removing a clone is yours.** There is no delete door: remove the
 directory yourself. Its row stays, and a later clone of the same
 repository and ref lands in the same place under the same row. The
@@ -2108,8 +2137,13 @@ There are three ways in:
   pattern for regex, a rubric and an optional pass threshold for the
   judge), an optional system message, and optional documents picked from
   what the bench already stores, which is how a repository snapshot
-  enters a task. Row N is line N of what Store sends. The builder holds
-  50 rows; past that, paste or upload.
+  enters a task. A snapshot's option names its latest walk in its title
+  ("latest capture #N at <commit>, clean"), so two snapshots of one
+  repository can be told apart; walks that composed identical bytes are
+  one option naming the newest, and a snapshot cited this way (by bare
+  digest) records the latest walk when the experiment is created. Row N
+  is line N of what Store sends. The builder holds 50 rows; past that,
+  paste or upload.
 - **JSONL**, pasted or uploaded. It is sent exactly as it is: the page
   counts its lines (split and skipped as the parser splits and skips)
   against the 2000-task ceiling and parses nothing, and an uploaded file

@@ -23,6 +23,12 @@ from stub_openrouter import build_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# tests/ ON THE IMPORT PATH, for clone_stub. A full run puts it there as
+# a side effect of collecting tests/test_*.py first, and a run of one
+# browser file does not, so the clone bench's fixture would import in
+# the one case and not the other. Said here rather than left to order.
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
 
 def free_port() -> int:
     with socket.socket() as s:
@@ -356,6 +362,64 @@ def snapshot_bench(page, snapshot_bench_url):
     return open_bench
 
 
+# ---- The clone door (Phase O, O3). A git remote over HTTPS on
+# ---- loopback, and a fourth bench whose clone door fetches from it.
+
+
+@pytest.fixture(scope="session")
+def clone_remote(tmp_path_factory):
+    """tests/clone_stub.py's remote, for the session.
+
+    Bound before the clone bench boots, because the bench reads
+    BENCH_CLONE_HOSTS and BENCH_CLONE_CAINFO once at boot and both name
+    this remote (its port, its certificate); and stopped after it, since
+    session teardown runs in reverse.
+    """
+    import clone_stub
+
+    with clone_stub.serving(tmp_path_factory.mktemp("clone-remote")) as remote:
+        yield remote
+
+
+@pytest.fixture(scope="session")
+def clone_root(tmp_path_factory):
+    """Where the clone bench's door puts what it fetches, empty at boot."""
+    return tmp_path_factory.mktemp("clone-root")
+
+
+@pytest.fixture(scope="session")
+def clone_bench_url(stub_url, tmp_path_factory, clone_remote, clone_root):
+    """A fourth bench, the only one whose clone door is on.
+
+    BENCH_CLONE_ROOT is an exact entry of BENCH_REPO_ROOTS, as the door
+    requires, and the only one, so every root this bench may walk is a
+    clone its door made. The snapshot bench stays the one that proves
+    the clone door off (snapshots on, no BENCH_CLONE_ROOT).
+    """
+    env = {
+        "BENCH_REPO_ROOTS": str(clone_root),
+        "BENCH_CLONE_ROOT": str(clone_root),
+        "BENCH_CLONE_HOSTS": clone_remote.host,
+        "BENCH_CLONE_CAINFO": str(clone_remote.cainfo),
+    }
+    with boot_bench(stub_url, tmp_path_factory, env) as url:
+        yield url
+
+
+@pytest.fixture
+def clone_bench(page, clone_bench_url):
+    """The page factory, pointed at the bench that may clone."""
+
+    def open_bench(lineup):
+        page.add_init_script(
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
+        )
+        page.goto(clone_bench_url)
+        return page
+
+    return open_bench
+
+
 # ---- The experiment runner and the scoring slot (Phases N3 and N4).
 # Shared here so test_n3.py and test_n4.py take the same fixtures; the
 # helpers they call live in test_n3.py beside the tests that made them.
@@ -372,6 +436,19 @@ def runs(page, bench_url):
     yield started
     for eid in started:
         drain(page, bench_url, eid)
+
+
+@pytest.fixture
+def clone_runs(page, clone_bench_url):
+    """runs, for the clone bench: an experiment id names a row in one
+    bench's database, and the default bench's row of the same id is some
+    other test's experiment."""
+    from test_n3 import drain
+
+    started = []
+    yield started
+    for eid in started:
+        drain(page, clone_bench_url, eid)
 
 
 @pytest.fixture

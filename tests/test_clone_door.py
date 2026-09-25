@@ -1121,7 +1121,9 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
     it (.git included) under a second allowlisted root; each snapshot then
     compared by hand in a group and cited by an experiment that ran; the
     capture as POST /snapshots, GET /runs/{id}, GET /groups/{id}, GET
-    /runs (the group's entry), the report and the export each carry it.
+    /runs (the group's entry), the report, the export, and (since O3)
+    GET /attachments/{digest} and the GET /attachments list each carry
+    it.
 
     DECLARATION TRANSPORT, the house law's test. On every surface the two
     captures differ in clone_id (the clone's id, and a present null) and
@@ -1212,6 +1214,17 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
                 "GET /runs": listed[0]["attachments"][0]["capture"],
                 "report": report.json()["captures"][str(capture["id"])],
                 "export": export["captures"][str(capture["id"])],
+                # Read here, inside this label's turn: both labels compose
+                # one digest, so after the other's walk the latest capture
+                # is the other's.
+                "GET /attachments/{digest}": client.get(
+                    f"/attachments/{digest}"
+                ).json()["capture"],
+                "GET /attachments": next(
+                    row
+                    for row in client.get("/attachments").json()["attachments"]
+                    if row["digest"] == digest
+                )["capture"],
             }
 
     clone, plain_ = surfaces.pop("clone"), surfaces.pop("plain")
@@ -1224,3 +1237,96 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
         assert "clone_id" in b and b["clone_id"] is None, surface
         differing = {key for key in a.keys() | b.keys() if a.get(key) != b.get(key)}
         assert differing == {"id", "captured_at", "clone_id"}, surface
+
+
+# ----- the page's pure half, executed with node against this door ---------
+
+
+def test_the_pages_blank_check_is_the_one_rule_it_adds(request, bench, stub):
+    """WINDOW: static/lib.js cloneInputsBlocker and cloneBody, executed by
+    node over typed pairs, and each body the page would send (trimmed, as
+    the page trims) POSTed to the door with clones on.
+
+    Every pair the page blocks is one the door refuses in the model,
+    naming the field left blank, before the remote hears anything; the
+    pairs it lets through are the server's to judge: a good one is
+    cloned, and the others are refused in the server's words, not the
+    page's. PRE-STATE: the door is on and the remote serves the
+    repository."""
+    from test_api import run_lib
+
+    name, _ = repo_for(request, stub)
+    good = stub.url(OWNER, name)
+    assert bench.get("/models").json()["clones_enabled"] is True
+    pairs = [
+        ["", "main", "url"],
+        ["   ", "main", "url"],
+        [good, "", "ref"],
+        [good, " \t ", "ref"],
+        [good, "main", None],
+        [f"http://{stub.host}/o/r", "main", None],
+        [f"https://u:t@{stub.host}/o/r", "main", None],
+        [good, "+main", None],
+    ]
+    answers = run_lib(
+        "const lib = require(process.argv[1]);"
+        "console.log(JSON.stringify(INPUT.map(([u, r]) => ({"
+        " blocked: lib.cloneInputsBlocker(u.trim(), r.trim()),"
+        " body: lib.cloneBody(u.trim(), r.trim())}))));",
+        pairs,
+    )
+    for (url, ref, blank), answer in zip(pairs, answers, strict=True):
+        seen = len(stub.seen)
+        resp = bench.post("/clones", json=answer["body"])
+        if blank is not None:
+            assert answer["blocked"] is not None
+            assert resp.status_code == 422, (url, ref)
+            assert [e["loc"][-1] for e in resp.json()["detail"]] == [blank]
+            assert len(stub.seen) == seen
+        elif url == good and ref == "main":
+            assert answer["blocked"] is None
+            assert resp.status_code in (200, 201)
+        else:
+            assert answer["blocked"] is None
+            assert resp.status_code in (403, 422)
+            assert isinstance(resp.json()["detail"], str)
+
+
+def test_the_outcome_line_over_real_answers_names_no_url_and_no_root(
+    request, bench, stub
+):
+    """WINDOW: static/lib.js cloneOutcomeLine and readableClone, executed
+    by node over the door's own answers to a first clone and an update.
+
+    "cloned at" and "updated to" the head the remote serves, by seven
+    characters, and nothing of the URL or the root; both answers are
+    readable. CLONE_OUTCOMES is the door's outcome Literal.
+    PRE-STATE: upstream moved between the two clones."""
+    import typing
+
+    from test_api import run_lib
+
+    name, first = repo_for(request, stub, {"a.py": b"one\n"})
+    cloned = clone_of(bench, stub, name).json()
+    second = stub.repository(OWNER, name, {"a.py": b"two\n"})
+    assert second != first
+    updated = clone_of(bench, stub, name).json()
+    out = run_lib(
+        "const lib = require(process.argv[1]);"
+        "console.log(JSON.stringify({outcomes: lib.CLONE_OUTCOMES,"
+        " lines: INPUT.map(lib.cloneOutcomeLine),"
+        " readable: INPUT.map(lib.readableClone)}));",
+        [cloned, updated],
+    )
+    assert out["lines"] == ["cloned at " + first[:7], "updated to " + second[:7]]
+    assert out["readable"] == [True, True]
+    assert tuple(out["outcomes"]) == typing.get_args(
+        main.CloneRecord.model_fields["outcome"].annotation
+    )
+    # Exact above; and, named, what it must never hold: the root's own
+    # name, the repository, its owner and its host. (A five-character
+    # run of the whole root would find "clone", the clone root's name,
+    # in "cloned at", which is a word and not a leak.)
+    for record, line in zip((cloned, updated), out["lines"], strict=True):
+        for part in (Path(record["root"]).name, name, OWNER, stub.host):
+            assert part not in line

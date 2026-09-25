@@ -4074,3 +4074,44 @@ def test_migration_onto_pre_o_database_adds_clone_id_null_and_enforced(tmp_path)
             store.record_capture(conn, "cd", "snapshot", "1", **walk, clone_id=999)
     finally:
         conn.close()
+
+
+def test_a_listed_row_names_the_latest_capture_of_its_own_reading(db):
+    """WINDOW: store.list_attachments over a snapshot row whose bytes also
+    have a capture under another reading (a newer walker version), and a
+    document row.
+
+    latest_capture_id is keyed on the row's own digest, extractor and
+    version, as latest_capture is, so the newer capture of the other
+    reading is not the row's: a bare citation of the row never resolves
+    to it. The document's is null though its bytes were also walked by
+    another extractor at its version. PRE-STATE: the other readings'
+    captures are the newest ids for their bytes, so a key without the
+    version, or without the extractor, would name them."""
+    snapshot_row = {
+        "digest": "cc" * 32,
+        "filename": "snapshot-cccccccccccc.txt",
+        "mime": "text/plain",
+        "byte_size": 3,
+        "content": b"abc",
+        "extracted_text": "abc",
+        "extractor": "snapshot",
+        "kind": "snapshot",
+        "extractor_version": "1",
+    }
+    store.save_attachment(db, snapshot_row)
+    store.save_attachment(
+        db,
+        {**snapshot_row, "digest": "dd" * 32, "extractor": "text", "kind": "document"},
+    )
+    walk = dict(head="a" * 40, dirty=False, patterns=["*"], excludes=[], clone_id=None)
+    own = store.record_capture(db, "cc" * 32, "snapshot", "1", **walk)
+    other = store.record_capture(db, "cc" * 32, "snapshot", "2", **walk)
+    # And the document's bytes walked by another extractor at its own
+    # version: the extractor is part of the key as much as the version.
+    beside = store.record_capture(db, "dd" * 32, "snapshot", "1", **walk)
+    assert other["id"] > own["id"] and beside["id"] > own["id"]
+    rows = {row["digest"]: row for row in store.list_attachments(db, 10)}
+    assert rows["cc" * 32]["latest_capture_id"] == own["id"]
+    assert rows["dd" * 32]["latest_capture_id"] is None
+    assert store.latest_capture(db, "cc" * 32, "snapshot", "1")["id"] == own["id"]

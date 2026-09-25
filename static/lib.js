@@ -1127,6 +1127,87 @@
     );
   }
 
+  // One line saying which walk a snapshot was, for a title or a chip
+  // bit, or "" for anything without a capture. The commit is shortened
+  // to the seven characters git itself shows; "dirty" or "clean" is the
+  // tree's state at the walk, and "unknown" when the bench could read
+  // the commit but not the status. MOVED HERE FROM attach.js in Phase O,
+  // when a second control needed it (the dataset builder's snapshot
+  // option), for refusalText's reason.
+  function captureLine(capture) {
+    if (!capture || !Number.isInteger(capture.id)) return "";
+    const head =
+      typeof capture.head === "string" ? capture.head.slice(0, 7) : "no commit";
+    const state =
+      capture.dirty === true
+        ? "dirty"
+        : capture.dirty === false
+          ? "clean"
+          : "unknown";
+    return "capture #" + capture.id + " at " + head + ", " + state;
+  }
+
+  // ---- The clone step (Phase O, O3): what the page may send to POST
+  // ---- /clones, and what it says about the answer. Every rule about a
+  // ---- URL or a ref is the server's and is shown in its words; the page
+  // ---- checks only that something was typed.
+
+  // Why the Clone button cannot send yet, or null when it can. The two
+  // values are already trimmed by the page. BLANK IS NOT SENT, and
+  // nothing else is decided here: a second wording of a server rule
+  // would be a second explanation of one fact.
+  function cloneInputsBlocker(url, ref) {
+    if (url === "") {
+      return (
+        "Name the public repository to clone: an https URL of a host " +
+        "this bench lists."
+      );
+    }
+    if (ref === "") {
+      return "Name the branch, tag or 40-character commit to clone.";
+    }
+    return null;
+  }
+
+  // The request body, exactly: the door refuses any other field, and a
+  // clone is not a comparison, so nothing about the lineup rides along.
+  function cloneBody(url, ref) {
+    return { url: url, ref: ref };
+  }
+
+  const CLONE_OUTCOMES = ["cloned", "updated"];
+  const FULL_SHA = /^[0-9a-f]{40}$/;
+
+  // What the step says beside the root box once a clone has landed:
+  // whether it was made or replaced, and the commit checked out, by
+  // git's seven characters. Never the URL, the root or the ref. "" for
+  // an answer it cannot read, which the caller says in words.
+  function cloneOutcomeLine(record) {
+    if (
+      !record ||
+      !CLONE_OUTCOMES.includes(record.outcome) ||
+      typeof record.head_sha !== "string" ||
+      !FULL_SHA.test(record.head_sha)
+    ) {
+      return "";
+    }
+    const head = record.head_sha.slice(0, 7);
+    return record.outcome === "cloned"
+      ? "cloned at " + head
+      : "updated to " + head;
+  }
+
+  // Whether a clone's success body can be acted on: an outcome the step
+  // can name, and a root to put in the box. A 2xx that says less is said
+  // in words, and the root box keeps what it held.
+  function readableClone(record) {
+    return (
+      cloneOutcomeLine(record) !== "" &&
+      typeof record.root === "string" &&
+      record.root !== ""
+    );
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -1182,6 +1263,12 @@
     unfixableRow,
     listingSummary,
     checkedSummary,
+    captureLine,
+    CLONE_OUTCOMES,
+    cloneInputsBlocker,
+    cloneBody,
+    cloneOutcomeLine,
+    readableClone,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;
