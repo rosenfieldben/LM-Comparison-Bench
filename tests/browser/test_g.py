@@ -323,9 +323,11 @@ def test_review_repro_a_zero_billed_session_is_not_reported_as_unpriced_idle(ben
     """
     page = bench(["stub/fast"])
     spend = page.get_by_test_id("stat-spend")
-    # Untouched: the fixed zero, honestly, because nothing has run.
+    # Untouched: the fixed zero, honestly, because nothing has run. (The
+    # tooltip names the composer's runs since N3, which added a second
+    # thing on the page that spends: an experiment's cost is its report's.)
     expect(spend).to_have_text("~$0.0000")
-    expect(spend).to_have_attribute("title", re.compile("nothing priced yet"))
+    expect(spend).to_have_attribute("title", re.compile("^no composer run priced yet"))
 
     shown = page.evaluate(
         """() => {

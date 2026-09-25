@@ -136,11 +136,13 @@ MAX_POSITION = 999
 # unintended paid request: the caller asked for one thing, the bench did
 # another, and the money moved either way. A 422 naming the offending field
 # costs nothing and turns a silent wrong run into an obvious mistake.
-# The audience is whoever hand-writes a request (curl, a script): FastAPI's
-# 422 detail is a list of per-field errors, and the card's error path only
-# renders a string detail, so a card would read "HTTP 422" rather than the
-# field name. That is not worth widening the error renderer for, because the
-# frontend sends fixed bodies and cannot produce this 422 at all.
+# The audience is whoever hand-writes a request (curl, a script). The
+# browser builds every body from a fixed set of keys (the composer's, the
+# dataset builder's, the experiment form's BenchLib.experimentBody), so it
+# cannot produce this 422 at all. The dataset and experiment panels print
+# any other list-shaped 422 item by item through BenchLib.refusalText;
+# the composer's card path and its attachment upload render only a string
+# detail, and show the status for a list.
 FORBID_UNKNOWN = ConfigDict(extra="forbid")
 
 # The largest document the bench will take, measured in DECODED bytes.

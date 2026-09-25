@@ -939,20 +939,17 @@
     libraryEl.textContent = message;
   }
 
-  // The selection line. Nothing on the page creates an experiment yet,
-  // so it names the digest an experiment takes rather than promising an
-  // effect no control delivers.
+  // The selection line: which stored dataset the experiment form below
+  // will create over.
   function renderSelected() {
     const chosen = library.find((d) => d.digest === selectedDigest);
     setText(
       selectedEl,
       chosen
-        ? "selected: " +
+        ? "selected for a new experiment: " +
             chosen.name +
             " · sha256 " +
-            shortDigest(chosen.digest) +
-            " · an experiment names it as dataset_digest " +
-            chosen.digest
+            shortDigest(chosen.digest)
         : "",
     );
     for (const el of libraryEl.querySelectorAll(
@@ -993,7 +990,10 @@
     // than kept as a digest nothing on screen describes; the note below
     // a full list says why one can fall off it.
     if (!library.some((d) => d.digest === selectedDigest)) {
-      selectedDigest = null;
+      if (selectedDigest !== null) {
+        selectedDigest = null;
+        selectionChanged();
+      }
     }
     if (library.length === 0) {
       setLibraryState("empty", "no stored datasets yet");
@@ -1034,6 +1034,7 @@
         selectedDigest =
           selectedDigest === dataset.digest ? null : dataset.digest;
         renderSelected();
+        selectionChanged();
       });
       libraryEl.append(row);
     }
@@ -1099,13 +1100,23 @@
     renderRows();
   }
 
-  // selected() is for the experiment form, which does not exist yet: N3
-  // adds it, and its Start sends the selection as dataset_digest. Until
-  // then nothing on the page reads it, and the selection line says how an
-  // experiment names the dataset by hand.
+  // Everything that wants to know when the selection changed: the
+  // experiment form reads it for the dataset it creates over, the scorer
+  // kinds its primary metric offers, and whether an attachments mode can
+  // be chosen at all.
+  const selectionListeners = [];
+  function selectionChanged() {
+    for (const listener of selectionListeners) listener();
+  }
+
+  // selected() is what the experiment form creates over: the stored
+  // dataset chosen here, as the server listed it, or null. Create sends
+  // its digest; Start sends the digest the experiment recorded, which is
+  // the same one.
   window.BenchDatasets = {
     init,
     selected: () => library.find((d) => d.digest === selectedDigest) || null,
+    onSelect: (listener) => selectionListeners.push(listener),
     refresh: loadLibrary,
   };
 })();

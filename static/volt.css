@@ -752,7 +752,8 @@
 
   /* ==== History strip: flat, no panel chrome ==== */
   #history summary,
-  #datasets summary {
+  #datasets summary,
+  #experiments summary {
     list-style: none;
     cursor: pointer;
     display: flex;
@@ -766,11 +767,14 @@
     color: var(--text-dim);
   }
   #history summary::-webkit-details-marker,
-  #datasets summary::-webkit-details-marker { display: none; }
+  #datasets summary::-webkit-details-marker,
+  #experiments summary::-webkit-details-marker { display: none; }
   #history summary::before,
-  #datasets summary::before { content: "▸"; color: var(--text-ghost); }
+  #datasets summary::before,
+  #experiments summary::before { content: "▸"; color: var(--text-ghost); }
   #history[open] summary::before,
-  #datasets[open] summary::before { content: "▾"; }
+  #datasets[open] summary::before,
+  #experiments[open] summary::before { content: "▾"; }
   #history-tools { display: flex; align-items: center; gap: 10px; padding: 0 2px 8px; }
   #history-filter {
     flex: 1;
@@ -1201,3 +1205,67 @@
 #dataset-library { font-size: 11px; color: var(--text-faint); padding-bottom: 8px; }
 .ds-entry[aria-pressed="true"] { box-shadow: inset 2px 0 0 var(--accent); }
 .ds-library-note { padding: 6px 2px 0; color: var(--text-faint); }
+
+/* ---- Experiments: the form, the selected experiment and the list
+   (Phase N3). The form and the selected experiment sit on the panel
+   surface, as the dataset builder does, and their text is --text-faint,
+   --text-sec, --text and --err there; the list below is the history
+   strip's flat rows on the page, its "Recorded" label in --text-dim for
+   the reason the datasets library gives. A selected row is marked by
+   the accent bar alone. Every pairing is in tests/browser/test_contrast.py,
+   and tests/browser/test_n3.py measures the panel's own text on the live
+   page. */
+#experiment-create,
+#experiment-selected {
+  display: grid;
+  gap: 8px;
+  margin: 0 2px 10px;
+  padding: 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+#experiment-head,
+#experiment-create-row,
+#experiment-start-row,
+#experiment-list-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+#experiment-head .panel-label,
+#experiment-list-head .panel-label { margin: 0; }
+#experiment-list-head .panel-label { color: var(--text-dim); }
+#experiment-name { flex: 1; min-width: 160px; max-width: 420px; }
+#experiment-sources { display: grid; gap: 2px; font-size: 11px; color: var(--text-sec); }
+#experiment-fields { display: flex; flex-wrap: wrap; gap: 10px; align-items: flex-end; }
+.xp-cap { display: grid; gap: 2px; }
+.xp-cap-text { font-size: 10.5px; color: var(--text-faint); }
+.xp-cap input[type="number"] { width: 150px; }
+.xp-check { display: flex; gap: 6px; align-items: center; font-size: 11px; color: var(--text-sec); }
+#experiment-notes { display: grid; gap: 2px; }
+#experiment-estimand-note,
+#experiment-attachments-note,
+#experiment-create-nudge,
+#experiment-projection,
+#experiment-start-note,
+#experiment-counters,
+#experiment-dataset,
+#experiment-stream { font-size: 11px; color: var(--text-faint); }
+#experiment-estimand-note:empty,
+#experiment-attachments-note:empty,
+#experiment-start-note:empty { display: none; }
+#experiment-title { font-size: 12px; color: var(--text); }
+#experiment-status { font-size: 11px; color: var(--text-sec); }
+#experiment-create-msg,
+#experiment-action-msg { font-size: 11px; color: var(--text-sec); }
+#experiment-create-msg:empty,
+#experiment-action-msg:empty,
+#experiment-stream:empty { display: none; }
+#experiment-create-msg[data-state="refused"],
+#experiment-action-msg[data-state="refused"] { color: var(--err); }
+#experiment-list-head { padding: 0 2px 4px; }
+#experiment-list-note { font-size: 11px; color: var(--text-faint); }
+#experiment-list { font-size: 11px; color: var(--text-faint); padding-bottom: 8px; }
+.xp-entry[aria-pressed="true"] { box-shadow: inset 2px 0 0 var(--accent); }

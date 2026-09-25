@@ -258,10 +258,11 @@ load-bearing). `static/lib.js` holds the pure,
 DOM-free helpers, including the diff engine. The DOM logic is split by
 concern into small classic scripts, each assigning one `window.Bench*`
 namespace: `state`, `controls`, `attach`, `render`, `diff`, `library`,
-`stream`, `rating`, `experiments` (the report), `datasets` and `history`,
-with `boot.js` wiring them last. Cross-file access goes
-through the namespaces, so a load-order mistake fails loudly rather than
-silently at click time; the script order in index.html is load-bearing.
+`stream`, `rating`, `experiments` (the report), `datasets`, `lifecycle`
+(the experiment panel) and `history`, with `boot.js` wiring them last.
+Cross-file access goes through the namespaces, so a load-order mistake
+fails loudly rather than silently at click time; the script order in
+index.html is load-bearing.
 All are served from the `/static` mount.
 
 Every response that does not choose its own caching carries
@@ -285,8 +286,9 @@ A full-width command bar carries the brand plus live session stats:
 run count, spend (tilde-marked while any contribution to it was an
 estimate, with a count of unpriced results when any run could not be
 priced by either route), mean TTFT of completed requests, and
-lineup size. They are this browser session's totals and reset on
-reload.
+lineup size. They are this browser session's totals for the composer's
+runs and reset on reload; an experiment's cost is in its report, not
+here.
 
 Controls sit in one console deck above the results, three rows: the
 prompt row (auto-growing monospace textarea in an inset field, plus
@@ -1582,12 +1584,14 @@ comparison is worth checking against the models you picked.
 
 There is a routing flag that converts that silence into a hard failure,
 `require_parameters`, which restricts a request to providers supporting
-every parameter it carries. **The bench deliberately does not send it.**
-It would change which providers are eligible, and changing the eligible
-set changes what is being measured, which is the opposite of what these
-controls are for: you would be comparing a different population of
-providers depending on which controls you set. Choosing that tradeoff is a
-decision for a later phase, not a default to slip in with this one.
+every parameter it carries. **The composer and every routed-service
+experiment deliberately do not send it.** It would change which
+providers are eligible, and changing the eligible set changes what is
+being measured, which is the opposite of what these controls are for: you
+would be comparing a different population of providers depending on
+which controls you set. Phase I made that tradeoff a declaration rather
+than a default: an `underlying_model` experiment sends it, and its
+report says which estimand it answers (see Estimands).
 
 Every field name, bound and behavior above is pinned against OpenRouter's
 current documentation, with the URLs and the dates they were read in the
@@ -1932,11 +1936,9 @@ panel says afterwards (an import, a file loaded) takes the message line,
 and the mark then stands on its own.
 
 Stored datasets are listed newest first (the newest 500) with their task
-count, scorer kinds and digest. Selecting one marks it and shows the
-`dataset_digest` an experiment names it by, and loads nothing back into
-the builder: editing a stored dataset is storing a new one. No control on
-the page creates an experiment yet, so the selection is for reading the
-digest off; experiments are still created through the API below.
+count, scorer kinds and digest. Selecting one marks it for the
+experiment form in the Experiments panel and loads nothing back into the
+builder: editing a stored dataset is storing a new one.
 
 ## Experiments
 
@@ -1961,6 +1963,38 @@ curl -X POST localhost:8000/experiments \
 
 For a stored dataset, send `"dataset_digest": "<digest>"` in place of
 `dataset_path`; exactly one of the two.
+
+**In the browser**, the **Experiments** panel creates an experiment over
+a stored dataset, starts it, watches it, stops it, and opens its report.
+Money moves on Start and on nothing else.
+
+- **Create** reads the dataset selected in the Datasets panel and the
+  composer's own checked lineup, budget and `+ Controls`, at the moment
+  it is pressed, so there is one of each on the page. Beside them:
+  repeats, a task order seed, the estimand, the attachments mode
+  (disabled, with the reason, when the dataset cites no document: the
+  server refuses native there, and inline is its default), a primary
+  metric over the scorer kinds the dataset uses, and halt on refusal. A
+  blank box is not sent, so the row is the one the API makes with that
+  key absent. Create is free, and its button says so.
+- **Start** is live for a created experiment and nothing else, and sends
+  the digest the experiment recorded; one created from a file by path,
+  whose dataset the store does not hold, is started through the API, and
+  the panel says so. There is no confirm dialog: the projection Create
+  returned is shown beside it, as described below, output as a ceiling
+  on tokens, input as an estimate, and the total, or, when any lineup
+  member is unpriced, those members named and no figure. The projection
+  is not stored, so an experiment created elsewhere, or before a reload,
+  shows none and says so.
+- **Progress** is watched while it runs: done, failed and refused of the
+  total, and the status with its detail verbatim. A dropped stream
+  reconnects by itself and the first frame after it carries the current
+  counters; the stream is closed when the experiment finishes.
+- **Stop** is present while it runs, and the trial in flight finishes
+  first.
+- Selecting a row marks it and opens its report, as it always has.
+
+The strict-mode fields are not set from the page: see Estimands below.
 
 The row is written complete before anything runs, exactly as a group row
 is written before its first upstream call: it is the declaration, and what
@@ -2145,6 +2179,14 @@ at trial one of three hundred, and the checks refuse rather than assume:
 
 `max_tokens` is checked even though no control sets it, because every
 payload the bench builds carries one.
+
+The browser's experiment form offers the estimand and nothing more:
+`provider_pins` and `quantizations` are set through the API. Choosing
+underlying model with no pins is a request the server takes, and the
+selector is there so the record can say which question it answers. The
+strict-mode fields are deferred past Phase N to a phase of their own,
+because strict mode carries its own family of refusals and each needs a
+browser proof; `BACKLOG.md` holds the entry and its reason.
 
 ## Running an experiment
 
@@ -3177,6 +3219,12 @@ picked up without restarts, and verify by eyeball after UI changes:
   earlier name stands. Upload a CRLF file and compare the listed digest
   with `sha256sum` of the file. Select a stored dataset and confirm the
   builder did not change.
+- Experiments: select a stored dataset, check two models, open the
+  Experiments panel, name one and Create: the projection appears beside
+  Start and nothing is spent. Start it: the counters climb to the total
+  and the report opens. Start another over several tasks with a slow
+  model and press Stop partway: the status reads "stopped between
+  trials" and the report counts the trials that never ran.
 
 ## License
 

@@ -34,6 +34,12 @@ const {
   refusalLine,
   countLines,
   refusalText,
+  hasControls,
+  experimentFinished,
+  experimentBody,
+  experimentNudge,
+  projectionText,
+  experimentRowMeta,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -871,4 +877,220 @@ test("countLines ends a line at a newline and at nothing else", () => {
     assert.equal(countLines("a" + mark + "b"), 1, code.toString(16));
   }
   assert.equal(countLines("a\nb"), 2);
+});
+
+// ---- Phase N3: the experiment form. The unit suite executes the same
+// ---- functions against the real door; these pin the composing half.
+
+function form(fields) {
+  return Object.assign(
+    {
+      name: "n",
+      digest: "d".repeat(64),
+      lineup: ["a/b"],
+      budget: "standard",
+      params: {},
+      repeats: "",
+      seed: "",
+      estimand: "routed_service",
+      attachments: null,
+      metric: "",
+      halt: true,
+      invalid: [],
+    },
+    fields,
+  );
+}
+
+test("hasControls is false for no controls and an empty set", () => {
+  assert.strictEqual(hasControls(null), false);
+  assert.strictEqual(hasControls(undefined), false);
+  assert.strictEqual(hasControls({}), false);
+  assert.strictEqual(hasControls({ temperature: 0 }), true);
+});
+
+test("experimentBody writes a key only when it was set", () => {
+  assert.deepStrictEqual(experimentBody(form({})), {
+    name: "n",
+    dataset_digest: "d".repeat(64),
+    lineup: ["a/b"],
+    budget: "standard",
+    estimand_mode: "routed_service",
+    halt_on_refusal: true,
+  });
+  const set = experimentBody(
+    form({
+      params: { top_p: 1 },
+      repeats: "3",
+      seed: "0",
+      attachments: "inline",
+      metric: "judge",
+      halt: false,
+    }),
+  );
+  assert.deepStrictEqual(set.params, { top_p: 1 });
+  assert.strictEqual(set.repeats, 3);
+  // Zero is a seed, not a blank: Number("") is 0 as well.
+  assert.strictEqual(set.task_order_seed, 0);
+  assert.strictEqual(set.attachments_mode, "inline");
+  assert.strictEqual(set.primary_metric, "judge");
+  assert.strictEqual(set.halt_on_refusal, false);
+  // Read as the number box means it: "1e1" is ten, as Chromium validates
+  // it, not the one parseInt would read.
+  assert.strictEqual(experimentBody(form({ repeats: "1e1" })).repeats, 10);
+  // Past what JavaScript holds exactly, the text goes for the server to
+  // refuse in its own words.
+  assert.strictEqual(
+    experimentBody(form({ seed: "9007199254740993" })).task_order_seed,
+    "9007199254740993",
+  );
+});
+
+test("experimentBody sends a copy of the lineup, never the live array", () => {
+  const lineup = ["a/b"];
+  const body = experimentBody(form({ lineup }));
+  lineup.push("c/d");
+  assert.deepStrictEqual(body.lineup, ["a/b"]);
+});
+
+test("experimentNudge names what the server would refuse, first first", () => {
+  assert.strictEqual(
+    experimentNudge(form({ name: "" })),
+    "name the experiment",
+  );
+  assert.match(
+    experimentNudge(form({ name: String.fromCodePoint(0x1f600).repeat(201) })),
+    /201 characters, over the 200 limit/,
+  );
+  assert.strictEqual(
+    experimentNudge(form({ name: String.fromCodePoint(0x1f600).repeat(200) })),
+    null,
+  );
+  // A name of spaces is legal to the server.
+  assert.strictEqual(experimentNudge(form({ name: "   " })), null);
+  assert.strictEqual(
+    experimentNudge(form({ digest: null })),
+    "select a stored dataset in Datasets above",
+  );
+  assert.strictEqual(
+    experimentNudge(form({ lineup: [] })),
+    "check a model in the lineup above",
+  );
+  assert.strictEqual(
+    experimentNudge(form({ invalid: ["temperature", "repeats"] })),
+    "check temperature, repeats",
+  );
+});
+
+test("projectionText says every shape the door returns", () => {
+  assert.strictEqual(projectionText(null), "");
+  assert.strictEqual(
+    projectionText({
+      input_usd: 0.000008,
+      output_usd: 0.262144,
+      total_usd: 0.262152,
+      unpriced: [],
+    }),
+    "output at most $0.26 (a ceiling on tokens, not on the bill) · " +
+      "input about $0.000008 (an estimate) · total $0.26",
+  );
+  // Native mode: the output stands, nobody is unpriced, and there is no
+  // input estimate and so no total.
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: 0.032768,
+      total_usd: null,
+      unpriced: [],
+    }),
+    "output at most $0.033 (a ceiling on tokens, not on the bill) · " +
+      "no input estimate, so no total",
+  );
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: ["x/y (charges request)"],
+    }),
+    "unpriced: x/y (charges request). No figure is given, because a total " +
+      "missing one arm would read as the whole comparison's total.",
+  );
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: [],
+    }),
+    "no projection: the figures could not be computed",
+  );
+  // Every unpriced member is named, in the door's order.
+  assert.strictEqual(
+    projectionText({
+      input_usd: null,
+      output_usd: null,
+      total_usd: null,
+      unpriced: ["a/b", "c/d"],
+    }),
+    "unpriced: a/b, c/d. No figure is given, because a total missing one " +
+      "arm would read as the whole comparison's total.",
+  );
+  // A real zero is a figure, not an absence, in each place it can stand.
+  assert.strictEqual(
+    projectionText({
+      input_usd: 0,
+      output_usd: 0,
+      total_usd: 0,
+      unpriced: [],
+    }),
+    "output at most $0 (a ceiling on tokens, not on the bill) · " +
+      "input about $0 (an estimate) · total $0",
+  );
+});
+
+test("experimentFinished is every status but created and running", () => {
+  for (const status of ["created", "running"]) {
+    assert.strictEqual(experimentFinished(status), false);
+  }
+  for (const status of [
+    "done",
+    "stopped",
+    "halted_on_refusal",
+    "interrupted",
+    "failed",
+  ]) {
+    assert.strictEqual(experimentFinished(status), true);
+  }
+});
+
+test("experimentRowMeta counts every finished trial and names the trouble", () => {
+  const row = (fields) => ({
+    status: "done",
+    trials_total: 6,
+    trials_done: 0,
+    trials_failed: 0,
+    trials_refused: 0,
+    ...fields,
+  });
+  assert.strictEqual(
+    experimentRowMeta(row({ trials_done: 6 })),
+    "done · 6/6 trials",
+  );
+  assert.strictEqual(
+    experimentRowMeta(
+      row({ status: "halted_on_refusal", trials_done: 2, trials_refused: 1 }),
+    ),
+    "halted_on_refusal · 3/6 trials (1 refused)",
+  );
+  assert.strictEqual(
+    experimentRowMeta(
+      row({ trials_done: 3, trials_failed: 2, trials_refused: 1 }),
+    ),
+    "done · 6/6 trials (2 failed, 1 refused)",
+  );
+  assert.strictEqual(
+    experimentRowMeta(row({ status: "running", trials_total: 1 })),
+    "running · 0/1 trials",
+  );
 });

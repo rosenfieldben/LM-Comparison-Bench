@@ -485,7 +485,8 @@
 
   // The builder's own bound, which the server does not have: past this
   // many rows a person composing by hand is better served pasting or
-  // uploading JSONL. Proposed at 50 in the commission, pending a ruling.
+  // uploading JSONL. 50, as proposed in the commission and confirmed at
+  // the N2 checkpoint.
   const BUILDER_MAX_ROWS = 50;
 
   // bench.datasets.SCORERS, in its order; the same test holds the pair.
@@ -712,6 +713,182 @@
     return fallback;
   }
 
+  // ---- The experiment lifecycle (Phase N3).
+  //
+  // THE BROWSER COMPOSES; THE SERVER VALIDATES, as in the builder. These
+  // turn what the experiment form holds into the body POST /experiments
+  // reads, name the few omissions plain enough to grey Create, and say
+  // what a projection means. None of them decides whether an experiment
+  // is valid: create_experiment does, and its sentence is what the page
+  // prints.
+
+  // Whether a controls object holds anything at all. Rule one lives here
+  // on the client side: an empty controls set must produce a body with no
+  // params key, not a body carrying an empty object, because the server
+  // stores the two identically but the wire should not have to be trusted
+  // to collapse them. Moved here from stream.js when the experiment form
+  // needed it, so the composer and the form read blank controls one way.
+  function hasControls(controls) {
+    return controls != null && Object.keys(controls).length > 0;
+  }
+
+  // Mirrors of the ExperimentCreate bounds the form shows or checks, the
+  // SERVER's numbers: tests/test_api.py executes this file with node and
+  // holds each equal to the constant it names, and the markup's min and
+  // max for repeats and the task order seed to the model's, for the
+  // reason DATASET_LIMITS gives.
+  const EXPERIMENT_LIMITS = {
+    maxNameChars: 200, // bench.main.ExperimentCreate.name max_length
+    maxRepeats: 20, // bench.main.MAX_REPEATS
+    maxSeed: 9007199254740991, // bench.main.MAX_SEED
+    // How many GET /experiments lists, newest first: the default limit of
+    // bench.store.list_experiments, which the door passes on unchanged.
+    listed: 100,
+  };
+
+  // Whether an experiment has finished: every status but these two is
+  // terminal, and the progress door closes its stream on one.
+  function experimentFinished(status) {
+    return status !== "created" && status !== "running";
+  }
+
+  // A whole-number box as the body sends it. BLANK IS NOT SENT, so an
+  // empty box is absent, and the server's default (one repeat, file
+  // order) is what the record says. Otherwise a number when the box reads
+  // as a whole number JavaScript holds exactly, and the text when it does
+  // not, so the server's own sentence says what is wrong with it.
+  function wholeNumberField(text) {
+    if (isBlank(text)) return undefined;
+    const value = Number(text);
+    return Number.isSafeInteger(value) ? value : text;
+  }
+
+  // The body POST /experiments is sent, from what the form holds.
+  //
+  // RULE ONE: A KEY IS WRITTEN ONLY WHEN IT WAS SET. No params key for a
+  // blank controls panel, no repeats or task_order_seed for an empty
+  // box, no primary_metric when none is declared, and no attachments_mode
+  // while that control is disabled (the dataset cites no document, so the
+  // server refuses native and inline is its default). estimand_mode and
+  // halt_on_refusal
+  // are always written: a select and a checkbox have no blank state, so
+  // what they show is what the person left them saying.
+  //
+  // THE DATASET IS NAMED BY DIGEST, never by path: the form creates only
+  // from a stored dataset, and the digest is the identity the record
+  // cites.
+  function experimentBody(form) {
+    const body = {
+      name: form.name,
+      dataset_digest: form.digest,
+      lineup: form.lineup.slice(),
+      budget: form.budget,
+    };
+    if (hasControls(form.params)) body.params = form.params;
+    const repeats = wholeNumberField(form.repeats);
+    if (repeats !== undefined) body.repeats = repeats;
+    const seed = wholeNumberField(form.seed);
+    if (seed !== undefined) body.task_order_seed = seed;
+    body.estimand_mode = form.estimand;
+    if (form.attachments !== null) body.attachments_mode = form.attachments;
+    if (form.metric !== "") body.primary_metric = form.metric;
+    body.halt_on_refusal = form.halt;
+    return body;
+  }
+
+  // Why Create is greyed, or null. A COURTESY AND NOT A RULE, as the
+  // builder's nudges are: each is a request the server would refuse (an
+  // empty name, a name over its bound, no dataset, no model), or one the
+  // composer already refuses to send (a control or box its own validity
+  // check fails, whose typed value would otherwise be dropped from the
+  // body without a word). A name of spaces is legal to the server and is
+  // not nudged.
+  function experimentNudge(form) {
+    if (form.name === "") return "name the experiment";
+    const chars = codePoints(form.name);
+    if (chars > EXPERIMENT_LIMITS.maxNameChars) {
+      return (
+        "the name is " +
+        chars +
+        " characters, over the " +
+        EXPERIMENT_LIMITS.maxNameChars +
+        " limit"
+      );
+    }
+    if (!form.digest) return "select a stored dataset in Datasets above";
+    if (form.lineup.length === 0) return "check a model in the lineup above";
+    if (form.invalid.length > 0) return "check " + form.invalid.join(", ");
+    return null;
+  }
+
+  // A list row's counts. Progress is trials FINISHED, the three disjoint
+  // buckets added up: showing trials_done alone would leave an experiment
+  // whose trials are failing looking stuck rather than failing, and the
+  // two are the opposite of each other to act on. The failed and refused
+  // are named beside the sum.
+  function experimentRowMeta(experiment) {
+    const finished =
+      experiment.trials_done +
+      experiment.trials_failed +
+      experiment.trials_refused;
+    const trouble = [];
+    if (experiment.trials_failed > 0) {
+      trouble.push(experiment.trials_failed + " failed");
+    }
+    if (experiment.trials_refused > 0) {
+      trouble.push(experiment.trials_refused + " refused");
+    }
+    return (
+      experiment.status +
+      " · " +
+      finished +
+      "/" +
+      experiment.trials_total +
+      " trials" +
+      (trouble.length ? " (" + trouble.join(", ") + ")" : "")
+    );
+  }
+
+  // A projection as the README describes it: the output figure a ceiling
+  // on tokens (not on the bill), the input figure an estimate, and a
+  // total only when both halves exist. WHEN ANY LINEUP MEMBER IS UNPRICED
+  // EVERY FIGURE IS NULL and the members are named, verbatim, because a
+  // total missing one arm of a comparison reads as the comparison's
+  // total. A null figure with nobody unpriced (native mode, where images
+  // are not estimated) says what is missing instead of a total.
+  function projectionText(projection) {
+    if (!projection) return "";
+    const usd = (value) => "$" + fmtEstimate(value);
+    if (projection.unpriced.length > 0) {
+      return (
+        "unpriced: " +
+        projection.unpriced.join(", ") +
+        ". No figure is given, because a total missing one arm would " +
+        "read as the whole comparison's total."
+      );
+    }
+    const parts = [];
+    if (projection.output_usd !== null) {
+      parts.push(
+        "output at most " +
+          usd(projection.output_usd) +
+          " (a ceiling on tokens, not on the bill)",
+      );
+    }
+    if (projection.input_usd !== null) {
+      parts.push("input about " + usd(projection.input_usd) + " (an estimate)");
+    }
+    if (projection.total_usd !== null) {
+      parts.push("total " + usd(projection.total_usd));
+    } else if (parts.length > 0) {
+      parts.push("no input estimate, so no total");
+    }
+    if (parts.length === 0) {
+      return "no projection: the figures could not be computed";
+    }
+    return parts.join(" · ");
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -747,6 +924,13 @@
     refusalLine,
     countLines,
     refusalText,
+    hasControls,
+    EXPERIMENT_LIMITS,
+    experimentFinished,
+    experimentBody,
+    experimentNudge,
+    projectionText,
+    experimentRowMeta,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;

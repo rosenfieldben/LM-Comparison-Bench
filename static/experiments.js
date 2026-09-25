@@ -564,7 +564,15 @@
     throw new Error(detail);
   }
 
+  // Each show() is numbered, and a report whose fetch returns after a
+  // newer show() began is dropped: the experiment panel opens reports on
+  // its own (after Create, when a watched run finishes) as well as on a
+  // click, and a late answer appended under a newer one stacked two
+  // experiments' reports in one panel.
+  let showVersion = 0;
+
   async function show(experimentId, datasetPath) {
+    const version = ++showVersion;
     // Undefined means "whatever the operator last applied", which is how
     // opening a second experiment keeps their file. An explicit empty
     // string means they cleared it, and that has to survive.
@@ -584,6 +592,7 @@
     try {
       report = await fetchReport(experimentId, path);
     } catch (err) {
+      if (version !== showVersion) return;
       // Same rule as every other load in this app: the failure is on the
       // page and on the console, never only in a variable.
       console.error("report load failed", err);
@@ -592,6 +601,7 @@
       panel.dataset.state = "error";
       return;
     }
+    if (version !== showVersion) return;
     note.remove();
     panel.append(banner(report));
     // Above the tables, because the documents changed what every model
@@ -607,92 +617,8 @@
     panel.dataset.state = "ready";
   }
 
-  // ---- The list, so the report has a way in.
-
-  const listEl = document.getElementById("experiment-list");
-  const detailsEl = document.getElementById("experiments");
-
-  // Same state discipline as the history panel, and for the same reason:
-  // an empty list means two different things while a fetch is in flight,
-  // so the panel names its own state rather than leaving a blank to be
-  // read as "none".
-  function setState(state, message) {
-    listEl.dataset.state = state;
-    listEl.textContent = message;
-  }
-
-  async function loadExperiments() {
-    setState("loading", "loading experiments");
-    let data;
-    try {
-      const resp = await fetch("/experiments");
-      if (!resp.ok) throw new Error("HTTP " + resp.status);
-      data = await resp.json();
-    } catch (err) {
-      console.error("experiment list load failed", err);
-      setState("error", "failed to load experiments: " + err.message);
-      return;
-    }
-    if (data.experiments.length === 0) {
-      setState("empty", "no experiments yet");
-      return;
-    }
-    setState("ready", "");
-    for (const experiment of data.experiments) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "hrow";
-      row.dataset.testid = "experiment-row";
-      const time = document.createElement("span");
-      time.className = "htime";
-      time.textContent =
-        experiment.created_at.slice(0, 19).replace("T", " ") + " UTC";
-      const name = document.createElement("span");
-      name.className = "hprompt";
-      name.textContent = experiment.name;
-      const meta = document.createElement("span");
-      meta.className = "hcount";
-      // Progress is trials FINISHED, which is the three disjoint buckets
-      // added up. Showing trials_done alone would leave an experiment
-      // whose trials are failing looking stuck rather than failing, and
-      // the two are the opposite of each other to act on.
-      const finished =
-        experiment.trials_done +
-        experiment.trials_failed +
-        experiment.trials_refused;
-      const trouble = [];
-      if (experiment.trials_failed > 0)
-        trouble.push(experiment.trials_failed + " failed");
-      if (experiment.trials_refused > 0)
-        trouble.push(experiment.trials_refused + " refused");
-      meta.textContent =
-        experiment.status +
-        " · " +
-        finished +
-        "/" +
-        experiment.trials_total +
-        " trials" +
-        (trouble.length ? " (" + trouble.join(", ") + ")" : "");
-      row.append(time, name, meta);
-      row.addEventListener("click", () => show(experiment.id));
-      listEl.append(row);
-    }
-  }
-
-  function init() {
-    detailsEl.addEventListener("click", (event) => {
-      // The synchronous claim, exactly as the history panel makes it:
-      // toggle is dispatched asynchronously, so without this the panel
-      // still reads the previous load's terminal state when the click
-      // lands. See static/history.js for the incident that taught it.
-      if (!detailsEl.open && event.target.closest("summary")) {
-        setState("loading", "loading experiments");
-      }
-    });
-    detailsEl.addEventListener("toggle", () => {
-      if (detailsEl.open) loadExperiments();
-    });
-  }
-
-  window.BenchReport = { show, init };
+  // The list the report is opened from lives in static/lifecycle.js,
+  // with the rest of the experiment panel: selecting a row there calls
+  // show.
+  window.BenchReport = { show };
 })();

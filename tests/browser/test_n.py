@@ -1586,9 +1586,10 @@ def test_selecting_a_stored_dataset_selects_it_and_loads_nothing(
     """WINDOW: clicks on a stored dataset in the library, a reload of the
     library, and the builder beside it.
 
-    Selecting marks the row, shows the digest an experiment names it by
-    (nothing on the page creates one yet, so the line promises no more)
-    and hands it to BenchDatasets.selected; the builder's rows and name
+    Selecting marks the row, says it is selected for a new experiment
+    (the experiment panel creates over it; tests/browser/test_n3.py
+    proves that half) and hands it to BenchDatasets.selected; the
+    builder's rows and name
     are untouched, because a stored dataset is a record and editing it is
     storing a new one. A reload that finds the same selection does not
     re-announce it, and a second click lets it go."""
@@ -1613,12 +1614,7 @@ def test_selecting_a_stored_dataset_selects_it_and_loads_nothing(
 
     expect(entry).to_have_attribute("aria-pressed", "true")
     expect(selected).to_have_text(
-        "selected: "
-        + name
-        + " · sha256 "
-        + digest[:7]
-        + " · an experiment names it as dataset_digest "
-        + digest
+        "selected for a new experiment: " + name + " · sha256 " + digest[:7]
     )
     assert page.evaluate("window.BenchDatasets.selected().digest") == digest
     expect(page.get_by_test_id("dataset-row")).to_have_count(1)

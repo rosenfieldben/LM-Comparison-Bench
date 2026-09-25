@@ -66,8 +66,22 @@
     experimentParams,
     setExperimentParams,
     reuseExperiment,
+    // Read by the experiment form, which sends the same lineup, budget
+    // and controls the composer does and refuses to Create while a
+    // control fails the check that refuses a Run.
+    invalidControls,
+    onChange,
     init,
   };
+
+  // Everything that wants to know when the lineup, the budget or a
+  // control changed. updateRunState is the one function every such
+  // change reaches, so it tells these after it has settled the Run
+  // button; the button keeps its single owner and a listener only reads.
+  const changeListeners = [];
+  function onChange(listener) {
+    changeListeners.push(listener);
+  }
 
   const promptEl = document.getElementById("prompt");
   const modelsEl = document.getElementById("models");
@@ -455,6 +469,7 @@
     lineupLabel.textContent = "Lineup " + checked + "/" + C.lineup.length;
     renderLinked();
     updateEstimate();
+    for (const listener of changeListeners) listener();
   }
 
   async function loadCatalog() {

@@ -47,8 +47,11 @@
     // library entry, so the link would lie.
     selectedPromptId: null,
     // ---- Command-bar session stats. Runs, spend and mean TTFT are this
-    // ---- browser session's live totals, reset by a reload on purpose:
-    // ---- the bar answers "what has this sitting cost me", not history.
+    // ---- browser session's live totals for the composer's runs, reset by
+    // ---- a reload on purpose: the bar answers "what have my runs cost me
+    // ---- this sitting", not history. An experiment started from the
+    // ---- panel is not counted here; its cost is in its report, which
+    // ---- reads it from the trials themselves.
     // estimated counts the contributions that came from catalog arithmetic
     // rather than from a billed figure. The total is a mix whenever it is
     // nonzero, and one estimated contribution is enough to make the whole
@@ -208,19 +211,20 @@
     // runs: a fixed string calling it an estimate became false the moment
     // a billed figure landed in it.
     const composition = idle
-      ? "nothing priced yet this session"
+      ? "no composer run priced yet this session"
       : state.sessionStats.estimated > 0
         ? "part billed by OpenRouter, part estimated from catalog " +
           "prices and reported tokens; the tilde marks that some of it " +
           "is an estimate"
         : "billed by OpenRouter, not estimated";
     statSpend.title =
-      state.sessionStats.unpriced > 0
+      (state.sessionStats.unpriced > 0
         ? composition +
           ". Unpriced counts runs with neither a billed nor an estimated " +
           "cost, and runs stopped after they started, whose billing " +
           "depends on whether the provider supports cancellation"
-        : composition;
+        : composition) +
+      ". The composer's runs only: an experiment's cost is in its report";
     statTtft.textContent =
       state.sessionStats.ttftN > 0
         ? Math.round(state.sessionStats.ttftSum / state.sessionStats.ttftN) +

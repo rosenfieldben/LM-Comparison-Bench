@@ -2824,8 +2824,9 @@ def test_the_served_index_versions_every_asset_url(client):
     # it is asserted rather than derived on purpose: a new asset that the
     # transform failed to version would otherwise pass unnoticed, since
     # every OTHER url would still carry its rev.
-    # 14 since K4 added static/attach.js; 15 since N2 added static/datasets.js.
-    assert len(referenced) == 15, referenced
+    # 14 since K4 added static/attach.js; 15 since N2 added static/datasets.js;
+    # 16 since N3 added static/lifecycle.js.
+    assert len(referenced) == 16, referenced
     for url in referenced:
         assert f"?v={main.STATIC_REV}" in url, url
     # The committed file itself keeps plain URLs, so opening it straight
@@ -19182,8 +19183,8 @@ def test_the_builders_mirrors_are_the_servers_numbers():
     ExperimentParams. A mirror tighter than the server would grey Store
     on a dataset the door would take; a looser one would show a ceiling
     the server does not have. BUILDER_MAX_ROWS is the builder's own bound
-    and has no server twin; it is pinned at the commission's proposal
-    until the checkpoint rules on it."""
+    and has no server twin; it is pinned at the commission's proposal,
+    which the N2 checkpoint confirmed."""
     js = run_lib(
         "const l = require(process.argv[1]);"
         "process.stdout.write(JSON.stringify({limits: l.DATASET_LIMITS,"
@@ -19599,3 +19600,245 @@ def test_the_builder_reads_blank_as_python_strip_does(client):
     assert nel == "name the dataset"
     resp = client.post("/datasets", json={"name": NEL, "content": task})
     assert resp.status_code == 422
+
+
+# =====================================================================
+# ---- Phase N3: the experiment form's pure half, executed with node
+# ---- against the door it composes for.
+# =====================================================================
+
+import inspect
+
+from bench import store as bench_store
+
+
+def form_state(**fields):
+    """A form as BenchLib.experimentBody and experimentNudge read it,
+    blank except for what is given."""
+    form = {
+        "name": "n",
+        "digest": None,
+        "lineup": ["model/alpha"],
+        "budget": "standard",
+        "params": {},
+        "repeats": "",
+        "seed": "",
+        "estimand": "routed_service",
+        "attachments": None,
+        "metric": "",
+        "halt": True,
+        "invalid": [],
+    }
+    form.update(fields)
+    return form
+
+
+def test_the_experiment_forms_mirrors_are_the_servers_numbers():
+    """WINDOW: EXPERIMENT_LIMITS as node reads it out of static/lib.js, and
+    the min and max index.html gives the repeats and task-order-seed
+    boxes, against the constants and the model they name.
+
+    The name bound and the markup's ranges are the server's, mirrored the
+    way index.html mirrors ExperimentParams; `listed` is the default limit
+    GET /experiments passes to the store, which the list's "newest N"
+    note names. A mirror tighter than the server would refuse a legal
+    value, and a looser one would promise a range the door refuses."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(l.EXPERIMENT_LIMITS));"
+    )
+    name_bound = next(
+        c.max_length
+        for c in main.ExperimentCreate.model_fields["name"].metadata
+        if type(c).__name__ == "MaxLen"
+    )
+    listed = inspect.signature(bench_store.list_experiments).parameters["limit"]
+    assert js == {
+        "maxNameChars": name_bound,
+        "maxRepeats": main.MAX_REPEATS,
+        "maxSeed": main.MAX_SEED,
+        "listed": listed.default,
+    }
+    html = (Path(__file__).parent.parent / "static" / "index.html").read_text()
+    repeats = _input_attrs(html, "experiment-repeats")
+    seed = _input_attrs(html, "experiment-seed")
+    assert (repeats["min"], repeats["max"], repeats["step"]) == (
+        "1",
+        str(main.MAX_REPEATS),
+        "1",
+    )
+    assert (seed["min"], seed["max"], seed["step"]) == ("0", str(main.MAX_SEED), "1")
+    assert _select_values(html, "experiment-estimand") == list(main.ESTIMAND_MODES)
+    assert _select_values(html, "experiment-attachments") == list(
+        typing.get_args(
+            main.ExperimentCreate.model_fields["attachments_mode"].annotation
+        )
+    )
+
+
+def test_the_forms_body_is_what_the_door_records_and_blank_is_absent(client):
+    """WINDOW: experimentBody executed over a blank form and a set one,
+    POST /experiments over each body, and the rows recorded beside rows
+    created with the same fields written by hand.
+
+    The blank form's body carries no params, repeats, task_order_seed,
+    primary_metric or attachments_mode, and its row equals the row a body
+    with those keys absent records. A seed of "0" is sent as 0, a real
+    seed; the set form's every field lands on the row as set."""
+    digest = store_dataset(
+        client,
+        "form",
+        {"id": "t1", "prompt": "p", "reference": "x", "scorer": {"kind": "exact"}},
+    ).json()["digest"]
+    forms = [
+        form_state(digest=digest),
+        form_state(
+            digest=digest,
+            params={"temperature": 0},
+            repeats="2",
+            seed="0",
+            estimand="underlying_model",
+            metric="exact",
+            halt=False,
+        ),
+    ]
+    bodies = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((f) => l.experimentBody(f))));",
+        forms,
+    )
+    assert bodies[0] == {
+        "name": "n",
+        "dataset_digest": digest,
+        "lineup": ["model/alpha"],
+        "budget": "standard",
+        "estimand_mode": "routed_service",
+        "halt_on_refusal": True,
+    }
+    assert bodies[1]["task_order_seed"] == 0
+    assert bodies[1]["repeats"] == 2
+    by_hand = [
+        {
+            "name": "n",
+            "dataset_digest": digest,
+            "lineup": ["model/alpha"],
+            "budget": "standard",
+        },
+        {
+            "name": "n",
+            "dataset_digest": digest,
+            "lineup": ["model/alpha"],
+            "budget": "standard",
+            "params": {"temperature": 0},
+            "repeats": 2,
+            "task_order_seed": 0,
+            "estimand_mode": "underlying_model",
+            "primary_metric": "exact",
+            "halt_on_refusal": False,
+        },
+    ]
+    for body, hand in zip(bodies, by_hand, strict=True):
+        from_form = client.post("/experiments", json=body)
+        from_hand = client.post("/experiments", json=hand)
+        assert from_form.status_code == from_hand.status_code == 201, from_form.text
+        assert experiment_record(client, from_form.json()["id"]) == experiment_record(
+            client, from_hand.json()["id"]
+        )
+
+
+def test_every_create_nudge_is_a_refusal_and_not_the_reverse(client):
+    """WINDOW: experimentNudge executed over forms at and past each bound,
+    and POST /experiments over each form's body.
+
+    The nudge-subset rule for the form: every form the page greys Create
+    for, sent anyway, is refused (an empty name, a name one code point
+    over, no dataset, no model); and forms at the bounds, counted the
+    server's way, are not greyed and are created (a name of spaces, which
+    the server takes, and 200 characters that are two UTF-16 units
+    each). The invalid-controls nudge is the composer's own gate and has
+    its browser proof in tests/browser/test_n3.py."""
+    digest = store_dataset(client, "nudge", {"id": "t1", "prompt": "p"}).json()[
+        "digest"
+    ]
+    grin = chr(0x1F600)
+    refused = [
+        form_state(digest=digest, name=""),
+        form_state(digest=digest, name=grin * 201),
+        form_state(digest=None),
+        form_state(digest=digest, lineup=[]),
+    ]
+    created = [
+        form_state(digest=digest, name="   "),
+        form_state(digest=digest, name=grin * 200),
+    ]
+    forms = refused + created
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((f) =>"
+        " [l.experimentNudge(f), l.experimentBody(f)])));",
+        forms,
+    )
+    for form, (nudge, body) in zip(forms, js, strict=True):
+        resp = client.post("/experiments", json=body)
+        if form in refused:
+            assert nudge is not None, form["name"][:10]
+            assert resp.status_code == 422, (nudge, resp.text[:200])
+        else:
+            assert nudge is None, nudge
+            assert resp.status_code == 201, resp.text[:200]
+
+
+def test_the_projection_text_says_what_the_door_returned(client):
+    """WINDOW: projectionText executed over the projected_cost POST
+    /experiments returns for a priced lineup and for one with an unpriced
+    member.
+
+    Priced: the output figure as a ceiling on tokens, the input as an
+    estimate, and the total, each the door's number. Unpriced: every
+    figure is null, and the text names the member verbatim and gives no
+    figure. PRE-STATE: the test catalog prices model/alpha and not
+    model/beta."""
+    digest = store_dataset(client, "cost", {"id": "t1", "prompt": "p"}).json()["digest"]
+
+    def projection(lineup):
+        resp = client.post(
+            "/experiments",
+            json={
+                "name": "cost",
+                "dataset_digest": digest,
+                "lineup": lineup,
+                "budget": "standard",
+            },
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["projected_cost"]
+
+    priced, unpriced = (
+        projection(["model/alpha"]),
+        projection(["model/alpha", "model/beta"]),
+    )
+    assert priced["unpriced"] == [] and priced["total_usd"] is not None
+    assert unpriced["unpriced"] == ["model/beta"] and unpriced["total_usd"] is None
+    texts = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((p) => l.projectionText(p))));",
+        [priced, unpriced],
+    )
+
+    shape = re.fullmatch(
+        r"output at most \$(\S+) \(a ceiling on tokens, not on the bill\) · "
+        r"input about \$(\S+) \(an estimate\) · total \$(\S+)",
+        texts[0],
+    )
+    assert shape is not None, texts[0]
+    # Each figure is the door's, to the two significant figures shown.
+    for shown, value in zip(
+        shape.groups(),
+        (priced["output_usd"], priced["input_usd"], priced["total_usd"]),
+        strict=True,
+    ):
+        assert float(shown) == float(f"{value:.2g}")
+    assert texts[1] == (
+        "unpriced: model/beta. No figure is given, because a total missing one "
+        "arm would read as the whole comparison's total."
+    )
