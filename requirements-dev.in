@@ -17,4 +17,4 @@ hypothesis==6.165.10
 pip-audit==2.10.1
 # The compiler for the .txt files this repo ships; pinned so the
 # recompile documented in the README works from the documented install.
-pip-tools==7.6.0
+pip-tools==7.6.1
