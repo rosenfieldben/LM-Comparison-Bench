@@ -1,3 +1,4 @@
+import hashlib
 import json
 import pathlib
 import sqlite3
@@ -3658,6 +3659,7 @@ def test_a_capture_is_recorded_per_walk_and_read_back_by_id_and_by_latest(tmp_pa
             dirty=False,
             patterns=["*.py"],
             excludes=[".git"],
+            clone_id=None,
         )
         second = store.record_capture(
             conn,
@@ -3668,6 +3670,7 @@ def test_a_capture_is_recorded_per_walk_and_read_back_by_id_and_by_latest(tmp_pa
             dirty=True,
             patterns=["*.py"],
             excludes=[".git"],
+            clone_id=None,
         )
         assert first["id"] != second["id"]
         assert store.latest_capture(conn, "ab", "repo-walk", "1")["id"] == second["id"]
@@ -3867,3 +3870,248 @@ def test_migration_onto_pre_n_database_adds_the_table_and_touches_nothing(tmp_pa
         assert dict(again.execute("SELECT * FROM experiments").fetchone()) == before
     finally:
         again.close()
+
+
+PRE_O_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_o_schema.sql"
+).read_text()
+
+# The sha256 of SCHEMA's body at d1d792d (the text between the header
+# comment and the end of the file), as `git show d1d792d:bench/store.py`
+# gave it when the fixture was extracted. CI's checkout is shallow, so
+# the commit itself is not there to ask; the digest is.
+PRE_O_SCHEMA_DIGEST = "fc109ea3228fbfc04a3e076df2024c10028ba986a76df5bbd7dc723a7836a6e1"
+
+
+def _pre_o_database(path):
+    """A database as d1d792d left it: its SCHEMA, plus the two columns
+    only its MIGRATIONS added, holding an experiment and a capture."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(PRE_O_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('old', '2026-09-01T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO snapshot_captures (digest, extractor, extractor_version,
+               head, dirty, patterns_json, excludes_json, captured_at)
+           VALUES (?, 'snapshot', '1', ?, 0, '["**"]', '[]',
+                   '2026-09-01T00:00:00+00:00')""",
+        ("cd" * 32, "e" * 40),
+    )
+    legacy.commit()
+    return legacy
+
+
+def test_the_pre_o_fixture_is_the_schema_as_it_stood_before_phase_o():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's text at
+    d1d792d, pinned by digest. The right era and not merely an old one:
+    it has Phase N's datasets table and not Phase O's clones."""
+    body = "".join(
+        line
+        for line in PRE_O_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == PRE_O_SCHEMA_DIGEST
+    assert "CREATE TABLE IF NOT EXISTS datasets" in PRE_O_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS clones" not in PRE_O_SCHEMA
+    assert "git show d1d792d:bench/store.py" in PRE_O_SCHEMA
+
+
+def test_migration_onto_pre_o_database_adds_clones_and_touches_nothing(tmp_path):
+    """WINDOW: a database whose schema is d1d792d's, holding an experiment
+    and a snapshot capture, through connect(), and a second boot.
+
+    A WHOLE NEW TABLE, created by CREATE TABLE IF NOT EXISTS with no
+    MIGRATIONS entry. The existing rows survive field for field, the new
+    table starts empty, a clone recorded on the migrated database reads
+    back, and a second connect disturbs nothing. PRE-STATE: the table is
+    absent and the capture is there."""
+    db_path = tmp_path / "pre_o.db"
+    legacy = _pre_o_database(db_path)
+    tables = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert "clones" not in tables
+    legacy.row_factory = sqlite3.Row
+    before = {
+        t: [dict(r) for r in legacy.execute(f"SELECT * FROM {t}")]
+        for t in ("experiments", "snapshot_captures")
+    }
+    assert len(before["snapshot_captures"]) == 1
+    legacy.close()
+    # The capture gains one column, clone_id, NULL on a walk that
+    # predates the clone door; every field it had is as it was.
+    after = {
+        "experiments": before["experiments"],
+        "snapshot_captures": [
+            {**r, "clone_id": None} for r in before["snapshot_captures"]
+        ],
+    }
+
+    conn = store.connect(str(db_path))
+    try:
+        assert store.list_clones(conn) == []
+        for table, rows in after.items():
+            assert [dict(r) for r in conn.execute(f"SELECT * FROM {table}")] == rows
+        made = store.record_clone(
+            conn, url="https://h/o/r", ref="main", head_sha="f" * 40, root="/c/x"
+        )
+        assert made["id"] == 1
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        assert [c["url"] for c in store.list_clones(again)] == ["https://h/o/r"]
+        for table, rows in after.items():
+            assert [dict(r) for r in again.execute(f"SELECT * FROM {table}")] == rows
+    finally:
+        again.close()
+
+
+def test_a_clone_row_is_one_per_repository_and_ref_and_never_replaced(db):
+    """WINDOW: record_clone twice for one repository and ref, once for
+    another ref, and the rows it leaves.
+
+    One statement for both cases: the second call brings the same row
+    up to date (same id, same created_at, new head, root and updated_at)
+    rather than inserting or replacing it. PRE-STATE: the table is
+    empty."""
+    assert store.list_clones(db) == []
+    first = store.record_clone(
+        db, url="https://h/o/r", ref="main", head_sha="a" * 40, root="/c/1"
+    )
+    other = store.record_clone(
+        db, url="https://h/o/r", ref="dev", head_sha="b" * 40, root="/c/2"
+    )
+    second = store.record_clone(
+        db, url="https://h/o/r", ref="main", head_sha="c" * 40, root="/d/1"
+    )
+    assert second["id"] == first["id"] != other["id"]
+    assert second["created_at"] == first["created_at"]
+    assert second["updated_at"] >= first["updated_at"]
+    assert (second["head_sha"], second["root"]) == ("c" * 40, "/d/1")
+    assert [c["id"] for c in store.list_clones(db)] == [first["id"], other["id"]]
+
+
+def test_a_capture_names_its_clone_and_only_a_clone_that_exists(db):
+    """WINDOW: record_capture with a clone id, read back by capture(), and
+    with an id no clones row has.
+
+    The id travels on the capture record as head does, and the foreign
+    key holds: a capture cannot name a clone the table never had.
+    PRE-STATE: foreign keys are on for this connection, and the clone is
+    recorded."""
+    assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    clone = store.record_clone(
+        db, url="https://h/o/r", ref="main", head_sha="a" * 40, root="/c/x"
+    )
+    walk = dict(head="a" * 40, dirty=False, patterns=["*.py"], excludes=[".git"])
+    named = store.record_capture(
+        db, "ab", "snapshot", "1", **walk, clone_id=clone["id"]
+    )
+    assert store.capture(db, named["id"])["clone_id"] == clone["id"]
+    plain = store.record_capture(db, "ab", "snapshot", "1", **walk, clone_id=None)
+    assert store.capture(db, plain["id"])["clone_id"] is None
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_capture(
+            db, "ab", "snapshot", "1", **walk, clone_id=clone["id"] + 99
+        )
+
+
+def test_migration_onto_pre_o_database_adds_clone_id_null_and_enforced(tmp_path):
+    """WINDOW: a database whose schema is d1d792d's, holding a capture,
+    through connect() twice.
+
+    The column arrives by MIGRATIONS on a table that has rows, which is
+    where a NOT NULL or a non-NULL default would have failed boot: the
+    old capture reads clone_id None and is otherwise untouched, a new
+    capture may name a clone, one naming no clone is refused, and a
+    second boot changes nothing. PRE-STATE: the column is absent and the
+    capture is there."""
+    db_path = tmp_path / "pre_o.db"
+    legacy = _pre_o_database(db_path)
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(snapshot_captures)")]
+    assert "clone_id" not in columns
+    legacy.row_factory = sqlite3.Row
+    before = dict(legacy.execute("SELECT * FROM snapshot_captures").fetchone())
+    legacy.close()
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            row = dict(
+                conn.execute("SELECT * FROM snapshot_captures WHERE id = 1").fetchone()
+            )
+            assert row == {**before, "clone_id": None}
+            assert store.capture(conn, 1)["clone_id"] is None
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        clone = store.record_clone(
+            conn, url="https://h/o/r", ref="main", head_sha="f" * 40, root="/c/x"
+        )
+        walk = dict(head=None, dirty=None, patterns=["*"], excludes=[])
+        made = store.record_capture(
+            conn, "cd", "snapshot", "1", **walk, clone_id=clone["id"]
+        )
+        assert store.capture(conn, made["id"])["clone_id"] == clone["id"]
+        with pytest.raises(sqlite3.IntegrityError):
+            store.record_capture(conn, "cd", "snapshot", "1", **walk, clone_id=999)
+    finally:
+        conn.close()
+
+
+def test_a_listed_row_names_the_latest_capture_of_its_own_reading(db):
+    """WINDOW: store.list_attachments over a snapshot row whose bytes also
+    have a capture under another reading (a newer walker version), and a
+    document row.
+
+    latest_capture_id is keyed on the row's own digest, extractor and
+    version, as latest_capture is, so the newer capture of the other
+    reading is not the row's: a bare citation of the row never resolves
+    to it. The document's is null though its bytes were also walked by
+    another extractor at its version. PRE-STATE: the other readings'
+    captures are the newest ids for their bytes, so a key without the
+    version, or without the extractor, would name them."""
+    snapshot_row = {
+        "digest": "cc" * 32,
+        "filename": "snapshot-cccccccccccc.txt",
+        "mime": "text/plain",
+        "byte_size": 3,
+        "content": b"abc",
+        "extracted_text": "abc",
+        "extractor": "snapshot",
+        "kind": "snapshot",
+        "extractor_version": "1",
+    }
+    store.save_attachment(db, snapshot_row)
+    store.save_attachment(
+        db,
+        {**snapshot_row, "digest": "dd" * 32, "extractor": "text", "kind": "document"},
+    )
+    walk = dict(head="a" * 40, dirty=False, patterns=["*"], excludes=[], clone_id=None)
+    own = store.record_capture(db, "cc" * 32, "snapshot", "1", **walk)
+    other = store.record_capture(db, "cc" * 32, "snapshot", "2", **walk)
+    # And the document's bytes walked by another extractor at its own
+    # version: the extractor is part of the key as much as the version.
+    beside = store.record_capture(db, "dd" * 32, "snapshot", "1", **walk)
+    assert other["id"] > own["id"] and beside["id"] > own["id"]
+    rows = {row["digest"]: row for row in store.list_attachments(db, 10)}
+    assert rows["cc" * 32]["latest_capture_id"] == own["id"]
+    assert rows["dd" * 32]["latest_capture_id"] is None
+    assert store.latest_capture(db, "cc" * 32, "snapshot", "1")["id"] == own["id"]

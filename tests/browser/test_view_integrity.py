@@ -63,7 +63,10 @@ def test_superseded_run_never_touches_new_view(bench, open_history):
     errors = collect_page_errors(page)
 
     check_chip(page, 0)
-    start_run_via_ui(page, "first slow")
+    # The first model call goes out only once the page has read POST
+    # /groups; superseding before then leaves nothing to supersede.
+    with page.expect_response("**/compare/stream"):
+        start_run_via_ui(page, "first slow")
     expect(cards(page)).to_have_count(1)
     expect(status_of(cards(page).first)).to_contain_text("thinking")
 

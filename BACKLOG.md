@@ -82,36 +82,6 @@ a23b257).
 - **First written:** bench/main.py, the comment on the attachment window
   check ("a named deferral and stays one"), commit 8f02dc6.
 
-## GitHub
-
-### Clone door
-
-- **What:** connecting a repository by URL and cloning it from the
-  bench, rather than walking a clone already on disk.
-- **Deferred by:** Phase L, and again by Phase N's non-goals ("Connecting
-  a repository is the phase after this one").
-- **Reason:** the snapshot door fetches nothing, and a fetching door is a
-  change to the single-outbound-destination posture that needs its own
-  phase.
-- **First written:** commit 661df53 ("IT FETCHES NOTHING");
-  docs/phases/phase-n-prompt.md, "Non-goals".
-
-### Member listing
-
-- **What:** a dry run of the snapshot composer. Same root, same include
-  patterns, same ceilings; it returns the paths and sizes it would have
-  composed and the refusals it would have raised, without composing. It
-  is a snapshot-side endpoint that does not need the clone door, and it
-  is useful on a local clone today.
-- **Deferred by:** Phase L, which ruled that a snapshot's ceiling is the
-  one a set of attachments has.
-- **Reason:** under that ceiling a real repository refuses often, so a
-  selection has to be made from fact before it is composed.
-- **First written:** the ruling and its select-from-fact reason are in
-  the README, "A repository snapshot" ("The ceiling is the same one a set
-  of attachments has"), commit f239cac. The member listing itself was not
-  written in the repository before this file.
-
 ## Composed-size checks in native mode
 
 - **What:** the per-task composed-size and context-window refusals that
@@ -288,3 +258,41 @@ a23b257).
   at all, its end included; the error is one field of the read door
   that would, and that door was outside N4's scope.
 - **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)".
+
+## Private repositories and tokens
+
+- **What:** cloning a repository that needs a credential: a token, a
+  credential helper, an SSH key or any other identity.
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** the clone door's secrets posture is that no credential
+  exists on its path; a private repository is refused rather than cloned
+  through a helper the operator forgot was configured.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals", "Private
+  repositories and tokens. The secrets posture is that no credential
+  exists on this path."
+
+## Deleting a clone from the page
+
+- **What:** a door that removes a clone's directory, where today the
+  operator removes it by hand (its clones row stays, and a later clone of
+  the same repository and ref reuses it).
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** a delete door on working trees needs the same containment
+  proofs the walk has; and it would remove trees, never rows, since a
+  snapshot's capture may cite the row.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals",
+  "Deleting a clone from the page. The operator removes directories;
+  backlog entry (disk hygiene) with the reason that a delete door on
+  working trees needs the same containment proofs the walk has."
+
+## Proxy support for the clone door
+
+- **What:** cloning through an HTTP(S) proxy, where today the clone
+  door's git runs with no proxy and the system's certificates only, so
+  a bench behind a mandatory proxy cannot clone.
+- **Deferred by:** Phase O, at the O2 checkpoint.
+- **Reason:** honoring proxy variables widens the scrubbed environment
+  that the no-credential proof depends on, so proxy support is a change
+  to that proof, not a setting.
+- **First written:** the operator's ruling at the O2 checkpoint, in
+  those words; recorded in the commit that adds this entry.

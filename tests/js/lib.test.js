@@ -6,6 +6,19 @@ const test = require("node:test");
 const assert = require("node:assert");
 
 const {
+  captureLine,
+  CLONE_OUTCOMES,
+  cloneInputsBlocker,
+  cloneBody,
+  cloneOutcomeLine,
+  readableClone,
+  SNAPSHOT_LIMITS,
+  patternFor,
+  tooManyPatterns,
+  tooManyChecked,
+  unfixableRow,
+  listingSummary,
+  checkedSummary,
   shortName,
   fmtCost,
   fmtBilled,
@@ -1193,4 +1206,230 @@ test("scoreNudge follows the catalog and shows the door's sentence as given", ()
   assert.deepStrictEqual(scoreBody("d", refused, "stub/j"), {
     dataset_digest: "d",
   });
+});
+
+// ---- The member listing (Phase O).
+
+test("patternFor is the path itself unless the matcher or a trim would misread it", () => {
+  assert.strictEqual(patternFor("src/main.py"), "src/main.py");
+  assert.strictEqual(patternFor("a..b.py"), "a..b.py");
+  assert.strictEqual(patternFor("a[1].py"), "a[[]1].py");
+  assert.strictEqual(patternFor("src/**/x?"), "src/[*][*]/x[?]");
+  assert.strictEqual(patternFor(" a.py"), "[ ]a.py");
+  assert.strictEqual(patternFor("a.py\t"), "a.py[\t]");
+  assert.strictEqual(patternFor("\ufeffa.py"), "[\ufeff]a.py");
+  assert.strictEqual(patternFor("\u0085a.py"), "[\u0085]a.py");
+  // A space inside a name is left alone: only the ends are trimmed.
+  assert.strictEqual(patternFor("my file.py"), "my file.py");
+  for (const path of ["a\\b.py", "a\nb.py", "a\rb.py"]) {
+    assert.strictEqual(patternFor(path), null, JSON.stringify(path));
+  }
+});
+
+test("more patterns than a request may carry name the constant", () => {
+  const max = SNAPSHOT_LIMITS.maxPatterns;
+  assert.strictEqual(tooManyPatterns(max), null);
+  assert.strictEqual(
+    tooManyPatterns(max + 1),
+    `${max + 1} include patterns, over the ${max} pattern limit (MAX_PATTERNS). ` +
+      "A selection that needs more is one a glob can say, such as 'src/**/*.py'.",
+  );
+  assert.strictEqual(tooManyChecked(max), null);
+  assert.match(
+    tooManyChecked(max + 1),
+    /over the 20 pattern limit \(MAX_PATTERNS\)/,
+  );
+});
+
+test("a listing's line says what Compose would do, in the listing's own words", () => {
+  const row = (path, status, reason = null, kind = "file") => ({
+    path,
+    bytes: status === "selected" ? 10 : null,
+    kind,
+    status,
+    reason,
+  });
+  const composes = {
+    members: [row("a.py", "selected"), row("b.py", "selected")],
+    selected_bytes: 20,
+    would_compose: true,
+    refusal: null,
+    complete: true,
+    composed_chars_at_most: 700,
+  };
+  assert.strictEqual(
+    listingSummary(composes),
+    "Compose would read 2 files, 20 bytes, at most 700 characters composed, " +
+      "at or under the 200000 character ceiling. File contents are checked " +
+      "only when it composes: images, NUL bytes and UTF-8.",
+  );
+  // At the ceiling exactly, which compose's '>' does not refuse.
+  assert.match(
+    listingSummary({ ...composes, composed_chars_at_most: 200000 }),
+    /at most 200000 characters composed, at or under the 200000/,
+  );
+  assert.match(
+    listingSummary({ ...composes, composed_chars_at_most: 250000 }),
+    /up to 250000 characters composed, over the 200000 character ceiling/,
+  );
+  // Refusals narrowing CAN clear get no clause: a file over the bound,
+  // and the two refusals with no row at all.
+  const tooBig = "big.py is 250000 bytes, over the 200000 limit";
+  const refuses = (members, refusal) => ({
+    ...composes,
+    members,
+    would_compose: false,
+    refusal,
+  });
+  for (const listing of [
+    refuses([row("big.py", "refused", tooBig)], tooBig),
+    refuses([], "no file under the root matched '*.md'. Patterns are ..."),
+    refuses([row("a.py", "selected")], "the selection passed 800000 bytes"),
+  ]) {
+    assert.strictEqual(unfixableRow(listing), null, listing.refusal);
+    assert.strictEqual(
+      listingSummary(listing),
+      "Compose would refuse: " + listing.refusal,
+    );
+  }
+  // A refusal no pattern clears, when it is the first.
+  const pipe = "pipe is not a regular file";
+  const stuck = refuses([row("pipe", "refused", pipe, "other")], pipe);
+  assert.strictEqual(unfixableRow(stuck).path, "pipe");
+  assert.strictEqual(
+    listingSummary(stuck),
+    "Compose would refuse: " +
+      pipe +
+      " No choice of patterns changes this: it is the tree or the root " +
+      "that has to change.",
+  );
+  // And when a clearable refusal comes first, the later one is named.
+  const both = refuses(
+    [row("big.py", "refused", tooBig), row("pipe", "refused", pipe, "other")],
+    tooBig,
+  );
+  assert.strictEqual(
+    listingSummary(both),
+    "Compose would refuse: " +
+      tooBig +
+      " And past that, pipe is refused whatever the patterns select (see " +
+      "its row), so no choice of patterns makes this tree compose.",
+  );
+  // A walk that stopped ends on its stopping row, whatever came first.
+  const ceiling = "the walk passed 20000 directory entries";
+  const stopped = {
+    ...refuses(
+      [
+        row("big.py", "refused", tooBig),
+        row("", "refused", ceiling, "directory"),
+      ],
+      tooBig,
+    ),
+    complete: false,
+  };
+  assert.strictEqual(unfixableRow(stopped).reason, ceiling);
+  assert.match(
+    listingSummary(stopped),
+    /past that, the snapshot root is refused/,
+  );
+  assert.strictEqual(
+    checkedSummary(1, 6),
+    "1 file checked, 6 bytes: the patterns now name exactly it. List again " +
+      "to see what Compose makes of them.",
+  );
+});
+
+const HEAD = "0123456789abcdef0123456789abcdef01234567";
+
+test("captureLine names the walk, and nothing for no capture", () => {
+  assert.equal(captureLine(null), "");
+  assert.equal(captureLine(undefined), "");
+  assert.equal(captureLine({ id: "3", head: HEAD, dirty: false }), "");
+  assert.equal(
+    captureLine({ id: 3, head: HEAD, dirty: false }),
+    "capture #3 at 0123456, clean",
+  );
+  assert.equal(
+    captureLine({ id: 4, head: HEAD, dirty: true }),
+    "capture #4 at 0123456, dirty",
+  );
+  assert.equal(
+    captureLine({ id: 5, head: null, dirty: null }),
+    "capture #5 at no commit, unknown",
+  );
+});
+
+test("a clone is not sent blank, and nothing else is decided here", () => {
+  assert.equal(
+    cloneInputsBlocker("", "main"),
+    "Name the public repository to clone: an https URL of a host this " +
+      "bench lists.",
+  );
+  assert.equal(
+    cloneInputsBlocker("", ""),
+    cloneInputsBlocker("", "main"),
+    "the URL is asked for first",
+  );
+  assert.equal(
+    cloneInputsBlocker("https://github.com/o/r", ""),
+    "Name the branch, tag or 40-character commit to clone.",
+  );
+  // Every other rule is the server's, shown in its words.
+  for (const [url, ref] of [
+    ["http://github.com/o/r", "main"],
+    ["https://u:t@github.com/o/r", "main"],
+    ["https://github.com/o/r", "+main"],
+    ["not a url", "a..b"],
+  ]) {
+    assert.equal(cloneInputsBlocker(url, ref), null);
+  }
+});
+
+test("the clone body is the URL and the ref and nothing else", () => {
+  assert.deepStrictEqual(cloneBody("https://h/o/r", "main"), {
+    url: "https://h/o/r",
+    ref: "main",
+  });
+  assert.deepStrictEqual(Object.keys(cloneBody("u", "r")), ["url", "ref"]);
+});
+
+test("the outcome line says which and at what, and nothing it cannot read", () => {
+  assert.deepStrictEqual(CLONE_OUTCOMES, ["cloned", "updated"]);
+  const record = {
+    id: 1,
+    url: "https://h/o/r",
+    ref: "main",
+    head_sha: HEAD,
+    root: "/clones/abcdef0123456789",
+    outcome: "cloned",
+  };
+  assert.equal(cloneOutcomeLine(record), "cloned at 0123456");
+  assert.equal(
+    cloneOutcomeLine({ ...record, outcome: "updated" }),
+    "updated to 0123456",
+  );
+  for (const bad of [
+    null,
+    { ...record, outcome: "copied" },
+    { ...record, head_sha: "0123456" },
+    { ...record, head_sha: HEAD.toUpperCase() },
+    { ...record, head_sha: 7 },
+  ]) {
+    assert.equal(cloneOutcomeLine(bad), "");
+  }
+  // Never the URL, the root or the ref.
+  const line = cloneOutcomeLine(record);
+  for (const part of ["h/o/r", "clones", "abcdef", "main"]) {
+    assert.ok(!line.includes(part), part);
+  }
+});
+
+test("a clone answer is readable only with an outcome and a root", () => {
+  const record = { head_sha: HEAD, root: "/c/x", outcome: "cloned" };
+  assert.equal(readableClone(record), true);
+  assert.equal(readableClone({ ...record, root: "" }), false);
+  assert.equal(readableClone({ ...record, root: 3 }), false);
+  assert.equal(readableClone({ head_sha: HEAD, outcome: "cloned" }), false);
+  assert.equal(readableClone({ ...record, outcome: "made" }), false);
+  assert.equal(readableClone(null), false);
 });

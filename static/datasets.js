@@ -34,6 +34,7 @@
     refusalLine,
     countLines,
     refusalText,
+    captureLine,
   } = window.BenchLib;
 
   // How many stored documents a picker offers and how many stored
@@ -337,6 +338,12 @@
     return out;
   }
 
+  // A cited document on a line. NO WALK ON THIS CHIP, though the picker's
+  // option names one (Phase O, ratified at the operator's pass at
+  // 9c920e5): the line sends a bare digest, and a bare citation records
+  // the digest's latest capture when the experiment is created, not the
+  // one the option showed when it was pressed. A capture printed here
+  // would be a claim the record might not keep.
   function documentChip(index, doc) {
     const chip = document.createElement("span");
     chip.className = "attach-chip ds-doc";
@@ -465,6 +472,16 @@
         label + " · " + doc.kind + " · sha256 " + shortDigest(doc.digest);
       option.textContent = face;
       option.setAttribute("aria-label", face + ", for line " + (index + 1));
+      // THE LATEST WALK, for a snapshot (Phase O): which capture of these
+      // bytes the list was read at, so two snapshots of one repository
+      // can be told apart by commit. "latest" because it can move: walks
+      // that composed identical bytes are one option naming the newest,
+      // and a bare citation freezes the latest when the experiment is
+      // created, not when this option is pressed. Nothing on the cited
+      // chip (documentChip, which says why): the line sends a bare
+      // digest, so the chip cannot say which walk the experiment will
+      // record.
+      const walk = captureLine(doc.capture);
       option.title =
         label +
         "\nsha256 " +
@@ -472,7 +489,8 @@
         "\n" +
         fmtBytes(doc.byte_size) +
         ", read as " +
-        doc.kind;
+        doc.kind +
+        (walk ? "\nlatest " + walk : "");
       option.addEventListener("click", () => {
         const row = rows[index];
         if (row.documents.some((d) => d.digest === doc.digest)) {

@@ -979,6 +979,235 @@
     return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
   }
 
+  // ---- The member listing (Phase O): what a snapshot would select,
+  // ---- and patterns written from the rows a person checks.
+
+  // Mirrors of the snapshot's bounds, the server's numbers: a test
+  // executes this file and asserts each equals the constant it names.
+  const SNAPSHOT_LIMITS = {
+    maxPatterns: 20, // bench.snapshot.MAX_PATTERNS
+    maxComposedChars: 200000, // bench.extract.MAX_COMPOSED_CHARS
+  };
+
+  // The characters a pattern must not begin or end with, because one
+  // side or the other strips them. The panel trims each line it sends
+  // with String.prototype.trim, which removes JavaScript's whitespace
+  // (U+FEFF among it), and the server refuses a pattern that str.strip
+  // would change, which removes Python's (U+001C to U+001F and U+0085
+  // among it). The union, written out as a character class; a test holds
+  // it equal to the two sets over every code point. Either set alone
+  // lets a checked " a.py" be sent as "a.py" and compose a sibling.
+  const PATTERN_TRIMMED = "\\s\\x1c-\\x1f\\x85";
+  const TRIMMED = new RegExp("^[" + PATTERN_TRIMMED + "]$", "u");
+
+  // A pattern that selects exactly one listed file, or null when no
+  // pattern the panel can send could.
+  //
+  // THE PATH ITSELF WHEN IT HOLDS NOTHING THE MATCHER READS AS A GLOB,
+  // and the commission's "a pattern equal to its path" is then literal.
+  // The server matches each segment with fnmatch, so '*', '?' and '['
+  // are written as the one-character classes [*], [?] and [[], which
+  // match only themselves; and a first or last character either side
+  // would strip is written as its own class, which neither strips. A
+  // path holding a backslash (the server refuses one in any pattern) or
+  // a line break (the box is split into lines, and the browser turns a
+  // carriage return into one) has no exact pattern, and null says so.
+  function patternFor(path) {
+    if (/[\\\r\n]/.test(path)) return null;
+    const chars = Array.from(path);
+    return chars
+      .map((ch, i) => {
+        if (ch === "*" || ch === "?" || ch === "[") return "[" + ch + "]";
+        const end = i === 0 || i === chars.length - 1;
+        return end && TRIMMED.test(ch) ? "[" + ch + "]" : ch;
+      })
+      .join("");
+  }
+
+  // The sentence for more include patterns than a request may carry,
+  // naming the constant and its value, or null within it. Said by the
+  // page before it sends, since the server's own refusal of a longer
+  // list is the request model's, which names neither.
+  function tooManyPatterns(count) {
+    if (count <= SNAPSHOT_LIMITS.maxPatterns) return null;
+    return (
+      count +
+      " include patterns, over the " +
+      SNAPSHOT_LIMITS.maxPatterns +
+      " pattern limit (MAX_PATTERNS). A selection that needs more is one " +
+      "a glob can say, such as 'src/**/*.py'."
+    );
+  }
+
+  // The same limit, met by checking rows: one pattern per checked file.
+  function tooManyChecked(count) {
+    if (count <= SNAPSHOT_LIMITS.maxPatterns) return null;
+    return (
+      count +
+      " files checked, over the " +
+      SNAPSHOT_LIMITS.maxPatterns +
+      " pattern limit (MAX_PATTERNS): one pattern per checked file cannot " +
+      "name that many. The last check was undone; write a glob that " +
+      "covers them instead."
+    );
+  }
+
+  // The refused row no choice of patterns can clear, or null: the row a
+  // stopped walk ends on (the entry ceiling, a name it cannot spell, a
+  // tree that changed), or else the first refused row that is not a file
+  // (a link out of the root, a socket or pipe, a directory too deep),
+  // which the walk refuses whatever the patterns select. Looked for among
+  // ALL the rows and not only at the first refusal: the first may be one
+  // narrowing clears (a file over the bound) while a later one never is.
+  function unfixableRow(listing) {
+    if (!listing.complete) return listing.members[listing.members.length - 1];
+    return (
+      listing.members.find(
+        (m) => m.status === "refused" && m.kind !== "file",
+      ) || null
+    );
+  }
+
+  // The listing's line, from its facts and its own sentences.
+  function listingSummary(listing) {
+    const max = SNAPSHOT_LIMITS.maxComposedChars;
+    if (!listing.would_compose) {
+      const stuck = unfixableRow(listing);
+      let clause = "";
+      if (stuck !== null && stuck.reason === listing.refusal) {
+        clause =
+          " No choice of patterns changes this: it is the tree or the root " +
+          "that has to change.";
+      } else if (stuck !== null) {
+        clause =
+          " And past that, " +
+          (stuck.path === "" ? "the snapshot root" : stuck.path) +
+          " is refused whatever the patterns select (see its row), so no " +
+          "choice of patterns makes this tree compose.";
+      }
+      return "Compose would refuse: " + listing.refusal + clause;
+    }
+    const count = listing.members.filter((m) => m.status === "selected").length;
+    const bound = listing.composed_chars_at_most;
+    const chars =
+      bound <= max
+        ? "at most " +
+          bound +
+          " characters composed, at or under the " +
+          max +
+          " character ceiling"
+        : "up to " +
+          bound +
+          " characters composed, over the " +
+          max +
+          " character ceiling: text of one byte per character this long " +
+          "is refused, and multibyte text may fit";
+    return (
+      "Compose would read " +
+      count +
+      (count === 1 ? " file, " : " files, ") +
+      listing.selected_bytes +
+      " bytes, " +
+      chars +
+      ". File contents are checked only when it composes: images, NUL " +
+      "bytes and UTF-8."
+    );
+  }
+
+  // The line once checked rows have written the patterns.
+  function checkedSummary(count, bytes) {
+    return (
+      count +
+      (count === 1 ? " file" : " files") +
+      " checked, " +
+      bytes +
+      " bytes: the patterns now name exactly " +
+      (count === 1 ? "it" : "these") +
+      ". List again to see what Compose makes of them."
+    );
+  }
+
+  // One line saying which walk a snapshot was, for a title or a chip
+  // bit, or "" for anything without a capture. The commit is shortened
+  // to the seven characters git itself shows; "dirty" or "clean" is the
+  // tree's state at the walk, and "unknown" when the bench could read
+  // the commit but not the status. MOVED HERE FROM attach.js in Phase O,
+  // when a second control needed it (the dataset builder's snapshot
+  // option), for refusalText's reason.
+  function captureLine(capture) {
+    if (!capture || !Number.isInteger(capture.id)) return "";
+    const head =
+      typeof capture.head === "string" ? capture.head.slice(0, 7) : "no commit";
+    const state =
+      capture.dirty === true
+        ? "dirty"
+        : capture.dirty === false
+          ? "clean"
+          : "unknown";
+    return "capture #" + capture.id + " at " + head + ", " + state;
+  }
+
+  // ---- The clone step (Phase O, O3): what the page may send to POST
+  // ---- /clones, and what it says about the answer. Every rule about a
+  // ---- URL or a ref is the server's and is shown in its words; the page
+  // ---- checks only that something was typed.
+
+  // Why the Clone button cannot send yet, or null when it can. The two
+  // values are already trimmed by the page. BLANK IS NOT SENT, and
+  // nothing else is decided here: a second wording of a server rule
+  // would be a second explanation of one fact.
+  function cloneInputsBlocker(url, ref) {
+    if (url === "") {
+      return (
+        "Name the public repository to clone: an https URL of a host " +
+        "this bench lists."
+      );
+    }
+    if (ref === "") {
+      return "Name the branch, tag or 40-character commit to clone.";
+    }
+    return null;
+  }
+
+  // The request body, exactly: the door refuses any other field, and a
+  // clone is not a comparison, so nothing about the lineup rides along.
+  function cloneBody(url, ref) {
+    return { url: url, ref: ref };
+  }
+
+  const CLONE_OUTCOMES = ["cloned", "updated"];
+  const FULL_SHA = /^[0-9a-f]{40}$/;
+
+  // What the step says beside the root box once a clone has landed:
+  // whether it was made or replaced, and the commit checked out, by
+  // git's seven characters. Never the URL, the root or the ref. "" for
+  // an answer it cannot read, which the caller says in words.
+  function cloneOutcomeLine(record) {
+    if (
+      !record ||
+      !CLONE_OUTCOMES.includes(record.outcome) ||
+      typeof record.head_sha !== "string" ||
+      !FULL_SHA.test(record.head_sha)
+    ) {
+      return "";
+    }
+    const head = record.head_sha.slice(0, 7);
+    return record.outcome === "cloned"
+      ? "cloned at " + head
+      : "updated to " + head;
+  }
+
+  // Whether a clone's success body can be acted on: an outcome the step
+  // can name, and a root to put in the box. A 2xx that says less is said
+  // in words, and the root box keeps what it held.
+  function readableClone(record) {
+    return (
+      cloneOutcomeLine(record) !== "" &&
+      typeof record.root === "string" &&
+      record.root !== ""
+    );
+  }
+
   const BenchLib = {
     shortName,
     fmtCost,
@@ -1026,6 +1255,20 @@
     scoreBody,
     scoreNudge,
     scoreLabel,
+    SNAPSHOT_LIMITS,
+    PATTERN_TRIMMED,
+    patternFor,
+    tooManyPatterns,
+    tooManyChecked,
+    unfixableRow,
+    listingSummary,
+    checkedSummary,
+    captureLine,
+    CLONE_OUTCOMES,
+    cloneInputsBlocker,
+    cloneBody,
+    cloneOutcomeLine,
+    readableClone,
   };
   if (typeof window !== "undefined") window.BenchLib = BenchLib;
   if (typeof module !== "undefined") module.exports = BenchLib;

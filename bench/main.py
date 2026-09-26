@@ -15,9 +15,12 @@ import os
 import random
 import re
 import secrets
+import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
+import tempfile
 import time
 from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from contextlib import asynccontextmanager
@@ -35,7 +38,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from starlette.datastructures import Headers, MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from bench import snapshot, store
+from bench import clones, snapshot, store
 from bench.datasets import (
     DatasetError,
     cites_documents,
@@ -305,6 +308,13 @@ class SnapshotCapture(BaseModel):
     patterns: list[str]
     excludes: list[str]
     captured_at: str
+    # Phase O: the clones row whose directory the walked root is in, so
+    # "which repository was this" is answered from the record, through
+    # the clones table, where the URL is kept and nowhere else. Null for
+    # a root no clone the door made contains, and for every capture
+    # recorded before the column. No default: present on every capture,
+    # so a null is said rather than implied.
+    clone_id: int | None
 
 
 class CompareRequest(BaseModel):
@@ -608,15 +618,32 @@ class Attachment(BaseModel):
     created_at: str
 
 
+class ListedAttachment(Attachment):
+    """One row of GET /attachments: the metadata, and the latest capture
+    of the row's own reading.
+
+    THE CAPTURE TRAVELS ON THE LIST (Phase O) so the dataset builder can
+    tell two snapshots of one repository apart by the walk each was: the
+    same SnapshotCapture record GET /attachments/{digest} serves, head
+    and clone id included, and null for a reading with no capture (every
+    document and image). It is the latest when the list was read; a
+    snapshot cited by bare digest freezes the latest at the experiment's
+    creation, which a walk in between can move. THE MANIFEST DOES NOT
+    TRAVEL here, for AttachmentDetail's reason: it is body-sized.
+    """
+
+    capture: SnapshotCapture | None = None
+
+
 class AttachmentList(BaseModel):
     """The documents the bench holds, as metadata and nothing else.
 
-    THE SAME Attachment SHAPE the detail endpoint serves, so a caller
-    that can read one can read a page of them. No content field on
-    either, for the reason Attachment gives.
+    THE DETAIL SHAPE LESS ITS MANIFEST, so a caller that can read one can
+    read a page of them. No content field on either, for the reason
+    Attachment gives.
     """
 
-    attachments: list[Attachment]
+    attachments: list[ListedAttachment]
 
 
 # The longest root path a request may name. Linux caps a path at
@@ -668,16 +695,18 @@ class SnapshotManifest(BaseModel):
     encoding: str
 
 
-class AttachmentDetail(Attachment):
+class AttachmentDetail(ListedAttachment):
     """One attachment, with the manifest when it has one.
 
-    A SEPARATE MODEL FROM Attachment RATHER THAN A FIELD ON IT, and the
+    A SEPARATE MODEL FROM THE LIST'S RATHER THAN A FIELD ON IT, and the
     split is about the LIST. A member manifest is body-sized: a snapshot
     of two thousand files carries two thousand rows, and a page of five
     hundred attachments carrying those would undo exactly what K1.5
     bought when it stopped the list reader from loading bodies. The list
-    answers Attachment, the two single-attachment doors answer this, and
-    neither shape has to be read as "sometimes populated".
+    answers ListedAttachment (this less the manifest; the capture, a
+    walk's facts and not a body, travels on both since Phase O), the two
+    single-attachment doors answer this, and neither shape has to be
+    read as "sometimes populated".
 
     None is every rendition of a single file, which is every rendition
     but a snapshot's. It is not a missing value; see the migration entry
@@ -692,7 +721,6 @@ class AttachmentDetail(Attachment):
     """
 
     manifest: SnapshotManifest | None = None
-    capture: SnapshotCapture | None = None
 
 
 class SnapshotCreate(BaseModel):
@@ -720,6 +748,100 @@ class SnapshotCreate(BaseModel):
     # parsed, and the two bounds are the same constant rather than two
     # numbers that could drift.
     patterns: list[str] = Field(min_length=1, max_length=snapshot.MAX_PATTERNS)
+
+
+class SnapshotListingMember(BaseModel):
+    """One row of a member listing: an entry the walk has something to say
+    about, and what.
+
+    `bytes` is the listed size of a file and null for anything else,
+    including an EXCLUDED file: the listing does not report the size of
+    what it will not read, which for the secrets group would say how long
+    a key is. `path` is repo-relative and "" for the root itself, which a
+    refusal about the traversal can stop at. `reason` is null for a
+    selected file, and otherwise the sentence: the exclusion that applied,
+    naming its group; for a link inside the root that a pattern matched,
+    why it is not followed and what it names; or the composer's own
+    refusal, word for word.
+    """
+
+    path: str
+    bytes: int | None
+    kind: Literal["file", "directory", "symlink", "other"]
+    status: Literal["selected", "excluded", "refused"]
+    reason: str | None
+
+
+class SnapshotListing(BaseModel):
+    """What POST /snapshots would select and refuse on the same body.
+
+    `would_compose` is true exactly when the composer's walk would reach
+    composition on the facts the tree shows, and `refusal` is the
+    sentence the composer would raise first when it would not. `counted`
+    is the directory entries the walk counted against its ceiling
+    (MAX_WALKED_ENTRIES, excluded entries included and the contents of
+    excluded directories not); past the ceiling means the listing
+    stopped there. `complete` is false when a refusal about the
+    traversal itself stopped it, as it stops the composer, and that
+    refusal is then the last row whatever its path; the other rows are
+    sorted by path. `selected_bytes` is the selection's listed size.
+
+    WHAT IT CANNOT SEE, AND SAYS SO. `text_checked` is always false:
+    whether a file is an image or holds a NUL byte, and whether it is
+    UTF-8, are properties of the bytes, and the composed-character ceiling
+    is a count of decoded characters, so each stays a refusal only Compose
+    can make.
+    `composed_chars_at_most` bounds the last from the sizes: at or under
+    the ceiling it cannot refuse; over it, text of one byte per character
+    is refused and multibyte text may fit. A file the process cannot
+    open, or one that changes between the listing and the composition,
+    is refused only by Compose, which opens and reads what the listing
+    only looked at.
+    """
+
+    members: list[SnapshotListingMember]
+    counted: int
+    selected_bytes: int
+    would_compose: bool
+    refusal: str | None
+    complete: bool
+    text_checked: bool
+    composed_chars_at_most: int | None
+
+
+class CloneCreate(BaseModel):
+    """A clone request: one public repository URL and the ref to check out.
+
+    Bounded here so a body is refused before it is parsed further, and a
+    refusal of this model never repeats what was sent (see
+    refuse_malformed_request): a URL can carry a token, and the rule that
+    no refusal repeats a URL holds for the model's refusals as it does
+    for the door's.
+    """
+
+    model_config = FORBID_UNKNOWN
+
+    url: str = Field(min_length=1, max_length=clones.MAX_URL_CHARS)
+    ref: str = Field(min_length=1, max_length=clones.MAX_REF_CHARS)
+
+
+class CloneRecord(BaseModel):
+    """What POST /clones made, as its clones row holds it.
+
+    `url` is the repository's identity: the URL as it was checked, with a
+    trailing ".git" dropped so both spellings of one repository are one
+    clone. `root` is the directory the clone is in, which is what a
+    snapshot door takes. `head_sha` is the commit checked out there now,
+    and `outcome` says whether this request made the directory ("cloned")
+    or replaced one it had made before ("updated").
+    """
+
+    id: int
+    url: str
+    ref: str
+    head_sha: str
+    root: str
+    outcome: Literal["cloned", "updated"]
 
 
 class AttachmentRef(BaseModel):
@@ -1313,6 +1435,12 @@ class CatalogResponse(BaseModel):
     # is waste.
     snapshots_enabled: bool = False
     snapshots_off_reason: str = ""
+    # The same pair for POST /clones, for the same reason: the clone step
+    # shows the door's own refusal when the door is off, which is
+    # CLONES_OFF when BENCH_CLONE_ROOT is unset and the sentence naming
+    # both variables when it is not one of BENCH_REPO_ROOTS.
+    clones_enabled: bool = False
+    clones_off_reason: str = ""
 
 
 class StoredModelResult(ModelResult):
@@ -1523,6 +1651,19 @@ SNAPSHOTS_OFF = (
 )
 
 
+# What either snapshot door says to a root inside a version control
+# directory. It names the rule and not the path: the path is the
+# person's own, and the refusal is about where it points.
+ROOT_IN_VCS = (
+    "a snapshot root may not be inside a version control directory "
+    "(.git, .hg or .svn) below its BENCH_REPO_ROOTS entry. Those hold a "
+    "repository's history and configuration, a remote URL with a token "
+    "in it among them, and the walk excludes them so that none of it "
+    "reaches a prompt; a root inside one would walk what the exclusion "
+    "keeps out. Name the repository's own directory instead."
+)
+
+
 def _resolved_directory(path: str) -> str | None:
     """The fully resolved path, if it is a directory, else None.
 
@@ -1675,6 +1816,20 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     if app.state.repo_roots:
         logger.info("snapshot roots: %s", ", ".join(app.state.repo_roots))
+    # Where POST /clones may put what it fetches, from which hosts, and
+    # (a test seam only) which certificate bundle git trusts. Unset is
+    # the door off; set and wrong raises here, as the roots do. The slot
+    # holds the directories a running clone is writing, or None.
+    app.state.clone_root = _parse_clone_root(
+        os.environ.get("BENCH_CLONE_ROOT"), resolved=_resolved_directory
+    )
+    app.state.clone_hosts = clones.parse_clone_hosts(
+        os.environ.get("BENCH_CLONE_HOSTS")
+    )
+    app.state.clone_cainfo = _parse_clone_cainfo(os.environ.get("BENCH_CLONE_CAINFO"))
+    app.state.clone_run = {"paths": None}
+    if app.state.clone_root is not None:
+        _sweep_clone_work(app.state.clone_root)
     app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
     app.state.provider_prefs = provider_preferences(app.state.data_policy)
     if app.state.data_policy != "standard":
@@ -1690,12 +1845,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # flows that move no bytes, and the resulting deaths wore mixed
     # ReadError and stall signatures. OS-level probes keep those quiet
     # flows alive; see keepalive_socket_options in models.py.
-    # trust_env stays at its default (on): an operator may legitimately
-    # reach OpenRouter through a corporate proxy, and honoring HTTP(S)_PROXY
-    # is the right behavior for the real app. The test harness is the one
-    # place that must not inherit a developer proxy, and it opts out itself
-    # (trust_env=False on its own clients, proxy vars scrubbed from the
-    # browser subprocess) rather than the app degrading its own behavior.
+    # NO PROXY IS READ, and this comment said otherwise until Phase O. An
+    # explicit transport makes httpx skip the proxy variables whatever
+    # trust_env says (httpx 0.28.1: allow_env_proxies = trust_env and
+    # transport is None), so HTTP(S)_PROXY and ALL_PROXY never reach this
+    # client. trust_env, left on, still lets the transport read
+    # SSL_CERT_FILE and SSL_CERT_DIR for its certificate store. The clone
+    # door is the same: no proxy, and the system's certificates.
     app.state.client = httpx.AsyncClient(
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
@@ -1884,10 +2040,27 @@ async def refuse_malformed_request(
     model and the refusal's echo of that name then failed to encode; it
     is not particular to that door, since every model refusal echoes its
     input, so it is fixed where every door shares it.
+
+    NOTHING OF THE BODY AT THE CLONE DOOR. Every error echoes its input,
+    and a missing field's input is the whole body, so a URL with a token
+    in it would come back in a refusal of a request that merely forgot
+    its ref. There, each error keeps its type and message and names only
+    the fields the door takes; its input and context go, and an unknown
+    field is named as one without its name, which can be anything.
     """
-    return _SpellableJSON(
-        status_code=422, content={"detail": jsonable_encoder(exc.errors())}
-    )
+    errors = exc.errors()
+    if request.url.path == "/clones":
+        errors = [_unechoed(error) for error in errors]
+    return _SpellableJSON(status_code=422, content={"detail": jsonable_encoder(errors)})
+
+
+def _unechoed(error: Mapping[str, Any]) -> dict[str, Any]:
+    """One model error at the clone door, repeating nothing that was sent."""
+    loc = [
+        part if part in ("body", "url", "ref") else "(a field the door does not take)"
+        for part in error.get("loc", ())
+    ]
+    return {"type": error.get("type"), "loc": loc, "msg": error.get("msg")}
 
 
 # The bench is a localhost tool holding a paid API key, which makes it a
@@ -6536,6 +6709,7 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
 @app.get("/models", response_model=CatalogResponse)
 async def get_models() -> dict[str, Any]:
     enabled = bool(getattr(app.state, "repo_roots", ()))
+    clones_off = _clones_off_reason()
     return {
         "models": app.state.catalog["models"],
         "fetched": app.state.catalog["fetched"],
@@ -6544,6 +6718,8 @@ async def get_models() -> dict[str, Any]:
         # The door's own sentence, not a second one. See
         # CatalogResponse for why it travels rather than being restated.
         "snapshots_off_reason": "" if enabled else SNAPSHOTS_OFF,
+        "clones_enabled": not clones_off,
+        "clones_off_reason": clones_off,
     }
 
 
@@ -6840,6 +7016,7 @@ def _capture_view(record: dict[str, Any] | None) -> dict[str, Any] | None:
         "patterns": record["patterns"],
         "excludes": record["excludes"],
         "captured_at": record["captured_at"],
+        "clone_id": record["clone_id"],
     }
 
 
@@ -7092,16 +7269,21 @@ def enforce_snapshot_root(
 ) -> str:
     """The resolved root a request may walk, or a refusal saying why not.
 
-    THREE REFUSALS AND TWO CODES. No allowlist at all and a root outside
-    it are both 403: the request is well formed and the bench's policy
-    says no, which is the same answer LocalOnlyGuard gives a non-loopback
-    client and for the same reason. A root that is not a directory is
-    422, because that one is about what the caller wrote.
+    THREE REFUSALS AND TWO CODES (and a fourth since Phase O, below).
+    No allowlist at all and a root outside it are both 403: the request
+    is well formed and the bench's policy says no, which is the same
+    answer LocalOnlyGuard gives a non-loopback client and for the same
+    reason. A root that is not a directory is 422, because that one is
+    about what the caller wrote.
 
     The allowed roots are named back on refusal. They are the operator's
     own configuration and the caller is that operator on loopback, so
     listing them is the difference between "no" and "no, and here is
     what you meant to type".
+
+    A FOURTH REFUSAL, 403, since Phase O: a root inside .git, .hg or
+    .svn below its allowlist entry (snapshot.vcs_below), which would walk
+    what the exclusions keep out. It names the rule and not the path.
 
     THE RESOLVER IS INJECTED RATHER THAN THE RESOLUTION, and the
     difference is an ordering rather than a style. A resolved path passed
@@ -7123,15 +7305,25 @@ def enforce_snapshot_root(
             "walks a clone root, so this wants the directory the "
             "repository was cloned into.",
         )
-    if not any(snapshot.contained(real, allowed) for allowed in roots):
+    holding = [allowed for allowed in roots if snapshot.contained(real, allowed)]
+    if not holding:
+        # Each path spelled as a response can carry it: a root resolved
+        # through a link to a name UTF-8 cannot spell, or an allowlist
+        # entry read from such an environment, would otherwise put a raw
+        # surrogate in the refusal and the refusal would be a 500.
+        allowed_roots = ", ".join(snapshot.printable(r) for r in roots)
         raise HTTPException(
             403,
-            f"{named!r} resolves to {real}, which is not under any entry "
-            f"of BENCH_REPO_ROOTS ({', '.join(roots)}). A snapshot "
+            f"{named!r} resolves to {snapshot.printable(real)}, which is not "
+            f"under any entry of BENCH_REPO_ROOTS ({allowed_roots}). A snapshot "
             "composes a tree's files into a prompt sent to a provider, "
             "so which trees may be walked is an explicit allowlist "
             "rather than whatever path a request names.",
         )
+    # Below the deepest entry holding it, which is the one the operator
+    # named most exactly: an entry named inside .git is theirs to walk.
+    if snapshot.vcs_below(real, max(holding, key=len)):
+        raise HTTPException(403, ROOT_IN_VCS)
     return real
 
 
@@ -7359,12 +7551,17 @@ def _attachment_detail(
     It matters here because the manifest is NOT a function of the
     rendition key. Two walks of one clone at two commits compose
     byte-identical text whenever the selected files did not change, so
-    they are one rendition with one row, and the head recorded is the
+    they are one rendition with one row and one stored manifest, the
     first walk's. That is a true statement about these bytes rather than
     a stale one: the snapshot IS its content, and the earlier commit
     produced exactly this content. Rule two's forward-only law does the
     rest, since rewriting the manifest would relabel a record every
-    existing comparison already cites.
+    existing comparison already cites. The WALKS' facts, the head and
+    the dirty flag among them, are not on the manifest: each walk is its
+    own capture, and this answers the one it is handed (POST's own) or
+    the latest (GET's). GET /attachments answers the same latest by its
+    own query (store.list_attachments' latest_capture_id), which must
+    stay keyed as latest_capture is.
     """
     view = _attachment_view(row)
     stored = store.extraction_for(
@@ -7397,10 +7594,12 @@ def _manifest_view(recorded: dict[str, Any]) -> dict[str, Any]:
 async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     """Walk one allowlisted clone and store the reading as one attachment.
 
-    IT FETCHES NOTHING. The single-outbound-destination posture is
-    untouched: this reads the local filesystem and the local git, and
-    the only thing that ever leaves the machine is the composed prompt,
-    through the same door every other comparison uses.
+    IT FETCHES NOTHING. This reads the local filesystem and the local
+    git, and the only thing that ever leaves the machine is the composed
+    prompt, through the same door every other comparison uses. Fetching
+    lives in POST /clones, under its own posture (named hosts, https,
+    no credential), and lands in a directory this door then walks like
+    any other allowlisted tree.
 
     THE WHOLE SNAPSHOT IS ONE ATTACHMENT, which is what keeps the
     fairness law intact for free. One digest, one rendition, one
@@ -7435,6 +7634,7 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     root = enforce_snapshot_root(
         body.root, app.state.repo_roots, resolve=_resolved_directory
     )
+    refuse_while_cloning(root)
     try:
         members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
         head, dirty = _clone_state(root)
@@ -7484,8 +7684,803 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
         dirty=dirty,
         patterns=list(body.patterns),
         excludes=list(manifest["excludes"]),
+        clone_id=_clone_for(root),
     )
     return _attachment_detail(stored, capture=recorded)
+
+
+@app.post("/snapshots/listing", response_model=SnapshotListing, status_code=200)
+async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
+    """What POST /snapshots would select and refuse on this body, composing
+    nothing, storing nothing and reading no file.
+
+    THE SAME DOOR IN FRONT OF THE SAME WALK. The body is SnapshotCreate,
+    the root goes through enforce_snapshot_root with the same allowlist
+    and the same refusals, and the tree is the same DescriptorTree. The
+    walk is the composer's own traversal (snapshot.Survey), iterated
+    without a reader: directories are opened and listed and link
+    targets resolved, as the composer does, and no member is opened or
+    read. So the listing and the composer agree by construction about
+    what is selected, excluded and refused; the tests hold the rewrite
+    to walk as it stood before it, and hold the two doors to each other.
+
+    A REFUSAL OF THE REQUEST IS AN HTTP ERROR, THE SAME AT BOTH DOORS: no
+    allowlist (403), a root outside it (403) or not a directory (422), a
+    root a clone is writing or left unfinished (409, refuse_while_cloning),
+    a malformed pattern (422) and more than MAX_PATTERNS of them (422,
+    from the model). A refusal about the tree is a fact the listing
+    reports in a 200: would_compose false, with the composer's sentence.
+
+    NO RECORD. A listing is a look, not a capture: nothing is written,
+    and the head and dirty flag are not read, since no capture is made.
+
+    SYNCHRONOUS ON THE EVENT LOOP, bounded rather than offloaded, for the
+    reason create_snapshot gives; it does strictly less, never opening a
+    member. It does go on past a refusal about one entry, where the
+    composer stops, so it resolves every symbolic link the walk reaches
+    rather than stopping at the first that leaves the root. At the entry
+    ceiling that is at most MAX_WALKED_ENTRIES resolutions.
+    """
+    root = enforce_snapshot_root(
+        body.root, app.state.repo_roots, resolve=_resolved_directory
+    )
+    refuse_while_cloning(root)
+    try:
+        return snapshot.list_members(tree=DescriptorTree(root), patterns=body.patterns)
+    except snapshot.SnapshotError as exc:
+        # Only a malformed pattern reaches here: every refusal about the
+        # tree is reported in the listing rather than raised.
+        raise HTTPException(422, str(exc)) from None
+
+
+# ---- The clone door ----------------------------------------------------
+#
+# POST /clones fetches a public repository into BENCH_CLONE_ROOT, and it
+# is the one door that reaches a host other than OpenRouter. What a
+# request may name is decided in bench/clones.py; what follows is the
+# process, the directory and the record.
+
+# THE CLONE DOOR'S THREE CEILINGS, named here and nowhere else, as the
+# operator ratified them at the O2 checkpoint.
+#
+# MAX_CLONE_SECONDS bounds one clone from its first git to its last,
+# measured once: the network is the one thing here the bench does not
+# control, and a clone that has not finished in two minutes is killed,
+# git and everything it started, and removed.
+#
+# MAX_CLONE_BYTES and MAX_CLONE_ENTRIES bound what one clone may put on
+# disk under its directory, .git included, because disk is disk, and
+# they are TWO CEILINGS BECAUSE EACH IS BLIND TO WHAT THE OTHER
+# MEASURES. Bytes are the sizes of regular files: they bound the
+# download and the space it takes, and they cannot see an entry that
+# holds nothing. A tree of a million empty files weighs zero bytes, yet
+# it costs an inode each to check out, a stat each to measure, and
+# every later walk of it (the snapshot walk stops at MAX_WALKED_ENTRIES
+# for the same reason). Entries count the files and directories: they
+# bound that cost and cannot see how large each is. Either ceiling
+# alone passes the case the other exists for.
+MAX_CLONE_SECONDS = 120
+MAX_CLONE_BYTES = 200_000_000
+MAX_CLONE_ENTRIES = 100_000
+
+# How often the directory a fetch or a checkout is writing is measured.
+CLONE_POLL_SECONDS = 0.5
+
+# How much of git's stderr a clone keeps: enough to say which kind of
+# failure it was. It is never shown, since git names the URL in it.
+CLONE_STDERR_KEEP = 4096
+
+# The work directories a clone makes beside the one it is making: the
+# new tree before it is swapped in, and the old one after.
+CLONE_WORK = re.compile(r"\.[0-9a-f]{16}\.(?:partial|old)")
+
+
+def _parse_clone_root(
+    raw: str | None, *, resolved: Callable[[str], str | None]
+) -> str | None:
+    """BENCH_CLONE_ROOT, resolved, or None when it is not set.
+
+    _parse_repo_roots's two halves, for its reasons: absent is the door
+    off (CLONES_OFF, at the door), and set and wrong fails boot, because
+    a relative path or a missing directory means the sentence the
+    operator wrote does not name what they meant. Whether it is one of
+    BENCH_REPO_ROOTS is the door's question and not boot's: the
+    commission has the door refuse naming both variables.
+    """
+    if raw is None or not raw.strip():
+        return None
+    named = raw.strip()
+    if not os.path.isabs(named):
+        raise RuntimeError(
+            f"BENCH_CLONE_ROOT {named!r} is not an absolute path. It is "
+            "compared against the resolved BENCH_REPO_ROOTS, so a relative "
+            "one would depend on where the bench happened to be started."
+        )
+    real = resolved(named)
+    if real is None:
+        raise RuntimeError(
+            f"BENCH_CLONE_ROOT {named!r} is not a directory. It is where "
+            "the clone door puts the repositories it fetches."
+        )
+    return real
+
+
+def _parse_clone_cainfo(raw: str | None) -> str | None:
+    """BENCH_CLONE_CAINFO: a TEST SEAM, like OPENROUTER_URL, not a feature.
+
+    A certificate bundle git is told to trust (GIT_SSL_CAINFO) so the
+    tests can clone from a loopback remote with a certificate of their
+    own. Unset in real use, where git trusts the system's store and
+    nothing else. Checked at boot like the roots: git reads a relative
+    bundle against the clone's own directory, and a missing one fails
+    every clone as though the remote had.
+    """
+    if raw is None or not raw.strip():
+        return None
+    named = raw.strip()
+    if not os.path.isabs(named) or not os.path.isfile(named):
+        raise RuntimeError(
+            f"BENCH_CLONE_CAINFO {named!r} is not an absolute path to a "
+            "file. It is a test seam naming a certificate bundle for git."
+        )
+    return named
+
+
+def _clones_off_reason() -> str:
+    """Why POST /clones will not answer, or "" when it will.
+
+    ONE SENTENCE, TWO PLACES, as SNAPSHOTS_OFF: the door's refusal and
+    the page's standing reason are this same text.
+    """
+    clone_root = getattr(app.state, "clone_root", None)
+    if clone_root is None:
+        return clones.CLONES_OFF
+    roots = getattr(app.state, "repo_roots", ())
+    if clone_root not in roots:
+        allowed = ", ".join(snapshot.printable(r) for r in roots) or "none set"
+        return (
+            f"BENCH_CLONE_ROOT ({snapshot.printable(clone_root)}) is not one "
+            f"of BENCH_REPO_ROOTS ({allowed}). BENCH_REPO_ROOTS is the one "
+            "list of trees the snapshot doors may walk, and the clone door "
+            "does not get to add to it by putting clones somewhere else: "
+            "name the same directory in both and restart the bench."
+        )
+    return ""
+
+
+def _clone_env(home: str, cainfo: str | None) -> dict[str, str]:
+    """The whole environment a clone's git runs in, and nothing more.
+
+    BUILT, NOT COPIED, so no variable of the bench's reaches git unless
+    it is named here: not OPENROUTER_API_KEY, not a GIT_ASKPASS or a
+    GIT_CONFIG_* the operator's shell carried, not a proxy. HOME is an
+    empty directory made for this clone, so no ~/.gitconfig and no
+    ~/.config/git applies; GIT_CONFIG_NOSYSTEM drops /etc/gitconfig
+    (where macOS's names the keychain helper); GIT_TERMINAL_PROMPT=0
+    means a request for credentials fails rather than waits. The one
+    addition is the test seam's certificate bundle, when it is set.
+
+    NO PROXY, AND THE SYSTEM'S TRUST STORE ONLY. A proxy is a host the
+    operator did not list in BENCH_CLONE_HOSTS, so a bench behind a
+    mandatory proxy cannot clone; its refusal says the host could not
+    be reached.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": home,
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+    if cainfo is not None:
+        env["GIT_SSL_CAINFO"] = cainfo
+    return env
+
+
+def _clone_argv(tree: str, args: Sequence[str], operands: Sequence[str]) -> list[str]:
+    """The argv of one git a clone runs in `tree`.
+
+    THE CONFIGURATION COMES FIRST AND IS FIXED, and the network posture
+    walk pins it literally. https and nothing else (protocol.allow);
+    no credential helper from any source (an empty helper clears the
+    list); no redirect, so a listed host cannot send the fetch to one
+    nobody listed; no empty-auth, so a Negotiate challenge gets no
+    ambient Kerberos ticket; no reflog, which would record the
+    operator's login name and host inside the clone; and no automatic
+    maintenance, which git runs detached, outside the process group the
+    timeout kills.
+
+    THE REPOSITORY IS PINNED, --git-dir and --work-tree, so git never
+    searches upward: a directory without its own .git must not become
+    the fetch and checkout of whatever repository encloses it.
+
+    "--" COMES BEFORE EVERY OPERAND, whatever the operands are. Those
+    are the URL and the ref, the only strings derived from a request,
+    and each has already been refused if it starts with '-'; "--" is
+    the line that holds if a refusal ever did not.
+    """
+    return [
+        "git",
+        "-c",
+        "protocol.allow=never",
+        "-c",
+        "protocol.https.allow=always",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "http.followRedirects=false",
+        "-c",
+        "http.emptyAuth=false",
+        "-c",
+        "core.logAllRefUpdates=false",
+        "-c",
+        "gc.auto=0",
+        "-c",
+        "maintenance.auto=false",
+        f"--git-dir={os.path.join(tree, '.git')}",
+        f"--work-tree={tree}",
+        *args,
+        "--",
+        *operands,
+    ]
+
+
+async def _stderr_tail(stream: asyncio.StreamReader) -> str:
+    """git's stderr, drained as it arrives so a full pipe never stalls
+    git, keeping the last CLONE_STDERR_KEEP bytes."""
+    kept = bytearray()
+    while chunk := await stream.read(65536):
+        kept += chunk
+        del kept[:-CLONE_STDERR_KEEP]
+    return kept.decode("utf-8", "replace")
+
+
+async def _stdout_to(
+    stream: asyncio.StreamReader, read: Callable[[bytes], None]
+) -> None:
+    while chunk := await stream.read(65536):
+        read(chunk)
+
+
+async def _git_clone(
+    tree: str,
+    args: list[str],
+    operands: list[str],
+    *,
+    env: dict[str, str],
+    deadline: float,
+    read: Callable[[bytes], None] | None = None,
+    watch: bool = False,
+) -> tuple[int, str]:
+    """Run one git of a clone: its exit status and the tail of its stderr.
+
+    THE CLONE'S OWN RUNNER, and not _git, which stays as it is for its
+    two-second local questions. A clone waits on the network, so this
+    one is a subprocess the event loop awaits rather than one that holds
+    it.
+
+    ONE DEADLINE FOR THE WHOLE CLONE, passed in rather than restarted per
+    command: past it, git and every child in its process group (the
+    remote helper, index-pack) are killed and the clone is refused
+    naming MAX_CLONE_SECONDS. With `watch`, the clone's directory is
+    measured every CLONE_POLL_SECONDS while git runs and the same kill
+    ends it past a ceiling, so a large repository is stopped while it
+    arrives rather than counted once it has. `read` is handed git's
+    stdout as it comes and may refuse by raising, which kills git too.
+
+    KILLED ON EVERY WAY OUT: a refusal, a timeout, or a cancellation of
+    the request (a client gone, the bench shutting down). The group is
+    signalled only while git is unreaped, so its id cannot have been
+    reused, and only if git leads its own group, so a runner started
+    some other way can never signal the bench's. A bench killed outright
+    leaves its git to finish or fail alone; nothing can signal from a
+    process that is gone.
+    """
+    if any(operand.startswith("-") for operand in operands):
+        raise ValueError("a clone operand starts with '-'")
+    proc = await asyncio.create_subprocess_exec(
+        *_clone_argv(tree, args, operands),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE if read is not None else subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert proc.stderr is not None
+    errors = asyncio.ensure_future(_stderr_tail(proc.stderr))
+    reading = None
+    if read is not None:
+        assert proc.stdout is not None
+        reading = asyncio.ensure_future(_stdout_to(proc.stdout, read))
+    exited = asyncio.ensure_future(proc.wait())
+    try:
+        while not exited.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise HTTPException(504, _clone_timeout())
+            waiting = (
+                {exited} if reading is None or reading.done() else {exited, reading}
+            )
+            await asyncio.wait(
+                waiting,
+                timeout=min(CLONE_POLL_SECONDS, remaining),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if reading is not None and reading.done():
+                reading.result()
+            if watch and not exited.done():
+                measured = await asyncio.to_thread(_measure_clone, tree)
+                if measured.over:
+                    raise HTTPException(422, _clone_too_large(measured, "was stopped"))
+        if reading is not None:
+            await reading
+    finally:
+        if proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                if os.getpgid(proc.pid) == proc.pid:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                else:
+                    proc.kill()
+            await proc.wait()
+        for task in (reading, exited):
+            if task is not None and not task.done():
+                task.cancel()
+        tail = await errors
+    assert proc.returncode is not None
+    return proc.returncode, tail
+
+
+def _clone_timeout() -> str:
+    return (
+        f"the clone took longer than MAX_CLONE_SECONDS ({MAX_CLONE_SECONDS} "
+        "seconds), so git was stopped and what it had fetched was removed. "
+        "A repository that large or a host that slow is past what the "
+        "clone door waits for."
+    )
+
+
+class _Measured:
+    """A clone's directory, counted: regular-file bytes and entries, and
+    whether either passed its ceiling (the count stops when one does)."""
+
+    def __init__(self) -> None:
+        self.bytes = 0
+        self.entries = 0
+
+    @property
+    def over(self) -> bool:
+        return self.bytes > MAX_CLONE_BYTES or self.entries > MAX_CLONE_ENTRIES
+
+
+def _measure_clone(tree: str) -> _Measured:
+    """Count what a clone has put on disk, following no link.
+
+    Stops at the first ceiling passed, so a refusal's figure is "at
+    least". A directory that vanishes while git works in it is skipped:
+    during a fetch git renames its temporary pack, and the next poll
+    counts it under its new name.
+    """
+    measured = _Measured()
+    pending = [tree]
+    while pending:
+        try:
+            listing = os.scandir(pending.pop())
+        except FileNotFoundError:
+            continue
+        with listing:
+            for entry in listing:
+                measured.entries += 1
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        measured.bytes += entry.stat(follow_symlinks=False).st_size
+                except FileNotFoundError:
+                    continue
+                if measured.over:
+                    return measured
+    return measured
+
+
+class _TreeCount(_Measured):
+    """`git ls-tree -r -t -l -z` output, counted as it arrives.
+
+    A checkout's size is known before it is written: every entry of the
+    fetched commit's tree, and every blob's size, which is what checkout
+    writes. Raising here stops git (see _git_clone's `read`).
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._rest = b""
+
+    def __call__(self, chunk: bytes) -> None:
+        records = (self._rest + chunk).split(b"\0")
+        self._rest = records.pop()
+        for record in records:
+            self.entries += 1
+            size = record.split(b"\t", 1)[0].split()[-1]
+            if size != b"-":
+                self.bytes += int(size)
+            if self.over:
+                raise HTTPException(422, _clone_too_large(self, "would be checked out"))
+
+
+def _clone_too_large(measured: _Measured, when: str) -> str:
+    if measured.bytes > MAX_CLONE_BYTES:
+        passed = f"MAX_CLONE_BYTES ({MAX_CLONE_BYTES:,} bytes)"
+    else:
+        passed = f"MAX_CLONE_ENTRIES ({MAX_CLONE_ENTRIES:,} entries)"
+    return (
+        f"the clone came to at least {measured.bytes:,} bytes in "
+        f"{measured.entries:,} entries when it {when}, past {passed}, so "
+        "it was removed. A snapshot selects from a repository, and one "
+        "this large is past what the clone door keeps on disk."
+    )
+
+
+# git's stderr is never shown, because it names the URL. It is read only
+# to say which kind of failure a fetch was, from git's own words in the
+# C locale the scrubbed environment gives it. First match wins. A
+# failure to reach the host at all is the fallback rather than a row:
+# its wording is the TLS library's, which differs between platforms.
+_FETCH_FAILURES = (
+    (
+        ("couldn't find remote ref", "invalid refspec"),
+        "the repository has no branch or tag by that name, or does not "
+        "serve that commit",
+    ),
+    (
+        ("returned error: 30",),
+        # The operator's words at the checkpoint. A redirect could lead
+        # to a host nobody listed, so none is followed, and a renamed or
+        # moved repository refuses here.
+        "the host answered with a redirect, and redirects are not "
+        "followed; clone it from its current URL",
+    ),
+    (
+        (
+            "could not read Username",
+            "terminal prompts disabled",
+            "Authentication failed",
+            "returned error: 401",
+            "returned error: 403",
+        ),
+        "the host asked for credentials. A clone is of a public repository "
+        "and no credential exists on this path, so a private repository is "
+        "refused here, and so is one that does not exist on a host that "
+        "answers both the same way",
+    ),
+    (
+        ("returned error: 404", "not found"),
+        "the host has no repository at that URL",
+    ),
+)
+
+
+def _fetch_refused(code: int, stderr: str) -> HTTPException:
+    for markers, sentence in _FETCH_FAILURES:
+        if any(marker in stderr for marker in markers):
+            return HTTPException(422, f"the clone was refused: {sentence}.")
+    return HTTPException(
+        502,
+        f"the clone could not fetch from the host (git exited {code}). A "
+        "clone reaches the host over https, trusting the system's "
+        "certificates and using no proxy, and a host that cannot be "
+        "reached that way cannot be cloned from.",
+    )
+
+
+def _sweep_clone_work(clone_root: str) -> None:
+    """Remove the work directories a clone left behind, and nothing else.
+
+    Only names of CLONE_WORK's shape, directly under the clone root,
+    which are the door's own (a new tree before its swap, an old one
+    after), and only as what they are: a directory is removed as a
+    tree, anything else by its own name, and no link is followed. Run
+    at boot and at the start of every clone, holding the slot, so a
+    crash's leftovers never outlive the next clone and are never
+    snapshotted in between (the snapshot doors refuse them by name).
+    """
+    with os.scandir(clone_root) as listing:
+        leftovers = [e for e in listing if CLONE_WORK.fullmatch(e.name)]
+    for entry in leftovers:
+        if entry.is_dir(follow_symlinks=False):
+            _remove_tree(entry.path)
+        else:
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(entry.path)
+
+
+def _remove_tree(path: str) -> None:
+    """Remove a directory the clone door made, as far as it can be.
+
+    A named function rather than shutil.rmtree handed to a thread, so the
+    filesystem walk sees the call under a name: every tree removed is one
+    of a clone's own (its new directory, its old one, its empty HOME) or
+    a leftover the sweep found by the door's own naming. rmtree follows
+    no link; a partial removal is finished by the next sweep.
+    """
+    shutil.rmtree(path, ignore_errors=True)
+
+
+def _empty_home() -> str:
+    """A new empty directory to be a clone's HOME, so no gitconfig of the
+    operator's is read. Named for the filesystem walk, as _remove_tree."""
+    return tempfile.mkdtemp(prefix="bench-clone-home-")
+
+
+async def _fetch_into(
+    partial: str, url: str, ref: str, *, env: dict[str, str], deadline: float
+) -> str:
+    """Fetch one commit into a new directory and check it out; its sha.
+
+    FRESH EVERY TIME, the first clone and an update alike: a new
+    repository in a directory nobody else has written, so no git ever
+    runs against a .git/config, a hook or a lock the door did not just
+    make. Five commands under one deadline:
+      init: an empty repository, no template, so no hooks.
+      fetch: one commit at depth one, no tags, no submodules; watched,
+        so a repository too large is stopped as it arrives.
+      ls-tree: the fetched tree counted before anything is written, so
+        a checkout past a ceiling is refused with its exact figure.
+      checkout: the commit, detached; watched as well, since an
+        attribute can make a checkout larger than its blobs.
+      rev-parse: the commit checked out, which is the one recorded.
+    FETCH_HEAD is then removed: git writes the URL into it, and a
+    snapshot rooted at the clone's .git could compose it.
+    """
+    os.mkdir(partial)
+    code, stderr = await _git_clone(
+        partial, ["init", "-q", "--template="], [], env=env, deadline=deadline
+    )
+    if code != 0:
+        raise _fetch_refused(code, stderr)
+    code, stderr = await _git_clone(
+        partial,
+        ["fetch", "-q", "--depth", "1", "--no-tags", "--no-recurse-submodules"],
+        [url, ref],
+        env=env,
+        deadline=deadline,
+        watch=True,
+    )
+    if code != 0:
+        raise _fetch_refused(code, stderr)
+    counted = _TreeCount()
+    code, _ = await _git_clone(
+        partial,
+        ["ls-tree", "-r", "-t", "-l", "-z", "--full-tree", "FETCH_HEAD"],
+        [],
+        env=env,
+        deadline=deadline,
+        read=counted,
+    )
+    if code != 0:
+        raise HTTPException(
+            502, f"the clone's tree could not be read (git exited {code})."
+        )
+    code, _ = await _git_clone(
+        partial,
+        ["checkout", "-q", "--force", "--detach", "FETCH_HEAD"],
+        [],
+        env=env,
+        deadline=deadline,
+        watch=True,
+    )
+    if code != 0:
+        raise HTTPException(
+            502, f"the clone could not be checked out (git exited {code})."
+        )
+    measured = await asyncio.to_thread(_measure_clone, partial)
+    if measured.over:
+        raise HTTPException(422, _clone_too_large(measured, "was checked out"))
+    os.unlink(os.path.join(partial, ".git", "FETCH_HEAD"))
+    head = bytearray()
+    code, _ = await _git_clone(
+        partial,
+        ["rev-parse", "--verify", "HEAD"],
+        [],
+        env=env,
+        deadline=deadline,
+        read=head.extend,
+    )
+    sha = head.decode("ascii", "replace").strip()
+    if code != 0 or not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise HTTPException(502, "the clone's commit could not be read.")
+    return sha
+
+
+async def _clone(url: str, ref: str, clone_root: str) -> dict[str, Any]:
+    """Make or replace one clone, record it, and say which happened.
+
+    THE DIRECTORY IS A FUNCTION OF THE REQUEST: the repository's identity
+    and the ref name it (clones.clone_dir_name), so one repository at one
+    ref has one place.
+
+    AN UPDATE IS A FRESH CLONE AND A SWAP, which is how "fetches and
+    resets to the ref" is kept here (disclosed at the checkpoint). The
+    new tree is made beside the old one and swapped in by two renames
+    with no await between them, so a snapshot, which walks synchronously
+    on this loop, sees the old tree or the new one and never half of
+    either. A refused, failed or timed-out update removes only its own
+    new directory: the old tree and its row stay as they were.
+    """
+    state = app.state.clone_run
+    identity = clones.repository_identity(url)
+    name = clones.clone_dir_name(identity, ref)
+    final = os.path.join(clone_root, name)
+    partial = os.path.join(clone_root, f".{name}.partial")
+    old = os.path.join(clone_root, f".{name}.old")
+    state["paths"] = (final, partial, old)
+    await asyncio.to_thread(_sweep_clone_work, clone_root)
+    home = await asyncio.to_thread(_empty_home)
+    try:
+        head = await _fetch_into(
+            partial,
+            url,
+            ref,
+            env=_clone_env(home, app.state.clone_cainfo),
+            deadline=time.monotonic() + MAX_CLONE_SECONDS,
+        )
+    except BaseException:
+        await asyncio.to_thread(_remove_tree, partial)
+        raise
+    finally:
+        await asyncio.to_thread(_remove_tree, home)
+    # THE SWAP. Both renames stay inside BENCH_CLONE_ROOT, so on one
+    # filesystem, where a rename is atomic: the clone's name names the
+    # old tree or the new one, never a half of either, and nothing awaits
+    # between them. A walk already in flight on the old tree would keep
+    # its descriptors and finish on what it opened, which is what
+    # containment by descriptor was for (none can be in flight here: a
+    # walk runs synchronously on this loop, and refuse_while_cloning
+    # turns one away while the slot is held). The old tree is removed
+    # only after the new one has its name.
+    replaced = os.path.lexists(final)
+    if replaced:
+        os.rename(final, old)
+    os.rename(partial, final)
+    recorded = store.record_clone(
+        app.state.db, url=identity, ref=ref, head_sha=head, root=final
+    )
+    if replaced:
+        await asyncio.to_thread(_remove_tree, old)
+    return {**recorded, "outcome": "updated" if replaced else "cloned"}
+
+
+@app.post("/clones", response_model=CloneRecord, status_code=201)
+async def create_clone(body: CloneCreate, response: Response) -> dict[str, Any]:
+    """Clone one public repository at one ref into BENCH_CLONE_ROOT.
+
+    THE ONE DOOR THAT FETCHES, and the outbound posture is two named
+    destinations because of it: OpenRouter, and the hosts the operator
+    listed in BENCH_CLONE_HOSTS. The composer still fetches nothing; a
+    clone lands in a directory the snapshot doors may then walk, under
+    their own allowlist, which this door does not extend.
+
+    REFUSED IN THE COMMISSION'S ORDER, each before anything is fetched:
+    off (CLONES_OFF, 403); the clone root not one of BENCH_REPO_ROOTS
+    (403, naming both); the URL (its rules in clones.canonical_url, 403
+    for the operator's policy, 422 for its shape, never repeating it);
+    the ref (clones.check_ref, 422); another clone running (409). A body
+    the model refuses is 422 before any of these, as at every door, and
+    that refusal repeats nothing of what was sent either.
+
+    Then the clone: 201 and "cloned" when the directory is new, 200 and
+    "updated" when it replaced one. A repository the host refuses is
+    422, one that cannot be reached 502, one past a ceiling 422 naming
+    what was measured, and one past MAX_CLONE_SECONDS 504; each leaves
+    nothing new on disk.
+
+    ONE AT A TIME: the slot is claimed with nothing awaited since it was
+    checked, and released in a finally whose try begins with the first
+    line of the work, so a clone that raises anywhere frees it.
+    """
+    off = _clones_off_reason()
+    if off:
+        raise HTTPException(403, off)
+    try:
+        url = clones.canonical_url(body.url, app.state.clone_hosts)
+        clones.check_ref(body.ref)
+    except clones.CloneError as exc:
+        raise HTTPException(exc.status, str(exc)) from None
+    state = app.state.clone_run
+    if state["paths"] is not None:
+        raise HTTPException(
+            409,
+            "a clone is already running, and the door makes one at a time; "
+            "send this again when it has answered.",
+        )
+    state["paths"] = ()
+    try:
+        made = await _clone(url, body.ref, app.state.clone_root)
+    finally:
+        state["paths"] = None
+    if made["outcome"] == "updated":
+        response.status_code = 200
+    return made
+
+
+def _same_or_under(inner: str, outer: str) -> bool:
+    """Whether `inner` is `outer` or inside it, by what the paths ARE.
+
+    Compared by device and inode up `inner`'s ancestors rather than by
+    spelling: on a case-insensitive disk one directory has many
+    spellings, and a clone at "…/abcdef…" must not be missed by a root
+    spelled "…/ABCDEF…". A path that does not exist is inside nothing.
+    """
+    try:
+        target = os.stat(outer)
+    except OSError:
+        return False
+    for ancestor in (inner, *map(str, Path(inner).parents)):
+        try:
+            seen = os.stat(ancestor)
+        except OSError:
+            continue
+        if (seen.st_dev, seen.st_ino) == (target.st_dev, target.st_ino):
+            return True
+    return False
+
+
+def _clone_for(root: str) -> int | None:
+    """The id of the clones row whose directory holds this snapshot root,
+    or None.
+
+    BY WHAT THE DIRECTORIES ARE, not how they are spelled: each row's
+    directory is compared by device and inode with the root and each of
+    its ancestors, the root's own first, so the deepest clone holding it
+    wins and a case-folding disk's other spelling is the same clone. A
+    root that holds clones rather than sitting in one (BENCH_CLONE_ROOT
+    itself) is in none, and a row whose directory is gone matches
+    nothing.
+    """
+    rows: dict[tuple[int, int], int] = {}
+    for row in store.list_clones(app.state.db):
+        try:
+            seen = os.stat(row["root"])
+        except OSError:
+            continue
+        rows[(seen.st_dev, seen.st_ino)] = row["id"]
+    if not rows:
+        return None
+    for ancestor in (root, *map(str, Path(root).parents)):
+        try:
+            seen = os.stat(ancestor)
+        except OSError:
+            continue
+        found = rows.get((seen.st_dev, seen.st_ino))
+        if found is not None:
+            return found
+    return None
+
+
+def refuse_while_cloning(root: str) -> None:
+    """409 for a snapshot root a clone is writing, or one it left unfinished.
+
+    A clone's git is a process of its own and writes while the loop
+    serves other requests, and both snapshot doors walk synchronously:
+    a walk of a tree mid-checkout would store a mix of two commits with
+    one capture saying otherwise. So while a clone runs, a root that is
+    one of its directories, inside one, or around one (BENCH_CLONE_ROOT
+    itself is always an allowed root) is refused. A root inside a work
+    directory's name is refused at any time: that is a clone the door
+    has not finished, or one a crash left before the sweep.
+    """
+    if any(CLONE_WORK.fullmatch(part) for part in Path(root).parts):
+        raise HTTPException(
+            409,
+            "that directory is a clone the bench has not finished making or "
+            "removing; snapshot the finished clone instead.",
+        )
+    paths = app.state.clone_run["paths"] if hasattr(app.state, "clone_run") else None
+    if paths and any(
+        _same_or_under(root, busy) or _same_or_under(busy, root) for busy in paths
+    ):
+        raise HTTPException(
+            409,
+            "a clone is being made or replaced at, inside or around that root; "
+            "snapshot it once POST /clones has answered.",
+        )
 
 
 @app.get("/attachments", response_model=AttachmentList)
@@ -7499,9 +8494,14 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     look up is a citation nobody can check. Upload, list, cite, create.
 
     Bounded like the history list and for the same reason, and flat in
-    the number of rows: one query, no body columns, so a page of a
-    thousand documents costs a page of metadata rather than a page of
-    documents.
+    the number of rows: two queries (the rows, each with its latest
+    capture's id, then those captures by id), no body columns, so a page
+    of a thousand documents costs a page of metadata rather than a page
+    of documents.
+
+    EACH ROW CARRIES ITS LATEST CAPTURE since Phase O (ListedAttachment),
+    the same record GET /attachments/{digest} answers, so the dataset
+    builder can name the walk a snapshot option was.
 
     THE BASE ROW'S OWN READING, exactly as GET /attachments/{digest}
     answers it. This endpoint says what is STORED under these bytes; it
@@ -7511,9 +8511,22 @@ async def list_attachments(limit: int = Query(100, ge=1, le=500)) -> dict[str, A
     it means a batched per-digest rendition reader with its own bound,
     and this phase does not build it.
     """
+    rows = store.list_attachments(app.state.db, limit)
+    captures = store.captures_for(
+        app.state.db,
+        [
+            row["latest_capture_id"]
+            for row in rows
+            if row["latest_capture_id"] is not None
+        ],
+    )
     return {
         "attachments": [
-            _attachment_view(row) for row in store.list_attachments(app.state.db, limit)
+            {
+                **_attachment_view(row),
+                "capture": _capture_view(captures.get(row["latest_capture_id"])),
+            }
+            for row in rows
         ]
     }
 

@@ -23,6 +23,12 @@ from stub_openrouter import build_app
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
+# tests/ ON THE IMPORT PATH, for clone_stub. A full run puts it there as
+# a side effect of collecting tests/test_*.py first, and a run of one
+# browser file does not, so the clone bench's fixture would import in
+# the one case and not the other. Said here rather than left to order.
+sys.path.insert(0, str(REPO_ROOT / "tests"))
+
 
 def free_port() -> int:
     with socket.socket() as s:
@@ -88,11 +94,11 @@ def boot_bench(stub_url, tmp_path_factory, extra_env=None):
         }
     )
     env.update(extra_env or {})
-    # The app subprocess keeps trust_env on (real operators may reach
-    # OpenRouter through a proxy), so a developer proxy in the environment
-    # would route its real localhost call to the stub OpenRouter through
-    # that proxy and hang the harness. Scrub the proxy vars from this
-    # subprocess rather than making the app degrade its own behavior.
+    # The app's client reads no proxy variable (its explicit transport
+    # makes httpx skip them; see the lifespan), and the clone door builds
+    # git's environment from nothing. The scrub stays as a guard: should
+    # either ever read one, a developer proxy would route the app's
+    # localhost calls through itself and hang the harness.
     for proxy_var in (
         "HTTP_PROXY",
         "HTTPS_PROXY",
@@ -274,7 +280,62 @@ def snapshot_root(tmp_path_factory):
 
 
 @pytest.fixture(scope="session")
-def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root):
+def listing_root(tmp_path_factory):
+    """The trees the member listing is proved over (Phase O), under a
+    SECOND allowlist entry of the snapshot bench.
+
+    Kept apart from snapshot_root on purpose: a socket, a pipe or a link
+    out of the root refuses every snapshot of the tree it sits in,
+    whatever the patterns, so one placed there would refuse every Compose
+    the Phase L tests make. Each subtree here is a root of its own.
+    """
+    root = tmp_path_factory.mktemp("listing-clones")
+    files = {
+        # Selected, excluded (a secret and a dependency tree), and a file
+        # over the member bound, which refuses.
+        "mixed/src/a.py": b"A = 1\n",
+        "mixed/src/b.py": b"B = 2\n",
+        "mixed/README.md": b"readme\n",
+        "mixed/.env": b"KEY=secret\n",
+        "mixed/node_modules/x/index.js": b"x\n",
+        "mixed/big.txt": b"x" * 250_000,
+        # Names a pattern equal to the path would get wrong: a leading
+        # space the panel's trim would strip onto a sibling, and a
+        # bracket fnmatch reads as a class that matches the sibling.
+        "odd/ a.py": b"LEADING\n",
+        "odd/a.py": b"PLAIN\n",
+        "odd/[x].py": b"BRACKET\n",
+        "odd/x.py": b"X\n",
+        # A name no pattern the panel can send spells exactly.
+        "odd/back\\slash.py": b"BACKSLASH\n",
+        # One more file than a request may carry patterns.
+        **{f"many/f{n:02d}.py": f"F{n} = {n}\n".encode() for n in range(21)},
+        # A tree a pipe refuses whatever the patterns select.
+        "refusing/a.py": b"a\n",
+        # A tree with a link out of the root, whose refusal names an
+        # absolute path, and a tree whose walk stops at a directory the
+        # bench cannot open.
+        "linked/a.py": b"a\n",
+        "stopped/a.py": b"a\n",
+        "stopped/locked/b.py": b"b\n",
+    }
+    for name, body in files.items():
+        target = root / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(body)
+    os.mkfifo(root / "refusing" / "pipe")
+    elsewhere = tmp_path_factory.mktemp("listing-elsewhere")
+    (root / "linked" / "out").symlink_to(elsewhere)
+    locked = root / "stopped" / "locked"
+    locked.chmod(0)
+    yield root
+    # Given back, or pytest cannot remove the tree afterwards and every
+    # later run warns while it fails to.
+    locked.chmod(0o755)
+
+
+@pytest.fixture(scope="session")
+def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root, listing_root):
     """A third bench, the only one with BENCH_REPO_ROOTS set.
 
     Its own process for the reason the zdr bench has one: the allowlist
@@ -282,9 +343,8 @@ def snapshot_bench_url(stub_url, tmp_path_factory, snapshot_root):
     on" are two servers rather than two requests, and the default bench
     stays the one that proves the off state.
     """
-    with boot_bench(
-        stub_url, tmp_path_factory, {"BENCH_REPO_ROOTS": str(snapshot_root)}
-    ) as url:
+    roots = os.pathsep.join([str(snapshot_root), str(listing_root)])
+    with boot_bench(stub_url, tmp_path_factory, {"BENCH_REPO_ROOTS": roots}) as url:
         yield url
 
 
@@ -297,6 +357,64 @@ def snapshot_bench(page, snapshot_bench_url):
             f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
         )
         page.goto(snapshot_bench_url)
+        return page
+
+    return open_bench
+
+
+# ---- The clone door (Phase O, O3). A git remote over HTTPS on
+# ---- loopback, and a fourth bench whose clone door fetches from it.
+
+
+@pytest.fixture(scope="session")
+def clone_remote(tmp_path_factory):
+    """tests/clone_stub.py's remote, for the session.
+
+    Bound before the clone bench boots, because the bench reads
+    BENCH_CLONE_HOSTS and BENCH_CLONE_CAINFO once at boot and both name
+    this remote (its port, its certificate); and stopped after it, since
+    session teardown runs in reverse.
+    """
+    import clone_stub
+
+    with clone_stub.serving(tmp_path_factory.mktemp("clone-remote")) as remote:
+        yield remote
+
+
+@pytest.fixture(scope="session")
+def clone_root(tmp_path_factory):
+    """Where the clone bench's door puts what it fetches, empty at boot."""
+    return tmp_path_factory.mktemp("clone-root")
+
+
+@pytest.fixture(scope="session")
+def clone_bench_url(stub_url, tmp_path_factory, clone_remote, clone_root):
+    """A fourth bench, the only one whose clone door is on.
+
+    BENCH_CLONE_ROOT is an exact entry of BENCH_REPO_ROOTS, as the door
+    requires, and the only one, so every root this bench may walk is a
+    clone its door made. The snapshot bench stays the one that proves
+    the clone door off (snapshots on, no BENCH_CLONE_ROOT).
+    """
+    env = {
+        "BENCH_REPO_ROOTS": str(clone_root),
+        "BENCH_CLONE_ROOT": str(clone_root),
+        "BENCH_CLONE_HOSTS": clone_remote.host,
+        "BENCH_CLONE_CAINFO": str(clone_remote.cainfo),
+    }
+    with boot_bench(stub_url, tmp_path_factory, env) as url:
+        yield url
+
+
+@pytest.fixture
+def clone_bench(page, clone_bench_url):
+    """The page factory, pointed at the bench that may clone."""
+
+    def open_bench(lineup):
+        page.add_init_script(
+            f"localStorage.setItem('bench-lineup', {json.dumps(json.dumps(lineup))})"
+        )
+        page.goto(clone_bench_url)
         return page
 
     return open_bench
@@ -318,6 +436,19 @@ def runs(page, bench_url):
     yield started
     for eid in started:
         drain(page, bench_url, eid)
+
+
+@pytest.fixture
+def clone_runs(page, clone_bench_url):
+    """runs, for the clone bench: an experiment id names a row in one
+    bench's database, and the default bench's row of the same id is some
+    other test's experiment."""
+    from test_n3 import drain
+
+    started = []
+    yield started
+    for eid in started:
+        drain(page, clone_bench_url, eid)
 
 
 @pytest.fixture

@@ -232,8 +232,11 @@ The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
 SIL Open Font License in `static/fonts/OFL.txt`) rather than fetched
 from a CDN, so the page makes no external request. The offline story
-is complete: only the model calls reach the network, through
-OpenRouter.
+is complete: two things reach the network, and only to hosts the
+operator named. The model calls go to OpenRouter; a clone (`POST
+/clones`, below) comes from a host listed in `BENCH_CLONE_HOSTS`, and
+only when `BENCH_CLONE_ROOT` is set. Nothing leaves the machine to a
+host the operator did not name.
 
 ## Interface
 
@@ -1410,7 +1413,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 7**. Each trial line carries the ordered
+An **export is schema version 8**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1421,10 +1424,14 @@ declaration nowhere in the file. Version 6 let a pin's `kind` be
 `snapshot`. Version 7 lets a pin name a `capture_id` and adds `captures`
 to the manifest, the records those ids name, so a reader can say which
 *walk* of a repository each snapshot cell read and not merely which
-bytes. The manifest states the reason for the current bump in the file
-itself, and it names every field the earlier versions added, because a
-reader holding a v7 artifact and a v2 parser needs the whole list from
-the file in their hand.
+bytes. Version 8 adds `clone_id` to each of those capture records: the
+clones row the walked root was in, null when it was in none, so a
+reader holding this bench's database can say which repository and ref a
+snapshot was of; the URL itself stays out of the file. The manifest
+states the reason for the current bump in the file itself, and it names
+every field the earlier versions added, because a reader holding a v8
+artifact and a v2 parser needs the whole list from the file in their
+hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1699,6 +1706,17 @@ to a provider, and one mistyped root is the difference between sharing a
 module and sharing whatever happened to be under a parent directory. The
 allowlist bounds what a typo can gather.
 
+**A root inside version control is refused.** The exclusions below match
+paths under the root, so a root of `<repo>/.git` would walk the very
+directory they skip, and the pattern `config` would compose a remote URL
+with a token in it into a prompt. Both snapshot doors therefore refuse,
+with `403`, any root whose path below its `BENCH_REPO_ROOTS` entry passes
+through `.git`, `.hg` or `.svn` (compared without regard to case, since a
+disk that folds case reaches `.git` as `.GIT` too); the refusal names the
+rule and not the path. It is measured from the deepest entry holding the
+root, so an entry you name inside `.git` yourself is walked. This was
+possible from Phase L until Phase O.
+
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
 
@@ -1735,11 +1753,16 @@ and `static/*.js` composes past the total. Snapshotting this repository
 means naming modules rather than directories, which is what the rule
 says and not a defect in it.
 
-**It fetches nothing.** The single-outbound-destination posture is
-untouched. The bench reads the local filesystem and the local git, and
-the only thing that leaves the machine is the composed prompt, through
-the door every other comparison uses. Remote repositories, diffs between
-snapshots and agentic file browsing are all deliberately out.
+**It fetches nothing.** The composer reads the local filesystem and the
+local git, and the only thing that leaves the machine is the composed
+prompt, through the door every other comparison uses. Fetching a
+repository is the clone door's, a separate door with its own posture
+(see Cloning a repository), and the bench's outbound posture is two
+named destinations: OpenRouter, and the clone hosts the operator
+listed. Nothing leaves the machine to a host the operator did not name,
+and the network posture walk (`tests/test_network_posture.py`) checks
+that no other door reaches either. Diffs between snapshots and agentic
+file browsing are deliberately out.
 
 Default exclusions apply and are recorded in every snapshot's manifest:
 version control and dependency trees (`.git`, `node_modules`, `.venv`,
@@ -1749,24 +1772,95 @@ version control and dependency trees (`.git`, `node_modules`, `.venv`,
 overridable by a request, because an exclusion list a request could
 replace would make it opt-out, and an opt-out default is not a default.
 
+**List before you compose.** `POST /snapshots/listing` takes the same
+body as `POST /snapshots`, behind the same allowlist, and answers what
+the composer would select and refuse without composing, storing or
+reading a file:
+
+```sh
+curl -s -X POST localhost:8000/snapshots/listing \
+  -H "Content-Type: application/json" \
+  -d '{"root": "/home/you/code/myproject", "patterns": ["**/*.py"]}'
+```
+
+It is the composer's own walk, the same traversal in the same order,
+iterated without reading: directories are opened and listed and link
+targets resolved, and no file is opened. Each row is `{path, bytes,
+kind, status, reason}`, sorted by path. `selected` is a file the
+composer would read; `excluded` names the exclusion and its group
+(`bytes` is null, since the listing does not report the size of what it
+will not read, which for a secret would say how long a key is), and a
+link inside the root that a pattern matches is reported the same way,
+because the composer skips it: what it names is read only under its own
+path, if a pattern selects that, and never if an exclusion covers it;
+`refused` carries the composer's sentence word for word. A file no
+pattern matches is not a row. A link out of the root, a socket, device
+or pipe, and a directory past the depth ceiling refuse the snapshot
+whatever the patterns select, and the line above the table says when
+the refusal is one of those, which narrowing cannot fix.
+
+`would_compose` is true exactly when the composer's walk would reach
+composition, and `refusal` is the sentence it would raise first (in its
+walk order, which is not always the first refused row). `counted` is
+the directory entries the walk counted against its twenty-thousand
+ceiling, and `complete` is false when a refusal about the walk itself
+stopped it there, that refusal being the last row whatever its path.
+**`text_checked` is always false**: whether a file is an image or holds
+a NUL byte, and whether it is UTF-8, are properties of the bytes, so
+they stay refusals only Compose can make. So does the composed-character
+ceiling, since it counts decoded characters; `composed_chars_at_most`
+bounds it from the sizes, a character being at least one byte (and a
+leading byte-order mark, which is removed, making the text shorter). At or
+under 200,000 the ceiling cannot refuse; over it, plain ASCII of that
+length is refused and multibyte text may fit. A file the bench cannot
+open, and a tree that changes between the listing and the composition,
+are refused only by Compose, which opens and reads what the listing
+only looked at. A listing is a look and not a pin: nothing is recorded,
+and Compose walks the tree again.
+
 **In the composer**, `+ Snapshot` opens a root and a pattern box beside
 `+ Attach`, and a composed snapshot becomes one chip like any other
 document, reading `repository snapshot` with the number of files it
 selected. When `BENCH_REPO_ROOTS` is unset the button is disabled and the
 server's own refusal is printed beside it, so the page never offers a
 door the server would refuse and the sentence you read there is the
-sentence a `403` would carry. No view ever shows the clone root: the
-stored name is derived from the digest, which is the filename rule
-extended from a file to a tree.
+sentence a `403` would carry. No chip, stored snapshot, report or export
+ever shows the clone root: the stored name is derived from the digest,
+which is the filename rule extended from a file to a tree. The clones
+row and `POST /clones`'s answer hold it; the root box holds one only
+while you work (typed, or filled by Clone) and is emptied whenever the
+panel forgets its root (a composed snapshot, a reuse, a clear, the blind
+view); and the Clone step's off sentence can name `BENCH_CLONE_ROOT`, so
+it is shown only inside the open panel.
+
+**List members** sends the same root and patterns to the listing door
+and shows its rows as a table, the reasons in the server's own words.
+Checking rows writes the patterns: one per checked file, naming exactly
+that file, which is the path itself unless a character would be misread
+(a `*`, `?` or `[` becomes a one-character class like `[*]`, and a space
+or other stripped character at either end is bracketed the same way,
+since the panel trims each line and the server refuses surrounding
+whitespace). A name holding a backslash or a line break has no exact
+pattern and gets no checkbox. More than twenty checked files is refused
+on the page, naming `MAX_PATTERNS`, and so is typing more than twenty
+patterns. A box edited by hand after the listing is never overwritten
+by a check, typing another root empties the table, and every row goes
+whenever the panel forgets its root (a composed snapshot, a reuse, a
+clear, the blind view), since each is a path in somebody's repository.
 
 `GET /attachments/{digest}` serves the snapshot's **manifest**, which is
 the content half: every member's path, byte size and digest, and the
 encoding rule. Beside it rides the **capture**, which is the walk's
 half: the clone's HEAD commit, whether its tree was modified, the
-patterns that selected and the exclusions that were in force, and when.
+patterns that selected and the exclusions that were in force, when, and
+which clone the clone door made it was (`clone_id`, null for a tree the
+door did not make).
 Never any content, which is the promise every attachment response
-makes. The list endpoint omits both deliberately, since a page of
-snapshots carrying theirs would be a page of bodies.
+makes. The list endpoint omits the manifest deliberately, since a page of
+snapshots carrying theirs would be a page of bodies; each row does carry
+its reading's latest capture (since Phase O), the same record the detail
+serves, a walk's facts and not a body, so the dataset builder can tell two
+snapshots of one repository apart.
 
 **Content dedupes; captures do not.** Composing the same unchanged tree
 twice composes identical text, so the digest matches and the
@@ -1845,6 +1939,137 @@ and runs as you, so restricting the path would defend you against yourself
 while blocking the ordinary case. Or store the dataset in the bench and
 name it by digest instead, which needs no path at all.
 
+### Cloning a repository
+
+**`POST /clones` puts a public repository where a snapshot can walk
+it.** It takes a URL and a ref, fetches that one commit into a
+directory the operator named, and answers with the directory as a
+`root` the snapshot doors accept:
+
+```sh
+curl -s -X POST localhost:8000/clones \
+  -H "Content-Type: application/json" \
+  -d '{"url": "https://github.com/owner/repo", "ref": "main"}'
+```
+
+**It is off until you name where clones go.** `BENCH_CLONE_ROOT` is one
+absolute directory, and it must also be one of `BENCH_REPO_ROOTS`: the
+allowlist stays the one list of trees the snapshot doors may walk, and
+the clone door does not get to extend it by putting clones somewhere
+else. Unset, the door refuses naming the variable; set but not among the
+roots, it refuses naming both. `BENCH_CLONE_HOSTS` is a comma-separated
+list of the hosts a clone may come from, default `github.com`; an entry
+may carry a port (`host:8443`), and a port is allowed exactly where an
+entry names one. A relative or missing clone root, or a malformed host
+entry, fails boot naming the variable.
+
+**The URL is parsed, not matched.** It must be `https`, its host one of
+`BENCH_CLONE_HOSTS`, its path `/owner/repo` or `/owner/repo.git`, with
+no user or token before the host, no query, no fragment, no
+percent-escape and nothing around it. What git is given is rebuilt from
+the parts that passed. **No refusal repeats the URL**, not even a
+refusal of a body that forgot its ref, because a URL can carry a token
+and a refusal is shown, logged and reported. The ref is a branch or tag
+name under git's own rules (`git check-ref-format`, which a test holds
+it to) or a 40-character commit, with three rules of the door's: it
+may not start with `-` (git would read an option) or `+` (fetch's force
+flag, which would fetch the name after it), and may not be `@` alone
+(git reads that as HEAD). A ref is named in its refusal only when it
+is spelled like one.
+
+**Public only, and no identity.** git runs in an environment built from
+nothing: `PATH`, an empty temporary `HOME`, `GIT_TERMINAL_PROMPT=0` and
+`GIT_CONFIG_NOSYSTEM=1`. No gitconfig of yours, no credential helper,
+no askpass, no `GIT_CONFIG_*` and none of the bench's own variables
+(its API key included) reach it, and `-c credential.helper=` clears
+any helper that could. A private repository is therefore refused rather
+than cloned through a helper you forgot was configured, and so is one
+that does not exist on a host that answers both the same way. git also
+runs with `http.followRedirects=false`, so a listed host cannot hand the
+fetch to one nobody listed (redirects are not followed, so a renamed
+repository is cloned from its current URL), `http.emptyAuth=false`, so no Kerberos ticket is offered to a
+Negotiate challenge, and `protocol.allow=never` with only `https`
+allowed. **No proxy is used and only the system's certificates are
+trusted**: a proxy is a host `BENCH_CLONE_HOSTS` does not list, so a
+bench behind a mandatory proxy cannot clone, and says the host could not
+be reached. (`BENCH_CLONE_CAINFO` names a certificate bundle for git to
+trust; it is a test seam, like `OPENROUTER_URL`, not a feature.)
+
+**Bounded, and nothing half-made is kept.** One commit at depth one, no
+tags, no submodules, no LFS content (a pointer file is checked out as
+the pointer). The whole clone has `MAX_CLONE_SECONDS` (120), and its
+directory, `.git` included, may hold `MAX_CLONE_BYTES` (200,000,000
+bytes of files) in `MAX_CLONE_ENTRIES` (100,000 entries), as the
+operator ratified them; bytes and entries are two ceilings because each
+is blind to what the other measures (a tree of empty files weighs
+nothing). The size is measured while the
+fetch arrives, counted from the fetched tree before anything is checked
+out, and measured again after; past any ceiling, or past the time, git
+and everything it started are killed, what was fetched is removed, and
+the refusal names the ceiling and the figure measured. One clone runs at
+a time; a second is refused with `409` until the first has answered.
+
+**One repository at one ref has one place.** The directory is
+`BENCH_CLONE_ROOT/<first 16 hex of sha256("url\nref")>`, where the url
+is the repository's identity: the checked URL without a trailing `.git`,
+so both spellings are one clone. Other spellings are not folded: owner
+and repository case, and a ref named two ways (`main`,
+`refs/heads/main`), are two clones, because whether they coincide is
+the host's business. A second request for the same repository and ref
+**replaces** the clone: the commit is fetched fresh into a new directory
+beside the old one, which is swapped in only when everything has
+succeeded, and the answer says `updated` (with `200`) rather than
+`cloned` (`201`). A failed update leaves the old clone exactly as it
+was. No git ever runs in a directory the door did not just make, so no
+hook, lock or config inside an old clone is ever read. While a clone is
+being made or replaced, the snapshot doors refuse a root at it, inside
+it or around it with `409`: a walk of a tree mid-checkout would store two
+commits under one capture.
+
+**The URL is recorded once.** A `clones` table holds each repository and
+ref: the id, the URL, the ref, the commit checked out now, the
+directory, and when it was made and last replaced. That row is the only
+place the URL is kept. It is never in a composed text, a manifest, a
+report or an export, because a URL is not a fact about the reading; git
+writes it into the clone's `.git/FETCH_HEAD`, and the door removes that
+file, and git's reflog, which would name you and your machine, is off.
+The row describes the directory as it is now; what a snapshot read is on
+its capture, which never changes. **A snapshot of a clone names it**: its
+capture carries the clone's id (`clone_id`), found by what the
+directories are rather than how they are spelled, from the clone's
+root or a directory inside it; a root that holds clones
+rather than sitting in one (`BENCH_CLONE_ROOT` itself) names none. The
+id travels wherever the capture does (the snapshot's response, the
+history, the report and the export), so a reader asks "which
+repository was this" of the clones table and finds the URL there.
+
+**In the snapshot panel**, the Clone step sits above the root box: a
+URL, a ref and **Clone**. When the door is off, its own sentence is shown
+there, inside the open panel (one of the door's two off sentences names
+`BENCH_CLONE_ROOT` and every allowed root, so it is never left on the page
+while the panel is closed). On success the root box is
+filled with the directory the clone went to, and "cloned at" or "updated
+to" and the commit are shown beside it; List and Compose then work on it
+as on any root. Every refusal is the door's sentence, word for word, and
+none of them holds the URL you typed. While a clone the panel still
+waits for runs, the step says so, List and Compose wait for it, and the
+URL, ref and root boxes are read-only. A clone the panel forgets (a
+reuse, a clear, the blind view) fills nothing when it lands and holds
+only Clone, since the server makes one at a time; until it answers, the
+snapshot doors refuse its directory with `409`. Cloning waits while a
+blind rating is open, since a clone writes a path. A composed snapshot
+keeps the URL and ref only when they made the root. Blank is not sent. Nothing is
+remembered across loads: the four boxes are off to autocomplete and
+spell checking, and a page restored from the back/forward cache forgets
+the panel. A clone is not a comparison: the page sends the URL and the
+ref and nothing else, and stages nothing.
+
+**Removing a clone is yours.** There is no delete door: remove the
+directory yourself. Its row stays, and a later clone of the same
+repository and ref lands in the same place under the same row. The
+bench removes only its own half-made directories (`.<hex>.partial`,
+`.<hex>.old`), at boot and before each clone.
+
 ### Stored datasets
 
 A dataset can live in `bench.db` instead of on your disk, cited by the
@@ -1912,8 +2137,13 @@ There are three ways in:
   pattern for regex, a rubric and an optional pass threshold for the
   judge), an optional system message, and optional documents picked from
   what the bench already stores, which is how a repository snapshot
-  enters a task. Row N is line N of what Store sends. The builder holds
-  50 rows; past that, paste or upload.
+  enters a task. A snapshot's option names its latest walk in its title
+  ("latest capture #N at <commit>, clean"), so two snapshots of one
+  repository can be told apart; walks that composed identical bytes are
+  one option naming the newest, and a snapshot cited this way (by bare
+  digest) records the latest walk when the experiment is created. Row N
+  is line N of what Store sends. The builder holds 50 rows; past that,
+  paste or upload.
 - **JSONL**, pasted or uploaded. It is sent exactly as it is: the page
   counts its lines (split and skipped as the parser splits and skips)
   against the 2000-task ceiling and parses nothing, and an uploaded file

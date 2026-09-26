@@ -81,25 +81,83 @@
       <!-- A repository snapshot is an attachment the bench composes
            rather than one the person uploads, so it sits beside Attach
            and produces the same chip. Disabled, with the server's own
-           refusal in the title, when BENCH_REPO_ROOTS is unset: a
-           control that offers a door the server will refuse is worse
-           than one that says why it cannot. -->
+           refusal shown in #snapshot-msg below, when BENCH_REPO_ROOTS is
+           unset: a control that offers a door the server will refuse is
+           worse than one that says why it cannot. -->
       <button id="snapshot-open" data-testid="snapshot-open" type="button"
               class="attach-btn" aria-expanded="false"
               aria-controls="snapshot-panel">+ Snapshot</button>
     </div>
     <div id="snapshot-panel" data-testid="snapshot-panel" hidden>
+      <!-- The Clone step (Phase O): a public repository at one ref,
+           fetched by POST /clones into the directory the operator named,
+           whose answer fills the root box below. First, because a clone
+           is where the root comes from. The reason line is written only
+           while the panel is open: one of the door's two off sentences
+           names paths. -->
+      <!-- Nothing in the URL, ref, root and pattern boxes is
+           remembered across loads or handed to a spell checker: the URL
+           can carry a token, and a root is a path on somebody's
+           filesystem. -->
+      <div id="clone-step" data-testid="clone-step">
+        <input id="clone-url" data-testid="clone-url" type="text"
+               aria-label="Public repository URL to clone"
+               aria-describedby="clone-reason"
+               placeholder="Repository URL: https://github.com/owner/repo"
+               autocomplete="off" spellcheck="false">
+        <input id="clone-ref" data-testid="clone-ref" type="text"
+               aria-label="Branch, tag or commit to clone"
+               placeholder="Branch, tag or commit"
+               autocomplete="off" spellcheck="false">
+        <button id="clone-run" data-testid="clone-run"
+                type="button">Clone</button>
+        <span id="clone-outcome" data-testid="clone-outcome"
+              role="status"></span>
+        <div id="clone-reason" data-testid="clone-reason"></div>
+      </div>
+      <!-- Described by the Clone step's reason too: when cloning is
+           off, the URL box is disabled and focus opens here. -->
       <input id="snapshot-root" data-testid="snapshot-root" type="text"
              aria-label="Clone root to snapshot"
-             placeholder="Clone root, an absolute path under BENCH_REPO_ROOTS">
+             aria-describedby="clone-reason"
+             placeholder="Clone root, an absolute path under BENCH_REPO_ROOTS"
+             autocomplete="off" spellcheck="false">
       <!-- One pattern per line, never comma-separated: the server takes
            a comma literally and inside a character class, so a comma
            split would send two patterns where one was typed. -->
       <textarea id="snapshot-patterns" data-testid="snapshot-patterns" rows="2"
                 aria-label="Include patterns, one per line"
-                placeholder="Include patterns, one per line: bench/**/*.py then README.md"></textarea>
+                placeholder="Include patterns, one per line: bench/**/*.py then README.md"
+                autocomplete="off" spellcheck="false"></textarea>
+      <!-- List before Compose: the same body to POST /snapshots/listing,
+           which answers what Compose would select, exclude and refuse
+           without reading a file. -->
+      <button id="snapshot-list" data-testid="snapshot-list"
+              type="button">List members</button>
       <button id="snapshot-compose" data-testid="snapshot-compose"
               type="button">Compose snapshot</button>
+      <!-- After Compose in document order, so a keyboard reaches Compose
+           without passing every row. Inside the panel, so closing the
+           panel hides it; emptied whenever the panel forgets its inputs,
+           since every row is a path in somebody's repository. -->
+      <div id="snapshot-listing" data-testid="snapshot-listing" hidden>
+        <div id="snapshot-listing-summary" data-testid="snapshot-listing-summary"
+             role="status"></div>
+        <table id="snapshot-members" data-testid="snapshot-members">
+          <caption>What Compose would select, exclude and refuse, by path.
+            Check files to make the patterns name exactly them.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Use</th>
+              <th scope="col">Path</th>
+              <th scope="col">Bytes</th>
+              <th scope="col">Status</th>
+              <th scope="col">Reason</th>
+            </tr>
+          </thead>
+          <tbody id="snapshot-member-rows" data-testid="snapshot-member-rows"></tbody>
+        </table>
+      </div>
     </div>
     <!-- Outside the panel on purpose. When BENCH_REPO_ROOTS is unset the
          panel never opens, and the server's own sentence has to be
