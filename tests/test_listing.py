@@ -7,7 +7,11 @@ returns, refuses or opens, proved against walk as it stood at d1d792d
 (a file swapped for a link, a fifo or another file at the open, a file
 grown before its read); the directory races have their own tests in
 test_snapshot.py, and the one deliberate change, a link target UTF-8
-cannot spell now named by its repr, has its own test here. The listing
+cannot spell now named by its repr, has its own test here. A second
+change came after the operator's pass: a directory holding a git
+directory's four names is refused, with its own tests at the end of
+this file; no generated tree holds them (the differential's PRE-STATE),
+so the oracle still speaks for every tree it is given. The listing
 agrees with the composer on a still tree: the same selection, the same
 first refusal, the same entry ceiling. And the listing reads nothing:
 no member is opened, and no byte is read.
@@ -40,6 +44,7 @@ from bench.snapshot import (
     compose,
     composed_chars_at_most,
     list_members,
+    matches,
     walk,
 )
 
@@ -147,6 +152,10 @@ NAMES = [
     ".env.db",
     "z.pyc",
 ]
+# A git directory's four names, written out rather than read from the
+# module, so each PRE-STATE in this file that names them says the same
+# thing before the git directory rule existed as after.
+FOUR = ("HEAD", "config", "objects", "refs")
 # A name UTF-8 cannot spell, as os.scandir hands back a byte it cannot
 # decode. One tree in ten holds one, since any tree that does refuses.
 BAD_NAME = "bad" + chr(0xDCFF) + ".py"
@@ -296,7 +305,10 @@ def test_walk_on_the_survey_is_walk_as_it_was(spec):
     Equal outcomes (the same members, or the same refusal word for word)
     and equal ledgers: every open, close and read in the same order.
     PRE-STATE: the oracle is today's walk only by that assertion; see the
-    digest test above."""
+    digest test above; and no generated name is one of the four a git
+    directory holds, folded for case, so no generated tree meets the rule
+    the oracle predates."""
+    assert not {n.casefold() for n in NAMES} & {n.casefold() for n in FOUR}
     new, old = build(spec), build(spec)
     with small_ceilings():
         got = outcome(lambda: walk(tree=new, patterns=spec["patterns"]))
@@ -794,3 +806,308 @@ def test_nothing_selected_is_the_composers_sentence():
     assert listed["members"] == []
     assert listed["composed_chars_at_most"] is None
     assert listed["complete"] is True
+
+
+# ----- a git directory, by what it holds -----------------------------
+#
+# Found after the operator's pass at 9c920e5 and pre-existing since
+# Phase L: a directory holding HEAD, config, objects and refs is a git
+# directory whatever it is named, and the walk read one like any other.
+# These are the refusal's pure proofs, over the dict-backed tree and its
+# ledger of opens and reads. The fixture proof, a bare repository whose
+# config carries a sentinel string in the userinfo position of a remote
+# URL, is its own commit.
+
+# The shapes a git directory's top level takes here, each one git reads
+# as its own: the four names as git writes them; spelled as a disk that
+# folds case may hold them (git asking for config is served CONFIG);
+# refs a file, which git takes when it may execute it (a FakeTree keeps
+# no modes); and objects a link to a directory inside the root, which
+# git follows.
+SHAPES = {
+    "as-git-writes-them": FOUR,
+    "spelled-otherwise": ("Head", "CONFIG", "Objects", "REFS"),
+    "refs-a-file": FOUR,
+    "objects-a-link": FOUR,
+}
+CONFIG_BODY = b"[core]\n\tbare = true\n"
+
+
+def git_directory(at="", shape="as-git-writes-them"):
+    """A git directory's top level at `at`, in one of SHAPES, as the
+    (files, links) a FakeTree takes."""
+    head, config, objects, refs = (f"{at}/{n}" if at else n for n in SHAPES[shape])
+    files = {head: b"ref: refs/heads/main\n", config: CONFIG_BODY}
+    links = {}
+    if shape == "objects-a-link":
+        links[objects] = f"{ROOT}/store"
+        files["store/info/packs"] = b"\n"
+    else:
+        files[f"{objects}/info/packs"] = b"\n"
+    if shape == "refs-a-file":
+        files[refs] = b"\n"
+    else:
+        files[f"{refs}/heads/main"] = b"0" * 40
+    return files, links
+
+
+def without(tree, name, at=""):
+    """The same (files, links) with one of the four names at `at` spelled
+    otherwise, so the directory carries three of them."""
+    old = f"{at}/{name}" if at else name
+
+    def moved(path):
+        if path == old or path.startswith(old + "/"):
+            return old + ".old" + path[len(old) :]
+        return path
+
+    return tuple({moved(path): value for path, value in part.items()} for part in tree)
+
+
+def planted(tree, **kwargs):
+    files, links = tree
+    return FakeTree(files, links=links, **kwargs)
+
+
+def read_paths(fake):
+    return [path for path, _ in fake.reads]
+
+
+def under(path, at):
+    return path.startswith(at + "/")
+
+
+# Patterns for a root, from the four names as the shape spells them: one
+# that names config, one that names everything, and one that misses
+# config, since the rule holds whatever the patterns select.
+ROOT_PATTERNS = {
+    "under-config": lambda spelled: [spelled[1]],
+    "under-everything": lambda spelled: ["**/*"],
+    "under-a-pattern-that-misses-config": lambda spelled: [spelled[0]],
+}
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("which", ROOT_PATTERNS)
+def test_a_root_that_is_a_git_directory_opens_nothing_in_it(which, shape):
+    """WINDOW: walk and list_members over a FakeTree whose root is a git
+    directory in each of SHAPES, under a pattern that names config, one
+    that names everything, and one that misses config (HEAD).
+
+    The survey stops at the root before any member is opened, whatever
+    the patterns select: the one handle either consumer opens is the
+    root's, nothing is read, and so config is never opened. The composer
+    raises the root's sentence; the listing's one row is that sentence,
+    at the root, final, after the root's entries were counted. PRE-STATE:
+    with any one of the four names spelled otherwise, a walk under '**/*'
+    returns, having opened and read config (config.old when config is
+    the one respelled), so three of the four are not the rule and the
+    ledger records an open when there is one; and with refs spelled
+    otherwise, the walk under the case's own patterns returns, having
+    read exactly what they select."""
+    spelled = SHAPES[shape]
+    patterns = ROOT_PATTERNS[which](spelled)
+    config = spelled[1]
+    for name in spelled:
+        fake = planted(without(git_directory(shape=shape), name))
+        members = dict(walk(tree=fake, patterns=["**/*"]))
+        read = config + ".old" if name == config else config
+        assert read in fake.opened and read in read_paths(fake)
+        assert members[read] == CONFIG_BODY
+    fake = planted(without(git_directory(shape=shape), spelled[3]))
+    members = dict(walk(tree=fake, patterns=patterns))
+    assert members and sorted(members) == sorted(read_paths(fake))
+
+    tree = git_directory(shape=shape)
+    fake = planted(tree)
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=patterns)
+    assert (fake.opened, fake.closed, fake.reads) == ([""], [""], [])
+    looked = planted(tree)
+    listed = list_members(tree=looked, patterns=patterns)
+    assert (looked.opened, looked.closed, looked.reads) == ([""], [""], [])
+    assert listed["members"] == [
+        {
+            "path": "",
+            "bytes": None,
+            "kind": DIRECTORY,
+            "status": "refused",
+            "reason": str(refused.value),
+        }
+    ]
+    assert (listed["complete"], listed["would_compose"]) == (False, False)
+    assert listed["refusal"] == str(refused.value)
+    assert listed["counted"] == len(
+        {path.split("/")[0] for part in tree for path in part}
+    )
+    assert str(refused.value) == snapshot.ROOT_IS_GIT_DIRECTORY
+
+
+@pytest.mark.parametrize("shape", SHAPES)
+@pytest.mark.parametrize("at", ["g", "fixtures/g"], ids=["under-the-root", "two-down"])
+@pytest.mark.parametrize(
+    "patterns", [["**/*"], ["*.py"]], ids=["everything", "misses-config"]
+)
+def test_a_git_directory_the_walk_reaches_opens_nothing_in_it(patterns, at, shape):
+    """WINDOW: walk and list_members over a FakeTree holding a.py, a git
+    directory in each of SHAPES at g and at fixtures/g, and zz.py, under
+    '**/*' and under '*.py', which misses config.
+
+    The git directory is opened to be listed, which is how its names are
+    seen, and nothing under it is opened or read: not config, not
+    anything. The composer raises the walked directory's sentence at it,
+    having read only a.py; the listing's row for it is that sentence, and
+    the walk goes on past it to what the patterns select after it, as it
+    does past a directory too deep. PRE-STATE: with HEAD spelled
+    otherwise, the same walk under '**/*' opens and reads the git
+    directory's config and returns it, and under '*.py' composes a.py and
+    zz.py, so the refusal is what changes the outcome."""
+    spelled = SHAPES[shape]
+    config = f"{at}/{spelled[1]}"
+    parents = [at[:i] for i, c in enumerate(at) if c == "/"]
+    files, links = git_directory(at, shape)
+    tree = ({"a.py": b"a", **files, "zz.py": b"z"}, links)
+    fake = planted(without(tree, spelled[0], at))
+    members = dict(walk(tree=fake, patterns=["**/*"]))
+    assert config in fake.opened and config in read_paths(fake)
+    assert members[config] == CONFIG_BODY
+    fake = planted(without(tree, spelled[0], at))
+    assert [path for path, _ in walk(tree=fake, patterns=["*.py"])] == ["a.py", "zz.py"]
+
+    fake = planted(tree)
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=patterns)
+    assert fake.opened == ["", "a.py", *parents, at]
+    assert read_paths(fake) == ["a.py"]
+    assert fake.closed == ["a.py", at, *reversed(parents), ""]
+    looked = planted(tree)
+    listed = list_members(tree=looked, patterns=patterns)
+    assert at in looked.opened and looked.reads == []
+    assert [path for path in looked.opened if under(path, at)] == []
+    assert {
+        "path": at,
+        "bytes": None,
+        "kind": DIRECTORY,
+        "status": "refused",
+        "reason": str(refused.value),
+    } in listed["members"]
+    assert [m for m in listed["members"] if under(m["path"], at)] == []
+    assert [m["path"] for m in listed["members"] if m["status"] == "selected"] == [
+        path
+        for path in sorted(tree[0])
+        if not under(path, at) and any(matches(path, p) for p in patterns)
+    ]
+    assert (listed["complete"], listed["would_compose"]) == (True, False)
+    assert listed["refusal"] == str(refused.value)
+    assert str(refused.value) == snapshot.HOLDS_GIT_DIRECTORY
+
+
+def test_the_walks_own_refusals_come_before_the_git_directory_rule():
+    """WINDOW: list_members over a.py, a git directory at fixtures/g and
+    zz.py, under '**/*'; then the same tree with a name UTF-8 cannot
+    spell inside fixtures/g; then with the entry ceiling shrunk to fall
+    inside fixtures/g's listing.
+
+    The rule reads the names the directory's listing already gathered:
+    fixtures/g's four are counted before it (8 in all: a.py, fixtures,
+    zz.py, g, and g's four), and objects and refs are never descended. A
+    name UTF-8 cannot spell inside it stops the survey there with the
+    UTF-8 sentence, and a listing past the ceiling stops it with the
+    ceiling's: refusals about the traversal, which come first.
+    PRE-STATE: with HEAD spelled otherwise the walk descends objects and
+    refs and counts 12; the other two trees differ from the first by one
+    name and by one ceiling."""
+    files, _ = git_directory("fixtures/g")
+    files = {"a.py": b"a", **files, "zz.py": b"z"}
+    control = list_members(
+        tree=planted(without((files, {}), "HEAD", "fixtures/g")), patterns=["**/*"]
+    )
+    assert control["counted"] == 12
+
+    listed = list_members(tree=FakeTree(files), patterns=["**/*"])
+    assert listed["would_compose"] is False
+    assert listed["counted"] == 8
+    assert listed["refusal"] == snapshot.HOLDS_GIT_DIRECTORY
+    bad = list_members(
+        tree=FakeTree({**files, f"fixtures/g/{BAD_NAME}": b"q"}), patterns=["**/*"]
+    )
+    assert (bad["complete"], bad["members"][-1]["path"]) == (False, "fixtures/g")
+    assert bad["refusal"].startswith("fixtures/g holds an entry whose name is not")
+    with mock.patch.object(snapshot, "MAX_WALKED_ENTRIES", 6):
+        wide = list_members(tree=FakeTree(files), patterns=["**/*"])
+    assert (wide["complete"], wide["members"][-1]["path"]) == (False, "fixtures/g")
+    assert wide["refusal"].startswith("the walk passed 6 directory entries")
+
+
+def test_neither_git_directory_sentence_names_a_path():
+    """WINDOW: the sentence each rule raises, from both consumers, over
+    two trees in which the root and every entry a refusal could be about
+    carry 'zq' (the git directory's own four names aside): a root at
+    /zqroot/zqbare.git that is a git directory, and a root at
+    /zqroot/zqtree holding one at zqdir/zqgit beside a link out of the
+    root at zqdir/zqlink.
+
+    Neither sentence holds 'zq' or a path separator: each names the rule,
+    and the listing's row is what says where (its path is zqdir/zqgit).
+    PRE-STATE: the path was at hand (each root is its tree's), and the
+    walk's other refusals name theirs: the link's sentence, in the same
+    listing, carries 'zq', so the check can see a path when a sentence
+    holds one."""
+    at_root = planted(git_directory(), root="/zqroot/zqbare.git")
+    files, _ = git_directory("zqdir/zqgit")
+    below = ({**files, "zqdir/zqz.py": b"z"}, {"zqdir/zqlink": "/zqelsewhere/zqfile"})
+    listed = list_members(tree=planted(below, root="/zqroot/zqtree"), patterns=["**/*"])
+    rows = {m["path"]: m for m in listed["members"]}
+    assert rows["zqdir/zqlink"]["status"] == "refused"
+    assert "zq" in rows["zqdir/zqlink"]["reason"]
+    assert at_root.root_path() == "/zqroot/zqbare.git"
+
+    sentences = []
+    for fake in (at_root, planted(below, root="/zqroot/zqtree")):
+        with pytest.raises(SnapshotError) as refused:
+            walk(tree=fake, patterns=["**/*"])
+        sentences.append(str(refused.value))
+    sentences.append(
+        list_members(
+            tree=planted(git_directory(), root="/zqroot/zqbare.git"),
+            patterns=["**/*"],
+        )["refusal"]
+    )
+    assert rows["zqdir/zqgit"]["status"] == "refused"
+    sentences.append(rows["zqdir/zqgit"]["reason"])
+    for sentence in sentences:
+        assert "zq" not in sentence and "/" not in sentence and "\\" not in sentence
+    assert sentences == [
+        snapshot.ROOT_IS_GIT_DIRECTORY,
+        snapshot.HOLDS_GIT_DIRECTORY,
+        snapshot.ROOT_IS_GIT_DIRECTORY,
+        snapshot.HOLDS_GIT_DIRECTORY,
+    ]
+
+
+def test_the_git_directory_signature_is_four_names_folded_for_case():
+    """WINDOW: carries_git_directory over sets of names, and the names
+    GIT_DIRECTORY_SIGNATURE pins.
+
+    All four, whatever else is beside them and however they are cased,
+    from a list or a generator, and folded fully (casefold, not lower):
+    a disk that folds case, as APFS does, serves a name spelled with
+    U+FB01 (the fi ligature) when config is asked for, and one spelled
+    with U+017F (long s) for refs. PRE-STATE: no three of the four are
+    enough; names that only resemble them (HEAD.lock, configs, object,
+    ref, .config) are not them; and the two spellings fold to config and
+    refs under casefold and not under lower."""
+    carries = snapshot.carries_git_directory
+    assert snapshot.GIT_DIRECTORY_SIGNATURE == FOUR
+    for name in FOUR:
+        assert not carries([n for n in FOUR if n != name])
+    assert not carries(["HEAD.lock", "configs", "object", "ref", ".config"])
+    assert not carries([])
+    assert carries(FOUR)
+    assert carries(["description", *FOUR, "hooks", "info", "packed-refs"])
+    assert carries(["head", "CONFIG", "Objects", "REFS"])
+    assert carries(name for name in FOUR)
+    ligature, long_s = "con" + chr(0xFB01) + "g", "ref" + chr(0x17F)
+    assert ligature.lower() != "config" and ligature.casefold() == "config"
+    assert long_s.lower() != "refs" and long_s.casefold() == "refs"
+    assert carries(["HEAD", ligature, "objects", long_s])

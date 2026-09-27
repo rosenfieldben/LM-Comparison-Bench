@@ -7705,11 +7705,16 @@ async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     to walk as it stood before it, and hold the two doors to each other.
 
     A REFUSAL OF THE REQUEST IS AN HTTP ERROR, THE SAME AT BOTH DOORS: no
-    allowlist (403), a root outside it (403) or not a directory (422), a
-    root a clone is writing or left unfinished (409, refuse_while_cloning),
-    a malformed pattern (422) and more than MAX_PATTERNS of them (422,
-    from the model). A refusal about the tree is a fact the listing
-    reports in a 200: would_compose false, with the composer's sentence.
+    allowlist (403), a root outside it (403), inside .git, .hg or .svn
+    (403, ROOT_IN_VCS) or not a directory (422), a root a clone is
+    writing or left unfinished (409, refuse_while_cloning), a malformed
+    pattern (422) and more than MAX_PATTERNS of them (422, from the
+    model). A refusal about the tree is a fact the listing reports in a
+    200: would_compose false, with the composer's sentence. A git
+    directory by what it holds, the root or one the walk reaches
+    (snapshot.ROOT_IS_GIT_DIRECTORY, HOLDS_GIT_DIRECTORY), is one of
+    those: the walk reads names, so it is a fact about the tree, where a
+    root inside .git is a fact about the path the request named.
 
     NO RECORD. A listing is a look, not a capture: nothing is written,
     and the head and dirty flag are not read, since no capture is made.

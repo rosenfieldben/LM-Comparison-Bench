@@ -296,3 +296,23 @@ a23b257).
   to that proof, not a setting.
 - **First written:** the operator's ruling at the O2 checkpoint, in
   those words; recorded in the commit that adds this entry.
+
+## A snapshot root inside a git directory
+
+- **What:** refusing a snapshot root that sits below a git directory's
+  top level (a directory holding `HEAD`, `config`, `objects` and `refs`
+  together, whatever it is named). Today the walk refuses a root, or a
+  directory it reaches, that is one itself, and never looks above the
+  root; refusing a root inside one needs a look at the root's ancestors
+  by path, and if that is ever built it gets the walk's race proofs. A
+  submodule's `modules/<name>` holds the four names itself (as git
+  2.50.1 lays it out), so the walk already refuses one wherever it
+  reaches it.
+- **Deferred by:** Phase O, ruled by the operator on the bare-repository
+  readings after the operator's pass at 9c920e5.
+- **Reason:** only `config` at the top level carries anything sensitive
+  and a root below the top cannot reach it; the known exception is
+  `modules/*/config` in a repository with submodules.
+- **First written:** the operator's ruling on the bare-repository
+  readings after the pass at 9c920e5; the reason in the operator's words
+  as given for the commit that adds this entry.

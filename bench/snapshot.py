@@ -86,6 +86,9 @@ __all__ = [
     "SNAPSHOT_KIND",
     "SNAPSHOT_VERSION",
     "SYMLINK",
+    "GIT_DIRECTORY_SIGNATURE",
+    "ROOT_IS_GIT_DIRECTORY",
+    "HOLDS_GIT_DIRECTORY",
     "VCS_DIRECTORIES",
     "Entry",
     "Handle",
@@ -106,6 +109,7 @@ __all__ = [
     "list_members",
     "matches",
     "printable",
+    "carries_git_directory",
     "vcs_below",
     "walk",
 ]
@@ -153,6 +157,35 @@ UTF8_BOM = b"\xef\xbb\xbf"
 # the first group below); a ROOT inside one is refused outright
 # (vcs_below), since the exclusions match paths below the root.
 VCS_DIRECTORIES = (".git", ".hg", ".svn")
+
+# A GIT DIRECTORY BY WHAT IT HOLDS, not by its name: the four names
+# git's own directory keeps at its top level. A bare repository
+# (repo.git), a mirror, a --separate-git-dir and a submodule's
+# .git/modules/<name> all carry them, and none is named .git, so the
+# exclusion above never sees one; their config is where a remote URL
+# with a sentinel string in the userinfo position lives. The walk
+# refuses any directory carrying all four (carries_git_directory), the
+# root included. Found in Phase O; the walk has read them since Phase L.
+GIT_DIRECTORY_SIGNATURE = ("HEAD", "config", "objects", "refs")
+
+# The two refusals, the same at both doors: the composer's 422 and the
+# listing's row carry the one sentence. Each names the rule and not the
+# path; the listing's row says where, relative to the root.
+ROOT_IS_GIT_DIRECTORY = (
+    "the root is a git directory: it holds HEAD, config, objects and refs "
+    "together, as a bare repository or a repository's .git does. Its config can "
+    "carry a remote URL with a sentinel string in the userinfo position, so a "
+    "snapshot will not walk it whatever the patterns select, and a request "
+    "cannot turn this off. Name the repository's working tree instead."
+)
+HOLDS_GIT_DIRECTORY = (
+    "a directory under the root is a git directory: it holds HEAD, config, "
+    "objects and refs together, as a bare repository or a repository's .git "
+    "does. Its config can carry a remote URL with a sentinel string in the "
+    "userinfo position, so the walk refuses it whatever the patterns select, "
+    "and a request cannot turn this off. List shows where it is; name a root "
+    "beside it."
+)
 
 # THE GROUPS HAVE NAMES because the member listing reports which one
 # excluded an entry, and a name only a comment knew could not be
@@ -545,7 +578,11 @@ def vcs_below(real: str, entry: str) -> bool:
 
     ONLY BELOW THE ENTRY. An entry the operator named inside .git is
     their explicit choice and is walked; a root at the entry itself is
-    never refused by this rule.
+    never refused by this rule. The walk's own rule is another matter:
+    a root that IS a git directory by what it holds (the entry's .git
+    itself, or its modules/<name>) is refused by carries_git_directory
+    wherever the entry is, since the ruling for that shape says any
+    root.
 
     FOLDED FOR CASE: on a disk that folds case, <repo>/.GIT is the same
     directory as <repo>/.git and a realpath keeps the spelling it was
@@ -558,6 +595,30 @@ def vcs_below(real: str, entry: str) -> bool:
 
 
 _VCS_FOLDED = frozenset(name.casefold() for name in VCS_DIRECTORIES)
+
+
+def carries_git_directory(names: Iterable[str]) -> bool:
+    """Whether a directory's entries carry GIT_DIRECTORY_SIGNATURE: all
+    four names, whatever else is beside them.
+
+    NAMES, NOT KINDS. git takes objects, refs and config through a
+    symbolic link, and refs as a file it may execute (it asks whether it
+    may search objects and refs, not whether they are directories), and
+    a test of kinds would pass each of those; a test of names refuses
+    more and never less.
+
+    FOLDED FOR CASE, for a reason of its own (vcs_below's is a realpath
+    keeping the spelling it was given; these names come from the listing,
+    spelled as the disk holds them): on a disk that folds case, git asking
+    for config is served Config, so a directory git would read as its own
+    is caught however it is spelled. On one that does not, a directory of
+    Head, Config, Objects and Refs is refused too, which costs nothing
+    anybody meant. A value in, a value out.
+    """
+    return _SIGNATURE_FOLDED <= {name.casefold() for name in names}
+
+
+_SIGNATURE_FOLDED = frozenset(name.casefold() for name in GIT_DIRECTORY_SIGNATURE)
 
 
 # The kinds a directory entry can be, as the walk tells them apart. Four
@@ -763,14 +824,16 @@ class Survey:
          matches it, since the composer drops it without a word.
       3. a directory: past MAX_DEPTH it is REFUSED and not descended;
          otherwise descended through its parent's handle, identity
-         checked, and listed.
+         checked, and listed; if its names carry the git directory
+         signature it is REFUSED and nothing in it is seen (Phase O). A
+         ROOT carrying it stops the survey there, before anything else.
       4. anything but a regular file: REFUSED whatever the patterns say.
       5. a regular file no pattern matches: skipped, not reported.
       6. a matched file over MAX_MEMBER_BYTES by its listed size: REFUSED,
          never opened.
       7. otherwise SELECTED, read first when there is a reader.
 
-    TWO KINDS OF REFUSAL. The four above are facts about one entry, so
+    TWO KINDS OF REFUSAL. The five above are facts about one entry, so
     the survey reports them and goes on: the composer stops at the first
     (it raises it), and the listing records every one. A refusal about
     the traversal itself stops the survey: the entry ceiling, a name the
@@ -836,7 +899,7 @@ class Survey:
         def selects(path: str) -> bool:
             return any(matches(path, p) for p in patterns)
 
-        def listing(handle: Handle) -> Iterator[Entry]:
+        def listing(handle: Handle) -> list[Entry]:
             # Counted per streamed entry and refused before the entry is
             # kept; see MAX_WALKED_ENTRIES for the measurement that put
             # the count here rather than after the sort.
@@ -862,14 +925,22 @@ class Survey:
                     ) from None
                 gathered.append(entry)
             gathered.sort(key=lambda entry: entry.name.encode("utf-8"))
-            return iter(gathered)
+            return gathered
 
         stack: list[tuple[Handle, Iterator[Entry]]] = []
         try:
             try:
                 root = tree.open_root()
                 stack.append((root, iter(())))
-                stack[0] = (root, listing(root))
+                listed = listing(root)
+                # A root that is a git directory stops the survey before
+                # anything in it is seen, whatever the patterns: the
+                # root is the walk's first directory, so this one check
+                # covers the root by descriptor and every directory the
+                # walk reaches below (see the descent).
+                if carries_git_directory(entry.name for entry in listed):
+                    raise SnapshotError(ROOT_IS_GIT_DIRECTORY)
+                stack[0] = (root, iter(listed))
                 while stack:
                     handle, remaining = stack[-1]
                     entry = next(remaining, None)
@@ -935,7 +1006,19 @@ class Survey:
                         except BaseException:
                             tree.close_handle(child)
                             raise
-                        stack.append((child, inner))
+                        # A git directory the walk reaches is REFUSED as
+                        # an entry, after its names are counted and
+                        # checked and before anything in it is seen, and
+                        # the survey goes on past it as it does past a
+                        # directory too deep.
+                        if carries_git_directory(entry.name for entry in inner):
+                            tree.close_handle(child)
+                            refusal = SnapshotError(HOLDS_GIT_DIRECTORY)
+                            yield Sighting(
+                                path, DIRECTORY, None, REFUSED, str(refusal), refusal
+                            )
+                            continue
+                        stack.append((child, iter(inner)))
                         continue
                     if entry.kind != FILE:
                         refusal = SnapshotError(

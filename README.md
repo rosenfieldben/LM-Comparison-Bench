@@ -1714,7 +1714,24 @@ with `403`, any root whose path below its `BENCH_REPO_ROOTS` entry passes
 through `.git`, `.hg` or `.svn` (compared without regard to case, since a
 disk that folds case reaches `.git` as `.GIT` too); the refusal names the
 rule and not the path. It is measured from the deepest entry holding the
-root, so an entry you name inside `.git` yourself is walked. This was
+root, so an entry you name inside `.git` yourself is walked, unless the
+root is itself a git directory (below). This was possible from Phase L
+until Phase O.
+
+**A git directory is refused wherever the walk meets it.** A bare
+repository (`repo.git`), a mirror, a `--separate-git-dir` and a
+submodule's `.git/modules/<name>` hold a repository's configuration, a
+remote URL with a sentinel string in the userinfo position among them,
+and none is named `.git`, so the exclusions never see one. The walk
+therefore refuses any directory holding `HEAD`, `config`, `objects` and
+`refs` together (the names compared without regard to case), whatever
+the patterns select: as the root, both doors refuse it (`422` from
+Compose; the listing's `200` says so, stopped at the root), and as a
+directory the walk reaches, Compose refuses and the listing shows its
+row as refused, reading nothing inside it. The refusal names the rule
+and not the path; the listing's row says where. A tree that keeps a bare
+repository anywhere the walk goes, as some projects keep test fixtures,
+is refused whatever the patterns; name a root beside it. This was
 possible from Phase L until Phase O.
 
 ```sh
@@ -1795,9 +1812,9 @@ because the composer skips it: what it names is read only under its own
 path, if a pattern selects that, and never if an exclusion covers it;
 `refused` carries the composer's sentence word for word. A file no
 pattern matches is not a row. A link out of the root, a socket, device
-or pipe, and a directory past the depth ceiling refuse the snapshot
-whatever the patterns select, and the line above the table says when
-the refusal is one of those, which narrowing cannot fix.
+or pipe, a directory past the depth ceiling, and a git directory refuse
+the snapshot whatever the patterns select, and the line above the table
+says when the refusal is one of those, which narrowing cannot fix.
 
 `would_compose` is true exactly when the composer's walk would reach
 composition, and `refusal` is the sentence it would raise first (in its

@@ -18709,6 +18709,217 @@ def test_the_list_carries_each_rows_latest_capture_as_the_detail_does(client, tm
 
 
 # =====================================================================
+# ---- Phase O, after the operator's pass: a git directory by what it
+# ---- holds, the root or one the walk reaches. Pre-existing since
+# ---- Phase L; refused by the walk at both snapshot doors from here.
+# ---- The fixture proof (a bare repository whose config carries a
+# ---- sentinel string in the userinfo position of a remote URL) is its
+# ---- own commit. Every test names its window.
+# =====================================================================
+
+
+def bare_repository(where):
+    """A bare repository made by git with its own template, so the names
+    the rule looks for are the names git writes, and its configuration
+    is git's default: nothing in it but what init puts there."""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(where.parent),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(where)], env=env, check=True)
+    return where
+
+
+def git_directory_trees(tmp_path):
+    """Two roots, one per rule, each with its control: a bare repository
+    as the root, and a tree holding one at fixtures/zqbare.git between
+    a.py and zz.py; each control is the same with the git directory's
+    HEAD removed, so it holds three of the four names."""
+    roots = {}
+    for where, place in (("root", ""), ("below", "fixtures/zqbare.git")):
+        for control in (False, True):
+            top = tmp_path / f"zq{where}{'-control' if control else ''}"
+            if place:
+                clone(top, {"a.py": b"A = 1\n", "zz.py": b"Z = 1\n"})
+            bare = bare_repository(top / place if place else top)
+            if control:
+                (bare / "HEAD").unlink()
+            roots[(where, control)] = (top, place)
+    return roots
+
+
+@pytest.mark.parametrize(
+    ("where", "sentence"),
+    [("root", "ROOT_IS_GIT_DIRECTORY"), ("below", "HOLDS_GIT_DIRECTORY")],
+)
+def test_a_git_directory_refuses_at_both_doors_in_one_sentence(
+    client, tmp_path, where, sentence
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on a bare
+    repository made by git, as the root and as fixtures/zqbare.git under
+    it, with the patterns "**/*" and "**/config".
+
+    Compose answers 422, and the listing's row carries the same sentence
+    word for word: at the root, the stop row, last and final, with
+    complete false; below it, the row at fixtures/zqbare.git, with the
+    walk gone on past it to zz.py. The sentence is the rule's and names
+    no path: neither answer holds the temporary directory's path, and
+    the sentence holds no separator and neither "fixtures" nor "zq",
+    which the name of every root and git directory here holds; the
+    listing's row says where. Nothing is stored. PRE-STATE: the same
+    tree with the bare repository's HEAD removed composes (201) and
+    lists would_compose true with its config selected, so the walk of
+    that directory reads config when the rule does not stop it."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+    trees = git_directory_trees(tmp_path)
+    config = "/".join(filter(None, [trees[(where, False)][1], "config"]))
+
+    control, _ = trees[(where, True)]
+    body = {"root": str(control), "patterns": ["**/*", "**/config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 201, composed.text
+    listed = client.post("/snapshots/listing", json=body).json()
+    assert listed["would_compose"] is True
+    assert config in [path for path, _ in selected_rows(listed)]
+
+    counts = [
+        db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        for table in ("attachments", "snapshot_captures")
+    ]
+    top, place = trees[(where, False)]
+    body = {"root": str(top), "patterns": ["**/*", "**/config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422
+    detail = composed.json()["detail"]
+    listing = client.post("/snapshots/listing", json=body)
+    assert listing.status_code == 200
+    listed = listing.json()
+    assert listed["would_compose"] is False
+    assert listed["refusal"] == detail
+    row = {
+        "path": place,
+        "bytes": None,
+        "kind": "directory",
+        "status": "refused",
+        "reason": detail,
+    }
+    if where == "root":
+        assert listed["complete"] is False
+        assert listed["members"] == [row]
+    else:
+        assert listed["complete"] is True
+        assert row in listed["members"]
+        assert [m["path"] for m in listed["members"]] == [
+            "a.py",
+            "fixtures/zqbare.git",
+            "zz.py",
+        ]
+    for text in (composed.text, listing.text):
+        assert str(tmp_path) not in text and str(tmp_path.resolve()) not in text
+    for text in (detail, listed["refusal"]):
+        assert "zq" not in text and "fixtures" not in text and "/" not in text
+    assert detail == getattr(bench_snapshot, sentence)
+    assert counts == [
+        db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        for table in ("attachments", "snapshot_captures")
+    ]
+
+
+@pytest.mark.parametrize("where", ["root", "below"])
+def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
+    client, tmp_path, monkeypatch, where
+):
+    """WINDOW: POST /snapshots on a bare repository made by git, as the
+    root and as fixtures/zqbare.git under it, with main._git replaced by
+    a recorder of every git command the door runs and where.
+
+    The walk refuses before the composer asks git anything: no git
+    command runs, the head and dirty read (_clone_state) among them, so
+    nothing git would read from that directory is read. PRE-STATE: the
+    recorder is live and the read is where it was: the same tree with
+    the bare repository's HEAD removed composes, and the recorder saw
+    the composer's `git rev-parse HEAD` in the walked root."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    trees = git_directory_trees(tmp_path)
+    ran = []
+
+    def recorder(args, *, cwd=None):
+        ran.append((list(args), cwd))
+        return None
+
+    monkeypatch.setattr(main, "_git", recorder)
+    control, _ = trees[(where, True)]
+    body = {"root": str(control), "patterns": ["**/*"]}
+    assert client.post("/snapshots", json=body).status_code == 201
+    assert ran == [(["rev-parse", "HEAD"], str(control.resolve()))]
+
+    ran.clear()
+    top, _ = trees[(where, False)]
+    resp = client.post("/snapshots", json={"root": str(top), "patterns": ["**/*"]})
+    assert ran == []
+    assert resp.status_code == 422
+
+
+def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on <repo>/.git
+    when that directory is itself the BENCH_REPO_ROOTS entry, for a
+    repository made by git with its default configuration, under
+    "config".
+
+    This narrows 433d3ee's reading that an entry the operator names
+    inside .git is walked: a .git that is both the entry and the root
+    holds the four names, so the walk refuses it, Compose with 422 and
+    the listing with its stop row carrying the same sentence, and nothing
+    is stored. PRE-STATE: the entry is honored, since a root below it
+    that is not a git directory (its hooks) lists would_compose true;
+    ROOT_IN_VCS measures only below the entry, so vcs_below is false for
+    a root at its own entry and a 403 is not what refuses it; and git's
+    default configuration names no remote."""
+    repo = tmp_path / "zqrepo"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    dot_git = (repo / ".git").resolve()
+    assert "url" not in (dot_git / "config").read_text()
+    (dot_git / "hooks").mkdir(exist_ok=True)
+    (dot_git / "hooks" / "zq.txt").write_text("x\n")
+    client.app.state.repo_roots = (str(dot_git),)
+    db = client.app.state.db
+    hooks = client.post(
+        "/snapshots/listing", json={"root": str(dot_git / "hooks"), "patterns": ["*"]}
+    )
+    assert hooks.status_code == 200 and hooks.json()["would_compose"] is True
+    assert bench_snapshot.vcs_below(str(dot_git), str(dot_git)) is False
+
+    stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
+    body = {"root": str(dot_git), "patterns": ["config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422
+    listed = client.post("/snapshots/listing", json=body).json()
+    assert (listed["would_compose"], listed["complete"]) == (False, False)
+    assert listed["members"] == [
+        {
+            "path": "",
+            "bytes": None,
+            "kind": "directory",
+            "status": "refused",
+            "reason": composed.json()["detail"],
+        }
+    ]
+    assert composed.json()["detail"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+    assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
+
+
+# =====================================================================
 # ---- Phase N1: the datasets door, and three doors that take a digest.
 #
 # Every test below names its window. The path workflow the README walks
