@@ -1111,3 +1111,28 @@ def test_the_git_directory_signature_is_four_names_folded_for_case():
     assert ligature.lower() != "config" and ligature.casefold() == "config"
     assert long_s.lower() != "refs" and long_s.casefold() == "refs"
     assert carries(["HEAD", ligature, "objects", long_s])
+
+
+def test_the_git_directory_sentences_are_the_operators_words():
+    """WINDOW: ROOT_IS_GIT_DIRECTORY and HOLDS_GIT_DIRECTORY against the
+    words the operator ruled after f8bde6b, written out.
+
+    A person reads these two sentences at both doors, so they are pinned
+    as ruled rather than to whatever the module holds. PRE-STATE: each is
+    the sentence the walk raises, over a root that is a git directory and
+    over one the walk reaches, so the pin is on what a person reads."""
+    for tree, constant in (
+        (git_directory(), snapshot.ROOT_IS_GIT_DIRECTORY),
+        (({"a.py": b"a", **git_directory("g")[0]}, {}), snapshot.HOLDS_GIT_DIRECTORY),
+    ):
+        with pytest.raises(SnapshotError) as refused:
+            walk(tree=planted(tree), patterns=["**/*"])
+        assert str(refused.value) == constant
+    assert snapshot.ROOT_IS_GIT_DIRECTORY == (
+        "the root is a git directory, whose config can carry a remote URL "
+        "with sign-in details in it, so it is not walked."
+    )
+    assert snapshot.HOLDS_GIT_DIRECTORY == (
+        "the walk reached a git directory, whose config can carry a remote "
+        "URL with sign-in details in it, so the walk stopped there."
+    )

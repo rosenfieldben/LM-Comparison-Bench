@@ -170,21 +170,15 @@ GIT_DIRECTORY_SIGNATURE = ("HEAD", "config", "objects", "refs")
 
 # The two refusals, the same at both doors: the composer's 422 and the
 # listing's row carry the one sentence. Each names the rule and not the
-# path; the listing's row says where, relative to the root.
+# path; the listing's row says where, relative to the root. The words
+# are the operator's, ruled after f8bde6b, since a person reads them.
 ROOT_IS_GIT_DIRECTORY = (
-    "the root is a git directory: it holds HEAD, config, objects and refs "
-    "together, as a bare repository or a repository's .git does. Its config can "
-    "carry a remote URL with a sentinel string in the userinfo position, so a "
-    "snapshot will not walk it whatever the patterns select, and a request "
-    "cannot turn this off. Name the repository's working tree instead."
+    "the root is a git directory, whose config can carry a remote URL with "
+    "sign-in details in it, so it is not walked."
 )
 HOLDS_GIT_DIRECTORY = (
-    "a directory under the root is a git directory: it holds HEAD, config, "
-    "objects and refs together, as a bare repository or a repository's .git "
-    "does. Its config can carry a remote URL with a sentinel string in the "
-    "userinfo position, so the walk refuses it whatever the patterns select, "
-    "and a request cannot turn this off. List shows where it is; name a root "
-    "beside it."
+    "the walk reached a git directory, whose config can carry a remote URL "
+    "with sign-in details in it, so the walk stopped there."
 )
 
 # THE GROUPS HAVE NAMES because the member listing reports which one
