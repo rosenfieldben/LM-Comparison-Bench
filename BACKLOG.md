@@ -310,9 +310,21 @@ a23b257).
   reaches it.
 - **Deferred by:** Phase O, ruled by the operator on the bare-repository
   readings after the operator's pass at 9c920e5.
-- **Reason:** only `config` at the top level carries anything sensitive
-  and a root below the top cannot reach it; the known exception is
-  `modules/*/config` in a repository with submodules.
+- **Reason:** `config` at the top level is where git itself writes a
+  remote URL (`git remote add`, measured on git 2.43.0), and a root
+  below the top cannot reach it; the known exception, `modules/*/config`
+  in a repository with submodules, the walk already refuses by its own
+  signature. Three files below the top level can carry a URL git uses,
+  verified on git 2.43.0 by tests/test_api.py
+  (`test_below_a_git_directorys_top_level_the_walk_cannot_see_it`):
+  the legacy `remotes/<name>` and `branches/<name>` files, which
+  `git fetch` still resolves, and a linked worktree's
+  `worktrees/<name>/config.worktree`, which `git config --worktree`
+  writes under `extensions.worktreeConfig`. A root placed at any of
+  those composes with the URL in the text today; the test pins that
+  open state. Whether that exposure is low enough to leave open, or the
+  by-path ancestor look now earns the walk's race proofs, is put to the
+  Phase O external review under its git-directory lens, not built here.
 - **First written:** the operator's ruling on the bare-repository
   readings after the pass at 9c920e5; the reason in the operator's words
   as given for the commit that adds this entry.

@@ -18922,6 +18922,127 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
 
 
+# The string every fixture below plants in the userinfo position of a
+# remote URL. It is a sentinel, so a test can see whether repository-
+# supplied configuration reached a snapshot; it is not, and does not
+# resemble, anything real. The digits keep it out of every sentence the
+# doors can raise, which hold none.
+SENTINEL = "zqsentinel-7d19f3"
+SENTINEL_URL = f"https://user:{SENTINEL}@example.invalid/zqrepo.git"
+
+
+def git_env(home):
+    """The environment every git fixture here runs under: no system or
+    global configuration, so what a fixture holds is what the test put
+    there and nothing the machine adds."""
+    return {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+
+
+def stored_text(client, digest):
+    return client.app.state.db.execute(
+        "SELECT extracted_text FROM attachments WHERE digest = ?", (digest,)
+    ).fetchone()[0]
+
+
+def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on a bare
+    repository made by git whose config carries a remote URL with a
+    sentinel string in the userinfo position (git remote add writes it
+    there and nowhere else), under the patterns "config" and "**/*".
+
+    Both doors refuse in the rule's sentence, nothing is stored, and no
+    part of the sentinel is in either answer. PRE-STATE: the same
+    repository with its HEAD removed holds three of the four names, so
+    the rule does not fire, the walk reads config, and the sentinel is
+    in the stored text word for word. That is the exposure f8bde6b
+    closed, shown on the bytes git itself writes."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+    for control in (True, False):
+        top = tmp_path / ("zqcontrol" if control else "zqbare")
+        env = git_env(tmp_path)
+        subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
+        subprocess.run(
+            ["git", "-C", str(top), "remote", "add", "origin", SENTINEL_URL],
+            env=env,
+            check=True,
+        )
+        assert SENTINEL in (top / "config").read_text()
+        if control:
+            (top / "HEAD").unlink()
+        body = {"root": str(top), "patterns": ["config", "**/*"]}
+        composed = client.post("/snapshots", json=body)
+        listed = client.post("/snapshots/listing", json=body)
+        if control:
+            assert composed.status_code == 201, composed.text
+            assert SENTINEL in stored_text(client, composed.json()["digest"])
+            assert listed.json()["would_compose"] is True
+            continue
+        assert composed.status_code == 422
+        assert composed.json()["detail"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+        assert listed.status_code == 200
+        assert listed.json()["would_compose"] is False
+        assert listed.json()["refusal"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+        for text in (composed.text, listed.text):
+            assert SENTINEL not in text and "zqsentinel" not in text
+        assert (
+            db.execute(
+                "SELECT count(*) FROM attachments WHERE extracted_text LIKE ?",
+                (f"%{SENTINEL}%",),
+            ).fetchone()[0]
+            == 1
+        ), "only the control's snapshot holds the sentinel"
+
+
+@pytest.mark.parametrize(
+    ("place", "planted"),
+    [
+        # Legacy remote files git still reads for a fetch (measured on
+        # git 2.43.0: `git fetch legacy` resolves the URL they hold).
+        ("remotes", {"legacy": f"URL: {SENTINEL_URL}\nPush: refs/heads/main\n"}),
+        ("branches", {"br": f"{SENTINEL_URL}#main\n"}),
+        # A linked worktree's own configuration, which `git config
+        # --worktree` writes below the git directory's top level.
+        (
+            "worktrees/wt",
+            {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
+        ),
+    ],
+)
+def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
+    client, tmp_path, place, planted
+):
+    """WINDOW: POST /snapshots with the root placed INSIDE a git
+    directory, at remotes/, branches/ and worktrees/wt/, each holding a
+    file git reads a remote URL from, planted with a sentinel string in
+    the userinfo position.
+
+    This is the exposure BACKLOG names as open: the walk sees the four
+    names only at the root or below it, never above, so a root below a
+    git directory's top level composes and the sentinel is in the stored
+    text. The test pins the open state; when the ancestor look is built
+    it fails at the status and is rewritten as that commit's pre-state.
+    The three places were verified on git 2.43.0: the two legacy files
+    are used by `git fetch`, and config.worktree by `git config
+    --worktree` under extensions.worktreeConfig."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    env = git_env(tmp_path)
+    top = tmp_path / "zqbare"
+    subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
+    root = top / place
+    root.mkdir(parents=True, exist_ok=True)
+    for name, text in planted.items():
+        (root / name).write_text(text)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    assert composed.status_code == 201, composed.text
+    assert SENTINEL in stored_text(client, composed.json()["digest"])
+
+
 # =====================================================================
 # ---- Phase O, after the operator's pass: the snapshot door's git
 # ---- hardened. Every local git runs with _git_argv's configuration in
