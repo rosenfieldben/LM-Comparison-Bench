@@ -1914,8 +1914,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (a test seam only) which certificate bundle git trusts. Unset is
     # the door off; set and wrong raises here, as the roots do. The slot
     # holds the directories a running clone is writing, or None.
-    app.state.clone_root = _parse_clone_root(
-        os.environ.get("BENCH_CLONE_ROOT"), resolved=_resolved_directory
+    app.state.clone_root = _clone_root_as_entry(
+        _parse_clone_root(
+            os.environ.get("BENCH_CLONE_ROOT"), resolved=_resolved_directory
+        ),
+        app.state.repo_roots,
     )
     app.state.clone_hosts = clones.parse_clone_hosts(
         os.environ.get("BENCH_CLONE_HOSTS")
@@ -7940,7 +7943,9 @@ def _parse_clone_root(
     a relative path or a missing directory means the sentence the
     operator wrote does not name what they meant. Whether it is one of
     BENCH_REPO_ROOTS is the door's question and not boot's: the
-    commission has the door refuse naming both variables.
+    commission has the door refuse naming both variables. Boot does
+    decide how it is spelled, once it is known to be one of them
+    (_clone_root_as_entry).
     """
     if raw is None or not raw.strip():
         return None
@@ -7958,6 +7963,37 @@ def _parse_clone_root(
             "the clone door puts the repositories it fetches."
         )
     return real
+
+
+def _clone_root_as_entry(clone_root: str | None, roots: Sequence[str]) -> str | None:
+    """BENCH_CLONE_ROOT spelled as the BENCH_REPO_ROOTS entry that IS it,
+    by device and inode, or as given when no entry is.
+
+    BY IDENTITY, NOT SPELLING (the Phase O review's L3, the operator's
+    ruling). The clone root must be one of the entries, and a comparison
+    of strings refused one that was: on macOS one directory has many
+    spellings (case, the /System/Volumes/Data firmlink), and M6 showed
+    that spelling is what drifts while identity is what the operator
+    meant. When an entry is the clone root, the clone root takes that
+    entry's spelling, so every root the snapshot doors see is spelled
+    one way; when none is, it is returned as given and the door refuses
+    naming both variables (_clones_off_reason). Read once, at boot, from
+    the operator's own two variables.
+    """
+    if clone_root is None:
+        return None
+    try:
+        seen = os.stat(clone_root)
+    except OSError:
+        return clone_root
+    for entry in roots:
+        try:
+            other = os.stat(entry)
+        except OSError:
+            continue
+        if (other.st_dev, other.st_ino) == (seen.st_dev, seen.st_ino):
+            return entry
+    return clone_root
 
 
 def _parse_clone_cainfo(raw: str | None) -> str | None:
@@ -7991,6 +8027,9 @@ def _clones_off_reason() -> str:
     if clone_root is None:
         return clones.CLONES_OFF
     roots = getattr(app.state, "repo_roots", ())
+    # A string test on purpose: boot has already given a clone root that
+    # IS an entry that entry's spelling (_clone_root_as_entry), so a
+    # clone root not among them by spelling is none of them by identity.
     if clone_root not in roots:
         allowed = ", ".join(snapshot.printable(r) for r in roots) or "none set"
         return (

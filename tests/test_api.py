@@ -17293,6 +17293,9 @@ FILESYSTEM_CALLS = {
     #
     # The test seam's certificate bundle, checked at boot.
     ("main.py", "_parse_clone_cainfo"): {"os.path.isfile"},
+    # The clone root and each allowlist entry, compared by device and
+    # inode at boot so the clone root takes its entry's spelling.
+    ("main.py", "_clone_root_as_entry"): {"os.stat"},
     # git, run with its tree pinned by --git-dir and --work-tree to the
     # clone's own new directory, so it never searches upward.
     ("main.py", "_git_clone"): {"asyncio.create_subprocess_exec"},

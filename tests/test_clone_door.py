@@ -266,6 +266,60 @@ def test_a_clone_root_outside_the_roots_is_refused_naming_both(
         assert models["clones_off_reason"] == detail
 
 
+def test_the_clone_root_is_matched_to_its_entry_by_identity_not_spelling(
+    tmp_path,
+):
+    """WINDOW: _clone_root_as_entry over a clone root spelled through a
+    link to an allowlist entry (a second spelling of one directory, as
+    macOS makes by case and firmlink), over a clone root that is another
+    directory, and with no clone root.
+
+    The clone root that IS an entry by device and inode comes back
+    spelled as that entry, so the door's check and every root the
+    snapshot doors see agree on one spelling; one that is no entry comes
+    back as given, and the door refuses it naming both variables (the
+    proof above). PRE-STATE: the two spellings name one directory and
+    differ as strings; an entry that does not exist is passed over."""
+    entry = tmp_path.resolve() / "zqclones"
+    entry.mkdir()
+    link = tmp_path.resolve() / "zqlink"
+    link.symlink_to(entry)
+    other = tmp_path.resolve() / "zqother"
+    other.mkdir()
+    assert str(link) != str(entry) and os.path.samefile(link, entry)
+    roots = (str(tmp_path / "zqgone"), str(other.parent / "zqnothing"), str(entry))
+    assert main._clone_root_as_entry(str(link), roots) == str(entry)
+    assert main._clone_root_as_entry(str(other), roots) == str(other)
+    assert main._clone_root_as_entry(None, roots) is None
+
+
+def test_a_clone_root_spelled_in_another_case_is_its_entry(
+    bench_env, monkeypatch, request, stub, tmp_path
+):
+    """WINDOW: boot, GET /models and POST /clones with BENCH_REPO_ROOTS
+    naming the clone directory and BENCH_CLONE_ROOT naming the same
+    directory in another case, on a disk that folds case (macOS's).
+
+    Before this, the two were compared as strings and the door refused
+    naming both, though they are one directory. Now the door is on, the
+    bench's clone root is spelled as the entry, and a clone lands under
+    that spelling. PRE-STATE: the two spellings name one directory and
+    differ as strings. Skipped where the disk does not fold case."""
+    entry = Path(bench_env["BENCH_CLONE_ROOT"])
+    odd = entry.parent / entry.name.upper()
+    if not odd.is_dir() or not os.path.samefile(odd, entry):
+        pytest.skip("this disk does not fold case")
+    assert str(odd) != str(entry)
+    monkeypatch.setenv("BENCH_CLONE_ROOT", str(odd))
+    with TestClient(main.app, base_url="http://localhost") as client:
+        assert client.get("/models").json()["clones_enabled"] is True
+        assert client.app.state.clone_root == str(entry)
+        repo, _ = repo_for(request, stub)
+        made = clone_of(client, stub, repo)
+        assert made.status_code == 201, made.text
+        assert made.json()["root"].startswith(str(entry) + os.sep)
+
+
 @pytest.mark.parametrize(
     ("url", "ref", "status", "rule"),
     [

@@ -1997,15 +1997,18 @@ curl -s -X POST localhost:8000/clones \
 ```
 
 **It is off until you name where clones go.** `BENCH_CLONE_ROOT` is one
-absolute directory, and it must also be one of `BENCH_REPO_ROOTS`: the
-allowlist stays the one list of trees the snapshot doors may walk, and
-the clone door does not get to extend it by putting clones somewhere
-else. Unset, the door refuses naming the variable; set but not among the
-roots, it refuses naming both. `BENCH_CLONE_HOSTS` is a comma-separated
-list of the hosts a clone may come from, default `github.com`; an entry
-may carry a port (`host:8443`), and a port is allowed exactly where an
-entry names one. A relative or missing clone root, or a malformed host
-entry, fails boot naming the variable.
+absolute directory, and it must also be one of `BENCH_REPO_ROOTS`, by
+what the directory is and not how it is spelled (on macOS one directory
+has many spellings; the bench then spells the clone root as that entry,
+so every root is spelled one way): the allowlist stays the one list of
+trees the snapshot doors may walk, and the clone door does not get to
+extend it by putting clones somewhere else. Unset, the door refuses
+naming the variable; set but not among the roots, it refuses naming
+both. `BENCH_CLONE_HOSTS` is a comma-separated list of the hosts a clone
+may come from, default `github.com`; an entry may carry a port
+(`host:8443`), and a port is allowed exactly where an entry names one. A
+relative or missing clone root, or a malformed host entry, fails boot
+naming the variable.
 
 **The URL is parsed, not matched.** It must be `https`, its host one of
 `BENCH_CLONE_HOSTS`, its path `/owner/repo` or `/owner/repo.git`, with
