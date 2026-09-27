@@ -195,13 +195,18 @@ def check_ref(ref: str) -> None:
     refusal naming the rule.
 
     GIT'S OWN GRAMMAR (check-ref-format, for refs/heads/<ref>), held to
-    git itself by a test over generated names, plus three rules of the
+    git itself by a test over generated names, plus four rules of the
     door's. No leading '-': the argument-injection line (a ref is the
     last argument git is given, after '--' and after the URL, and is
     still refused here so no layer depends on another). No leading '+':
     fetch reads it as its force flag and fetches the name after it, so
     "+main" would land main's tree under a record saying "+main". Not
     '@' alone, which git reads as HEAD rather than as a branch or tag.
+    Not 'tag' alone, which fetch reads, even after '--', as its keyword
+    for the tag name that follows it: git exited before it asked the
+    host, and the door answered 502 blaming the network (the Phase O
+    review's M2). A branch or tag named "tag" is asked for by its full
+    name, refs/heads/tag or refs/tags/tag.
     """
     if _HEX40.fullmatch(ref):
         return
@@ -226,6 +231,11 @@ def _ref_problem(ref: str) -> str | None:
         return "it starts with '+', which fetch reads as its force flag"
     if ref == "@":
         return "'@' alone names HEAD, not a branch or a tag"
+    if ref == "tag":
+        return (
+            "'tag' alone is fetch's keyword for the tag name after it; name "
+            "the branch refs/heads/tag or the tag refs/tags/tag"
+        )
     if any(ord(c) < 0x20 or ord(c) == 0x7F for c in ref):
         return "it holds a control character"
     if any(c in _REF_FORBIDDEN for c in ref):

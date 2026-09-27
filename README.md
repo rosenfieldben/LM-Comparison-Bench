@@ -2010,11 +2010,13 @@ the parts that passed. **No refusal repeats the URL**, not even a
 refusal of a body that forgot its ref, because a URL can carry a token
 and a refusal is shown, logged and reported. The ref is a branch or tag
 name under git's own rules (`git check-ref-format`, which a test holds
-it to) or a 40-character commit, with three rules of the door's: it
+it to) or a 40-character commit, with four rules of the door's: it
 may not start with `-` (git would read an option) or `+` (fetch's force
 flag, which would fetch the name after it), and may not be `@` alone
-(git reads that as HEAD). A ref is named in its refusal only when it
-is spelled like one.
+(git reads that as HEAD) or `tag` alone (fetch's keyword for the tag
+name after it; ask for a branch or tag named `tag` as `refs/heads/tag`
+or `refs/tags/tag`). A ref is named in its refusal only when it is
+spelled like one.
 
 **Public only, and no identity.** git runs in an environment built from
 nothing: `PATH`, an empty temporary `HOME`, `GIT_TERMINAL_PROMPT=0` and

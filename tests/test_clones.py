@@ -254,7 +254,7 @@ def _door_accepts(ref: str) -> bool:
     return True
 
 
-def test_the_ref_grammar_is_gits_own_but_for_the_doors_three_rules():
+def test_the_ref_grammar_is_gits_own_but_for_the_doors_four_rules():
     """WINDOW: check_ref against `git check-ref-format refs/heads/<ref>`
     over four hundred generated names and the named edge cases.
 
@@ -263,10 +263,12 @@ def test_the_ref_grammar_is_gits_own_but_for_the_doors_three_rules():
 
     The door and git agree on every name except where the door is
     stricter on purpose: a leading '-' (the argument-injection line), a
-    leading '+' (fetch's force flag) and '@' alone (HEAD). PRE-STATE:
-    each of the three is a name git itself accepts, so each rule is the
-    door's and not git's."""
-    for own in ("-x", "+main", "@"):
+    leading '+' (fetch's force flag), '@' alone (HEAD) and 'tag' alone
+    (fetch's tag keyword; the Phase O review's M2). PRE-STATE: each of
+    the four is a name git itself accepts, so each rule is the door's
+    and not git's; and names that only begin with or resemble 'tag' are
+    among the named cases, so the fourth rule is held to the one word."""
+    for own in ("-x", "+main", "@", "tag"):
         assert _git_accepts(own)
         assert not _door_accepts(own)
     alphabet = [*"ab/.-_@{}~^:?*[\\ +", "\t", "\x7f", "é", "lock", "HEAD"]
@@ -283,6 +285,10 @@ def test_the_ref_grammar_is_gits_own_but_for_the_doors_three_rules():
         "a.",
         "a@{b",
         "a b",
+        "tags",
+        "tag/x",
+        "Tag",
+        "v-tag",
     ]
     names += [
         "".join(rng.choice(alphabet) for _ in range(rng.randint(1, 8)))
@@ -293,7 +299,7 @@ def test_the_ref_grammar_is_gits_own_but_for_the_doors_three_rules():
         for name in names
         if _door_accepts(name) != _git_accepts(name)
         and not name.startswith(("-", "+"))
-        and name != "@"
+        and name not in ("@", "tag")
     }
     assert differ == set()
 
@@ -306,6 +312,7 @@ def test_the_ref_grammar_is_gits_own_but_for_the_doors_three_rules():
         ("-", "starts with '-'"),
         ("+main", "force flag"),
         ("@", "names HEAD"),
+        ("tag", "fetch's keyword"),
         ("a\x01b", "control character"),
         ("a:b", "one of ~ ^ : ? * [ \\"),
         ("main:x", "one of ~ ^ : ? * [ \\"),

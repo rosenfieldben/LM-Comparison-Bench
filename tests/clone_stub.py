@@ -158,7 +158,19 @@ class Stub:
         git(self.env, "-C", w, "commit", "-q", "--allow-empty", "-m", "stub")
         if tag is not None:
             git(self.env, "-C", w, "tag", "-f", tag)
-        git(self.env, "-C", w, "push", "-q", "--force", "--tags", str(bare), branch)
+        # By its full name: git push, like fetch, reads a bare "tag" as
+        # its keyword for the tag name after it.
+        git(
+            self.env,
+            "-C",
+            w,
+            "push",
+            "-q",
+            "--force",
+            "--tags",
+            str(bare),
+            f"refs/heads/{branch}",
+        )
         return git(self.env, "-C", w, "rev-parse", "HEAD")
 
 

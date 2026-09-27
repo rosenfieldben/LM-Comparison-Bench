@@ -303,6 +303,41 @@ def test_the_url_and_the_ref_refuse_at_the_door_before_git_runs(
     assert os.listdir(clone_root(bench)) == []
 
 
+def test_a_branch_named_tag_is_refused_alone_and_cloned_by_its_full_name(
+    request, bench, stub
+):
+    """WINDOW: POST /clones of a repository whose one branch is named
+    "tag", asked for as "tag" and then as refs/heads/tag.
+
+    "tag" alone is refused 422 with the door's fourth rule before git
+    runs: the stub records no request and the clone root stays empty.
+    Before the rule, the door let it through, git read it after "--" as
+    fetch's keyword for a tag name, and exited before it asked the host,
+    so the door answered 502 blaming the network (the Phase O review's
+    M2). refs/heads/tag names the same branch and is cloned, 201, at its
+    commit. PRE-STATE: "tag" is a branch name git accepts, and the stub
+    serves the branch."""
+    repo, head = repo_for(request, stub, {"a.py": b"on tag\n"}, branch="tag")
+    assert (
+        subprocess.run(
+            ["git", "check-ref-format", "refs/heads/tag"], check=False
+        ).returncode
+        == 0
+    )
+    seen = len(stub.seen)
+    resp = clone_of(bench, stub, repo, "tag")
+    assert resp.status_code == 422, resp.text
+    assert "fetch's keyword" in resp.json()["detail"]
+    assert "refs/heads/tag" in resp.json()["detail"]
+    assert len(stub.seen) == seen
+    assert os.listdir(clone_root(bench)) == []
+
+    full = clone_of(bench, stub, repo, "refs/heads/tag")
+    assert full.status_code == 201, full.text
+    assert full.json()["head_sha"] == head
+    assert (Path(full.json()["root"]) / "a.py").read_text() == "on tag\n"
+
+
 @pytest.mark.parametrize(
     "body",
     [
