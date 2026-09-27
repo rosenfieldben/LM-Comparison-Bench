@@ -149,9 +149,12 @@ def test_no_refusal_echoes_any_part_of_the_url(url):
 
     The commission's rule: a URL carrying user:token@ refuses naming the
     rule and never echoes the URL, and every other refusal names the rule
-    and not the URL. PRE-STATE: the token is in the URL."""
+    and not the URL. The comparison folds case, because urlsplit
+    lowercases the scheme and the host, so a sentinel planted at either
+    position would come back in lowercase and a case-sensitive check
+    could not fail there. PRE-STATE: the sentinel is in the URL."""
     assert SECRET in url
-    assert SECRET not in str(refusal(url))
+    assert SECRET.casefold() not in str(refusal(url)).casefold()
 
 
 @settings(max_examples=300, deadline=None)
@@ -165,13 +168,15 @@ def test_no_refusal_echoes_any_part_of_the_url(url):
 def test_no_refusal_of_any_string_echoes_it(text):
     """WINDOW: canonical_url on arbitrary text wrapped around the token.
 
-    Whatever the string, the refusal carries none of it. PRE-STATE: the
+    Whatever the string, the refusal carries none of it, compared with
+    case folded, since urlsplit lowercases the scheme and the host and
+    the generated text can put the sentinel at either. PRE-STATE: the
     string is refused (no generated text spells an accepted URL, since
     the token's own segment would have to be a whole owner)."""
     url = f"https://{text}{SECRET}{text}"
     with pytest.raises(CloneError) as caught:
         canonical_url(url, HOSTS)
-    assert SECRET not in str(caught.value)
+    assert SECRET.casefold() not in str(caught.value).casefold()
 
 
 def test_a_host_entry_with_a_port_admits_exactly_that_port():
@@ -344,12 +349,13 @@ def test_a_url_sent_as_the_ref_is_not_repeated():
     swapped the two fields would send it.
 
     The ':' rule refuses it, and the sentence says "the ref" rather than
-    repeating it. PRE-STATE: the token is in what was sent."""
+    repeating it, compared with case folded as the URL proofs are.
+    PRE-STATE: the sentinel is in what was sent."""
     ref = f"https://u:{SECRET}@github.com/o/r"
     assert SECRET in ref
     with pytest.raises(CloneError) as caught:
         check_ref(ref)
-    assert SECRET not in str(caught.value)
+    assert SECRET.casefold() not in str(caught.value).casefold()
     assert "the ref is not" in str(caught.value)
 
 

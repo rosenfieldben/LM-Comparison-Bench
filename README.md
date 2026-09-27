@@ -2013,11 +2013,11 @@ naming the variable.
 
 **The URL is parsed, not matched.** It must be `https`, its host one of
 `BENCH_CLONE_HOSTS`, its path `/owner/repo` or `/owner/repo.git`, with
-no user or token before the host, no query, no fragment, no
-percent-escape and nothing around it. What git is given is rebuilt from
-the parts that passed. **No refusal repeats the URL**, not even a
-refusal of a body that forgot its ref, because a URL can carry a token
-and a refusal is shown, logged and reported. The ref is a branch or tag
+no user or sign-in details before the host, no query, no fragment,
+no percent-escape and nothing around it. What git is given is rebuilt
+from the parts that passed. **No refusal repeats the URL**, not even a
+refusal of a body that forgot its ref, because a URL can carry sign-in
+details and a refusal is shown, logged and reported. The ref is a branch or tag
 name under git's own rules (`git check-ref-format`, which a test holds
 it to) or a 40-character commit, with four rules of the door's: it
 may not start with `-` (git would read an option) or `+` (fetch's force

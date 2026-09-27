@@ -17,6 +17,7 @@ session's. Every proof names its window.
 import hashlib
 import json
 import re
+import urllib.parse
 
 import pytest
 from playwright.sync_api import expect
@@ -432,28 +433,45 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     request, page, clone_bench, clone_bench_url, clone_remote, collectors
 ):
     """WINDOW: after a good clone, a Clone of a URL carrying a user and a
-    token (403), one of an unknown ref (422), one of an over-long URL (the
-    request model's 422), and a 201 the page cannot read; then the page's
-    every surface, and a navigation away and Back.
+    sentinel in the userinfo position (403), one of an unknown ref (422),
+    one of an over-long URL (the request model's 422), and a 201 the page
+    cannot read; then the page's every surface, and a navigation away and
+    Back. The surfaces are scanned three times: after the first 403,
+    after the compose that follows a second 403, and after Back.
 
     Each refusal is the server's sentence word for word, and the root box
     keeps the good clone's root while the outcome goes. No five-character
-    run of the typed user, token, path or host is anywhere but the URL
-    box: not the markup (text and every attribute), not another box, the
-    title, the location, storage, cookies, any console message or any
-    request URL (the host, digits a port can share runs with, whole);
-    exactly one request carries the token, in its body.
-    After Back, the four boxes are empty, and each carries
-    autocomplete=off and spellcheck=false. PRE-STATE: the good clone
-    filled the root, and the scanner finds the token in the URL box."""
+    run of the typed user, sentinel, path or host is anywhere but the URL
+    box. The surfaces: the markup (text and every attribute), every other
+    box, the title, the location, storage, cookies, console messages,
+    every request's URL and headers, history.state and window.name, CSS
+    generated content (::before and ::after of every element) and every
+    open shadow root. The runs are matched after percent-decoding,
+    lowercasing and dropping everything but letters and digits, so a
+    case change or a percent escape cannot hide one; the host, digits and
+    dots a port can share runs with, is checked whole on the raw text.
+    Base64 or any other encoding is outside what the scan can see. The
+    requests that carry the sentinel are exactly the POST /clones bodies
+    the presses made, one per press: one at the first scan, two by the
+    end. After Back, the four boxes are empty (their values were set and
+    read before the navigation, so the emptiness is the page's doing),
+    and each carries autocomplete=off and spellcheck=false; the URL and
+    ref boxes are disabled at load (static/attach.js, the cloneBlocked
+    lines), so for those two the browser's own restore has nothing to
+    fill and the proof rests on the attributes. PRE-STATE: the good clone
+    filled the root, and the scanner finds the sentinel in the URL box
+    under the same normalisation."""
     collectors.append(FORBIDDEN_RESOURCE)
     name, _ = repo(request, clone_remote, {"a.py": b"A = 'refusals'\n"})
     good = clone_remote.url(OWNER, name)
     page = clone_bench(["stub/fast"])
     console = []
     page.on("console", lambda m: console.append(m.text))
-    urls = []
-    page.on("request", lambda r: urls.append((r.url, r.post_data or "")))
+    requests = []
+    page.on(
+        "request",
+        lambda r: requests.append((r.url, r.post_data or "", dict(r.headers))),
+    )
     open_panel(page)
     made = press_clone(page, good).json()
     root = page.get_by_test_id("snapshot-root")
@@ -463,18 +481,76 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
 
     host = clone_remote.host
     typed = f"https://{USER}:{TOKEN}@{host}/{PATH_OWNER}/{PATH_REPO}"
-    # The distinctive parts by every five-character run of them; the host,
-    # which is digits and dots a port can share runs with, whole.
+    # The distinctive parts by every five-character run of them, matched
+    # on normalised text; the host whole, on the raw text.
     secrets = [USER, TOKEN, PATH_OWNER, PATH_REPO]
 
+    def normalised(text):
+        return re.sub(r"[^a-z0-9]", "", urllib.parse.unquote(text).lower())
+
     def runs(text):
+        flat = normalised(text)
         found = [
             s[i : i + 5]
-            for s in secrets
+            for s in (normalised(x) for x in secrets)
             for i in range(len(s) - 4)
-            if s[i : i + 5] in text
+            if s[i : i + 5] in flat
         ]
         return found + ([host] if host in text else [])
+
+    def generated_and_shadow(page):
+        # ::before and ::after content of every element, and the markup
+        # of every open shadow root, neither of which outerHTML shows.
+        return page.evaluate(
+            """() => {
+              const out = [];
+              const walk = (root) => {
+                for (const el of root.querySelectorAll('*')) {
+                  for (const pseudo of ['::before', '::after']) {
+                    const c = getComputedStyle(el, pseudo).content;
+                    if (c && c !== 'none' && c !== 'normal') out.push(c);
+                  }
+                  if (el.shadowRoot) {
+                    out.push(el.shadowRoot.innerHTML);
+                    walk(el.shadowRoot);
+                  }
+                }
+              };
+              walk(document);
+              return out.join('\\n');
+            }"""
+        )
+
+    def scan(expected_sentinel_requests):
+        others = page.evaluate(
+            "[...document.querySelectorAll('input, textarea, select')]"
+            ".filter(el => el.id !== 'clone-url').map(el => el.value).join('\\n')"
+        )
+        surfaces = [
+            outer(page),
+            others,
+            page.title(),
+            page.url,
+            page.evaluate(
+                "JSON.stringify([Object.entries(localStorage), "
+                "Object.entries(sessionStorage)])"
+            ),
+            page.evaluate("document.cookie"),
+            page.evaluate("JSON.stringify([history.state, window.name])"),
+            generated_and_shadow(page),
+            "\n".join(console),
+            "\n".join(u for u, _, _ in requests),
+            "\n".join(json.dumps(h, sort_keys=True) for _, _, h in requests),
+        ]
+        for surface in surfaces:
+            assert runs(surface) == [], surface[:200]
+        carrying = [(u, body) for u, body, _ in requests if TOKEN in body]
+        assert len(carrying) == expected_sentinel_requests, carrying
+        for url, body in carrying:
+            assert url == clone_bench_url + "/clones"
+            sent = json.loads(body)
+            assert sent["url"] == typed
+            assert set(sent) <= {"url", "ref"}
 
     refused = press_clone(page, typed)
     assert refused.status == 403
@@ -484,25 +560,7 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     expect(root).to_have_value(made["root"])
     expect(outcome).to_have_text("")
     expect(outcome).not_to_have_attribute("title", ANY)
-    others = page.evaluate(
-        "[...document.querySelectorAll('input, textarea, select')]"
-        ".filter(el => el.id !== 'clone-url').map(el => el.value).join('\\n')"
-    )
-    surfaces = [
-        outer(page),
-        others,
-        page.title(),
-        page.url,
-        page.evaluate(
-            "JSON.stringify([Object.entries(localStorage), Object.entries(sessionStorage)])"
-        ),
-        page.evaluate("document.cookie"),
-        "\n".join(console),
-        "\n".join(u for u, _ in urls),
-    ]
-    for surface in surfaces:
-        assert runs(surface) == [], surface[:200]
-    assert [u for u, body in urls if TOKEN in body] == [clone_bench_url + "/clones"]
+    scan(1)
 
     unknown = press_clone(page, good, "no-such-ref")
     assert unknown.status == 422
@@ -541,25 +599,36 @@ def test_a_refusal_is_the_servers_sentence_and_repeats_nothing_typed(
     page.unroute("**/clones")
     # A snapshot composed after a refused URL keeps no URL: the URL and
     # ref are kept only when they made the root, and this one holds a
-    # token.
+    # sentinel in its userinfo.
     assert press_clone(page, typed).status == 403
     page.get_by_test_id("snapshot-patterns").fill("*.py")
     assert press(page, "snapshot-compose", "/snapshots").ok
     for testid in ("clone-url", "clone-ref", "snapshot-root"):
         expect(page.get_by_test_id(testid)).to_have_value("")
+    scan(2)
     open_panel(page)
 
     for testid in ("clone-url", "clone-ref", "snapshot-root", "snapshot-patterns"):
         box = page.get_by_test_id(testid)
         expect(box).to_have_attribute("autocomplete", "off")
         expect(box).to_have_attribute("spellcheck", "false")
-    page.get_by_test_id("clone-url").fill(typed)
-    page.get_by_test_id("snapshot-patterns").fill("src/secret.py")
+    # The Back leg's pre-state: all four boxes hold a value and the page
+    # reads them back, so an empty box after Back is the page's doing.
+    filled = {
+        "clone-url": typed,
+        "clone-ref": "main",
+        "snapshot-root": made["root"],
+        "snapshot-patterns": "src/secret.py",
+    }
+    for testid, value in filled.items():
+        page.get_by_test_id(testid).fill(value)
+        expect(page.get_by_test_id(testid)).to_have_value(value)
     page.goto(clone_bench_url + "/models")
     page.go_back()
     expect(page.get_by_test_id("snapshot-open")).to_be_enabled()
-    for testid in ("clone-url", "clone-ref", "snapshot-root", "snapshot-patterns"):
+    for testid in filled:
         expect(page.get_by_test_id(testid)).to_have_value("")
+    scan(2)
 
 
 def test_blank_is_not_sent(request, page, clone_bench, clone_remote):

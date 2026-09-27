@@ -19013,45 +19013,94 @@ def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp
         ), "only the control's snapshot holds the sentinel"
 
 
-@pytest.mark.parametrize(
-    ("place", "planted"),
-    [
-        # Legacy remote files git still reads for a fetch (measured on
-        # git 2.43.0: `git fetch legacy` resolves the URL they hold).
-        ("remotes", {"legacy": f"URL: {SENTINEL_URL}\nPush: refs/heads/main\n"}),
-        ("branches", {"br": f"{SENTINEL_URL}#main\n"}),
-        # A linked worktree's own configuration, which `git config
-        # --worktree` writes below the git directory's top level.
-        (
-            "worktrees/wt",
-            {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
-        ),
-    ],
-)
+# The places below a git directory's top level that can carry a URL git
+# uses, each verified on the git named. logs/ is written by git itself
+# (git pull keeps its arguments verbatim in the reflog message; git fetch
+# anonymises them), so the fixture has git write it rather than planting
+# a file: update-ref -m with core.logAllRefUpdates on, which is the
+# reflog line a pull would leave, and the list has no fixed end.
+BELOW_THE_TOP = [
+    # Legacy remote files git still reads for a fetch (git 2.43.0: `git
+    # fetch legacy` resolves the URL they hold with no warning; the review
+    # measured 2.50.1 reading them with a removal warning).
+    ("remotes", {"legacy": f"URL: {SENTINEL_URL}\nPush: refs/heads/main\n"}),
+    ("branches", {"br": f"{SENTINEL_URL}#main\n"}),
+    # A linked worktree's own configuration, which `git config
+    # --worktree` writes below the git directory's top level, and which
+    # `git worktree add` copies from the main worktree's (2.43.0 and
+    # 2.50.1 both).
+    (
+        "worktrees/wt",
+        {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
+    ),
+    # The reflog, written by git, not planted.
+    ("logs", "reflog"),
+]
+
+
+@pytest.mark.parametrize(("place", "planted"), BELOW_THE_TOP)
 def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
     client, tmp_path, place, planted
 ):
     """WINDOW: POST /snapshots with the root placed INSIDE a git
-    directory, at remotes/, branches/ and worktrees/wt/, each holding a
-    file git reads a remote URL from, planted with a sentinel string in
-    the userinfo position.
+    directory, at remotes/, branches/, worktrees/wt/ and logs/, each
+    holding a file git reads or writes a remote URL in, with a sentinel
+    string in the userinfo position.
 
     This is the exposure BACKLOG names as open: the walk sees the four
     names only at the root or below it, never above, so a root below a
     git directory's top level composes and the sentinel is in the stored
     text. The test pins the open state; when the ancestor look is built
     it fails at the status and is rewritten as that commit's pre-state.
-    The three places were verified on git 2.43.0: the two legacy files
-    are used by `git fetch`, and config.worktree by `git config
-    --worktree` under extensions.worktreeConfig."""
+    The places, verified on git 2.43.0 here and by the review on 2.50.1:
+    the two legacy files are used by `git fetch` (2.43.0 silently, 2.50.1
+    with a removal warning); `git init` still makes an empty branches/
+    on 2.43.0 and no longer does on 2.50.1, which changes nothing here
+    since the file is planted; config.worktree is written by `git config
+    --worktree` under extensions.worktreeConfig and copied into a new
+    linked worktree by `git worktree add`; and logs/ is written by git
+    itself, here by update-ref -m as a pull would write it, so the
+    reachable set has no fixed end."""
     client.app.state.repo_roots = (str(tmp_path.resolve()),)
     env = git_env(tmp_path)
     top = tmp_path / "zqbare"
     subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
     root = top / place
-    root.mkdir(parents=True, exist_ok=True)
-    for name, text in planted.items():
-        (root / name).write_text(text)
+    if planted == "reflog":
+        identity = {
+            **env,
+            "GIT_AUTHOR_NAME": "a",
+            "GIT_AUTHOR_EMAIL": "a@example.invalid",
+            "GIT_COMMITTER_NAME": "a",
+            "GIT_COMMITTER_EMAIL": "a@example.invalid",
+        }
+        git = ["git", "-C", str(top), "-c", "core.logAllRefUpdates=true"]
+        tree = subprocess.run(
+            [*git, "mktree"], input=b"", capture_output=True, env=env, check=True
+        ).stdout.strip()
+        commit = subprocess.run(
+            [*git, "commit-tree", tree, "-m", "x"],
+            capture_output=True,
+            env=identity,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            [
+                *git,
+                "update-ref",
+                "-m",
+                f"pull {SENTINEL_URL}",
+                "refs/heads/main",
+                commit,
+            ],
+            env=identity,
+            check=True,
+        )
+        assert SENTINEL in (root / "refs" / "heads" / "main").read_text()
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+        for name, text in planted.items():
+            (root / name).write_text(text)
     composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
     assert composed.status_code == 201, composed.text
     assert SENTINEL in stored_text(client, composed.json()["digest"])
