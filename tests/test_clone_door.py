@@ -450,14 +450,20 @@ def test_a_clone_variable_set_wrong_fails_boot_naming_it(
 
 
 @pytest.mark.parametrize("which", ["branch", "tag", "commit"])
-def test_a_branch_a_tag_or_a_commit_is_cloned_and_recorded(request, bench, stub, which):
+def test_a_branch_a_tag_or_a_commit_is_cloned_and_recorded(
+    request, bench, stub, which, tmp_path
+):
     """WINDOW: POST /clones of one ref, the response, the directory and
     the clones row.
 
     201 and "cloned"; the root is BENCH_CLONE_ROOT/<sha256 of the
     identity, a newline and the ref>[:16], its files the ref's; the row
-    holds the identity (no ".git") and the head. PRE-STATE: the branch
-    has moved past the tag, so the three check out different commits."""
+    holds the identity (no ".git") and the head. One commit, at depth
+    one: the branch's clone holds its tip and nothing below it (git's
+    shallow file names the tip, and the history counts one commit).
+    PRE-STATE: the branch has moved past the tag, so the three check out
+    different commits, and the branch has two, so a fetch of its whole
+    history would show."""
     repo, first = repo_for(request, stub, {"a.py": b"one\n"}, tag="v1")
     second = stub.repository(OWNER, repo, {"a.py": b"two\n"})
     assert first != second
@@ -480,6 +486,17 @@ def test_a_branch_a_tag_or_a_commit_is_cloned_and_recorded(request, bench, stub,
         "outcome": "cloned",
     }
     assert (Path(made["root"]) / "a.py").read_text() == text
+    if which == "branch":
+        shallow = (Path(made["root"]) / ".git" / "shallow").read_text().split()
+        assert shallow == [head]
+        history = clone_stub.git(
+            clone_stub.isolated_git_env(tmp_path),
+            f"--git-dir={made['root']}/.git",
+            "rev-list",
+            "--count",
+            "HEAD",
+        )
+        assert history == "1"
     rows = [dict(r) for r in bench.app.state.db.execute("SELECT * FROM clones")]
     assert [(r["url"], r["ref"], r["head_sha"], r["root"]) for r in rows] == [
         (identity, ref, head, made["root"])
@@ -901,6 +918,75 @@ def test_a_clone_past_max_clone_seconds_is_killed_and_removed(
     assert clone_of(bench, stub, repo).status_code == 201
 
 
+def test_one_deadline_bounds_the_whole_clone_not_each_git(
+    request, bench, stub, monkeypatch
+):
+    """WINDOW: POST /clones with MAX_CLONE_SECONDS at 2.0 and each git
+    after the fetch started 0.8 s late, every git of the clone recorded
+    with how long it took.
+
+    Each git alone fits the ceiling; together they pass it. The clone's
+    one deadline refuses it, 504 naming MAX_CLONE_SECONDS, after init
+    and fetch have run and before its last git; a deadline restarted for
+    each git would answer 201. Nothing is left on disk, and the same
+    clone without the delay is accepted. PRE-STATE: the clone root is
+    empty, and init and fetch run undelayed, so the refusal cannot fall
+    on the fetch however slow the runner."""
+    repo, _ = repo_for(request, stub)
+    monkeypatch.setattr(main, "MAX_CLONE_SECONDS", 2.0)
+    real = main._git_clone
+    seen = []
+
+    async def late(tree, args, operands, **kw):
+        started = time.monotonic()
+        if args[0] not in ("init", "fetch"):
+            await asyncio.sleep(0.8)
+        answer = await real(tree, args, operands, **kw)
+        seen.append((args[0], time.monotonic() - started))
+        return answer
+
+    monkeypatch.setattr(main, "_git_clone", late)
+    assert os.listdir(clone_root(bench)) == []
+    resp = clone_of(bench, stub, repo)
+    assert resp.status_code == 504, resp.text
+    assert "MAX_CLONE_SECONDS" in resp.json()["detail"]
+    verbs = [verb for verb, _ in seen]
+    assert verbs[:2] == ["init", "fetch"] and "rev-parse" not in verbs
+    assert all(took < 2.0 for _, took in seen), seen
+    assert os.listdir(clone_root(bench)) == []
+    monkeypatch.setattr(main, "_git_clone", real)
+    assert clone_of(bench, stub, repo).status_code == 201
+
+
+def test_the_fetch_and_the_checkout_are_the_gits_watched_while_they_write(
+    request, bench, stub, monkeypatch
+):
+    """WINDOW: POST /clones of a small repository, every git of the clone
+    recorded as (verb, watched).
+
+    The clone's directory is measured while the fetch and the checkout
+    run, the two gits that put its bytes on disk, so a ceiling crossed
+    mid-write stops it there; init, ls-tree and rev-parse write nothing
+    of size and are not watched. PRE-STATE: the clone answers 201."""
+    repo, _ = repo_for(request, stub)
+    real = main._git_clone
+    seen = []
+
+    async def spy(tree, args, operands, **kw):
+        seen.append((args[0], kw.get("watch", False)))
+        return await real(tree, args, operands, **kw)
+
+    monkeypatch.setattr(main, "_git_clone", spy)
+    assert clone_of(bench, stub, repo).status_code == 201
+    assert seen == [
+        ("init", False),
+        ("fetch", True),
+        ("ls-tree", False),
+        ("checkout", True),
+        ("rev-parse", False),
+    ]
+
+
 def test_a_checkout_past_max_clone_bytes_is_refused_before_it_is_written(
     request, bench, stub, monkeypatch
 ):
@@ -968,15 +1054,21 @@ def test_a_tree_past_max_clone_entries_is_refused_naming_it(
     request, bench, stub, monkeypatch
 ):
     """WINDOW: POST /clones of a tree of more entries than a shortened
-    MAX_CLONE_ENTRIES, every file empty.
+    MAX_CLONE_ENTRIES, every file empty, with the fetch's watch slowed
+    out of the way.
 
     A tree of empty files weighs nothing in bytes; the entry ceiling is
-    what refuses it. PRE-STATE: its blob bytes are zero."""
+    what refuses it, counted in the tree before checkout ("when it would
+    be checked out"). PRE-STATE: its blob bytes are zero."""
     repo, _ = repo_for(request, stub, {f"d/e{i}": b"" for i in range(30)})
     monkeypatch.setattr(main, "MAX_CLONE_ENTRIES", 10)
+    # The fetch's watch is slowed out of the way, so what refuses is the
+    # tree's count before checkout, the mechanism this proof names.
+    monkeypatch.setattr(main, "CLONE_POLL_SECONDS", 60)
     resp = clone_of(bench, stub, repo)
     assert resp.status_code == 422
     assert "MAX_CLONE_ENTRIES (10 entries)" in resp.json()["detail"]
+    assert "entries when it would be checked out" in resp.json()["detail"]
     assert "at least 0 bytes" in resp.json()["detail"]
     assert os.listdir(clone_root(bench)) == []
 
@@ -1023,6 +1115,48 @@ def test_a_second_clone_while_one_runs_is_refused(request, bench, stub):
     assert "one at a time" in resp.json()["detail"]
     assert len(stub.seen) == seen
     assert clone_of(bench, stub, repo).status_code == 201
+
+
+def test_two_clones_sent_together_are_one_clone_and_one_refusal(request, bench, stub):
+    """WINDOW: two POST /clones of two repositories, both started on one
+    event loop before either is awaited, through the app itself.
+
+    The slot is claimed with nothing awaited since it was checked, so one
+    clone runs and the other is refused 409 without reaching the remote.
+    A claim that awaited anything after its check would let both through
+    and run two clones at once. PRE-STATE: the slot is free before the
+    two are sent, and each repository clones alone."""
+    first, _ = repo_for(request, stub)
+    second = first + "b"
+    stub.repository(OWNER, second, {"b.py": b"two\n"})
+    assert bench.app.state.clone_run["paths"] is None
+
+    def body(repo):
+        return {"url": f"https://{stub.host}/{OWNER}/{repo}.git", "ref": "main"}
+
+    async def together():
+        transport = httpx.ASGITransport(app=main.app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://localhost", trust_env=False
+        ) as client:
+            one = asyncio.ensure_future(client.post("/clones", json=body(first)))
+            two = asyncio.ensure_future(client.post("/clones", json=body(second)))
+            return await asyncio.gather(one, two)
+
+    seen = len(stub.seen)
+    answers = asyncio.run(together())
+    assert sorted(a.status_code for a in answers) == [201, 409]
+    refused = next(
+        repo
+        for repo, a in zip((first, second), answers, strict=True)
+        if a.status_code == 409
+    )
+    assert "one at a time" in next(a for a in answers if a.status_code == 409).text
+    assert not [
+        s for s in stub.seen[seen:] if s.path.startswith(f"/{OWNER}/{refused}.git")
+    ]
+    assert bench.app.state.clone_run["paths"] is None
+    assert clone_of(bench, stub, refused).status_code == 201
 
 
 @pytest.mark.parametrize("where", ["_clone", "_sweep_clone_work", "_fetch_into"])
@@ -1335,17 +1469,28 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
     """WINDOW: one tree snapshotted twice, as a clone and as a byte-copy of
     it (.git included) under a second allowlisted root; each snapshot then
     compared by hand in a group and cited by an experiment that ran; the
-    capture as POST /snapshots, GET /runs/{id}, GET /groups/{id}, GET
-    /runs (the group's entry), the report, the export, and (since O3)
-    GET /attachments/{digest} and the GET /attachments list each carry
-    it.
+    capture as POST /snapshots, GET /runs/{id}, GET /groups/{id} (its
+    declaration and its member run's), GET /runs (the group's entry), the
+    report, the export, and (since O3) GET /attachments/{digest} and the
+    GET /attachments list each carry it.
 
     DECLARATION TRANSPORT, the house law's test. On every surface the two
     captures differ in clone_id (the clone's id, and a present null) and
     in nothing else but the id and captured_at any two captures differ
     in: the same digest, head, dirty flag, patterns and exclusions.
-    PRE-STATE: the copy is git-identical, so head and dirty agree and a
-    difference in them would be the bug."""
+
+    PINNED, NOT LATEST (the Phase O review's M8). The two snapshots share
+    one digest, so after the second walk the latest capture of that
+    digest is the plain copy's. The surfaces that answer a pin (the run,
+    the group and its member run, the runs list, the report, the export)
+    are read only after both walks, and each must carry its own label's
+    capture, by id; a surface that showed the latest capture would show
+    the plain copy's for the clone. The two /attachments surfaces show
+    the latest by design and are read in each label's turn. PRE-STATE:
+    the copy is git-identical, so head and dirty agree and a difference
+    in them would be the bug; after both walks the latest capture of the
+    shared digest is the plain copy's; and each group holds its one
+    member run."""
     import shutil
 
     from test_api import (
@@ -1376,7 +1521,7 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
         plain = elsewhere / "copy"
         shutil.copytree(made["root"], plain, symlinks=True)
 
-        surfaces = {}
+        surfaces, pinned = {}, {}
         for label, root in (("clone", made["root"]), ("plain", str(plain))):
             snap = client.post("/snapshots", json={"root": root, "patterns": ["*.py"]})
             assert snap.status_code == 201, snap.text
@@ -1408,27 +1553,10 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
                 "/experiments", json=experiment_body(path, lineup=["model/alpha"])
             ).json()["id"]
             run_experiment_to_completion(client, eid, path)
-            report = client.get(
-                f"/experiments/{eid}/report", params={"dataset_path": path}
-            )
-            export = json.loads(read_export(client, eid).decode().splitlines()[0])
-            listed = [
-                r
-                for r in client.get("/runs").json()["runs"]
-                if r.get("type") == "group" and r["id"] == gid
-            ]
+            pinned[label] = (capture, gid, run_id, eid, path)
             surfaces[label] = {
                 "digest": digest,
                 "POST /snapshots": capture,
-                "GET /runs/{id}": client.get(f"/runs/{run_id}").json()["attachments"][
-                    0
-                ]["capture"],
-                "GET /groups/{id}": client.get(f"/groups/{gid}").json()["attachments"][
-                    0
-                ]["capture"],
-                "GET /runs": listed[0]["attachments"][0]["capture"],
-                "report": report.json()["captures"][str(capture["id"])],
-                "export": export["captures"][str(capture["id"])],
                 # Read here, inside this label's turn: both labels compose
                 # one digest, so after the other's walk the latest capture
                 # is the other's.
@@ -1441,6 +1569,42 @@ def test_the_clone_id_travels_as_head_does_and_differs_in_nothing_else(
                     if row["digest"] == digest
                 )["capture"],
             }
+
+        # After both walks: the latest capture of the shared digest is the
+        # plain copy's, so a pinned surface showing the latest would show
+        # it for the clone.
+        digest = surfaces["clone"]["digest"]
+        latest = client.get(f"/attachments/{digest}").json()["capture"]["id"]
+        assert latest == pinned["plain"][0]["id"] != pinned["clone"][0]["id"]
+        for label, (capture, gid, run_id, eid, path) in pinned.items():
+            group = client.get(f"/groups/{gid}").json()
+            assert [member["id"] for member in group["runs"]] == [run_id]
+            report = client.get(
+                f"/experiments/{eid}/report", params={"dataset_path": path}
+            )
+            export = json.loads(read_export(client, eid).decode().splitlines()[0])
+            listed = [
+                r
+                for r in client.get("/runs").json()["runs"]
+                if r.get("type") == "group" and r["id"] == gid
+            ]
+            surfaces[label].update(
+                {
+                    "GET /runs/{id}": client.get(f"/runs/{run_id}").json()[
+                        "attachments"
+                    ][0]["capture"],
+                    "GET /groups/{id}": group["attachments"][0]["capture"],
+                    "GET /groups/{id} member run": group["runs"][0]["attachments"][0][
+                        "capture"
+                    ],
+                    "GET /runs": listed[0]["attachments"][0]["capture"],
+                    "report": report.json()["captures"][str(capture["id"])],
+                    "export": export["captures"][str(capture["id"])],
+                }
+            )
+            for surface, shown in surfaces[label].items():
+                if surface != "digest":
+                    assert shown["id"] == capture["id"], (label, surface)
 
     clone, plain_ = surfaces.pop("clone"), surfaces.pop("plain")
     assert clone.pop("digest") == plain_.pop("digest")
