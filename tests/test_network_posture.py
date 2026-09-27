@@ -25,9 +25,10 @@ Complete BY CONSTRUCTION over:
     clause or VALUE_OK. So partial(httpx.get), to_thread(subprocess.run),
     Process(target=subprocess.run) and getattr(httpx, ...) all fail.
   - processes: every process start is inside a named runner and nowhere
-    else. _git starts ["git", *args]; _git_clone starts exactly
-    _clone_argv's list, whose fixed configuration is pinned here word
-    for word, with "--" before the operands.
+    else. _git starts exactly _git_argv's list in the environment
+    _git_env builds, and _git_clone starts exactly _clone_argv's list;
+    each argv's fixed configuration is pinned here word for word, the
+    clone's with "--" before the operands.
   - git verbs: a runner is only ever called, never passed as a value;
     its git arguments are a list of literals whose first is a verb from
     that runner's allowlist, and no literal is an option that rewrites
@@ -48,8 +49,9 @@ callback passed as a value is not followed by DOOR_REACH; destinations
 are not evaluated (the OpenRouter URLs are env seams, models.py; the
 clone hosts are held by bench/clones.py and its tests); git's own
 config-driven behaviour is held by the pinned configuration and the
-scrubbed environment, which tests/test_clone_door.py proves, not by an
-AST; and the browser is held by the CSP's connect-src 'self'.
+built environment, which tests/test_clone_door.py proves for the clone
+runner and tests/test_api.py's recorder proofs for the local one, not
+by an AST; and the browser is held by the CSP's connect-src 'self'.
 """
 
 import ast
@@ -273,6 +275,24 @@ CLONE_PREFIX = (
 )
 
 
+# The local runner's fixed configuration, word for word, as _git_argv
+# must begin before *args. Each pair is a posture a repository's own
+# configuration cannot override from inside it: no file system monitor;
+# no hooks (/dev/null, a directory nothing can be in); no helper asked
+# for sign-in details; no bare repository found by searching.
+GIT_PREFIX = (
+    "git",
+    "-c",
+    "core.fsmonitor=",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "credential.helper=",
+    "-c",
+    "safe.bareRepository=explicit",
+)
+
+
 def _dotted(node):
     if isinstance(node, ast.Name):
         return node.id
@@ -373,6 +393,23 @@ def _runner_call(runner, call):
     return verb, None
 
 
+def _git_argv_problem(defs):
+    fn = defs.get("_git_argv")
+    if fn is None:
+        return "_git_argv is missing"
+    returns = [n for n in ast.walk(fn) if isinstance(n, ast.Return)]
+    if len(returns) != 1 or not isinstance(returns[0].value, ast.List):
+        return "_git_argv does not return one list display"
+    elts = returns[0].value.elts
+    head = tuple(_string(e) for e in elts[: len(GIT_PREFIX)])
+    if head != GIT_PREFIX:
+        return f"_git_argv's configuration is {head}, not the pinned one"
+    shape = [type(e).__name__ for e in elts[len(GIT_PREFIX) :]]
+    if shape != ["Starred"]:
+        return f"_git_argv's tail is {shape}, not *args"
+    return None
+
+
 def _clone_argv_problem(defs):
     fn = defs.get("_clone_argv")
     if fn is None:
@@ -429,6 +466,9 @@ def scan(files):
             problem = _clone_argv_problem(defs)
             if problem:
                 failures.add((fname, "_clone_argv", problem))
+            problem = _git_argv_problem(defs)
+            if problem:
+                failures.add((fname, "_git_argv", problem))
 
         def key_of(node, fname=fname, scope=scope):
             return (fname, scope.get(id(node), "<module>"))
@@ -512,6 +552,8 @@ def scan(files):
                     failures.add((fname, key[1], f"runner {node.id} used as a value"))
                 if node.id == "_clone_argv" and not is_callee:
                     failures.add((fname, key[1], "_clone_argv used as a value"))
+                if node.id in ("_git_argv", "_git_env") and not is_callee:
+                    failures.add((fname, key[1], f"{node.id} used as a value"))
             if isinstance(node, ast.Attribute) and not isinstance(
                 parent, ast.Attribute
             ):
@@ -537,16 +579,21 @@ def scan(files):
                 continue
             if name == "_clone_argv" and key[1] != "_git_clone":
                 failures.add((fname, key[1], "_clone_argv called outside _git_clone"))
+            if name in ("_git_argv", "_git_env") and key[1] != "_git":
+                failures.add((fname, key[1], f"{name} called outside _git"))
             if name in PROCESS_STARTS:
                 add(key, name)
                 if (fname, key[1]) == ("main.py", "_git"):
                     argv = node.args[0] if node.args else None
+                    env = [k.value for k in node.keywords if k.arg == "env"]
                     ok = (
                         name == "subprocess.run"
-                        and isinstance(argv, ast.List)
-                        and [type(e).__name__ for e in argv.elts]
-                        == ["Constant", "Starred"]
-                        and _string(argv.elts[0]) == "git"
+                        and len(node.args) == 1
+                        and isinstance(argv, ast.Call)
+                        and _dotted(argv.func) == "_git_argv"
+                        and len(env) == 1
+                        and isinstance(env[0], ast.Call)
+                        and _dotted(env[0].func) == "_git_env"
                     )
                 elif (fname, key[1]) == ("main.py", "_git_clone"):
                     ok = (
@@ -686,7 +733,9 @@ NETWORK_CALLS = {
     ),
     # ---- Local processes. ----
     # _git: two-second questions of a local repository, rev-parse and
-    # status only, from _app_sha at boot and _clone_state for a capture.
+    # status only, from _app_sha at boot and _clone_state for a capture,
+    # each with _git_argv's pinned configuration in _git_env's built
+    # environment (a snapshot's bounded by a ceiling above its entry).
     ("main.py", "_git"): Counter({"subprocess.run": 1}),
     ("main.py", "_app_sha"): Counter({"_git rev-parse": 1, "_git status": 1}),
     ("main.py", "_clone_state"): Counter({"_git rev-parse": 1, "_git status": 1}),
@@ -811,10 +860,16 @@ PLANTS = [
     ("a second client in lifespan", _planted_main("    app.state.db = store.connect(", "    app.state.http = httpx.AsyncClient()\n    app.state.db = store.connect("), ("main.py", "lifespan")),
     ("a second client used elsewhere", _planted_main("\n\ndef _remove_tree(", "\n\nasync def elsewhere(u):\n    return await app.state.http.get(u)\n\n\ndef _clone_http():\n    app.state.http = httpx.AsyncClient()\n\n\ndef _remove_tree("), ("main.py", "elsewhere")),
     ("loop.create_connection", _planted_module("import asyncio\nasync def door():\n    await asyncio.get_running_loop().create_connection(None, 'x', 1)\n"), ("planted.py", "door")),
-    ("the composer calls the clone worker", _planted_main("        head, dirty = _clone_state(root)\n", "        await _fetch_into(root, 'u', 'r', env={}, deadline=0)\n        head, dirty = _clone_state(root)\n"), "reach"),
+    ("the composer calls the clone worker", _planted_main("        head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))\n", "        await _fetch_into(root, 'u', 'r', env={}, deadline=0)\n        head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))\n"), "reach"),
     ("the prefix drops protocol.allow=never", _planted_main('        "-c",\n        "protocol.allow=never",\n', ""), "not the pinned one"),
     ("the prefix drops followRedirects", _planted_main('        "-c",\n        "http.followRedirects=false",\n', ""), "not the pinned one"),
     ("the argv drops --", _planted_main('        *args,\n        "--",\n        *operands,\n', "        *args,\n        *operands,\n"), "not --git-dir"),
+    ("_git's prefix drops core.hooksPath", _planted_main('        "-c",\n        "core.hooksPath=/dev/null",\n', ""), "not the pinned one"),
+    ("_git's prefix drops safe.bareRepository", _planted_main('        "-c",\n        "safe.bareRepository=explicit",\n', ""), "not the pinned one"),
+    ("_git back to the inherited environment", _planted_main("            env=_git_env(ceiling),\n", ""), "outside a named runner's shape"),
+    ("_git with the environment copied", _planted_main("            env=_git_env(ceiling),\n", "            env=dict(os.environ),\n"), "outside a named runner's shape"),
+    ("_git back to [git, *args]", _planted_main("            _git_argv(args),\n", '            ["git", *args],\n'), "outside a named runner's shape"),
+    ("_git_argv called outside _git", _planted_module("def door(r):\n    _git_argv(['status'])\n"), "_git_argv called outside _git"),
     ("a process started beside the runner", _planted_main("    proc = await asyncio.create_subprocess_exec(\n        *_clone_argv(tree, args, operands),", "    proc = await asyncio.create_subprocess_exec(\n        'git', *_clone_argv(tree, args, operands),"), "outside a named runner's shape"),
 ]  # fmt: skip
 

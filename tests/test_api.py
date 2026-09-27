@@ -17262,7 +17262,10 @@ FILESYSTEM_CALLS = {
     # The git runner: its default working directory is from __file__,
     # and its cwd parameter is where a snapshot passes an allowlisted
     # root. subprocess.run is listed because a working directory is a
-    # path operation, whatever the command.
+    # path operation, whatever the command. Since Phase O the search for
+    # a repository from that directory is bounded too: a snapshot's git
+    # runs with GIT_CEILING_DIRECTORIES at the parent of the root's
+    # allowlist entry (_git_env), so it reads no repository above it.
     ("main.py", "_git"): {"resolve", "subprocess.run"},
     # The database path from BENCH_DB, set by the operator at boot and
     # never per request: created private, tightened if found loose,
@@ -18846,7 +18849,7 @@ def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
     trees = git_directory_trees(tmp_path)
     ran = []
 
-    def recorder(args, *, cwd=None):
+    def recorder(args, *, cwd=None, ceiling=None):
         ran.append((list(args), cwd))
         return None
 
@@ -18917,6 +18920,301 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     ]
     assert composed.json()["detail"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
     assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
+
+
+# =====================================================================
+# ---- Phase O, after the operator's pass: the snapshot door's git
+# ---- hardened. Every local git runs with _git_argv's configuration in
+# ---- _git_env's built environment, and a snapshot's looks for no
+# ---- repository above its allowlist entry. Recorder proofs of argv and
+# ---- environment, the ceiling on real repositories, and the order; no
+# ---- proof here runs a program a repository's configuration names.
+# ---- Every test names its window.
+# =====================================================================
+
+from test_network_posture import GIT_PREFIX  # noqa: E402
+
+# The walk's pinned copy of _git_argv's configuration, as a list: what
+# every local git begins with, before its verb.
+LOCAL_GIT_PREFIX = list(GIT_PREFIX)
+
+
+def recorded_processes(monkeypatch):
+    """Every process started through subprocess.Popen from here on
+    (subprocess.run and asyncio's subprocess both start one), recorded as
+    (argv, env, cwd) and then started as asked. A start by os.system,
+    os.posix_spawn, an exec or a fork is not seen here; the network
+    posture walk refuses every one of those in bench/."""
+    ran = []
+    real = subprocess.Popen
+
+    class Recorded(real):
+        def __init__(self, argv, *args, **kwargs):
+            ran.append((list(argv), kwargs.get("env"), kwargs.get("cwd")))
+            super().__init__(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", Recorded)
+    return ran
+
+
+def local_git_env(ceiling=None):
+    """_git_env's environment, written out."""
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if ceiling is not None:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+    return env
+
+
+def head_of(repo):
+    """A repository's commit, asked of git outside the bench."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        env=local_git_env(),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots over a committed repository at
+    zqentry/zqrepo, zqentry the allowlist entry, with every process
+    started through subprocess.Popen recorded (argv, environment, working
+    directory) and then started as asked; then with GIT_DIR,
+    GIT_WORK_TREE, GIT_CEILING_DIRECTORIES, GIT_CONFIG_COUNT (0, so no
+    key is planted) and a variable of the bench's own set in the bench's
+    environment; then with the root spelled through a link outside the
+    entry.
+
+    Each git the door runs begins with _git_argv's configuration word for
+    word (no file system monitor, no hooks, no helper asked for sign-in
+    details, no bare repository found by searching) and runs in the
+    resolved root in exactly _git_env's environment: PATH; HOME and
+    GIT_CONFIG_GLOBAL at os.devnull; GIT_CONFIG_NOSYSTEM;
+    GIT_TERMINAL_PROMPT=0; GIT_CEILING_DIRECTORIES at the entry's parent.
+    Nothing of the bench's own environment reaches it, the planted
+    ceiling (at the entry, not its parent) included, and the head is
+    still the root's; a root spelled
+    through a link is asked about where it resolves, under the same
+    entry's ceiling. PRE-STATE: with nothing planted, the recorder is live
+    and git answered through it: it saw rev-parse HEAD, then status, both
+    in the root, and the capture's head is the repository's commit."""
+    entry = tmp_path.resolve() / "zqentry"
+    repo = clone(entry / "zqrepo", {"a.py": b"A = 1\n"})
+    git_clone(repo)
+    head = head_of(repo)
+    link = tmp_path.resolve() / "zqlink"
+    link.symlink_to(repo)
+    client.app.state.repo_roots = (str(entry),)
+    body = {"root": str(repo), "patterns": ["*.py"]}
+
+    ran = recorded_processes(monkeypatch)
+    before = client.post("/snapshots", json=body)
+    assert before.status_code == 201
+    assert before.json()["capture"]["head"] == head
+    assert len(ran) == 2
+    assert ran[0][0][-2:] == ["rev-parse", "HEAD"]
+    assert ran[1][0][-3:] == ["status", "--porcelain", "."]
+    assert [cwd for _, _, cwd in ran] == [str(repo), str(repo)]
+
+    ran.clear()
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "zqelsewhere"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "zqelsewhere"))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(entry))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    monkeypatch.setenv("ZQ_BENCH_ONLY", "zq")
+    (repo / "b.py").write_bytes(b"B = 1\n")
+    after = client.post("/snapshots", json=body)
+    assert after.status_code == 201
+    assert after.json()["capture"]["head"] == head
+    assert after.json()["capture"]["dirty"] is True
+    through = client.post("/snapshots", json={**body, "root": str(link)})
+    assert through.status_code == 201
+    assert through.json()["capture"]["head"] == head
+    assert [argv for argv, _, _ in ran] == 2 * [
+        [*LOCAL_GIT_PREFIX, "rev-parse", "HEAD"],
+        [*LOCAL_GIT_PREFIX, "status", "--porcelain", "."],
+    ]
+    for _, env, cwd in ran:
+        assert cwd == str(repo)
+        assert env == local_git_env(ceiling=str(entry.parent))
+        assert "OPENROUTER_API_KEY" not in env and "ZQ_BENCH_ONLY" not in env
+
+
+def test_the_snapshot_doors_git_finds_no_repository_above_the_entry(client, tmp_path):
+    """WINDOW: POST /snapshots on roots in a committed repository at
+    zqouter, with the allowlist entry named at the repository and then at
+    a plain directory inside it, zqouter/zqinner; the root at the entry
+    and at a directory below it, zqinner/zqsub.
+
+    With the entry at the plain directory, the capture has no head: git
+    looked in the root and the directories up to the entry and stopped,
+    rather than reading the repository above the entry that the operator
+    did not name. PRE-STATE: with the entry at the repository itself,
+    the same two roots read its commit, so the ceiling (the entry's
+    parent, not the entry) keeps discovery inside the entry and costs
+    nothing there; and the plain directory is inside the repository,
+    which git outside the bench finds from it."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter",
+        {"a.py": b"A = 1\n", "zqinner/b.py": b"B = 1\n", "zqinner/zqsub/c.py": b"C\n"},
+    )
+    git_clone(outer)
+    head = head_of(outer)
+    inner = outer / "zqinner"
+    assert head_of(inner) == head
+
+    def heads(entry):
+        client.app.state.repo_roots = (str(entry),)
+        out = []
+        for root in (inner, inner / "zqsub"):
+            resp = client.post(
+                "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
+            )
+            assert resp.status_code == 201, resp.text
+            out.append(resp.json()["capture"]["head"])
+        return out
+
+    assert heads(outer) == [head, head]
+    assert heads(inner) == [None, None]
+
+
+def test_the_ceiling_is_the_deepest_entry_holding_the_root(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots with more than one allowlist entry, over a
+    committed repository at zqouter holding a plain directory zqinner:
+    the repository and the plain directory both named, in either order;
+    the plain directory beside an unrelated entry longer than it; the
+    repository beside zqouter/zqs, a string prefix of the root
+    zqouter/zqsub and not a directory holding it. Then, recorded, an
+    entry that is the filesystem root, and an entry whose parent's path
+    holds the character git splits GIT_CEILING_DIRECTORIES on.
+
+    The ceiling is measured from snapshot_entry, the deepest entry that
+    holds the root as a directory: with both named, the root in the
+    plain directory has no head whichever is listed first; the unrelated
+    longer entry changes nothing; the string prefix is not an entry
+    holding the root, so zqouter/zqsub reads the repository's commit. An
+    entry at the filesystem root gets no ceiling at all; an entry whose
+    parent holds os.pathsep asks git nothing and has no head, rather
+    than a ceiling git would split. PRE-STATE: git outside the bench
+    finds the repository from the plain directory; with the repository
+    alone as the entry the root in the plain directory reads its commit;
+    the unrelated entry is longer than the plain directory's; and a
+    repository under an entry whose parent holds no os.pathsep reads its
+    head through the recorder."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter",
+        {"a.py": b"A = 1\n", "zqinner/b.py": b"B\n", "zqsub/c.py": b"C\n"},
+    )
+    git_clone(outer)
+    head = head_of(outer)
+    inner = outer / "zqinner"
+    other = tmp_path.resolve() / ("zqother-" + "x" * len(str(inner)))
+    other.mkdir()
+    assert head_of(inner) == head and len(str(other)) > len(str(inner))
+
+    def head_at(root, *entries):
+        client.app.state.repo_roots = tuple(str(e) for e in entries)
+        resp = client.post(
+            "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["capture"]["head"]
+
+    assert head_at(inner, outer) == head
+    assert head_at(inner, outer, inner) is None
+    assert head_at(inner, inner, outer) is None
+    assert head_at(inner, other, inner) is None
+    assert head_at(outer / "zqsub", outer, outer.parent / "zqouter" / "zqs") == head
+
+    split = tmp_path.resolve() / f"zq{os.pathsep}split"
+    repo = clone(split / "zqentry" / "zqrepo", {"a.py": b"A = 1\n"})
+    git_clone(repo)
+    plain = clone(
+        tmp_path.resolve() / "zqplain" / "zqentry" / "zqrepo", {"a.py": b"A\n"}
+    )
+    git_clone(plain)
+    ran = recorded_processes(monkeypatch)
+    assert head_at(plain, plain.parent) == head_of(plain)
+    ran.clear()
+    assert head_at(plain, Path(plain.anchor)) == head_of(plain)
+    assert [env for _, env, _ in ran][:2] == 2 * [local_git_env()]
+    ran.clear()
+    assert head_at(repo, repo.parent) is None
+    assert ran == []
+
+
+def test_the_build_label_asks_git_in_the_same_posture_without_a_ceiling(
+    tmp_path, monkeypatch
+):
+    """WINDOW: _app_sha, with main's own file placed in a committed
+    repository at zqlabel (so the checkout it asks about is that
+    repository, whatever the suite itself runs in), and every process
+    started through subprocess.Popen recorded (argv, environment, working
+    directory) and then started as asked.
+
+    Both its questions share the runner and the posture: _git_argv's
+    configuration, _git_env's environment, and no ceiling, since it asks
+    about its own checkout from that checkout. PRE-STATE: it asked
+    rev-parse HEAD and then status, both in zqlabel, and the label is
+    zqlabel's commit."""
+    repo = clone(tmp_path.resolve() / "zqlabel", {"bench/main.py": b"A = 1\n"})
+    git_clone(repo)
+    head = head_of(repo)
+    monkeypatch.setattr(main, "__file__", str(repo / "bench" / "main.py"))
+    ran = recorded_processes(monkeypatch)
+    assert main._app_sha() == head
+    assert [argv[-2:] for argv, _, _ in ran] == [
+        ["rev-parse", "HEAD"],
+        ["status", "--porcelain"],
+    ]
+    assert [str(cwd) for _, _, cwd in ran] == [str(repo), str(repo)]
+    assert [argv for argv, _, _ in ran] == [
+        [*LOCAL_GIT_PREFIX, "rev-parse", "HEAD"],
+        [*LOCAL_GIT_PREFIX, "status", "--porcelain"],
+    ]
+    assert [env for _, env, _ in ran] == 2 * [local_git_env()]
+
+
+@pytest.mark.parametrize("where", ["root", "below"])
+def test_no_process_starts_before_the_walk_refuses_a_git_directory(
+    client, tmp_path, monkeypatch, where
+):
+    """WINDOW: POST /snapshots on a bare repository made by git, as the
+    root and as fixtures/zqbare.git under it, with every process started
+    through subprocess.Popen recorded.
+
+    The walk refuses first, so no process starts through Popen: not the
+    head and dirty read's git and not any other, which is f8bde6b's order
+    proof taken down to the process start (the order is f8bde6b's). A
+    start by os.system, os.posix_spawn, an exec or a fork is the network
+    posture walk's to refuse, not this proof's. PRE-STATE: the same tree
+    with the bare repository's HEAD removed composes, and the recorder
+    saw the head read's git start in the root."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    trees = git_directory_trees(tmp_path)
+    ran = recorded_processes(monkeypatch)
+    control, _ = trees[(where, True)]
+    resp = client.post("/snapshots", json={"root": str(control), "patterns": ["**/*"]})
+    assert resp.status_code == 201
+    assert ran[0][0][-2:] == ["rev-parse", "HEAD"]
+    assert ran[0][2] == str(control.resolve())
+
+    ran.clear()
+    top, _ = trees[(where, False)]
+    resp = client.post("/snapshots", json={"root": str(top), "patterns": ["**/*"]})
+    assert ran == []
+    assert resp.status_code == 422
 
 
 # =====================================================================

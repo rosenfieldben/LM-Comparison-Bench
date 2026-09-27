@@ -1781,6 +1781,25 @@ and the network posture walk (`tests/test_network_posture.py`) checks
 that no other door reaches either. Diffs between snapshots and agentic
 file browsing are deliberately out.
 
+**The local git runs in a posture of its own making.** The head and the
+dirty flag are asked of git only after the walk has finished, so a root
+the walk refuses is never a directory git runs in. That git, and the one
+that labels a run's build (`app_sha`), start with a fixed configuration
+given on the command line, where a repository's own configuration cannot
+override it: no file system monitor, no hooks
+(`core.hooksPath=/dev/null`), no helper asked for sign-in details, and
+no bare repository found by searching (`safe.bareRepository=explicit`).
+Their environment is built rather than copied: `PATH`, and no system or
+global configuration, so no variable of the bench's (`GIT_DIR` among
+them) and none of your own git settings reach it. A snapshot's git also
+looks for the repository no higher than the root's allowlist entry
+(`GIT_CEILING_DIRECTORIES` at the entry's parent), so a root in a plain
+directory you allowed inside a larger repository you did not has no head
+rather than that repository's. What this costs: a file only your global
+excludes ignore now makes a tree read as dirty, and a checkout owned by
+another user reads as unknown rather than trusted by a `safe.directory`
+you set globally.
+
 Default exclusions apply and are recorded in every snapshot's manifest:
 version control and dependency trees (`.git`, `node_modules`, `.venv`,
 `vendor`), build output and caches (`__pycache__`, `dist`, `*.pyc`,

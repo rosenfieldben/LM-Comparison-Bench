@@ -1543,7 +1543,91 @@ class GroupDetail(BaseModel):
     renditions: list[RenditionPin] | None = None
 
 
-def _git(args: list[str], *, cwd: str | None = None) -> str | None:
+def _git_argv(args: Sequence[str]) -> list[str]:
+    """The argv of one local git: its fixed configuration, then args.
+
+    THE CONFIGURATION COMES FIRST AND IS FIXED, and the network posture
+    walk pins it literally. The repository a snapshot walks is somebody
+    else's, and its own config is repository-supplied configuration that
+    can name programs git runs. These settings, given on the command line
+    where a repository cannot override them, turn off the ones below:
+    - no file system monitor (core.fsmonitor with an empty value, which
+      every git reads as off; git 2.35 and older would take "false" as
+      the name of a program to run);
+    - no hooks: core.hooksPath=/dev/null, a directory nothing can be in.
+      Not an empty value, which git 2.50 resolves to the filesystem's
+      root ("/post-index-change", asked of `git rev-parse --git-path`);
+    - no helper git would ask for sign-in details, from any source (an
+      empty helper clears the list), as the clone runner has;
+    - no bare repository found by searching (safe.bareRepository), so a
+      directory inside a bare repository, which the walk does not refuse
+      (BACKLOG, "A snapshot root inside a git directory"), is not a
+      repository git will read. A command-line setting is protected
+      configuration, which a repository's own cannot override; git
+      older than 2.38 ignores the setting.
+
+    WHAT THEY DO NOT TURN OFF: a filter driver a repository's own
+    configuration names, which status runs on a file whose stat data
+    differs from the index. No one command-line setting clears every
+    driver; this is put to the operator, not closed here.
+    """
+    return [
+        "git",
+        "-c",
+        "core.fsmonitor=",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-c",
+        "credential.helper=",
+        "-c",
+        "safe.bareRepository=explicit",
+        *args,
+    ]
+
+
+def _git_env(ceiling: str | None) -> dict[str, str]:
+    """The whole environment a local git runs in, and nothing more.
+
+    BUILT, NOT COPIED, as the clone runner's is (_clone_env): no variable
+    of the bench's reaches git unless it is named here, not
+    OPENROUTER_API_KEY and not a GIT_DIR, GIT_WORK_TREE or GIT_CONFIG_*
+    the operator's shell carried. No system or global configuration
+    applies (GIT_CONFIG_NOSYSTEM, GIT_CONFIG_GLOBAL, and HOME at a path
+    nothing can be under), so what git reads is the repository's own
+    configuration and git's defaults. GIT_TERMINAL_PROMPT=0: nothing
+    waits on a terminal.
+
+    THE CEILING BOUNDS DISCOVERY, for a snapshot's question: git looks
+    for the repository in the root and the directories above it, and
+    never in `ceiling` or above it. The caller passes the parent of the
+    root's allowlist entry, not the entry, measured on git 2.50: git
+    ignores a ceiling equal to the directory it starts in (so a root
+    that is its entry found a repository above the entry), and never
+    enters a ceiling (so an entry that is the repository, walked from a
+    root below it, found none).
+
+    WHAT IT COSTS, since _app_sha shares it: the operator's global
+    configuration no longer reaches either question. A global excludes
+    file no longer hides untracked files from `status`, so a tree only it
+    ignored now reads as dirty; a safe.directory set globally no longer
+    applies, so a checkout owned by another user reads as unknown (None),
+    never as trusted.
+    """
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if ceiling is not None:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+    return env
+
+
+def _git(
+    args: list[str], *, cwd: str | None = None, ceiling: str | None = None
+) -> str | None:
     """One git command's stdout, or None when git could not answer.
 
     Split out of _app_sha so both of that function's questions run under
@@ -1557,10 +1641,19 @@ def _git(args: list[str], *, cwd: str | None = None) -> str | None:
     which is somebody else's. Both questions want the same two-second
     timeout and the same degrade-to-None, so they get the same runner
     rather than a second one that could drift on either.
+
+    AND THE SAME POSTURE, since Phase O: every local git runs with
+    _git_argv's fixed configuration in _git_env's built environment, the
+    bench's own checkout's as much as a snapshot's, so there is one
+    posture to state and one to pin. A snapshot's question passes a
+    ceiling, so git finds no repository above the root's allowlist
+    entry; see _git_env, which also says what the shared posture costs
+    _app_sha.
     """
     try:
         proc = subprocess.run(
-            ["git", *args],
+            _git_argv(args),
+            env=_git_env(ceiling),
             capture_output=True,
             text=True,
             timeout=2,
@@ -7322,9 +7415,18 @@ def enforce_snapshot_root(
         )
     # Below the deepest entry holding it, which is the one the operator
     # named most exactly: an entry named inside .git is theirs to walk.
-    if snapshot.vcs_below(real, max(holding, key=len)):
+    if snapshot.vcs_below(real, snapshot_entry(real, holding)):
         raise HTTPException(403, ROOT_IN_VCS)
     return real
+
+
+def snapshot_entry(real: str, roots: Sequence[str]) -> str:
+    """The deepest allowlist entry holding a resolved root: the one the
+    operator named most exactly. Both the .git rule (vcs_below) and the
+    head and dirty read's ceiling (_clone_state) are measured from it. A
+    value in and a value out; the caller has already refused a root no
+    entry holds."""
+    return max((a for a in roots if snapshot.contained(real, a)), key=len)
 
 
 class DescriptorTree:
@@ -7509,7 +7611,7 @@ class DescriptorTree:
         return os.path.realpath(os.path.join(self.root, handle.path, raw))
 
 
-def _clone_state(root: str) -> tuple[str | None, bool | None]:
+def _clone_state(root: str, entry: str) -> tuple[str | None, bool | None]:
     """The commit the walked tree is at and whether it is modified.
 
     TWO NULLABLE FIELDS RATHER THAN ONE DEGRADED LABEL, which is where
@@ -7529,11 +7631,31 @@ def _clone_state(root: str) -> tuple[str | None, bool | None]:
     Untracked files count as modified, which is _app_sha's reasoning
     inherited: an untracked file under the root is a file the walk may
     well have just composed.
+
+    NO REPOSITORY ABOVE THE ENTRY. git is asked with the parent of the
+    root's allowlist entry as its ceiling (_git_env says why the parent),
+    so a root in a plain directory the operator allowed, inside some
+    larger repository the operator did not name, has no head rather than
+    that repository's. And it asks only after the walk has finished, so
+    a root the walk refuses (a git directory by what it holds) is never
+    a directory git is run in. Two edges: an entry that is a filesystem
+    root gets no ceiling, since nothing is above it and git never enters
+    a ceiling; and git splits GIT_CEILING_DIRECTORIES on os.pathsep with
+    no escape, so a ceiling whose resolved path holds one (only through a
+    link, since the allowlist itself is split on it) cannot be given,
+    and the root reads as unknown rather than as a repository above it.
     """
-    head = as_text((_git(["rev-parse", "HEAD"], cwd=root) or "").strip()) or None
+    parent = os.path.dirname(entry)
+    if os.pathsep in parent:
+        return (None, None)
+    ceiling = None if parent == entry else parent
+    head = (
+        as_text((_git(["rev-parse", "HEAD"], cwd=root, ceiling=ceiling) or "").strip())
+        or None
+    )
     if head is None:
         return (None, None)
-    status = _git(["status", "--porcelain", "."], cwd=root)
+    status = _git(["status", "--porcelain", "."], cwd=root, ceiling=ceiling)
     if status is None:
         return (head, None)
     return (head, bool(status.strip()))
@@ -7637,7 +7759,7 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     refuse_while_cloning(root)
     try:
         members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
-        head, dirty = _clone_state(root)
+        head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))
         built = snapshot.compose(
             members, patterns=body.patterns, head=head, dirty=dirty
         )
