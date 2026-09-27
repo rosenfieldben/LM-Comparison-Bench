@@ -591,6 +591,60 @@ def test_the_read_ceiling_comes_before_a_later_refused_entry():
     assert ("zz", "refused") in [(m["path"], m["status"]) for m in listed["members"]]
 
 
+def test_a_refused_entry_before_the_read_ceiling_is_the_refusal():
+    """WINDOW: list_members and walk over a pipe 'a' and then three 30-byte
+    files, under '**/*', with the read ceiling shrunk to 60.
+
+    The walk meets the pipe first ('a' sorts before 'f0.py'), so the
+    composer's first refusal is the pipe's and so is the listing's,
+    though the selection goes on to cross the ceiling after it: the
+    listing keeps the refusal it met first and does not let the ceiling
+    replace it. A deterministic tree, because CI's Hypothesis profile
+    fixes its examples and the property did not reach this order there
+    (the Phase O review's M9). PRE-STATE: without the pipe, the same
+    walk's refusal is the ceiling."""
+    files = {f"f{n}.py": b"x" * 30 for n in range(3)}
+    with small_ceilings():
+        with pytest.raises(SnapshotError, match="^the selection passed 60 bytes"):
+            walk(tree=FakeTree(files), patterns=["**/*"])
+        with pytest.raises(SnapshotError) as raised:
+            walk(tree=FakeTree(files, others=["a"]), patterns=["**/*"])
+        listed = list_members(tree=FakeTree(files, others=["a"]), patterns=["**/*"])
+    assert str(raised.value).startswith("a is not a regular file")
+    assert listed["refusal"] == str(raised.value)
+
+
+def test_the_first_read_ceiling_crossing_is_the_refusal():
+    """WINDOW: list_members and walk over three 30-byte files and a 40-byte
+    one, under '*.py', with the read ceiling shrunk to 60 and the member
+    ceiling to 40.
+
+    The selection crosses the ceiling at the third file and again at the
+    fourth, and the two crossings word different sentences (the three
+    largest files so far differ). The listing's refusal is the first
+    crossing's, as the composer's is: the sentence naming f0.py, f1.py
+    and f2.py at 30 bytes each. A later crossing does not replace it. A
+    deterministic tree, for the reason the test above gives (the Phase O
+    review's M9). PRE-STATE: a fresh budget refuses at both spends, and
+    the two sentences differ."""
+    files = {**{f"f{n}.py": b"x" * 30 for n in range(3)}, "f3.py": b"x" * 40}
+    with small_ceilings():
+        budget = snapshot._ReadBudget()
+        for name in ("f0.py", "f1.py"):
+            assert budget.spend(name, 30) is None
+        first = budget.spend("f2.py", 30)
+        second = budget.spend("f3.py", 40)
+        assert first is not None and second is not None
+        assert str(first) != str(second)
+        with pytest.raises(SnapshotError) as raised:
+            walk(tree=FakeTree(files), patterns=["*.py"])
+        listed = list_members(tree=FakeTree(files), patterns=["*.py"])
+    assert "f0.py at 30 bytes, f1.py at 30 bytes, f2.py at 30 bytes" in str(
+        raised.value
+    )
+    assert listed["refusal"] == str(raised.value) == str(first)
+
+
 def test_the_refusal_is_the_first_the_composer_meets_not_the_first_row():
     """WINDOW: list_members over {x.py, a.py as a fifo, a/link out of the
     root} under '**/*'.

@@ -163,9 +163,11 @@ VCS_DIRECTORIES = (".git", ".hg", ".svn")
 # (repo.git), a mirror, a --separate-git-dir and a submodule's
 # .git/modules/<name> all carry them, and none is named .git, so the
 # exclusion above never sees one; their config is where a remote URL
-# with a sentinel string in the userinfo position lives. The walk
-# refuses any directory carrying all four (carries_git_directory), the
-# root included. Found in Phase O; the walk has read them since Phase L.
+# with sign-in details in it lives. The walk refuses any directory
+# carrying all four (carries_git_directory) that it reaches and no
+# exclusion covers, the root included; an excluded one, like an ordinary
+# .git, is excluded first and never listed. Found in Phase O; the walk
+# has read them since Phase L.
 GIT_DIRECTORY_SIGNATURE = ("HEAD", "config", "objects", "refs")
 
 # The two refusals, the same at both doors: the composer's 422 and the
@@ -830,9 +832,10 @@ class Survey:
     TWO KINDS OF REFUSAL. The five above are facts about one entry, so
     the survey reports them and goes on: the composer stops at the first
     (it raises it), and the listing records every one. A refusal about
-    the traversal itself stops the survey: the entry ceiling, a name the
-    snapshot cannot spell, a directory that changed before descent, any
-    refusal a tree operation raises, and any the reader raises. Each is
+    the traversal itself stops the survey: the entry ceiling, a root
+    that is a git directory, a name the snapshot cannot spell, a
+    directory that changed before descent, any refusal a tree operation
+    raises, and any the reader raises. Each is
     reported once, as a final sighting at the directory or entry it was
     raised at, and the traversal ends there, as the composer's does.
 

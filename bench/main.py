@@ -8049,8 +8049,12 @@ def _clone_env(home: str, cainfo: str | None) -> dict[str, str]:
     it is named here: not OPENROUTER_API_KEY, not a GIT_ASKPASS or a
     GIT_CONFIG_* the operator's shell carried, not a proxy. HOME is an
     empty directory made for this clone, so no ~/.gitconfig and no
-    ~/.config/git applies; GIT_CONFIG_NOSYSTEM drops /etc/gitconfig
-    (where macOS's names the keychain helper); GIT_TERMINAL_PROMPT=0
+    ~/.config/git applies; GIT_CONFIG_NOSYSTEM drops git's system-level
+    configuration wherever the build keeps it: /etc/gitconfig on most
+    builds, and on Apple's git the gitconfig it ships under the developer
+    tools' share/git-core, which is where the keychain helper
+    (osxkeychain) is named (measured on git 2.50.1, Apple Git-155, where
+    /etc/gitconfig does not exist); GIT_TERMINAL_PROMPT=0
     means a request for credentials fails rather than waits. The one
     addition is the test seam's certificate bundle, when it is set.
 

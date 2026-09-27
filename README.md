@@ -1721,18 +1721,19 @@ until Phase O.
 **A git directory is refused wherever the walk meets it.** A bare
 repository (`repo.git`), a mirror, a `--separate-git-dir` and a
 submodule's `.git/modules/<name>` hold a repository's configuration, a
-remote URL with a sentinel string in the userinfo position among them,
-and none is named `.git`, so the exclusions never see one. The walk
-therefore refuses any directory holding `HEAD`, `config`, `objects` and
-`refs` together (the names compared without regard to case), whatever
-the patterns select: as the root, both doors refuse it (`422` from
-Compose; the listing's `200` says so, stopped at the root), and as a
-directory the walk reaches, Compose refuses and the listing shows its
-row as refused, reading nothing inside it. The refusal names the rule
-and not the path; the listing's row says where. A tree that keeps a bare
-repository anywhere the walk goes, as some projects keep test fixtures,
-is refused whatever the patterns; name a root beside it. This was
-possible from Phase L until Phase O.
+remote URL with sign-in details in it among them, and none is named
+`.git`, so the exclusions never see one. The walk therefore refuses any
+directory it reaches that no exclusion covers and that holds `HEAD`,
+`config`, `objects` and `refs` together (the names compared without
+regard to case; a repository's own `.git` is still excluded first, as
+below), whatever the patterns select: as the root, both doors refuse it
+(`422` from Compose; the listing's `200` says so, stopped at the root),
+and as a directory the walk reaches, Compose refuses and the listing
+shows its row as refused, reading nothing inside it. The refusal names
+the rule and not the path; the listing's row says where. A tree that
+keeps a bare repository anywhere the walk goes, as some projects keep
+test fixtures, is refused whatever the patterns; name a root beside it.
+This was possible from Phase L until Phase O.
 
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app

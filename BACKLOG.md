@@ -283,7 +283,11 @@ a23b257).
 - **First written:** docs/phases/phase-o-prompt.md, "Non-goals",
   "Deleting a clone from the page. The operator removes directories;
   backlog entry (disk hygiene) with the reason that a delete door on
-  working trees needs the same containment proofs the walk has."
+  working trees needs the same containment proofs the walk has." The
+  clause on rows ("it would remove trees, never rows, since a snapshot's
+  capture may cite the row") is the builder's, added in d997fd7, not the
+  commission's; it became a fact in 44bb6b2, when
+  `snapshot_captures.clone_id` began referencing `clones(id)`.
 
 ## Proxy support for the clone door
 
@@ -303,11 +307,14 @@ a23b257).
   top level (a directory holding `HEAD`, `config`, `objects` and `refs`
   together, whatever it is named). Today the walk refuses a root, or a
   directory it reaches, that is one itself, and never looks above the
-  root; refusing a root inside one needs a look at the root's ancestors
-  by path, and if that is ever built it gets the walk's race proofs. A
-  submodule's `modules/<name>` holds the four names itself (as git
-  2.50.1 lays it out), so the walk already refuses one wherever it
-  reaches it.
+  root. Refusing a root inside one needs a look at the root's ancestors,
+  by path (as `refuse_while_cloning` already looks at both doors, and
+  `_clone_for` at the composer) or anchored on the root's directory
+  handle; a look that only refuses opens nothing, so a race against it
+  can at worst give back today's walked state, and if it is built it
+  gets the walk's race proofs. A submodule's `modules/<name>` holds the
+  four names itself (as git 2.50.1 lays it out), so the walk already
+  refuses one wherever it reaches it.
 - **Deferred by:** Phase O, ruled by the operator on the bare-repository
   readings after the operator's pass at 9c920e5.
 - **Reason:** `config` at the top level is where git itself writes a
@@ -322,12 +329,32 @@ a23b257).
   `worktrees/<name>/config.worktree`, which `git config --worktree`
   writes under `extensions.worktreeConfig`. A root placed at any of
   those composes with the URL in the text today; the test pins that
-  open state. Whether that exposure is low enough to leave open, or the
-  by-path ancestor look now earns the walk's race proofs, is put to the
-  Phase O external review under its git-directory lens, not built here.
+  open state. On git 2.50.1 (measured): `git worktree add` copies the
+  main worktree's `config.worktree` into `worktrees/<id>/config.worktree`,
+  a second writer beside `git config --worktree`; `git init` makes no
+  `branches/`; and the legacy `remotes/` and `branches/` files are
+  still read, with the warning that they are "nominated for removal".
+  And `logs/` is a fourth place, written by git itself on ordinary
+  commands: `git pull` and `git fetch` record their arguments there, a
+  repository's path verbatim (measured on git 2.50.1 with local paths;
+  whether a URL's userinfo survives is what the open-state pin's `logs/`
+  case measures), beside the committer's identity on every ref update.
+  The list of such files has no fixed end. The Phase O external review,
+  at db08aca (CI run 36338955465), answered that this stays open for
+  v0.6.0 and that the ancestor look is next-phase work: cheaper than
+  recorded, because a look that only refuses opens nothing (its L6), and
+  needed because the reachable set has no end, since `git pull` writes
+  into `logs/` below the top (its L14). It is to be built anchored on
+  the root's directory handle, with race proofs, and with 7b7241c's pins
+  plus a `logs/` case as its pre-states.
 - **First written:** the operator's ruling on the bare-repository
   readings after the pass at 9c920e5; the reason in the operator's words
-  as given for the commit that adds this entry.
+  as given for f8bde6b ("only config at the top level carries anything
+  sensitive and a root below the top cannot reach it"); the reason
+  restated in 7b7241c on git 2.43.0's measurements (the three files
+  below the top level), with its hand-off to the external review; the
+  review's answer and the operator's ruling on it recorded in the
+  commit that adds this sentence.
 
 ## Filter drivers in the snapshot's dirty read
 

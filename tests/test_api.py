@@ -20545,8 +20545,9 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     Before: thresholds_included false, the pre-state. After: the pathless
     export reads the store and includes them, and the three ways of
     asking (nothing, the path, the digest) produce one artifact byte for
-    byte, because each resolved the dataset the manifest cites. The
-    schema stays 7: no key was added, only a value became reachable."""
+    byte, because each resolved the dataset the manifest cites. No key
+    was added, only a value became reachable, so this did not bump the
+    export schema."""
     eid, path = threshold_experiment(client, tmp_path)
     assert export_lines(client, eid)[0]["thresholds_included"] is False
 

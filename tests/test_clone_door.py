@@ -584,10 +584,13 @@ def test_a_directory_with_no_row_is_replaced_and_given_one(request, bench, stub)
 
 
 def plant_credentials(tmp_path: Path, monkeypatch) -> Path:
-    """Every credential source the scrub removes, planted in the bench's
+    """Six ways git could be given sign-in details, planted in the bench's
     own environment: a helper and an askPass in HOME's gitconfig, a
     helper and an askPass in GIT_CONFIG_*, and GIT_ASKPASS and
-    SSH_ASKPASS. Each writes to one marker file when it runs."""
+    SSH_ASKPASS. Each writes to one marker file when it runs. A .netrc,
+    and any other file under HOME, is closed by the clone's empty HOME,
+    which test_git_runs_in_exactly_the_scrubbed_environment_and_argv
+    pins; none is planted here."""
     marker = tmp_path / "credential-was-asked"
     helper = tmp_path / "helper.sh"
     helper.write_text(
@@ -625,8 +628,10 @@ def test_a_private_repository_is_refused_and_no_planted_credential_is_asked(
     gitconfig's helper and askPass; nothing is asked, no Authorization
     reaches the remote, and the refusal says a public repository was
     wanted. PRE-STATE, the control: a plain git in the same planted
-    environment asks the planted credential and sends it, so each plant
-    is live and a layer that let it through would be seen."""
+    environment loads the planted helpers, and one of them is asked and
+    its answer reaches the remote, so the plants are live and a layer
+    that let one through would be seen. The control shows one helper
+    answering, not each plant on its own."""
     repo, _ = repo_for(request, stub)
     stub.private.add(f"/{OWNER}/{repo}.git")
     marker = plant_credentials(tmp_path, monkeypatch)
