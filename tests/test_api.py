@@ -19074,6 +19074,33 @@ from test_network_posture import GIT_PREFIX  # noqa: E402
 LOCAL_GIT_PREFIX = list(GIT_PREFIX)
 
 
+def plant_git_variables(monkeypatch, where):
+    """Every variable git reads for its configuration or its repository's
+    place, set in the bench's own environment to a harmless value (a path
+    that does not exist, an empty list, a switch turned back on). A built
+    environment passes none of them; a copied or partly copied one would
+    carry each into git, where the recorder's equality sees it."""
+    absent = where / "zqabsent"
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "XDG_CONFIG_HOME",
+    ):
+        monkeypatch.setenv(name, str(absent / name))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(absent))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    monkeypatch.setenv("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
+    monkeypatch.setenv("ZQ_BENCH_ONLY", "zq")
+
+
 def recorded_processes(monkeypatch):
     """Every process started through subprocess.Popen from here on
     (subprocess.run and asyncio's subprocess both start one), recorded as
@@ -19123,11 +19150,15 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     """WINDOW: POST /snapshots over a committed repository at
     zqentry/zqrepo, zqentry the allowlist entry, with every process
     started through subprocess.Popen recorded (argv, environment, working
-    directory) and then started as asked; then with GIT_DIR,
-    GIT_WORK_TREE, GIT_CEILING_DIRECTORIES, GIT_CONFIG_COUNT (0, so no
-    key is planted) and a variable of the bench's own set in the bench's
-    environment; then with the root spelled through a link outside the
-    entry.
+    directory) and then started as asked; then with every variable git
+    reads for its configuration or its repository's place planted in the
+    bench's environment (plant_git_variables: GIT_DIR, GIT_WORK_TREE,
+    GIT_CONFIG_GLOBAL and _SYSTEM, GIT_EXEC_PATH, GIT_INDEX_FILE,
+    GIT_OBJECT_DIRECTORY, GIT_COMMON_DIR, XDG_CONFIG_HOME,
+    GIT_CONFIG_NOSYSTEM=0, an empty GIT_CONFIG_PARAMETERS,
+    GIT_CONFIG_COUNT 0, GIT_DISCOVERY_ACROSS_FILESYSTEM, and
+    GIT_CEILING_DIRECTORIES at the entry) and a variable of the bench's
+    own; then with the root spelled through a link outside the entry.
 
     Each git the door runs begins with _git_argv's configuration word for
     word (no file system monitor, no hooks, no helper asked for sign-in
@@ -19162,11 +19193,8 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     assert [cwd for _, _, cwd in ran] == 3 * [str(repo)]
 
     ran.clear()
-    monkeypatch.setenv("GIT_DIR", str(tmp_path / "zqelsewhere"))
-    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "zqelsewhere"))
+    plant_git_variables(monkeypatch, tmp_path)
     monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(entry))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
-    monkeypatch.setenv("ZQ_BENCH_ONLY", "zq")
     (repo / "b.py").write_bytes(b"B = 1\n")
     after = client.post("/snapshots", json=body)
     assert after.status_code == 201
@@ -19442,13 +19470,16 @@ def test_the_build_label_asks_git_in_the_same_posture_without_a_ceiling(
 
     Both its questions share the runner and the posture: _git_argv's
     configuration, _git_env's environment, and no ceiling, since it asks
-    about its own checkout from that checkout. PRE-STATE: it asked
-    rev-parse HEAD and then status, both in zqlabel, and the label is
-    zqlabel's commit."""
+    about its own checkout from that checkout, with every variable git
+    reads for its configuration or place planted in the bench's
+    environment (plant_git_variables) and none of them passed on.
+    PRE-STATE: it asked rev-parse HEAD and then status, both in zqlabel,
+    and the label is zqlabel's commit."""
     repo = clone(tmp_path.resolve() / "zqlabel", {"bench/main.py": b"A = 1\n"})
     git_clone(repo)
     head = head_of(repo)
     monkeypatch.setattr(main, "__file__", str(repo / "bench" / "main.py"))
+    plant_git_variables(monkeypatch, tmp_path)
     ran = recorded_processes(monkeypatch)
     assert main._app_sha() == head
     assert [argv[-2:] for argv, _, _ in ran] == [

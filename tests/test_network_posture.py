@@ -185,9 +185,14 @@ VALUE_OK = {
     "subprocess.STDOUT",
 }
 
-# os names that start a process: os is INERT because the filesystem walk
-# classifies every os call, and these are named here so this walk keys a
-# process start itself.
+# os names that start a process, keyed here so this walk sees a process
+# start itself. os and sys are INERT for classification, but their import
+# forms are held as a tracked module's are (GUARDED, below): no alias, no
+# from-import, never a bare value, no sys.modules, no dunder read, and an
+# os process start is never a value. So every os process start in bench/
+# is a call spelled os.<name>, which this walk keys. (The filesystem walk
+# classifies os calls spelled that way; the forms it cannot see are
+# refused here.)
 OS_PROCESS = {
     "os.system",
     "os.popen",
@@ -225,6 +230,10 @@ PROCESS_STARTS = {
 } | OS_PROCESS
 
 CLIENT_TYPES = {"httpx.AsyncClient", "httpx.Client"}
+
+# INERT modules held to a tracked module's import forms, so the process
+# starts and module lookups they offer cannot be reached by another name.
+GUARDED = {"os", "sys"}
 
 # The two git runners: which argument is git's arguments, which verbs,
 # and (for the clone runner) which argument holds the operands.
@@ -294,6 +303,22 @@ GIT_PREFIX = (
     "-c",
     "safe.bareRepository=explicit",
 )
+
+
+# Each runner's process start takes exactly these keywords, each by name
+# (a ** spread has no name and fails): nothing that changes the program
+# run or how its argv is read (executable, shell, preexec_fn).
+GIT_KEYWORDS = ("env", "capture_output", "text", "timeout", "cwd", "check")
+CLONE_KEYWORDS = ("env", "stdin", "stdout", "stderr", "start_new_session")
+
+# _git_env's body, word for word as ast.unparse spells it: one dict of
+# literal names, whose only read of the bench's environment is PATH, and
+# the ceiling. So no variable passes through by another route (a spread,
+# an update, another os.environ read).
+GIT_ENV_BODY = """env = {'PATH': os.environ.get('PATH', os.defpath), 'HOME': os.devnull, 'GIT_CONFIG_NOSYSTEM': '1', 'GIT_CONFIG_GLOBAL': os.devnull, 'GIT_TERMINAL_PROMPT': '0'}
+if ceiling is not None:
+    env['GIT_CEILING_DIRECTORIES'] = ceiling
+return env"""
 
 
 def _dotted(node):
@@ -396,6 +421,19 @@ def _runner_call(runner, call):
     return verb, None
 
 
+def _git_env_problem(defs):
+    fn = defs.get("_git_env")
+    if fn is None:
+        return "_git_env is missing"
+    body = fn.body
+    if body and isinstance(body[0], ast.Expr) and _string(body[0].value) is not None:
+        body = body[1:]
+    text = "\n".join(ast.unparse(statement) for statement in body)
+    if text != GIT_ENV_BODY:
+        return f"_git_env's body is {text!r}, not the pinned one"
+    return None
+
+
 def _git_argv_problem(defs):
     fn = defs.get("_git_argv")
     if fn is None:
@@ -472,6 +510,9 @@ def scan(files):
             problem = _git_argv_problem(defs)
             if problem:
                 failures.add((fname, "_git_argv", problem))
+            problem = _git_env_problem(defs)
+            if problem:
+                failures.add((fname, "_git_env", problem))
 
         def key_of(node, fname=fname, scope=scope):
             return (fname, scope.get(id(node), "<module>"))
@@ -479,6 +520,8 @@ def scan(files):
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
+                    if alias.name.split(".")[0] in GUARDED and alias.asname:
+                        failures.add((fname, f"import {alias.name} as {alias.asname}"))
                     if alias.name in TRACKED:
                         if alias.asname:
                             failures.add(
@@ -491,7 +534,9 @@ def scan(files):
                 module = node.module or ""
                 if node.level:
                     continue
-                if module in TRACKED or any(
+                if module in GUARDED:
+                    failures.add((fname, f"from {module} import ..."))
+                elif module in TRACKED or any(
                     f"{module}.{a.name}" in TRACKED for a in node.names
                 ):
                     failures.add((fname, f"from {module} import ..."))
@@ -540,7 +585,9 @@ def scan(files):
                     add(key, f"<reads> getattr {node.args[1].value}")
             if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 is_callee = isinstance(parent, ast.Call) and parent.func is node
-                if node.id in TRACKED_ROOTS and not isinstance(parent, ast.Attribute):
+                if node.id in TRACKED_ROOTS | GUARDED and not isinstance(
+                    parent, ast.Attribute
+                ):
                     hasattr_first = (
                         isinstance(parent, ast.Call)
                         and _dotted(parent.func) == "hasattr"
@@ -569,6 +616,14 @@ def scan(files):
                     and dotted not in VALUE_OK
                 ):
                     failures.add((fname, key[1], f"{dotted} used as a value"))
+                if dotted in OS_PROCESS and not is_callee:
+                    failures.add((fname, key[1], f"{dotted} used as a value"))
+                if dotted.split(".")[0] in GUARDED and (
+                    dotted == "sys.modules"
+                    or dotted.startswith("sys.modules.")
+                    or any(part.startswith("__") for part in dotted.split(".")[1:])
+                ):
+                    failures.add((fname, key[1], f"{dotted} read"))
             if not isinstance(node, ast.Call):
                 continue
             name = _dotted(node.func)
@@ -586,15 +641,17 @@ def scan(files):
                 failures.add((fname, key[1], f"{name} called outside _git"))
             if name in PROCESS_STARTS:
                 add(key, name)
+                keywords = [k.arg for k in node.keywords]
+                env = [k.value for k in node.keywords if k.arg == "env"]
                 if (fname, key[1]) == ("main.py", "_git"):
                     argv = node.args[0] if node.args else None
-                    env = [k.value for k in node.keywords if k.arg == "env"]
                     ok = (
                         name == "subprocess.run"
                         and len(node.args) == 1
                         and isinstance(argv, ast.Call)
                         and _dotted(argv.func) == "_git_argv"
-                        and len(env) == 1
+                        and sorted(map(str, keywords)) == sorted(GIT_KEYWORDS)
+                        and len(keywords) == len(GIT_KEYWORDS)
                         and isinstance(env[0], ast.Call)
                         and _dotted(env[0].func) == "_git_env"
                     )
@@ -605,6 +662,10 @@ def scan(files):
                         and isinstance(node.args[0], ast.Starred)
                         and isinstance(node.args[0].value, ast.Call)
                         and _dotted(node.args[0].value.func) == "_clone_argv"
+                        and sorted(map(str, keywords)) == sorted(CLONE_KEYWORDS)
+                        and len(keywords) == len(CLONE_KEYWORDS)
+                        and isinstance(env[0], ast.Name)
+                        and env[0].id == "env"
                     )
                 else:
                     ok = False
@@ -874,6 +935,20 @@ PLANTS = [
     ("_git with the environment copied", _planted_main("            env=_git_env(ceiling),\n", "            env=dict(os.environ),\n"), "outside a named runner's shape"),
     ("_git back to [git, *args]", _planted_main("            _git_argv(args),\n", '            ["git", *args],\n'), "outside a named runner's shape"),
     ("_git_argv called outside _git", _planted_module("def door(r):\n    _git_argv(['status'])\n"), "_git_argv called outside _git"),
+    ("from os import system", _planted_module("from os import system\n"), "from os import"),
+    ("import os as o", _planted_module("import os as o\n"), "import os as o"),
+    ("getattr(os, ...)", _planted_module("import os\ndef door():\n    getattr(os, 'system')('x')\n"), "module os used as a value"),
+    ("os.system as a value", _planted_module("import os\ndef door():\n    run = os.system\n    run('x')\n"), "os.system used as a value"),
+    ("os.system called", _planted_module("import os\ndef door():\n    os.system('x')\n"), "os.system outside a named runner's shape"),
+    ("sys.modules for subprocess", _planted_module("import sys\ndef door():\n    sys.modules['subprocess'].run(['x'])\n"), "sys.modules read"),
+    ("sys.modules for httpx", _planted_module("import sys\ndef door():\n    sys.modules['httpx'].get('https://x')\n"), "sys.modules read"),
+    ("os.__dict__", _planted_module("import os\ndef door():\n    os.__dict__['system']('x')\n"), "os.__dict__ read"),
+    ("_git gains executable=", _planted_main("            cwd=cwd or Path(__file__)", "            executable='/bin/sh',\n            cwd=cwd or Path(__file__)"), "outside a named runner's shape"),
+    ("_git gains shell=True", _planted_main("            cwd=cwd or Path(__file__)", "            shell=True,\n            cwd=cwd or Path(__file__)"), "outside a named runner's shape"),
+    ("_git gains a ** spread", _planted_main("            cwd=cwd or Path(__file__)", "            **{'executable': 'x'},\n            cwd=cwd or Path(__file__)"), "outside a named runner's shape"),
+    ("_git_clone gains executable=", _planted_main("        start_new_session=True,\n    )", "        start_new_session=True,\n        executable='/bin/sh',\n    )"), "outside a named runner's shape"),
+    ("_git_env spreads the environment", _planted_main('        "GIT_TERMINAL_PROMPT": "0",\n    }\n    if ceiling', '        "GIT_TERMINAL_PROMPT": "0",\n        **os.environ,\n    }\n    if ceiling'), "not the pinned one"),
+    ("_git_env passes one variable through", _planted_main("    if ceiling is not None:\n        env[\"GIT_CEILING_DIRECTORIES\"] = ceiling\n    return env", "    if ceiling is not None:\n        env[\"GIT_CEILING_DIRECTORIES\"] = ceiling\n    env.update({k: v for k, v in os.environ.items() if k == 'GIT_CONFIG_PARAMETERS'})\n    return env"), "not the pinned one"),
     ("a process started beside the runner", _planted_main("    proc = await asyncio.create_subprocess_exec(\n        *_clone_argv(tree, args, operands),", "    proc = await asyncio.create_subprocess_exec(\n        'git', *_clone_argv(tree, args, operands),"), "outside a named runner's shape"),
 ]  # fmt: skip
 
