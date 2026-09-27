@@ -1709,14 +1709,14 @@ allowlist bounds what a typo can gather.
 **A root inside version control is refused.** The exclusions below match
 paths under the root, so a root of `<repo>/.git` would walk the very
 directory they skip, and the pattern `config` would compose a remote URL
-with a token in it into a prompt. Both snapshot doors therefore refuse,
-with `403`, any root whose path below its `BENCH_REPO_ROOTS` entry passes
-through `.git`, `.hg` or `.svn` (compared without regard to case, since a
-disk that folds case reaches `.git` as `.GIT` too); the refusal names the
-rule and not the path. It is measured from the deepest entry holding the
-root, so an entry you name inside `.git` yourself is walked, unless the
-root is itself a git directory (below). This was possible from Phase L
-until Phase O.
+with sign-in details in it into a prompt. Both snapshot doors therefore
+refuse, with `403`, any root whose path below its `BENCH_REPO_ROOTS`
+entry passes through `.git`, `.hg` or `.svn` (compared without regard to
+case, since a disk that folds case reaches `.git` as `.GIT` too); the
+refusal names the rule and not the path. It is measured from the deepest
+entry holding the root, so an entry you name inside `.git` yourself is
+walked, unless the root is itself a git directory (below). This was
+possible from Phase L until Phase O.
 
 **A git directory is refused wherever the walk meets it.** A bare
 repository (`repo.git`), a mirror, a `--separate-git-dir` and a
