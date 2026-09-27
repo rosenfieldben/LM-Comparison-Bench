@@ -5,6 +5,7 @@ import base64
 import binascii
 import contextlib
 import errno
+import fcntl
 import hashlib
 import hmac
 import ipaddress
@@ -7644,16 +7645,43 @@ def _clone_state(root: str, entry: str) -> tuple[str | None, bool | None]:
     no escape, so a ceiling whose resolved path holds one (only through a
     link, since the allowlist itself is split on it) cannot be given,
     and the root reads as unknown rather than as a repository above it.
+
+    THE RULE IS IDENTITY, NOT THE CEILING (the Phase O review's M6, the
+    operator's ruling). git compares the ceiling with its own spelling of
+    the directory it starts in, and on macOS one directory has many
+    spellings: an entry spelled otherwise than git spells it (case,
+    Unicode normalisation, the /System/Volumes/Data firmlink) had its
+    ceiling ignored, and the head and dirty flag of a repository above
+    the entry were recorded. So git is first asked where its search
+    landed: the work tree's top when the root is in one, its git
+    directory when the root is inside that (a --separate-git-dir
+    checkout's git directory can be anywhere; its work tree is the
+    place). The head is accepted, and status asked, only when that place
+    is the entry or below it by device and inode (_same_or_under), and
+    otherwise the root reads as unknown. The ceiling, spelled as the
+    kernel spells it (_canonical_directory), is a courtesy that keeps
+    git from searching above the entry in the ordinary case; the check
+    is the rule, and holds without it.
     """
     parent = os.path.dirname(entry)
-    if os.pathsep in parent:
+    ceiling = None if parent == entry else _canonical_directory(parent)
+    if ceiling is not None and os.pathsep in ceiling:
         return (None, None)
-    ceiling = None if parent == entry else parent
-    head = (
-        as_text((_git(["rev-parse", "HEAD"], cwd=root, ceiling=ceiling) or "").strip())
-        or None
+    found = as_text(
+        _git(
+            ["rev-parse", "--is-inside-work-tree", "--absolute-git-dir", "HEAD"],
+            cwd=root,
+            ceiling=ceiling,
+        )
     )
-    if head is None:
+    answer = (found or "").rstrip("\n").split("\n")
+    if len(answer) != 3 or answer[0] not in ("true", "false"):
+        return (None, None)
+    inside, landed, head = answer
+    if inside == "true":
+        top = as_text(_git(["rev-parse", "--show-toplevel"], cwd=root, ceiling=ceiling))
+        landed = (top or "").rstrip("\n")
+    if not landed or not head or not _same_or_under(landed, entry):
         return (None, None)
     status = _git(["status", "--porcelain", "."], cwd=root, ceiling=ceiling)
     if status is None:
@@ -8525,6 +8553,37 @@ async def create_clone(body: CloneCreate, response: Response) -> dict[str, Any]:
     if made["outcome"] == "updated":
         response.status_code = 200
     return made
+
+
+def _canonical_directory(path: str) -> str:
+    """A directory's path as the kernel spells it, where the kernel will
+    say; otherwise the path as given.
+
+    FOR THE CEILING'S SPELLING (_clone_state). On macOS one directory has
+    many spellings, and git matches GIT_CEILING_DIRECTORIES against its
+    own getcwd by spelling: measured on git 2.50.1, a ceiling spelled in
+    another case, or through the /System/Volumes/Data firmlink, was
+    ignored and git read the repository above it. F_GETPATH on a
+    descriptor answers with the spelling getcwd gives. A courtesy, not
+    the rule: _clone_state's identity check holds without it. Where
+    F_GETPATH does not exist (Linux, whose resolved path is already the
+    one spelling) or the directory cannot be opened, the path is
+    returned as given.
+    """
+    get_path = getattr(fcntl, "F_GETPATH", None)
+    if get_path is None:
+        return path
+    try:
+        held = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        return path
+    try:
+        spelled = fcntl.fcntl(held, get_path, bytes(1024))
+    except OSError:
+        return path
+    finally:
+        os.close(held)
+    return os.fsdecode(spelled.rstrip(b"\0")) or path
 
 
 def _same_or_under(inner: str, outer: str) -> bool:

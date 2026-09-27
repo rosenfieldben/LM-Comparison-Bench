@@ -1795,13 +1795,18 @@ them) and none of your own git settings reach it. A snapshot's git also
 looks for the repository no higher than the root's allowlist entry
 (`GIT_CEILING_DIRECTORIES` at the entry's parent), so a root in a plain
 directory you allowed inside a larger repository you did not has no head
-rather than that repository's. What this costs: a file only your global
-excludes ignore now makes a tree read as dirty, and a checkout owned by
-another user reads as unknown rather than trusted by a `safe.directory`
-you set globally. It does not turn off a filter driver the checkout's
-own configuration names, which `git status` runs for the dirty flag: no
-command-line setting disables every driver, so closing that means not
-running `git status` at all, a design change the BACKLOG holds.
+rather than that repository's. The ceiling is a courtesy and identity is
+the rule: git is first asked where its search landed, and the head and
+dirty flag are taken only when that place is the entry or below it by
+what the directories are, not how they are spelled, since on macOS one
+directory has many spellings and git matches a ceiling by spelling
+alone. What this costs: a file only your global excludes ignore now
+makes a tree read as dirty, and a checkout owned by another user reads
+as unknown rather than trusted by a `safe.directory` you set globally.
+It does not turn off a filter driver the checkout's own configuration
+names, which `git status` runs for the dirty flag: no command-line
+setting disables every driver, so closing that means not running `git
+status` at all, a design change the BACKLOG holds.
 
 Default exclusions apply and are recorded in every snapshot's manifest:
 version control and dependency trees (`.git`, `node_modules`, `.venv`,

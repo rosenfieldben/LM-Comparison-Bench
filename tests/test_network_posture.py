@@ -113,6 +113,9 @@ INERT = {
     "fastapi.exceptions",
     "fastapi.responses",
     "fastapi.staticfiles",
+    # fcntl: F_GETPATH, a directory's spelling read from its descriptor
+    # (main._canonical_directory); it reaches no network.
+    "fcntl",
     "fnmatch",
     "hashlib",
     "hmac",
@@ -738,7 +741,8 @@ NETWORK_CALLS = {
     # environment (a snapshot's bounded by a ceiling above its entry).
     ("main.py", "_git"): Counter({"subprocess.run": 1}),
     ("main.py", "_app_sha"): Counter({"_git rev-parse": 1, "_git status": 1}),
-    ("main.py", "_clone_state"): Counter({"_git rev-parse": 1, "_git status": 1}),
+    # _clone_state asks where git's search landed before it asks status.
+    ("main.py", "_clone_state"): Counter({"_git rev-parse": 2, "_git status": 1}),
     # Spawn children running a bench function this walk also scans:
     # _pdf_pages over bytes, _regex_search over text. Neither reaches
     # anything.

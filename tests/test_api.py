@@ -17267,6 +17267,9 @@ FILESYSTEM_CALLS = {
     # runs with GIT_CEILING_DIRECTORIES at the parent of the root's
     # allowlist entry (_git_env), so it reads no repository above it.
     ("main.py", "_git"): {"resolve", "subprocess.run"},
+    # The ceiling's spelling as the kernel gives it (F_GETPATH): the
+    # parent of an allowlist entry, opened as a directory, read, closed.
+    ("main.py", "_canonical_directory"): {"os.open", "fcntl.fcntl", "os.close"},
     # The database path from BENCH_DB, set by the operator at boot and
     # never per request: created private, tightened if found loose,
     # and then opened.
@@ -17335,6 +17338,8 @@ FILESYSTEM_TOUCHERS = {
     "os.close",
     "os.fstat",
     "os.listdir",
+    # F_GETPATH: a directory's spelling read from its descriptor.
+    "fcntl.fcntl",
     "os.makedirs",
     "os.mkdir",
     "os.open",
@@ -17395,6 +17400,7 @@ FILESYSTEM_TOUCHERS = {
 # the os half of the list stays complete without anybody remembering.
 PURE_OS_CALLS = {
     "os.environ.get",
+    "os.fsdecode",
     "os.path.basename",
     "os.path.commonpath",
     "os.path.dirname",
@@ -18857,7 +18863,12 @@ def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
     control, _ = trees[(where, True)]
     body = {"root": str(control), "patterns": ["**/*"]}
     assert client.post("/snapshots", json=body).status_code == 201
-    assert ran == [(["rev-parse", "HEAD"], str(control.resolve()))]
+    assert ran == [
+        (
+            ["rev-parse", "--is-inside-work-tree", "--absolute-git-dir", "HEAD"],
+            str(control.resolve()),
+        )
+    ]
 
     ran.clear()
     top, _ = trees[(where, False)]
@@ -19126,8 +19137,9 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     still the root's; a root spelled
     through a link is asked about where it resolves, under the same
     entry's ceiling. PRE-STATE: with nothing planted, the recorder is live
-    and git answered through it: it saw rev-parse HEAD, then status, both
-    in the root, and the capture's head is the repository's commit."""
+    and git answered through it: it saw rev-parse asked where its search
+    landed and for the head, then for the work tree's top, then status,
+    all in the root, and the capture's head is the repository's commit."""
     entry = tmp_path.resolve() / "zqentry"
     repo = clone(entry / "zqrepo", {"a.py": b"A = 1\n"})
     git_clone(repo)
@@ -19141,10 +19153,10 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     before = client.post("/snapshots", json=body)
     assert before.status_code == 201
     assert before.json()["capture"]["head"] == head
-    assert len(ran) == 2
-    assert ran[0][0][-2:] == ["rev-parse", "HEAD"]
-    assert ran[1][0][-3:] == ["status", "--porcelain", "."]
-    assert [cwd for _, _, cwd in ran] == [str(repo), str(repo)]
+    assert len(ran) == 3
+    assert ran[0][0][-1:] == ["HEAD"]
+    assert ran[-1][0][-3:] == ["status", "--porcelain", "."]
+    assert [cwd for _, _, cwd in ran] == 3 * [str(repo)]
 
     ran.clear()
     monkeypatch.setenv("GIT_DIR", str(tmp_path / "zqelsewhere"))
@@ -19161,7 +19173,14 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     assert through.status_code == 201
     assert through.json()["capture"]["head"] == head
     assert [argv for argv, _, _ in ran] == 2 * [
-        [*LOCAL_GIT_PREFIX, "rev-parse", "HEAD"],
+        [
+            *LOCAL_GIT_PREFIX,
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--absolute-git-dir",
+            "HEAD",
+        ],
+        [*LOCAL_GIT_PREFIX, "rev-parse", "--show-toplevel"],
         [*LOCAL_GIT_PREFIX, "status", "--porcelain", "."],
     ]
     for _, env, cwd in ran:
@@ -19275,6 +19294,140 @@ def test_the_ceiling_is_the_deepest_entry_holding_the_root(
     assert ran == []
 
 
+def test_the_head_is_taken_only_where_git_landed_at_or_below_the_entry(
+    tmp_path, monkeypatch
+):
+    """WINDOW: _clone_state, with main._git replaced by a runner that
+    answers rev-parse as git 2.50.1 does (whether the root is in a work
+    tree, the absolute git directory, the head; then the work tree's
+    top) for a search that landed at each of five places, and records
+    every question: above the entry; at the entry; below it; in a git
+    directory the root is inside, below the entry; in a
+    --separate-git-dir checkout whose git directory is outside the
+    entry and whose work tree is below it.
+
+    The head is accepted, and status asked, only where the landing place
+    (the work tree's top, or the git directory when the root is inside
+    one) is the entry or below it by device and inode; from above, the
+    root reads as unknown and status is never asked, so nothing of the
+    repository above is recorded. This is the rule of the Phase O
+    review's M6, and it runs on every platform, where the spelling that
+    lets git pass a ceiling is macOS's alone. PRE-STATE: at the entry the
+    head is read and status asked, so the runner is live; and the five
+    places are real directories, the landing above holding the entry."""
+    above = tmp_path.resolve() / "zqabove"
+    entry = above / "zqentry"
+    root = entry / "zqsub"
+    root.mkdir(parents=True)
+    (entry / ".git").mkdir()
+    elsewhere = tmp_path.resolve() / "zqsep.git"
+    elsewhere.mkdir()
+    head = "a" * 40
+
+    def answered(inside, git_dir, top):
+        asked = []
+
+        def runner(args, *, cwd=None, ceiling=None):
+            asked.append(args[1] if len(args) > 1 else args[0])
+            if args[:1] == ["rev-parse"] and args[-1] == "HEAD":
+                if "--absolute-git-dir" not in args:
+                    return head + "\n"
+                return f"{inside}\n{git_dir}\n{head}\n"
+            if args == ["rev-parse", "--show-toplevel"]:
+                # Fatal inside a git directory, as git 2.50.1 is.
+                return f"{top}\n" if inside == "true" else None
+            if args[:1] == ["status"]:
+                return ""
+            return None
+
+        monkeypatch.setattr(main, "_git", runner)
+        state = main._clone_state(str(root), str(entry))
+        return state, asked
+
+    state, asked = answered("true", entry / ".git", entry)
+    assert state == (head, False) and asked[-1] == "--porcelain"
+    assert main._same_or_under(str(entry), str(above))
+
+    assert answered("true", above / ".git", above) == (
+        (None, None),
+        ["--is-inside-work-tree", "--show-toplevel"],
+    )
+    assert answered("true", root / ".git", root)[0] == (head, False)
+    assert answered("false", entry / ".git", entry)[0] == (head, False)
+    assert answered("false", above / ".git", above)[0] == (None, None)
+    assert answered("true", elsewhere, root)[0] == (head, False)
+
+
+@pytest.mark.parametrize("spelling", ["case", "firmlink"])
+def test_an_entry_spelled_unlike_gits_own_reads_no_head_from_above(
+    client, tmp_path, monkeypatch, spelling
+):
+    """WINDOW: POST /snapshots on a plain directory zqinner inside a
+    committed repository zqouter, with the allowlist entry at zqinner
+    spelled as macOS also spells it and git does not: zqouter in another
+    case, or the whole path through the /System/Volumes/Data firmlink;
+    the root at the entry, spelled the same way. Every git the door
+    starts is recorded; then the same with the ceiling's courtesy
+    rewrite (_canonical_directory) switched off.
+
+    No head either way. With the rewrite, the ceiling is spelled as git
+    spells it and git's search stops below it: one git, which finds no
+    repository. Without it, git ignores the ceiling and lands in zqouter,
+    above the entry, and the identity check alone refuses it: two gits
+    (where it landed, and the work tree's top), and status never asked.
+    And identity, not spelling: with the entry at zqouter itself, spelled
+    the same odd way, git lands there under its own spelling and the head
+    is read.
+    PRE-STATE: the other spelling names the same directory and is not the
+    spelling git gives; git outside the bench, with the ceiling so
+    spelled, finds zqouter from the root, so the window is live on this
+    disk; and with the entry spelled as git spells it the ceiling holds.
+    Skipped where the disk does not fold case or has no such firmlink."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter", {"a.py": b"A\n", "zqinner/b.py": b"B\n"}
+    )
+    git_clone(outer)
+    inner = outer / "zqinner"
+    if spelling == "case":
+        odd = outer.parent / "ZQOUTER" / "zqinner"
+    else:
+        odd = Path("/System/Volumes/Data" + str(inner))
+    if not odd.is_dir() or not os.path.samefile(odd, inner):
+        pytest.skip(f"this disk has no {spelling} spelling of a directory")
+    assert str(odd) != str(inner)
+    found = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=odd,
+        env={**local_git_env(), "GIT_CEILING_DIRECTORIES": str(odd.parent)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert found.returncode == 0 and os.path.samefile(found.stdout.strip(), outer)
+
+    def head_at(entry):
+        client.app.state.repo_roots = (str(entry),)
+        resp = client.post(
+            "/snapshots", json={"root": str(entry), "patterns": ["*.py"]}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["capture"]["head"]
+
+    ran = recorded_processes(monkeypatch)
+    assert head_at(inner) is None and len(ran) == 1
+    ran.clear()
+    assert head_at(odd) is None
+    assert len(ran) == 1
+    assert head_at(odd.parent) == head_of(outer)
+    ran.clear()
+    monkeypatch.setattr(main, "_canonical_directory", lambda path: path)
+    assert head_at(odd) is None
+    assert [argv[len(LOCAL_GIT_PREFIX) + 1] for argv, _, _ in ran] == [
+        "--is-inside-work-tree",
+        "--show-toplevel",
+    ]
+
+
 def test_the_build_label_asks_git_in_the_same_posture_without_a_ceiling(
     tmp_path, monkeypatch
 ):
@@ -19328,7 +19481,7 @@ def test_no_process_starts_before_the_walk_refuses_a_git_directory(
     control, _ = trees[(where, True)]
     resp = client.post("/snapshots", json={"root": str(control), "patterns": ["**/*"]})
     assert resp.status_code == 201
-    assert ran[0][0][-2:] == ["rev-parse", "HEAD"]
+    assert ran[0][0][-1:] == ["HEAD"] and "rev-parse" in ran[0][0]
     assert ran[0][2] == str(control.resolve())
 
     ran.clear()
