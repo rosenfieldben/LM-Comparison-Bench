@@ -328,3 +328,24 @@ a23b257).
 - **First written:** the operator's ruling on the bare-repository
   readings after the pass at 9c920e5; the reason in the operator's words
   as given for the commit that adds this entry.
+
+## Filter drivers in the snapshot's dirty read
+
+- **What:** a filter driver named in the configuration of a checkout the
+  operator listed, which `git status` runs on a file whose stat data
+  differs from the index when a snapshot reads the dirty flag. The local
+  git's fixed configuration (94e70ee) turns off the file system monitor,
+  hooks and the sign-in helper; it does not turn off filter drivers.
+- **Deferred by:** Phase O, ruled by the operator on 94e70ee's open
+  items.
+- **Reason:** with the ceiling at the entry's parent and
+  `safe.bareRepository=explicit`, discovery can no longer land on a
+  repository-supplied directory, so a filter driver can only come from a
+  config the operator's own git wrote into a checkout the operator
+  listed. That is the operator's machine, not repository-supplied
+  configuration, and it is outside this phase's threat model. No
+  command-line setting disables every driver, so closing it means not
+  running `git status` for the dirty read, which is a design change for
+  its own phase.
+- **First written:** the operator's ruling on 94e70ee's open items, in
+  those words; recorded in the commit that adds this entry.
