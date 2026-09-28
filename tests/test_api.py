@@ -8051,11 +8051,12 @@ def test_review_repro_a_write_landing_mid_export_reaches_neither_export(
     it wrote between the exports, so both reads were already whole.
 
     The write comes from a SECOND CONNECTION, which is the only shape
-    that can reach this window and is a real one: `python -m
-    bench.reconcile --apply` against a live bench is a second connection
-    by design, and is the reason connect() turns WAL on. A write on the
-    export's own connection would join its transaction and be visible to
-    it, which proves nothing about isolation.
+    that can reach this window and is a real one: a person at the sqlite3
+    prompt, or a script, beside a live bench. (`python -m bench.reconcile
+    --apply` was the bench's own such writer until Phase P gave it the
+    server's lock.) A write on the export's own connection would join its
+    transaction and be visible to it, which proves nothing about
+    isolation.
 
     Two exports, each with its own write injected mid-read, and neither
     sees the write injected into it. The second DOES see the first's,
@@ -17358,11 +17359,12 @@ FILESYSTEM_CALLS = {
         "os.stat",
     },
     ("store.py", "connect"): {"sqlite3.connect"},
-    # The database's one-server lock, Phase P: a file beside BENCH_DB's
+    # The database's one-writer lock, Phase P: a file beside BENCH_DB's
     # database, opened, locked without waiting, and written with this
-    # process's id; or, when another server holds it, read for that id
-    # and closed. Released by closing it at shutdown.
-    ("main.py", "_hold_bench_lock"): {
+    # process's id and what it is (a server, or reconcile --apply); or,
+    # when another process holds it, read for those and closed. Released
+    # by closing it.
+    ("store.py", "hold_lock"): {
         "fcntl.flock",
         "os.close",
         "os.ftruncate",
@@ -17370,7 +17372,7 @@ FILESYSTEM_CALLS = {
         "os.read",
         "os.write",
     },
-    ("main.py", "_release_bench_lock"): {"os.close"},
+    ("store.py", "release_lock"): {"os.close"},
     #
     # ---- The clone door. Every path is BENCH_CLONE_ROOT, from the
     # ---- operator's environment at boot, or a name under it the door
@@ -22893,9 +22895,12 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     The charge is counted before the answer is written, so a failed write
     never un-counts money that left. The pass fails with the error as its
     detail, and its close finds the call still open and ends it as
-    interrupted, saying why, so nothing reads as still in flight.
-    PRE-STATE: the counter before the Score, and the call open when the
-    write raised."""
+    interrupted, so nothing reads as still in flight. What was interrupted
+    is the record and not the request (the operator's ruling at P1's
+    checkpoint), and the detail says that: the answer arrived and its
+    write failed, with the error, which no reader can take for the boot
+    sweep's "found open at boot". PRE-STATE: the counter before the Score,
+    and the call open when the write raised."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: (
             httpx.Response(200, json=judge_answer(cost=0.00004))
@@ -22922,7 +22927,10 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     assert seen == [None]
     assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00004)
     (call,) = calls_of(client.app.state.db, eid)
-    assert (call["outcome"], call["detail"]) == ("interrupted", store.CALL_LEFT_OPEN)
+    assert (call["outcome"], call["detail"]) == (
+        "interrupted",
+        "the answer arrived; its write failed: OperationalError: database is locked",
+    )
     (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
     assert (made["outcome"], made["detail"], made["unanswered"]) == (
         "failed",
@@ -23385,17 +23393,18 @@ def test_a_second_server_on_one_database_refuses_to_start(
     bench's state is untouched and it goes on answering. PRE-STATE: the
     first bench holds the lock, and its file names this process."""
     lock = store.lock_path(str(tmp_path / "bench.db"))
-    assert Path(lock).read_text().strip() == str(os.getpid())
+    assert Path(lock).read_text().strip() == f"{os.getpid()} server"
 
     with pytest.raises(RuntimeError) as refused:
         with boot_against(monkeypatch, tmp_path / "bench.db"):
             pass
 
     assert str(refused.value) == (
-        f"{lock} is held by process {os.getpid()}, another bench server using "
-        "this database. Two servers on one database would each record the "
-        "other's running experiment and scoring pass as interrupted while "
-        "they ran, so this one will not start; stop that server first."
+        f"{lock} is held by process {os.getpid()}, a bench server, which is "
+        "using this database, and one process writes to a bench database at "
+        "a time, so this server will not start: its startup records as "
+        "interrupted whatever the database says is running, which is true "
+        "only when nothing else is writing to it. Stop that process first."
     )
     assert client.get("/models").status_code == 200
 
@@ -23438,7 +23447,7 @@ def test_the_lock_dies_with_the_process_that_held_it(monkeypatch, tmp_path):
 
     with boot_against(monkeypatch, db_path) as c:
         assert c.get("/models").status_code == 200
-        assert Path(lock).read_text().strip() == str(os.getpid())
+        assert Path(lock).read_text().strip() == f"{os.getpid()} server"
 
 
 def test_a_memory_database_takes_no_lock():
@@ -23939,3 +23948,189 @@ def test_the_pages_pass_vocabulary_and_keys_are_the_servers():
     assert set(keys) <= set(fields)
     assert set(keys) == set(fields) - {"id"}
     assert len(set(lines)) == len(lines) and all(lines)
+
+
+# ---- The rulings at P1's checkpoint.
+
+
+def test_a_server_will_not_start_while_reconcile_writes(monkeypatch, tmp_path):
+    """WINDOW: a lifespan over a database whose lock reconcile --apply
+    holds (its record, held on its own descriptor here), and a boot after
+    it lets go.
+
+    One process writes to a bench database at a time, so a server does
+    not start while reconcile --apply writes, and its sentence names
+    reconcile rather than calling it another server. PRE-STATE: the lock
+    holds reconcile's record."""
+    db_path = tmp_path / "bench.db"
+    store.connect(str(db_path)).close()
+    lock = store.lock_path(str(db_path))
+    held = store.hold_lock(str(db_path), "reconcile")
+    try:
+        assert Path(lock).read_text().split() == [str(os.getpid()), "reconcile"]
+        with pytest.raises(store.LockHeld) as refused:
+            with boot_against(monkeypatch, db_path):
+                pass
+    finally:
+        store.release_lock(held)
+    assert str(refused.value).startswith(
+        f"{lock} is held by process {os.getpid()}, python -m bench.reconcile "
+        "--apply, which is using this database, and one process writes to a "
+        "bench database at a time, so this server will not start"
+    )
+    with boot_against(monkeypatch, db_path) as c:
+        assert c.get("/models").status_code == 200
+
+
+@respx.mock
+def test_a_cut_whose_ending_cannot_be_written_says_so(monkeypatch, tmp_path):
+    """WINDOW: shutdown's cut of a judge call on the wire, with the write
+    of its stopped ending raising, and the records read after.
+
+    The call's ending could not be written, so the pass's close ends it
+    as interrupted, and its detail says what happened to the request and
+    that only its record was cut off: "it was cut off at shutdown; its
+    write failed: <error>" (the operator's ruling at P1's checkpoint),
+    not the generic sentence and not the boot sweep's. PRE-STATE: the
+    call is open when shutdown begins, and the write raises once."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    def refusing(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+        monkeypatch.setattr(store, "record_judge_call_answer", refusing)
+
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        "it was cut off at shutdown; its write failed: OperationalError: "
+        "database is locked",
+        None,
+    )
+    assert made["outcome"] == "stopped"
+
+
+@respx.mock
+def test_after_a_call_that_was_never_sent_the_stop_is_read_before_the_next(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: a pass over three judged trials with the bench's client
+    closed, a stop set the moment the first call's not_sent ending is
+    written, and the records after.
+
+    The operator's condition on a closed client at P1's checkpoint: a
+    pass that meets one must not march through every trial writing
+    not_sent once it has been asked to stop. It was already so: the loop
+    reads the stop before every trial, and again inside the slot, so the
+    next trial after a not_sent is not sent; and shutdown closes the
+    client only after its wait for the pass, so a pass never meets a
+    client shutdown closed. Here the stop lands after the first not_sent
+    and the pass ends stopped with that one call. PRE-STATE: the client
+    is closed and no stop is set when the pass starts."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS)
+    client.portal.call(client.app.state.client.aclose)
+    real = store.record_judge_call_answer
+
+    def and_stop(conn, call_id, outcome, **kwargs):
+        real(conn, call_id, outcome, **kwargs)
+        if outcome == "not_sent":
+            main._ask_scoring_to_stop("shutdown")
+
+    monkeypatch.setattr(store, "record_judge_call_answer", and_stop)
+    assert not client.app.state.scoring_run["stop"].is_set()
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    assert judged == []
+    assert [c["outcome"] for c in calls_of(client.app.state.db, eid)] == ["not_sent"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"]) == (
+        "stopped",
+        main.PASS_STOPPED_AT_SHUTDOWN,
+    )
+
+
+def test_the_semaphore_attribute_the_slot_proof_reads_is_there():
+    """WINDOW: an asyncio.Semaphore with its one slot taken and one waiter
+    queued, read the way the slot-wait proof reads it.
+
+    test_a_stop_while_a_trial_waits_for_a_slot_sends_nothing holds a
+    trial at the upstream slot by reading asyncio.Semaphore._waiters, a
+    private attribute. This is its guard (the operator's ruling at P1's
+    checkpoint): if an interpreter changes the attribute, it fails here,
+    in one line naming the Python the proof was written for, rather than
+    as a timing failure in the proof. PRE-STATE: the waiter is queued."""
+
+    async def probe():
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        waiter = asyncio.ensure_future(semaphore.acquire())
+        await asyncio.sleep(0)
+        waiters = getattr(semaphore, "_waiters", "absent")
+        shape = (type(waiters).__name__, len(waiters) if waiters != "absent" else None)
+        waiter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+        return shape
+
+    shape = asyncio.run(probe())
+    assert shape == ("deque", 1), (
+        f"asyncio.Semaphore._waiters is {shape} on Python "
+        f"{sys.version.split()[0]}; the slot-wait proof reads it as a deque of "
+        "queued waiters, as CPython 3.11 to 3.14 keep it, the versions the CI "
+        "matrix pins (.github/workflows/tests.yml)"
+    )
+
+
+@respx.mock
+def test_a_stop_is_read_between_trials_that_take_no_slot(client, tmp_path, monkeypatch):
+    """WINDOW: a pass over three deterministic trials, a stop set the
+    moment the first trial's score row is written, and the rows after.
+
+    A deterministic trial takes no upstream slot, so the check inside the
+    slot never sees it: the check between trials is the one that stops
+    it. The second and third trials are not scored and the pass ends
+    stopped. PRE-STATE: no stop is set when the pass starts."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    exact = {"id": "e1", "prompt": "p", "reference": "x", "scorer": {"kind": "exact"}}
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS, rows=(exact,))
+    real = store.add_score
+
+    def and_stop(conn, result_id, record):
+        made = real(conn, result_id, record)
+        main._ask_scoring_to_stop("request")
+        return made
+
+    monkeypatch.setattr(store, "add_score", and_stop)
+    assert not client.app.state.scoring_run["stop"].is_set()
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+
+    assert [r["scorer"] for r in scores_in(client, eid)] == ["exact"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["scored"]) == ("stopped", 1)

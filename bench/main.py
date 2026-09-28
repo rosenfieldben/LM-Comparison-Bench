@@ -2002,16 +2002,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     db_path = os.environ.get("BENCH_DB", "./bench.db")
     app.state.db = store.connect(db_path)
-    # ONE SERVER PER DATABASE, held from here to the process's end. The
-    # two sweeps below mark whatever the database says is running as
-    # interrupted, which is true only if nothing is: a second server
-    # started on a live bench's database would record the first one's
-    # running experiment and scoring pass as interrupted while they ran,
-    # and the first pass's answer would then find its record already
-    # ended. After connect, which makes the directory the lock sits in.
+    # ONE WRITER PER DATABASE, the server holding it from here to the
+    # process's end (store.hold_lock; reconcile --apply takes the same lock
+    # while it writes). The two sweeps below mark whatever the database
+    # says is running as interrupted, which is true only if nothing is: a
+    # second server started on a live bench's database would record the
+    # first one's running experiment and scoring pass as interrupted while
+    # they ran, and the first pass's answer would then find its record
+    # already ended. After connect, which makes the directory the lock
+    # sits in.
     try:
-        app.state.bench_lock = _hold_bench_lock(db_path)
-    except RuntimeError:
+        app.state.bench_lock = store.hold_lock(db_path, "server")
+    except store.LockHeld:
         app.state.db.close()
         await app.state.client.aclose()
         raise
@@ -2128,45 +2130,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exchanges these lines just finished waiting for.
     await app.state.client.aclose()
     app.state.db.close()
-    _release_bench_lock(app.state.bench_lock)
-
-
-def _hold_bench_lock(db_path: str) -> int | None:
-    """Take this database's lock, or refuse to start in a sentence.
-
-    An exclusive flock on a file beside the database, taken without
-    waiting and held until the process ends: released by
-    _release_bench_lock on the way out and by the kernel if the process
-    dies, so a crash never leaves a lock behind for the next boot to
-    trip over. The holder writes its process id into the file, which is
-    how the refusal can say what holds it. A memory database has no
-    lock, since no second process can open it.
-    """
-    lock = store.lock_path(db_path)
-    if lock is None:
-        return None
-    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        holder = os.read(fd, 32).decode("ascii", "replace").strip()
-        os.close(fd)
-        who = f"process {holder}" if holder.isdigit() else "another process"
-        raise RuntimeError(
-            f"{lock} is held by {who}, another bench server using this "
-            "database. Two servers on one database would each record the "
-            "other's running experiment and scoring pass as interrupted "
-            "while they ran, so this one will not start; stop that server "
-            "first."
-        ) from None
-    os.ftruncate(fd, 0)
-    os.write(fd, f"{os.getpid()}\n".encode())
-    return fd
-
-
-def _release_bench_lock(fd: int | None) -> None:
-    if fd is not None:
-        os.close(fd)
+    store.release_lock(app.state.bench_lock)
 
 
 def _ask_scoring_to_stop(reason: str) -> None:
@@ -6754,6 +6718,29 @@ def pass_cut_at_shutdown() -> str:
 CALL_CUT_AT_SHUTDOWN = "cut off before a reply because the bench was shutting down"
 
 
+def unwritten_ending(outcome: str, replied: bool, exc: Exception) -> str:
+    """The detail of a judge call whose ending could not be written: what
+    happened to the request, then that its record's write failed and why.
+    The request was not interrupted; its record was (the operator's ruling
+    at P1's checkpoint), and a reader must not take this for the boot
+    sweep's "found open at boot"."""
+    if outcome == "answered":
+        happened = "the answer arrived"
+    elif outcome == "failed":
+        happened = (
+            "a reply arrived and could not be used"
+            if replied
+            else "it failed after it was sent"
+        )
+    else:
+        happened = {
+            "timed_out": "it timed out",
+            "stopped": "it was cut off at shutdown",
+            "not_sent": "it was never sent",
+        }.get(outcome, f"it ended {outcome}")
+    return f"{happened}; its write failed: {type(exc).__name__}: {exc}"
+
+
 def _pass_view(row: dict[str, Any]) -> dict[str, Any]:
     """A scoring_passes row as ScoringPass, with this process's flags."""
     state = app.state.scoring_run
@@ -6828,6 +6815,9 @@ async def score_experiment(
     db = app.state.db
     state = app.state.scoring_run
     outcome, detail = "finished", None
+    # A call whose ending could not be written, by id, with what the pass
+    # knows happened to it; the close records that as the call's detail.
+    unrecorded: dict[int, str] = {}
     # EVERYTHING THE PASS DOES IS INSIDE THE TRY, its first read included.
     # The finally below is the only thing that ever frees the one scoring
     # slot, so a statement that could raise before it would leave the slot
@@ -6848,7 +6838,13 @@ async def score_experiment(
         # the only way this loop ends early.
         for task, result in _scorable_trials(db, experiment_id, state["tasks"]):
             if state["stop"].is_set() or not await score_one_result(
-                experiment_id, pass_id, task, result, judge_model, self_judged
+                experiment_id,
+                pass_id,
+                task,
+                result,
+                judge_model,
+                self_judged,
+                unrecorded,
             ):
                 outcome = "stopped"
                 detail = (
@@ -6871,7 +6867,9 @@ async def score_experiment(
         # pass then stays open in the record, and the next boot's sweep
         # closes it as interrupted.
         try:
-            store.close_scoring_pass(db, pass_id, outcome, detail)
+            store.close_scoring_pass(
+                db, pass_id, outcome, detail, unrecorded=unrecorded
+            )
         except Exception:
             logger.exception(
                 "the end of scoring pass %s could not be recorded", pass_id
@@ -6888,6 +6886,7 @@ async def score_one_result(
     result: dict[str, Any],
     judge_model: str | None,
     self_judged: bool,
+    unrecorded: dict[int, str],
 ) -> bool:
     """Score one stored result, writing exactly one row. Returns False,
     having written nothing, only when a stop arrived while the trial
@@ -6992,10 +6991,11 @@ async def score_one_result(
             store.record_judge_call_answer(
                 db, call_id, outcome, replied=False, detail=detail
             )
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "the ending of judge call %s could not be recorded", call_id
             )
+            unrecorded[call_id] = unwritten_ending(outcome, False, exc)
 
     def settle(verdict: dict[str, Any]) -> None:
         # Post-spend. The call has happened, so the charge is counted first,
@@ -7006,15 +7006,26 @@ async def score_one_result(
         except Exception:
             logger.exception("judge settlement failed")
         if call_id is not None:
-            store.record_judge_call_answer(
-                db,
-                call_id,
-                verdict["outcome"],
-                replied=verdict["replied"],
-                generation_id=verdict["generation_id"],
-                billed_cost_usd=verdict["billed_cost_usd"],
-                detail=None if verdict["outcome"] == "answered" else verdict["error"],
-            )
+            try:
+                store.record_judge_call_answer(
+                    db,
+                    call_id,
+                    verdict["outcome"],
+                    replied=verdict["replied"],
+                    generation_id=verdict["generation_id"],
+                    billed_cost_usd=verdict["billed_cost_usd"],
+                    detail=(
+                        None if verdict["outcome"] == "answered" else verdict["error"]
+                    ),
+                )
+            except Exception as exc:
+                # The pass fails on this; its close records the call as
+                # interrupted with this sentence, so the record says the
+                # request came back and only its record was cut off.
+                unrecorded[call_id] = unwritten_ending(
+                    verdict["outcome"], verdict["replied"], exc
+                )
+                raise
         store.add_score(
             db,
             result["id"],
@@ -9968,9 +9979,11 @@ def _export_lines(
     Two DIFFERENT protections, and conflating them is what hid this. The
     store's synchronous contract rules out another TASK interleaving on
     this connection, and it did that correctly the whole time. It says
-    nothing about another CONNECTION, and `python -m bench.reconcile
-    --apply` against a live bench is exactly that, by design: it is the
-    reason connect() turns WAL on.
+    nothing about another CONNECTION writing: a person at the sqlite3
+    prompt, or a script of their own. (`python -m bench.reconcile --apply`
+    was that connection by design until Phase P gave it the server's lock;
+    its dry run still reads beside a live bench, which is what WAL is
+    for.)
     """
     db = app.state.db
     # Trials first, manifest prepended after, and the order of the OUTPUT

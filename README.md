@@ -70,8 +70,9 @@ call it says is still open, which is true only when no other server is
 running them. Before the lock, a second server started by mistake, even
 one that then failed to bind its port, would have recorded the first
 one's live experiment as interrupted while it ran. `python -m
-bench.reconcile` takes no lock: it is a second connection by design,
-safe beside a live bench, and corrects nothing at startup.
+bench.reconcile --apply` writes, so it takes the same lock while it
+runs; its dry run writes nothing, takes no lock, and runs beside a live
+bench.
 
 OpenRouter attaches a `usage` object to every response reporting what it
 actually charged, and that billed figure is the number a card and the
@@ -1095,8 +1096,12 @@ leaves whatever was captured live in place (an unreported charge clears
 only a stored one no reader would trust anyway), and a row the endpoint
 cannot fill stays on the list and is asked about again next pass. An
 expired record (the endpoint 404s for old generations) is reported and
-skipped. It is safe
-to run against a live bench, since the database is in WAL mode.
+skipped. The dry run is safe
+to run against a live bench, since the database is in WAL mode, and
+takes no lock. `--apply` writes, so it takes the lock a server holds
+(see Setup): it refuses while a bench is running on the database, and a
+bench refuses to start while it writes, each in a sentence naming what
+holds the lock.
 `--limit N` walks the oldest rows first, and `--delay` sets the pause.
 
 Nothing runs it for you. Reconciliation is one upstream call per row, and
@@ -2727,8 +2732,11 @@ the time it was sent, and once more with how it ended: `answered`;
 `timed_out`; `stopped`, cut at shutdown; `failed`, sent with no usable
 reply (a transport error after sending, an error status, or a body that
 could not be read); `not_sent`, when no connection was made, so nothing
-left; or `interrupted`, when the record of its ending was cut off with
-the process. The line between `not_sent` and the rest is the
+left; or `interrupted`, when the record of its ending was cut off: by
+the process ending ("found open at boot"), or by the write that should
+have held it failing, whose detail says what happened to the request
+and that only its record's write failed ("the answer arrived; its write
+failed: " and the error). The line between `not_sent` and the rest is the
 connection: anything after one was established counts as sent, because
 money may have moved. The generation id and the charge are on the call,
 recorded once, and a judged score cites its call. No value in either
@@ -3186,8 +3194,10 @@ them in its own autocommit transaction. It reads as the guarantee and
 gives none of it. The writer this defends against is another
 **connection**, not another task: the store's synchronous contract
 already rules out an interleaving on the export's own connection, but
-`python -m bench.reconcile --apply` against a live bench is a second
-connection by design, and is the reason `connect()` turns WAL on.
+another connection can still write, a person at the sqlite3 prompt or a
+script of their own. (`python -m bench.reconcile --apply` was the
+bench's own such writer until it took the server's lock; its dry run
+still reads beside a live bench, which is what WAL is for.)
 
 **Two exports of the same experiment are byte-identical.** Line order is
 task, then repeat, then position; key order within a line is sorted.

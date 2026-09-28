@@ -16,8 +16,15 @@ it did not ask for. The rows it touches are the audit columns only
 (store.RECONCILABLE_COLUMNS), never text, errors, timings, or the local
 estimate.
 
-Safe to run against a live bench. store.connect opens the same database
-in WAL mode, which is what lets a reader and a writer coexist.
+ONE WRITER AT A TIME (Phase P). `--apply` writes, so it takes the lock
+a server holds (store.hold_lock) and will not run beside a live bench,
+nor a bench start beside it; each refuses in a sentence naming what
+holds the lock. The dry run writes nothing, takes no lock, and runs
+beside a live bench: store.connect opens the database in WAL mode, which
+is what lets a reader and the server's writes coexist. Its connect()
+adds any column a database older than this build lacks, as a server's
+boot does, which is the same idempotent work and nothing on a database a
+live server has already opened.
 """
 
 import argparse
@@ -107,7 +114,15 @@ async def reconcile(
 
 
 async def _run(args: argparse.Namespace, api_key: str) -> dict[str, int]:
-    conn = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    path = os.environ.get("BENCH_DB", "./bench.db")
+    conn = store.connect(path)
+    # After connect, which makes the directory the lock sits in, and
+    # before any lookup, so a refusal costs no upstream call.
+    try:
+        lock = store.hold_lock(path, "reconcile") if args.apply else None
+    except store.LockHeld:
+        conn.close()
+        raise
     try:
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
@@ -120,6 +135,7 @@ async def _run(args: argparse.Namespace, api_key: str) -> dict[str, int]:
             )
     finally:
         conn.close()
+        store.release_lock(lock)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -159,7 +175,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    asyncio.run(_run(args, api_key))
+    try:
+        asyncio.run(_run(args, api_key))
+    except store.LockHeld as held:
+        print(str(held), file=sys.stderr)
+        return 3
     return 0
 
 

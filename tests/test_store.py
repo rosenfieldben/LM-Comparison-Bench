@@ -4846,3 +4846,80 @@ def test_a_scoring_record_is_never_deleted_by_direct_sql(db, table):
     noun = "judge call" if table == "judge_calls" else "scoring pass"
     assert str(refused.value) == f"a {noun} record is never deleted"
     assert _row(db, table, target) == before
+
+
+def test_a_close_names_why_each_open_call_was_left_open(db):
+    """WINDOW: close_scoring_pass over a pass holding two open calls, one
+    the pass says the write of whose answer failed and one it says
+    nothing of.
+
+    What was interrupted is the record, not the request (the operator's
+    ruling at P1's checkpoint): the call the pass names gets the pass's
+    sentence, and the other the fallback; both are interrupted, and
+    neither is the boot sweep's sentence. PRE-STATE: both calls are
+    open."""
+    eid, (r1, r2) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    named = store.record_judge_call_sent(db, pass_id, r1, "j/x")
+    silent = store.record_judge_call_sent(db, pass_id, r2, "j/x")
+    assert [_row(db, "judge_calls", c)["outcome"] for c in (named, silent)] == [
+        None
+    ] * 2
+    said = "the answer arrived; its write failed: OperationalError: disk I/O error"
+
+    store.close_scoring_pass(db, pass_id, "failed", "x", unrecorded={named: said})
+
+    rows = {c: _row(db, "judge_calls", c) for c in (named, silent)}
+    assert [(r["outcome"], r["detail"]) for r in rows.values()] == [
+        ("interrupted", said),
+        ("interrupted", store.CALL_LEFT_OPEN),
+    ]
+    assert store.FOUND_OPEN_AT_BOOT not in (said, store.CALL_LEFT_OPEN)
+
+
+@pytest.mark.parametrize(
+    "record,holder,who",
+    [
+        ("4242 server", "server", "process 4242, a bench server,"),
+        (
+            "4242 reconcile",
+            "server",
+            "process 4242, python -m bench.reconcile --apply,",
+        ),
+        ("4242", "server", "process 4242,"),
+        ("4242 script", "server", "process 4242,"),
+        ("", "reconcile", "another process,"),
+        ("x y", "reconcile", "another process,"),
+    ],
+)
+def test_the_lock_refusal_names_what_the_lock_file_says(record, holder, who):
+    """WINDOW: the refusal store.hold_lock raises, for each record a lock
+    file can hold (a server's, reconcile's, a bare process id as P1's
+    builds wrote, nothing, and junk) and each kind of process refused.
+
+    The sentence names what the file says holds the lock and no more: an
+    unknown kind is left unnamed and an unreadable record is "another
+    process", never a guess. PRE-STATE:
+    none; the sentence is a pure function of the record."""
+    sentence = store._lock_refusal("/x/bench.db.lock", record.split(), holder)
+    assert sentence.startswith(f"/x/bench.db.lock is held by {who} which is using")
+    ending = (
+        "so this server will not start"
+        if holder == "server"
+        else "so reconcile --apply will not start"
+    )
+    assert ending in sentence
+
+
+def test_a_lock_is_held_only_under_a_name_it_knows(tmp_path):
+    """WINDOW: store.hold_lock asked for a holder it does not name, and for
+    a memory database.
+
+    A lock record names a known kind of process or the refusal could not
+    say what holds it; a memory database takes no lock. PRE-STATE: no
+    lock file exists."""
+    path = str(tmp_path / "bench.db")
+    with pytest.raises(ValueError, match="no lock holder is called 'script'"):
+        store.hold_lock(path, "script")
+    assert not (tmp_path / "bench.db.lock").exists()
+    assert store.hold_lock(":memory:", "server") is None

@@ -30,13 +30,14 @@ about the one process that holds this connection.
 """
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import sqlite3
 import stat
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, datetime
 from typing import Any
 
@@ -954,11 +955,88 @@ def _disk_path(path: str) -> str | None:
 
 
 def lock_path(path: str) -> str | None:
-    """Where the bench's one-server lock for this database lives: beside
+    """Where the bench's one-writer lock for this database lives: beside
     the file, or None for a memory database, which no second process can
-    open. The lifespan takes it; see _hold_bench_lock in main.py."""
+    open. See hold_lock."""
     disk = _disk_path(path)
     return None if disk is None else disk + ".lock"
+
+
+# ONE PROCESS WRITES TO A BENCH DATABASE AT A TIME (Phase P). Who can hold
+# the lock, as the refusal names them. The server holds it for its whole
+# life, because its startup records as interrupted whatever the database
+# says is running, which is true only when nothing else is writing; and
+# reconcile holds it while --apply writes, since it is the one other
+# writer the bench ships. reconcile's dry run writes nothing and takes no
+# lock.
+LOCK_HOLDERS = {
+    "server": "a bench server",
+    "reconcile": "python -m bench.reconcile --apply",
+}
+
+
+class LockHeld(RuntimeError):
+    """The database's lock is held by another process; the message is the
+    sentence the refused process prints."""
+
+
+def _lock_refusal(lock: str, held: list[str], holder: str) -> str:
+    pid = held[0] if held and held[0].isdigit() else None
+    kind = LOCK_HOLDERS.get(held[1]) if len(held) > 1 else None
+    if pid is None:
+        who = "another process,"
+    elif kind is None:
+        who = f"process {pid},"
+    else:
+        who = f"process {pid}, {kind},"
+    opening = (
+        f"{lock} is held by {who} which is using this database, and one "
+        "process writes to a bench database at a time"
+    )
+    if holder == "server":
+        return (
+            opening + ", so this server will not start: its startup records "
+            "as interrupted whatever the database says is running, which is "
+            "true only when nothing else is writing to it. Stop that process "
+            "first."
+        )
+    return (
+        opening + ", so reconcile --apply will not start. Stop that process "
+        "first, or run without --apply, which writes nothing."
+    )
+
+
+def hold_lock(path: str, holder: str) -> int | None:
+    """Take the database's lock for `holder` (a key of LOCK_HOLDERS), or
+    raise LockHeld in the sentence the refused process prints.
+
+    An exclusive flock on the file lock_path names, taken without waiting
+    and held until release_lock or the process's end: the kernel lets it
+    go however the process dies, so a crash never leaves a lock behind.
+    The holder writes its process id and what it is into the file, which
+    is how a refusal can name what holds it. A memory database has no
+    lock, since no second process can open it.
+    """
+    if holder not in LOCK_HOLDERS:
+        raise ValueError(f"no lock holder is called {holder!r}")
+    lock = lock_path(path)
+    if lock is None:
+        return None
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held = os.read(fd, 64).decode("ascii", "replace").split()
+        os.close(fd)
+        raise LockHeld(_lock_refusal(lock, held, holder)) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()} {holder}\n".encode())
+    return fd
+
+
+def release_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -1294,9 +1372,12 @@ def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
     The writer this defends against is another CONNECTION, not another
     task. Nothing inside awaits, so the store's synchronous contract
     already rules out an interleaving on this connection. What it cannot
-    rule out is `python -m bench.reconcile --apply` against a live bench,
-    which is a second connection by design and is the reason this file
-    turns WAL on at all.
+    rule out is a write from another connection: a person at the sqlite3
+    prompt, or a script of their own. (`python -m bench.reconcile
+    --apply` was the bench's own such writer until Phase P gave it the
+    server's lock, see hold_lock; its dry run still reads beside a live
+    bench, and letting a reader and the server's writes coexist is what
+    this file turns WAL on for.)
 
     rollback rather than commit, because nothing was written and rollback
     is the honest close for a read. It also cannot fail on a busy
@@ -3514,6 +3595,10 @@ UNANSWERED_CALL_OUTCOMES = ("timed_out", "stopped", "failed", "interrupted")
 
 FOUND_OPEN_AT_BOOT = "found open at boot"
 
+# A call a pass's close finds open, when the pass said nothing of why:
+# every path through a pass either writes a call's ending or records why
+# that write failed (close_scoring_pass's unrecorded), so this is the
+# fallback no path is expected to reach.
 CALL_LEFT_OPEN = "the pass ended before this call's ending was recorded"
 
 
@@ -3571,6 +3656,8 @@ def close_scoring_pass(
     pass_id: int,
     outcome: str,
     detail: str | None = None,
+    *,
+    unrecorded: Mapping[int, str] | None = None,
 ) -> None:
     """Record how a pass ended, once, with its counts.
 
@@ -3579,15 +3666,31 @@ def close_scoring_pass(
     writes a call's ending, so one left open means that write itself
     failed, and a sealed pass holding an open call would be read as a
     request still in flight long after anything was.
+
+    WHAT WAS INTERRUPTED IS THE RECORD, NOT THE REQUEST (the operator's
+    ruling at P1's checkpoint), so the detail says so: unrecorded maps a
+    call's id to the pass's own sentence for it, what arrived and that
+    its write failed, with the error ("the answer arrived; its write
+    failed: <error>"). A call the map does not name gets CALL_LEFT_OPEN.
+    Neither is the boot sweep's "found open at boot".
     """
     if outcome not in PASS_OUTCOMES or outcome == "interrupted":
         raise ValueError(f"a pass cannot close as {outcome!r}")
+    said = unrecorded or {}
     with conn:
-        conn.execute(
-            """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
-               WHERE pass_id = ? AND outcome IS NULL""",
-            (CALL_LEFT_OPEN, pass_id),
-        )
+        left = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM judge_calls WHERE pass_id = ? AND outcome IS NULL",
+                (pass_id,),
+            )
+        ]
+        for call_id in left:
+            conn.execute(
+                """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
+                   WHERE id = ? AND outcome IS NULL""",
+                (as_text(said.get(call_id, CALL_LEFT_OPEN)), call_id),
+            )
         cur = conn.execute(
             f"""UPDATE scoring_passes
                    SET ended_at = ?, outcome = ?, detail = ?, {_PASS_COUNTS}
