@@ -42,16 +42,6 @@ a23b257).
   deferred"), commit bd00ab9; the note moved to requirements-dev.in in
   commit d835c04 (Phase F.3), where it stands now.
 
-## Atomic admission for the spend ceiling
-
-- **What:** a full reservation ledger, so admitting an upstream call
-  atomically reserves its worst-case cost against the ceiling.
-- **Deferred by:** Phase F.1, and restated when Phase H.1 rewrote the
-  paragraph.
-- **Reason:** no reason was written.
-- **First written:** README, Setup ("A full reservation ledger (atomic
-  admission) is deliberately deferred"), commit 095e293.
-
 ## Pairwise judging with position swapping
 
 - **What:** a judge that compares two responses side by side, run in both
@@ -315,3 +305,43 @@ a23b257).
   its own phase.
 - **First written:** the operator's ruling on 94e70ee's open items, in
   those words; recorded in the commit that adds this entry.
+
+## The page shows money in flight
+
+- **What:** the page's spend indicator reads the ceiling's figures from
+  `GET /models` (`spend`: `accumulated_usd`, and `reserved_usd` and
+  `limit_usd` under a ceiling) and shows what calls not yet settled have
+  claimed beside what has been recorded.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the page fetches `/models` once, at boot, and its spend
+  figure is its own sum of the composer's runs, so showing a live,
+  process-wide figure needs a refresh the page does not make, and that
+  page work was not sized in P2, which built the figures it would read.
+- **First written:** the commission's P2 ("so the page's spend indicator
+  can show money in flight"); deferred in the commit that adds this
+  entry.
+
+## A rerun on a card refused for room
+
+- **What:** the rerun control on a streamed card refused because the
+  claims of calls not yet settled left no room for its worst case, a
+  refusal that can clear as those calls settle.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the card cannot tell that refusal from one because the
+  ceiling was reached, since both arrive as `spend_refused`, and a rerun
+  of the second can only be refused again; telling them apart is a field
+  on the frame and a page change P2 did not make.
+- **First written:** the comment on the rerun control in
+  `static/stream.js`, in the commit that adds this entry.
+
+## The catalog a scoring pass priced against
+
+- **What:** a scoring pass records the digest of the catalog whose rates
+  settled its unbilled judge calls, so that the estimate each such call
+  counted can be derived again from the record alone.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the operator's ruling at P1's checkpoint asked for the
+  counts, which the judge call's record keeps (2e8bd02); the rates are
+  the booted process's catalog, which the pass does not name, and naming
+  it is a third column and a seal change the ruling did not ask for.
+- **First written:** the commit that adds this entry.

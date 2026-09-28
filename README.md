@@ -209,40 +209,86 @@ Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message
 naming the variable, rather than silently producing a ceiling that never
-trips. Once accumulated
-spend reaches the ceiling, `/compare` and `/compare/stream`
-refuse new runs with HTTP 402 and a message naming both figures,
-checked at entry before any upstream call so a refusal costs nothing;
-runs already in flight are never interrupted. Admission is rechecked
-once more the instant a run acquires its upstream slot, so a run admitted
-below the ceiling is still refused (before it spends) if a concurrent run
-crossed the ceiling in the meantime; that refusal costs nothing and lands
-in history as an honest cut-short row.
+trips.
 
-Each result is settled against the ceiling inside the slot it holds,
-before that slot is released. That ordering is what makes the bound below
-true rather than merely intended: a freed slot implies a recorded
-settlement, so once spend crosses the ceiling every later acquisition sees
-it and refuses. Worst-case overshoot is therefore bounded by the runs
-already executing at the moment the ceiling trips, at most
-`MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
-cost, whatever the size of the lineup and however many comparisons are in
-flight at once.
+Every paid upstream call reserves against the ceiling before it queues
+for an upstream slot: its completion budget at the catalog's completion
+rate, plus its system and user messages at the catalog's prompt rate,
+weighed by the bench's characters-over-four estimate. That is the
+arithmetic `projected_cost` quotes for the same call, and like the
+projection it is not a bound on the bill: the messages are an estimate,
+and a route dearer than the listed rate can charge more. A pinned trial
+reserves, as its experiment's projection is priced, at its endpoint's
+own rates, and a native-mode call, whose documents go as images,
+reserves the completion half alone. A model whose listing also names a
+charge the two rates cannot count still reserves at the two rates,
+because that is what its settlement will count; the projection refuses
+such a model, and the ceiling following it would admit most of the
+catalog reserving nothing. A call is refused when recorded spend, what
+calls not yet settled have reserved, and what it would reserve would
+together pass the limit; a call that fits exactly is admitted. The check
+and the reservation are one step with nothing awaited between them, on
+the process's one event loop, so two calls racing for the last dollar
+cannot both be admitted. When a call ends, its reservation is replaced
+by what it counts: its billed cost when the platform reported one, and
+the catalog estimate otherwise. A call that ends any other way (refused
+in its slot, cancelled while queued, cut off mid-answer, timed out, or
+raising before its request went out) gives its reservation back and
+counts nothing. A call the catalog cannot price reserves nothing, and is
+refused only once recorded spend has reached the limit, or recorded
+spend and the reservations already pass it.
 
-That last clause is the correction. Settlement used to run after a batch's
-whole fan-out completed, so a fast member released its slot having recorded
-nothing and a model from a concurrent batch rechecked against a counter
-that had not moved. The bound held for one comparison at a time and failed
-for several: eight concurrent five-model batches against a ceiling worth
-half a result put 23 calls upstream where this paragraph promised five. The
-documentation and the mechanism now state the same fact, and a regression
-test measures it. A full reservation ledger (atomic admission) is
-deliberately deferred. The ceiling counts each result
+A refusal costs nothing and names the figures: recorded spend, the
+limit, what calls not yet settled have reserved, and what the refused
+call reserves. Once recorded spend reaches the limit, `/compare` and
+`/compare/stream` refuse at entry with HTTP 402, before any other check,
+as they always have; short of that, they refuse with a 402 when none of
+the request's calls would fit. A batch some of whose members fit runs
+those, and the others are refusal rows in its history; a stream
+admitted at entry reserves when it starts, and if another call took the
+room in between it ends with a refusal frame. A trial or a judge call
+refused only for room that calls not yet settled have reserved waits
+for it, holding nothing, since that room comes back as they settle; a
+Stop, or shutdown, ends the wait with nothing sent. A trial whose own
+reservation no longer fits beside recorded spend is a refusal row and by
+default halts its experiment; a judge call in that case is that
+result's scoring failure, and the pass goes on. Judge calls reserve and
+settle like trials: at the judge's own completion budget
+(`JUDGE_MAX_TOKENS`) and its catalog rates, settled on the billed cost
+or, when the reply carried none, on the catalog estimate over the counts
+the reply reported, which the judge call's record keeps. Admission is
+also rechecked the instant a call holds its upstream slot, so a call
+admitted below the ceiling is still refused, before it spends, if
+recorded spend reached the limit while it waited. Runs already in
+flight are never interrupted.
+
+For what the catalog can price, the bound is exact to the reservations:
+recorded spend passes the limit only by what calls counted beyond what
+they reserved. That is a billed charge above the catalog's rates,
+messages the characters-over-four estimate weighed low, the images a
+native-mode call sent, and a call the catalog cannot price, which
+reserves nothing and is held only by the older bound, the recheck in its
+slot. A call cut short counts nothing, since nothing records what it
+cost, so it is outside recorded spend altogether. With a ceiling worth
+half of one result, one call goes upstream, the one whose reservation
+fit, however many comparisons, trials and judge calls are in flight:
+eight concurrent five-model batches against such a ceiling send one
+call, and a regression test measures it. That one call's charge is by
+construction above its reservation (a result worth twice the limit,
+against a reservation within it), so recorded spend ends at twice the
+limit, the first overshoot named above. Settling each result inside its
+slot, which the reservations replaced, bounded the overshoot by the
+calls already executing when the ceiling tripped, at most
+`MAX_CONCURRENT_UPSTREAM` of them, and against these batches it sent
+five; settling after a batch's whole fan-out, before that, sent 23
+against the batches the test used then. The ceiling counts each result
 once, using its billed cost when the platform reported one and the
 catalog estimate otherwise: it is advisory, and advising from real
 charges beats advising from catalog arithmetic. Results that are
 unpriced by both routes do not count against it. It resets when the
-process restarts.
+process restarts, and so do its reservations. `GET /models` reports the
+figures under `spend`: `accumulated_usd` always, and `reserved_usd` and
+`limit_usd` when a ceiling is set.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
@@ -953,7 +999,9 @@ had been surfacing as mixed ReadError and stall failures mid-lineup.
 At most five paid upstream calls run at once across everything in
 flight (`MAX_CONCURRENT_UPSTREAM` in `bench/main.py`); extra models
 queue quietly for a slot, and the wait never counts toward a model's
-measured latency or ttft. Every result also records OpenRouter's
+measured latency or ttft. Under a spend ceiling a model can also be
+refused before it queues, when what the calls ahead of it have reserved
+leaves no room for what it would reserve (see Setup). Every result also records OpenRouter's
 generation id and the provider's finish_reason, which make historical
 runs auditable against OpenRouter's generation API (actual provider,
 authoritative cost) and let budget analysis see
@@ -2538,9 +2586,10 @@ the experiment is still created and can be started with the right one.
 One experiment runs at a time. They share the five upstream slots and the
 spend ceiling, so two at once would interleave through the same queue and
 each would measure the other's waiting; a second start gets a 409 saying
-exactly that. Every trial goes through the same semaphore, the same
-post-admission ceiling recheck, the same settlement inside the held slot
-and the same entry checks as any browser run. The runner creates its
+exactly that. Every trial goes through the same reservation against the
+spend ceiling before it queues, the same semaphore, the same recheck in its
+slot, the same settlement when its call ends and the same entry checks
+as any browser run. The runner creates its
 groups through the normal path with no bypass, so experiment-to-group
 consistency is the law the manifest check already enforces rather than a
 promise the runner makes about itself.
@@ -2823,9 +2872,14 @@ An unparseable verdict has no score and so no pass either, rather than
 counting as a failure. Collapsing the two would put the judge's own
 malfunctions into the model's pass rate.
 
-**Judge calls are spend.** The billed cost is captured in band, recorded
-on the judge call, and added to the same accumulator the ceiling reads, so
-a scoring pass cannot run free against the limit. Judges get their own
+**Judge calls are spend.** Each reserves against the ceiling before it
+queues, at `JUDGE_MAX_TOKENS` and the judge's catalog rates, and settles
+like a trial's call: on the billed cost, captured in band and recorded
+on the judge call, or, when the reply carried none, on the catalog
+estimate over the counts the reply reported, which the call's record
+keeps beside the charge. Either goes to the same accumulator the ceiling
+reads, so a scoring pass cannot run free against the limit. Judges get
+their own
 modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
 experiment's tier, because a verdict is a number and a sentence and a
 judge inheriting an extended budget would buy headroom no rubric needs,
@@ -2837,7 +2891,9 @@ or "judge spend: none billed"), never added into a model's cost: that
 is the bench's instrument cost, not what any model under test was paid.
 A judge reply that came back with no price is named as unpriced rather
 than counted as nothing spent (", K unpriced", or "none billed, K calls
-unpriced"). After the spend the line names each request the figure
+unpriced"). The line reports what was billed; the ceiling, which has to
+count what it can, counts such a reply at the catalog estimate over its
+counts, so the two figures differ by exactly those replies. After the spend the line names each request the figure
 cannot speak for, as what it is: calls that went out and got nothing
 back ("; M judge calls went out and got no answer"), calls that got a
 reply that could not be used ("; M judge calls got replies that could
@@ -3459,7 +3515,9 @@ Other endpoints:
 - `GET /models` returns the boot-time catalog snapshot as
   `{"models": [...], "fetched": bool}`; `fetched` false means the
   boot fetch failed, which is how the picker tells an offline boot
-  from an empty catalog
+  from an empty catalog. Beside it, `spend` carries the ceiling's live
+  figures for this process: `accumulated_usd` always, and `reserved_usd`
+  and `limit_usd` when a ceiling is set
 - `GET /prompts` lists saved prompts
 - `POST /prompts` with `{"name": ..., "text": ...}` saves one; 409 on
   a duplicate name
@@ -3656,10 +3714,12 @@ picked up without restarts, and verify by eyeball after UI changes:
   shows a visible focus ring.
 - Theme: flip the OS color scheme; the page follows without a
   reload, and both themes keep the state labels readable.
-- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set to a
-  tiny value, run until the session estimate crosses it, then run
-  again: the columns error with the ceiling message spelled out in
-  words, and no new upstream call is made.
+- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set below
+  what one run reserves (a 16384 completion budget at $2 per million is
+  about $0.033): the column errors with the ceiling message naming its
+  figures, and no upstream call is made. Set it between one and two
+  runs' reservations and run two models at once: one runs and the
+  other's column reads the refusal.
 - Queued state: run six or more models at once; the sixth card reads
   "queued" while five are in flight, then flips to "thinking" when a
   slot frees, and its counter restarts so its ttft excludes the wait.

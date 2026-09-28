@@ -84,6 +84,10 @@ def boot_bench(stub_url, tmp_path_factory, extra_env=None):
     """
     port = free_port()
     env = os.environ.copy()
+    # A spend limit set in the shell running the suite is not the test's:
+    # under it a call is refused once what it would reserve does not fit,
+    # from the first call on. A test that wants one passes it in extra_env.
+    env.pop("BENCH_SPEND_LIMIT_USD", None)
     db_path = tmp_path_factory.mktemp("browser-db") / "bench.db"
     env.update(
         {

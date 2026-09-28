@@ -3224,6 +3224,15 @@ def parse_verdict(text: str | None) -> dict[str, Any]:
     return {"score": score, "reason": as_text(data.get("reason"))}
 
 
+def judge_would_send(response_text: str | None) -> bool:
+    """Whether judge_response makes a request for this text: not for none,
+    and not for whitespace, which is not an answer. Written once, because
+    the spend ceiling's ledger asks it too, and a call it claimed for that
+    was never made, or one it did not claim for that was, would be the
+    ledger disagreeing with the wire."""
+    return response_text is not None and bool(response_text.strip())
+
+
 async def judge_response(
     client: httpx.AsyncClient,
     judge_model: str,
@@ -3264,7 +3273,7 @@ async def judge_response(
     # money spent on a verdict nobody can use. parse_verdict at the
     # other end of this file already applies the same test to what comes
     # back; this applies it to what goes out.
-    if response_text is None or not response_text.strip():
+    if response_text is None or not judge_would_send(response_text):
         # A trial that produced no text. Scored without asking anyone,
         # because there is nothing to grade and paying a judge to say so
         # would be spending money to learn what the row already says.
