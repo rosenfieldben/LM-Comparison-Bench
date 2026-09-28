@@ -770,8 +770,8 @@ def test_a_late_score_answer_does_not_open_its_report_under_another(
         (lambda route: settle(page, route), r"^a scoring pass was started at "),
         (
             lambda route: route.abort(),
-            rf"^no answer came back at {UTC} \(.+\); GET /experiments/{b}/scoring "
-            r"says whether a pass started$",
+            rf"^no answer came back at {UTC} \(.+\); the line beside Score says "
+            r"whether a pass started$",
         ),
     ):
         row_for(page, b).click()
@@ -1093,11 +1093,12 @@ def test_a_lost_score_answer_reads_the_report_again(
     """WINDOW: GET /experiments/{id}/report requests while Score's POST is
     held, and after that POST is lost with the row still selected.
 
-    The page cannot know whether a pass started, so it says where that is
-    recorded (GET /experiments/{id}/scoring, since Phase P; until then it
-    said no door says), in full and stamped, reads the report again for
-    whatever it now holds, and leaves Score live. Pre-state: no read of
-    the report while the POST is out."""
+    The page cannot know whether a pass started, so it says where to look
+    (the line beside Score, which the list read after the answer fills
+    from the server's record; until Phase P it said no door says), in
+    full and stamped, reads the report again for whatever it now holds,
+    and leaves Score live. Pre-state: no read of the report while the
+    POST is out."""
     collectors.extend([ABORTED_RESOURCE, "bench: scoring an experiment failed"])
     eid, _ = finished(page, bench_url, PLAIN)
     bench(["stub/fast"])
@@ -1118,8 +1119,8 @@ def test_a_lost_score_answer_reads_the_report_again(
 
     expect(page.get_by_test_id("experiment-action-msg")).to_have_text(
         re.compile(
-            rf"^no answer came back at {UTC} \(.+\); GET /experiments/{eid}/scoring "
-            r"says whether a pass started$"
+            rf"^no answer came back at {UTC} \(.+\); the line beside Score says "
+            r"whether a pass started$"
         )
     )
     expect(page.get_by_test_id("experiment-score")).to_be_enabled()
@@ -1335,10 +1336,11 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
 
     The select is named by its caption alone and described by the note
     that says the list is unfiltered and unchecked; Score is described
-    by why it waits and by what a press pays for, which says that every
-    press sends every judge trial with response text to the judge again.
-    The nudge is a polite live region, and stays rendered while empty so
-    a reason that arrives later is announced; the notes are not live.
+    by why it waits, by the latest scoring pass (Phase P), and by what a
+    press pays for, which says that every press sends every judge trial
+    with response text to the judge again. The nudge is a polite live
+    region, and stays rendered while empty so a reason that arrives later
+    is announced; the notes and the pass line are not live.
     With no judge tasks the select, its note and the paying sentence are
     gone."""
     a, _ = finished(page, bench_url, JUDGED)
@@ -1352,7 +1354,8 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
     expect(judge).to_have_attribute("aria-describedby", "experiment-judge-note")
     score = page.get_by_test_id("experiment-score")
     expect(score).to_have_attribute(
-        "aria-describedby", "experiment-score-nudge experiment-score-note"
+        "aria-describedby",
+        "experiment-score-nudge experiment-score-pass experiment-score-note",
     )
     expect(page.get_by_test_id("experiment-judge-note")).to_contain_text("unfiltered")
     expect(page.get_by_test_id("experiment-score-note")).to_have_text(
@@ -1370,7 +1373,11 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
     assert nudge.evaluate("el => getComputedStyle(el).display") != "none"
     page.get_by_test_id("experiment-judge").select_option("")
     expect(nudge).to_have_text(WAITS_FOR_JUDGE)
-    for testid in ("experiment-judge-note", "experiment-score-note"):
+    for testid in (
+        "experiment-judge-note",
+        "experiment-score-note",
+        "experiment-score-pass",
+    ):
         assert page.get_by_test_id(testid).get_attribute("role") is None
 
     row_for(page, p).click()

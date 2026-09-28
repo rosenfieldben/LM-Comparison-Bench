@@ -59,6 +59,9 @@ const {
   scoreNudge,
   scoreLabel,
   judgeSpendLine,
+  PASS_OUTCOMES,
+  utcStamp,
+  scoringPassLine,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -1506,4 +1509,105 @@ test("judgeSpendLine names unanswered, in-flight and older rows each in its own 
       "when this report was read; 1 judge row written before the bench " +
       "recorded its requests cannot say whether its request went out",
   );
+});
+
+// Phase P: the Score row's line about the latest scoring pass.
+const A_PASS = {
+  id: 4,
+  judge_model: "judge/one",
+  started_at: "2026-09-28T07:10:00.123456+00:00",
+  ended_at: "2026-09-28T07:12:30.654321+00:00",
+  outcome: "finished",
+  detail: null,
+  scored: 3,
+  failed: 0,
+  unanswered: 0,
+  running: false,
+  stopping: false,
+};
+
+test("utcStamp is the recorded UTC, saying so", () => {
+  assert.equal(utcStamp(A_PASS.started_at), "2026-09-28 07:10:00 UTC");
+});
+
+test("scoringPassLine makes no claim without a recorded pass", () => {
+  assert.equal(scoringPassLine(null), "");
+  assert.equal(scoringPassLine(undefined), "");
+});
+
+test("scoringPassLine says how the last pass ended, with its counts", () => {
+  assert.equal(
+    scoringPassLine(A_PASS),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored",
+  );
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      judge_model: null,
+      scored: 1,
+      failed: 2,
+      unanswered: 1,
+    }),
+    "scored 2026-09-28 07:12:30 UTC, with no judge: 1 trial scored, " +
+      "2 with no score, 1 judge call got no usable answer",
+  );
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      outcome: "failed",
+      detail: "OperationalError: disk I/O error",
+    }),
+    "the last scoring pass failed 2026-09-28 07:12:30 UTC: " +
+      "OperationalError: disk I/O error",
+  );
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      outcome: "stopped",
+      detail: "stopped on request, between trials",
+      scored: 1,
+      unanswered: 2,
+    }),
+    "the last scoring pass stopped (2026-09-28 07:12:30 UTC, judged by " +
+      "judge/one): stopped on request, between trials; 1 trial scored, " +
+      "2 judge calls got no usable answer",
+  );
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      outcome: "interrupted",
+      ended_at: null,
+      detail: "found open at boot",
+      scored: 0,
+      unanswered: 1,
+    }),
+    "the last scoring pass was interrupted (started 2026-09-28 07:10:00 " +
+      "UTC, judged by judge/one): found open at boot; 0 trials scored, " +
+      "1 judge call got no usable answer",
+  );
+});
+
+test("scoringPassLine says a pass runs, is stopping, or has no recorded end", () => {
+  const open = { ...A_PASS, ended_at: null, outcome: null, scored: null };
+  assert.equal(
+    scoringPassLine({ ...open, running: true }),
+    "a scoring pass judged by judge/one, started 2026-09-28 07:10:00 UTC, " +
+      "is running",
+  );
+  assert.equal(
+    scoringPassLine({ ...open, running: true, stopping: true }),
+    "a scoring pass judged by judge/one, started 2026-09-28 07:10:00 UTC, " +
+      "is stopping after the trial being scored",
+  );
+  assert.equal(
+    scoringPassLine(open),
+    "a scoring pass started 2026-09-28 07:10:00 UTC has no recorded end",
+  );
+});
+
+test("PASS_OUTCOMES names every ending the line words", () => {
+  for (const outcome of PASS_OUTCOMES) {
+    const line = scoringPassLine({ ...A_PASS, outcome, detail: "why" });
+    assert.ok(line.length > 0, outcome);
+  }
 });

@@ -1336,6 +1336,10 @@
 #experiment-score-note:empty { display: none; }
 #experiment-title { font-size: 12px; color: var(--text); }
 #experiment-status { font-size: 11px; color: var(--text-sec); }
+/* The latest scoring pass, as recorded: a statement like the status
+   line, so it reads at the status line's weight rather than a note's. */
+#experiment-score-pass { font-size: 11px; color: var(--text-sec); }
+#experiment-score-pass:empty { display: none; }
 #experiment-create-msg,
 #experiment-action-msg { font-size: 11px; color: var(--text-sec); }
 #experiment-create-msg:empty,

@@ -979,6 +979,92 @@
     return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
   }
 
+  // How a scoring pass can end, mirrored from bench.store.PASS_OUTCOMES;
+  // a test executes this file and holds the two equal.
+  const PASS_OUTCOMES = ["finished", "stopped", "failed", "interrupted"];
+
+  // A recorded time in the list's form: the UTC the server wrote, and
+  // saying so, whatever zone the page is in.
+  function utcStamp(iso) {
+    return iso.slice(0, 19).replace("T", " ") + " UTC";
+  }
+
+  // The Score row's line about the latest scoring pass, from the list's
+  // experiment.scoring, or "" when there is none. A null makes no claim:
+  // it says no pass has been recorded, and scores written before passes
+  // were recorded may still exist, so "not scored" would be a guess.
+  // running and stopping are the server's; outcome, detail and the
+  // counts are the record's, and the detail is the server's sentence,
+  // shown as it is.
+  function scoringPassLine(pass) {
+    if (!pass) return "";
+    const counted = (n, one, many) => n + (n === 1 ? one : many);
+    const by =
+      pass.judge_model === null
+        ? "with no judge"
+        : "judged by " + pass.judge_model;
+    if (pass.running) {
+      return (
+        "a scoring pass " +
+        by +
+        ", started " +
+        utcStamp(pass.started_at) +
+        (pass.stopping
+          ? ", is stopping after the trial being scored"
+          : ", is running")
+      );
+    }
+    if (pass.outcome === null) {
+      return (
+        "a scoring pass started " +
+        utcStamp(pass.started_at) +
+        " has no recorded end"
+      );
+    }
+    const counts =
+      counted(pass.scored, " trial scored", " trials scored") +
+      (pass.failed > 0
+        ? ", " + counted(pass.failed, " with no score", " with no score")
+        : "") +
+      (pass.unanswered > 0
+        ? ", " +
+          counted(
+            pass.unanswered,
+            " judge call got no usable answer",
+            " judge calls got no usable answer",
+          )
+        : "");
+    if (pass.outcome === "finished") {
+      return "scored " + utcStamp(pass.ended_at) + ", " + by + ": " + counts;
+    }
+    if (pass.outcome === "failed") {
+      return (
+        "the last scoring pass failed " +
+        utcStamp(pass.ended_at) +
+        ": " +
+        pass.detail
+      );
+    }
+    // stopped and interrupted: the record's own sentence says who ended
+    // it. An interrupted pass has no end time, so its start is given.
+    const when =
+      pass.ended_at === null
+        ? "started " + utcStamp(pass.started_at)
+        : utcStamp(pass.ended_at);
+    return (
+      "the last scoring pass " +
+      (pass.outcome === "stopped" ? "stopped" : "was interrupted") +
+      " (" +
+      when +
+      ", " +
+      by +
+      "): " +
+      pass.detail +
+      "; " +
+      counts
+    );
+  }
+
   // The report's judge spend as one line, from report.judge_cost. What
   // the judging cost first, then each request it cannot speak for, each
   // count in words true of every request counted: an unpriced call came
@@ -1311,6 +1397,9 @@
     scoreNudge,
     scoreLabel,
     judgeSpendLine,
+    PASS_OUTCOMES,
+    utcStamp,
+    scoringPassLine,
     SNAPSHOT_LIMITS,
     PATTERN_TRIMMED,
     patternFor,

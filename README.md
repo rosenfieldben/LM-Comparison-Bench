@@ -2712,7 +2712,15 @@ latest as `scoring`: its judge, when it started and ended, how it ended
 how many trials it scored, how many it wrote with no score, and how many
 of its judge calls went out and got no usable answer. A pass that fails
 frees the bench's one scoring slot and stays in the list, and a re-score
-is a new pass beside it.
+is a new pass beside it. The panel says the latest in a line beside
+Score, in the record's words and stamped in UTC ("scored 2026-09-28
+07:12:30 UTC, judged by ...: 3 trials scored", or "the last scoring pass
+failed ...: " and the error). The line is read with the list, which the
+panel reads again after every answer to Score and to Stop scoring;
+there is no progress stream for a pass, so to see a running pass end,
+read the list again (reopen the panel). An experiment with no recorded
+pass shows no line: its scores, if any, were written before passes were
+recorded, and the panel does not guess.
 
 **Every judge request is recorded before it goes out**, as a row with
 the time it was sent, and once more with how it ended: `answered`;
@@ -2732,7 +2740,11 @@ second connection or the sqlite3 prompt included.
 running pass to stop between trials, as the runner's Stop does: a judge
 call already in flight finishes and is recorded, a trial still waiting
 for a slot sends nothing, and the pass ends `stopped`. It is refused 409
-when no pass for that experiment is running. Shutting the bench down asks
+when no pass for that experiment is running. In the panel it is **Stop
+scoring**, beside Score, present only while the list says that
+experiment's pass runs; pressed, it says the pass was asked to stop and
+greys, and the line beside Score says the pass is stopping until the
+list says it has ended. Shutting the bench down asks
 the same way and waits up to `SCORING_SHUTDOWN_SECONDS`, 30 seconds, then
 cuts the pass, and the call on the wire is recorded `stopped`: still
 recorded as sent, with no answer, which is the point. The bound sits

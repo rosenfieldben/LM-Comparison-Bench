@@ -23908,3 +23908,34 @@ def test_a_score_citing_a_call_the_report_was_not_given_is_refused():
     assert report._judge_cost({}, [call])["unpriced_calls"] == 1
     with pytest.raises(ValueError, match="score row 7 cites judge call 3"):
         report._judge_cost({1: [row]}, [])
+
+
+def test_the_pages_pass_vocabulary_and_keys_are_the_servers():
+    """WINDOW: static/lib.js executed in node: PASS_OUTCOMES, and every key
+    scoringPassLine reads from a pass over each ending and each running
+    state, against store.PASS_OUTCOMES and ScoringPass's fields.
+
+    The Score row's line is the list's pass in words, so it reads only
+    what the server sends and words every ending the store can record; a
+    key the line read and the server dropped would vanish from the line
+    without a word. PRE-STATE: every branch of the line is taken."""
+    fields = sorted(main.ScoringPass.model_fields)
+    got = run_lib(
+        "const l = require(process.argv[1]);"
+        "const seen = new Set();"
+        "const base = {id: 1, judge_model: 'j/x', started_at: '2026-09-28T07:10:00',"
+        " ended_at: '2026-09-28T07:11:00', outcome: 'finished', detail: 'd',"
+        " scored: 1, failed: 1, unanswered: 1, running: false, stopping: false};"
+        "const read = (p) => l.scoringPassLine(new Proxy(p,"
+        " {get(t, k) { seen.add(k); return t[k]; }}));"
+        "const lines = l.PASS_OUTCOMES.map((o) => read({...base, outcome: o}));"
+        "lines.push(read({...base, outcome: null, running: true}));"
+        "lines.push(read({...base, outcome: null, running: true, stopping: true}));"
+        "lines.push(read({...base, outcome: null}));"
+        "process.stdout.write(JSON.stringify([l.PASS_OUTCOMES, [...seen].sort(), lines]));",
+    )
+    outcomes, keys, lines = got
+    assert tuple(outcomes) == store.PASS_OUTCOMES
+    assert set(keys) <= set(fields)
+    assert set(keys) == set(fields) - {"id"}
+    assert len(set(lines)) == len(lines) and all(lines)
