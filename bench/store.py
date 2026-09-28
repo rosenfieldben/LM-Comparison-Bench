@@ -990,10 +990,21 @@ def _disk_path(path: str) -> str | None:
 
 def lock_path(path: str) -> str | None:
     """Where the bench's one-writer lock for this database lives: beside
-    the file, or None for a memory database, which no second process can
-    open. See hold_lock."""
+    the file the path RESOLVES to, or None for a memory database, which
+    no second process can open. See hold_lock.
+
+    Resolved, so every name that reaches the database through a symbolic
+    link finds the one lock (the external review's M2: a lock named by
+    the path as given let a second server reach a live database through
+    a link, take a lock of its own, and sweep the first one's running
+    pass and call). A hard link is a second name the resolution cannot
+    join to the first; it is on BACKLOG. The lock is not taken on the
+    database file itself, which would join every name: on macOS an
+    exclusive flock on a file conflicts with sqlite's own locks on it
+    (measured: a process could not flock its own database in WAL mode
+    while its connection held it)."""
     disk = _disk_path(path)
-    return None if disk is None else disk + ".lock"
+    return None if disk is None else os.path.realpath(disk) + ".lock"
 
 
 # ONE PROCESS WRITES TO A BENCH DATABASE AT A TIME (Phase P). Who can hold
@@ -1001,8 +1012,9 @@ def lock_path(path: str) -> str | None:
 # life, because its startup records as interrupted whatever the database
 # says is running, which is true only when nothing else is writing; and
 # reconcile holds it while --apply writes, since it is the one other
-# writer the bench ships. reconcile's dry run writes nothing and takes no
-# lock.
+# writer the bench ships. reconcile's dry run writes no row and takes no
+# lock (on a database an older bench wrote, its connect still migrates
+# it: BACKLOG).
 LOCK_HOLDERS = {
     "server": "a bench server",
     "reconcile": "python -m bench.reconcile --apply",
@@ -1056,6 +1068,11 @@ def hold_lock(path: str, holder: str) -> int | None:
     lock = lock_path(path)
     if lock is None:
         return None
+    # Taken before connect (which used to make this directory), so it makes
+    # the directory itself, private as connect makes it.
+    directory = os.path.dirname(lock)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
     fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)

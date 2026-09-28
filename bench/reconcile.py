@@ -117,13 +117,15 @@ async def reconcile(
 
 async def _run(args: argparse.Namespace, api_key: str) -> dict[str, int]:
     path = os.environ.get("BENCH_DB", "./bench.db")
-    conn = store.connect(path)
-    # After connect, which makes the directory the lock sits in, and
-    # before any lookup, so a refusal costs no upstream call.
+    # Before connect, as the server takes it (the external review's M3):
+    # --apply refused beside a live server has written nothing, not even
+    # the migration connect would lay on an older database; and before any
+    # lookup, so a refusal costs no upstream call.
+    lock = store.hold_lock(path, "reconcile") if args.apply else None
     try:
-        lock = store.hold_lock(path, "reconcile") if args.apply else None
-    except store.LockHeld:
-        conn.close()
+        conn = store.connect(path)
+    except BaseException:
+        store.release_lock(lock)
         raise
     try:
         async with httpx.AsyncClient(

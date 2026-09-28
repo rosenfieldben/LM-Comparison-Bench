@@ -618,14 +618,23 @@ def test_apply_takes_the_lock_a_server_holds_and_the_dry_run_does_not(
     sentence naming what holds the lock, before any lookup and without
     running the pass; with the lock free it holds the lock for its run,
     under its own name, and lets it go after, so a server can start. The
-    dry run writes nothing and takes no lock, so it runs beside the
-    server. PRE-STATE: the lock is held, by a server's record, when the
-    first two runs start."""
+    dry run writes no row and takes no lock, so it runs beside the
+    server. Refused, --apply has written nothing (the external review's
+    M3): it takes the lock before it connects, so a database an older
+    bench wrote, holding a pass and a call a live server has open, keeps
+    its bytes. PRE-STATE: the lock is held, by a server's record, when the
+    first two runs start; before this series --apply connected, and so
+    migrated the older database, before it asked for the lock."""
+    import hashlib
+    from pathlib import Path
+
+    from test_api import seed_a_live_older_database
+
     from bench import reconcile as reconcile_module
     from bench.reconcile import main
 
     path = str(tmp_path / "bench.db")
-    store.connect(path).close()
+    before = seed_a_live_older_database(path)
     lock = store.lock_path(path)
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("BENCH_DB", path)
@@ -649,6 +658,7 @@ def test_apply_takes_the_lock_a_server_holds_and_the_dry_run_does_not(
         assert main(["--apply"]) == 3
         refused = capsys.readouterr().err.strip()
         assert seen == []
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == before
         assert main([]) == 0
     finally:
         store.release_lock(server)

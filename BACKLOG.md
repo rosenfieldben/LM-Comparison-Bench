@@ -332,3 +332,34 @@ a23b257).
 - **Reason:** a dry run that writes is not a dry run.
 - **First written:** 9571082's body, as a reading noted and not
   changed; the operator ruled it an entry here instead.
+
+## A database reached through a hard link
+
+- **What:** the one-writer lock (`store.lock_path`) is named by the file
+  `BENCH_DB` resolves to, so a symbolic link to a live database finds
+  its lock (the external review's M2, fixed); a hard link is a second
+  name for the same file that resolving a path cannot join, so a server
+  started through one takes a lock of its own. Locking the database file
+  itself, which every name shares, was measured and not used: on macOS
+  an exclusive flock on a file conflicts with sqlite's own locks on it,
+  and a process could not take one on its own database in WAL mode.
+- **Deferred by:** Phase P, ruled by the operator on the external review
+  at 1d91670.
+- **Reason:** in the operator's words, "the lock keys by identity after
+  this series and a hard link is the operator's own act on their own
+  file."
+- **First written:** the commit that adds this entry.
+
+## The clone root has no lock of its own
+
+- **What:** the one-writer lock is the database's. Two servers on two
+  databases that share a `BENCH_CLONE_ROOT` each remove the other's
+  clone work directories at boot (`_sweep_clone_work`), and each can
+  clone into the root while the other does.
+- **Deferred by:** Phase P, found by the external review at 1d91670
+  beside M3; the entry ratified by the operator.
+- **Reason:** the database's lock is what M3 needed: a server refused it
+  now removes nothing. A lock of the clone root's own is a second lock,
+  with its own refusal and its own proofs, for a sharing no single
+  database's lock can see.
+- **First written:** the commit that adds this entry.

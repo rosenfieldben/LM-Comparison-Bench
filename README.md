@@ -58,12 +58,19 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
-**One server per database.** At startup the server takes an exclusive
-lock on a file beside the database (`bench.db.lock` for `./bench.db`)
-and holds it until it exits; the kernel lets it go if the process dies,
-however it dies, so a crash never leaves a lock for the next start to
-trip over. A second server started on the same database refuses to
-boot, naming the lock and the process that holds it. The lock is what
+**One server per database.** At startup, once it has read its
+environment and before it writes anything, the server takes an
+exclusive lock on a file beside the database (`bench.db.lock` for
+`./bench.db`; beside the file a symbolic link resolves to, so every
+link to one database finds one lock) and holds it until it exits; the
+kernel lets it go if the process dies, however it dies, so a crash never
+leaves a lock for the next start to trip over. A second server started
+on the same database refuses to boot, naming the lock and the process
+that holds it, and has written nothing: it has not connected to the
+database, so an older one is not migrated, and it has not removed the
+clone door's leftover work directories, which a live clone may still be
+writing. (A hard link is a second name the lock cannot see: BACKLOG.)
+The lock is what
 makes startup's two corrections safe: the bench records as interrupted
 an experiment the database says is running and a scoring pass or judge
 call it says is still open, which is true only when no other server is

@@ -17436,16 +17436,22 @@ FILESYSTEM_CALLS = {
         "os.stat",
     },
     ("store.py", "connect"): {"sqlite3.connect"},
-    # The database's one-writer lock, Phase P: a file beside BENCH_DB's
-    # database, opened, locked without waiting, and written with this
-    # process's id and what it is (a server, or reconcile --apply); or,
-    # when another process holds it, read for those and closed. Released
-    # by closing it.
+    # The database's one-writer lock, Phase P: a file beside the file
+    # BENCH_DB resolves to (lock_path resolves it, so a link to a live
+    # database finds its lock: the external review's M2), its directory
+    # made private if it is not there yet (the lock is taken before
+    # connect, which used to make it: M3), opened, locked without waiting,
+    # and written with this process's id and what it is (a server, or
+    # reconcile --apply); or, when another process holds it, read for
+    # those and closed. Released by closing it.
+    ("store.py", "lock_path"): {"os.path.realpath"},
     ("store.py", "hold_lock"): {
         "fcntl.flock",
         "os.close",
         "os.ftruncate",
+        "os.makedirs",
         "os.open",
+        "os.path.isdir",
         "os.read",
         "os.write",
     },
@@ -23683,24 +23689,89 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
     assert (cost["unanswered_calls"], cost["in_flight_calls"]) == (1, 0)
 
 
-def test_a_second_server_on_one_database_refuses_to_start(
-    client, monkeypatch, tmp_path
-):
-    """WINDOW: a second lifespan over the database a running bench holds,
-    and the first bench after.
+def seed_a_live_older_database(path):
+    """A database as b6c088c left it (tests/fixtures/pre_p2_schema.sql,
+    before P2's two usage-count columns), holding what a live bench has
+    open: an experiment running, a scoring pass open, and a judge call
+    sent with no ending. Returns its bytes' digest."""
+    fixture = (Path(__file__).parent / "fixtures" / "pre_p2_schema.sql").read_text()
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('live', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'running',
+                   1, 1, 0, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute("INSERT INTO runs (prompt_text, created_at) VALUES ('p', 'x')")
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.commit()
+    legacy.close()
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
-    One server per database, because both sweeps assume nothing is
-    running: the second refuses to boot in a sentence naming the lock and
-    the process that holds it, and never reaches a sweep, so the first
-    bench's state is untouched and it goes on answering. PRE-STATE: the
-    first bench holds the lock, and its file names this process."""
-    lock = store.lock_path(str(tmp_path / "bench.db"))
-    assert Path(lock).read_text().strip() == f"{os.getpid()} server"
 
-    with pytest.raises(RuntimeError) as refused:
-        with boot_against(monkeypatch, tmp_path / "bench.db"):
-            pass
+def live_triple(path):
+    """The seeded pass's ending, its call's ending, and the experiment's
+    status, read without connect (which would migrate)."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return (
+            conn.execute("SELECT outcome FROM scoring_passes").fetchone()[0],
+            conn.execute("SELECT outcome FROM judge_calls").fetchone()[0],
+            conn.execute("SELECT status FROM experiments").fetchone()[0],
+        )
+    finally:
+        conn.close()
 
+
+def test_a_second_server_on_one_database_refuses_to_start(monkeypatch, tmp_path):
+    """WINDOW: a lifespan over a database whose lock a live server holds
+    (its record, held on its own descriptor here): a database an older
+    bench wrote, with an experiment running, a scoring pass open and a
+    judge call sent, and a clone root holding a clone's work directory.
+
+    One server per database, and a refused server writes nothing (the
+    external review's M3, M4): it refuses in a sentence naming the lock
+    and what holds it before it connects, so the older database is not
+    migrated, its bytes are as they were, the live rows are not swept,
+    and the clone's work directory is not removed. PRE-STATE: the three
+    rows are open and running, and before this series the refused boot
+    connected (migrating the database) and swept the clone root first;
+    the old proof booted a first bench in this process, whose app.state
+    the second boot then overwrote, and could not see either."""
+    db_path = tmp_path / "bench.db"
+    before = seed_a_live_older_database(db_path)
+    assert live_triple(db_path) == (None, None, "running")
+    clones = tmp_path / "clones"
+    work = clones / ".0123456789abcdef.partial"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(clones.resolve()))
+    monkeypatch.setenv("BENCH_CLONE_ROOT", str(clones.resolve()))
+    lock = store.lock_path(str(db_path))
+    held = store.hold_lock(str(db_path), "server")
+    try:
+        with pytest.raises(store.LockHeld) as refused:
+            with boot_against(monkeypatch, db_path):
+                pass
+    finally:
+        store.release_lock(held)
     assert str(refused.value) == (
         f"{lock} is held by process {os.getpid()}, a bench server, which is "
         "using this database, and one process writes to a bench database at "
@@ -23708,7 +23779,77 @@ def test_a_second_server_on_one_database_refuses_to_start(
         "interrupted whatever the database says is running, which is true "
         "only when nothing else is writing to it. Stop that process first."
     )
-    assert client.get("/models").status_code == 200
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+    assert live_triple(db_path) == (None, None, "running")
+    assert work.is_dir()
+
+
+def test_a_link_to_a_live_database_finds_its_lock(monkeypatch, tmp_path):
+    """WINDOW: a lifespan whose BENCH_DB is a symbolic link to a database
+    whose lock a live server holds under the database's own name, with a
+    pass open and a call sent in it.
+
+    The lock is named by the file the path resolves to (the external
+    review's M2), so the link finds the one lock and the boot is refused,
+    and the live rows are not swept. PRE-STATE: the rows are open; before
+    this series the lock was named by the path as given, so the boot
+    through the link took a lock of its own and swept the live pass and
+    call as interrupted."""
+    real = tmp_path / "real" / "bench.db"
+    real.parent.mkdir()
+    seed_a_live_older_database(real)
+    link = tmp_path / "link.db"
+    link.symlink_to(real)
+    assert store.lock_path(str(link)) == store.lock_path(str(real))
+    held = store.hold_lock(str(real), "server")
+    try:
+        with pytest.raises(store.LockHeld):
+            with boot_against(monkeypatch, link):
+                pass
+    finally:
+        store.release_lock(held)
+    assert live_triple(real) == (None, None, "running")
+
+
+def test_a_boot_that_fails_after_its_lock_gives_the_lock_back(monkeypatch, tmp_path):
+    """WINDOW: a lifespan whose connect raises, after the lock is taken,
+    and the lock asked for after.
+
+    The lock comes first now (the external review's M3), so a boot that
+    fails later must give it back, or the next start would be refused by
+    a process that never started. PRE-STATE: connect raises inside the
+    boot, and the lock is free before it."""
+    db_path = tmp_path / "bench.db"
+    store.release_lock(store.hold_lock(str(db_path), "server"))
+
+    def refuse(path):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(main.store, "connect", refuse)
+    with pytest.raises(sqlite3.OperationalError):
+        with boot_against(monkeypatch, db_path):
+            pass
+    store.release_lock(store.hold_lock(str(db_path), "server"))
+
+
+def test_a_database_in_a_directory_not_yet_made_boots_under_its_lock(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a lifespan whose BENCH_DB names a file two directories that
+    do not exist yet below tmp, and the lock and directory after.
+
+    The lock is taken before connect, which used to make the directory,
+    so the lock makes it, private as connect makes it, and the boot goes
+    on. PRE-STATE: neither directory exists."""
+    db_path = tmp_path / "made" / "here" / "bench.db"
+    assert not db_path.parent.parent.exists()
+    with boot_against(monkeypatch, db_path) as c:
+        assert c.get("/models").status_code == 200
+        assert Path(store.lock_path(str(db_path))).read_text().split() == [
+            str(os.getpid()),
+            "server",
+        ]
+    assert stat_module.S_IMODE(db_path.parent.stat().st_mode) == 0o700
 
 
 def test_the_lock_dies_with_the_process_that_held_it(monkeypatch, tmp_path):

@@ -2009,8 +2009,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.clone_cainfo = _parse_clone_cainfo(os.environ.get("BENCH_CLONE_CAINFO"))
     app.state.clone_run = {"paths": None}
-    if app.state.clone_root is not None:
-        _sweep_clone_work(app.state.clone_root)
     app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
     app.state.provider_prefs = provider_preferences(app.state.data_policy)
     if app.state.data_policy != "standard":
@@ -2019,6 +2017,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.data_policy,
             app.state.provider_prefs,
         )
+    db_path = os.environ.get("BENCH_DB", "./bench.db")
+    # ONE WRITER PER DATABASE, the server holding it from here to the
+    # process's end (store.hold_lock; reconcile --apply takes the same lock
+    # while it writes). Taken once the environment is read and BEFORE
+    # ANYTHING WRITES (the external review's M3): the clone door's
+    # leftovers are removed and the database is connected, and so
+    # migrated, only by the process that holds it. A server refused here
+    # has written nothing, not a column onto an older database and not a
+    # live clone's work directory away. What holds it is named in the
+    # refusal. The sweeps inside mark whatever the database says is
+    # running as interrupted, which is true only if nothing is: a second
+    # server on a live bench's database would record the first one's
+    # running experiment and scoring pass as interrupted while they ran.
+    # Released however boot or shutdown ends.
+    app.state.bench_lock = store.hold_lock(db_path, "server")
+    try:
+        async with _serve(app, db_path, api_key):
+            yield
+    finally:
+        store.release_lock(app.state.bench_lock)
+
+
+@asynccontextmanager
+async def _serve(app: FastAPI, db_path: str, api_key: str) -> AsyncIterator[None]:
+    """Everything the server does while it holds its database's lock: the
+    clone door's leftovers, the client, the database and its sweeps, and
+    on the way out the same in reverse. See lifespan for why the lock
+    comes first."""
+    if app.state.clone_root is not None:
+        _sweep_clone_work(app.state.clone_root)
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -2037,23 +2065,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
     )
-    db_path = os.environ.get("BENCH_DB", "./bench.db")
     app.state.db = store.connect(db_path)
-    # ONE WRITER PER DATABASE, the server holding it from here to the
-    # process's end (store.hold_lock; reconcile --apply takes the same lock
-    # while it writes). The two sweeps below mark whatever the database
-    # says is running as interrupted, which is true only if nothing is: a
-    # second server started on a live bench's database would record the
-    # first one's running experiment and scoring pass as interrupted while
-    # they ran, and the first pass's answer would then find its record
-    # already ended. After connect, which makes the directory the lock
-    # sits in.
-    try:
-        app.state.bench_lock = store.hold_lock(db_path, "server")
-    except store.LockHeld:
-        app.state.db.close()
-        await app.state.client.aclose()
-        raise
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
@@ -2167,7 +2179,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # exchanges these lines just finished waiting for.
     await app.state.client.aclose()
     app.state.db.close()
-    store.release_lock(app.state.bench_lock)
 
 
 def _ask_scoring_to_stop(reason: str) -> None:
