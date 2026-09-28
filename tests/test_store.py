@@ -1,6 +1,7 @@
 import hashlib
 import json
 import pathlib
+import re
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -4115,3 +4116,733 @@ def test_a_listed_row_names_the_latest_capture_of_its_own_reading(db):
     assert rows["cc" * 32]["latest_capture_id"] == own["id"]
     assert rows["dd" * 32]["latest_capture_id"] is None
     assert store.latest_capture(db, "cc" * 32, "snapshot", "1")["id"] == own["id"]
+
+
+# Phase P, the scoring pass as a record.
+
+PRE_P_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_p_schema.sql"
+).read_text()
+
+# The sha256 of SCHEMA's body at ed00174, as `git show ed00174:bench/store.py`
+# gave it when the fixture was extracted; see PRE_O_SCHEMA_DIGEST.
+PRE_P_SCHEMA_DIGEST = "7bba797726706e45793c31079a95be392d67431f3b6295dce6a590fdc90e46f5"
+
+# The sha256 of store.SEALS, the triggers that seal the two scoring
+# tables. A seal is schema, and CREATE TRIGGER IF NOT EXISTS keeps an old
+# body on every database that already booted, so a changed body under
+# the old name would change nothing in the field. An edit here without a
+# new trigger name (and the old one dropped) is the mistake this catches.
+SEALS_DIGEST = "79495beb0cf76b702e4105c16737b67d11a31da7ae59d94735fe26d1adb88d37"
+
+SEAL_NAMES = [
+    "scoring_passes_sealed_v1",
+    "scoring_passes_never_replaced_v1",
+    "scoring_passes_never_deleted_v1",
+    "judge_calls_sealed_v1",
+    "judge_calls_never_replaced_v1",
+    "judge_calls_never_deleted_v1",
+]
+
+
+def _pre_p_database(path):
+    """A database as ed00174 left it: its SCHEMA, plus the two columns
+    only its MIGRATIONS added, holding an experiment, one result and the
+    score rows a pre-P pass wrote: a judge row with a figure, one with a
+    generation id and no figure, one with neither, a ceiling refusal, a
+    deterministic row and a human rating."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(PRE_P_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('old', '2026-09-01T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO runs (prompt_text, created_at)
+           VALUES ('p', '2026-09-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    rows = [
+        ("judge", 0.5, "fine", "j/x", "gen-1", 0.002),
+        ("judge", 1.0, "good", "j/x", "gen-2", None),
+        ("judge", None, "judge request failed: ReadTimeout", "j/x", None, None),
+        (
+            "judge",
+            None,
+            "the per-boot spend ceiling was reached before this result "
+            "could be judged; re-run the scoring pass to fill it in",
+            "j/x",
+            None,
+            None,
+        ),
+        ("exact_match", 1.0, "matched", None, None, None),
+        ("human", 0.75, "rated 4 of 5", None, None, None),
+    ]
+    for scorer, score, detail, judge, gen, billed in rows:
+        legacy.execute(
+            """INSERT INTO scores (result_id, scorer, score, detail, judge_model,
+                   judge_generation_id, judge_billed_cost_usd, created_at)
+               VALUES (1, ?, ?, ?, ?, ?, ?, '2026-09-01T00:00:00+00:00')""",
+            (scorer, score, detail, judge, gen, billed),
+        )
+    legacy.commit()
+    return legacy
+
+
+def _seals_as_stored(conn):
+    """The seal triggers' SQL as the database holds it, reassembled in
+    SEALS's own order, for comparison with the text in store.py. sqlite
+    stores each CREATE TRIGGER without its IF NOT EXISTS."""
+    sql = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    return "\n" + "".join(sql[n] + ";\n" for n in SEAL_NAMES if n in sql)
+
+
+def _scoring_setup(conn, results=2):
+    """An experiment and `results` stored results to score, as ids."""
+    eid = store.create_experiment(conn, experiment_spec())
+    run_id = store.save_run(conn, "p", [make_result() for _ in range(results)])
+    rids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM results WHERE run_id = ? ORDER BY id", (run_id,)
+        )
+    ]
+    return eid, rids
+
+
+def _row(conn, table, row_id):
+    return dict(
+        conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    )
+
+
+def test_the_pre_p_fixture_is_the_schema_as_it_stood_before_phase_p():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's text at
+    ed00174, pinned by digest. The right era and not merely an old one:
+    it has Phase O's clones table and neither of Phase P's, and its
+    scores table has no citation column."""
+    body = "".join(
+        line
+        for line in PRE_P_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == PRE_P_SCHEMA_DIGEST
+    assert "CREATE TABLE IF NOT EXISTS clones" in PRE_P_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS scoring_passes" not in PRE_P_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS judge_calls" not in PRE_P_SCHEMA
+    assert "judge_call_id" not in PRE_P_SCHEMA
+    assert "git show ed00174:bench/store.py" in PRE_P_SCHEMA
+
+
+def test_the_seals_are_the_pinned_text():
+    """WINDOW: store.SEALS as imported, and a fresh database's
+    sqlite_master.
+
+    The seals are schema, pinned by digest the way an era's SCHEMA is,
+    and a new database holds exactly that text: six triggers, in
+    SEALS's order, and nothing of theirs missing. PRE-STATE: SEALS names
+    exactly the six triggers this file lists."""
+    assert re.findall(r"CREATE TRIGGER IF NOT EXISTS (\w+)", store.SEALS) == SEAL_NAMES
+    assert hashlib.sha256(store.SEALS.encode()).hexdigest() == SEALS_DIGEST
+    conn = store.connect(":memory:")
+    try:
+        assert _seals_as_stored(conn) == store.SEALS.replace(
+            "CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER "
+        )
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    "table,seal", [("scoring_passes", SEAL_NAMES[0]), ("judge_calls", SEAL_NAMES[3])]
+)
+def test_every_column_of_a_sealed_table_is_named_in_its_seal(db, table, seal):
+    """WINDOW: the table's columns as the database reports them, and its
+    update seal's text.
+
+    The seal's first refusal lists its columns one by one, so a column
+    added to either table later would be one no seal protects. This
+    holds the two lists equal. PRE-STATE: the table has columns beyond
+    its id, so the loop has something to check."""
+    columns = [r[1] for r in db.execute(f"PRAGMA table_info({table})")]
+    assert len(columns) > 5
+    (sql,) = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?", (seal,)
+    ).fetchone()
+    named = set(
+        re.findall(r"OLD\.(\w+) IS NOT NULL\s+AND\s+NEW\.\1 IS NOT OLD\.\1", sql)
+    )
+    assert "NEW.id IS NOT OLD.id" in sql
+    assert named == set(columns) - {"id"}
+
+
+def test_migration_onto_pre_p_database_adds_the_records_and_touches_nothing(
+    tmp_path,
+):
+    """WINDOW: a database whose schema is ed00174's, holding an
+    experiment, a result and six score rows, through connect(), and a
+    second boot.
+
+    Two whole new tables with no MIGRATIONS entry, two columns on scores
+    by MIGRATIONS, and the seals. Every old score row survives field for
+    field with both new columns NULL, which on a judge row is the fact
+    that it was written before Phase P; the new tables start empty; the
+    database holds the seals' pinned text; a pass and a call recorded on
+    the migrated database read back; and a second connect disturbs
+    nothing. PRE-STATE: neither table, neither column and no seal."""
+    db_path = tmp_path / "pre_p.db"
+    legacy = _pre_p_database(db_path)
+    tables = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert not {"scoring_passes", "judge_calls"} & tables
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(scores)")]
+    assert not {"judge_call_id", "pass_id"} & set(columns)
+    assert _seals_as_stored(legacy) == "\n"
+    legacy.row_factory = sqlite3.Row
+    before = {
+        t: [dict(r) for r in legacy.execute(f"SELECT * FROM {t}")]
+        for t in ("experiments", "results", "scores")
+    }
+    assert len(before["scores"]) == 6
+    legacy.close()
+    after = {
+        **before,
+        "scores": [
+            {**r, "judge_call_id": None, "pass_id": None} for r in before["scores"]
+        ],
+    }
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    conn = store.connect(str(db_path))
+    try:
+        assert store.scoring_passes_for(conn, 1) == []
+        assert store.judge_calls_for(conn, 1) == []
+        for table, rows in after.items():
+            assert [dict(r) for r in conn.execute(f"SELECT * FROM {table}")] == rows
+        assert _seals_as_stored(conn) == sealed
+        pass_id = store.open_scoring_pass(conn, 1, "j/y")
+        call_id = store.record_judge_call_sent(conn, pass_id, 1, "j/y")
+        store.record_judge_call_answer(
+            conn, call_id, "answered", replied=True, generation_id="gen-3"
+        )
+        store.add_score(
+            conn,
+            1,
+            {
+                "scorer": "judge",
+                "score": 0.25,
+                "judge_model": "j/y",
+                "judge_call_id": call_id,
+                "pass_id": pass_id,
+            },
+        )
+        store.close_scoring_pass(conn, pass_id, "finished")
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        for table, rows in after.items():
+            got = [
+                dict(r) for r in again.execute(f"SELECT * FROM {table} WHERE id <= 6")
+            ]
+            assert got == rows
+        assert _seals_as_stored(again) == sealed
+        (made,) = store.scoring_passes_for(again, 1)
+        assert (made["outcome"], made["scored"], made["failed"]) == ("finished", 1, 0)
+        assert [c["generation_id"] for c in store.judge_calls_for(again, 1)] == [
+            "gen-3"
+        ]
+    finally:
+        again.close()
+
+
+def test_a_score_cites_its_pass_and_its_call_and_a_call_has_one_score(db):
+    """WINDOW: add_score with and without the two citations, read back by
+    scores_for_results, and a second row citing the same call.
+
+    The citations travel on the score record; any number of rows cite no
+    call; two rows citing one call are refused by the unique index, since
+    that would be one answer recorded twice. PRE-STATE: foreign keys are
+    on, and the call exists."""
+    assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    cited = {"scorer": "judge", "judge_call_id": call_id, "pass_id": pass_id}
+    store.add_score(db, rid, cited)
+    store.add_score(db, rid, {"scorer": "judge", "pass_id": pass_id})
+    store.add_score(db, rid, {"scorer": "human", "score": 0.5})
+    rows = store.scores_for_results(db, [rid])[rid]
+    assert [(r["judge_call_id"], r["pass_id"]) for r in rows] == [
+        (call_id, pass_id),
+        (None, pass_id),
+        (None, None),
+    ]
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        store.add_score(db, rid, cited)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store.add_score(db, rid, {"scorer": "judge", "judge_call_id": call_id + 99})
+
+
+def test_the_answer_fills_only_what_the_sent_write_left_null(db):
+    """WINDOW: record_judge_call_sent, then record_judge_call_answer, then
+    a second answer for the same call.
+
+    The two-write rule. The sent write holds the identity and the time;
+    the answer fills the five columns the first left NULL and changes
+    none it wrote. A second answer is the store's own refusal, not the
+    seal's, because the writer only ever touches an open row, and the
+    row is as the first answer left it. PRE-STATE: after the sent write
+    every answer column is NULL and the experiment came from the pass."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    sent = _row(db, "judge_calls", call_id)
+    answer_columns = [
+        "answered_at",
+        "generation_id",
+        "billed_cost_usd",
+        "outcome",
+        "detail",
+    ]
+    assert all(sent[c] is None for c in answer_columns)
+    assert (sent["experiment_id"], sent["pass_id"], sent["result_id"]) == (
+        eid,
+        pass_id,
+        rid,
+    )
+    assert sent["sent_at"]
+
+    store.record_judge_call_answer(
+        db,
+        call_id,
+        "answered",
+        replied=True,
+        generation_id="gen-1",
+        billed_cost_usd=0.003,
+        detail="ok",
+    )
+    answered = _row(db, "judge_calls", call_id)
+    assert {c: answered[c] for c in sent if c not in answer_columns} == {
+        c: sent[c] for c in sent if c not in answer_columns
+    }
+    assert answered["answered_at"] >= sent["sent_at"]
+    assert (
+        answered["generation_id"],
+        answered["billed_cost_usd"],
+        answered["outcome"],
+        answered["detail"],
+    ) == ("gen-1", 0.003, "answered", "ok")
+
+    with pytest.raises(store.AlreadyRecorded, match=f"judge call {call_id} has"):
+        store.record_judge_call_answer(db, call_id, "failed", replied=True, detail="x")
+    assert _row(db, "judge_calls", call_id) == answered
+
+
+@pytest.mark.parametrize(
+    "outcome,replied",
+    [
+        ("answered", True),
+        ("failed", True),
+        ("failed", False),
+        ("timed_out", False),
+        ("stopped", False),
+        ("not_sent", False),
+    ],
+)
+def test_the_answer_time_is_stamped_only_when_a_reply_arrived(db, outcome, replied):
+    """WINDOW: one call's answer write, for each ending a pass can write.
+
+    answered_at is present exactly when a reply arrived, whatever the
+    reply said: an error status is a reply, a timeout is not. PRE-STATE:
+    the call is open."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+    store.record_judge_call_answer(db, call_id, outcome, replied=replied)
+    row = _row(db, "judge_calls", call_id)
+    assert row["outcome"] == outcome
+    assert (row["answered_at"] is not None) is replied
+
+
+@pytest.mark.parametrize(
+    "outcome,replied,refusal",
+    [
+        ("answered", False, "an answered call had a reply"),
+        ("timed_out", True, "had no reply"),
+        ("stopped", True, "had no reply"),
+        ("not_sent", True, "had no reply"),
+        ("interrupted", False, "cannot end as 'interrupted'"),
+        ("lost", False, "cannot end as 'lost'"),
+    ],
+)
+def test_an_answer_that_contradicts_itself_is_refused(db, outcome, replied, refusal):
+    """WINDOW: the answer writer's argument checks, before any write.
+
+    interrupted belongs to the sweep and a pass's own close, and the
+    reply flag must agree with the outcome. The call stays open.
+    PRE-STATE: the call is open."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+    with pytest.raises(ValueError, match=refusal):
+        store.record_judge_call_answer(db, call_id, outcome, replied=replied)
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+
+
+def test_a_call_is_recorded_only_under_an_open_pass(db):
+    """WINDOW: record_judge_call_sent under a pass that has ended, and
+    under one that does not exist.
+
+    A call under an ended pass would be a request that pass's counts
+    never saw. Refused by the store, and nothing written. PRE-STATE: the
+    pass has ended and holds no call."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, pass_id, "finished")
+    assert _row(db, "scoring_passes", pass_id)["outcome"] == "finished"
+    assert store.judge_calls_for(db, eid) == []
+    with pytest.raises(store.AlreadyRecorded, match=f"scoring pass {pass_id} has"):
+        store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    with pytest.raises(store.AlreadyRecorded):
+        store.record_judge_call_sent(db, pass_id + 9, rid, "j/x")
+    assert store.judge_calls_for(db, eid) == []
+
+
+def test_a_pass_ends_once_with_counts_from_its_own_rows(db):
+    """WINDOW: open_scoring_pass, the rows a pass writes, and
+    close_scoring_pass twice.
+
+    The counts are read from the records in the statement that seals the
+    pass: scored is a row with a score, failed a row with none,
+    unanswered a call that went out and got no usable answer. A call
+    that was never sent and one that was answered are not unanswered,
+    and another pass's rows count toward nothing here. The second close
+    is the store's refusal and leaves the row as it was. PRE-STATE: the
+    pass is open with no counts, and the other pass has rows of its own."""
+    eid, (r1, r2) = _scoring_setup(db)
+    other = store.open_scoring_pass(db, eid, "j/x")
+    store.add_score(db, r1, {"scorer": "judge", "score": 1.0, "pass_id": other})
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    opened = _row(db, "scoring_passes", pass_id)
+    assert opened["started_at"] and opened["ended_at"] is None
+    assert [opened[k] for k in ("outcome", "scored", "failed", "unanswered")] == [
+        None
+    ] * 4
+
+    ends = [
+        ("answered", True),
+        ("timed_out", False),
+        ("not_sent", False),
+        ("failed", True),
+    ]
+    for outcome, replied in ends:
+        call_id = store.record_judge_call_sent(db, pass_id, r1, "j/x")
+        store.record_judge_call_answer(db, call_id, outcome, replied=replied)
+    store.add_score(db, r1, {"scorer": "judge", "score": 0.5, "pass_id": pass_id})
+    store.add_score(db, r2, {"scorer": "exact_match", "score": 0.0, "pass_id": pass_id})
+    store.add_score(db, r2, {"scorer": "judge", "score": None, "pass_id": pass_id})
+
+    store.close_scoring_pass(db, pass_id, "finished")
+    ended = _row(db, "scoring_passes", pass_id)
+    assert ended["ended_at"] >= ended["started_at"]
+    assert (ended["outcome"], ended["detail"]) == ("finished", None)
+    assert (ended["scored"], ended["failed"], ended["unanswered"]) == (2, 1, 2)
+    with pytest.raises(store.AlreadyRecorded, match=f"scoring pass {pass_id} has"):
+        store.close_scoring_pass(db, pass_id, "failed", "late")
+    assert _row(db, "scoring_passes", pass_id) == ended
+    assert _row(db, "scoring_passes", other)["outcome"] is None
+
+
+def test_closing_a_pass_closes_a_call_it_left_open(db):
+    """WINDOW: close_scoring_pass over a pass holding a call whose ending
+    was never written.
+
+    Every path through a pass writes a call's ending, so an open one at
+    the close means that write failed. It is closed as interrupted in
+    the same transaction, with a detail saying why, and counted
+    unanswered; a sealed pass never holds a call that reads as still in
+    flight. PRE-STATE: the call is open."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+    store.close_scoring_pass(db, pass_id, "failed", "the answer could not be written")
+    call = _row(db, "judge_calls", call_id)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        store.CALL_LEFT_OPEN,
+        None,
+    )
+    ended = _row(db, "scoring_passes", pass_id)
+    assert (ended["outcome"], ended["detail"], ended["unanswered"]) == (
+        "failed",
+        "the answer could not be written",
+        1,
+    )
+
+
+@pytest.mark.parametrize("outcome", ["interrupted", "done"])
+def test_a_pass_cannot_close_as_what_only_the_sweep_writes(db, outcome):
+    """WINDOW: close_scoring_pass's argument check.
+
+    interrupted belongs to the boot sweep, and an outcome outside the
+    vocabulary is not an ending. PRE-STATE: the pass is open, and stays
+    open."""
+    eid, _ = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, None)
+    with pytest.raises(ValueError, match=f"cannot close as {outcome!r}"):
+        store.close_scoring_pass(db, pass_id, outcome)
+    assert _row(db, "scoring_passes", pass_id)["outcome"] is None
+
+
+def test_the_boot_sweep_closes_what_a_dead_process_left_open(db):
+    """WINDOW: sweep_open_scoring_records over a pass a crash left open
+    (one call answered, one still open) beside a pass that ended, and a
+    second sweep.
+
+    The open pass becomes interrupted with ended_at still NULL, since
+    when it ended is not known, and its counts from its own rows; its
+    open call becomes interrupted with no answer time; the answered call
+    and the ended pass are untouched; the second sweep finds nothing.
+    PRE-STATE: one pass and one call are open."""
+    eid, (r1, r2) = _scoring_setup(db)
+    done = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, done, "finished")
+    done_row = _row(db, "scoring_passes", done)
+    live = store.open_scoring_pass(db, eid, "j/x")
+    answered = store.record_judge_call_sent(db, live, r1, "j/x")
+    store.record_judge_call_answer(db, answered, "answered", replied=True)
+    store.add_score(db, r1, {"scorer": "judge", "score": 1.0, "pass_id": live})
+    answered_row = _row(db, "judge_calls", answered)
+    left = store.record_judge_call_sent(db, live, r2, "j/x")
+    open_passes = db.execute("SELECT id FROM scoring_passes WHERE outcome IS NULL")
+    assert [r[0] for r in open_passes] == [live]
+    open_calls = db.execute("SELECT id FROM judge_calls WHERE outcome IS NULL")
+    assert [r[0] for r in open_calls] == [left]
+
+    assert store.sweep_open_scoring_records(db) == (1, 1)
+    swept = _row(db, "scoring_passes", live)
+    assert (swept["outcome"], swept["ended_at"], swept["detail"]) == (
+        "interrupted",
+        None,
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert (swept["scored"], swept["failed"], swept["unanswered"]) == (1, 0, 1)
+    call = _row(db, "judge_calls", left)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+        None,
+    )
+    assert _row(db, "judge_calls", answered) == answered_row
+    assert _row(db, "scoring_passes", done) == done_row
+    assert store.sweep_open_scoring_records(db) == (0, 0)
+
+
+def test_the_readers_are_plain_reads_that_run_inside_a_snapshot(db):
+    """WINDOW: the three scoring readers inside read_snapshot, which
+    raises on a commit in its block.
+
+    The export reads calls and passes inside one snapshot, so none of
+    the readers may write. latest_scoring_passes names each
+    experiment's newest pass in one query and leaves out an experiment
+    with none. PRE-STATE: the first experiment has two passes and the
+    second none."""
+    eid, (rid, _) = _scoring_setup(db)
+    bare = store.create_experiment(db, experiment_spec())
+    first = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, first, rid, "j/x")
+    store.close_scoring_pass(db, first, "stopped")
+    second = store.open_scoring_pass(db, eid, None)
+    assert store.scoring_passes_for(db, bare) == []
+    with store.read_snapshot(db):
+        passes = store.scoring_passes_for(db, eid)
+        latest = store.latest_scoring_passes(db, [eid, bare])
+        calls = store.judge_calls_for(db, eid)
+    assert [p["id"] for p in passes] == [first, second]
+    assert list(latest) == [eid] and latest[eid]["id"] == second
+    assert [c["id"] for c in calls] == [call_id]
+    assert calls[0]["outcome"] == "interrupted"
+    assert store.latest_scoring_passes(db, []) == {}
+
+
+# THE SEALS BY DIRECT SQL. The writers never reach a seal, so these go
+# around them, as a second connection or a person at the sqlite3 prompt
+# would, and each refusal is the trigger's own sentence.
+
+
+def _open_and_ended_call(conn):
+    eid, (r1, r2) = _scoring_setup(conn)
+    pass_id = store.open_scoring_pass(conn, eid, "j/x")
+    open_call = store.record_judge_call_sent(conn, pass_id, r1, "j/x")
+    ended_call = store.record_judge_call_sent(conn, pass_id, r2, "j/x")
+    store.record_judge_call_answer(conn, ended_call, "timed_out", replied=False)
+    return pass_id, open_call, ended_call
+
+
+CALL_HELD = "a judge call record never changes a value once written"
+CALL_LATE = "a judge call ends once, and this one has already ended"
+CALL_PARTIAL = "a judge call ends in one write, and that write names its outcome"
+PASS_HELD = "a scoring pass record never changes a value once written"
+PASS_LATE = "a scoring pass ends once, and this one has already ended"
+PASS_PARTIAL = "a scoring pass ends in one write, and that write names its outcome"
+
+
+@pytest.mark.parametrize(
+    "which,sql,refusal",
+    [
+        ("open", "UPDATE judge_calls SET sent_at = 'x' WHERE id = ?", CALL_HELD),
+        ("open", "UPDATE judge_calls SET result_id = 2 WHERE id = ?", CALL_HELD),
+        (
+            "open",
+            "UPDATE judge_calls SET sent_at = 'x', outcome = 'answered' WHERE id = ?",
+            CALL_HELD,
+        ),
+        ("open", "UPDATE judge_calls SET id = 99 WHERE id = ?", CALL_HELD),
+        (
+            "ended",
+            "UPDATE judge_calls SET outcome = 'answered' WHERE id = ?",
+            CALL_HELD,
+        ),
+        (
+            "open",
+            "UPDATE judge_calls SET generation_id = 'g' WHERE id = ?",
+            CALL_PARTIAL,
+        ),
+        ("ended", "UPDATE judge_calls SET generation_id = 'g' WHERE id = ?", CALL_LATE),
+        ("ended", "UPDATE judge_calls SET detail = 'late' WHERE id = ?", CALL_LATE),
+    ],
+)
+def test_a_judge_call_refuses_an_update_by_direct_sql(db, which, sql, refusal):
+    """WINDOW: one UPDATE statement on judge_calls, not through the store.
+
+    A change to a held value, a partial fill (answer columns with no
+    outcome) and a late fill (anything after the ending) are each
+    refused in the seal's own sentence, and the row is unchanged.
+    PRE-STATE: the open call's answer columns are NULL and the ended
+    call's outcome is timed_out."""
+    _, open_call, ended_call = _open_and_ended_call(db)
+    call_id = open_call if which == "open" else ended_call
+    before = _row(db, "judge_calls", call_id)
+    assert before["outcome"] == (None if which == "open" else "timed_out")
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(sql, (call_id,))
+    assert str(refused.value) == refusal
+    assert _row(db, "judge_calls", call_id) == before
+
+
+@pytest.mark.parametrize(
+    "which,sql,refusal",
+    [
+        ("open", "UPDATE scoring_passes SET started_at = 'x' WHERE id = ?", PASS_HELD),
+        ("open", "UPDATE scoring_passes SET experiment_id = 2 WHERE id = ?", PASS_HELD),
+        ("ended", "UPDATE scoring_passes SET scored = 9 WHERE id = ?", PASS_HELD),
+        ("open", "UPDATE scoring_passes SET scored = 9 WHERE id = ?", PASS_PARTIAL),
+        ("ended", "UPDATE scoring_passes SET detail = 'late' WHERE id = ?", PASS_LATE),
+    ],
+)
+def test_a_scoring_pass_refuses_an_update_by_direct_sql(db, which, sql, refusal):
+    """WINDOW: one UPDATE statement on scoring_passes, not through the
+    store.
+
+    The same three refusals as a call's, in the pass's own sentences.
+    PRE-STATE: the open pass has no ending and the ended one has its
+    counts."""
+    eid, _ = _scoring_setup(db)
+    open_pass = store.open_scoring_pass(db, eid, "j/x")
+    ended_pass = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, ended_pass, "finished")
+    pass_id = open_pass if which == "open" else ended_pass
+    before = _row(db, "scoring_passes", pass_id)
+    assert (before["outcome"], before["scored"]) == (
+        (None, None) if which == "open" else ("finished", 0)
+    )
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(sql, (pass_id,))
+    assert str(refused.value) == refusal
+    assert _row(db, "scoring_passes", pass_id) == before
+
+
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE", "INSERT"])
+@pytest.mark.parametrize("table", ["judge_calls", "scoring_passes"])
+def test_a_scoring_record_is_never_replaced_by_direct_sql(db, verb, table):
+    """WINDOW: an insert naming an id the table already holds.
+
+    REPLACE deletes the old row without firing a DELETE trigger, so the
+    insert's seal is what catches it: refused in the seal's sentence and
+    the row as it was. PRE-STATE: the row exists, with its sent time or
+    start time written."""
+    pass_id, open_call, _ = _open_and_ended_call(db)
+    row_id = open_call if table == "judge_calls" else pass_id
+    before = _row(db, table, row_id)
+    stamp = "sent_at" if table == "judge_calls" else "started_at"
+    assert before[stamp]
+    columns = ", ".join(before)
+    marks = ", ".join("?" for _ in before)
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(
+                f"{verb} INTO {table} ({columns}) VALUES ({marks})",
+                tuple({**before, stamp: "1999-01-01T00:00:00+00:00"}.values()),
+            )
+    noun = "judge call" if table == "judge_calls" else "scoring pass"
+    assert str(refused.value) == f"a {noun} record is never replaced"
+    assert _row(db, table, row_id) == before
+
+
+@pytest.mark.parametrize("table", ["judge_calls", "scoring_passes"])
+def test_a_scoring_record_is_never_deleted_by_direct_sql(db, table):
+    """WINDOW: a DELETE of one row nothing cites: an ended call no score
+    row names, or a pass no call belongs to.
+
+    Refused in the seal's sentence, and the row is still there. Nothing
+    cites the row, so no foreign key stands between the statement and
+    the delete: the seal is the only thing that can refuse it.
+    PRE-STATE: no row of scores or judge_calls cites the target."""
+    _, _, ended_call = _open_and_ended_call(db)
+    if table == "judge_calls":
+        target = ended_call
+        citing = db.execute(
+            "SELECT COUNT(*) FROM scores WHERE judge_call_id = ?", (target,)
+        )
+    else:
+        eid = db.execute("SELECT MAX(id) FROM experiments").fetchone()[0]
+        target = store.open_scoring_pass(db, eid, None)
+        citing = db.execute(
+            """SELECT (SELECT COUNT(*) FROM judge_calls WHERE pass_id = ?)
+                    + (SELECT COUNT(*) FROM scores WHERE pass_id = ?)""",
+            (target, target),
+        )
+    assert citing.fetchone()[0] == 0
+    before = _row(db, table, target)
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(f"DELETE FROM {table} WHERE id = ?", (target,))
+    noun = "judge call" if table == "judge_calls" else "scoring pass"
+    assert str(refused.value) == f"a {noun} record is never deleted"
+    assert _row(db, table, target) == before
