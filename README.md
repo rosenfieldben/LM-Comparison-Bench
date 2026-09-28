@@ -71,8 +71,10 @@ running them. Before the lock, a second server started by mistake, even
 one that then failed to bind its port, would have recorded the first
 one's live experiment as interrupted while it ran. `python -m
 bench.reconcile --apply` writes, so it takes the same lock while it
-runs; its dry run writes nothing, takes no lock, and runs beside a live
-bench.
+runs; its dry run writes no row, takes no lock, and runs beside a live
+bench (on a database an older bench wrote, its connection still adds
+what that database lacks: BACKLOG, "A reconcile dry run migrates an
+older database").
 
 OpenRouter attaches a `usage` object to every response reporting what it
 actually charged, and that billed figure is the number a card and the
@@ -1130,7 +1132,7 @@ close (no trustworthy billed cost, or no `provider`, or no
 write:
 
 ```sh
-.venv/bin/python -m bench.reconcile          # dry run, writes nothing
+.venv/bin/python -m bench.reconcile          # dry run, writes no row
 .venv/bin/python -m bench.reconcile --apply  # take the writes
 ```
 

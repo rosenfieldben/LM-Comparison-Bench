@@ -19,12 +19,14 @@ estimate.
 ONE WRITER AT A TIME (Phase P). `--apply` writes, so it takes the lock
 a server holds (store.hold_lock) and will not run beside a live bench,
 nor a bench start beside it; each refuses in a sentence naming what
-holds the lock. The dry run writes nothing, takes no lock, and runs
+holds the lock. The dry run writes no row, takes no lock, and runs
 beside a live bench: store.connect opens the database in WAL mode, which
 is what lets a reader and the server's writes coexist. Its connect()
-adds any column a database older than this build lacks, as a server's
-boot does, which is the same idempotent work and nothing on a database a
-live server has already opened.
+adds any column, index, trigger or seal a database older than this build
+lacks, as a server's boot does, which is nothing on a database a live
+server has already opened and a migration on one an older bench wrote:
+a dry run that writes is not a dry run, and it is on the BACKLOG,
+pre-existing since this command arrived.
 """
 
 import argparse
@@ -85,7 +87,7 @@ async def reconcile(
         print("nothing to reconcile", file=out)
         return counts
 
-    mode = "applying" if apply else "dry run, nothing will be written"
+    mode = "applying" if apply else "dry run, no row will be written"
     print(f"{len(pending)} result(s) to reconcile ({mode})", file=out)
     for index, row in enumerate(pending):
         record = await fetch_generation(client, row["generation_id"])
@@ -150,7 +152,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="perform the writes (default is a dry run that writes nothing)",
+        help="perform the writes (default is a dry run that writes no row)",
     )
     parser.add_argument(
         "--limit",

@@ -24580,6 +24580,54 @@ def test_a_call_is_claimed_at_its_two_rates_as_its_settlement_counts_it():
         assert main.call_worst_case(model, 100, chars, prices) is None, model
 
 
+def test_the_ledger_and_the_projection_disagree_about_one_price_shape_only():
+    """WINDOW: call_worst_case (what the ledger reserves) beside
+    projected_cost (what an experiment's projection quotes) for one call,
+    over every shape a price entry can take: a model's two rates; a
+    model's two rates with a charge beyond them; a pinned route with only
+    the charges it cannot count; no entry; a rate missing; a rate that is
+    not finite; rates at zero.
+
+    The operator's ruling after the pass at f123525: the two must not
+    disagree about a member silently. They agree on every shape but one,
+    and where they agree on a figure it is the same figure. The one is a
+    model whose listing names a nonzero charge beyond its two rates: the
+    projection refuses it, naming the charge, and the ledger reserves at
+    the two rates, as cost_usd's estimate will settle it (BACKLOG: the
+    projection and the ledger price a model with charges beyond its two
+    rates differently, with the 131 of 396 measurement as its reason).
+    PRE-STATE: each shape is one the catalog or the endpoint listing can
+    produce (fetch_catalog, experiment_prices)."""
+    from bench.models import projected_cost
+
+    rates = {"prompt": 1e-06, "completion": 2e-06}
+    shapes = {
+        "two rates": {**rates, "beyond": []},
+        "two rates and a charge beyond": {**rates, "beyond": ["web_search"]},
+        "a pinned route charging only beyond": {"beyond": ["request"]},
+        "no entry": None,
+        "a rate missing": {"completion": 2e-06},
+        "a rate not finite": {"prompt": float("nan"), "completion": 2e-06},
+        "rates at zero": {"prompt": 0.0, "completion": 0.0, "beyond": []},
+    }
+    chars = {"prompt": 5, "system": 9}
+    disagree = []
+    for name, price in shapes.items():
+        prices = {} if price is None else {"m": price}
+        try:
+            projected = projected_cost(
+                1, {"call": chars}, ["m"], 1, {"m": 100}, prices, chars_per_token=4
+            )
+        except (KeyError, TypeError):
+            projected = {"total_usd": None, "unpriced": ["m"]}
+        reserved = main.call_worst_case("m", 100, chars, prices)
+        if (projected["total_usd"] is None) != (reserved is None):
+            disagree.append(name)
+        elif reserved is not None:
+            assert reserved == projected["total_usd"], name
+    assert disagree == ["two rates and a charge beyond"]
+
+
 # ---- The window: two claims racing the last dollar.
 
 
@@ -25728,6 +25776,69 @@ def test_a_trial_waits_for_room_other_calls_hold_and_then_runs(monkeypatch, tmp_
         final = c.get(f"/experiments/{eid}").json()
         assert (final["status"], final["trials_done"]) == ("done", 1)
         assert calls == [pytest.approx(W_ALPHA)]
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_waiting_trial_wakes_when_the_call_it_waited_on_settles(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a /compare/stream run held on the wire with its claim, an
+    experiment's trial waiting for the room it holds, and the stream's
+    answer then let through to its end.
+
+    The trial is woken by the stream's SETTLEMENT (its claim replaced by
+    what it cost), not by a claim handed back uncounted: the stream's
+    finally then finds nothing left to give back, so the settlement is
+    the only thing that can wake it. The trial runs, waiting once, and
+    recorded spend is the two results'. PRE-STATE: 0.05 holds one
+    reservation of 0.032769 and not two, so the trial cannot claim while
+    the stream is in flight (before P2 it was sent beside it, with no
+    claim to wait on)."""
+    calls = []
+
+    async def reply(request):
+        calls.append(held())
+        if len(calls) == 1:
+            await gate.wait()
+        return httpx.Response(200, stream=alpha_stream())
+
+    gate = None
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+
+        async def staged():
+            nonlocal gate
+            gate = asyncio.Event()
+            stream = await opened_stream()
+            started = frame(await stream.__anext__())
+            assert started["type"] == "started"
+            first = asyncio.ensure_future(stream.__anext__())
+            await spin(lambda: calls)
+            async with app_client() as r:
+                await r.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+            await spin(lambda: waits or len(calls) > 1)
+            before = (list(waits), len(calls))
+            gate.set()
+            frames = [frame(await first)] + [frame(f) async for f in stream]
+            await spin(lambda: len(calls) > 1)
+            return before, frames
+
+        before, frames = c.portal.call(staged)
+        assert before == ([pytest.approx(W_ALPHA)], 1)
+        assert frames[-1]["type"] == "done" and frames[-1]["run_id"] is not None
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "run")
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["trials_done"]) == ("done", 1)
+        assert len(waits) == 1
+        # The trial claimed once the stream had settled: nothing else held.
+        assert calls == [pytest.approx(W_ALPHA), pytest.approx(W_ALPHA)]
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2 * 2.9e-05)
         assert c.app.state.spend_reservations == {}
 
 

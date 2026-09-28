@@ -2942,7 +2942,25 @@ async def wait_for_spend_room(stop: asyncio.Event) -> None:
     set. For the two callers that can wait, a trial and a judge call: a
     refusal for room another call holds would halt an experiment whose
     money has not run out, or write the rest of a scoring pass as gaps in
-    one step of the loop, and in either case the room comes back."""
+    one step of the loop, and in either case the room comes back.
+
+    WHY THE WAIT ENDS, AND THE BOUND IT HAS. A waiter holds nothing, so
+    no call waits on it; what it waits on are the calls holding claims,
+    and each gives its claim back, settled or released, when it ends. A
+    call on the wire ends when its answer is complete, when its upstream
+    falls silent past its read timeout (models.JUDGE_TIMEOUT_S, 60 s, for
+    a judge call; models.STREAM_READ_TIMEOUT_S, 300 s, for a trial or a
+    stream; models.COMPLETION_READ_TIMEOUT_S, 300 s, for a /compare
+    member), or when it is cancelled: a browser stream by its reader
+    going away, a judge call by shutdown's cut. A call still queued for a
+    slot holds its claim while it waits, and ends the same ways once the
+    calls ahead of it free their slots. Every release and every
+    settlement wakes each waiter, which tries its claim again. Those
+    timeouts bound a silence, not a call, so the wait has no fixed
+    wall-clock bound: an answer that keeps arriving holds its claim until
+    it is complete. The stop ends the wait at once, whatever the others
+    do: the Stop control's, or shutdown's, which sets the runner's and the
+    pass's before it waits on either."""
     freed = asyncio.ensure_future(app.state.spend_room_freed.wait())
     stopped = asyncio.ensure_future(stop.wait())
     try:
@@ -6485,6 +6503,8 @@ async def run_one_trial(
     held: object | None = None
     try:
         held = reserve_spend(worst)
+        # Why this wait ends, and why no timeout bounds it: see
+        # wait_for_spend_room.
         while held is None and spend_room_held_by_others(worst) and not stop.is_set():
             await wait_for_spend_room(stop)
             held = reserve_spend(worst)
@@ -7509,7 +7529,8 @@ async def score_one_result(
             # nothing, as a trial waits: refusing for it would write every
             # remaining trial of the pass as a gap in one step of the loop,
             # since nothing else runs between them. A Stop, or shutdown's,
-            # ends the wait, and this call was never sent.
+            # ends the wait, and this call was never sent. Why the wait
+            # ends, and why no timeout bounds it: see wait_for_spend_room.
             while (
                 held is None and spend_room_held_by_others(worst) and not stop.is_set()
             ):

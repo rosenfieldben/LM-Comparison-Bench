@@ -290,3 +290,39 @@ a23b257).
   the booted process's catalog, which the pass does not name, and naming
   it is a third column and a seal change the ruling did not ask for.
 - **First written:** the commit that adds this entry.
+
+## The projection and the ledger disagree about a model with charges beyond its two rates
+
+- **What:** for a model whose listing publishes a nonzero charge beyond
+  its prompt and completion rates (a cache-read rate, a web search, an
+  overrides object), an experiment's projection (`projected_cost`)
+  refuses to price it and names the charge, while the spend ceiling's
+  reservation (`call_worst_case`) reserves for it at the two rates, the
+  same arithmetic, since `cost_usd`'s estimate will settle it at those
+  rates. On every other shape of price the two agree, and on the figure
+  (`test_the_ledger_and_the_projection_disagree_about_one_price_shape_only`).
+- **Deferred by:** Phase P, ruled by the operator after the pass at
+  f123525.
+- **Reason:** 131 of the 396 models in the pinned measurement
+  (`TOKEN_PRICE_DIMENSIONS`, read 2026-08-30) publish no nonzero charge
+  beyond the two rates, so the projection's rule would leave 265 of 396
+  reserving nothing, and the ledger's rule would give the projection an
+  "at most" that leaves out a charge it cannot count, the confident
+  understatement the projection was made to refuse.
+- **First written:** the commit that adds this entry, on the operator's
+  ruling that the disagreement be surfaced rather than reconciled
+  silently.
+
+## A reconcile dry run migrates an older database
+
+- **What:** `python -m bench.reconcile` without `--apply` opens the
+  database through `store.connect`, which lays any column, index,
+  trigger or seal a database written by an older bench lacks and drops
+  the retired seals, so a dry run against such a database migrates it.
+  On a database this build has already opened it writes nothing, and it
+  never writes a row. Pre-existing since the dry run arrived (9c695c5).
+- **Deferred by:** Phase P, ruled by the operator after the pass at
+  f123525.
+- **Reason:** a dry run that writes is not a dry run.
+- **First written:** 9571082's body, as a reading noted and not
+  changed; the operator ruled it an entry here instead.
