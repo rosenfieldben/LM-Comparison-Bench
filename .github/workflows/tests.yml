@@ -43,8 +43,18 @@ jobs:
       # The supported floor plus the newer interpreters. 3.13 and 3.14
       # ship cp3xx wheels for the one compiled pin (pydantic-core), and
       # everything else is pure Python.
+      #
+      # THE UNIT SUITE IN TWO SHARDS per interpreter, split when a leg
+      # crossed 240 s (the house rule: the job is split, the limit is not
+      # raised). At 2e8bd02 the 3.14 leg's pytest took 282.19 s, and the
+      # job's five minutes cancelled it with every test passed. api runs
+      # tests/test_api.py and rest runs everything else, which halves each
+      # leg (67.67 s and 66.72 s on the development Mac at the split);
+      # tests/test_harness.py holds the two commands to one file and its
+      # ignore, so no test can fall between them.
       matrix:
         python-version: ["3.11", "3.12", "3.13", "3.14"]
+        shard: ["api", "rest"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -55,7 +65,10 @@ jobs:
       # when one leg grows, its run names the tests that carry the growth.
       # Added after 94e70ee, when the 3.14 leg had gone from 125 s to
       # 209 s in three commits while the other legs held near 120 s.
-      - run: pytest -rs --durations=10
+      - if: matrix.shard == 'api'
+        run: pytest -rs --durations=10 tests/test_api.py
+      - if: matrix.shard == 'rest'
+        run: pytest -rs --durations=10 --ignore=tests/test_api.py
 
   # Pure-function frontend tests. static/lib.js is DOM-free and has a
   # CommonJS guard, so node requires it directly: no build step, no npm

@@ -135,3 +135,33 @@ def test_the_guard_can_see_the_clients_it_is_guarding():
         "tests/test_models.py",
         "tests/test_properties.py",
     }
+
+
+def test_the_two_unit_shards_run_every_test_once():
+    """WINDOW: the unit job in .github/workflows/tests.yml, read as text:
+    its shard list and the one pytest command each shard runs.
+
+    The unit suite runs in two shards per interpreter since the 3.14 leg
+    crossed 240 s at 2e8bd02 (split, not the limit raised). The split is
+    only safe while the shards are exact complements: one runs a file and
+    the other ignores exactly that file, so every test runs in one shard
+    and none in both or neither. A second file moved into one shard
+    without the matching ignore in the other would run twice or not at
+    all, and this fails first. PRE-STATE: the job lists exactly two
+    shards."""
+    workflow = (
+        Path(__file__).parent.parent / ".github/workflows/tests.yml"
+    ).read_text()
+    job = workflow[workflow.index("\n  tests:\n") : workflow.index("\n  js:\n")]
+    assert 'shard: ["api", "rest"]' in job
+    commands = [
+        line.strip()
+        for line in job.splitlines()
+        if line.strip().startswith("run: pytest")
+    ]
+    assert commands == [
+        "run: pytest -rs --durations=10 tests/test_api.py",
+        "run: pytest -rs --durations=10 --ignore=tests/test_api.py",
+    ]
+    assert job.count("if: matrix.shard == 'api'") == 1
+    assert job.count("if: matrix.shard == 'rest'") == 1
