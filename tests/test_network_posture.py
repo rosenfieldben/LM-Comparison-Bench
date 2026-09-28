@@ -790,7 +790,12 @@ NETWORK_CALLS = {
     ("models.py", "fetch_endpoints"): Counter({"client.get": 1}),
     ("models.py", "fetch_generation"): Counter({"client.get": 1}),
     ("models.py", "run_model"): Counter({"client.post": 1}),
-    ("models.py", "judge_response"): Counter({"client.post": 1}),
+    # The judge's request, built and sent streamed so its reply is seen
+    # from its head (the operator's ruling H2 on the 1d91670 review): one
+    # request to OpenRouter, as client.post was.
+    ("models.py", "judge_response"): Counter(
+        {"client.build_request": 1, "client.send": 1}
+    ),
     ("models.py", "stream_model"): Counter({"client.stream": 1}),
     # The reconcile CLI's own client, to OpenRouter's generation lookup;
     # a command an operator runs, not a door.

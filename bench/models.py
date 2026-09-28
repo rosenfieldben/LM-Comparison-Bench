@@ -3271,23 +3271,42 @@ async def judge_response(
     provider_prefs: dict[str, Any] | None = None,
     *,
     sending: Callable[[], object] | None = None,
+    replying: Callable[[], object] | None = None,
 ) -> dict[str, Any]:
     """One rubric score from a judge model, or an error saying why not.
 
-    Never raises, the same contract run_model and stream_model carry, for
-    the same reason: this runs in a loop over many results and one bad
-    reply must not end the pass. The one exception is `sending` itself:
-    it is the caller's, and what it raises is the caller's to handle,
-    with no request made.
+    Never raises for anything the judge or the wire does, the contract
+    run_model and stream_model carry, for the same reason: this runs in a
+    loop over many results and one bad reply must not end the pass. What
+    does raise is not the judge's: `sending` and `replying` are the
+    caller's, and what they raise is the caller's to handle; and a
+    RuntimeError from an open client is not the closed-client refusal
+    below, so it is not guessed at and propagates (the scoring pass
+    records such a call failed and fails).
 
     sending is called immediately before the request is handed to the
     client, and only when a request is going to be made: never for a
     trial with no text. The scoring pass records the call there, so the
     record exists before anything can leave, whatever happens next.
 
+    replying is called once, when a reply's head arrives and before its
+    body is read, and never when none arrives. Like sending, it is the
+    caller's, and what it raises is the caller's to handle. The scoring
+    pass takes the reply's time there.
+
     outcome says how the request ended, in the store's words (answered,
-    timed_out, failed, not_sent), and replied whether an HTTP reply
-    arrived at all; both are None and False when no request was made.
+    timed_out, failed, not_sent), and replied whether a reply's head
+    arrived; both are None and False when no request was made. A body
+    that is then cut off or stalls is failed with a reply ("judge reply
+    was cut off while it was read: <Class>"), not timed_out: the timeout
+    that makes a call timed_out is one in which no reply arrived.
+
+    A REPLY IS A REPLY FROM ITS HEAD (the operator's ruling H2 on the
+    1d91670 review: bytes came back, an unreadable body included). The
+    request is sent streamed so that the head, the status line and the
+    headers, is seen when it arrives, before the body is read; a whole
+    read, as client.post does, would have recorded a reply whose body was
+    cut off as no reply at all.
     They are decided here, where the exception is caught, because the
     class is the only evidence of which side of the connection it came
     from, and a reader of the error string would be guessing.
@@ -3351,9 +3370,10 @@ async def judge_response(
     if sending is not None:
         sending()
     try:
-        response = await client.post(
-            OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
+        request = client.build_request(
+            "POST", OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
         )
+        response = await client.send(request, stream=True)
     # WHICH FAILURES LEFT NOTHING, by class, and the line is the
     # connection. A request that failed before a connection was
     # established never left the machine and cannot have been charged:
@@ -3385,10 +3405,27 @@ async def judge_response(
         out["error"] = "judge request not sent: the bench's HTTP client was closed"
         out["outcome"] = "not_sent"
         return out
-    # A reply arrived. From here every return is "failed" (sent, and no
-    # usable reply) until the body proves to be one the judge answered.
-    out["replied"] = True
-    out["outcome"] = "failed"
+    # A REPLY ARRIVED. Its head is the first point httpx hands a reply
+    # over, and from here bytes have come back, an unreadable body
+    # included; a reply cut inside its own head raised above and is
+    # recorded as no reply, since httpx shows nothing finer. From here
+    # every return is "failed" (sent, and no usable reply) until the body
+    # proves to be one the judge answered. The body is read here, and the
+    # response closed whatever happens to the read.
+    try:
+        if replying is not None:
+            replying()
+        out["replied"] = True
+        out["outcome"] = "failed"
+        try:
+            await response.aread()
+        except httpx.HTTPError as exc:
+            out["error"] = (
+                f"judge reply was cut off while it was read: {type(exc).__name__}"
+            )
+            return out
+    finally:
+        await response.aclose()
     if response.status_code != 200:
         out["error"] = f"judge returned HTTP {response.status_code}"
         return out

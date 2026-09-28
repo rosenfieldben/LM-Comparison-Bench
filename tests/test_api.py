@@ -23249,6 +23249,74 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     assert (cost["unanswered_calls"], cost["in_flight_calls"]) == (1, 0)
 
 
+@respx.mock
+def test_an_unexplained_runtime_error_fails_the_call_and_the_pass(client, tmp_path):
+    """WINDOW: a scoring pass whose judge request raises a RuntimeError
+    with the bench's client still open, and the records after.
+
+    The closed-client refusal is the one RuntimeError judge_response
+    explains (not_sent); any other is not guessed at and propagates, so
+    the call is recorded failed, sent, in the pass's sentence for a
+    request that raised, and the pass fails (the external review's M7:
+    mutants C6 and M5 survived, one reading every RuntimeError as a
+    closed client). PRE-STATE: the client is open when the request is
+    made."""
+
+    def route(request):
+        if is_judge(request):
+            raise RuntimeError("an error that is not the closed client's")
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert client.app.state.client.is_closed is False
+    assert score(client, eid, path).status_code == 202
+    wait_pass_ended(client)
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"]) == (
+        "failed",
+        "judge request failed: RuntimeError",
+    )
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "failed"
+
+
+@respx.mock
+def test_a_trial_whose_text_is_whitespace_is_never_sent_to_the_judge(client, tmp_path):
+    """WINDOW: a judged pass over a trial whose stored response text is
+    whitespace, planted in the row (a model that streams only whitespace
+    stores none, so no route reaches this shape).
+
+    Whitespace is not an answer: no request, no call recorded, no claim
+    on the spend ceiling, the no-text score, and the pass finished (the
+    external review's M7: mutant C10, sending whitespace, survived).
+    PRE-STATE: the row holds text, so a test of None alone would send it."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    with client.app.state.db:
+        client.app.state.db.execute("UPDATE results SET response_text = '  \n '")
+    assert (
+        client.app.state.db.execute("SELECT response_text FROM results").fetchone()[0]
+        == "  \n "
+    )
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+    assert judged == []
+    assert calls_of(client.app.state.db, eid) == []
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["detail"] == "no response text: the trial did not complete"
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "finished"
+
+
 def gated_judge(gate, judged, answer=None):
     """A route whose judge requests wait on gate, recording each arrival."""
 
