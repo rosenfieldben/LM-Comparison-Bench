@@ -456,37 +456,13 @@
     // payload keeps it on its own key (report.judge_cost). It is the
     // bench's instrument cost, money spent measuring, and is never added
     // into a model's cost cell, whose total is what that model was paid.
-    // A call whose reply carried no price is named as unpriced rather
-    // than left out, and every judge row with no billing figure is
-    // counted after the spend (the unpriced calls among them), so the
-    // line never reads as the whole cost of judging when it may not be.
-    const spend = report.judge_cost;
-    const unpriced = spend.unpriced_calls;
-    const bare = spend.rows_without_figure;
+    // Every request the figure cannot speak for is named after it, in
+    // lib.judgeSpendLine's words, so the line never reads as the whole
+    // cost of judging when it may not be.
     const judgeSpend = document.createElement("span");
     judgeSpend.dataset.testid = "report-judge-spend";
     judgeSpend.className = "report-note";
-    judgeSpend.textContent =
-      (spend.billed_calls > 0
-        ? "judge spend: $" +
-          spend.total_usd.toFixed(4) +
-          " over " +
-          spend.billed_calls +
-          (spend.billed_calls === 1 ? " billed call" : " billed calls") +
-          (unpriced > 0 ? ", " + unpriced + " unpriced" : "")
-        : "judge spend: none billed" +
-          (unpriced > 0
-            ? ", " +
-              unpriced +
-              (unpriced === 1 ? " call unpriced" : " calls unpriced")
-            : "")) +
-      (bare > 0
-        ? "; " +
-          bare +
-          (bare === 1
-            ? " judge row carries no billing figure"
-            : " judge rows carry no billing figure")
-        : "");
+    judgeSpend.textContent = window.BenchLib.judgeSpendLine(report.judge_cost);
     el.append(judgeSpend);
     if (report.arm_caveat) {
       // Present only when it was earned, so a reader who sees it knows

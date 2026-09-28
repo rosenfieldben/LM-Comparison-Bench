@@ -763,14 +763,16 @@ NETWORK_CALLS = {
     # ---- OpenRouter, through the one client the lifespan builds. ----
     # The client, its transport (TCP keepalive; no proxy is read, since
     # an explicit transport makes httpx skip the proxy variables), and
-    # its close; the catalog is fetched through it at boot.
+    # its close; the catalog is fetched through it at boot. Closed in two
+    # places since Phase P: at shutdown, and by a server that refuses to
+    # start because another holds the database's lock.
     ("main.py", "<imports>"): Counter({"asyncio": 1, "httpx": 1, "subprocess": 1}),
     ("main.py", "lifespan"): Counter(
         {
             "httpx.AsyncClient": 1,
             "httpx.AsyncHTTPTransport": 1,
-            "<reads> state.client": 2,
-            "client.aclose": 1,
+            "<reads> state.client": 3,
+            "client.aclose": 2,
         }
     ),
     # The doors that hand that client to models.py: a comparison, a

@@ -825,7 +825,7 @@
   }
 
   // The clock time of an answer, in UTC and saying so: Score's words
-  // describe a pass on the server that no door reports on, so they are
+  // describe a pass on the server that goes on after them, so they are
   // stamped rather than worded as if still current.
   function utcTime() {
     return new Date().toISOString().slice(11, 19) + " UTC";
@@ -876,9 +876,7 @@
         id,
         "a scoring pass was started at " +
           utcTime() +
-          "; no door says when it ends or whether it failed, so select the " +
-          "experiment again to " +
-          "read what it has scored since",
+          "; select the experiment again to read what it has scored since",
         "",
       );
       // After scoring, the report opens: read now, while the pass runs.
@@ -891,7 +889,9 @@
           utcTime() +
           " (" +
           err.message +
-          "); no door says whether a pass started",
+          "); GET /experiments/" +
+          id +
+          "/scoring says whether a pass started",
         "",
       );
       showReport(id);

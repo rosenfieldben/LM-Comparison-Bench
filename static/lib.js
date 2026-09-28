@@ -979,6 +979,61 @@
     return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
   }
 
+  // The report's judge spend as one line, from report.judge_cost. What
+  // the judging cost first, then each request it cannot speak for, each
+  // count in words true of every request counted: an unpriced call came
+  // back with no price; an unanswered one went out and got no usable
+  // answer (timed out, cut at shutdown, failed after sending); one in
+  // flight had not come back when the report was read; and a judge row
+  // written before the bench recorded its requests cannot say whether its
+  // request went out. A request never sent is in none of them. Every key
+  // it reads is a key of the report's judge_cost, which a test holds.
+  function judgeSpendLine(spend) {
+    const counted = (n, one, many) => n + (n === 1 ? one : many);
+    const unpriced = spend.unpriced_calls;
+    let line =
+      spend.billed_calls > 0
+        ? "judge spend: $" +
+          spend.total_usd.toFixed(4) +
+          " over " +
+          counted(spend.billed_calls, " billed call", " billed calls") +
+          (unpriced > 0 ? ", " + unpriced + " unpriced" : "")
+        : "judge spend: none billed" +
+          (unpriced > 0
+            ? ", " + counted(unpriced, " call unpriced", " calls unpriced")
+            : "");
+    if (spend.unanswered_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.unanswered_calls,
+          " judge call went out and got no usable answer",
+          " judge calls went out and got no usable answer",
+        );
+    }
+    if (spend.in_flight_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.in_flight_calls,
+          " judge call had not come back when this report was read",
+          " judge calls had not come back when this report was read",
+        );
+    }
+    if (spend.rows_before_call_records > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.rows_before_call_records,
+          " judge row written before the bench recorded its requests " +
+            "cannot say whether its request went out",
+          " judge rows written before the bench recorded its requests " +
+            "cannot say whether their requests went out",
+        );
+    }
+    return line;
+  }
+
   // ---- The member listing (Phase O): what a snapshot would select,
   // ---- and patterns written from the rows a person checks.
 
@@ -1255,6 +1310,7 @@
     scoreBody,
     scoreNudge,
     scoreLabel,
+    judgeSpendLine,
     SNAPSHOT_LIMITS,
     PATTERN_TRIMMED,
     patternFor,

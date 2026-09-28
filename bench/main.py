@@ -1358,6 +1358,41 @@ class ScoringStart(BaseModel):
     judge_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+class ScoringPass(BaseModel):
+    """One scoring pass as the record holds it, and whether it is the one
+    this process is running.
+
+    The first nine fields are the scoring_passes row: outcome, ended_at
+    and the three counts are null until the pass ends, and a pass the
+    boot sweep closed has an outcome and no ended_at, because when it
+    ended is not known. running and stopping are this process's, not the
+    record's: running says the pass is the one the scoring slot holds,
+    and stopping that it has been asked to stop and has not yet. A pass
+    whose outcome is null and which is not running has no recorded end;
+    the boot sweep gives it one.
+    """
+
+    id: int
+    judge_model: str | None
+    started_at: str
+    ended_at: str | None
+    outcome: str | None
+    detail: str | None
+    scored: int | None
+    failed: int | None
+    unanswered: int | None
+    running: bool
+    stopping: bool
+
+
+class ScoringRecord(BaseModel):
+    experiment_id: int
+    # The running pass, in the same shape as the list's, or null.
+    active: ScoringPass | None
+    # Every pass over this experiment, newest first.
+    passes: list[ScoringPass]
+
+
 class ExperimentDetail(BaseModel):
     id: int
     name: str
@@ -1390,6 +1425,11 @@ class ExperimentDetail(BaseModel):
     trials_done: int
     trials_refused: int
     trials_failed: int
+    # The latest scoring pass, so the panel can say how the last one
+    # ended from the list it already reads. Null when no pass has run
+    # since Phase P recorded them: a null says nothing about the scores
+    # an older pass may have written.
+    scoring: ScoringPass | None = None
 
 
 class ExperimentList(BaseModel):
@@ -1891,10 +1931,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # separate because they are separately useful: a finished experiment
     # can be re-scored while nothing is running, and a running experiment
     # must not be scored while its results are still arriving.
+    #
+    # pass_id is the running pass's scoring_passes row, the record that
+    # outlives this dict. stop_reason says who asked it to stop, "request"
+    # (the stop door) or "shutdown" (the lifespan), because the pass's
+    # recorded ending says which.
     app.state.scoring_run = {
         "active": None,
+        "pass_id": None,
         "task": None,
         "stop": asyncio.Event(),
+        "stop_reason": None,
         "tasks": {},
         "error": None,
     }
@@ -1953,7 +2000,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
     )
-    app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    db_path = os.environ.get("BENCH_DB", "./bench.db")
+    app.state.db = store.connect(db_path)
+    # ONE SERVER PER DATABASE, held from here to the process's end. The
+    # two sweeps below mark whatever the database says is running as
+    # interrupted, which is true only if nothing is: a second server
+    # started on a live bench's database would record the first one's
+    # running experiment and scoring pass as interrupted while they ran,
+    # and the first pass's answer would then find its record already
+    # ended. After connect, which makes the directory the lock sits in.
+    try:
+        app.state.bench_lock = _hold_bench_lock(db_path)
+    except RuntimeError:
+        app.state.db.close()
+        await app.state.client.aclose()
+        raise
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
@@ -2037,6 +2098,18 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "finished; its completed trials are real and its "
                 "remaining trials never ran",
             )
+    # The same correction for scoring: a pass and its calls have rows now,
+    # and a crash or a kill leaves them with no ending. Closed as
+    # interrupted, "found open at boot", safe for the reason the sweep
+    # above is and only because the lock is held.
+    swept_passes, swept_calls = store.sweep_open_scoring_records(app.state.db)
+    if swept_passes or swept_calls:
+        logger.warning(
+            "%s scoring pass(es) and %s judge call(s) were left open by a "
+            "previous process; recorded as interrupted",
+            swept_passes,
+            swept_calls,
+        )
     yield
     # The runner outlives the request that started it, deliberately, but
     # it must not outlive the process. Without this the task is cancelled
@@ -2044,12 +2117,83 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # middle of a settlement: the money is spent and the row is not
     # written. Asking it to stop between trials and then waiting is the
     # same contract the stop endpoint offers.
-    await _shutdown_runner()
-    # After the runner, not before. The client is what the in-flight
-    # trial is streaming through, so closing it first would break the
-    # exchange this line just finished waiting for.
+    #
+    # The scoring pass is asked the same way and waited for beside the
+    # runner, not after it, so neither wait adds to the other; its wait
+    # is bounded (see SCORING_SHUTDOWN_SECONDS), the runner's is not.
+    _ask_scoring_to_stop("shutdown")
+    await asyncio.gather(_shutdown_scoring(), _shutdown_runner())
+    # After both, not before. The client is what the in-flight trial and
+    # judge call are going through, so closing it first would break the
+    # exchanges these lines just finished waiting for.
     await app.state.client.aclose()
     app.state.db.close()
+    _release_bench_lock(app.state.bench_lock)
+
+
+def _hold_bench_lock(db_path: str) -> int | None:
+    """Take this database's lock, or refuse to start in a sentence.
+
+    An exclusive flock on a file beside the database, taken without
+    waiting and held until the process ends: released by
+    _release_bench_lock on the way out and by the kernel if the process
+    dies, so a crash never leaves a lock behind for the next boot to
+    trip over. The holder writes its process id into the file, which is
+    how the refusal can say what holds it. A memory database has no
+    lock, since no second process can open it.
+    """
+    lock = store.lock_path(db_path)
+    if lock is None:
+        return None
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        holder = os.read(fd, 32).decode("ascii", "replace").strip()
+        os.close(fd)
+        who = f"process {holder}" if holder.isdigit() else "another process"
+        raise RuntimeError(
+            f"{lock} is held by {who}, another bench server using this "
+            "database. Two servers on one database would each record the "
+            "other's running experiment and scoring pass as interrupted "
+            "while they ran, so this one will not start; stop that server "
+            "first."
+        ) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()}\n".encode())
+    return fd
+
+
+def _release_bench_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)
+
+
+def _ask_scoring_to_stop(reason: str) -> None:
+    """Set the running pass's stop, recording who asked first."""
+    state = app.state.scoring_run
+    if state["stop_reason"] is None:
+        state["stop_reason"] = reason
+    state["stop"].set()
+
+
+async def _shutdown_scoring() -> None:
+    """Wait for the scoring pass to stop, then cut it.
+
+    The pass has been asked to stop, and stops between trials, which
+    takes as long as the trial in hand. SCORING_SHUTDOWN_SECONDS bounds
+    that wait; past it wait_for cancels the pass, whose in-flight judge
+    call is then recorded stopped and its pass stopped, both before the
+    database closes, since wait_for returns only once the cancelled pass
+    has finished. Never raises: shutdown goes on to the client and the
+    database whatever the pass did.
+    """
+    state = getattr(app.state, "scoring_run", None) or {}
+    task = state.get("task")
+    if task is None or task.done():
+        return
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(task, SCORING_SHUTDOWN_SECONDS)
 
 
 async def _shutdown_runner() -> None:
@@ -5662,7 +5806,14 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
 
 @app.get("/experiments", response_model=ExperimentList)
 async def list_experiments() -> dict[str, Any]:
-    return {"experiments": store.list_experiments(app.state.db)}
+    experiments = store.list_experiments(app.state.db)
+    latest = store.latest_scoring_passes(
+        app.state.db, [experiment["id"] for experiment in experiments]
+    )
+    for experiment in experiments:
+        found = latest.get(experiment["id"])
+        experiment["scoring"] = _pass_view(found) if found is not None else None
+    return {"experiments": experiments}
 
 
 @app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
@@ -5671,6 +5822,9 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     experiment = store.get_experiment(app.state.db, experiment_id)
     if experiment is None:
         raise HTTPException(404, "no such experiment")
+    found = store.latest_scoring_passes(app.state.db, [experiment_id])
+    latest = found.get(experiment_id)
+    experiment["scoring"] = _pass_view(latest) if latest is not None else None
     return experiment
 
 
@@ -6572,7 +6726,78 @@ async def experiment_progress(experiment_id: int) -> StreamingResponse:
     return StreamingResponse(frames(), media_type="text/event-stream")
 
 
-async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
+# HOW LONG SHUTDOWN WAITS FOR A SCORING PASS before cutting it. Asked to
+# stop, a pass finishes the trial in hand and stops; this bounds that
+# wait. Two facts fix it between two numbers. It is shorter than the
+# judge's own timeout (models.JUDGE_TIMEOUT_S, 60 s), so a slow judge
+# call does not hold shutdown for its whole timeout: it is cut, and
+# recorded as stopped with its pass. It is longer than the ten seconds a
+# typical supervisor allows between asking a process to stop and killing
+# it, so under one of those the kill usually comes first, and then
+# nothing here runs at all: the pass and its open call are left for the
+# next boot's sweep, which records them interrupted. Read at call time,
+# so a test can shorten it.
+SCORING_SHUTDOWN_SECONDS = 30.0
+
+# A pass's recorded endings, each saying who ended it.
+PASS_STOPPED_ON_REQUEST = "stopped on request, between trials"
+PASS_STOPPED_AT_SHUTDOWN = "stopped between trials because the bench was shutting down"
+
+
+def pass_cut_at_shutdown() -> str:
+    return (
+        "cut off because the bench was shutting down and the trial in hand "
+        f"had not finished within {SCORING_SHUTDOWN_SECONDS:g} seconds"
+    )
+
+
+CALL_CUT_AT_SHUTDOWN = "cut off before a reply because the bench was shutting down"
+
+
+def _pass_view(row: dict[str, Any]) -> dict[str, Any]:
+    """A scoring_passes row as ScoringPass, with this process's flags."""
+    state = app.state.scoring_run
+    running = state["pass_id"] is not None and state["pass_id"] == row["id"]
+    return {
+        "id": row["id"],
+        "judge_model": row["judge_model"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "outcome": row["outcome"],
+        "detail": row["detail"],
+        "scored": row["scored"],
+        "failed": row["failed"],
+        "unanswered": row["unanswered"],
+        "running": running,
+        "stopping": running and state["stop"].is_set(),
+    }
+
+
+def _scorable_trials(
+    db: sqlite3.Connection, experiment_id: int, tasks: dict[str, dict[str, Any]]
+) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Every trial the pass will score, with its task, in trial order.
+
+    A task the dataset no longer has, or one with no scorer, contributes
+    nothing and writes no row. Each store call inside materializes before
+    it returns, so this generator holds no cursor across the awaits of
+    the loop that drives it.
+    """
+    for group in store.experiment_groups(db, experiment_id):
+        task = tasks.get(group["task_id"])
+        if task is None or task["scorer"] is None:
+            continue
+        detail = store.get_group(db, group["id"])
+        if detail is None:
+            continue
+        for run in detail["runs"]:
+            for result in run["results"]:
+                yield task, result
+
+
+async def score_experiment(
+    experiment_id: int, pass_id: int, judge_model: str | None
+) -> None:
     """Score every trial of an experiment, deterministic and judged alike.
 
     Re-runnable and idempotent per (result, scorer, judge_model): a second
@@ -6591,9 +6816,18 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
     pass for one would trade a complete scoring run for nothing. That
     later pass sends every judge result that has response text to the
     judge again, not only the gaps, and pays for each call.
+
+    THE PASS IS A RECORD. pass_id is its scoring_passes row, opened by the
+    Score door, and this function ends it exactly once, in the finally,
+    with the outcome of what actually happened: stopped only when a stop
+    was found with a trial still to score, or when shutdown cut the pass;
+    failed when something raised; finished otherwise. A Stop that lands
+    after the last trial began changes nothing about a pass that then
+    scored every trial, so it is not read after the loop.
     """
     db = app.state.db
     state = app.state.scoring_run
+    outcome, detail = "finished", None
     # EVERYTHING THE PASS DOES IS INSIDE THE TRY, its first read included.
     # The finally below is the only thing that ever frees the one scoring
     # slot, so a statement that could raise before it would leave the slot
@@ -6610,41 +6844,63 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
         # the report rather than to refuse the pass: the user may have
         # good reason, and a silent absorption is what would be wrong.
         self_judged = judge_model is not None and judge_model in experiment["lineup"]
-        for group in store.experiment_groups(db, experiment_id):
-            if state["stop"].is_set():
+        # Between trials, and a stop found with a trial still to score is
+        # the only way this loop ends early.
+        for task, result in _scorable_trials(db, experiment_id, state["tasks"]):
+            if state["stop"].is_set() or not await score_one_result(
+                experiment_id, pass_id, task, result, judge_model, self_judged
+            ):
+                outcome = "stopped"
+                detail = (
+                    PASS_STOPPED_AT_SHUTDOWN
+                    if state["stop_reason"] == "shutdown"
+                    else PASS_STOPPED_ON_REQUEST
+                )
                 break
-            task = state["tasks"].get(group["task_id"])
-            if task is None or task["scorer"] is None:
-                continue
-            detail = store.get_group(db, group["id"])
-            if detail is None:
-                continue
-            for run in detail["runs"]:
-                for result in run["results"]:
-                    await score_one_result(
-                        experiment_id, task, result, judge_model, self_judged
-                    )
+    except asyncio.CancelledError:
+        # Only shutdown cancels a pass, and only once its bound ran out.
+        outcome, detail = "stopped", pass_cut_at_shutdown()
+        raise
     except Exception as exc:
         logger.exception("scoring pass for experiment %s failed", experiment_id)
         state["error"] = f"{type(exc).__name__}: {exc}"
+        outcome, detail = "failed", state["error"]
     finally:
-        state["active"] = None
+        # The ending is written once, here, and a failure to write it must
+        # not keep the slot: that would be L8's defect one line later. The
+        # pass then stays open in the record, and the next boot's sweep
+        # closes it as interrupted.
+        try:
+            store.close_scoring_pass(db, pass_id, outcome, detail)
+        except Exception:
+            logger.exception(
+                "the end of scoring pass %s could not be recorded", pass_id
+            )
+        finally:
+            state["active"] = None
+            state["pass_id"] = None
 
 
 async def score_one_result(
     experiment_id: int,
+    pass_id: int,
     task: dict[str, Any],
     result: dict[str, Any],
     judge_model: str | None,
     self_judged: bool,
-) -> None:
-    """Score one stored result, writing exactly one row.
+) -> bool:
+    """Score one stored result, writing exactly one row. Returns False,
+    having written nothing, only when a stop arrived while the trial
+    waited for a slot and before any request was made for it.
 
     Every path writes a row, including the failures. A scoring pass that
     silently skipped what it could not score would leave the report
     unable to tell "not scored yet" from "scored and unscorable", and
-    those are different facts about the same trial.
+    those are different facts about the same trial. Every row cites the
+    pass; a judged row cites the judge call too, and the call, not the
+    row, holds the generation id and the charge.
     """
+    db = app.state.db
     spec = task["scorer"]
     kind = spec["kind"]
     if kind != "judge":
@@ -6659,7 +6915,7 @@ async def score_one_result(
             score_response, spec, task["reference"], result["response_text"]
         )
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": kind,
@@ -6668,29 +6924,31 @@ async def score_one_result(
                 "detail": verdict["detail"],
                 "blind": None,
                 "self_judged": None,
+                "pass_id": pass_id,
             },
         )
-        return
+        return True
 
     if judge_model is None:
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": "judge",
                 "score": None,
                 "passed": None,
                 "detail": "no judge model was given for this scoring pass",
+                "pass_id": pass_id,
             },
         )
-        return
+        return True
 
     # The ceiling applies to judge calls because judge calls are spend.
     # A refusal here is this result's scoring failure and the pass goes
     # on; see score_experiment for why that differs from a trial refusal.
     def refuse_for_ceiling() -> None:
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": "judge",
@@ -6703,6 +6961,7 @@ async def score_one_result(
                 ),
                 "judge_model": judge_model,
                 "self_judged": self_judged,
+                "pass_id": pass_id,
             },
         )
 
@@ -6710,7 +6969,70 @@ async def score_one_result(
     # not spend minutes waiting for slots it will refuse anyway.
     if spend_ceiling_reached():
         refuse_for_ceiling()
-        return
+        return True
+
+    # THE CALL IS RECORDED BEFORE IT GOES OUT. judge_response calls this
+    # immediately before handing the request to the client, and only when
+    # it is about to make one, so the row exists whatever happens to the
+    # request: a timeout, a cut at shutdown, a crash. If the record cannot
+    # be written the request is not made, and the pass fails.
+    call_id: int | None = None
+
+    def sending() -> None:
+        nonlocal call_id
+        call_id = store.record_judge_call_sent(db, pass_id, result["id"], judge_model)
+
+    def end_call_unanswered(outcome: str, detail: str) -> None:
+        # For the paths that leave this function by an exception: the
+        # call's ending is written if it can be, and the exception that is
+        # propagating is never replaced by a failure to write it.
+        if call_id is None:
+            return
+        try:
+            store.record_judge_call_answer(
+                db, call_id, outcome, replied=False, detail=detail
+            )
+        except Exception:
+            logger.exception(
+                "the ending of judge call %s could not be recorded", call_id
+            )
+
+    def settle(verdict: dict[str, Any]) -> None:
+        # Post-spend. The call has happened, so the charge is counted first,
+        # whether or not the verdict parsed and whether or not the writes
+        # after it succeed.
+        try:
+            record_spend(as_money(verdict["billed_cost_usd"]))
+        except Exception:
+            logger.exception("judge settlement failed")
+        if call_id is not None:
+            store.record_judge_call_answer(
+                db,
+                call_id,
+                verdict["outcome"],
+                replied=verdict["replied"],
+                generation_id=verdict["generation_id"],
+                billed_cost_usd=verdict["billed_cost_usd"],
+                detail=None if verdict["outcome"] == "answered" else verdict["error"],
+            )
+        store.add_score(
+            db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": verdict["score"],
+                # From the task's own threshold when its author declared
+                # one, and None otherwise. judge_response cannot decide
+                # this: it is a client function and has never seen the
+                # dataset spec.
+                "passed": judged_pass(spec, verdict["score"]),
+                "detail": verdict["error"] or verdict["detail"],
+                "judge_model": judge_model,
+                "self_judged": self_judged,
+                "judge_call_id": call_id,
+                "pass_id": pass_id,
+            },
+        )
 
     async with app.state.upstream_semaphore:
         # And again inside the held slot, which is the check that actually
@@ -6721,44 +7043,57 @@ async def score_one_result(
         # queue is the F1.2 defect, one layer up.
         if spend_ceiling_reached():
             refuse_for_ceiling()
-            return
-        verdict = await judge_response(
-            app.state.client,
-            judge_model,
-            task["rubric"],
-            task["reference"],
-            result["response_text"],
-            # Routed-service prefs even under the underlying-model
-            # estimand. The estimand is a claim about the models being
-            # MEASURED; the judge is the bench's own instrument and is
-            # not one of them, and pinning it to a provider chosen for
-            # somebody else's lineup would be a claim nobody made.
-            provider_prefs=app.state.provider_prefs,
+            return True
+        # And the stop, for the same reason: a Stop that arrived while
+        # this trial waited for a slot is honoured before anything is
+        # sent, so nothing is lost by not sending it. A call already in
+        # flight is never cut by a Stop; only shutdown's bound does that.
+        if app.state.scoring_run["stop"].is_set():
+            return False
+        # SHIELDED, so the only cancellation that reaches the call is the
+        # one decided below. A reply that arrived in the same turn as
+        # shutdown's cut is kept and recorded as answered; one still on
+        # the wire is abandoned and recorded as stopped.
+        judging = asyncio.ensure_future(
+            judge_response(
+                app.state.client,
+                judge_model,
+                task["rubric"],
+                task["reference"],
+                result["response_text"],
+                # Routed-service prefs even under the underlying-model
+                # estimand. The estimand is a claim about the models being
+                # MEASURED; the judge is the bench's own instrument and is
+                # not one of them, and pinning it to a provider chosen for
+                # somebody else's lineup would be a claim nobody made.
+                provider_prefs=app.state.provider_prefs,
+                sending=sending,
+            )
         )
-    # Post-spend. The call has happened, so nothing below may turn a paid
-    # verdict into an exception, and the charge is recorded whether or not
-    # the verdict parsed.
-    try:
-        record_spend(as_money(verdict["billed_cost_usd"]))
-    except Exception:
-        logger.exception("judge settlement failed")
-    store.add_score(
-        app.state.db,
-        result["id"],
-        {
-            "scorer": "judge",
-            "score": verdict["score"],
-            # From the task's own threshold when its author declared one,
-            # and None otherwise. judge_response cannot decide this: it is
-            # a client function and has never seen the dataset spec.
-            "passed": judged_pass(spec, verdict["score"]),
-            "detail": verdict["error"] or verdict["detail"],
-            "judge_model": judge_model,
-            "judge_generation_id": verdict["generation_id"],
-            "judge_billed_cost_usd": verdict["billed_cost_usd"],
-            "self_judged": self_judged,
-        },
-    )
+        try:
+            verdict = await asyncio.shield(judging)
+        except asyncio.CancelledError:
+            if not judging.done():
+                judging.cancel()
+                end_call_unanswered("stopped", CALL_CUT_AT_SHUTDOWN)
+            elif judging.cancelled() or judging.exception() is not None:
+                end_call_unanswered(
+                    "failed", "the judge call ended as the pass was cut"
+                )
+            else:
+                try:
+                    settle(judging.result())
+                except Exception:
+                    logger.exception("a judge answer at shutdown could not be recorded")
+            raise
+        except Exception as exc:
+            # Nothing judge_response raises is an HTTP outcome (those it
+            # returns), so whether this request left is not known: counted
+            # as sent, the side on which money may have moved.
+            end_call_unanswered("failed", f"judge request failed: {type(exc).__name__}")
+            raise
+    settle(verdict)
+    return True
 
 
 @app.post("/experiments/{experiment_id}/score", status_code=202)
@@ -6782,6 +7117,8 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
     # and the claim) await, and two requests can both pass this check and
     # start two passes over the one slot, one graded against the other's
     # tasks. test_two_scores_sent_at_once_start_one_pass sends two at once.
+    # The pass's record is opened in the same step, and the store is
+    # synchronous by contract, which is what keeps that true.
     if state["active"] is not None:
         raise HTTPException(
             409, f"a scoring pass for experiment {state['active']} is running"
@@ -6793,14 +7130,55 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
         "Scoring against different tasks would attribute one rubric's "
         "verdict to another's trial.",
     )
+    pass_id = store.open_scoring_pass(app.state.db, experiment_id, body.judge_model)
     state["active"] = experiment_id
+    state["pass_id"] = pass_id
     state["stop"] = asyncio.Event()
+    state["stop_reason"] = None
     state["error"] = None
     state["tasks"] = {t["id"]: t for t in dataset["tasks"]}
     state["task"] = asyncio.create_task(
-        score_experiment(experiment_id, body.judge_model)
+        score_experiment(experiment_id, pass_id, body.judge_model)
     )
-    return {"id": experiment_id, "status": "scoring"}
+    return {"id": experiment_id, "status": "scoring", "pass_id": pass_id}
+
+
+@app.post("/experiments/{experiment_id}/scoring/stop", status_code=202)
+async def stop_scoring(experiment_id: int) -> dict[str, Any]:
+    """Ask the running scoring pass to stop between trials.
+
+    Between trials, never inside one, as the runner's Stop is: a judge
+    call already sent has already cost money, and abandoning it would
+    throw away a verdict that was paid for. A trial still waiting for a
+    slot sends nothing. The pass then ends as stopped, and the record says
+    it was asked to.
+    """
+    ensure_rowid(experiment_id)
+    state = app.state.scoring_run
+    if state["active"] != experiment_id:
+        raise HTTPException(
+            409, f"no scoring pass for experiment {experiment_id} is running"
+        )
+    _ask_scoring_to_stop("request")
+    return {"id": experiment_id, "pass_id": state["pass_id"], "status": "stopping"}
+
+
+@app.get("/experiments/{experiment_id}/scoring", response_model=ScoringRecord)
+async def experiment_scoring(experiment_id: int) -> dict[str, Any]:
+    """Every scoring pass over an experiment, newest first, and the one
+    running now if any, from the record."""
+    ensure_rowid(experiment_id)
+    if store.get_experiment(app.state.db, experiment_id) is None:
+        raise HTTPException(404, "no such experiment")
+    passes = [
+        _pass_view(row)
+        for row in reversed(store.scoring_passes_for(app.state.db, experiment_id))
+    ]
+    return {
+        "experiment_id": experiment_id,
+        "active": next((p for p in passes if p["running"]), None),
+        "passes": passes,
+    }
 
 
 @app.get("/models", response_model=CatalogResponse)
@@ -9544,6 +9922,8 @@ def _report_inputs(
         "groups": groups,
         "runs_by_group": runs_by_group,
         "scores_by_result": store.scores_for_results(db, result_ids),
+        "judge_calls": store.judge_calls_for(db, experiment_id),
+        "scoring_passes": store.scoring_passes_for(db, experiment_id),
         "tasks_by_id": tasks_by_id,
         "thresholds_source": thresholds_source,
         "dataset_unreadable": dataset_unreadable,
@@ -9603,6 +9983,12 @@ def _export_lines(
     out: list[dict[str, Any]] = []
     with store.read_snapshot(db):
         groups = store.experiment_groups(db, experiment_id)
+        # The scoring records, in the same snapshot as the scores that
+        # cite them, grouped by trial as the lines are.
+        calls_by_result: dict[int, list[dict[str, Any]]] = {}
+        for call in store.judge_calls_for(db, experiment_id):
+            calls_by_result.setdefault(call["result_id"], []).append(call)
+        scoring_passes = store.scoring_passes_for(db, experiment_id)
         for group in groups:
             detail = store.get_group(db, group["id"])
             if detail is None:
@@ -9624,7 +10010,13 @@ def _export_lines(
             score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
             for run, result in rows:
                 out.append(
-                    export_trial(group, run, result, score_rows.get(result["id"], []))
+                    export_trial(
+                        group,
+                        run,
+                        result,
+                        score_rows.get(result["id"], []),
+                        judge_calls=calls_by_result.get(result["id"], []),
+                    )
                 )
         # AN ARTIFACT IS DESCRIBED BY WHAT IS IN IT, which is why the
         # trial half is read from the emitted LINES rather than from the
@@ -9652,6 +10044,7 @@ def _export_lines(
                 thresholds,
                 referenced,
                 _captures_named(groups, experiment.get("task_attachments")),
+                scoring_passes=scoring_passes,
             ),
         )
     return out

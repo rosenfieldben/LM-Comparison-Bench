@@ -7,7 +7,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -3231,12 +3231,28 @@ async def judge_response(
     reference: str | None,
     response_text: str | None,
     provider_prefs: dict[str, Any] | None = None,
+    *,
+    sending: Callable[[], object] | None = None,
 ) -> dict[str, Any]:
     """One rubric score from a judge model, or an error saying why not.
 
     Never raises, the same contract run_model and stream_model carry, for
     the same reason: this runs in a loop over many results and one bad
-    reply must not end the pass.
+    reply must not end the pass. The one exception is `sending` itself:
+    it is the caller's, and what it raises is the caller's to handle,
+    with no request made.
+
+    sending is called immediately before the request is handed to the
+    client, and only when a request is going to be made: never for a
+    trial with no text. The scoring pass records the call there, so the
+    record exists before anything can leave, whatever happens next.
+
+    outcome says how the request ended, in the store's words (answered,
+    timed_out, failed, not_sent), and replied whether an HTTP reply
+    arrived at all; both are None and False when no request was made.
+    They are decided here, where the exception is caught, because the
+    class is the only evidence of which side of the connection it came
+    from, and a reader of the error string would be guessing.
 
     provider_prefs carries the boot data policy exactly as it rides every
     other payload. A judge call sends the response text of a run, which is
@@ -3259,6 +3275,8 @@ async def judge_response(
             "generation_id": None,
             "billed_cost_usd": None,
             "error": None,
+            "outcome": None,
+            "replied": False,
         }
     out: dict[str, Any] = {
         "score": None,
@@ -3267,6 +3285,8 @@ async def judge_response(
         "generation_id": None,
         "billed_cost_usd": None,
         "error": None,
+        "outcome": None,
+        "replied": False,
     }
     payload: dict[str, Any] = {
         "model": judge_model,
@@ -3286,13 +3306,47 @@ async def judge_response(
     }
     if provider_prefs:
         payload["provider"] = provider_prefs
+    if sending is not None:
+        sending()
     try:
         response = await client.post(
             OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
         )
+    # WHICH FAILURES LEFT NOTHING, by class, and the line is the
+    # connection. A request that failed before a connection was
+    # established never left the machine and cannot have been charged:
+    # httpx raises these three while opening one (a refused or
+    # unresolvable host, the connect timeout, the wait for a pooled
+    # connection). Every other transport failure comes after the
+    # connection existed, when the request may be on the wire and money
+    # may have moved, so it counts as sent. That includes WriteTimeout:
+    # some of the request went out. The judge_calls outcome column states
+    # the same boundary.
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "not_sent"
+        return out
+    except httpx.ReadTimeout as exc:
+        out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "timed_out"
+        return out
     except httpx.HTTPError as exc:
         out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "failed"
         return out
+    except RuntimeError:
+        # httpx refuses a closed client with a bare RuntimeError, before
+        # any connection: nothing left. Any other RuntimeError is not
+        # this one and is not guessed at.
+        if not client.is_closed:
+            raise
+        out["error"] = "judge request not sent: the bench's HTTP client was closed"
+        out["outcome"] = "not_sent"
+        return out
+    # A reply arrived. From here every return is "failed" (sent, and no
+    # usable reply) until the body proves to be one the judge answered.
+    out["replied"] = True
+    out["outcome"] = "failed"
     if response.status_code != 200:
         out["error"] = f"judge returned HTTP {response.status_code}"
         return out
@@ -3322,6 +3376,10 @@ async def judge_response(
     except (LookupError, TypeError):
         out["error"] = "judge returned a malformed body"
         return out
+    # Answered: the judge replied with a message. A verdict that does not
+    # parse is still an answer, and a paid one; its failure is the score
+    # row's to record, not the call's.
+    out["outcome"] = "answered"
     verdict = parse_verdict(_flatten_content(content))
     if "error" in verdict:
         out["error"] = verdict["error"]

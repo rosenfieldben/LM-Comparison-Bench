@@ -243,14 +243,21 @@ JUDGE_SCORES = {"stub/fast": 0.9, "stub/slow": 0.4}
 
 # A judge whose calls wait at a gate a test arms and releases, so a
 # scoring pass can be held open for as long as a proof needs the one
-# scoring slot busy, and ended when it says so. No door can stop a pass,
-# which is why the hold is a gate rather than a sleep: a sleep either
-# ends before the proof has looked or keeps the shared bench busy for
-# the tests after it. It is off the catalog, so no page offers it, and
-# the cap keeps a gate nobody released under the bench's own judge
-# timeout (JUDGE_TIMEOUT_S, 60 s), so the pass still ends.
+# scoring slot busy, and ended when it says so. The hold is a gate rather
+# than a sleep because a sleep either ends before the proof has looked or
+# keeps the shared bench busy for the tests after it; and since Phase P,
+# when a door can stop a pass, because a Stop lets the call in flight
+# finish, so only the gate ends that call. It is off the catalog, so no
+# page offers it, and the cap keeps a gate nobody released under the
+# bench's own judge timeout (JUDGE_TIMEOUT_S, 60 s), so the pass still
+# ends.
 HELD_JUDGE = "stub/judge-held"
 JUDGE_GATE_CAP_S = 20
+
+# A judge that answers every call with HTTP 500: a request that went out
+# and got no usable answer, which the report counts as unanswered. Off
+# the catalog like the held judge.
+FAILING_JUDGE = "stub/judge-500"
 
 
 def sse(obj) -> bytes:
@@ -685,6 +692,13 @@ def build_app() -> Starlette:
         # exact case the header exists to cover.
         headers = {GENERATION_ID_HEADER: f"gen-hdr-{model.split('/')[-1]}"}
         if is_judge_request(payload):
+            if model == FAILING_JUDGE:
+                return Response(
+                    json.dumps({"error": {"message": "stub judge failure"}}),
+                    status_code=500,
+                    media_type="application/json",
+                    headers=headers,
+                )
             gate = state["judge_gate"]
             if model == HELD_JUDGE and gate is not None:
                 try:

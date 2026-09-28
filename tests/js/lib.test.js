@@ -58,6 +58,7 @@ const {
   scoreBody,
   scoreNudge,
   scoreLabel,
+  judgeSpendLine,
 } = require("../../static/lib.js");
 
 test("shortName strips the vendor prefix, keeping the rest", () => {
@@ -1432,4 +1433,77 @@ test("a clone answer is readable only with an outcome and a root", () => {
   assert.equal(readableClone({ head_sha: HEAD, outcome: "cloned" }), false);
   assert.equal(readableClone({ ...record, outcome: "made" }), false);
   assert.equal(readableClone(null), false);
+});
+
+// Phase P: the judge spend line over report.judge_cost's six keys.
+const NO_SPEND = {
+  total_usd: 0,
+  billed_calls: 0,
+  unpriced_calls: 0,
+  unanswered_calls: 0,
+  in_flight_calls: 0,
+  rows_before_call_records: 0,
+};
+
+test("judgeSpendLine says none billed and nothing else when nothing is", () => {
+  assert.equal(judgeSpendLine(NO_SPEND), "judge spend: none billed");
+});
+
+test("judgeSpendLine states the figure, then the calls it cannot speak for", () => {
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, total_usd: 0.00002, billed_calls: 1 }),
+    "judge spend: $0.0000 over 1 billed call",
+  );
+  assert.equal(
+    judgeSpendLine({
+      ...NO_SPEND,
+      total_usd: 0.0123,
+      billed_calls: 2,
+      unpriced_calls: 1,
+    }),
+    "judge spend: $0.0123 over 2 billed calls, 1 unpriced",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unpriced_calls: 2 }),
+    "judge spend: none billed, 2 calls unpriced",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unpriced_calls: 1 }),
+    "judge spend: none billed, 1 call unpriced",
+  );
+});
+
+test("judgeSpendLine names unanswered, in-flight and older rows each in its own words", () => {
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unanswered_calls: 3 }),
+    "judge spend: none billed; 3 judge calls went out and got no usable answer",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unanswered_calls: 1 }),
+    "judge spend: none billed; 1 judge call went out and got no usable answer",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, in_flight_calls: 1 }),
+    "judge spend: none billed; 1 judge call had not come back when this " +
+      "report was read",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, rows_before_call_records: 2 }),
+    "judge spend: none billed; 2 judge rows written before the bench " +
+      "recorded its requests cannot say whether their requests went out",
+  );
+  assert.equal(
+    judgeSpendLine({
+      total_usd: 0.005,
+      billed_calls: 2,
+      unpriced_calls: 2,
+      unanswered_calls: 2,
+      in_flight_calls: 2,
+      rows_before_call_records: 1,
+    }),
+    "judge spend: $0.0050 over 2 billed calls, 2 unpriced; 2 judge calls " +
+      "went out and got no usable answer; 2 judge calls had not come back " +
+      "when this report was read; 1 judge row written before the bench " +
+      "recorded its requests cannot say whether its request went out",
+  );
 });

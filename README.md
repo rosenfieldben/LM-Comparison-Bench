@@ -58,6 +58,21 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
+**One server per database.** At startup the server takes an exclusive
+lock on a file beside the database (`bench.db.lock` for `./bench.db`)
+and holds it until it exits; the kernel lets it go if the process dies,
+however it dies, so a crash never leaves a lock for the next start to
+trip over. A second server started on the same database refuses to
+boot, naming the lock and the process that holds it. The lock is what
+makes startup's two corrections safe: the bench records as interrupted
+an experiment the database says is running and a scoring pass or judge
+call it says is still open, which is true only when no other server is
+running them. Before the lock, a second server started by mistake, even
+one that then failed to bind its port, would have recorded the first
+one's live experiment as interrupted while it ran. `python -m
+bench.reconcile` takes no lock: it is a second connection by design,
+safe beside a live bench, and corrects nothing at startup.
+
 OpenRouter attaches a `usage` object to every response reporting what it
 actually charged, and that billed figure is the number a card and the
 session total show, without a tilde. The bench still degrades gracefully
@@ -1413,7 +1428,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 8**. Each trial line carries the ordered
+An **export is schema version 9**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1427,11 +1442,17 @@ to the manifest, the records those ids name, so a reader can say which
 bytes. Version 8 adds `clone_id` to each of those capture records: the
 clones row the walked root was in, null when it was in none, so a
 reader holding this bench's database can say which repository and ref a
-snapshot was of; the URL itself stays out of the file. The manifest
-states the reason for the current bump in the file itself, and it names
-every field the earlier versions added, because a reader holding a v8
-artifact and a v2 parser needs the whole list from the file in their
-hand.
+snapshot was of; the URL itself stays out of the file. Version 9 adds
+the scoring records: each trial line's `judge_calls`, every judge request
+sent for that trial with how it ended, so an artifact can be audited
+against a provider's bill line by line; `judge_call_id` and `pass_id` on
+each score; and the manifest's `scoring_passes`. A judged score written
+since version 9 has `judge_generation_id` and `judge_billed_cost_usd`
+null, because its call carries them: the figure is recorded once. The
+manifest states the reason for the current bump in the file itself, and
+it names every field the earlier versions added, because a reader
+holding a v9 artifact and a v2 parser needs the whole list from the file
+in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -2674,17 +2695,55 @@ store again):
   stored, is scored through the API with its `dataset_path`, and the
   panel says so.
 
-The pass runs on the server after the door's 202, and no door says when
-it ends or whether it failed, so the report opened then shows what has
-been scored by that moment; select the experiment again to read more.
-Stopping the bench does not wait for a pass: a judge call in flight then
-is paid for and records no score. BACKLOG.md holds both gaps. A pass that
-fails does free the bench's one scoring slot. A refusal, such as
-another pass holding the bench's one scoring slot, is the door's
-sentence, and Score stays live, because the server knows when the other
-pass ends. **Every press scores every trial again**, judged ones
-included; each trial of a judge task that has response text is sent to
-the judge, and each call is paid.
+The pass runs on the server after the door's 202, so the report opened
+then shows what has been scored by that moment; select the experiment
+again to read more. A refusal, such as another pass holding the bench's
+one scoring slot, is the door's sentence, and Score stays live, because
+the server knows when the other pass ends. **Every press scores every
+trial again**, judged ones included; each trial of a judge task that has
+response text is sent to the judge, and each call is paid.
+
+**A scoring pass is a record.** Each pass is a row, written when it
+starts and once more when it ends. `GET /experiments/{id}/scoring`
+lists an experiment's passes newest first, with the one running now as
+`active`, and `GET /experiments` and `GET /experiments/{id}` carry the
+latest as `scoring`: its judge, when it started and ended, how it ended
+(`finished`; `stopped`; `failed`, with the error; or `interrupted`), and
+how many trials it scored, how many it wrote with no score, and how many
+of its judge calls went out and got no usable answer. A pass that fails
+frees the bench's one scoring slot and stays in the list, and a re-score
+is a new pass beside it.
+
+**Every judge request is recorded before it goes out**, as a row with
+the time it was sent, and once more with how it ended: `answered`;
+`timed_out`; `stopped`, cut at shutdown; `failed`, sent with no usable
+reply (a transport error after sending, an error status, or a body that
+could not be read); `not_sent`, when no connection was made, so nothing
+left; or `interrupted`, when the record of its ending was cut off with
+the process. The line between `not_sent` and the rest is the
+connection: anything after one was established counts as sent, because
+money may have moved. The generation id and the charge are on the call,
+recorded once, and a judged score cites its call. No value in either
+record ever changes once written: triggers in the database refuse a
+change, a second ending, a replacement or a delete, from any writer, a
+second connection or the sqlite3 prompt included.
+
+`POST /experiments/{id}/scoring/stop`, with the body `{}`, asks the
+running pass to stop between trials, as the runner's Stop does: a judge
+call already in flight finishes and is recorded, a trial still waiting
+for a slot sends nothing, and the pass ends `stopped`. It is refused 409
+when no pass for that experiment is running. Shutting the bench down asks
+the same way and waits up to `SCORING_SHUTDOWN_SECONDS`, 30 seconds, then
+cuts the pass, and the call on the wire is recorded `stopped`: still
+recorded as sent, with no answer, which is the point. The bound sits
+between two numbers on purpose. It is shorter than the judge's own 60 s
+timeout, so a slow judge call is cut and recorded rather than holding
+shutdown for its whole timeout. It is longer than the ten seconds a
+typical supervisor allows between asking a process to stop and killing
+it, so under one of those the kill usually comes first; then the pass
+and its open call are left for the next start, which records them
+`interrupted` ("found open at boot"), with no end time, because none is
+known.
 
 Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
 are pure functions over the stored response text. `normalized_exact` and
@@ -2736,7 +2795,7 @@ counting as a failure. Collapsing the two would put the judge's own
 malfunctions into the model's pass rate.
 
 **Judge calls are spend.** The billed cost is captured in band, recorded
-on the score row, and added to the same accumulator the ceiling reads, so
+on the judge call, and added to the same accumulator the ceiling reads, so
 a scoring pass cannot run free against the limit. Judges get their own
 modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
 experiment's tier, because a verdict is a number and a sentence and a
@@ -2749,12 +2808,18 @@ or "judge spend: none billed"), never added into a model's cost: that
 is the bench's instrument cost, not what any model under test was paid.
 A judge reply that came back with no price is named as unpriced rather
 than counted as nothing spent (", K unpriced", or "none billed, K calls
-unpriced"), and when any judge row carries no billing figure the line
-says how many ("; M judge rows carry no billing figure"), whatever the
-reason: a reply with no price, a call that timed out after it was sent,
-a pass with no judge to call. The unpriced calls are among those M. A
-score row does not record whether a call that got no reply was sent, so
-the count cannot be split further; BACKLOG.md says why that waits.
+unpriced"). After the spend the line names each request the figure
+cannot speak for, as what it is: calls that went out and got no usable
+answer ("; M judge calls went out and got no usable answer"), calls that
+had not come back when the report was read (only while a pass runs), and
+judge rows written before the bench recorded its requests, which cannot
+say whether their request went out. A request never sent (no judge
+given, the ceiling refusing, a trial with no text, a connection never
+made) is in none of those counts. Until the requests were recorded the
+line could only say how many judge rows carried no billing figure,
+whatever the reason, because a score row could not say whether a call
+that got no reply had been sent; `judge_cost` then had a key for that
+count, `rows_without_figure`, which is gone.
 
 **If the judge model is in the experiment's lineup**, every score it
 produces is flagged `self_judged` and the flag is surfaced in the report.
@@ -3087,7 +3152,9 @@ JSONL. Line one is the manifest: which dataset by digest, which build,
 which catalog, which estimand, which seeds, what the experiment declared
 itself to be. Every following line is one trial with its full provenance,
 including the payload sent, the response, the timings, the token counts,
-both cost figures, the serving provider, and every score row attached.
+both cost figures, the serving provider, every score row attached, and
+every judge request sent for it. The manifest also carries every scoring
+pass over the experiment.
 The last line is a sha256 over the preceding bytes, so a citation can
 name the artifact it cites and anyone can check the name.
 

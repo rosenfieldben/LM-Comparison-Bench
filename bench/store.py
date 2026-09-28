@@ -953,6 +953,14 @@ def _disk_path(path: str) -> str | None:
     return decoded or None
 
 
+def lock_path(path: str) -> str | None:
+    """Where the bench's one-server lock for this database lives: beside
+    the file, or None for a memory database, which no second process can
+    open. The lifespan takes it; see _hold_bench_lock in main.py."""
+    disk = _disk_path(path)
+    return None if disk is None else disk + ".lock"
+
+
 def connect(path: str) -> sqlite3.Connection:
     """Open a connection with the schema applied and foreign keys on.
 
