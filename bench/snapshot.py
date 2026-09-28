@@ -182,6 +182,18 @@ HOLDS_GIT_DIRECTORY = (
     "the walk reached a git directory, whose config can carry a remote URL "
     "with sign-in details in it, so the walk stopped there."
 )
+# The third, since Phase P (P3): a root BELOW a git directory's top
+# level, found by the look above the root (look_above). Below the top
+# the walk cannot see the four names, and the files there can carry a
+# URL git uses (the legacy remotes/ and branches/ files, a linked
+# worktree's config.worktree, and logs/, which git writes itself), a list
+# with no fixed end, so the whole of a git directory is refused rather
+# than the files one by one. The composer's 422 and the listing's stop
+# row carry it, as the other two.
+ROOT_INSIDE_GIT_DIRECTORY = (
+    "the root is inside a git directory, whose files can carry a remote URL "
+    "with sign-in details in them, so it is not walked."
+)
 
 # THE GROUPS HAVE NAMES because the member listing reports which one
 # excluded an entry, and a name only a comment knew could not be
@@ -681,7 +693,7 @@ class Opened:
 
 
 class Tree(Protocol):
-    """The filesystem as the walk sees it: eight operations, no names.
+    """The filesystem as the walk sees it: nine operations, no names.
 
     EVERY OPERATION AFTER open_root TAKES A HANDLE OR AN OPENED, never a
     path. That is the containment: a directory is descended through the
@@ -730,6 +742,95 @@ class Tree(Protocol):
         """Where a symbolic link points, resolved, for the containment
         decision about it. Never used to open anything."""
         ...
+
+    def parent(self, handle: Handle) -> Handle:
+        """The directory holding an open directory, opened through its
+        handle ('..' relative to it), never by a name: what the handle's
+        own directory entry says its parent is, whatever the names above
+        it now point to. At the top of the filesystem it is the same
+        directory again, and its identity says so. (Phase P, P3; used by
+        look_above and nothing else.)"""
+        ...
+
+
+# THE LOOK ABOVE THE ROOT (Phase P, P3). A root below a git directory's
+# top level is inside one, and the walk, which sees names at the root
+# and below, cannot tell. So before the walk lists anything but the root,
+# the look climbs from the root's own handle through parent, one
+# directory at a time, and refuses if any directory it passes holds the
+# four names, up to and including the allowlist entry the root was
+# admitted under, which it recognises by the device and inode recorded
+# at boot, or up to the top of the filesystem when there is no entry to
+# stop at. It opens nothing but directories, reads no file, and only
+# refuses, so a race against it can at worst give back the walk as it
+# was before the look existed.
+#
+# How many directories the climb may pass, from the root: the walk's
+# own depth bound, for the same reason (one descriptor at a time here,
+# but a climb this long has left any tree anybody meant). A climb that
+# reaches neither the entry nor the top within it is refused.
+LOOK_CEILING = (
+    f"the look above the root climbed {MAX_DEPTH} directories without "
+    "reaching its allowlist entry or the top of the filesystem, so it is not "
+    "walked. Name a root nearer its entry."
+)
+# And how many entries its listings may pass in all: the walk's own
+# ceiling, since a directory above the root can be as wide as any below.
+LOOK_TOO_WIDE = (
+    f"the look above the root passed {MAX_WALKED_ENTRIES} directory entries "
+    "without finishing, so the root is not walked. Name a root nearer its "
+    "entry."
+)
+
+
+def look_above(tree: Tree, root: Handle, entry: Identity | None) -> None:
+    """Refuse a root inside a git directory, or return.
+
+    THE CLIMB IS BY DESCRIPTOR. Each step opens '..' through the handle
+    the step before it holds, so a directory above the root renamed,
+    moved, or replaced by a link to somewhere else while the look climbs
+    changes nothing it sees: it reports what the chain of directories
+    that actually hold the root shows. One ancestor is held at a time,
+    beside the root, and each is closed before the next is examined and
+    whatever ends the look.
+
+    WHAT IT CHECKS AT EACH is the walk's own rule, carries_git_directory
+    over the directory's listed names, so a normal checkout, whose .git
+    sits beside its files and is not above them, is never refused: the
+    directory holding .git lists .git, not the four names inside it.
+
+    WHERE IT STOPS: at the entry, which is checked too (a root inside an
+    entry that is itself a git directory is inside one), or at the top of
+    the filesystem, whose parent is itself; and it is refused at
+    MAX_DEPTH steps without either. entry None stops only at the top.
+    """
+    held: Handle | None = None
+    current = root
+    listed = 0
+    try:
+        for _ in range(MAX_DEPTH):
+            if current.identity == entry:
+                return
+            above = tree.parent(current)
+            if held is not None:
+                tree.close_handle(held)
+            held = above
+            if above.identity == current.identity:
+                return
+            names: list[str] = []
+            for child in tree.entries(above):
+                listed += 1
+                if listed > MAX_WALKED_ENTRIES:
+                    raise SnapshotError(LOOK_TOO_WIDE)
+                names.append(child.name)
+            if carries_git_directory(names):
+                raise SnapshotError(ROOT_INSIDE_GIT_DIRECTORY)
+            current = above
+        if current.identity != entry:
+            raise SnapshotError(LOOK_CEILING)
+    finally:
+        if held is not None:
+            tree.close_handle(held)
 
 
 def _describe(kind: str) -> str:
@@ -822,7 +923,9 @@ class Survey:
          otherwise descended through its parent's handle, identity
          checked, and listed; if its names carry the git directory
          signature it is REFUSED and nothing in it is seen (Phase O). A
-         ROOT carrying it stops the survey there, before anything else.
+         ROOT carrying it stops the survey there, before anything else,
+         and so does a root inside one, found by the look above it
+         (look_above, Phase P), right after the root's own check.
       4. anything but a regular file: REFUSED whatever the patterns say.
       5. a regular file no pattern matches: skipped, not reported.
       6. a matched file over MAX_MEMBER_BYTES by its listed size: REFUSED,
@@ -833,7 +936,8 @@ class Survey:
     the survey reports them and goes on: the composer stops at the first
     (it raises it), and the listing records every one. A refusal about
     the traversal itself stops the survey: the entry ceiling, a root
-    that is a git directory, a name the snapshot cannot spell, a
+    that is a git directory or inside one, a look above the root past
+    its ceilings, a name the snapshot cannot spell, a
     directory that changed before descent, any refusal a tree operation
     raises, and any the reader raises. Each is
     reported once, as a final sighting at the directory or entry it was
@@ -850,12 +954,16 @@ class Survey:
         patterns: Sequence[str],
         excludes: Sequence[str] = DEFAULT_EXCLUDES,
         read: Reader | None = None,
+        entry: Identity | None = None,
     ) -> None:
         # Before any tree operation: a malformed pattern is a refusal of
         # the request, the same at both doors, and not a fact about the
         # tree.
         enforce_patterns(patterns)
         self._tree = tree
+        # The allowlist entry's identity, where the look above the root
+        # stops; None climbs to the top of the filesystem.
+        self._entry = entry
         self._patterns = tuple(patterns)
         self._excludes = tuple(excludes)
         self._read = read
@@ -937,6 +1045,11 @@ class Survey:
                 # walk reaches below (see the descent).
                 if carries_git_directory(entry.name for entry in listed):
                     raise SnapshotError(ROOT_IS_GIT_DIRECTORY)
+                # And a root INSIDE one, by the look above it, before
+                # anything below the root is seen: the root's own check
+                # first, so a root that is a git directory keeps its own
+                # sentence.
+                look_above(tree, root, self._entry)
                 stack[0] = (root, iter(listed))
                 while stack:
                     handle, remaining = stack[-1]
@@ -1190,6 +1303,7 @@ def walk(
     tree: Tree,
     patterns: Sequence[str],
     excludes: Sequence[str] = DEFAULT_EXCLUDES,
+    entry: Identity | None = None,
 ) -> list[tuple[str, bytes]]:
     """Every file under the root the patterns select, READ, in order.
 
@@ -1257,7 +1371,8 @@ def walk(
         tree=tree,
         patterns=patterns,
         excludes=excludes,
-        read=lambda handle, entry, path: _read_member(tree, handle, entry, path),
+        read=lambda handle, listed, path: _read_member(tree, handle, listed, path),
+        entry=entry,
     )
     budget = _ReadBudget()
     selected: list[tuple[str, bytes]] = []
@@ -1289,6 +1404,7 @@ def list_members(
     tree: Tree,
     patterns: Sequence[str],
     excludes: Sequence[str] = DEFAULT_EXCLUDES,
+    entry: Identity | None = None,
 ) -> dict[str, Any]:
     """What POST /snapshots would select and refuse, without reading a file.
 
@@ -1322,7 +1438,7 @@ def list_members(
     is refused only by the composer, which opens and reads what the
     listing only looked at.
     """
-    survey = Survey(tree=tree, patterns=patterns, excludes=excludes)
+    survey = Survey(tree=tree, patterns=patterns, excludes=excludes, entry=entry)
     budget = _ReadBudget()
     members: list[dict[str, Any]] = []
     selected: list[tuple[str, int]] = []

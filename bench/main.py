@@ -1987,6 +1987,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repo_roots = _parse_repo_roots(
         os.environ.get("BENCH_REPO_ROOTS"), resolved=_resolved_directory
     )
+    # Each entry's device and inode, read once here: where the snapshot
+    # doors' look above a root stops (snapshot.look_above). Read at boot,
+    # as the clone root's identity is (_clone_root_as_entry), so an entry
+    # replaced later is not what the look stops at, and it climbs on.
+    app.state.repo_root_identities = _root_identities(app.state.repo_roots)
     if app.state.repo_roots:
         logger.info("snapshot roots: %s", ", ".join(app.state.repo_roots))
     # Where POST /clones may put what it fetches, from which hosts, and
@@ -8311,6 +8316,39 @@ def enforce_snapshot_root(
     return real
 
 
+def _root_identities(roots: Sequence[str]) -> dict[str, snapshot.Identity]:
+    """Each allowlist entry's (device, inode) as boot finds it, for the
+    look above a snapshot root (Phase P, P3). An entry that cannot be
+    described is left out, and the look then climbs past where it would
+    have stopped, to the top of the filesystem, refusing more and never
+    less."""
+    identities: dict[str, snapshot.Identity] = {}
+    for entry in roots:
+        try:
+            seen = os.stat(entry)
+        except OSError:
+            continue
+        identities[entry] = (seen.st_dev, seen.st_ino)
+    return identities
+
+
+def entry_identity(root: str) -> snapshot.Identity | None:
+    """The identity of the entry a resolved root was admitted under, where
+    the look above it stops: boot's, and only for an entry boot did not
+    see (an allowlist set after boot, which a test does) described now.
+    None when neither can be read, and the look climbs to the top. A
+    wrong identity can only make the climb go further, never stop it
+    short of the entry, since the entry's own directory has the identity
+    boot recorded or no directory on the chain has it."""
+    entry = snapshot_entry(root, app.state.repo_roots)
+    identities: dict[str, snapshot.Identity] = getattr(
+        app.state, "repo_root_identities", {}
+    )
+    if entry in identities:
+        return identities[entry]
+    return _root_identities([entry]).get(entry)
+
+
 def snapshot_entry(real: str, roots: Sequence[str]) -> str:
     """The deepest allowlist entry holding a resolved root: the one the
     operator named most exactly. Both the .git rule (vcs_below) and the
@@ -8487,6 +8525,14 @@ class DescriptorTree:
             # and a refusal raised from inside a close would hide the
             # refusal that was already on its way.
             pass
+
+    def parent(self, handle: snapshot.Handle) -> snapshot.Handle:
+        # '..' through the handle's descriptor, with the same flags as
+        # every directory open: what this directory's own entry says holds
+        # it, whatever any name above now points to. The path is for
+        # messages only, as every Handle's is.
+        path = f"{handle.path}/.." if handle.path else ".."
+        return self._directory(path, "..", handle.token)
 
     def link_target(self, handle: snapshot.Handle, entry: snapshot.Entry) -> str:
         path = f"{handle.path}/{entry.name}" if handle.path else entry.name
@@ -8676,7 +8722,11 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     )
     refuse_while_cloning(root)
     try:
-        members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
+        members = snapshot.walk(
+            tree=DescriptorTree(root),
+            patterns=body.patterns,
+            entry=entry_identity(root),
+        )
         head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))
         built = snapshot.compose(
             members, patterns=body.patterns, head=head, dirty=dirty
@@ -8771,7 +8821,11 @@ async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     )
     refuse_while_cloning(root)
     try:
-        return snapshot.list_members(tree=DescriptorTree(root), patterns=body.patterns)
+        return snapshot.list_members(
+            tree=DescriptorTree(root),
+            patterns=body.patterns,
+            entry=entry_identity(root),
+        )
     except snapshot.SnapshotError as exc:
         # Only a malformed pattern reaches here: every refusal about the
         # tree is reported in the listing rather than raised.

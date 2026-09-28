@@ -17353,6 +17353,16 @@ FILESYSTEM_CALLS = {
         "tree.root_path",
     },
     ("snapshot.py", "Survey._sightings.listing"): {"tree.entries"},
+    # THE LOOK ABOVE THE ROOT (Phase P, P3): through parent, one directory
+    # at a time from the root's own handle, each listed for the four
+    # names and closed. It opens nothing but directories and reads no
+    # file. DescriptorTree.parent makes no call of its own here: it is
+    # _directory with '..' and the handle's descriptor.
+    ("snapshot.py", "look_above"): {
+        "tree.close_handle",
+        "tree.entries",
+        "tree.parent",
+    },
     # The one place a member is opened and read: the composer's reader,
     # which walk hands the survey and list_members does not. That the
     # listing never reaches it is proved at runtime (the FakeTree ledger
@@ -17457,6 +17467,11 @@ FILESYSTEM_CALLS = {
     # Which clone a snapshot root is in, the same way: each clones row's
     # recorded directory, and the root's ancestors, stat'd.
     ("main.py", "_clone_for"): {"os.stat"},
+    # Each BENCH_REPO_ROOTS entry's device and inode, at boot from the
+    # operator's own variable (and, for an allowlist a test set after
+    # boot, when a root is admitted under it): where the look above a
+    # snapshot root stops.
+    ("main.py", "_root_identities"): {"os.stat"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
@@ -17531,6 +17546,8 @@ FILESYSTEM_TOUCHERS = {
     "close_handle",
     "link_target",
     "root_path",
+    # The ninth, since Phase P (P3): the look above the root.
+    "parent",
 }
 
 # os calls that compute on strings and touch nothing. A call into os
@@ -19029,11 +19046,13 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     inside .git is walked: a .git that is both the entry and the root
     holds the four names, so the walk refuses it, Compose with 422 and
     the listing with its stop row carrying the same sentence, and nothing
-    is stored. PRE-STATE: the entry is honored, since a root below it
-    that is not a git directory (its hooks) lists would_compose true;
-    ROOT_IN_VCS measures only below the entry, so vcs_below is false for
-    a root at its own entry and a 403 is not what refuses it; and git's
-    default configuration names no remote."""
+    is stored. Since Phase P (P3) a root BELOW such an entry (its hooks)
+    is refused too, by the look above the root, which checks the entry
+    it stops at: the root is inside a git directory, whoever named it.
+    Before P3 that root listed would_compose true (measured at 9571082).
+    PRE-STATE: ROOT_IN_VCS measures only below the entry, so vcs_below is
+    false for a root at its own entry and a 403 is not what refuses
+    either; and git's default configuration names no remote."""
     repo = tmp_path / "zqrepo"
     env = {
         "PATH": os.environ["PATH"],
@@ -19051,7 +19070,8 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     hooks = client.post(
         "/snapshots/listing", json={"root": str(dot_git / "hooks"), "patterns": ["*"]}
     )
-    assert hooks.status_code == 200 and hooks.json()["would_compose"] is True
+    assert hooks.status_code == 200 and hooks.json()["would_compose"] is False
+    assert hooks.json()["refusal"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
     assert bench_snapshot.vcs_below(str(dot_git), str(dot_git)) is False
 
     stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
@@ -19151,12 +19171,14 @@ def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp
 
 
 # The places below a git directory's top level that can carry a URL git
-# uses, each verified on the git named. logs/ is written by git itself
-# (git pull keeps its arguments verbatim in the reflog message; git fetch
-# anonymises them), so the fixture has git write it rather than planting
-# a file: update-ref -m with core.logAllRefUpdates on, which is the
-# reflog line a pull would leave, and the list has no fixed end.
+# uses, each verified on the git named. logs/ leads: it is written by git
+# itself (git pull keeps its arguments verbatim in the reflog message; git
+# fetch anonymises them), so the fixture has git write it rather than
+# planting a file: update-ref -m with core.logAllRefUpdates on, which is
+# the reflog line a pull would leave, and the list has no fixed end.
 BELOW_THE_TOP = [
+    # The reflog, written by git, not planted.
+    ("logs", "reflog"),
     # Legacy remote files git still reads for a fetch (git 2.43.0: `git
     # fetch legacy` resolves the URL they hold with no warning; the review
     # measured 2.50.1 reading them with a removal warning).
@@ -19170,25 +19192,28 @@ BELOW_THE_TOP = [
         "worktrees/wt",
         {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
     ),
-    # The reflog, written by git, not planted.
-    ("logs", "reflog"),
 ]
 
 
 @pytest.mark.parametrize(("place", "planted"), BELOW_THE_TOP)
-def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
+def test_a_root_below_a_git_directorys_top_level_is_refused_at_both_doors(
     client, tmp_path, place, planted
 ):
-    """WINDOW: POST /snapshots with the root placed INSIDE a git
-    directory, at remotes/, branches/, worktrees/wt/ and logs/, each
-    holding a file git reads or writes a remote URL in, with a sentinel
-    string in the userinfo position.
+    """WINDOW: POST /snapshots and POST /snapshots/listing with the root
+    placed INSIDE a git directory, at logs/, remotes/, branches/ and
+    worktrees/wt/, each holding a file git reads or writes a remote URL
+    in, with a sentinel string in the userinfo position.
 
-    This is the exposure BACKLOG names as open: the walk sees the four
-    names only at the root or below it, never above, so a root below a
-    git directory's top level composes and the sentinel is in the stored
-    text. The test pins the open state; when the ancestor look is built
-    it fails at the status and is rewritten as that commit's pre-state.
+    Phase P (P3) closes the exposure BACKLOG named as open: the look above
+    the root climbs from its handle and finds the four names one or two
+    directories up, so both doors refuse in the new sentence, the listing
+    in its stop row, nothing is stored, and no part of the sentinel is in
+    either answer. PRE-STATE, this test as it stood (the open-state pin,
+    test_below_a_git_directorys_top_level_the_walk_cannot_see_it, written
+    in 7b7241c, its logs/ case added in 48d4c82): the walk saw the four
+    names only at the root or below it, the composer answered 201 and the
+    sentinel was in the stored text; stash-proven against this commit's
+    parent, 201 with the sentinel on all four.
     The places, verified on git 2.43.0 here and by the review on 2.50.1:
     the two legacy files are used by `git fetch` (2.43.0 silently, 2.50.1
     with a removal warning); `git init` still makes an empty branches/
@@ -19238,9 +19263,208 @@ def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
         root.mkdir(parents=True, exist_ok=True)
         for name, text in planted.items():
             (root / name).write_text(text)
-    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    body = {"root": str(root), "patterns": ["**/*"]}
+    stored = client.app.state.db.execute("SELECT count(*) FROM attachments")
+    before = stored.fetchone()[0]
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422, composed.text
+    assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.status_code == 200
+    assert (listed.json()["would_compose"], listed.json()["complete"]) == (
+        False,
+        False,
+    )
+    assert listed.json()["members"] == [
+        {
+            "path": "",
+            "bytes": None,
+            "kind": "directory",
+            "status": "refused",
+            "reason": bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY,
+        }
+    ]
+    for text in (composed.text, listed.text):
+        assert SENTINEL not in text and "zqsentinel" not in text
+    after = client.app.state.db.execute("SELECT count(*) FROM attachments")
+    assert after.fetchone()[0] == before
+
+
+# ---- Phase P, P3: the look above the root, at the doors.
+
+
+def allow(client, entry):
+    """Allowlist one entry as boot reads BENCH_REPO_ROOTS: its resolved
+    spelling, and its device and inode, where the look above a root
+    admitted under it stops."""
+    entry = str(Path(entry).resolve())
+    client.app.state.repo_roots = (entry,)
+    # Read through getattr so a tree without the look (a pre-state) is
+    # allowlisted the same way and differs only in what its doors do.
+    identities = getattr(main, "_root_identities", lambda roots: {})
+    client.app.state.repo_root_identities = identities([entry])
+    return entry
+
+
+def on_climb(monkeypatch, step, action):
+    """Run action() on disk the moment the look is about to take its
+    step-th step up (1 is the root's parent), then let the real open of
+    '..' answer; returns the identity each step reached. On a tree with
+    no look there is nothing to hook, and nothing is reached."""
+    original = getattr(main.DescriptorTree, "parent", None)
+    reached = []
+
+    def hooked(self, handle):
+        if len(reached) + 1 == step:
+            action()
+        above = original(self, handle)
+        reached.append(above.identity)
+        return above
+
+    monkeypatch.setattr(main.DescriptorTree, "parent", hooked, raising=False)
+    return reached
+
+
+def identity_of(path):
+    seen = os.stat(path)
+    return (seen.st_dev, seen.st_ino)
+
+
+def test_a_plain_checkouts_subdirectory_still_composes(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on src/ of a
+    checkout git made (git init, not bare), the checkout's parent the
+    allowlist entry.
+
+    The look must not refuse a root whose ancestors hold a .git directory
+    beside them, only one whose ancestor is itself a git directory: a
+    normal checkout's .git is a sibling of its files, not their ancestor.
+    PRE-STATE: the checkout's top level holds .git, and .git holds the
+    four names, so a look that took .git's names for the checkout's would
+    refuse. A pin: this composed before P3 too (measured at 9571082)."""
+    env = git_env(tmp_path)
+    repo = tmp_path / "zqrepo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    held = {child.name for child in (repo / ".git").iterdir()}
+    assert {"HEAD", "config", "objects", "refs"} <= held
+    clone(repo, {"src/a.py": b"a = 1\n"})
+    allow(client, tmp_path)
+    body = {"root": str(repo / "src"), "patterns": ["**/*.py"]}
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.json()["would_compose"] is True, listed.text
+    composed = client.post("/snapshots", json=body)
     assert composed.status_code == 201, composed.text
-    assert SENTINEL in stored_text(client, composed.json()["digest"])
+
+
+def test_an_ancestor_swapped_for_a_link_mid_climb_is_not_followed(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on entry/a/b, where entry/a is renamed and
+    a symbolic link to an outside bare repository put in its place the
+    moment the look is about to climb from a to the entry.
+
+    The climb opens '..' through the descriptor it holds, so it goes on
+    through the directory that holds b, now named a-moved, to the entry,
+    and reports what that chain shows: no git directory, so the root is
+    walked, as it was before the look existed. PRE-STATE: by name,
+    entry/a is now the outside git directory, so a look that climbed by
+    name would refuse; the swap lands at the second step (before P3
+    there is no climb, so nothing lands and nothing is reached)."""
+    env = git_env(tmp_path)
+    outside = tmp_path / "zqoutside.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(outside)], env=env, check=True)
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+
+    def swap():
+        (entry / "a").rename(entry / "a-moved")
+        (entry / "a").symlink_to(outside)
+
+    reached = on_climb(monkeypatch, 2, swap)
+    composed = client.post(
+        "/snapshots", json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]}
+    )
+    assert (entry / "a").is_symlink()
+    assert reached == [identity_of(entry / "a-moved"), identity_of(entry)]
+    assert composed.status_code == 201, composed.text
+
+
+def test_an_ancestor_renamed_mid_climb_is_climbed_by_what_holds_the_root(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing on entry/a/b, entry/a renamed to
+    entry/z the moment the look is about to climb from a to the entry.
+
+    The chain is the directories that hold the root, whatever they are
+    now called: the look reaches the entry by its identity, stops there,
+    and the root is listed. PRE-STATE: the name the request gave no
+    longer spells the root's parent when the climb goes on."""
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+    reached = on_climb(monkeypatch, 2, lambda: (entry / "a").rename(entry / "z"))
+    listed = client.post(
+        "/snapshots/listing",
+        json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]},
+    )
+    assert not (entry / "a").exists()
+    assert reached == [identity_of(entry / "z"), identity_of(entry)]
+    assert listed.json()["would_compose"] is True, listed.text
+
+
+def test_the_entry_replaced_mid_climb_is_still_where_the_look_stops(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on entry/a/b, the entry renamed and a link
+    to an outside bare repository put under its name the moment the look
+    takes its first step.
+
+    The look stops at the directory boot described, by device and inode,
+    which is the renamed one on the root's own chain; the link now under
+    the entry's name is never opened. PRE-STATE: by name the entry is now
+    a git directory, so a look that stopped at the entry's name would
+    check it and refuse."""
+    env = git_env(tmp_path)
+    outside = tmp_path / "zqoutside.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(outside)], env=env, check=True)
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+    booted = identity_of(entry)
+
+    def swap():
+        entry.rename(tmp_path / "entry-old")
+        entry.symlink_to(outside)
+
+    reached = on_climb(monkeypatch, 1, swap)
+    composed = client.post(
+        "/snapshots", json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]}
+    )
+    assert entry.is_symlink()
+    assert reached == [identity_of(tmp_path / "entry-old" / "a"), booted]
+    assert composed.status_code == 201, composed.text
+
+
+@pytest.mark.parametrize("depth", [128, 129])
+def test_a_root_past_the_climbs_ceiling_below_its_entry_is_refused(
+    client, tmp_path, depth
+):
+    """WINDOW: POST /snapshots on a root `depth` plain directories below
+    its allowlist entry, on disk, at MAX_DEPTH and one past it.
+
+    A climb that reaches neither the entry nor the top within MAX_DEPTH
+    steps is refused in the ceiling's sentence; at the ceiling the entry
+    is reached and the root composes. PRE-STATE: no directory on the
+    chain holds a git name, and before P3 both depths composed (measured
+    at 9571082)."""
+    assert bench_snapshot.MAX_DEPTH == 128
+    entry = tmp_path / "e"
+    root = entry.joinpath(*["d"] * depth)
+    clone(root, {"x.py": b"x = 1\n"})
+    allow(client, entry)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["*.py"]})
+    if depth == 128:
+        assert composed.status_code == 201, composed.text
+    else:
+        assert composed.status_code == 422
+        assert composed.json()["detail"] == bench_snapshot.LOOK_CEILING
 
 
 # =====================================================================

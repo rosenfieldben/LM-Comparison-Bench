@@ -1794,8 +1794,8 @@ entry passes through `.git`, `.hg` or `.svn` (compared without regard to
 case, since a disk that folds case reaches `.git` as `.GIT` too); the
 refusal names the rule and not the path. It is measured from the deepest
 entry holding the root, so an entry you name inside `.git` yourself is
-walked, unless the root is itself a git directory (below). This was
-possible from Phase L until Phase O.
+walked, unless the root is itself a git directory or inside one (below).
+This was possible from Phase L until Phase O.
 
 **A git directory is refused wherever the walk meets it.** A bare
 repository (`repo.git`), a mirror, a `--separate-git-dir` and a
@@ -1813,6 +1813,31 @@ the rule and not the path; the listing's row says where. A tree that
 keeps a bare repository anywhere the walk goes, as some projects keep
 test fixtures, is refused whatever the patterns; name a root beside it.
 This was possible from Phase L until Phase O.
+
+**So is a root inside one.** Below a git directory's top level the walk
+cannot see the four names, and the files there can carry a URL git uses:
+the legacy `remotes/` and `branches/` files a fetch still reads, a linked
+worktree's `config.worktree`, and `logs/`, where git itself records a
+pull's arguments, a list with no fixed end. So before the walk lists
+anything below the root, both doors look above it: from the root's own
+directory handle, one directory at a time through `..`, never by a name,
+up to and including the `BENCH_REPO_ROOTS` entry the root was admitted
+under (recognised by the device and inode read at boot) or the top of
+the filesystem. If any of them holds `HEAD`, `config`, `objects` and
+`refs` together, Compose answers `422` and the listing's `200` stops at
+the root, both in the sentence "the root is inside a git directory,
+whose files can carry a remote URL with sign-in details in them, so it
+is not walked." A normal checkout is not refused: its `.git` sits beside
+its files, not above them, so the directory above `src/` lists `.git`
+and not the four names inside it. The look opens only directories, reads
+no file and only refuses; a directory above renamed, moved or replaced
+by a link while it climbs changes nothing it sees, because it climbs by
+the descriptors that hold the root, and the most such a race can give
+back is the walk as it was before the look existed. It climbs at most
+the walk's depth ceiling, 128 directories, and refuses a root farther
+than that below its entry, naming the ceiling; it lists at most the
+walk's twenty thousand entries on the way. This was possible from
+Phase L until Phase P.
 
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
@@ -1919,8 +1944,8 @@ because the composer skips it: what it names is read only under its own
 path, if a pattern selects that, and never if an exclusion covers it;
 `refused` carries the composer's sentence word for word. A file no
 pattern matches is not a row. A link out of the root, a socket, device
-or pipe, a directory past the depth ceiling, and a git directory refuse
-the snapshot whatever the patterns select, and the line above the table
+or pipe, a directory past the depth ceiling, a git directory, and a root
+inside one refuse the snapshot whatever the patterns select, and the line above the table
 says when the refusal is one of those, which narrowing cannot fix.
 
 `would_compose` is true exactly when the composer's walk would reach
