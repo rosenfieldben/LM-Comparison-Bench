@@ -1433,7 +1433,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 9**. Each trial line carries the ordered
+An **export is schema version 10**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1453,11 +1453,14 @@ sent for that trial with how it ended, so an artifact can be audited
 against a provider's bill line by line; `judge_call_id` and `pass_id` on
 each score; and the manifest's `scoring_passes`. A judged score written
 since version 9 has `judge_generation_id` and `judge_billed_cost_usd`
-null, because its call carries them: the figure is recorded once. The
-manifest states the reason for the current bump in the file itself, and
-it names every field the earlier versions added, because a reader
-holding a v9 artifact and a v2 parser needs the whole list from the file
-in their hand.
+null, because its call carries them: the figure is recorded once.
+Version 10 splits a pass's count of requests with no usable answer in
+two: `unanswered`, the requests nothing came back for, and `unusable`,
+the ones that got something back that could not be used. The manifest
+states the reason for the current bump in the file itself, and it names
+every field the earlier versions added, because a reader holding a v10
+artifact and a v2 parser needs the whole list from the file in their
+hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -2714,8 +2717,11 @@ lists an experiment's passes newest first, with the one running now as
 `active`, and `GET /experiments` and `GET /experiments/{id}` carry the
 latest as `scoring`: its judge, when it started and ended, how it ended
 (`finished`; `stopped`; `failed`, with the error; or `interrupted`), and
-how many trials it scored, how many it wrote with no score, and how many
-of its judge calls went out and got no usable answer. A pass that fails
+how many trials it scored, how many it wrote with no score, how many of
+its judge calls went out and got nothing back (`unanswered`: timed out,
+cut at shutdown, or its record cut off), and how many got a reply that
+could not be used (`unusable`: an error status, a body that could not be
+read, or a failure after sending). A pass that fails
 frees the bench's one scoring slot and stays in the list, and a re-score
 is a new pass beside it. The panel says the latest in a line beside
 Score, in the record's words and stamped in UTC ("scored 2026-09-28
@@ -2829,9 +2835,11 @@ is the bench's instrument cost, not what any model under test was paid.
 A judge reply that came back with no price is named as unpriced rather
 than counted as nothing spent (", K unpriced", or "none billed, K calls
 unpriced"). After the spend the line names each request the figure
-cannot speak for, as what it is: calls that went out and got no usable
-answer ("; M judge calls went out and got no usable answer"), calls that
-had not come back when the report was read (only while a pass runs), and
+cannot speak for, as what it is: calls that went out and got nothing
+back ("; M judge calls went out and got no answer"), calls that got a
+reply that could not be used ("; M judge calls got replies that could
+not be used"), calls that had not come back when the report was read
+(only while a pass runs), and
 judge rows written before the bench recorded its requests, which cannot
 say whether their request went out. A request never sent (no judge
 given, the ceiling refusing, a trial with no text, a connection never

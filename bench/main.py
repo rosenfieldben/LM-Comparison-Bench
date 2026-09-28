@@ -1362,8 +1362,8 @@ class ScoringPass(BaseModel):
     """One scoring pass as the record holds it, and whether it is the one
     this process is running.
 
-    The first nine fields are the scoring_passes row: outcome, ended_at
-    and the three counts are null until the pass ends, and a pass the
+    The first ten fields are the scoring_passes row: outcome, ended_at
+    and the four counts are null until the pass ends, and a pass the
     boot sweep closed has an outcome and no ended_at, because when it
     ended is not known. running and stopping are this process's, not the
     record's: running says the pass is the one the scoring slot holds,
@@ -1381,6 +1381,9 @@ class ScoringPass(BaseModel):
     scored: int | None
     failed: int | None
     unanswered: int | None
+    # Null only on a pass closed before this count existed, whose
+    # unanswered counted its failed calls too; see store.MIGRATIONS.
+    unusable: int | None
     running: bool
     stopping: bool
 
@@ -6755,6 +6758,7 @@ def _pass_view(row: dict[str, Any]) -> dict[str, Any]:
         "scored": row["scored"],
         "failed": row["failed"],
         "unanswered": row["unanswered"],
+        "unusable": row["unusable"],
         "running": running,
         "stopping": running and state["stop"].is_set(),
     }

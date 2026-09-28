@@ -4133,10 +4133,14 @@ PRE_P_SCHEMA_DIGEST = "7bba797726706e45793c31079a95be392d67431f3b6295dce6a590fdc
 # body on every database that already booted, so a changed body under
 # the old name would change nothing in the field. An edit here without a
 # new trigger name (and the old one dropped) is the mistake this catches.
-SEALS_DIGEST = "79495beb0cf76b702e4105c16737b67d11a31da7ae59d94735fe26d1adb88d37"
+# It moved once, and the rule was followed: the column unusable (the
+# operator's ruling 4 at P1's checkpoint) made scoring_passes_sealed_v2,
+# and store.RETIRED_SEALS drops v1. The digest was
+# 79495beb0cf76b702e4105c16737b67d11a31da7ae59d94735fe26d1adb88d37 until then.
+SEALS_DIGEST = "dee963a5b1c8bf58b86b7b08231876e4ea232001eb39403d9d387098b3b0c8bf"
 
 SEAL_NAMES = [
-    "scoring_passes_sealed_v1",
+    "scoring_passes_sealed_v2",
     "scoring_passes_never_replaced_v1",
     "scoring_passes_never_deleted_v1",
     "judge_calls_sealed_v1",
@@ -4537,9 +4541,11 @@ def test_a_pass_ends_once_with_counts_from_its_own_rows(db):
 
     The counts are read from the records in the statement that seals the
     pass: scored is a row with a score, failed a row with none,
-    unanswered a call that went out and got no usable answer. A call
-    that was never sent and one that was answered are not unanswered,
-    and another pass's rows count toward nothing here. The second close
+    unanswered a call that went out and got nothing back, unusable one
+    that got a reply it could not use (two counts, two words, the
+    operator's ruling 4 at P1's checkpoint; unanswered counted both until
+    then). A call that was never sent and one that was answered are
+    neither, and another pass's rows count toward nothing here. The second close
     is the store's refusal and leaves the row as it was. PRE-STATE: the
     pass is open with no counts, and the other pass has rows of its own."""
     eid, (r1, r2) = _scoring_setup(db)
@@ -4548,9 +4554,8 @@ def test_a_pass_ends_once_with_counts_from_its_own_rows(db):
     pass_id = store.open_scoring_pass(db, eid, "j/x")
     opened = _row(db, "scoring_passes", pass_id)
     assert opened["started_at"] and opened["ended_at"] is None
-    assert [opened[k] for k in ("outcome", "scored", "failed", "unanswered")] == [
-        None
-    ] * 4
+    counts = ("outcome", "scored", "failed", "unanswered", "unusable")
+    assert [opened[k] for k in counts] == [None] * 5
 
     ends = [
         ("answered", True),
@@ -4569,7 +4574,8 @@ def test_a_pass_ends_once_with_counts_from_its_own_rows(db):
     ended = _row(db, "scoring_passes", pass_id)
     assert ended["ended_at"] >= ended["started_at"]
     assert (ended["outcome"], ended["detail"]) == ("finished", None)
-    assert (ended["scored"], ended["failed"], ended["unanswered"]) == (2, 1, 2)
+    assert (ended["scored"], ended["failed"]) == (2, 1)
+    assert (ended["unanswered"], ended["unusable"]) == (1, 1)
     with pytest.raises(store.AlreadyRecorded, match=f"scoring pass {pass_id} has"):
         store.close_scoring_pass(db, pass_id, "failed", "late")
     assert _row(db, "scoring_passes", pass_id) == ended
@@ -4651,6 +4657,7 @@ def test_the_boot_sweep_closes_what_a_dead_process_left_open(db):
         store.FOUND_OPEN_AT_BOOT,
     )
     assert (swept["scored"], swept["failed"], swept["unanswered"]) == (1, 0, 1)
+    assert swept["unusable"] == 0
     call = _row(db, "judge_calls", left)
     assert (call["outcome"], call["detail"], call["answered_at"]) == (
         "interrupted",
@@ -4923,3 +4930,131 @@ def test_a_lock_is_held_only_under_a_name_it_knows(tmp_path):
         store.hold_lock(path, "script")
     assert not (tmp_path / "bench.db.lock").exists()
     assert store.hold_lock(":memory:", "server") is None
+
+
+P1_SCHEMA = (pathlib.Path(__file__).parent / "fixtures" / "p1_schema.sql").read_text()
+
+# The sha256 of SCHEMA's body and then SEALS's body at 74ca55b, as `git show
+# 74ca55b:bench/store.py` gave them when the fixture was extracted.
+P1_SCHEMA_DIGEST = "75003702eab206f77c91417c5efb38bb8a4d5f14329fa10bb179f79352cd0d70"
+
+
+def test_the_p1_fixture_is_the_schema_and_seals_before_the_split():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's and then SEALS's
+    text at 74ca55b, pinned by digest. The right era: it has the scoring
+    tables and scoring_passes_sealed_v1, and no unusable column."""
+    body = "".join(
+        line
+        for line in P1_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == P1_SCHEMA_DIGEST
+    assert "CREATE TABLE IF NOT EXISTS scoring_passes" in body
+    assert "CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v1" in body
+    assert "unusable" not in body
+    assert "git show 74ca55b:bench/store.py" in P1_SCHEMA
+
+
+def test_migration_onto_a_p1_database_splits_the_counts_and_retires_the_seal(
+    tmp_path,
+):
+    """WINDOW: a database as P1's builds left it (74ca55b's SCHEMA and
+    SEALS, plus the two columns only MIGRATIONS added), holding a pass
+    closed with one failed call counted as unanswered, through connect()
+    twice.
+
+    The column arrives by MIGRATIONS, NULL on the old pass, whose every
+    other field is as it was: its unanswered still counts the failed call,
+    and the NULL is what says so (see store.MIGRATIONS). The v1 seal is
+    dropped and v2 laid, so the new column is sealed too: the old pass,
+    having ended, refuses a late fill of it in v2's sentence. A pass closed
+    on the migrated database counts the two apart. PRE-STATE: no unusable
+    column, v1 in force and v2 absent, and the old pass's unanswered is
+    1 for its one failed call."""
+    db_path = tmp_path / "p1.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(P1_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p1', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES ('p', '2026-09-28')"
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               outcome = 'failed', detail = 'judge returned HTTP 500'
+            WHERE id = 1"""
+    )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 0, failed = 1, unanswered = 1
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.row_factory = sqlite3.Row
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(scoring_passes)")]
+    assert "unusable" not in columns
+    triggers = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    assert "scoring_passes_sealed_v1" in triggers
+    assert "scoring_passes_sealed_v2" not in triggers
+    before = dict(legacy.execute("SELECT * FROM scoring_passes").fetchone())
+    assert before["unanswered"] == 1
+    legacy.close()
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            triggers = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert "scoring_passes_sealed_v1" not in triggers
+            assert _seals_as_stored(conn) == sealed
+            assert _row(conn, "scoring_passes", 1) == {**before, "unusable": None}
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            with conn:
+                conn.execute("UPDATE scoring_passes SET unusable = 1 WHERE id = 1")
+        assert str(refused.value) == PASS_LATE
+        pass_id = store.open_scoring_pass(conn, 1, "j/x")
+        for outcome, replied in (("failed", True), ("timed_out", False)):
+            call_id = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+            store.record_judge_call_answer(conn, call_id, outcome, replied=replied)
+        store.close_scoring_pass(conn, pass_id, "finished")
+        made = _row(conn, "scoring_passes", pass_id)
+        assert (made["unanswered"], made["unusable"]) == (1, 1)
+    finally:
+        conn.close()

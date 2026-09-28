@@ -225,7 +225,8 @@ CREATE TABLE IF NOT EXISTS scoring_passes (
     detail TEXT,
     scored INTEGER,
     failed INTEGER,
-    unanswered INTEGER
+    unanswered INTEGER,
+    unusable INTEGER
 );
 CREATE TABLE IF NOT EXISTS judge_calls (
     id INTEGER PRIMARY KEY,
@@ -346,8 +347,13 @@ END;
 # A changed seal gets a new name (_v2), and connect() drops the old one
 # in the same commit. The text below is pinned by digest in the tests,
 # so an edit that forgets the rename fails there.
+# THE SEALS NO LONGER IN FORCE, dropped by connect() before SEALS is laid.
+# scoring_passes_sealed_v1 named every column of the table as 1e6f2ab
+# made it; the column unusable (ruling 4) made it v2.
+RETIRED_SEALS = ("scoring_passes_sealed_v1",)
+
 SEALS = """
-CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v1
+CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2
 BEFORE UPDATE ON scoring_passes
 BEGIN
     SELECT RAISE(ABORT,
@@ -362,7 +368,8 @@ BEGIN
         OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail)
         OR (OLD.scored IS NOT NULL AND NEW.scored IS NOT OLD.scored)
         OR (OLD.failed IS NOT NULL AND NEW.failed IS NOT OLD.failed)
-        OR (OLD.unanswered IS NOT NULL AND NEW.unanswered IS NOT OLD.unanswered);
+        OR (OLD.unanswered IS NOT NULL AND NEW.unanswered IS NOT OLD.unanswered)
+        OR (OLD.unusable IS NOT NULL AND NEW.unusable IS NOT OLD.unusable);
     SELECT RAISE(ABORT,
         'a scoring pass ends once, and this one has already ended')
      WHERE OLD.outcome IS NOT NULL;
@@ -876,6 +883,16 @@ MIGRATIONS = [
     # clone_id's reasons above.
     ("scores", "judge_call_id", "INTEGER REFERENCES judge_calls(id)"),
     ("scores", "pass_id", "INTEGER REFERENCES scoring_passes(id)"),
+    # Phase P, the operator's ruling 4 at P1's checkpoint: TWO COUNTS, TWO
+    # WORDS. A pass's end counted every sent request with no usable answer
+    # as unanswered; it now counts a request nothing came back for
+    # (timed_out, stopped, interrupted) as unanswered and one something
+    # came back for that could not be used (failed) as unusable, beside
+    # it. NULL on a pass closed before this column, whose unanswered then
+    # counted its failed calls too: only builds 95ee626 to 74ca55b wrote
+    # such a pass, and none was released. Filled once, with the other
+    # counts, in the statement that ends the pass.
+    ("scoring_passes", "unusable", "INTEGER"),
 ]
 
 
@@ -1146,6 +1163,12 @@ def connect(path: str) -> sqlite3.Connection:
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
     conn.executescript(TRIGGERS)
+    # A seal whose body changed has a new name, and the old name is
+    # dropped here, first: CREATE TRIGGER IF NOT EXISTS would leave the
+    # old body in force under the old name on every database that booted
+    # before the change. See SEALS and RETIRED_SEALS.
+    for retired in RETIRED_SEALS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {retired}")
     conn.executescript(SEALS)
     # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
     # reader because of a real gap rather than for tidiness.
@@ -3588,10 +3611,13 @@ CALL_OUTCOMES = (
     "interrupted",
 )
 
-# Sent, and no usable answer came back: what a pass's end counts as
-# unanswered and what the report calls unanswered. Not answered, which
-# came back, and not not_sent, which never left.
-UNANSWERED_CALL_OUTCOMES = ("timed_out", "stopped", "failed", "interrupted")
+# TWO COUNTS, TWO WORDS (the operator's ruling 4 at P1's checkpoint).
+# Unanswered: the request was sent and nothing came back, because it
+# timed out, was cut at shutdown, or had its record cut off. Unusable:
+# something came back and could not be used (failed). Neither is answered,
+# which came back usable, or not_sent, which never left.
+UNANSWERED_CALL_OUTCOMES = ("timed_out", "stopped", "interrupted")
+UNUSABLE_CALL_OUTCOMES = ("failed",)
 
 FOUND_OPEN_AT_BOOT = "found open at boot"
 
@@ -3619,7 +3645,7 @@ class AlreadyRecorded(Exception):
 # seals it, so they are what the records say and not what the process
 # remembered. scored is a trial the pass gave a score; failed is a trial
 # whose row it wrote with none; unanswered is a request it sent that got
-# no usable answer.
+# nothing back, and unusable one that got something back it could not use.
 _PASS_COUNTS = f"""
     scored = (SELECT COUNT(*) FROM scores
                WHERE scores.pass_id = scoring_passes.id
@@ -3630,7 +3656,11 @@ _PASS_COUNTS = f"""
     unanswered = (SELECT COUNT(*) FROM judge_calls
                    WHERE judge_calls.pass_id = scoring_passes.id
                      AND judge_calls.outcome IN
-                         ({", ".join(f"'{o}'" for o in UNANSWERED_CALL_OUTCOMES)}))"""
+                         ({", ".join(f"'{o}'" for o in UNANSWERED_CALL_OUTCOMES)})),
+    unusable = (SELECT COUNT(*) FROM judge_calls
+                 WHERE judge_calls.pass_id = scoring_passes.id
+                   AND judge_calls.outcome IN
+                       ({", ".join(f"'{o}'" for o in UNUSABLE_CALL_OUTCOMES)}))"""
 
 
 def open_scoring_pass(

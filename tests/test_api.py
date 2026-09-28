@@ -5174,6 +5174,7 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
         "billed_calls": 1,
         "unpriced_calls": 1,
         "unanswered_calls": 1,
+        "unusable_answers": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -6480,12 +6481,17 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 9
+    assert manifest["export_schema_version"] == 10
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[9]
-    # Version 9 is Phase P's scoring records: the judge calls on each
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[10]
+    # Version 10 is the operator's ruling 4 at P1's checkpoint: a pass's
+    # unanswered count split from its unusable one, and the note says the
+    # meaning of unanswered changed and what a null unusable means.
+    assert "unusable" in manifest["export_schema_change"]
+    assert "in version 9 unanswered counted both" in manifest["export_schema_change"]
+    # Version 9, carried: Phase P's scoring records: the judge calls on each
     # trial line, the two citations on each score, the passes in the
     # manifest, and the two old judge columns null on a judged score
     # whose call carries them.
@@ -6495,12 +6501,9 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
     # This experiment was scored once, deterministically: one pass,
     # finished, cited by every score, and no judge call on any line.
     (scored,) = manifest["scoring_passes"]
-    assert set(scored) == set(report.PASS_FIELDS)
-    assert (scored["outcome"], scored["judge_model"], scored["unanswered"]) == (
-        "finished",
-        None,
-        0,
-    )
+    assert set(scored) == set(report.PASS_FIELDS) >= {"unanswered", "unusable"}
+    assert (scored["outcome"], scored["judge_model"]) == ("finished", None)
+    assert (scored["unanswered"], scored["unusable"]) == (0, 0)
     trials = [line for line in lines if line["type"] == "trial"]
     assert {s["pass_id"] for line in trials for s in line["scores"]} == {scored["id"]}
     assert all(line["judge_calls"] == [] for line in trials)
@@ -7552,6 +7555,7 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
         "billed_calls": 0,
         "unpriced_calls": 0,
         "unanswered_calls": 0,
+        "unusable_answers": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -17235,7 +17239,7 @@ def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 9
+    assert manifest["export_schema_version"] == 10
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -20742,7 +20746,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 9
+    assert manifest["export_schema_version"] == 10
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(
@@ -22488,6 +22492,7 @@ def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
             "scored",
             "failed",
             "unanswered",
+            "unusable",
             "running",
             "stopping",
         }
@@ -22814,9 +22819,12 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
     and is counted nowhere. Anything after the connection counts as sent,
     because money may have moved: a read timeout is timed_out, and a
     write timeout, a broken read, a protocol error, an error status and a
-    body that cannot be read are failed; all five are unanswered.
-    answered_at is set only where a reply arrived (the error status and
-    the unreadable body). The class decides, never the detail string.
+    body that cannot be read are failed. Two counts and two words (the
+    operator's ruling 4 at P1's checkpoint): the timeout is unanswered,
+    nothing came back; the five failed are unusable, and until the ruling
+    were counted unanswered with it. answered_at is set only where a reply
+    arrived (the error status and the unreadable body). The class decides,
+    never the detail string.
     PRE-STATE: before this phase the three not_sent rows and the timeout
     were the same score row; here the call row exists before the request
     is made, with no ending."""
@@ -22840,11 +22848,18 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
     assert (call["answered_at"] is not None) is replied
     assert call["sent_at"] and call["generation_id"] is None
     cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
-    assert cost["unanswered_calls"] == (0 if outcome == "not_sent" else 1)
+    assert (cost["unanswered_calls"], cost["unusable_answers"]) == {
+        "not_sent": (0, 0),
+        "timed_out": (1, 0),
+        "failed": (0, 1),
+    }[outcome]
     assert (cost["billed_calls"], cost["in_flight_calls"]) == (0, 0)
     (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
     assert (made["outcome"], made["failed"]) == ("finished", 1)
-    assert made["unanswered"] == cost["unanswered_calls"]
+    assert (made["unanswered"], made["unusable"]) == (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+    )
 
 
 @respx.mock
@@ -23581,6 +23596,7 @@ def test_the_report_over_a_pre_p_database_shows_what_its_rows_support(
         "billed_calls": 1,
         "unpriced_calls": 1,
         "unanswered_calls": 0,
+        "unusable_answers": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
@@ -23690,14 +23706,16 @@ def test_a_mixed_era_experiment_reports_each_request_once(client, tmp_path):
         "total_usd": math.fsum([0.002, 0.003]),
         "billed_calls": 2,
         "unpriced_calls": 2,
-        "unanswered_calls": 2,
+        "unanswered_calls": 1,
+        "unusable_answers": 1,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
     assert rebuilt["judge_cost"] == served["judge_cost"]
     assert rebuilt["scoring_passes"] == served["scoring_passes"]
     (made,) = served["scoring_passes"]
-    assert (made["outcome"], made["scored"], made["unanswered"]) == ("finished", 2, 2)
+    assert (made["outcome"], made["scored"]) == ("finished", 2)
+    assert (made["unanswered"], made["unusable"]) == (1, 1)
 
 
 def lift_to_pre_p(lines):
@@ -23826,7 +23844,7 @@ def test_the_spend_line_reads_exactly_the_keys_the_report_writes():
         spend,
     )
     keys, line = read
-    assert line.count(";") == 3 and ", 1 unpriced" in line
+    assert line.count(";") == 4 and ", 1 unpriced" in line
     assert keys == sorted(written)
 
 

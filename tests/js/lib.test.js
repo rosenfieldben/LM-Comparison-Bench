@@ -1444,6 +1444,7 @@ const NO_SPEND = {
   billed_calls: 0,
   unpriced_calls: 0,
   unanswered_calls: 0,
+  unusable_answers: 0,
   in_flight_calls: 0,
   rows_before_call_records: 0,
 };
@@ -1479,11 +1480,19 @@ test("judgeSpendLine states the figure, then the calls it cannot speak for", () 
 test("judgeSpendLine names unanswered, in-flight and older rows each in its own words", () => {
   assert.equal(
     judgeSpendLine({ ...NO_SPEND, unanswered_calls: 3 }),
-    "judge spend: none billed; 3 judge calls went out and got no usable answer",
+    "judge spend: none billed; 3 judge calls went out and got no answer",
   );
   assert.equal(
     judgeSpendLine({ ...NO_SPEND, unanswered_calls: 1 }),
-    "judge spend: none billed; 1 judge call went out and got no usable answer",
+    "judge spend: none billed; 1 judge call went out and got no answer",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unusable_answers: 2 }),
+    "judge spend: none billed; 2 judge calls got replies that could not be used",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unusable_answers: 1 }),
+    "judge spend: none billed; 1 judge call got a reply that could not be used",
   );
   assert.equal(
     judgeSpendLine({ ...NO_SPEND, in_flight_calls: 1 }),
@@ -1501,13 +1510,15 @@ test("judgeSpendLine names unanswered, in-flight and older rows each in its own 
       billed_calls: 2,
       unpriced_calls: 2,
       unanswered_calls: 2,
+      unusable_answers: 1,
       in_flight_calls: 2,
       rows_before_call_records: 1,
     }),
     "judge spend: $0.0050 over 2 billed calls, 2 unpriced; 2 judge calls " +
-      "went out and got no usable answer; 2 judge calls had not come back " +
-      "when this report was read; 1 judge row written before the bench " +
-      "recorded its requests cannot say whether its request went out",
+      "went out and got no answer; 1 judge call got a reply that could not " +
+      "be used; 2 judge calls had not come back when this report was read; " +
+      "1 judge row written before the bench recorded its requests cannot " +
+      "say whether its request went out",
   );
 });
 
@@ -1522,6 +1533,7 @@ const A_PASS = {
   scored: 3,
   failed: 0,
   unanswered: 0,
+  unusable: 0,
   running: false,
   stopping: false,
 };
@@ -1547,9 +1559,18 @@ test("scoringPassLine says how the last pass ended, with its counts", () => {
       scored: 1,
       failed: 2,
       unanswered: 1,
+      unusable: 2,
     }),
     "scored 2026-09-28 07:12:30 UTC, with no judge: 1 trial scored, " +
-      "2 with no score, 1 judge call got no usable answer",
+      "2 with no score, 1 judge call got no answer, 2 judge replies could " +
+      "not be used",
+  );
+  // A pass closed before the split has no unusable count, and its
+  // unanswered held both, so the line keeps the wording true of both.
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unanswered: 2, unusable: null }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "2 judge calls got no usable answer",
   );
   assert.equal(
     scoringPassLine({
@@ -1570,7 +1591,7 @@ test("scoringPassLine says how the last pass ended, with its counts", () => {
     }),
     "the last scoring pass stopped (2026-09-28 07:12:30 UTC, judged by " +
       "judge/one): stopped on request, between trials; 1 trial scored, " +
-      "2 judge calls got no usable answer",
+      "2 judge calls got no answer",
   );
   assert.equal(
     scoringPassLine({
@@ -1583,7 +1604,7 @@ test("scoringPassLine says how the last pass ended, with its counts", () => {
     }),
     "the last scoring pass was interrupted (started 2026-09-28 07:10:00 " +
       "UTC, judged by judge/one): found open at boot; 0 trials scored, " +
-      "1 judge call got no usable answer",
+      "1 judge call got no answer",
   );
 });
 

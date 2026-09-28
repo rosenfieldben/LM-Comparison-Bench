@@ -1026,12 +1026,30 @@
       (pass.failed > 0
         ? ", " + counted(pass.failed, " with no score", " with no score")
         : "") +
+      // Two counts, two words (the operator's ruling 4 at P1's
+      // checkpoint). A pass closed before the split has no unusable
+      // count and its unanswered holds both, so it keeps the one wording
+      // that is true of both.
       (pass.unanswered > 0
         ? ", " +
+          (pass.unusable === null
+            ? counted(
+                pass.unanswered,
+                " judge call got no usable answer",
+                " judge calls got no usable answer",
+              )
+            : counted(
+                pass.unanswered,
+                " judge call got no answer",
+                " judge calls got no answer",
+              ))
+        : "") +
+      (pass.unusable > 0
+        ? ", " +
           counted(
-            pass.unanswered,
-            " judge call got no usable answer",
-            " judge calls got no usable answer",
+            pass.unusable,
+            " judge reply could not be used",
+            " judge replies could not be used",
           )
         : "");
     if (pass.outcome === "finished") {
@@ -1068,9 +1086,11 @@
   // The report's judge spend as one line, from report.judge_cost. What
   // the judging cost first, then each request it cannot speak for, each
   // count in words true of every request counted: an unpriced call came
-  // back with no price; an unanswered one went out and got no usable
-  // answer (timed out, cut at shutdown, failed after sending); one in
-  // flight had not come back when the report was read; and a judge row
+  // back with no price; an unanswered one went out and got nothing back
+  // (timed out, cut at shutdown, its record cut off); an unusable one got
+  // a reply that could not be used (an error status, a body that could
+  // not be read, a failure after sending); one in flight had not come
+  // back when the report was read; and a judge row
   // written before the bench recorded its requests cannot say whether its
   // request went out. A request never sent is in none of them. Every key
   // it reads is a key of the report's judge_cost, which a test holds.
@@ -1093,8 +1113,17 @@
         "; " +
         counted(
           spend.unanswered_calls,
-          " judge call went out and got no usable answer",
-          " judge calls went out and got no usable answer",
+          " judge call went out and got no answer",
+          " judge calls went out and got no answer",
+        );
+    }
+    if (spend.unusable_answers > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.unusable_answers,
+          " judge call got a reply that could not be used",
+          " judge calls got replies that could not be used",
         );
     }
     if (spend.in_flight_calls > 0) {

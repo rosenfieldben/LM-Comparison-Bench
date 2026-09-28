@@ -40,7 +40,7 @@ from typing import Any
 from bench.datasets import JUDGE_SCORER
 from bench.models import as_flag
 from bench.scoring import latest_per_key
-from bench.store import UNANSWERED_CALL_OUTCOMES
+from bench.store import UNANSWERED_CALL_OUTCOMES, UNUSABLE_CALL_OUTCOMES
 
 # The message the disconnect path writes, shared rather than duplicated.
 # A reader matching this literal on its own would be matching prose that
@@ -1716,9 +1716,15 @@ def _judge_cost(
       billed_calls        a request with a billed figure, in either era.
       unpriced_calls      answered and no figure; before Phase P, a row
                           with a generation id and no figure.
-      unanswered_calls    sent, and no usable answer came back: timed
-                          out, cut at shutdown, failed after sending, or
-                          interrupted. A request never sent is not one.
+      unanswered_calls    sent, and nothing came back: timed out, cut at
+                          shutdown, or its record cut off (interrupted).
+      unusable_answers    sent, and something came back that could not
+                          be used: an error status, a body that could not
+                          be read, or a transport failure after sending
+                          (failed). Two counts and two words, by the
+                          operator's ruling 4 at P1's checkpoint; until it
+                          one count, unanswered_calls, held both.
+                          A request never sent is in neither.
       in_flight_calls     sent and not yet ended, when the report was
                           read; only a running pass has any, since the
                           boot sweep ends what a dead process left.
@@ -1777,6 +1783,9 @@ def _judge_cost(
         "unanswered_calls": sum(
             1 for call in judge_calls if call["outcome"] in UNANSWERED_CALL_OUTCOMES
         ),
+        "unusable_answers": sum(
+            1 for call in judge_calls if call["outcome"] in UNUSABLE_CALL_OUTCOMES
+        ),
         "in_flight_calls": sum(1 for call in judge_calls if call["outcome"] is None),
         "rows_before_call_records": sum(
             1 for row in unpriced_old if row.get("judge_generation_id") is None
@@ -1797,6 +1806,7 @@ PASS_FIELDS = (
     "scored",
     "failed",
     "unanswered",
+    "unusable",
 )
 
 CALL_FIELDS = (
@@ -1833,7 +1843,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 9
+EXPORT_SCHEMA_VERSION = 10
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1963,6 +1973,15 @@ def _manifest_token_note() -> str:
 # P, whose call holds them: the money is recorded once. Field additions
 # throughout, so the first limb of the rule again; and the null that
 # moves is why a reader summing the old columns must be told.
+#
+# Version 10 is the operator's ruling 4 at P1's checkpoint: two counts,
+# two words. Each record in scoring_passes gains unusable, the requests
+# that got something back that could not be used, and unanswered narrows
+# to the requests nothing came back for. Both limbs this time: a field
+# addition, and a key whose meaning changed, which a reader holding a
+# version 9 file must be told; only builds on the phase's draft branch
+# ever wrote one. A pass closed by one of those carries unusable null,
+# and its unanswered counts its failed calls too.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -2118,6 +2137,37 @@ EXPORT_SCHEMA_NOTES = {
         "renditions, the ordered pins each with digest, extractor, "
         "extractor_version and kind, from version 3, and kind may be "
         "snapshot from version 6; token_counts in the manifest and "
+        "is_byok on each trial line from version 4; task_attachments and "
+        "attachments_mode in the manifest from version 5."
+    ),
+    10: (
+        "each record in the manifest's scoring_passes carries unusable, the "
+        "requests that pass sent that got something back that could not be "
+        "used (outcome failed), and unanswered now counts only the requests "
+        "nothing came back for (timed_out, stopped, interrupted); in version "
+        "9 unanswered counted both. A pass closed by a build before this "
+        "version carries unusable null, and its unanswered counts its failed "
+        "calls too. Both a field addition and a changed meaning. Every field "
+        "the earlier versions added is carried with its meaning intact: "
+        "judge_calls on each trial line, each with id, pass_id, judge_model, "
+        "sent_at, answered_at, generation_id, billed_cost_usd, outcome and "
+        "detail, judge_call_id and pass_id on each score, and scoring_passes "
+        "in the manifest, from version 9, where a judged score written from "
+        "then on has judge_generation_id and judge_billed_cost_usd null "
+        "because its call carries them, so the figure is recorded once and a "
+        "reader summing judge spend reads the calls, plus the scores whose "
+        "pass_id is null; pass_id is null on a judge or deterministic score "
+        "written before version 9 and on every human rating; answered_at is "
+        "set only when a reply arrived; clone_id on each record in the "
+        "manifest's captures from version 8, and the URL is deliberately not "
+        "in the artifact; capture_id on pins and captures in the manifest, "
+        "with head, dirty, patterns, excludes and captured_at for each, from "
+        "version 7; attachments and attachments_mode on each trial line and "
+        "attachments_referenced in the manifest from version 2, whose truth "
+        "conditions widened at version 5 because the manifest itself now "
+        "cites digests; renditions, the ordered pins each with digest, "
+        "extractor, extractor_version and kind, from version 3, and kind may "
+        "be snapshot from version 6; token_counts in the manifest and "
         "is_byok on each trial line from version 4; task_attachments and "
         "attachments_mode in the manifest from version 5."
     ),

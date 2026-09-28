@@ -1244,15 +1244,16 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
     A reply with no price is a call that went out, so the line names it
     as unpriced rather than reading "none billed" as if nothing had been
     spent. Since Phase P each request the figure cannot speak for is
-    named for what it is: the judge's 500 as a call that went out and got
-    no usable answer, the old row as one that cannot say whether its
-    request went out, and the pass with no judge as nothing, since it
-    sent nothing. Until then the line counted every judge row with no
+    named for what it is: the judge's 500 as a call that got a reply that
+    could not be used (an unusable answer, by the operator's ruling 4 at
+    P1's checkpoint; it was counted with the unanswered until then), the
+    old row as one that cannot say whether its request went out, and the
+    pass with no judge as nothing, since it sent nothing. Until then the line counted every judge row with no
     figure together ("judge rows carry no billing figure"), the unpriced
     call and the no-judge rows among them. The expected text is built
     here from the payload's numbers, not by the page's own code.
     PRE-STATE: A's payload holds two unpriced calls and nothing else, and
-    B's one billed call, one unpriced, one unanswered and one old row, so
+    B's one billed call, one unpriced, one unusable and one old row, so
     each count the line states is one the records hold."""
     a, a_digest = finished(page, bench_url, JUDGED, lineup=("stub/fast", "stub/slow"))
     b, b_digest = finished(page, bench_url, JUDGED)
@@ -1294,6 +1295,7 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         "billed_calls": 0,
         "unpriced_calls": 2,
         "unanswered_calls": 0,
+        "unusable_answers": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }, a_spend
@@ -1301,9 +1303,10 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         b_spend["billed_calls"],
         b_spend["unpriced_calls"],
         b_spend["unanswered_calls"],
+        b_spend["unusable_answers"],
         b_spend["in_flight_calls"],
         b_spend["rows_before_call_records"],
-    ) == (1, 1, 1, 0, 1), b_spend
+    ) == (1, 1, 0, 1, 0, 1), b_spend
     bench(["stub/fast"])
     open_experiments(page)
     line = page.get_by_test_id("report-judge-spend")
@@ -1318,8 +1321,8 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         f"judge spend: ${b_spend['total_usd']:.4f} over "
         f"{b_spend['billed_calls']} billed call, "
         f"{b_spend['unpriced_calls']} unpriced; "
-        f"{b_spend['unanswered_calls']} judge call went out and got no usable "
-        "answer; "
+        f"{b_spend['unusable_answers']} judge call got a reply that could not "
+        "be used; "
         f"{b_spend['rows_before_call_records']} judge row written before the "
         "bench recorded its requests cannot say whether its request went out"
     )
