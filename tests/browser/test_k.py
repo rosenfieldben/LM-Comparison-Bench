@@ -146,6 +146,12 @@ def test_a_restricted_session_says_so_at_the_attach_control(zdr_bench):
     one file over proves the header, and this proves the control, which
     is a different element fed from a different place."""
     page = zdr_bench(["stub/fast"])
+    # The note repaints once the page has read GET /models, which boot
+    # does not wait for: goto returns at load, and the page first paints
+    # the default sentence.
+    expect(page.get_by_test_id("attach-note")).to_contain_text(
+        "Session routing: zero-retention"
+    )
 
     note = page.get_by_test_id("attach-note").inner_text()
 

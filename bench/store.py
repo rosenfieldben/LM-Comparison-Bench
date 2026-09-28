@@ -154,6 +154,16 @@ CREATE TABLE IF NOT EXISTS attachment_extractions (
     extracted_chars INTEGER,
     UNIQUE (digest, extractor, extractor_version)
 );
+CREATE TABLE IF NOT EXISTS clones (
+    id INTEGER PRIMARY KEY,
+    url TEXT NOT NULL,
+    ref TEXT NOT NULL,
+    head_sha TEXT NOT NULL,
+    root TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE (url, ref)
+);
 CREATE TABLE IF NOT EXISTS snapshot_captures (
     id INTEGER PRIMARY KEY,
     digest TEXT NOT NULL,
@@ -163,7 +173,8 @@ CREATE TABLE IF NOT EXISTS snapshot_captures (
     dirty INTEGER,
     patterns_json TEXT NOT NULL,
     excludes_json TEXT NOT NULL,
-    captured_at TEXT NOT NULL
+    captured_at TEXT NOT NULL,
+    clone_id INTEGER REFERENCES clones(id)
 );
 CREATE TABLE IF NOT EXISTS datasets (
     digest TEXT PRIMARY KEY NOT NULL,
@@ -636,6 +647,40 @@ MIGRATIONS = [
     # and a browser can decide on without reading a body or parsing one;
     # the content is authoritative and these never disagree with it,
     # because they are computed from one parse of it in one statement.
+    #
+    # Phase O, the clones POST /clones made. NO ENTRY HERE, for Phase N's
+    # reason: a whole new table, created on any database by CREATE TABLE
+    # IF NOT EXISTS. Proven against tests/fixtures/pre_o_schema.sql.
+    #
+    # ONE ROW PER REPOSITORY AND REF, the clone's identity, and the ONE
+    # place the URL is recorded: never in a composed text, a manifest or
+    # an export, because a URL is not a fact about the reading. The row
+    # is the clone's working tree as it is now, so head_sha, root and
+    # updated_at move when a clone is replaced. A row is never deleted
+    # (see record_clone).
+    #
+    # WHY THE ROW MAY MOVE, and why an append-only log of fetches was not
+    # needed (the O2 store critique's preference; the operator's ruling
+    # at the checkpoint): a clone row points at a working tree; the
+    # record of a reading is the capture, and the capture already carries
+    # the head sha it was taken at, so nothing about a reading is lost
+    # when the pointer moves.
+    #
+    # Phase O, O2: WHICH CLONE A CAPTURE WALKED, as the id of its clones
+    # row, so an export can be traced to a URL through the clones table
+    # (the operator's ruling at the checkpoint). NULL is every capture of
+    # a root no clone the door made contains, and every capture recorded
+    # before this column, the Phase L backfill in connect() included:
+    # nothing derives it, because which clone a past walk read was never
+    # recorded and a guess from a path would be a record of a guess. In
+    # SCHEMA too, so the next era fixture has it.
+    #
+    # A PLAIN REFERENCE WITH NO ON DELETE ACTION: ON DELETE SET NULL would
+    # rewrite a capture, and nothing deletes a clones row (record_clone).
+    # A NULL default, because sqlite refuses a REFERENCES column with a
+    # non-NULL default on a table that has rows, which is every database
+    # holding one snapshot.
+    ("snapshot_captures", "clone_id", "INTEGER REFERENCES clones(id)"),
 ]
 
 
@@ -1002,6 +1047,8 @@ def connect(path: str) -> sqlite3.Connection:
         if not isinstance(recorded, dict) or "patterns" not in recorded:
             continue
         dirty = recorded.get("dirty")
+        # clone_id is left NULL: a Phase L walk predates the clone door,
+        # and which clone it read was never recorded.
         conn.execute(
             """INSERT INTO snapshot_captures
                (digest, extractor, extractor_version, head, dirty,
@@ -1419,6 +1466,7 @@ def record_capture(
     dirty: bool | None,
     patterns: list[str],
     excludes: list[str],
+    clone_id: int | None,
 ) -> dict[str, Any]:
     """One CAPTURE: the moment a tree was walked into this rendition.
 
@@ -1437,8 +1485,8 @@ def record_capture(
         cur = conn.execute(
             """INSERT INTO snapshot_captures
                (digest, extractor, extractor_version, head, dirty,
-                patterns_json, excludes_json, captured_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                patterns_json, excludes_json, captured_at, clone_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 digest,
                 extractor,
@@ -1448,11 +1496,51 @@ def record_capture(
                 json.dumps(list(patterns)),
                 json.dumps(list(excludes)),
                 _now(),
+                clone_id,
             ),
         )
     found = capture(conn, int(cur.lastrowid or 0))
     assert found is not None
     return found
+
+
+def record_clone(
+    conn: sqlite3.Connection, *, url: str, ref: str, head_sha: str, root: str
+) -> dict[str, Any]:
+    """The clones row for this repository and ref, made or brought up to
+    date, as it now stands.
+
+    ONE STATEMENT FOR BOTH CASES, an upsert on the identity, because
+    whether the directory existed and whether the row did are two facts
+    that can disagree: an operator removes a clone's directory (the
+    README says that is how clones are removed) and the row stays; a
+    database is restored beside a clone root it never recorded. Either
+    way this is one row with one id, and a snapshot's clone id keeps
+    naming it.
+
+    NEVER INSERT OR REPLACE and never a delete. REPLACE is a delete and
+    an insert: it would give the repository a new id, and under foreign
+    keys it is refused outright once a capture cites the row.
+    """
+    now = _now()
+    with conn:
+        row = conn.execute(
+            """INSERT INTO clones
+               (url, ref, head_sha, root, created_at, updated_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT (url, ref) DO UPDATE SET
+                   head_sha = excluded.head_sha,
+                   root = excluded.root,
+                   updated_at = excluded.updated_at
+               RETURNING id, url, ref, head_sha, root, created_at, updated_at""",
+            (url, ref, head_sha, root, now, now),
+        ).fetchone()
+    return dict(row)
+
+
+def list_clones(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Every clones row, oldest first."""
+    return [dict(r) for r in conn.execute("SELECT * FROM clones ORDER BY id")]
 
 
 def _capture_view(row: sqlite3.Row) -> dict[str, Any]:
@@ -1466,6 +1554,7 @@ def _capture_view(row: sqlite3.Row) -> dict[str, Any]:
         "patterns": json.loads(row["patterns_json"]),
         "excludes": json.loads(row["excludes_json"]),
         "captured_at": row["captured_at"],
+        "clone_id": row["clone_id"],
     }
 
 
@@ -1713,10 +1802,25 @@ def list_attachments(conn: sqlite3.Connection, limit: int) -> list[dict[str, Any
     Newest first, because the reason to list is usually to find what was
     just uploaded and cite it. Bounded by the caller, for the reason the
     history list is: this stays cheap as bench.db grows.
+
+    AND THE ID OF EACH ROW'S LATEST CAPTURE (Phase O), latest_capture_id:
+    the newest capture of the row's OWN reading, keyed on digest,
+    extractor and version exactly as latest_capture keys it, and null for
+    a reading that has none (every document and image). A correlated
+    MAX over the covering index idx_snapshot_captures_rendition, so one
+    seek per listed row and still one query; the captures themselves are
+    read by id in one more (captures_for). Keyed on digest alone it would
+    name a capture of another reading of the same bytes, one a bare
+    citation never resolves to.
     """
     rows = conn.execute(
-        f"SELECT {', '.join(ATTACHMENT_COLUMNS)} FROM attachments"
-        " ORDER BY id DESC LIMIT ?",
+        f"SELECT {', '.join(ATTACHMENT_COLUMNS)},"
+        " (SELECT MAX(s.id) FROM snapshot_captures s"
+        "  WHERE s.digest = attachments.digest"
+        "  AND s.extractor = attachments.extractor"
+        "  AND s.extractor_version = attachments.extractor_version)"
+        " AS latest_capture_id"
+        " FROM attachments ORDER BY id DESC LIMIT ?",
         (limit,),
     ).fetchall()
     return [dict(row) for row in rows]

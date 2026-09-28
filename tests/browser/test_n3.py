@@ -182,7 +182,12 @@ def create(page, name):
             r"Start, and on Score when a judge grades\.$"
         )
     )
-    return int(re.search(r"\d+", msg.inner_text()).group())
+    eid = int(re.search(r"\d+", msg.inner_text()).group())
+    # The page writes that line before it reloads the list and selects
+    # the new row, two answers later; a press before then lands on a
+    # hidden, disabled Start.
+    expect(row_for(page, eid)).to_have_attribute("aria-pressed", "true")
+    return eid
 
 
 def created_id(page):
@@ -1831,8 +1836,15 @@ def test_a_failed_store_question_leaves_start_live(
         f"**/datasets/{digest}",
         lambda route: (aborted.append(route.request.url), route.abort()),
     )
-    row_for(page, other).click()
-    row_for(page, eid).click()
+    # Until the page has read the 500 it holds the question as out and
+    # asks nothing, and nothing on the page moves when it reads it, so
+    # the selection is moved away and back until it asks again.
+    for _ in range(40):
+        row_for(page, other).click()
+        row_for(page, eid).click()
+        if aborted:
+            break
+        page.wait_for_timeout(50)
     wait_held(page, aborted)
     expect(start).to_be_enabled()
     expect(note).to_have_text("")

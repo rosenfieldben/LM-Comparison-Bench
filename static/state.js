@@ -83,6 +83,12 @@
     // known" rather than as off: a fetch that has not resolved is not
     // evidence that a feature is disabled.
     snapshots: null,
+    // The clone door's posture, the same shape for the same reasons:
+    // {enabled, reason} off GET /models, null until the catalog answers.
+    // The reason is the server's own sentence, and one of its two
+    // sentences names paths (the clone root and every allowed root), so
+    // the page shows it only inside the open panel.
+    clones: null,
     sessionStats: {
       runs: 0,
       spend: 0,
@@ -94,6 +100,7 @@
     },
     newViewEpoch,
     renderStats,
+    setClones,
     setDataPolicy,
     setSnapshots,
   };
@@ -139,6 +146,23 @@
     };
   }
 
+  // The clone posture off the same response, read by the same rule: a
+  // catalog that did not answer, or an older server that says nothing
+  // about clones, leaves it null rather than guessing.
+  function setClones(catalog) {
+    if (!catalog || typeof catalog.clones_enabled !== "boolean") {
+      state.clones = null;
+      return;
+    }
+    state.clones = {
+      enabled: catalog.clones_enabled,
+      reason:
+        typeof catalog.clones_off_reason === "string"
+          ? catalog.clones_off_reason
+          : "",
+    };
+  }
+
   function setDataPolicy(policy) {
     // Recorded before the badge is touched, and deliberately before the
     // early return below: the attach control states the policy in words
@@ -176,6 +200,11 @@
     for (const c of state.epochControllers) c.abort();
     state.epochControllers = [];
     state.inflightRuns = 0;
+    // The composer repaints for the new view: a Clone step that waited
+    // for a blind rating to be left must say so as soon as it is, even
+    // with the snapshot panel open (Phase O). Optional, since this runs
+    // before the attach module exists on some pages' boot.
+    window.BenchAttach?.refresh?.();
     return state.viewEpoch;
   }
 

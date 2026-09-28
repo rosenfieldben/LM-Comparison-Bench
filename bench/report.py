@@ -1717,7 +1717,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 7
+EXPORT_SCHEMA_VERSION = 8
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1926,6 +1926,31 @@ EXPORT_SCHEMA_NOTES = {
         "token_counts in the manifest and is_byok on each trial line "
         "from version 4; task_attachments and attachments_mode in the "
         "manifest from version 5."
+    ),
+    8: (
+        "each record in the manifest's captures carries clone_id: the id "
+        "of the row in the clones table of the bench that produced this "
+        "file whose directory the walked root was in, so a reader with "
+        "that bench's database can say which repository and ref a "
+        "snapshot cell read. The id means nothing against another "
+        "bench's database. It is null when the root was in no clone the "
+        "clone door made, and on every capture recorded before this "
+        "version. The repository's URL is deliberately not in the "
+        "artifact: a URL is not a fact about the reading, and it is kept "
+        "in the clones table alone. Pins and trial lines are unchanged; "
+        "clone_id travels on the capture as head does. A field addition, "
+        "so the first limb of the rule. Every field the earlier versions "
+        "added is carried with its meaning intact: capture_id on pins and "
+        "captures in the manifest, with head, dirty, patterns, excludes "
+        "and captured_at for each, from version 7; attachments and "
+        "attachments_mode on each trial line and attachments_referenced "
+        "in the manifest from version 2, whose truth conditions widened "
+        "at version 5 because the manifest itself now cites digests; "
+        "renditions, the ordered pins each with digest, extractor, "
+        "extractor_version and kind, from version 3, and kind may be "
+        "snapshot from version 6; token_counts in the manifest and "
+        "is_byok on each trial line from version 4; task_attachments and "
+        "attachments_mode in the manifest from version 5."
     ),
 }
 

@@ -82,36 +82,6 @@ a23b257).
 - **First written:** bench/main.py, the comment on the attachment window
   check ("a named deferral and stays one"), commit 8f02dc6.
 
-## GitHub
-
-### Clone door
-
-- **What:** connecting a repository by URL and cloning it from the
-  bench, rather than walking a clone already on disk.
-- **Deferred by:** Phase L, and again by Phase N's non-goals ("Connecting
-  a repository is the phase after this one").
-- **Reason:** the snapshot door fetches nothing, and a fetching door is a
-  change to the single-outbound-destination posture that needs its own
-  phase.
-- **First written:** commit 661df53 ("IT FETCHES NOTHING");
-  docs/phases/phase-n-prompt.md, "Non-goals".
-
-### Member listing
-
-- **What:** a dry run of the snapshot composer. Same root, same include
-  patterns, same ceilings; it returns the paths and sizes it would have
-  composed and the refusals it would have raised, without composing. It
-  is a snapshot-side endpoint that does not need the clone door, and it
-  is useful on a local clone today.
-- **Deferred by:** Phase L, which ruled that a snapshot's ceiling is the
-  one a set of attachments has.
-- **Reason:** under that ceiling a real repository refuses often, so a
-  selection has to be made from fact before it is composed.
-- **First written:** the ruling and its select-from-fact reason are in
-  the README, "A repository snapshot" ("The ceiling is the same one a set
-  of attachments has"), commit f239cac. The member listing itself was not
-  written in the repository before this file.
-
 ## Composed-size checks in native mode
 
 - **What:** the per-task composed-size and context-window refusals that
@@ -288,3 +258,121 @@ a23b257).
   at all, its end included; the error is one field of the read door
   that would, and that door was outside N4's scope.
 - **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)".
+
+## Private repositories and tokens
+
+- **What:** cloning a repository that needs a credential: a token, a
+  credential helper, an SSH key or any other identity.
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** the clone door's secrets posture is that no credential
+  exists on its path; a private repository is refused rather than cloned
+  through a helper the operator forgot was configured.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals", "Private
+  repositories and tokens. The secrets posture is that no credential
+  exists on this path."
+
+## Deleting a clone from the page
+
+- **What:** a door that removes a clone's directory, where today the
+  operator removes it by hand (its clones row stays, and a later clone of
+  the same repository and ref reuses it).
+- **Deferred by:** Phase O, O2 (the commission's non-goals).
+- **Reason:** a delete door on working trees needs the same containment
+  proofs the walk has; and it would remove trees, never rows, since a
+  snapshot's capture may cite the row.
+- **First written:** docs/phases/phase-o-prompt.md, "Non-goals",
+  "Deleting a clone from the page. The operator removes directories;
+  backlog entry (disk hygiene) with the reason that a delete door on
+  working trees needs the same containment proofs the walk has." The
+  clause on rows ("it would remove trees, never rows, since a snapshot's
+  capture may cite the row") is the builder's, added in d997fd7, not the
+  commission's; it became a fact in 44bb6b2, when
+  `snapshot_captures.clone_id` began referencing `clones(id)`.
+
+## Proxy support for the clone door
+
+- **What:** cloning through an HTTP(S) proxy, where today the clone
+  door's git runs with no proxy and the system's certificates only, so
+  a bench behind a mandatory proxy cannot clone.
+- **Deferred by:** Phase O, at the O2 checkpoint.
+- **Reason:** honoring proxy variables widens the scrubbed environment
+  that the no-credential proof depends on, so proxy support is a change
+  to that proof, not a setting.
+- **First written:** the operator's ruling at the O2 checkpoint, in
+  those words; recorded in the commit that adds this entry.
+
+## A snapshot root inside a git directory
+
+- **What:** refusing a snapshot root that sits below a git directory's
+  top level (a directory holding `HEAD`, `config`, `objects` and `refs`
+  together, whatever it is named). Today the walk refuses a root, or a
+  directory it reaches, that is one itself, and never looks above the
+  root. Refusing a root inside one needs a look at the root's ancestors,
+  by path (as `refuse_while_cloning` already looks at both doors, and
+  `_clone_for` at the composer) or anchored on the root's directory
+  handle; a look that only refuses opens nothing, so a race against it
+  can at worst give back today's walked state, and if it is built it
+  gets the walk's race proofs. A submodule's `modules/<name>` holds the
+  four names itself (as git 2.50.1 lays it out), so the walk already
+  refuses one wherever it reaches it.
+- **Deferred by:** Phase O, ruled by the operator on the bare-repository
+  readings after the operator's pass at 9c920e5.
+- **Reason:** `config` at the top level is where git itself writes a
+  remote URL (`git remote add`, measured on git 2.43.0), and a root
+  below the top cannot reach it; the known exception, `modules/*/config`
+  in a repository with submodules, the walk already refuses by its own
+  signature. Three files below the top level can carry a URL git uses,
+  verified on git 2.43.0 by tests/test_api.py
+  (`test_below_a_git_directorys_top_level_the_walk_cannot_see_it`):
+  the legacy `remotes/<name>` and `branches/<name>` files, which
+  `git fetch` still resolves, and a linked worktree's
+  `worktrees/<name>/config.worktree`, which `git config --worktree`
+  writes under `extensions.worktreeConfig`. A root placed at any of
+  those composes with the URL in the text today; the test pins that
+  open state. On git 2.50.1 (measured): `git worktree add` copies the
+  main worktree's `config.worktree` into `worktrees/<id>/config.worktree`,
+  a second writer beside `git config --worktree`; `git init` makes no
+  `branches/`; and the legacy `remotes/` and `branches/` files are
+  still read, with the warning that they are "nominated for removal".
+  And `logs/` is a fourth place, written by git itself on ordinary
+  commands: `git pull` and `git fetch` record their arguments there, a
+  repository's path verbatim (measured on git 2.50.1 with local paths;
+  whether a URL's userinfo survives is what the open-state pin's `logs/`
+  case measures), beside the committer's identity on every ref update.
+  The list of such files has no fixed end. The Phase O external review,
+  at db08aca (CI run 36338955465), answered that this stays open for
+  v0.6.0 and that the ancestor look is next-phase work: cheaper than
+  recorded, because a look that only refuses opens nothing (its L6), and
+  needed because the reachable set has no end, since `git pull` writes
+  into `logs/` below the top (its L14). It is to be built anchored on
+  the root's directory handle, with race proofs, and with 7b7241c's pins
+  plus a `logs/` case as its pre-states.
+- **First written:** the operator's ruling on the bare-repository
+  readings after the pass at 9c920e5; the reason in the operator's words
+  as given for f8bde6b ("only config at the top level carries anything
+  sensitive and a root below the top cannot reach it"); the reason
+  restated in 7b7241c on git 2.43.0's measurements (the three files
+  below the top level), with its hand-off to the external review; the
+  review's answer and the operator's ruling on it recorded in the
+  commit that adds this sentence.
+
+## Filter drivers in the snapshot's dirty read
+
+- **What:** a filter driver named in the configuration of a checkout the
+  operator listed, which `git status` runs on a file whose stat data
+  differs from the index when a snapshot reads the dirty flag. The local
+  git's fixed configuration (94e70ee) turns off the file system monitor,
+  hooks and the sign-in helper; it does not turn off filter drivers.
+- **Deferred by:** Phase O, ruled by the operator on 94e70ee's open
+  items.
+- **Reason:** with the ceiling at the entry's parent and
+  `safe.bareRepository=explicit`, discovery can no longer land on a
+  repository-supplied directory, so a filter driver can only come from a
+  config the operator's own git wrote into a checkout the operator
+  listed. That is the operator's machine, not repository-supplied
+  configuration, and it is outside this phase's threat model. No
+  command-line setting disables every driver, so closing it means not
+  running `git status` for the dirty read, which is a design change for
+  its own phase.
+- **First written:** the operator's ruling on 94e70ee's open items, in
+  those words; recorded in the commit that adds this entry.

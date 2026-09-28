@@ -18,7 +18,7 @@ import pytest
 import respx
 from fastapi.testclient import TestClient
 
-from bench import main, report
+from bench import clones, main, report
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import (
@@ -977,6 +977,10 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
             # sentence is the door's own rather than a second wording.
             "snapshots_enabled": False,
             "snapshots_off_reason": main.SNAPSHOTS_OFF,
+            # Phase O, the same pair for the clone door, off here because
+            # BENCH_CLONE_ROOT is unset: its own sentence, verbatim.
+            "clones_enabled": False,
+            "clones_off_reason": clones.CLONES_OFF,
         }
 
         with respx.mock:
@@ -6427,14 +6431,19 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[7]
-    # Version 7 is the fourteenth review's H2: pins may name a capture
-    # and the manifest carries the captures those ids name, so a reader
-    # holding only the file can say which walk a snapshot cell read.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[8]
+    # Version 8 is Phase O's clone id: each capture record names the
+    # clones row its walked root was in, and the URL stays out of the
+    # file.
+    assert "clone_id" in manifest["export_schema_change"]
+    assert "URL is deliberately not in the artifact" in manifest["export_schema_change"]
+    # Version 7's, carried: pins may name a capture and the manifest
+    # carries the captures those ids name, so a reader holding only the
+    # file can say which walk a snapshot cell read.
     assert "capture_id" in manifest["export_schema_change"]
     assert "captures" in manifest["export_schema_change"]
     # Present and empty on an experiment with no snapshot in it, so a
@@ -10620,15 +10629,16 @@ def test_the_attachment_list_serves_metadata_newest_first_and_no_content(client)
     # snapshot of two thousand files carries two thousand rows, and a
     # page of five hundred attachments carrying those would undo what
     # K1.5 bought when it stopped this reader loading bodies. The list
-    # answers Attachment, the two single-attachment doors answer
+    # answers ListedAttachment, the two single-attachment doors answer
     # AttachmentDetail, and neither shape has to be read as "sometimes
-    # populated".
+    # populated". Since Phase O the capture is NOT an exception (it used
+    # to be): the list carries each row's latest capture, the same record
+    # the detail serves, so the one exception left is the manifest.
     detail = client.get(f"/attachments/{third}").json()
     assert listed[0] == {
-        key: value
-        for key, value in detail.items()
-        if key not in ("manifest", "capture")
+        key: value for key, value in detail.items() if key != "manifest"
     }
+    assert listed[0]["capture"] is None
     assert detail["manifest"] is None
     assert "manifest" not in listed[0]
     # NEVER CONTENT, on this endpoint as on every other. The bodies are
@@ -16453,10 +16463,11 @@ def test_composing_one_tree_twice_returns_the_first_row(client, tmp_path):
 
     The MANIFEST is the first walk's, and that is the interesting half.
     It is not a function of the rendition key, so two walks a commit
-    apart whose selected files did not change are one row, and the head
-    recorded is the earlier one. That is a true statement about these
-    bytes rather than a stale one, and rewriting it would relabel a
-    record every existing comparison already cites.
+    apart whose selected files did not change are one row and one
+    manifest. That is a true statement about these bytes rather than a
+    stale one, and rewriting it would relabel a record every existing
+    comparison already cites. (Each walk's head is its own capture's,
+    since the fourteenth review's H2; the doors answer the latest.)
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
 
@@ -16483,7 +16494,9 @@ def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
     The LIST does not carry it, and the split is deliberate: a snapshot
     of two thousand files carries two thousand manifest rows, and a page
     of five hundred attachments carrying those would undo what K1.5
-    bought when it stopped this reader loading bodies.
+    bought when it stopped this reader loading bodies. The CAPTURE, a
+    walk's facts and not a body, the list does carry since Phase O, and
+    it is the same record the detail serves.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
     created = snapshot_of(client, root, ["*.py"]).json()
@@ -16493,6 +16506,7 @@ def test_the_detail_endpoint_serves_the_stored_manifest_and_the_list_does_not(
 
     listed = client.get("/attachments").json()["attachments"]
     assert "manifest" not in listed[0]
+    assert listed[0]["capture"] == fetched["capture"] == created["capture"]
     # And never the content, on either door, which is the promise every
     # attachment response makes.
     assert "x = 1" not in json.dumps(fetched)
@@ -17121,7 +17135,7 @@ def test_a_missing_snapshot_reading_is_refused_with_a_remedy_that_exists(
 
 
 @respx.mock
-def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
+def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
     """WINDOW: the export manifest and trial lines of an experiment whose
     task cited a snapshot.
 
@@ -17146,7 +17160,7 @@ def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -17166,6 +17180,8 @@ def test_the_export_carries_the_snapshot_pin_at_schema_seven(client, tmp_path):
     named = manifest["captures"][str(built["capture"]["id"])]
     assert named["patterns"] == ["**/*.py"]
     assert named["head"] is None and named["dirty"] is None
+    # A root no clone the door made contains: present and null.
+    assert named["clone_id"] is None
 
 
 # ---- Phase L closing: the filesystem posture, enumerated.
@@ -17208,16 +17224,28 @@ FILESYSTEM_CALLS = {
     # being called, which is the whole reason the module can be tested
     # as a value in and a value out, and the reason the review's races
     # are deterministic tests there.
-    ("snapshot.py", "walk"): {
+    #
+    # THE TRAVERSAL IS Survey's, which the composer and the member
+    # listing both iterate. It lists, descends, resolves links and
+    # closes; it never opens or reads a member itself.
+    ("snapshot.py", "Survey._sightings"): {
         "tree.close_handle",
         "tree.descend",
         "tree.link_target",
-        "tree.open_member",
         "tree.open_root",
-        "tree.read_member",
         "tree.root_path",
     },
-    ("snapshot.py", "listing"): {"tree.entries"},
+    ("snapshot.py", "Survey._sightings.listing"): {"tree.entries"},
+    # The one place a member is opened and read: the composer's reader,
+    # which walk hands the survey and list_members does not. That the
+    # listing never reaches it is proved at runtime (the FakeTree ledger
+    # and the door's recording window), not by this table, which sees
+    # only the calls a function makes itself.
+    ("snapshot.py", "_read_member"): {
+        "tree.close_handle",
+        "tree.open_member",
+        "tree.read_member",
+    },
     #
     # ---- Outside it, each on its own posture.
     #
@@ -17234,8 +17262,14 @@ FILESYSTEM_CALLS = {
     # The git runner: its default working directory is from __file__,
     # and its cwd parameter is where a snapshot passes an allowlisted
     # root. subprocess.run is listed because a working directory is a
-    # path operation, whatever the command.
+    # path operation, whatever the command. Since Phase O the search for
+    # a repository from that directory is bounded too: a snapshot's git
+    # runs with GIT_CEILING_DIRECTORIES at the parent of the root's
+    # allowlist entry (_git_env), so it reads no repository above it.
     ("main.py", "_git"): {"resolve", "subprocess.run"},
+    # The ceiling's spelling as the kernel gives it (F_GETPATH): the
+    # parent of an allowlist entry, opened as a directory, read, closed.
+    ("main.py", "_canonical_directory"): {"os.open", "fcntl.fcntl", "os.close"},
     # The database path from BENCH_DB, set by the operator at boot and
     # never per request: created private, tightened if found loose,
     # and then opened.
@@ -17250,6 +17284,48 @@ FILESYSTEM_CALLS = {
         "os.stat",
     },
     ("store.py", "connect"): {"sqlite3.connect"},
+    #
+    # ---- The clone door. Every path is BENCH_CLONE_ROOT, from the
+    # ---- operator's environment at boot, or a name under it the door
+    # ---- made itself: <16 hex> for a clone, .<16 hex>.partial and .old
+    # ---- for its work, never a string from a request. The URL and the
+    # ---- ref choose the hex (a sha256) and nothing else.
+    #
+    # The test seam's certificate bundle, checked at boot.
+    ("main.py", "_parse_clone_cainfo"): {"os.path.isfile"},
+    # The clone root and each allowlist entry, compared by device and
+    # inode at boot so the clone root takes its entry's spelling.
+    ("main.py", "_clone_root_as_entry"): {"os.stat"},
+    # git, run with its tree pinned by --git-dir and --work-tree to the
+    # clone's own new directory, so it never searches upward.
+    ("main.py", "_git_clone"): {"asyncio.create_subprocess_exec"},
+    # The new directory made, and the URL git wrote into FETCH_HEAD
+    # removed from it.
+    ("main.py", "_fetch_into"): {"os.mkdir", "os.unlink"},
+    # The swap: the old clone renamed aside and the new one renamed in.
+    ("main.py", "_clone"): {"os.path.lexists", "os.rename"},
+    # A clone's directories removed (a failed one's new directory, a
+    # replaced one's old, its empty HOME), and that HOME made.
+    ("main.py", "_remove_tree"): {"shutil.rmtree"},
+    ("main.py", "_empty_home"): {"tempfile.mkdtemp"},
+    # The door's own leftovers, by its own naming, directly under the
+    # clone root: a directory removed as a tree, anything else unlinked,
+    # no link followed.
+    ("main.py", "_sweep_clone_work"): {"entry.is_dir", "os.scandir", "os.unlink"},
+    # A clone's size, counted without following a link.
+    ("main.py", "_measure_clone"): {
+        "entry.is_dir",
+        "entry.is_file",
+        "entry.stat",
+        "os.scandir",
+    },
+    # Whether a snapshot root and a clone's directory overlap, by device
+    # and inode up the ancestors of a root already resolved and matched
+    # against BENCH_REPO_ROOTS.
+    ("main.py", "_same_or_under"): {"os.stat"},
+    # Which clone a snapshot root is in, the same way: each clones row's
+    # recorded directory, and the root's ancestors, stat'd.
+    ("main.py", "_clone_for"): {"os.stat"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
@@ -17265,7 +17341,10 @@ FILESYSTEM_TOUCHERS = {
     "os.close",
     "os.fstat",
     "os.listdir",
+    # F_GETPATH: a directory's spelling read from its descriptor.
+    "fcntl.fcntl",
     "os.makedirs",
+    "os.mkdir",
     "os.open",
     "os.read",
     "os.readlink",
@@ -17278,10 +17357,17 @@ FILESYSTEM_TOUCHERS = {
     "os.path.abspath",
     "os.path.exists",
     "os.path.isdir",
+    "os.path.isfile",
+    "os.path.lexists",
     "os.path.realpath",
     "open",
     "sqlite3.connect",
     "subprocess.run",
+    # A process's working tree is a path operation, whatever the command;
+    # the clone runner names its tree in its argv (--git-dir, --work-tree).
+    "asyncio.create_subprocess_exec",
+    "shutil.rmtree",
+    "tempfile.mkdtemp",
     "StaticFiles",
     # pathlib and DirEntry methods, matched on the method name.
     "read_bytes",
@@ -17317,6 +17403,7 @@ FILESYSTEM_TOUCHERS = {
 # the os half of the list stays complete without anybody remembering.
 PURE_OS_CALLS = {
     "os.environ.get",
+    "os.fsdecode",
     "os.path.basename",
     "os.path.commonpath",
     "os.path.dirname",
@@ -17324,6 +17411,16 @@ PURE_OS_CALLS = {
     "os.path.join",
     "os.path.normcase",
     "os.path.normpath",
+}
+
+
+# os calls that name a PROCESS and touch no path: the clone runner's
+# group kill and the check that the group is its own. A third class
+# rather than a pure one, because signalling is not computing on
+# strings; tests/test_network_posture.py keys them with the runner.
+PROCESS_OS_CALLS = {
+    "os.getpgid",
+    "os.killpg",
 }
 
 
@@ -17358,14 +17455,23 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
     StaticFiles) are in the list because this rule and the next would
     now refuse a tree without them.
 
+    The os rule has a third class since Phase O, PROCESS_OS_CALLS: the
+    clone runner's group kill names a process and touches no path, and
+    the network walk (tests/test_network_posture.py, this walk's
+    sibling) keys it with the runner.
+
     The non-os half is complete BY ENUMERATION and says so: builtins
     open, the pathlib and DirEntry methods this codebase calls,
-    sqlite3.connect, subprocess.run for its working directory,
-    Starlette's StaticFiles for the directory it serves, and the Tree
-    protocol's operations so the pure walk's injected calls appear under
-    the function that makes them. A NEW library that reaches disk under
-    a name not in that list would not be seen, and that is the limit of
-    what an AST scan of call names can promise.
+    sqlite3.connect, subprocess.run and asyncio.create_subprocess_exec
+    for the tree a process works in, shutil.rmtree and tempfile.mkdtemp
+    for the clone door's directories, Starlette's StaticFiles for the
+    directory it serves, and the Tree protocol's operations so the pure
+    walk's injected calls appear under the function that makes them. A
+    NEW library that reaches disk under a name not in that list would
+    not be seen, nor would a toucher handed to another function as a
+    value (the clone door names its rmtree and mkdtemp in functions of
+    their own for that reason), and that is the limit of what an AST
+    scan of call names can promise.
 
     A NEW ENTRY FAILS THIS TEST, which is the point. Adding a read or a
     stat anywhere in bench/ now requires saying which posture it sits in:
@@ -17378,26 +17484,42 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
     test anchored to an offset in a seven-thousand-line file breaks on
     every unrelated edit and gets deleted. A method is keyed as
     Class.method so the descriptor tree's eight operations read as its.
+
+    A NESTED FUNCTION IS KEYED BY ITS WHOLE ENCLOSING PATH
+    (Survey._sightings.listing), and no two definitions may share a key.
+    Keyed by its bare name, as it was until Phase O, a nested function
+    merged with any other function of that name, so a helper named walk
+    inside the member listing could have opened a member under the
+    composer's entry and the table would not have moved.
     """
     found = {}
     unclassified = set()
+    defined = {}
     for path in sorted(Path("bench").glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         parents = {}
         for node in ast.walk(tree):
             for child in ast.iter_child_nodes(node):
                 parents[id(child)] = node
+
+        def qualified(node, parents=parents):
+            names = [node.name]
+            parent = parents.get(id(node))
+            while parent is not None:
+                if isinstance(
+                    parent, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef
+                ):
+                    names.append(parent.name)
+                parent = parents.get(id(parent))
+            return ".".join(reversed(names))
+
         scope = {}
         # Breadth-first, so an inner function's assignment lands after
         # its enclosing function's and the innermost name wins.
         for node in ast.walk(tree):
             if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
-                parent = parents.get(id(node))
-                name = (
-                    f"{parent.name}.{node.name}"
-                    if isinstance(parent, ast.ClassDef)
-                    else node.name
-                )
+                name = qualified(node)
+                defined[(path.name, name)] = defined.get((path.name, name), 0) + 1
                 for child in ast.walk(node):
                     scope[id(child)] = name
         for node in ast.walk(tree):
@@ -17408,7 +17530,7 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
             if name.startswith("os."):
                 if name in FILESYSTEM_TOUCHERS:
                     found.setdefault(key, set()).add(name)
-                elif name not in PURE_OS_CALLS:
+                elif name not in PURE_OS_CALLS | PROCESS_OS_CALLS:
                     unclassified.add((path.name, key[1], name))
                 continue
             if (
@@ -17421,6 +17543,7 @@ def test_review_repro_every_path_operation_sits_in_a_named_posture():
         "os calls that are neither touchers nor pure: classify them in "
         f"FILESYSTEM_TOUCHERS or PURE_OS_CALLS: {sorted(unclassified)}"
     )
+    assert [key for key, count in defined.items() if count > 1] == []
     assert found == FILESYSTEM_CALLS
 
 
@@ -17899,6 +18022,1556 @@ def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
         },
     )
     assert "Use native mode" in alone.json()["detail"]
+
+
+# =====================================================================
+# ---- Phase O, O1: the member listing, the composer's walk without its
+# ---- reads. Every test names its window.
+# =====================================================================
+
+
+def listing_of(client, root, patterns=("**/*.py",)):
+    """POST /snapshots/listing against an allowlisted root."""
+    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    return client.post(
+        "/snapshots/listing", json={"root": str(root), "patterns": list(patterns)}
+    )
+
+
+def selected_rows(listing):
+    return [
+        (m["path"], m["bytes"]) for m in listing["members"] if m["status"] == "selected"
+    ]
+
+
+def _deep(root, levels):
+    here = root
+    for n in range(levels):
+        here = here / f"d{n}"
+    clone(here, {"deep.py": b"x = 1\n"})
+
+
+# (name, the tree, the patterns, ceilings shrunk in bench.snapshot)
+DOOR_TREES = [
+    (
+        "clean",
+        lambda r: clone(
+            r, {"pkg/a.py": b"A = 1\n", "pkg/b.py": b"B = 2\n", "notes.md": b"n\n"}
+        ),
+        ["**/*.py"],
+        {},
+    ),
+    (
+        "excluded",
+        lambda r: clone(
+            r,
+            {
+                "src/a.py": b"a\n",
+                ".git/config": b"c\n",
+                "node_modules/x.js": b"x\n",
+                ".env": b"KEY=1\n",
+                "pkg/__pycache__/a.cpython.pyc": b"p",
+            },
+        ),
+        ["**/*"],
+        {},
+    ),
+    (
+        "link out",
+        lambda r: (clone(r, {"a.py": b"a\n"}), os.symlink("/etc", r / "out")),
+        ["*.py"],
+        {},
+    ),
+    (
+        "link in",
+        lambda r: (
+            clone(r, {"a.py": b"a\n", "b.md": b"b\n"}),
+            os.symlink(r / "b.md", r / "c.py"),
+        ),
+        ["*.py"],
+        {},
+    ),
+    (
+        "fifo",
+        lambda r: (clone(r, {"a.py": b"a\n"}), os.mkfifo(r / "pipe")),
+        ["*.py"],
+        {},
+    ),
+    (
+        "oversized",
+        lambda r: clone(r, {"a.py": b"a\n", "big.py": b"x" * 250_000}),
+        ["*.py"],
+        {},
+    ),
+    ("nothing matched", lambda r: clone(r, {"a.py": b"a\n"}), ["*.md", "docs/**"], {}),
+    (
+        "read budget",
+        lambda r: clone(r, {f"f{n}.py": b"x" * 40 for n in range(5)}),
+        ["*.py"],
+        {"MAX_READ_BYTES": 100},
+    ),
+    ("depth", lambda r: _deep(r, 4), ["**/*.py"], {"MAX_DEPTH": 3}),
+    (
+        "entry ceiling",
+        lambda r: clone(r, {f"f{n}.py": b"x\n" for n in range(9)}),
+        ["*.py"],
+        {"MAX_WALKED_ENTRIES": 5},
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    ("build", "patterns", "ceilings"),
+    [pytest.param(b, p, c, id=name) for name, b, p, c in DOOR_TREES],
+)
+def test_the_listing_is_what_the_composer_does_through_both_doors(
+    client, tmp_path, monkeypatch, build, patterns, ceilings
+):
+    """WINDOW: POST /snapshots/listing, then POST /snapshots, over one real
+    tree on disk through the door's own DescriptorTree: a clean tree, one
+    with every exclusion group, a link out of the root, a link inside it,
+    a fifo, a file over the member bound, a selection of nothing, and
+    (with the ceilings shrunk) the read ceiling, the depth ceiling and the
+    entry ceiling.
+
+    ONE WALK, TWO DOORS, AT THE DOOR. When the composer stores a snapshot
+    the listing said it would compose, its selected rows are the
+    manifest's members, path and size, and its bound on the composed
+    characters is the stored text's length (these files are ASCII). When
+    the composer refuses, the listing said it would not, with the
+    composer's sentence word for word. PRE-STATE: the listing ran first,
+    on a store with no snapshot in it."""
+    for name, value in ceilings.items():
+        monkeypatch.setattr(bench_snapshot, name, value)
+    root = tmp_path / "clone"
+    root.mkdir()
+    build(root)
+    assert client.get("/attachments").json()["attachments"] == []
+    listed = listing_of(client, root, patterns)
+    assert listed.status_code == 200, listed.text
+    listing = listed.json()
+    composed = snapshot_of(client, root, patterns)
+    if composed.status_code == 201:
+        assert listing["would_compose"] is True
+        assert listing["refusal"] is None
+        body = composed.json()
+        assert selected_rows(listing) == [
+            (f["path"], f["size"]) for f in body["manifest"]["files"]
+        ]
+        assert listing["composed_chars_at_most"] == body["extracted_chars"]
+    else:
+        assert composed.status_code == 422, composed.text
+        assert listing["would_compose"] is False
+        assert listing["refusal"] == composed.json()["detail"]
+
+
+def test_a_selection_past_the_character_ceiling_is_bounded_not_promised(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots/listing and POST /snapshots over two ASCII
+    files of 150,000 bytes, which the walk reads (300,000 is under the
+    read ceiling) and compose refuses (over 200,000 characters): the
+    README's own example of a selection that does not fit has this shape.
+
+    would_compose is the walk's answer, and here the walk reaches
+    composition; the character ceiling is a count of decoded characters,
+    which the listing cannot make without reading. What it can say, it
+    says: composed_chars_at_most, over the ceiling, and on ASCII text
+    exactly the figure compose refuses with. PRE-STATE: each file is
+    within the member bound."""
+    root = clone(tmp_path / "clone", {"a.py": b"a" * 150_000, "b.py": b"b" * 150_000})
+    listing = listing_of(client, root, ["*.py"]).json()
+    assert listing["would_compose"] is True
+    assert listing["text_checked"] is False
+    bound = listing["composed_chars_at_most"]
+    assert bound > bench_snapshot.MAX_COMPOSED_CHARS
+    refused = snapshot_of(client, root, ["*.py"])
+    assert refused.status_code == 422
+    assert refused.json()["detail"].startswith(
+        f"the snapshot composes to {bound} characters"
+    )
+
+
+def test_a_file_the_bench_cannot_open_is_refused_only_by_the_composer(client, tmp_path):
+    """WINDOW: POST /snapshots/listing and POST /snapshots over a tree
+    holding a file with no read permission.
+
+    A DISCLOSED DIVERGENCE, pinned. The listing opens no file, so it
+    cannot know one will not open: it reports the file selected and the
+    walk reaching composition, and the composer refuses it at the open.
+    The listing's docstring and the README say so. PRE-STATE: the file
+    lists as an ordinary regular file of its size."""
+    if os.geteuid() == 0:
+        pytest.skip("root opens a file with no permission bits")
+    root = clone(tmp_path / "clone", {"a.py": b"a\n", "b.py": b"bb\n"})
+    (root / "b.py").chmod(0)
+    try:
+        listing = listing_of(client, root, ["*.py"]).json()
+        assert ("b.py", 3) in selected_rows(listing)
+        assert listing["would_compose"] is True
+        refused = snapshot_of(client, root, ["*.py"])
+    finally:
+        (root / "b.py").chmod(0o644)
+    assert refused.status_code == 422
+    assert refused.json()["detail"] == "b.py could not be opened: Permission denied."
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["off", "outside", "not a directory", "bad pattern", "too many", "unknown field"],
+)
+def test_a_refused_request_is_the_same_refusal_at_both_doors(client, tmp_path, case):
+    """WINDOW: POST /snapshots and POST /snapshots/listing with the same
+    refused body: no allowlist, a root outside it, a root that is not a
+    directory, a malformed pattern, more patterns than MAX_PATTERNS, and
+    a field neither door takes.
+
+    A refusal of the request is an HTTP error, the same status and the
+    same detail at both doors; only a refusal about the tree is a fact
+    the listing reports in a 200. PRE-STATE: with the same root and a
+    good pattern the listing answers 200."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    elsewhere = clone(tmp_path / "elsewhere", {"b.py": b"b\n"})
+    client.app.state.repo_roots = (str(root.resolve()),)
+    good = {"root": str(root), "patterns": ["*.py"]}
+    assert client.post("/snapshots/listing", json=good).status_code == 200
+    body = dict(good)
+    if case == "off":
+        client.app.state.repo_roots = ()
+    elif case == "outside":
+        body["root"] = str(elsewhere)
+    elif case == "not a directory":
+        body["root"] = str(root / "a.py")
+    elif case == "bad pattern":
+        body["patterns"] = ["/src/"]
+    elif case == "too many":
+        body["patterns"] = [f"p{n}.py" for n in range(bench_snapshot.MAX_PATTERNS + 1)]
+    else:
+        body["excludes"] = []
+    composer = client.post("/snapshots", json=body)
+    listing = client.post("/snapshots/listing", json=body)
+    assert composer.status_code in (403, 422), composer.text
+    assert (listing.status_code, listing.json()) == (
+        composer.status_code,
+        composer.json(),
+    )
+
+
+def test_a_link_target_utf8_cannot_spell_is_a_422_at_both_doors(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing over a tree
+    holding a link out of the root to a path with a byte that is not
+    UTF-8.
+
+    The refusal named the target raw, a surrogate escape no response can
+    carry, and the composer answered 500 rather than its own sentence.
+    Both doors now name it by its repr. PRE-STATE: the link exists and
+    its target does not decode."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    try:
+        os.symlink(b"/elsewhere/caf\xe9", bytes(root / "l"))
+    except OSError as exc:
+        pytest.skip(f"this filesystem will not hold such a link target: {exc}")
+    assert os.readlink(bytes(root / "l")) == b"/elsewhere/caf\xe9"
+    composer = snapshot_of(client, root, ["*.py"])
+    assert composer.status_code == 422, composer.status_code
+    assert "is a symbolic link to '" in composer.json()["detail"]
+    listing = listing_of(client, root, ["*.py"]).json()
+    assert listing["refusal"] == composer.json()["detail"]
+
+
+def test_a_root_resolving_to_a_name_utf8_cannot_spell_is_a_403_at_both_doors(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing with a root that
+    resolves, through a link, outside the allowlist to a path holding a
+    byte UTF-8 cannot spell (os.path.realpath's surrogate escape, the
+    resolver stood in for since APFS will not hold such a name).
+
+    The 403 named the resolved path raw, and a response carrying the raw
+    surrogate could not be written: both doors answered 500 where they
+    promise a 403 naming the allowlist. The path is now named by its
+    repr. PRE-STATE: the resolved path cannot be encoded."""
+    root = clone(tmp_path / "clone", {"a.py": b"a\n"})
+    resolved = "/elsewhere/caf" + chr(0xDCE9)
+    with pytest.raises(UnicodeEncodeError):
+        resolved.encode("utf-8")
+    client.app.state.repo_roots = (str(root.resolve()),)
+    monkeypatch.setattr(main, "_resolved_directory", lambda path: resolved)
+    body = {"root": str(root / "w"), "patterns": ["*.py"]}
+    for door in ("/snapshots", "/snapshots/listing"):
+        refused = client.post(door, json=body)
+        assert refused.status_code == 403, (door, refused.status_code)
+        assert (
+            f"resolves to {resolved!r}, which is not under" in refused.json()["detail"]
+        )
+
+
+def test_the_listing_door_reads_no_file_and_writes_nothing(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing over a tree of source files, a
+    Markdown file and an excluded .env, the route warmed first, with every
+    call in PATH_TAKERS that is given a path recorded, and os.read,
+    os.pread and os.readv recorded whatever they are given.
+
+    "READS NO FILE CONTENTS" AT THE DOOR. The door opens directories, and
+    only directories: every os.open it makes carries O_DIRECTORY. The
+    only calls that name a path are the allowlist's resolution of the
+    root (os.path.realpath's lstat of each component, and isdir's stat),
+    the same the composer makes, and none names a member. It reads no
+    byte (no os.read of any kind), opens no path through io or the
+    builtin open, spawns nothing (no git: a listing is not a capture),
+    and writes no row. PRE-STATE: inside the window a Path
+    read_bytes, an os.read and an os.open of a file are each recorded,
+    so the recorder sees the calls that would be a read."""
+    root = clone(
+        tmp_path / "clone",
+        {
+            "pkg/a.py": b"A = 1\n",
+            "pkg/b.py": b"B = 2\n",
+            "notes.md": b"n\n",
+            ".env": b"K=1\n",
+        },
+    )
+    assert listing_of(client, root, ["**/*.py"]).status_code == 200
+    changes = client.app.state.db.total_changes
+    calls = []
+    real_open = os.open
+
+    def recording(name, real):
+        def call(*args, **kwargs):
+            if name in ("os.read", "os.pread", "os.readv"):
+                calls.append((name, None))
+            elif name == "os.open":
+                flags = args[1] if len(args) > 1 else kwargs.get("flags", 0)
+                calls.append((name, bool(flags & os.O_DIRECTORY)))
+            else:
+                target = (
+                    args[0] if args else kwargs.get("path", kwargs.get("file", "."))
+                )
+                if name == "subprocess.run":
+                    calls.append((name, repr(target)))
+                elif not isinstance(target, int):
+                    calls.append((name, os.fsdecode(target)))
+            return real(*args, **kwargs)
+
+        return call
+
+    takers = [*PATH_TAKERS, (os, "read"), (os, "pread"), (os, "readv")]
+    with monkeypatch.context() as window:
+        for module, attr in takers:
+            window.setattr(
+                module,
+                attr,
+                recording(f"{module.__name__}.{attr}", getattr(module, attr)),
+            )
+        (tmp_path / "probe").write_bytes(b"p")
+        calls.clear()
+        Path(tmp_path / "probe").read_bytes()
+        fd = real_open(tmp_path / "probe", os.O_RDONLY)
+        os.read(fd, 1)
+        os.close(fd)
+        os.close(os.open(tmp_path / "probe", os.O_RDONLY))
+        assert {name for name, _ in calls} == {"io.open", "os.read", "os.open"}, calls
+        calls.clear()
+
+        listed = listing_of(client, root, ["**/*.py"])
+
+    assert listed.status_code == 200
+    assert selected_rows(listed.json()) == [("pkg/a.py", 6), ("pkg/b.py", 6)]
+    resolved = root.resolve()
+    the_root = {str(resolved), *map(str, resolved.parents), str(root)}
+    opens = [flag for name, flag in calls if name == "os.open"]
+    by_name = [(name, target) for name, target in calls if name != "os.open"]
+    assert opens and all(opens), calls
+    assert all(
+        name in ("os.lstat", "os.stat") and target in the_root
+        for name, target in by_name
+    ), by_name
+    assert client.app.state.db.total_changes == changes
+
+
+def test_the_listings_mirrors_are_the_servers_numbers():
+    """WINDOW: SNAPSHOT_LIMITS as node reads it out of static/lib.js,
+    against the constants it names.
+
+    The page says the pattern limit with its value before it sends, and
+    reads a listing's bound against the composed ceiling; both are the
+    server's numbers. PRE-STATE: the page's object names both keys."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(l.SNAPSHOT_LIMITS));"
+    )
+    assert set(js) == {"maxPatterns", "maxComposedChars"}
+    assert js == {
+        "maxPatterns": bench_snapshot.MAX_PATTERNS,
+        "maxComposedChars": bench_snapshot.MAX_COMPOSED_CHARS,
+    }
+
+
+def test_the_pages_trim_set_is_both_sides_trim_sets_over_every_code_point():
+    """WINDOW: PATTERN_TRIMMED, the class patternFor wraps at a pattern's
+    ends, over every code point outside the surrogates, against what
+    node's String.prototype.trim removes and what Python's str.strip
+    removes.
+
+    The panel trims each line it sends and the server refuses a pattern
+    str.strip would change, so a character either side strips must be
+    wrapped. The two sets differ (trim removes U+FEFF, strip removes
+    U+001C to U+001F and U+0085), and the class is their union exactly.
+    PRE-STATE: each side's set has a member the other lacks."""
+    js = run_lib(
+        "const l = require(process.argv[1]);"
+        "const cls = new RegExp('^[' + l.PATTERN_TRIMMED + ']$', 'u');"
+        "const inClass = [], trimmed = [];"
+        "for (let c = 0; c <= 0x10ffff; c++) {"
+        "  if (c >= 0xd800 && c <= 0xdfff) continue;"
+        "  const ch = String.fromCodePoint(c);"
+        "  if (cls.test(ch)) inClass.push(c);"
+        "  if (('x' + ch).trim() !== 'x' + ch) trimmed.push(c);"
+        "}"
+        "process.stdout.write(JSON.stringify({inClass, trimmed}));"
+    )
+    stripped = {
+        c
+        for c in range(0x110000)
+        if not 0xD800 <= c <= 0xDFFF and ("x" + chr(c)).strip() != "x" + chr(c)
+    }
+    trimmed = set(js["trimmed"])
+    assert 0xFEFF in trimmed - stripped
+    assert {0x1C, 0x85} <= stripped - trimmed
+    assert set(js["inClass"]) == trimmed | stripped
+
+
+def test_a_pattern_the_page_writes_selects_exactly_its_file():
+    """WINDOW: patternFor executed with node over adversarial file names
+    (every ASCII punctuation character, brackets and classes, '**' as a
+    segment, runs of dots, whitespace of each kind either side strips at
+    either end, nested paths), each answer then held to the server's own
+    matcher in Python.
+
+    A checked row's pattern must select that file and no other: the
+    server's enforce_patterns accepts it, matches() takes it for its own
+    path and for no other name in the set, and the panel's trim leaves it
+    as it is. It is null exactly for a name holding a backslash, a
+    carriage return or a line feed, which no pattern the panel can send
+    spells. PRE-STATE: most names in the set are misread when used as
+    their own pattern."""
+    ends = [" ", "\t", chr(0x85), chr(0xFEFF), chr(0x1C), chr(0x3000), chr(0xA0)]
+    names = {f"a{c}b.py" for c in "!\"#$%&'()*+,-.:;<=>?@[]^_`{|}~"}
+    names |= {
+        "[x].py",
+        "x.py",
+        "[!]x",
+        "[a-z].py",
+        "a.py",
+        "**",
+        "*",
+        "?",
+        "a..b.py",
+        "...",
+        "..x",
+        "src/**/x.py",
+        "src/[a]/b.py",
+        "my file.py",
+        "a\\b.py",
+        "a\nb.py",
+        "a\rb.py",
+    }
+    for c in ends:
+        names |= {f"{c}a.py", f"a.py{c}", f"src/{c}x.py", f"src/x.py{c}"}
+    names = sorted(names)
+    patterns = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(INPUT.map((p) => {"
+        "  const q = l.patternFor(p);"
+        "  return [q, q === null ? null : q.trim() === q];"
+        "})));",
+        names,
+    )
+
+    def misread(name):
+        """Whether a name used as its own pattern goes wrong: refused, or
+        stripped on the way, or matching itself not at all or not alone."""
+        try:
+            bench_snapshot.enforce_patterns([name])
+        except bench_snapshot.SnapshotError:
+            return True
+        return (
+            name != name.strip()
+            or not bench_snapshot.matches(name, name)
+            or any(bench_snapshot.matches(o, name) for o in names if o != name)
+        )
+
+    assert len([n for n in names if misread(n)]) > 10
+    for name, (pattern, survives_trim) in zip(names, patterns, strict=True):
+        if any(c in name for c in "\\\r\n"):
+            assert pattern is None, name
+            continue
+        assert pattern is not None, name
+        assert survives_trim, (name, pattern)
+        bench_snapshot.enforce_patterns([pattern])
+        assert bench_snapshot.matches(name, pattern), (name, pattern)
+        others = [n for n in names if n != name and bench_snapshot.matches(n, pattern)]
+        assert others == [], (name, pattern, others)
+        # THE PATH ITSELF WHEN NOTHING WOULD MISREAD IT: no glob character,
+        # and nothing at either end that either side strips.
+        plain = (
+            not any(c in name for c in "*?[")
+            and name == name.strip()
+            and not name.startswith(chr(0xFEFF))
+            and not name.endswith(chr(0xFEFF))
+        )
+        if plain:
+            assert pattern == name, (name, pattern)
+
+
+def test_the_listing_door_is_on_the_loop_like_the_composer():
+    """WINDOW: the two route functions, as the app registers them.
+
+    Bounded rather than offloaded, for create_snapshot's reason: a plain
+    def route would be moved to FastAPI's thread pool. PRE-STATE: the
+    composer's route is itself a coroutine function."""
+    assert inspect.iscoroutinefunction(main.create_snapshot)
+    assert inspect.iscoroutinefunction(main.list_snapshot)
+
+
+# =====================================================================
+# ---- Phase O, O3: a root inside version control. Pre-existing since
+# ---- Phase L; refused at both snapshot doors from here. Every test
+# ---- names its window.
+# =====================================================================
+
+# A token no sentence of the bench's could hold by accident.
+VCS_TOKEN = "ghp_Zq9x7Wv3Kp2Jm8"
+
+
+def repo_with_a_token(tmp_path):
+    """A repository, made by git, whose remote URL carries a token, so
+    the token sits in its .git/config exactly where a clone puts one."""
+    repo = tmp_path / "zqrepo"
+    clone(repo, {"a.py": b"A = 1\n"})
+    home = tmp_path / "git-home"
+    home.mkdir()
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    url = f"https://u:{VCS_TOKEN}@github.com/o/r.git"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", url], env=env, check=True
+    )
+    return repo
+
+
+def holds_no_part_of(text, secret, shortest=5):
+    return not any(
+        secret[i : i + shortest] in text for i in range(len(secret) - shortest + 1)
+    )
+
+
+@pytest.mark.parametrize("door", ["/snapshots", "/snapshots/listing"])
+def test_a_root_inside_git_is_refused_and_its_token_stays_out(client, tmp_path, door):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on <repo>/.git
+    with the pattern "config", where .git/config names a remote whose URL
+    carries a token.
+
+    Refused, 403, with the rule and not the path, and no part of the
+    token in the sentence; nothing is stored. PRE-STATE, the control:
+    the same file copied out of .git is selected by the same pattern and
+    its token composed, so the plant is live and the composer carries
+    whatever it is given; before this rule, <repo>/.git composed the
+    same way."""
+    repo = repo_with_a_token(tmp_path)
+    config = (repo / ".git" / "config").read_text()
+    assert VCS_TOKEN in config
+    copied = repo / "copied"
+    copied.mkdir()
+    (copied / "config").write_text(config)
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+
+    control = client.post(door, json={"root": str(copied), "patterns": ["config"]})
+    if door == "/snapshots":
+        assert control.status_code == 201, control.text
+        text = db.execute(
+            "SELECT extracted_text FROM attachment_extractions WHERE digest = ?",
+            (control.json()["digest"],),
+        ).fetchone()[0]
+        assert VCS_TOKEN in text
+    else:
+        assert control.status_code == 200
+        assert control.json()["would_compose"] is True
+        assert ("config", len(config.encode())) in selected_rows(control.json())
+
+    stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
+    resp = client.post(door, json={"root": str(repo / ".git"), "patterns": ["config"]})
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == main.ROOT_IN_VCS
+    assert holds_no_part_of(resp.text, VCS_TOKEN)
+    assert "zqrepo" not in resp.text and str(tmp_path) not in resp.text
+    assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
+
+
+def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_path):
+    """WINDOW: POST /snapshots/listing on roots at, inside and around
+    version control directories, and on names that only look like one.
+
+    Refused: a root deeper inside .git, inside .hg and .svn, inside a
+    directory spelled .GIT (on a disk that folds case, the repository's
+    .git itself), and a link into .git, which resolves to it. Answered:
+    the repository, .github, git, x.git. And only BELOW the entry: an
+    entry the operator named inside .git is walked, while the same
+    directory reached from an entry above it is refused, because the
+    deepest entry holding a root is the one it is measured from.
+    PRE-STATE: every root is a directory under an allowed entry."""
+    repo = repo_with_a_token(tmp_path)
+    for name in (
+        ".git/objects",
+        ".hg/store",
+        ".svn/pristine",
+        ".github",
+        "git",
+        "x.git",
+    ):
+        (repo / name).mkdir(parents=True, exist_ok=True)
+    other = tmp_path / "other"
+    (other / ".GIT").mkdir(parents=True)
+    (repo / "link").symlink_to(repo / ".git")
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+
+    def status(root):
+        assert Path(root).is_dir()
+        return client.post(
+            "/snapshots/listing", json={"root": str(root), "patterns": ["*"]}
+        ).status_code
+
+    for refused in (".git", ".git/objects", ".hg/store", ".svn/pristine", "link"):
+        assert status(repo / refused) == 403, refused
+    assert status(other / ".GIT") == 403
+    for answered in ("", ".github", "git", "x.git"):
+        assert status(repo / answered) == 200, answered
+
+    hooks = repo / ".git" / "hooks"
+    hooks.mkdir(exist_ok=True)
+    client.app.state.repo_roots = (str(tmp_path.resolve()), str(hooks.resolve()))
+    assert status(hooks) == 200
+    assert status(repo / ".git") == 403
+
+
+def test_the_list_carries_each_rows_latest_capture_as_the_detail_does(client, tmp_path):
+    """WINDOW: GET /attachments against GET /attachments/{digest}, row for
+    row, over a document and three snapshots of one repository at two
+    heads.
+
+    The list's capture is the detail's, field for field. The snapshot
+    whose selected bytes did not change between the heads (b.md) is one
+    row, and both doors name its LATEST walk; the two whose bytes did are
+    two rows, each at its own head; the document's is null. PRE-STATE:
+    the heads differ, and b.md's first walk was at the first."""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@example.invalid",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@example.invalid",
+    }
+    repo = clone(tmp_path / "heads", {"a.py": b"A = 1\n", "b.md": b"# b\n"})
+
+    def commit():
+        for args in (["add", "-A"], ["commit", "-q", "-m", "c"]):
+            subprocess.run(["git", "-C", str(repo), *args], env=env, check=True)
+        return subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    first = commit()
+    document = upload(client, "doc.txt", b"a document").json()["digest"]
+    d1 = snapshot_of(client, repo, ["*.py"]).json()
+    e1 = snapshot_of(client, repo, ["*.md"]).json()
+    (repo / "a.py").write_bytes(b"A = 2\n")
+    second = commit()
+    assert first != second
+    d2 = snapshot_of(client, repo, ["*.py"]).json()
+    e2 = snapshot_of(client, repo, ["*.md"]).json()
+    assert e1["digest"] == e2["digest"] and e1["capture"]["head"] == first
+
+    listed = {
+        row["digest"]: row for row in client.get("/attachments").json()["attachments"]
+    }
+    for digest in (document, d1["digest"], d2["digest"], e1["digest"]):
+        detail = client.get(f"/attachments/{digest}").json()
+        assert listed[digest]["capture"] == detail["capture"], digest
+    assert listed[document]["capture"] is None
+    assert listed[d1["digest"]]["capture"]["head"] == first
+    assert listed[d2["digest"]]["capture"]["head"] == second
+    assert listed[e1["digest"]]["capture"] == e2["capture"]
+    assert listed[e1["digest"]]["capture"]["head"] == second
+
+
+# =====================================================================
+# ---- Phase O, after the operator's pass: a git directory by what it
+# ---- holds, the root or one the walk reaches. Pre-existing since
+# ---- Phase L; refused by the walk at both snapshot doors from here.
+# ---- The fixture proof (a bare repository whose config carries a
+# ---- sentinel string in the userinfo position of a remote URL) is its
+# ---- own commit. Every test names its window.
+# =====================================================================
+
+
+def bare_repository(where):
+    """A bare repository made by git with its own template, so the names
+    the rule looks for are the names git writes, and its configuration
+    is git's default: nothing in it but what init puts there."""
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(where.parent),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    subprocess.run(["git", "init", "-q", "--bare", str(where)], env=env, check=True)
+    return where
+
+
+def git_directory_trees(tmp_path):
+    """Two roots, one per rule, each with its control: a bare repository
+    as the root, and a tree holding one at fixtures/zqbare.git between
+    a.py and zz.py; each control is the same with the git directory's
+    HEAD removed, so it holds three of the four names."""
+    roots = {}
+    for where, place in (("root", ""), ("below", "fixtures/zqbare.git")):
+        for control in (False, True):
+            top = tmp_path / f"zq{where}{'-control' if control else ''}"
+            if place:
+                clone(top, {"a.py": b"A = 1\n", "zz.py": b"Z = 1\n"})
+            bare = bare_repository(top / place if place else top)
+            if control:
+                (bare / "HEAD").unlink()
+            roots[(where, control)] = (top, place)
+    return roots
+
+
+@pytest.mark.parametrize(
+    ("where", "sentence"),
+    [("root", "ROOT_IS_GIT_DIRECTORY"), ("below", "HOLDS_GIT_DIRECTORY")],
+)
+def test_a_git_directory_refuses_at_both_doors_in_one_sentence(
+    client, tmp_path, where, sentence
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on a bare
+    repository made by git, as the root and as fixtures/zqbare.git under
+    it, with the patterns "**/*" and "**/config".
+
+    Compose answers 422, and the listing's row carries the same sentence
+    word for word: at the root, the stop row, last and final, with
+    complete false; below it, the row at fixtures/zqbare.git, with the
+    walk gone on past it to zz.py. The sentence is the rule's and names
+    no path: neither answer holds the temporary directory's path, and
+    the sentence holds no separator and neither "fixtures" nor "zq",
+    which the name of every root and git directory here holds; the
+    listing's row says where. Nothing is stored. PRE-STATE: the same
+    tree with the bare repository's HEAD removed composes (201) and
+    lists would_compose true with its config selected, so the walk of
+    that directory reads config when the rule does not stop it."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+    trees = git_directory_trees(tmp_path)
+    config = "/".join(filter(None, [trees[(where, False)][1], "config"]))
+
+    control, _ = trees[(where, True)]
+    body = {"root": str(control), "patterns": ["**/*", "**/config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 201, composed.text
+    listed = client.post("/snapshots/listing", json=body).json()
+    assert listed["would_compose"] is True
+    assert config in [path for path, _ in selected_rows(listed)]
+
+    counts = [
+        db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        for table in ("attachments", "snapshot_captures")
+    ]
+    top, place = trees[(where, False)]
+    body = {"root": str(top), "patterns": ["**/*", "**/config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422
+    detail = composed.json()["detail"]
+    listing = client.post("/snapshots/listing", json=body)
+    assert listing.status_code == 200
+    listed = listing.json()
+    assert listed["would_compose"] is False
+    assert listed["refusal"] == detail
+    row = {
+        "path": place,
+        "bytes": None,
+        "kind": "directory",
+        "status": "refused",
+        "reason": detail,
+    }
+    if where == "root":
+        assert listed["complete"] is False
+        assert listed["members"] == [row]
+    else:
+        assert listed["complete"] is True
+        assert row in listed["members"]
+        assert [m["path"] for m in listed["members"]] == [
+            "a.py",
+            "fixtures/zqbare.git",
+            "zz.py",
+        ]
+    for text in (composed.text, listing.text):
+        assert str(tmp_path) not in text and str(tmp_path.resolve()) not in text
+    for text in (detail, listed["refusal"]):
+        assert "zq" not in text and "fixtures" not in text and "/" not in text
+    assert detail == getattr(bench_snapshot, sentence)
+    assert counts == [
+        db.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+        for table in ("attachments", "snapshot_captures")
+    ]
+
+
+@pytest.mark.parametrize("where", ["root", "below"])
+def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
+    client, tmp_path, monkeypatch, where
+):
+    """WINDOW: POST /snapshots on a bare repository made by git, as the
+    root and as fixtures/zqbare.git under it, with main._git replaced by
+    a recorder of every git command the door runs and where.
+
+    The walk refuses before the composer asks git anything: no git
+    command runs, the head and dirty read (_clone_state) among them, so
+    nothing git would read from that directory is read. PRE-STATE: the
+    recorder is live and the read is where it was: the same tree with
+    the bare repository's HEAD removed composes, and the recorder saw
+    the composer's `git rev-parse HEAD` in the walked root."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    trees = git_directory_trees(tmp_path)
+    ran = []
+
+    def recorder(args, *, cwd=None, ceiling=None):
+        ran.append((list(args), cwd))
+        return None
+
+    monkeypatch.setattr(main, "_git", recorder)
+    control, _ = trees[(where, True)]
+    body = {"root": str(control), "patterns": ["**/*"]}
+    assert client.post("/snapshots", json=body).status_code == 201
+    assert ran == [
+        (
+            ["rev-parse", "--is-inside-work-tree", "--absolute-git-dir", "HEAD"],
+            str(control.resolve()),
+        )
+    ]
+
+    ran.clear()
+    top, _ = trees[(where, False)]
+    resp = client.post("/snapshots", json={"root": str(top), "patterns": ["**/*"]})
+    assert ran == []
+    assert resp.status_code == 422
+
+
+def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
+    client, tmp_path
+):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on <repo>/.git
+    when that directory is itself the BENCH_REPO_ROOTS entry, for a
+    repository made by git with its default configuration, under
+    "config".
+
+    This narrows 433d3ee's reading that an entry the operator names
+    inside .git is walked: a .git that is both the entry and the root
+    holds the four names, so the walk refuses it, Compose with 422 and
+    the listing with its stop row carrying the same sentence, and nothing
+    is stored. PRE-STATE: the entry is honored, since a root below it
+    that is not a git directory (its hooks) lists would_compose true;
+    ROOT_IN_VCS measures only below the entry, so vcs_below is false for
+    a root at its own entry and a 403 is not what refuses it; and git's
+    default configuration names no remote."""
+    repo = tmp_path / "zqrepo"
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    dot_git = (repo / ".git").resolve()
+    assert "url" not in (dot_git / "config").read_text()
+    (dot_git / "hooks").mkdir(exist_ok=True)
+    (dot_git / "hooks" / "zq.txt").write_text("x\n")
+    client.app.state.repo_roots = (str(dot_git),)
+    db = client.app.state.db
+    hooks = client.post(
+        "/snapshots/listing", json={"root": str(dot_git / "hooks"), "patterns": ["*"]}
+    )
+    assert hooks.status_code == 200 and hooks.json()["would_compose"] is True
+    assert bench_snapshot.vcs_below(str(dot_git), str(dot_git)) is False
+
+    stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
+    body = {"root": str(dot_git), "patterns": ["config"]}
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422
+    listed = client.post("/snapshots/listing", json=body).json()
+    assert (listed["would_compose"], listed["complete"]) == (False, False)
+    assert listed["members"] == [
+        {
+            "path": "",
+            "bytes": None,
+            "kind": "directory",
+            "status": "refused",
+            "reason": composed.json()["detail"],
+        }
+    ]
+    assert composed.json()["detail"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+    assert db.execute("SELECT count(*) FROM attachments").fetchone()[0] == stored
+
+
+# The string every fixture below plants in the userinfo position of a
+# remote URL. It is a sentinel, so a test can see whether repository-
+# supplied configuration reached a snapshot; it is not, and does not
+# resemble, anything real. The digits keep it out of every sentence the
+# doors can raise, which hold none.
+SENTINEL = "zqsentinel-7d19f3"
+SENTINEL_URL = f"https://user:{SENTINEL}@example.invalid/zqrepo.git"
+
+
+def git_env(home):
+    """The environment every git fixture here runs under: no system or
+    global configuration, so what a fixture holds is what the test put
+    there and nothing the machine adds."""
+    return {
+        "PATH": os.environ["PATH"],
+        "HOME": str(home),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+    }
+
+
+def stored_text(client, digest):
+    return client.app.state.db.execute(
+        "SELECT extracted_text FROM attachments WHERE digest = ?", (digest,)
+    ).fetchone()[0]
+
+
+def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on a bare
+    repository made by git whose config carries a remote URL with a
+    sentinel string in the userinfo position (git remote add writes it
+    there and nowhere else), under the patterns "config" and "**/*".
+
+    Both doors refuse in the rule's sentence, nothing is stored, and no
+    part of the sentinel is in either answer. PRE-STATE: the same
+    repository with its HEAD removed holds three of the four names, so
+    the rule does not fire, the walk reads config, and the sentinel is
+    in the stored text word for word. That is the exposure f8bde6b
+    closed, shown on the bytes git itself writes."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    db = client.app.state.db
+    for control in (True, False):
+        top = tmp_path / ("zqcontrol" if control else "zqbare")
+        env = git_env(tmp_path)
+        subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
+        subprocess.run(
+            ["git", "-C", str(top), "remote", "add", "origin", SENTINEL_URL],
+            env=env,
+            check=True,
+        )
+        assert SENTINEL in (top / "config").read_text()
+        if control:
+            (top / "HEAD").unlink()
+        body = {"root": str(top), "patterns": ["config", "**/*"]}
+        composed = client.post("/snapshots", json=body)
+        listed = client.post("/snapshots/listing", json=body)
+        if control:
+            assert composed.status_code == 201, composed.text
+            assert SENTINEL in stored_text(client, composed.json()["digest"])
+            assert listed.json()["would_compose"] is True
+            continue
+        assert composed.status_code == 422
+        assert composed.json()["detail"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+        assert listed.status_code == 200
+        assert listed.json()["would_compose"] is False
+        assert listed.json()["refusal"] == bench_snapshot.ROOT_IS_GIT_DIRECTORY
+        for text in (composed.text, listed.text):
+            assert SENTINEL not in text and "zqsentinel" not in text
+        assert (
+            db.execute(
+                "SELECT count(*) FROM attachments WHERE extracted_text LIKE ?",
+                (f"%{SENTINEL}%",),
+            ).fetchone()[0]
+            == 1
+        ), "only the control's snapshot holds the sentinel"
+
+
+# The places below a git directory's top level that can carry a URL git
+# uses, each verified on the git named. logs/ is written by git itself
+# (git pull keeps its arguments verbatim in the reflog message; git fetch
+# anonymises them), so the fixture has git write it rather than planting
+# a file: update-ref -m with core.logAllRefUpdates on, which is the
+# reflog line a pull would leave, and the list has no fixed end.
+BELOW_THE_TOP = [
+    # Legacy remote files git still reads for a fetch (git 2.43.0: `git
+    # fetch legacy` resolves the URL they hold with no warning; the review
+    # measured 2.50.1 reading them with a removal warning).
+    ("remotes", {"legacy": f"URL: {SENTINEL_URL}\nPush: refs/heads/main\n"}),
+    ("branches", {"br": f"{SENTINEL_URL}#main\n"}),
+    # A linked worktree's own configuration, which `git config
+    # --worktree` writes below the git directory's top level, and which
+    # `git worktree add` copies from the main worktree's (2.43.0 and
+    # 2.50.1 both).
+    (
+        "worktrees/wt",
+        {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
+    ),
+    # The reflog, written by git, not planted.
+    ("logs", "reflog"),
+]
+
+
+@pytest.mark.parametrize(("place", "planted"), BELOW_THE_TOP)
+def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
+    client, tmp_path, place, planted
+):
+    """WINDOW: POST /snapshots with the root placed INSIDE a git
+    directory, at remotes/, branches/, worktrees/wt/ and logs/, each
+    holding a file git reads or writes a remote URL in, with a sentinel
+    string in the userinfo position.
+
+    This is the exposure BACKLOG names as open: the walk sees the four
+    names only at the root or below it, never above, so a root below a
+    git directory's top level composes and the sentinel is in the stored
+    text. The test pins the open state; when the ancestor look is built
+    it fails at the status and is rewritten as that commit's pre-state.
+    The places, verified on git 2.43.0 here and by the review on 2.50.1:
+    the two legacy files are used by `git fetch` (2.43.0 silently, 2.50.1
+    with a removal warning); `git init` still makes an empty branches/
+    on 2.43.0 and no longer does on 2.50.1, which changes nothing here
+    since the file is planted; config.worktree is written by `git config
+    --worktree` under extensions.worktreeConfig and copied into a new
+    linked worktree by `git worktree add`; and logs/ is written by git
+    itself, here by update-ref -m as a pull would write it, so the
+    reachable set has no fixed end."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    env = git_env(tmp_path)
+    top = tmp_path / "zqbare"
+    subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
+    root = top / place
+    if planted == "reflog":
+        identity = {
+            **env,
+            "GIT_AUTHOR_NAME": "a",
+            "GIT_AUTHOR_EMAIL": "a@example.invalid",
+            "GIT_COMMITTER_NAME": "a",
+            "GIT_COMMITTER_EMAIL": "a@example.invalid",
+        }
+        git = ["git", "-C", str(top), "-c", "core.logAllRefUpdates=true"]
+        tree = subprocess.run(
+            [*git, "mktree"], input=b"", capture_output=True, env=env, check=True
+        ).stdout.strip()
+        commit = subprocess.run(
+            [*git, "commit-tree", tree, "-m", "x"],
+            capture_output=True,
+            env=identity,
+            check=True,
+        ).stdout.strip()
+        subprocess.run(
+            [
+                *git,
+                "update-ref",
+                "-m",
+                f"pull {SENTINEL_URL}",
+                "refs/heads/main",
+                commit,
+            ],
+            env=identity,
+            check=True,
+        )
+        assert SENTINEL in (root / "refs" / "heads" / "main").read_text()
+    else:
+        root.mkdir(parents=True, exist_ok=True)
+        for name, text in planted.items():
+            (root / name).write_text(text)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    assert composed.status_code == 201, composed.text
+    assert SENTINEL in stored_text(client, composed.json()["digest"])
+
+
+# =====================================================================
+# ---- Phase O, after the operator's pass: the snapshot door's git
+# ---- hardened. Every local git runs with _git_argv's configuration in
+# ---- _git_env's built environment, and a snapshot's looks for no
+# ---- repository above its allowlist entry. Recorder proofs of argv and
+# ---- environment, the ceiling on real repositories, and the order; no
+# ---- proof here runs a program a repository's configuration names.
+# ---- Every test names its window.
+# =====================================================================
+
+from test_network_posture import GIT_PREFIX  # noqa: E402
+
+# The walk's pinned copy of _git_argv's configuration, as a list: what
+# every local git begins with, before its verb.
+LOCAL_GIT_PREFIX = list(GIT_PREFIX)
+
+
+def plant_git_variables(monkeypatch, where):
+    """Every variable git reads for its configuration or its repository's
+    place, set in the bench's own environment to a harmless value (a path
+    that does not exist, an empty list, a switch turned back on). A built
+    environment passes none of them; a copied or partly copied one would
+    carry each into git, where the recorder's equality sees it."""
+    absent = where / "zqabsent"
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_CONFIG_GLOBAL",
+        "GIT_CONFIG_SYSTEM",
+        "GIT_EXEC_PATH",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+        "XDG_CONFIG_HOME",
+    ):
+        monkeypatch.setenv(name, str(absent / name))
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(absent))
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "0")
+    monkeypatch.setenv("GIT_CONFIG_PARAMETERS", "")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "0")
+    monkeypatch.setenv("GIT_DISCOVERY_ACROSS_FILESYSTEM", "1")
+    monkeypatch.setenv("ZQ_BENCH_ONLY", "zq")
+
+
+def recorded_processes(monkeypatch):
+    """Every process started through subprocess.Popen from here on
+    (subprocess.run and asyncio's subprocess both start one), recorded as
+    (argv, env, cwd) and then started as asked. A start by os.system,
+    os.posix_spawn, an exec or a fork is not seen here; the network
+    posture walk refuses every one of those in bench/."""
+    ran = []
+    real = subprocess.Popen
+
+    class Recorded(real):
+        def __init__(self, argv, *args, **kwargs):
+            ran.append((list(argv), kwargs.get("env"), kwargs.get("cwd")))
+            super().__init__(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", Recorded)
+    return ran
+
+
+def local_git_env(ceiling=None):
+    """_git_env's environment, written out."""
+    env = {
+        "PATH": os.environ.get("PATH", os.defpath),
+        "HOME": os.devnull,
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_TERMINAL_PROMPT": "0",
+    }
+    if ceiling is not None:
+        env["GIT_CEILING_DIRECTORIES"] = ceiling
+    return env
+
+
+def head_of(repo):
+    """A repository's commit, asked of git outside the bench."""
+    return subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        env=local_git_env(),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+
+def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots over a committed repository at
+    zqentry/zqrepo, zqentry the allowlist entry, with every process
+    started through subprocess.Popen recorded (argv, environment, working
+    directory) and then started as asked; then with every variable git
+    reads for its configuration or its repository's place planted in the
+    bench's environment (plant_git_variables: GIT_DIR, GIT_WORK_TREE,
+    GIT_CONFIG_GLOBAL and _SYSTEM, GIT_EXEC_PATH, GIT_INDEX_FILE,
+    GIT_OBJECT_DIRECTORY, GIT_COMMON_DIR, XDG_CONFIG_HOME,
+    GIT_CONFIG_NOSYSTEM=0, an empty GIT_CONFIG_PARAMETERS,
+    GIT_CONFIG_COUNT 0, GIT_DISCOVERY_ACROSS_FILESYSTEM, and
+    GIT_CEILING_DIRECTORIES at the entry) and a variable of the bench's
+    own; then with the root spelled through a link outside the entry.
+
+    Each git the door runs begins with _git_argv's configuration word for
+    word (no file system monitor, no hooks, no helper asked for sign-in
+    details, no bare repository found by searching) and runs in the
+    resolved root in exactly _git_env's environment: PATH; HOME and
+    GIT_CONFIG_GLOBAL at os.devnull; GIT_CONFIG_NOSYSTEM;
+    GIT_TERMINAL_PROMPT=0; GIT_CEILING_DIRECTORIES at the entry's parent.
+    Nothing of the bench's own environment reaches it, the planted
+    ceiling (at the entry, not its parent) included, and the head is
+    still the root's; a root spelled
+    through a link is asked about where it resolves, under the same
+    entry's ceiling. PRE-STATE: with nothing planted, the recorder is live
+    and git answered through it: it saw rev-parse asked where its search
+    landed and for the head, then for the work tree's top, then status,
+    all in the root, and the capture's head is the repository's commit."""
+    entry = tmp_path.resolve() / "zqentry"
+    repo = clone(entry / "zqrepo", {"a.py": b"A = 1\n"})
+    git_clone(repo)
+    head = head_of(repo)
+    link = tmp_path.resolve() / "zqlink"
+    link.symlink_to(repo)
+    client.app.state.repo_roots = (str(entry),)
+    body = {"root": str(repo), "patterns": ["*.py"]}
+
+    ran = recorded_processes(monkeypatch)
+    before = client.post("/snapshots", json=body)
+    assert before.status_code == 201
+    assert before.json()["capture"]["head"] == head
+    assert len(ran) == 3
+    assert ran[0][0][-1:] == ["HEAD"]
+    assert ran[-1][0][-3:] == ["status", "--porcelain", "."]
+    assert [cwd for _, _, cwd in ran] == 3 * [str(repo)]
+
+    ran.clear()
+    plant_git_variables(monkeypatch, tmp_path)
+    monkeypatch.setenv("GIT_CEILING_DIRECTORIES", str(entry))
+    (repo / "b.py").write_bytes(b"B = 1\n")
+    after = client.post("/snapshots", json=body)
+    assert after.status_code == 201
+    assert after.json()["capture"]["head"] == head
+    assert after.json()["capture"]["dirty"] is True
+    through = client.post("/snapshots", json={**body, "root": str(link)})
+    assert through.status_code == 201
+    assert through.json()["capture"]["head"] == head
+    assert [argv for argv, _, _ in ran] == 2 * [
+        [
+            *LOCAL_GIT_PREFIX,
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--absolute-git-dir",
+            "HEAD",
+        ],
+        [*LOCAL_GIT_PREFIX, "rev-parse", "--show-toplevel"],
+        [*LOCAL_GIT_PREFIX, "status", "--porcelain", "."],
+    ]
+    for _, env, cwd in ran:
+        assert cwd == str(repo)
+        assert env == local_git_env(ceiling=str(entry.parent))
+        assert "OPENROUTER_API_KEY" not in env and "ZQ_BENCH_ONLY" not in env
+
+
+def test_the_snapshot_doors_git_finds_no_repository_above_the_entry(client, tmp_path):
+    """WINDOW: POST /snapshots on roots in a committed repository at
+    zqouter, with the allowlist entry named at the repository and then at
+    a plain directory inside it, zqouter/zqinner; the root at the entry
+    and at a directory below it, zqinner/zqsub.
+
+    With the entry at the plain directory, the capture has no head: git
+    looked in the root and the directories up to the entry and stopped,
+    rather than reading the repository above the entry that the operator
+    did not name. PRE-STATE: with the entry at the repository itself,
+    the same two roots read its commit, so the ceiling (the entry's
+    parent, not the entry) keeps discovery inside the entry and costs
+    nothing there; and the plain directory is inside the repository,
+    which git outside the bench finds from it."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter",
+        {"a.py": b"A = 1\n", "zqinner/b.py": b"B = 1\n", "zqinner/zqsub/c.py": b"C\n"},
+    )
+    git_clone(outer)
+    head = head_of(outer)
+    inner = outer / "zqinner"
+    assert head_of(inner) == head
+
+    def heads(entry):
+        client.app.state.repo_roots = (str(entry),)
+        out = []
+        for root in (inner, inner / "zqsub"):
+            resp = client.post(
+                "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
+            )
+            assert resp.status_code == 201, resp.text
+            out.append(resp.json()["capture"]["head"])
+        return out
+
+    assert heads(outer) == [head, head]
+    assert heads(inner) == [None, None]
+
+
+def test_the_ceiling_is_the_deepest_entry_holding_the_root(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots with more than one allowlist entry, over a
+    committed repository at zqouter holding a plain directory zqinner:
+    the repository and the plain directory both named, in either order;
+    the plain directory beside an unrelated entry longer than it; the
+    repository beside zqouter/zqs, a string prefix of the root
+    zqouter/zqsub and not a directory holding it. Then, recorded, an
+    entry that is the filesystem root, and an entry whose parent's path
+    holds the character git splits GIT_CEILING_DIRECTORIES on.
+
+    The ceiling is measured from snapshot_entry, the deepest entry that
+    holds the root as a directory: with both named, the root in the
+    plain directory has no head whichever is listed first; the unrelated
+    longer entry changes nothing; the string prefix is not an entry
+    holding the root, so zqouter/zqsub reads the repository's commit. An
+    entry at the filesystem root gets no ceiling at all; an entry whose
+    parent holds os.pathsep asks git nothing and has no head, rather
+    than a ceiling git would split. PRE-STATE: git outside the bench
+    finds the repository from the plain directory; with the repository
+    alone as the entry the root in the plain directory reads its commit;
+    the unrelated entry is longer than the plain directory's; and a
+    repository under an entry whose parent holds no os.pathsep reads its
+    head through the recorder."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter",
+        {"a.py": b"A = 1\n", "zqinner/b.py": b"B\n", "zqsub/c.py": b"C\n"},
+    )
+    git_clone(outer)
+    head = head_of(outer)
+    inner = outer / "zqinner"
+    other = tmp_path.resolve() / ("zqother-" + "x" * len(str(inner)))
+    other.mkdir()
+    assert head_of(inner) == head and len(str(other)) > len(str(inner))
+
+    def head_at(root, *entries):
+        client.app.state.repo_roots = tuple(str(e) for e in entries)
+        resp = client.post(
+            "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["capture"]["head"]
+
+    assert head_at(inner, outer) == head
+    assert head_at(inner, outer, inner) is None
+    assert head_at(inner, inner, outer) is None
+    assert head_at(inner, other, inner) is None
+    assert head_at(outer / "zqsub", outer, outer.parent / "zqouter" / "zqs") == head
+
+    split = tmp_path.resolve() / f"zq{os.pathsep}split"
+    repo = clone(split / "zqentry" / "zqrepo", {"a.py": b"A = 1\n"})
+    git_clone(repo)
+    plain = clone(
+        tmp_path.resolve() / "zqplain" / "zqentry" / "zqrepo", {"a.py": b"A\n"}
+    )
+    git_clone(plain)
+    ran = recorded_processes(monkeypatch)
+    assert head_at(plain, plain.parent) == head_of(plain)
+    ran.clear()
+    assert head_at(plain, Path(plain.anchor)) == head_of(plain)
+    assert [env for _, env, _ in ran][:2] == 2 * [local_git_env()]
+    ran.clear()
+    assert head_at(repo, repo.parent) is None
+    assert ran == []
+
+
+def test_the_head_is_taken_only_where_git_landed_at_or_below_the_entry(
+    tmp_path, monkeypatch
+):
+    """WINDOW: _clone_state, with main._git replaced by a runner that
+    answers rev-parse as git 2.50.1 does (whether the root is in a work
+    tree, the absolute git directory, the head; then the work tree's
+    top) for a search that landed at each of five places, and records
+    every question: above the entry; at the entry; below it; in a git
+    directory the root is inside, below the entry; in a
+    --separate-git-dir checkout whose git directory is outside the
+    entry and whose work tree is below it.
+
+    The head is accepted, and status asked, only where the landing place
+    (the work tree's top, or the git directory when the root is inside
+    one) is the entry or below it by device and inode; from above, the
+    root reads as unknown and status is never asked, so nothing of the
+    repository above is recorded. This is the rule of the Phase O
+    review's M6, and it runs on every platform, where the spelling that
+    lets git pass a ceiling is macOS's alone. PRE-STATE: at the entry the
+    head is read and status asked, so the runner is live; and the five
+    places are real directories, the landing above holding the entry."""
+    above = tmp_path.resolve() / "zqabove"
+    entry = above / "zqentry"
+    root = entry / "zqsub"
+    root.mkdir(parents=True)
+    (entry / ".git").mkdir()
+    elsewhere = tmp_path.resolve() / "zqsep.git"
+    elsewhere.mkdir()
+    head = "a" * 40
+
+    def answered(inside, git_dir, top):
+        asked = []
+
+        def runner(args, *, cwd=None, ceiling=None):
+            asked.append(args[1] if len(args) > 1 else args[0])
+            if args[:1] == ["rev-parse"] and args[-1] == "HEAD":
+                if "--absolute-git-dir" not in args:
+                    return head + "\n"
+                return f"{inside}\n{git_dir}\n{head}\n"
+            if args == ["rev-parse", "--show-toplevel"]:
+                # Fatal inside a git directory, as git 2.50.1 is.
+                return f"{top}\n" if inside == "true" else None
+            if args[:1] == ["status"]:
+                return ""
+            return None
+
+        monkeypatch.setattr(main, "_git", runner)
+        state = main._clone_state(str(root), str(entry))
+        return state, asked
+
+    state, asked = answered("true", entry / ".git", entry)
+    assert state == (head, False) and asked[-1] == "--porcelain"
+    assert main._same_or_under(str(entry), str(above))
+
+    assert answered("true", above / ".git", above) == (
+        (None, None),
+        ["--is-inside-work-tree", "--show-toplevel"],
+    )
+    assert answered("true", root / ".git", root)[0] == (head, False)
+    assert answered("false", entry / ".git", entry)[0] == (head, False)
+    assert answered("false", above / ".git", above)[0] == (None, None)
+    assert answered("true", elsewhere, root)[0] == (head, False)
+
+
+@pytest.mark.parametrize("spelling", ["case", "firmlink"])
+def test_an_entry_spelled_unlike_gits_own_reads_no_head_from_above(
+    client, tmp_path, monkeypatch, spelling
+):
+    """WINDOW: POST /snapshots on a plain directory zqinner inside a
+    committed repository zqouter, with the allowlist entry at zqinner
+    spelled as macOS also spells it and git does not: zqouter in another
+    case, or the whole path through the /System/Volumes/Data firmlink;
+    the root at the entry, spelled the same way. Every git the door
+    starts is recorded; then the same with the ceiling's courtesy
+    rewrite (_canonical_directory) switched off.
+
+    No head either way. With the rewrite, the ceiling is spelled as git
+    spells it and git's search stops below it: one git, which finds no
+    repository. Without it, git ignores the ceiling and lands in zqouter,
+    above the entry, and the identity check alone refuses it: two gits
+    (where it landed, and the work tree's top), and status never asked.
+    And identity, not spelling: with the entry at zqouter itself, spelled
+    the same odd way, git lands there under its own spelling and the head
+    is read.
+    PRE-STATE: the other spelling names the same directory and is not the
+    spelling git gives; git outside the bench, with the ceiling so
+    spelled, finds zqouter from the root, so the window is live on this
+    disk; and with the entry spelled as git spells it the ceiling holds.
+    Skipped where the disk does not fold case or has no such firmlink."""
+    outer = clone(
+        tmp_path.resolve() / "zqouter", {"a.py": b"A\n", "zqinner/b.py": b"B\n"}
+    )
+    git_clone(outer)
+    inner = outer / "zqinner"
+    if spelling == "case":
+        odd = outer.parent / "ZQOUTER" / "zqinner"
+    else:
+        odd = Path("/System/Volumes/Data" + str(inner))
+    if not odd.is_dir() or not os.path.samefile(odd, inner):
+        pytest.skip(f"this disk has no {spelling} spelling of a directory")
+    assert str(odd) != str(inner)
+    found = subprocess.run(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=odd,
+        env={**local_git_env(), "GIT_CEILING_DIRECTORIES": str(odd.parent)},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert found.returncode == 0 and os.path.samefile(found.stdout.strip(), outer)
+
+    def head_at(entry):
+        client.app.state.repo_roots = (str(entry),)
+        resp = client.post(
+            "/snapshots", json={"root": str(entry), "patterns": ["*.py"]}
+        )
+        assert resp.status_code == 201, resp.text
+        return resp.json()["capture"]["head"]
+
+    ran = recorded_processes(monkeypatch)
+    assert head_at(inner) is None and len(ran) == 1
+    ran.clear()
+    assert head_at(odd) is None
+    assert len(ran) == 1
+    assert head_at(odd.parent) == head_of(outer)
+    ran.clear()
+    monkeypatch.setattr(main, "_canonical_directory", lambda path: path)
+    assert head_at(odd) is None
+    assert [argv[len(LOCAL_GIT_PREFIX) + 1] for argv, _, _ in ran] == [
+        "--is-inside-work-tree",
+        "--show-toplevel",
+    ]
+
+
+def test_the_build_label_asks_git_in_the_same_posture_without_a_ceiling(
+    tmp_path, monkeypatch
+):
+    """WINDOW: _app_sha, with main's own file placed in a committed
+    repository at zqlabel (so the checkout it asks about is that
+    repository, whatever the suite itself runs in), and every process
+    started through subprocess.Popen recorded (argv, environment, working
+    directory) and then started as asked.
+
+    Both its questions share the runner and the posture: _git_argv's
+    configuration, _git_env's environment, and no ceiling, since it asks
+    about its own checkout from that checkout, with every variable git
+    reads for its configuration or place planted in the bench's
+    environment (plant_git_variables) and none of them passed on.
+    PRE-STATE: it asked rev-parse HEAD and then status, both in zqlabel,
+    and the label is zqlabel's commit."""
+    repo = clone(tmp_path.resolve() / "zqlabel", {"bench/main.py": b"A = 1\n"})
+    git_clone(repo)
+    head = head_of(repo)
+    monkeypatch.setattr(main, "__file__", str(repo / "bench" / "main.py"))
+    plant_git_variables(monkeypatch, tmp_path)
+    ran = recorded_processes(monkeypatch)
+    assert main._app_sha() == head
+    assert [argv[-2:] for argv, _, _ in ran] == [
+        ["rev-parse", "HEAD"],
+        ["status", "--porcelain"],
+    ]
+    assert [str(cwd) for _, _, cwd in ran] == [str(repo), str(repo)]
+    assert [argv for argv, _, _ in ran] == [
+        [*LOCAL_GIT_PREFIX, "rev-parse", "HEAD"],
+        [*LOCAL_GIT_PREFIX, "status", "--porcelain"],
+    ]
+    assert [env for _, env, _ in ran] == 2 * [local_git_env()]
+
+
+@pytest.mark.parametrize("where", ["root", "below"])
+def test_no_process_starts_before_the_walk_refuses_a_git_directory(
+    client, tmp_path, monkeypatch, where
+):
+    """WINDOW: POST /snapshots on a bare repository made by git, as the
+    root and as fixtures/zqbare.git under it, with every process started
+    through subprocess.Popen recorded.
+
+    The walk refuses first, so no process starts through Popen: not the
+    head and dirty read's git and not any other, which is f8bde6b's order
+    proof taken down to the process start (the order is f8bde6b's). A
+    start by os.system, os.posix_spawn, an exec or a fork is the network
+    posture walk's to refuse, not this proof's. PRE-STATE: the same tree
+    with the bare repository's HEAD removed composes, and the recorder
+    saw the head read's git start in the root."""
+    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    trees = git_directory_trees(tmp_path)
+    ran = recorded_processes(monkeypatch)
+    control, _ = trees[(where, True)]
+    resp = client.post("/snapshots", json={"root": str(control), "patterns": ["**/*"]})
+    assert resp.status_code == 201
+    assert ran[0][0][-1:] == ["HEAD"] and "rev-parse" in ran[0][0]
+    assert ran[0][2] == str(control.resolve())
+
+    ran.clear()
+    top, _ = trees[(where, False)]
+    resp = client.post("/snapshots", json={"root": str(top), "patterns": ["**/*"]})
+    assert ran == []
+    assert resp.status_code == 422
 
 
 # =====================================================================
@@ -18921,8 +20594,9 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     Before: thresholds_included false, the pre-state. After: the pathless
     export reads the store and includes them, and the three ways of
     asking (nothing, the path, the digest) produce one artifact byte for
-    byte, because each resolved the dataset the manifest cites. The
-    schema stays 7: no key was added, only a value became reachable."""
+    byte, because each resolved the dataset the manifest cites. No key
+    was added, only a value became reachable, so this did not bump the
+    export schema."""
     eid, path = threshold_experiment(client, tmp_path)
     assert export_lines(client, eid)[0]["thresholds_included"] is False
 
@@ -18942,7 +20616,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 7
+    assert manifest["export_schema_version"] == 8
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(

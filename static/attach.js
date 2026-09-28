@@ -24,7 +24,23 @@
 // is what makes reuse and replay able to name a document at all, and it
 // is the reason the note under this control says where the file went.
 (function () {
-  const { fmtBytes, shortDigest, approxTokens, refusalText } = window.BenchLib;
+  const {
+    fmtBytes,
+    shortDigest,
+    approxTokens,
+    refusalText,
+    patternFor,
+    tooManyPatterns,
+    tooManyChecked,
+    listingSummary,
+    checkedSummary,
+    unfixableRow,
+    captureLine,
+    cloneInputsBlocker,
+    cloneBody,
+    cloneOutcomeLine,
+    readableClone,
+  } = window.BenchLib;
 
   const rowEl = document.getElementById("attach-row");
   const listEl = document.getElementById("attachments");
@@ -38,6 +54,65 @@
   const snapPatternsEl = document.getElementById("snapshot-patterns");
   const snapComposeEl = document.getElementById("snapshot-compose");
   const snapMsgEl = document.getElementById("snapshot-msg");
+  const snapListEl = document.getElementById("snapshot-list");
+  const snapListingEl = document.getElementById("snapshot-listing");
+  const snapSummaryEl = document.getElementById("snapshot-listing-summary");
+  const snapRowsEl = document.getElementById("snapshot-member-rows");
+  const cloneUrlEl = document.getElementById("clone-url");
+  const cloneRefEl = document.getElementById("clone-ref");
+  const cloneRunEl = document.getElementById("clone-run");
+  const cloneOutcomeEl = document.getElementById("clone-outcome");
+  const cloneReasonEl = document.getElementById("clone-reason");
+
+  // The member listing the table shows, or null: the patterns text it
+  // was made with, the text the panel last wrote into the patterns box,
+  // the listing itself, and one entry per row a person can check (the
+  // pattern that names exactly its file, its listed bytes, and its
+  // checkbox).
+  let listed = null;
+  // Moved by every List press and by every forget (another root typed,
+  // a composed snapshot, a reuse, a clear, the blind view), so an answer
+  // that lands after either is dropped. Typing another root moves no
+  // epoch at all, and a listing still in flight for the old root must
+  // not draw its rows under the new one.
+  let listToken = 0;
+  // Listings in flight. Their own count and never inFlight, which is
+  // the attachment count's: a listing is not a document, and counting it
+  // there would block Run and use a slot.
+  let listsInFlight = 0;
+
+  // ---- The Clone step's state (Phase O, O3).
+  //
+  // THE TOKEN IS THE ONLY GUARD ON A CLONE'S ANSWER, moved by every
+  // forget (a composed snapshot, a reuse, a clear, the blind view, a
+  // back/forward-cache restore) and by each Clone press, which takes a
+  // fresh one, and by nothing else. Not the view epochs: Run, a history
+  // entry and a run
+  // leave the panel and its root where they are, so a clone that lands
+  // after one of them still fills the box, and a refusal is still said,
+  // rather than vanishing with a root the server made and the page lost.
+  let cloneToken = 0;
+  // The token of the clone this page still waits for, or null. While it
+  // is current, the root, URL and ref boxes are read-only (the answer is
+  // about to fill the first and belongs to the other two), and List and
+  // Compose wait: nothing typed can drop the answer, and nothing listed
+  // or composed can be of a root about to be replaced.
+  let cloneOut = null;
+  // Clones not yet answered, forgotten or not. The server runs one at a
+  // time, so Clone waits for any; a counter of its own, and never
+  // inFlight, for listsInFlight's reason.
+  let clonesInFlight = 0;
+  // What the step says beside the Clone button about the last clone
+  // that landed ({text, title}), or null. Cleared by a new clone, by any
+  // forget, and by typing in any of the three boxes it describes. While
+  // it is set, the URL and ref in the boxes are the ones that made the
+  // root, which is what a composed snapshot may keep (see
+  // composeSnapshot).
+  let cloneOutcome = null;
+  // The view epoch the blind view opened at, or null. While it is the
+  // current epoch, cloning waits: a clone writes a path into the root
+  // box, and the blind view shows none.
+  let blindEpoch = null;
 
   // Mirrors MAX_ATTACHMENTS in bench/main.py. A client-side cap is a
   // convenience over the server's and never an authority: the refusal
@@ -90,24 +165,6 @@
   // document one thing and its own chip another.
   function docLabel(doc) {
     return doc.kind === SNAPSHOT_KIND ? SNAPSHOT_LABEL : doc.filename;
-  }
-
-  // One line saying which walk a snapshot was, for a title or a chip
-  // bit, or "" for anything without a capture. The commit is shortened
-  // to the seven characters git itself shows; "dirty" or "clean" is the
-  // tree's state at the walk, and "unknown" when the bench could read
-  // the commit but not the status.
-  function captureLine(capture) {
-    if (!capture || !Number.isInteger(capture.id)) return "";
-    const head =
-      typeof capture.head === "string" ? capture.head.slice(0, 7) : "no commit";
-    const state =
-      capture.dirty === true
-        ? "dirty"
-        : capture.dirty === false
-          ? "clean"
-          : "unknown";
-    return "capture #" + capture.id + " at " + head + ", " + state;
   }
 
   // Staged documents, in attachment order, which IS the order they are
@@ -714,6 +771,41 @@
     return "";
   }
 
+  // Why the Clone step cannot clone, or "" when it can. The server's
+  // own sentence when the door is off, never a second wording; a
+  // catalog that said nothing about clones is its own fact (an older
+  // server, a partial response), and so is a blind rating in progress.
+  //
+  // THE BLIND VIEW'S SENTENCE COMES FIRST, and the order is the rule:
+  // the door's other off sentence names BENCH_CLONE_ROOT and every
+  // allowed root, and the blind view shows no path.
+  function cloneBlocker() {
+    if (blindEpoch !== null && blindEpoch === window.BenchState.viewEpoch) {
+      return (
+        "Cloning waits until this blind rating is left: a clone fills " +
+        "the root box with a path, and the blind view shows none."
+      );
+    }
+    const posture = window.BenchState.clones;
+    if (posture === null || posture === undefined) {
+      return (
+        "The model catalog did not say whether cloning is configured " +
+        "on this bench."
+      );
+    }
+    if (!posture.enabled) {
+      // An empty reason must not switch the step on; see
+      // snapshotBlocker for the same guard.
+      return posture.reason || "Cloning is not configured on this bench.";
+    }
+    return "";
+  }
+
+  // Whether the clone in flight is one this page still waits for.
+  function liveClone() {
+    return cloneOut !== null && cloneOut === cloneToken;
+  }
+
   function closeSnapshotPanel() {
     snapPanelEl.hidden = true;
     snapOpenEl.setAttribute("aria-expanded", "false");
@@ -723,17 +815,60 @@
   // snapshot, on every view takeover that replaces the staging set, and
   // by the blind view when it opens, because a control holding a clone
   // root is a path waiting to be shown and the blind view's rule is
-  // that it shows none.
-  function forgetSnapshot() {
+  // that it shows none. The root box holds a root only while a person
+  // works (typed, or filled by Clone); no chip, stored snapshot, report
+  // or export shows one.
+  //
+  // THE CLONE STEP FORGETS WITH IT: its outcome, and any clone still
+  // out, whose answer would otherwise fill a root the panel has just
+  // forgotten. The URL and the ref too, except after a composed
+  // snapshot of the root they cloned (keepClone), where they are the
+  // person's own words for the repository and a second snapshot of it
+  // is one Clone away.
+  function forgetSnapshot(keepClone) {
     snapRootEl.value = "";
     snapPatternsEl.value = "";
+    if (!keepClone) {
+      cloneUrlEl.value = "";
+      cloneRefEl.value = "";
+    }
+    cloneToken += 1;
+    cloneOutcome = null;
+    // The message line too, which sits outside the panel: a refusal can
+    // carry an absolute path (a root outside the allowlist, a link's
+    // target), and the blind view's rule is that it shows none.
+    said("");
+    forgetListing();
     closeSnapshotPanel();
+    // The answer is gone, so the standing reason (snapshots off, the
+    // document bound, a catalog not yet answered) is shown again: none of
+    // those carries a path, and a disabled + Snapshot with no reason on
+    // the page is a reason no keyboard user reads. The clone step's
+    // reason, which can name paths, is written only inside the open
+    // panel (renderSnapshotControl), so closing it here empties it.
+    renderSnapshotControl();
+  }
+
+  // Empty the member table and its line. Every row is a path in
+  // somebody's repository, so the table goes wherever the root goes.
+  function clearListing() {
+    listed = null;
+    snapRowsEl.replaceChildren();
+    snapSummaryEl.textContent = "";
+    snapListingEl.hidden = true;
+  }
+
+  // Clear it and drop any listing still in flight.
+  function forgetListing() {
+    listToken += 1;
+    clearListing();
   }
 
   // A message this control produced in ANSWER to something the person
-  // did, as opposed to one it is merely restating. Set by every path in
-  // composeSnapshot, cleared when a snapshot lands or the staged set is
-  // replaced.
+  // did, as opposed to one it is merely restating. Set by composeSnapshot
+  // and listSnapshot on every path that is not a success, and by a check
+  // the panel undoes; cleared when a snapshot lands, a listing lands, a
+  // check writes the patterns, and whenever the panel forgets its root.
   function said(text) {
     snapMsgEl.textContent = text;
     snapMsgEl.dataset.said = text === "" ? "" : "1";
@@ -741,9 +876,46 @@
 
   function renderSnapshotControl() {
     const blocker = snapshotBlocker();
+    const cloneBlocked = cloneBlocker();
+    const live = liveClone();
     snapOpenEl.disabled = blocker !== "";
-    snapComposeEl.disabled = blocker !== "" || busy();
+    // Each waits for the other, so an answer never lands on a panel the
+    // other has just changed; and both wait for a clone the page still
+    // waits for, whose answer is about to replace the root.
+    snapComposeEl.disabled =
+      blocker !== "" || busy() || listsInFlight > 0 || live;
+    snapListEl.disabled = blocker !== "" || busy() || listsInFlight > 0 || live;
+    // Clone waits for List and Compose for the same reason, and for any
+    // clone at all, since the server makes one at a time.
+    cloneRunEl.disabled =
+      blocker !== "" ||
+      cloneBlocked !== "" ||
+      clonesInFlight > 0 ||
+      busy() ||
+      listsInFlight > 0;
+    cloneUrlEl.disabled = cloneBlocked !== "";
+    cloneRefEl.disabled = cloneBlocked !== "";
+    cloneUrlEl.readOnly = live;
+    cloneRefEl.readOnly = live;
+    snapRootEl.readOnly = live;
     if (blocker !== "") closeSnapshotPanel();
+    // THE CLONE STEP'S REASON ONLY WHILE THE PANEL IS OPEN. One of the
+    // door's two off sentences names BENCH_CLONE_ROOT and every allowed
+    // root, and a hidden element's text is still on the page; the other,
+    // CLONES_OFF, names none, and one rule covers both.
+    cloneReasonEl.textContent = snapPanelEl.hidden ? "" : cloneBlocked;
+    // Beside the Clone button: a clone running, or the last one's outcome.
+    // A running clone is said even after the panel forgot it, because
+    // Clone waits for it and a disabled button needs a reason.
+    if (clonesInFlight > 0) {
+      cloneOutcomeEl.textContent = live
+        ? "cloning; List and Compose wait for its answer"
+        : "an earlier clone is still running; Clone waits for it";
+      cloneOutcomeEl.title = "";
+    } else {
+      cloneOutcomeEl.textContent = cloneOutcome ? cloneOutcome.text : "";
+      cloneOutcomeEl.title = cloneOutcome ? cloneOutcome.title : "";
+    }
     // AN ANSWER OUTRANKS A RESTATEMENT. render() runs on every staging
     // change, so without this rule the specific thing a person just
     // earned ("the snapshot was composed and stored, and there was no
@@ -759,31 +931,123 @@
     snapMsgEl.textContent = blocker;
   }
 
-  async function composeSnapshot() {
-    const root = snapRootEl.value.trim();
-    // ONE PER LINE, NEVER SPLIT ON COMMAS: the fourteenth review's
-    // medium. The server accepts a comma literally in a pattern and
-    // inside a character class, so "a,b.py" is one pattern naming one
-    // file, and a comma split sent "a" and "b.py" and could have
-    // selected two different files from what was typed. A newline can
-    // never be part of a pattern, so it is the one safe separator.
-    const patterns = snapPatternsEl.value
+  // POST /clones with the URL and ref as typed (trimmed), and the answer
+  // as a filled root box and a line beside it. A clone is not a
+  // comparison: nothing is staged, and nothing about the lineup is sent.
+  async function cloneRepository() {
+    const url = cloneUrlEl.value.trim();
+    const ref = cloneRefEl.value.trim();
+    const blocked = cloneInputsBlocker(url, ref);
+    if (blocked !== null) {
+      said(blocked);
+      return;
+    }
+    cloneToken += 1;
+    const token = cloneToken;
+    cloneOut = token;
+    cloneOutcome = null;
+    clonesInFlight += 1;
+    said("");
+    renderSnapshotControl();
+    try {
+      const resp = await fetch("/clones", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(cloneBody(url, ref)),
+      });
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (err) {
+        body = null;
+      }
+      if (token !== cloneToken) return;
+      if (!resp.ok) {
+        // The server's sentence, word for word. None of the door's
+        // refusals repeats the URL, and the root box keeps what it held.
+        said(
+          body
+            ? refusalText(
+                body.detail,
+                "the clone was refused and the reason could not be read",
+              )
+            : "the clone was refused (HTTP " + resp.status + ")",
+        );
+        return;
+      }
+      if (!readableClone(body)) {
+        said(
+          "the bench answered " +
+            resp.status +
+            " with a clone this page could not read, so the root box " +
+            "keeps what it held.",
+        );
+        return;
+      }
+      // A table drawn for the root this replaces must go: a value set
+      // from script fires no input event, so nothing else would clear it.
+      forgetListing();
+      snapRootEl.value = body.root;
+      cloneOutcome = {
+        text: cloneOutcomeLine(body),
+        title: "head " + body.head_sha,
+      };
+      // Said outside the panel too when the panel is closed (by the
+      // person, or by a fourth document), since the step's own line is
+      // then hidden; the line names only the outcome and the commit.
+      said(snapPanelEl.hidden ? cloneOutcome.text : "");
+    } catch (err) {
+      if (token !== cloneToken) return;
+      said("the clone request could not be sent: " + err.message);
+    } finally {
+      clonesInFlight -= 1;
+      if (cloneOut === token) cloneOut = null;
+      renderSnapshotControl();
+    }
+  }
+
+  // The include patterns as the box holds them.
+  //
+  // ONE PER LINE, NEVER SPLIT ON COMMAS: the fourteenth review's
+  // medium. The server accepts a comma literally in a pattern and
+  // inside a character class, so "a,b.py" is one pattern naming one
+  // file, and a comma split sent "a" and "b.py" and could have
+  // selected two different files from what was typed. A newline can
+  // never be part of a pattern, so it is the one safe separator.
+  function typedPatterns() {
+    return snapPatternsEl.value
       .split("\n")
       .map((pattern) => pattern.trim())
       .filter((pattern) => pattern !== "");
+  }
+
+  // Why the panel cannot send its inputs yet, or "" when it can. Blank
+  // is not sent, and a list longer than a request may carry is said
+  // with the constant's name rather than sent for the request model to
+  // refuse in words that name neither.
+  function inputsBlocker(root, patterns) {
     if (root === "") {
-      said(
+      return (
         "Name the clone root to walk: an absolute path under one of the " +
-          "server's BENCH_REPO_ROOTS entries.",
+        "server's BENCH_REPO_ROOTS entries."
       );
-      return;
     }
     if (patterns.length === 0) {
-      said(
+      return (
         "Name at least one include pattern. Patterns are repo-relative " +
-          "and do not recurse unless they say so, so '*.py' is the top " +
-          "level and '**/*.py' is every depth.",
+        "and do not recurse unless they say so, so '*.py' is the top " +
+        "level and '**/*.py' is every depth."
       );
+    }
+    return tooManyPatterns(patterns.length) || "";
+  }
+
+  async function composeSnapshot() {
+    const root = snapRootEl.value.trim();
+    const patterns = typedPatterns();
+    const blocked = inputsBlocker(root, patterns);
+    if (blocked !== "") {
+      said(blocked);
       return;
     }
     // Both epochs, the same discipline addFiles follows: a snapshot that
@@ -852,11 +1116,14 @@
       staged.push(body);
       said("");
       // The inputs are cleared on success and the panel closed, so the
-      // root that was typed does not sit on the page waiting for the
-      // next open: a clone root is a path on somebody's filesystem, the
-      // one thing this feature never shows, and a hidden input holding
-      // one is a view that shows it one click later.
-      forgetSnapshot();
+      // root that was typed or filled does not sit on the page waiting
+      // for the next open: a clone root is a path on somebody's
+      // filesystem, which no chip, stored snapshot, report or export
+      // shows, and a hidden input holding one is a view that shows it
+      // one click later. The URL and ref stay only when they are the
+      // ones that cloned this root (a clone's outcome still stands):
+      // a refused URL, which can carry a token, is never kept.
+      forgetSnapshot(cloneOutcome !== null);
     } catch (err) {
       if (stale(epoch, staging)) return;
       said("the snapshot request could not be sent: " + err.message);
@@ -864,6 +1131,171 @@
       inFlight -= 1;
       render();
     }
+  }
+
+  // POST /snapshots/listing with the body Compose would send, and the
+  // answer as a table. The listing composes nothing and stores nothing;
+  // its sentences are the server's, word for word.
+  async function listSnapshot() {
+    const root = snapRootEl.value.trim();
+    const patterns = typedPatterns();
+    const blocked = inputsBlocker(root, patterns);
+    if (blocked !== "") {
+      said(blocked);
+      return;
+    }
+    listToken += 1;
+    const token = listToken;
+    const epoch = window.BenchState.viewEpoch;
+    const staging = stagingEpoch;
+    const text = snapPatternsEl.value;
+    listsInFlight += 1;
+    renderSnapshotControl();
+    try {
+      const resp = await fetch("/snapshots/listing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ root: root, patterns: patterns }),
+      });
+      let body = null;
+      try {
+        body = await resp.json();
+      } catch (err) {
+        body = null;
+      }
+      if (token !== listToken || stale(epoch, staging)) return;
+      if (!resp.ok) {
+        clearListing();
+        said(
+          body
+            ? refusalText(
+                body.detail,
+                "the listing was refused and the reason could not be read",
+              )
+            : "the listing was refused (HTTP " + resp.status + ")",
+        );
+        return;
+      }
+      if (body === null || !Array.isArray(body.members)) {
+        clearListing();
+        said(
+          "the bench answered " +
+            resp.status +
+            " with a listing this page could not read.",
+        );
+        return;
+      }
+      said("");
+      showListing(text, body);
+    } catch (err) {
+      if (token !== listToken || stale(epoch, staging)) return;
+      said("the listing request could not be sent: " + err.message);
+    } finally {
+      listsInFlight -= 1;
+      renderSnapshotControl();
+    }
+  }
+
+  function cell(text, name) {
+    const td = document.createElement("td");
+    td.className = name;
+    td.dataset.testid = name;
+    // textContent: every path and sentence here is somebody's repository
+    // or the server's words about it, and neither is markup.
+    td.textContent = text;
+    return td;
+  }
+
+  function showListing(text, listing) {
+    clearListing();
+    const narrowable = unfixableRow(listing) === null;
+    listed = { text, written: text, listing, rows: [] };
+    for (const member of listing.members) {
+      const tr = document.createElement("tr");
+      tr.className = "member-" + member.status;
+      tr.dataset.testid = "snapshot-member";
+      tr.dataset.status = member.status;
+      const use = cell("", "member-use");
+      // A row can be checked only when checking it can help: a selected
+      // file whose path a pattern can name exactly, in a listing no
+      // refusal outside the patterns' reach holds (a walk that stopped,
+      // a link out of the root, a pipe, a directory too deep), since no
+      // narrowing makes that listing compose.
+      if (member.status === "selected" && narrowable) {
+        const pattern = patternFor(member.path);
+        if (pattern === null) {
+          use.textContent = "no exact pattern";
+          use.title =
+            "This name holds a backslash or a line break, which no pattern " +
+            "the panel can send spells exactly; a glob can still select it.";
+        } else {
+          const box = document.createElement("input");
+          box.type = "checkbox";
+          box.dataset.testid = "snapshot-member-use";
+          // In quotes: an accessible name has its whitespace collapsed,
+          // so " a.py" and "a.py" would be read out as the same file.
+          box.setAttribute("aria-label", JSON.stringify(member.path));
+          box.addEventListener("change", () => narrow(box));
+          use.append(box);
+          listed.rows.push({ pattern, bytes: member.bytes, box });
+        }
+      }
+      tr.append(
+        use,
+        cell(
+          member.path === "" ? "(the snapshot root)" : member.path,
+          "member-path",
+        ),
+        cell(member.bytes === null ? "" : String(member.bytes), "member-bytes"),
+        cell(member.status, "member-status"),
+        cell(member.reason || "", "member-reason"),
+      );
+      snapRowsEl.append(tr);
+    }
+    snapSummaryEl.textContent = listingSummary(listing);
+    snapListingEl.hidden = false;
+  }
+
+  // Checked rows write the patterns: one per checked file, in the
+  // table's order, each naming exactly that file. None checked puts
+  // back the patterns the listing was made with.
+  function narrow(box) {
+    if (listed === null) return;
+    // HAND EDITS ARE NOT OVERWRITTEN. A box that no longer holds what the
+    // panel last wrote has been edited, and the listing no longer
+    // describes it, so the check is undone and the person is told.
+    if (snapPatternsEl.value !== listed.written) {
+      box.checked = !box.checked;
+      said(
+        "The patterns were edited after this listing, so it no longer " +
+          "describes them. List again to narrow from them.",
+      );
+      return;
+    }
+    const checked = listed.rows.filter((row) => row.box.checked);
+    // PAST THE LIMIT THE CHECK IS UNDONE, so the checked rows and the box
+    // always agree: a box left holding the first twenty while a
+    // twenty-first stood checked would compose a selection nobody made.
+    const over = tooManyChecked(checked.length);
+    if (over !== null) {
+      box.checked = false;
+      said(over);
+      return;
+    }
+    const text =
+      checked.length === 0
+        ? listed.text
+        : checked.map((row) => row.pattern).join("\n");
+    snapPatternsEl.value = text;
+    listed.written = text;
+    said("");
+    snapSummaryEl.textContent =
+      checked.length === 0
+        ? listingSummary(listed.listing)
+        : checkedSummary(
+            checked.length,
+            checked.reduce((sum, row) => sum + row.bytes, 0),
+          );
   }
 
   function init() {
@@ -888,10 +1320,52 @@
       const opening = snapPanelEl.hidden;
       snapPanelEl.hidden = !opening;
       snapOpenEl.setAttribute("aria-expanded", String(opening));
-      if (opening) snapRootEl.focus();
+      // Repainted, so the clone step's reason appears with the panel and
+      // goes with it (see renderSnapshotControl).
+      renderSnapshotControl();
+      if (opening) {
+        // The URL box first when cloning is open and no root is held,
+        // since that is where a root comes from; the root box otherwise.
+        const start =
+          cloneBlocker() === "" && snapRootEl.value === ""
+            ? cloneUrlEl
+            : snapRootEl;
+        start.focus();
+      }
     });
+    cloneRunEl.addEventListener("click", () => {
+      void cloneRepository();
+    });
+    // The outcome describes the URL, the ref and the root it came with;
+    // typing in any of them makes it describe something else.
+    for (const el of [cloneUrlEl, cloneRefEl]) {
+      el.addEventListener("input", () => {
+        cloneOutcome = null;
+        renderSnapshotControl();
+      });
+    }
     snapComposeEl.addEventListener("click", () => {
       void composeSnapshot();
+    });
+    snapListEl.addEventListener("click", () => {
+      void listSnapshot();
+    });
+    // A listing describes one root: typing another empties the table,
+    // rather than leave checkboxes that would write one tree's paths as
+    // patterns for another. Always, and not only when a table is shown:
+    // a listing still in flight for the old root must be dropped too,
+    // and nothing else moves its token.
+    snapRootEl.addEventListener("input", () => {
+      forgetListing();
+      cloneOutcome = null;
+      renderSnapshotControl();
+    });
+    // NOTHING IS REMEMBERED ACROSS LOADS, the back/forward cache
+    // included: a page restored from it comes back live, with whatever
+    // the boxes held (a URL with a token in it, a root), and autocomplete
+    // does not reach it. A restored page forgets the panel.
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted) forgetSnapshot(false);
     });
     render();
   }
@@ -1006,7 +1480,16 @@
   // dataset builder's document picker so a snapshot is "repository
   // snapshot" there too and never its derived filename.
   A.docLabel = docLabel;
-  A.forgetSnapshot = forgetSnapshot;
+  // Forget the panel, as a view takeover does.
+  A.forgetSnapshot = () => {
+    forgetSnapshot(false);
+  };
+  // The same, for the blind view, after which cloning waits until the
+  // view moves on (see cloneBlocker).
+  A.forgetSnapshotForBlind = () => {
+    blindEpoch = window.BenchState.viewEpoch;
+    forgetSnapshot(false);
+  };
   // Repaint on new facts from outside, currently the data policy landing
   // with the catalog. Named refresh rather than exposing render, because
   // a caller must not be able to pass it arguments and change what is

@@ -1172,3 +1172,36 @@ def test_a_file_over_the_bound_at_the_listing_is_refused_without_being_opened():
         walk(tree=fake, patterns=["*.py"])
     assert "huge.py" in str(caught.value)
     assert "huge.py" not in fake.opened
+
+
+@pytest.mark.parametrize(
+    ("real", "entry", "inside"),
+    [
+        ("/a/repo/.git", "/a", True),
+        ("/a/repo/.git/objects/pack", "/a", True),
+        ("/a/repo/.hg", "/a", True),
+        ("/a/repo/.svn/pristine", "/a", True),
+        ("/a/repo/.GIT", "/a", True),
+        ("/a/repo/.Hg", "/a", True),
+        ("/a/repo", "/a", False),
+        ("/a/repo/.github", "/a", False),
+        ("/a/repo/git", "/a", False),
+        ("/a/repo/x.git", "/a", False),
+        ("/a/repo/.gitignore", "/a", False),
+        ("/a/.git", "/a/.git", False),
+        ("/a/.git/hooks", "/a/.git", False),
+        ("/.git/a", "/.git/a", False),
+    ],
+)
+def test_a_root_through_version_control_is_found_below_its_entry(real, entry, inside):
+    """WINDOW: snapshot.vcs_below on one resolved root and its entry.
+
+    Any part below the entry that is .git, .hg or .svn, case folded;
+    nothing above the entry counts, and nothing that merely resembles
+    one. PRE-STATE: the three names are the version control group's
+    first three, so the root rule and the walk's exclusion name the same
+    directories."""
+    from bench.snapshot import EXCLUDE_GROUPS, VCS_DIRECTORIES, vcs_below
+
+    assert EXCLUDE_GROUPS[0][1][:3] == VCS_DIRECTORIES == (".git", ".hg", ".svn")
+    assert vcs_below(real, entry) is inside
