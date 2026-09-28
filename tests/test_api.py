@@ -18,6 +18,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from bench import clones, main, report
+from bench import models as bench_models
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import (
@@ -28,6 +29,10 @@ from bench.models import (
     provider_preferences,
     token_rates,
 )
+
+# Read through getattr so this file still collects against a tree from
+# before the sentence existed (a pre-state), where it fails on the value.
+UNREAD_ROUTE = getattr(bench_models, "UNREAD_ROUTE", "(no such sentence)")
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -9468,6 +9473,12 @@ def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
     asked. This is the same asymmetry trial_route already draws for the
     reasoning field: an unanswerable listing is an absence, not a
     licence to use the aggregate.
+
+    Since Phase P (the operator's ruling on the external review's H1) the
+    projection still refuses and now says why, and what the spend
+    ceiling does instead: the trial reserves at the catalog's model
+    rates (models.UNREAD_ROUTE). Before, it named the bare model and the
+    trial reserved nothing.
     """
     respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
         json={
@@ -9494,7 +9505,7 @@ def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
     # the null below is a refusal and not an absence of data.
     assert app.state.prices["model/alpha"]["prompt"] == 1e-06
     assert cost["total_usd"] is None
-    assert cost["unpriced"] == ["model/alpha"]
+    assert cost["unpriced"] == [f"model/alpha ({UNREAD_ROUTE})"]
 
 
 def test_review_repro_a_request_charge_makes_the_projection_null_not_zero(
@@ -10140,8 +10151,9 @@ def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_p
     THREE ANSWERS, NOT TWO. "This route charges something I cannot
     count" and "I know nothing about this route's price" are different
     facts with different remedies, and collapsing them was half of what
-    the finding was about. The bare name is the honest answer to the
-    second and only to the second.
+    the finding was about. The second names no charge; since Phase P it
+    says the price could not be read and what the spend ceiling does
+    instead, where it was the bare name.
     """
     respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
         json={
@@ -10164,7 +10176,7 @@ def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_p
         json=strict_body(path, provider_pins={"model/alpha": "together"}),
     ).json()["projected_cost"]
 
-    assert cost["unpriced"] == ["model/alpha"]
+    assert cost["unpriced"] == [f"model/alpha ({UNREAD_ROUTE})"]
     assert "charges" not in cost["unpriced"][0]
 
 
@@ -10224,9 +10236,16 @@ def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
     MEASURED BEFORE THIS TEST EXISTED: the refusal could be deleted
     outright and the suite stayed green at 976 passed.
 
-    ANY MATCHING ENDPOINT POISONS THE PIN, because the router may pick
-    it. Returning the other endpoint's clean rates would be quoting the
-    one route the pin does not guarantee.
+    ANY MATCHING ENDPOINT POISONS THE PIN'S PROJECTION, because the
+    router may pick it. Returning the other endpoint's clean rates as
+    though they were the whole price would be quoting the one route the
+    pin does not guarantee.
+
+    Since Phase P (the external review's H1) the highest rates come back
+    beside the charge's name rather than None: the projection still
+    refuses on the name (asserted below), and the spend ceiling's
+    reservation reads the rates, where None made the trial reserve
+    nothing while its settlement counted it.
     """
     listing = {
         "fetched": True,
@@ -10246,8 +10265,14 @@ def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
 
     rates, beyond = endpoint_rates(listing, "together")
 
-    assert rates is None
+    assert rates == {"prompt": 1.0, "completion": 2.0}
     assert beyond == ["request"]
+    from bench.models import projected_cost
+
+    route = {"pin": "together", "rates": rates, "beyond": beyond}
+    priced = main.experiment_prices(["m"], {"m": route}, {})
+    cost = projected_cost(1, None, ["m"], 1, {"m": 10}, priced, chars_per_token=4)
+    assert (cost["total_usd"], cost["unpriced"]) == (None, ["m (charges request)"])
 
 
 # ---- Thirteenth review panel, D: F2 is enforced at four doors, so it
@@ -24580,52 +24605,88 @@ def test_a_call_is_claimed_at_its_two_rates_as_its_settlement_counts_it():
         assert main.call_worst_case(model, 100, chars, prices) is None, model
 
 
-def test_the_ledger_and_the_projection_disagree_about_one_price_shape_only():
-    """WINDOW: call_worst_case (what the ledger reserves) beside
-    projected_cost (what an experiment's projection quotes) for one call,
-    over every shape a price entry can take: a model's two rates; a
-    model's two rates with a charge beyond them; a pinned route with only
-    the charges it cannot count; no entry; a rate missing; a rate that is
-    not finite; rates at zero.
+def test_the_ledger_and_the_projection_disagree_about_one_price_shape_only(
+    monkeypatch,
+):
+    """WINDOW: what the ledger reserves for one call beside what the
+    projection (projected_cost over experiment_prices, as the 201 builds
+    it) quotes for the same call, over every shape a price can take: an
+    unpinned model's two rates; its two rates and a charge beyond them; a
+    pinned route's two rates; a pinned route's two rates and a charge
+    beyond them; a pinned route whose endpoint published no price the
+    bench could read; a model the catalog has no entry for; rates at
+    zero; and, though the catalog's token_rates never yields them, a
+    rate missing and a rate not finite, the two functions' own contract.
 
-    The operator's ruling after the pass at f123525: the two must not
-    disagree about a member silently. They agree on every shape but one,
-    and where they agree on a figure it is the same figure. The one is a
-    model whose listing names a nonzero charge beyond its two rates: the
-    projection refuses it, naming the charge, and the ledger reserves at
-    the two rates, as cost_usd's estimate will settle it (BACKLOG: the
-    projection and the ledger price a model with charges beyond its two
-    rates differently, with the 131 of 396 measurement as its reason).
-    PRE-STATE: each shape is one the catalog or the endpoint listing can
-    produce (fetch_catalog, experiment_prices)."""
+    The operator's rulings: the two must not disagree silently. They
+    agree on every shape but a charge beyond the two rates, pinned or
+    not, and a pinned route whose price could not be read, and where both
+    price the figure is equal. The first is on BACKLOG ("The projection
+    and the ledger disagree about a model with charges beyond its two
+    rates", the 131 of 396 measurement its reason); the second is the
+    ruling on the external review's H1, and the projection says so in
+    its sentence (models.UNREAD_ROUTE). The name of this proof keeps the
+    words 1d91670 gave it; the shapes are what it holds. PRE-STATE: before
+    the H1 fix the pinned shapes reserved nothing (both disagreements
+    were silent, in the ceiling's unsafe direction)."""
     from bench.models import projected_cost
 
     rates = {"prompt": 1e-06, "completion": 2e-06}
-    shapes = {
+    catalog = {"m": {**rates, "beyond": []}}
+    unpinned = {
         "two rates": {**rates, "beyond": []},
         "two rates and a charge beyond": {**rates, "beyond": ["web_search"]},
-        "a pinned route charging only beyond": {"beyond": ["request"]},
         "no entry": None,
         "a rate missing": {"completion": 2e-06},
         "a rate not finite": {"prompt": float("nan"), "completion": 2e-06},
         "rates at zero": {"prompt": 0.0, "completion": 0.0, "beyond": []},
     }
+    pinned = {
+        "a pinned route's two rates": {"rates": rates, "beyond": []},
+        "a pinned route's two rates and a charge beyond": {
+            "rates": rates,
+            "beyond": ["input_cache_read"],
+        },
+        "a pinned route whose price could not be read": {"rates": None, "beyond": []},
+    }
     chars = {"prompt": 5, "system": 9}
-    disagree = []
-    for name, price in shapes.items():
-        prices = {} if price is None else {"m": price}
+
+    def projected(prices):
         try:
-            projected = projected_cost(
+            return projected_cost(
                 1, {"call": chars}, ["m"], 1, {"m": 100}, prices, chars_per_token=4
-            )
+            )["total_usd"]
         except (KeyError, TypeError):
-            projected = {"total_usd": None, "unpriced": ["m"]}
-        reserved = main.call_worst_case("m", 100, chars, prices)
-        if (projected["total_usd"] is None) != (reserved is None):
+            return None
+
+    disagree = []
+    for name, price in unpinned.items():
+        prices = {} if price is None else {"m": price}
+        quoted, reserved = (
+            projected(prices),
+            main.call_worst_case("m", 100, chars, prices),
+        )
+        if (quoted is None) != (reserved is None):
             disagree.append(name)
         elif reserved is not None:
-            assert reserved == projected["total_usd"], name
-    assert disagree == ["two rates and a charge beyond"]
+            assert reserved == quoted, name
+    monkeypatch.setattr(main.app.state, "prices", catalog, raising=False)
+    for name, route in pinned.items():
+        route = {"pin": "together", **route}
+        quoted = projected(main.experiment_prices(["m"], {"m": route}, catalog))
+        reserved = main.trial_worst_case("m", 100, chars, route)
+        if (quoted is None) != (reserved is None):
+            disagree.append(name)
+        elif reserved is not None:
+            assert reserved == quoted, name
+    assert disagree == [
+        "two rates and a charge beyond",
+        "a pinned route's two rates and a charge beyond",
+        "a pinned route whose price could not be read",
+    ]
+    # What the unread route reserves is the catalog's figure for the call.
+    unread = {"pin": "together", "rates": None, "beyond": []}
+    assert main.trial_worst_case("m", 100, chars, unread) == projected(catalog)
 
 
 # ---- The window: two claims racing the last dollar.
@@ -26119,6 +26180,184 @@ def test_a_judge_call_stopped_while_it_waits_for_room_is_never_sent(
         assert [r for r in scores_in(c, eid) if r["scorer"] == "judge"] == []
         (made,) = c.get(f"/experiments/{eid}/scoring").json()["passes"]
         assert (made["outcome"], made["scored"]) == ("stopped", 0)
+
+
+def pinned_listing(pricing):
+    """An endpoint listing for model/alpha with one Together endpoint
+    capped at 100 completion units, priced as given (None: no pricing
+    object at all)."""
+    endpoint = {
+        "provider_name": "Together",
+        "tag": "together",
+        "max_completion_tokens": 100,
+        "supported_parameters": ["max_tokens"],
+    }
+    if pricing is not None:
+        endpoint["pricing"] = pricing
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": [endpoint]}}
+    )
+
+
+@respx.mock
+def test_a_pinned_trial_whose_endpoint_charges_beyond_reserves_its_two_rates(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a strict experiment pinned to an endpoint publishing its two
+    rates and a cache-read rate, its one trial's claim read at its
+    upstream call, and the 201's projection.
+
+    The projection refuses and names the charge, as before; the trial
+    reserves at the endpoint's two rates (the 100 completion cap at 0.002
+    and one unit of input at 0.001), the same rule as an unpinned model's.
+    PRE-STATE, the external review's H1: at 1d91670 endpoint_rates
+    dropped the rates when a charge beyond them was named, so the claim
+    was 0.0 while the settlement still counted the call."""
+    pinned_listing(
+        {"prompt": "0.001", "completion": "0.002", "input_cache_read": "0.0001"}
+    )
+    during = []
+
+    def reply(request):
+        during.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        assert created.status_code == 201, created.text
+        cost = created.json()["projected_cost"]
+        assert cost["total_usd"] is None
+        assert cost["unpriced"] == ["model/alpha (charges input_cache_read)"]
+        run_experiment_to_completion(c, created.json()["id"], path)
+        assert during == [pytest.approx(0.201)]
+
+
+@respx.mock
+def test_a_pinned_trial_past_the_limit_alone_is_refused_before_it_is_sent(
+    monkeypatch, tmp_path
+):
+    """WINDOW: the same pinned trial, reserving 0.201 at its endpoint's two
+    rates, under a 0.1 limit with nothing else in flight.
+
+    Its reservation cannot fit beside recorded spend alone, so it is
+    refused at once, a refusal row, the experiment halted, and nothing
+    sent. PRE-STATE: at 1d91670 it reserved nothing and was sent (one
+    upstream call here, settled at the catalog's rates; the external
+    review, with the reply billed at the endpoint's rates, measured 0.201
+    recorded against the 0.1 limit)."""
+    pinned_listing(
+        {"prompt": "0.001", "completion": "0.002", "input_cache_read": "0.0001"}
+    )
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.1) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        eid = created.json()["id"]
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        drive_until(
+            c,
+            lambda: c.app.state.experiment_run["active"] is None,
+            "the run",
+            timeout_s=5.0,
+        )
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["trials_refused"]) == ("halted_on_refusal", 1)
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_a_pinned_trial_waits_for_room_another_call_holds(monkeypatch, tmp_path):
+    """WINDOW: a claim of 0.032769 standing, and a trial pinned to an
+    endpoint charging beyond its two rates whose reservation (the 100
+    completion cap at 0.0002 and one unit at 0.0001, 0.0201) fits the 0.05
+    limit alone and not beside it; then the claim given back.
+
+    The pinned trial waits as any trial does, and goes once the room is
+    back. PRE-STATE: at 1d91670 it reserved nothing and went upstream
+    beside the standing claim (the review measured two calls on the wire
+    against a limit with room for one)."""
+    pinned_listing(
+        {"prompt": "0.0001", "completion": "0.0002", "input_cache_read": "0.00001"}
+    )
+    calls = []
+
+    def reply(request):
+        calls.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        eid = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        ).json()["id"]
+
+        async def staged():
+            standing = stand(W_ALPHA)
+            try:
+                async with app_client() as r:
+                    await r.post(
+                        f"/experiments/{eid}/start", json={"dataset_path": path}
+                    )
+                await spin(lambda: waits or calls)
+                before = (list(waits), list(calls))
+            finally:
+                give_back(standing)
+            await spin(lambda: calls)
+            return before
+
+        before = c.portal.call(staged)
+        assert before == ([pytest.approx(W_ALPHA)], [])
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "run")
+        assert calls == [pytest.approx(0.0201)]
+
+
+@respx.mock
+def test_a_pinned_trial_whose_endpoint_price_cannot_be_read_reserves_at_the_catalogs(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a strict experiment pinned to an endpoint whose listing
+    carries no pricing object, its one trial's claim read at its upstream
+    call, and the 201's projection.
+
+    The operator's ruling on the external review's H1: the trial reserves
+    at the catalog's model rates (the 100 completion cap at alpha's 2e-6
+    and one unit at 1e-6), the rates its settlement will count, and the
+    projection still refuses and says so. PRE-STATE: at 1d91670 the claim
+    was 0.0 and the projection named the bare model."""
+    pinned_listing(None)
+    during = []
+
+    def reply(request):
+        during.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["projected_cost"]["unpriced"] == [
+            f"model/alpha ({UNREAD_ROUTE})"
+        ]
+        run_experiment_to_completion(c, created.json()["id"], path)
+        assert during == [pytest.approx(100 * 2e-06 + 1 * 1e-06)]
 
 
 # ---- The census: every paid call is claimed, and released in a finally.

@@ -299,7 +299,13 @@ a23b257).
   refuses to price it and names the charge, while the spend ceiling's
   reservation (`call_worst_case`) reserves for it at the two rates, the
   same arithmetic, since `cost_usd`'s estimate will settle it at those
-  rates. On every other shape of price the two agree, and on the figure
+  rates. The same holds for a pinned route whose endpoint names such a
+  charge (its endpoint's two rates, since the external review's H1),
+  and a pinned route whose endpoint published no price the bench could
+  read is refused by the projection while its trial reserves at the
+  catalog's model rates, by the operator's ruling on H1, which the
+  projection says in naming it. On every other shape of price the two
+  agree, and on the figure
   (`test_the_ledger_and_the_projection_disagree_about_one_price_shape_only`).
 - **Deferred by:** Phase P, ruled by the operator after the pass at
   f123525.

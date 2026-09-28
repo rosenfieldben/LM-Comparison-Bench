@@ -1152,10 +1152,18 @@ def endpoint_rates(
     total until a caller supplies token counts.
 
     (None, names) when the listing never fetched, when no endpoint
-    matched the pin, when a matched endpoint's rates cannot be read, or
-    when one charges a dimension this cannot price. The caller must not
-    fall back to the model level on any of them: falling back is exactly
-    the substitution this function exists to stop.
+    matched the pin, or when a matched endpoint's rates cannot be read.
+    The caller must not fall back to the model level for the projection
+    on any of them: falling back is exactly the substitution this
+    function exists to stop. (The spend ceiling's reservation does, and
+    says so: see experiment_prices.)
+
+    (rates, names) when a matched endpoint charges a dimension this
+    cannot price: the rates are still what the route charges per unit,
+    and the names say what else it charges. The projection refuses on
+    the names as before; the reservation needs the rates (Phase P, the
+    external review's H1: returning None here made a pinned trial
+    reserve nothing while its settlement counted it).
     """
     if not listing.get("fetched") or provider is None:
         return None, []
@@ -1179,9 +1187,7 @@ def endpoint_rates(
             if best is None
             else {name: max(best[name], rates[name]) for name in TOKEN_PRICE_DIMENSIONS}
         )
-    if beyond:
-        return None, sorted(beyond)
-    return best, []
+    return best, sorted(beyond)
 
 
 def endpoint_completion_cap(
@@ -1339,6 +1345,31 @@ def _named(model: str, beyond: list[str]) -> str:
     return f"{model} (charges {', '.join(beyond)})"
 
 
+# A pinned route whose endpoint listing gave no rates the bench could
+# read, named in the projection with what the spend ceiling does instead
+# (Phase P, the operator's ruling on the external review's H1): its trial
+# reserves at the catalog's model rates, the rates its settlement will
+# count, rather than reserving nothing.
+UNREAD_ROUTE = (
+    "its pinned endpoint published no price the bench could read, so the "
+    "spend ceiling reserves for it at the catalog's model rates"
+)
+
+
+def _unpriced_name(model: str, price: Mapping[str, Any] | None) -> str | None:
+    """Why projected_cost cannot price one model, as the projection names
+    it, or None when it can."""
+    if price is None:
+        return model
+    beyond = price.get("beyond") or []
+    if price.get("unread"):
+        charges = f"charges {', '.join(beyond)}; " if beyond else ""
+        return f"{model} ({charges}{UNREAD_ROUTE})"
+    if beyond:
+        return _named(model, beyond)
+    return None
+
+
 def projected_cost(
     tasks_total: int,
     task_chars: Mapping[str, Mapping[str, int]] | None,
@@ -1410,11 +1441,9 @@ def projected_cost(
     """
     unpriced = sorted(
         {
-            model
-            if not (prices.get(model) or {}).get("beyond")
-            else _named(model, prices[model]["beyond"])
+            named
             for model in lineup
-            if prices.get(model) is None or prices[model].get("beyond")
+            if (named := _unpriced_name(model, prices.get(model))) is not None
         }
     )
     if unpriced:

@@ -6208,29 +6208,39 @@ def experiment_prices(
     projected_cost.
 
     THAT LAST CLAUSE WAS FALSE UNTIL THE PANEL FOUND IT, and five lenses
-    found it. endpoint_rates returns rates None whenever the route
-    charges an uncountable dimension, which is precisely when beyond is
-    non-empty, and this function collapsed rates None to a bare None and
-    threw the names away. So the pinned path produced the same bare
-    model id as a route whose listing could not answer at all, the two
+    found it. endpoint_rates returned rates None whenever the route
+    charged an uncountable dimension (until Phase P's external review,
+    H1, whose fix returns the rates beside the names), which was
+    precisely when beyond was non-empty, and this function collapsed
+    rates None to a bare None and threw the names away. So the pinned
+    path produced the same bare model id as a route whose listing could
+    not answer at all, the two
     causes were indistinguishable, and the README's unqualified promise
     that the dimension is named was true only of unpinned models.
 
-    THREE ANSWERS, NOT TWO, which is what the entry shapes below mean:
+    TWO SHAPES FOR A PINNED ROUTE, which is what the entries below mean:
 
-      a mapping with rates      priceable, and beyond is empty
-      a mapping with only
-      beyond                    the route charges something this cannot
-                                count, and here is what
-      None                      nothing is known about this route's
-                                price at all
+      rates and beyond          the route's own two rates, and what else
+                                it charges (priceable when beyond is
+                                empty; the projection refuses and names
+                                the charges when it is not)
+      unread, and beyond        the route's listing gave no rates the
+                                bench could read: never fetched, no
+                                endpoint matched the pin, or a matched
+                                endpoint's rates unreadable
 
-    The third stays None rather than borrowing the catalog, for the
+    The second never borrows the catalog for the PROJECTION, for the
     reason above: falling back is the substitution the pin exists to
-    prevent. This mapping is built for projected_cost, and read besides
-    only by a trial's claim on the spend ceiling (call_worst_case), which
-    claims nothing for the middle shape and for None; the middle shape
-    may omit the rate keys because neither reader reaches for them.
+    prevent, so it is unpriced and projected_cost names it, with what
+    the spend ceiling does instead (models.UNREAD_ROUTE). The ceiling's
+    reservation does borrow it (trial_worst_case), by the operator's
+    ruling on the external review's H1: reserving nothing is how the
+    ceiling was passed, and the catalog's model rates are what the
+    trial's settlement will count. An unpinned model's entry is the
+    catalog's, None when the catalog has none.
+
+    Built for projected_cost, and read besides only by a trial's
+    reservation (trial_worst_case).
     """
     out: dict[str, Any] = {}
     for model in lineup:
@@ -6240,11 +6250,26 @@ def experiment_prices(
         rates, beyond = routes[model]["rates"], routes[model]["beyond"]
         if rates is not None:
             out[model] = {**rates, "beyond": beyond}
-        elif beyond:
-            out[model] = {"beyond": beyond}
         else:
-            out[model] = None
+            out[model] = {"unread": True, "beyond": beyond}
     return out
+
+
+def trial_worst_case(
+    model: str, budget: int, chars: dict[str, int] | None, route: dict[str, Any]
+) -> float | None:
+    """What one trial reserves against the spend ceiling: its route's two
+    rates, as its experiment's projection reads them (experiment_prices);
+    and, for a pinned route whose listing gave no rates the bench could
+    read, the catalog's model rates, which are what the trial's
+    settlement will count (the operator's ruling on the external review's
+    H1: a documented estimate over a documented overshoot). The
+    projection names that route as unpriced and says so
+    (models.UNREAD_ROUTE)."""
+    prices = experiment_prices([model], {model: route}, app.state.prices)
+    if (prices.get(model) or {}).get("unread"):
+        prices = app.state.prices
+    return call_worst_case(model, budget, chars, prices)
 
 
 async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
@@ -6486,11 +6511,11 @@ async def run_one_trial(
     # model's. Taken as the first step of a try that runs to the end of
     # the function, because settlement comes after the slot is given back,
     # so the finally that returns the claim has to outlast both.
-    worst = call_worst_case(
+    worst = trial_worst_case(
         model,
         max_tokens,
         call_chars(content["composed"], controls.get("system")),
-        experiment_prices([model], {model: route}, app.state.prices),
+        route,
     )
     # A claim refused only for room that calls not yet settled hold waits
     # for it, holding nothing, rather than being refused: that refusal

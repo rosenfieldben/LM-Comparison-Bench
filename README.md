@@ -221,12 +221,16 @@ arithmetic `projected_cost` quotes for the same call, and like the
 projection it is not a bound on the bill: the messages are an estimate,
 and a route dearer than the listed rate can charge more. A pinned trial
 reserves, as its experiment's projection is priced, at its endpoint's
-own rates, and a native-mode call, whose documents go as images,
-reserves the completion half alone. A model whose listing also names a
-charge the two rates cannot count still reserves at the two rates,
-because that is what its settlement will count; the projection refuses
-such a model, and the ceiling following it would admit most of the
-catalog reserving nothing. A call is refused when recorded spend, what
+own rates; one whose endpoint published no price the bench could read
+reserves at the catalog's model rates, and the projection, which never
+borrows them, says so where it names that model unpriced. A native-mode
+call, whose documents go as images, reserves the completion half alone.
+A model whose listing also names a charge the two rates cannot count,
+pinned or not, still reserves at the two rates, because that is what
+its settlement will count; the projection refuses such a model, and the
+ceiling following it would admit most of the catalog reserving nothing
+(BACKLOG: "The projection and the ledger disagree about a model with
+charges beyond its two rates"). A call is refused when recorded spend, what
 calls not yet settled have reserved, and what it would reserve would
 together pass the limit; a call that fits exactly is admitted. The check
 and the reservation are one step with nothing awaited between them, on
@@ -268,7 +272,10 @@ For what the catalog can price, the bound is exact to the reservations:
 recorded spend passes the limit only by what calls counted beyond what
 they reserved. That is a billed charge above the catalog's rates,
 messages the characters-over-four estimate weighed low, the images a
-native-mode call sent, and a call the catalog cannot price, which
+native-mode call sent, a pinned trial the platform did not bill, which
+settles at the catalog's model rates (the rates the estimate reads)
+where it reserved at its endpoint's, and a call the catalog cannot
+price, which
 reserves nothing and is held only by the older bound, the recheck in its
 slot. A call cut short counts nothing, since nothing records what it
 cost, so it is outside recorded spend altogether. With a ceiling worth
@@ -2457,7 +2464,10 @@ input side. An unpinned model is routed dynamically, so the model-level
 listing is the only thing that can speak for it and is used. A pinned
 model whose listing cannot answer is **unpriced**, never priced from the
 model level: borrowing the aggregate is the substitution the pin exists
-to prevent.
+to prevent. `unpriced` names it with why: "its pinned endpoint published
+no price the bench could read, so the spend ceiling reserves for it at
+the catalog's model rates", since the ceiling, which must reserve
+something for a call it will count, does borrow them (see Setup).
 
 Every figure is `null` when any model in the lineup publishes no price,
 and `unpriced` then names them: a total missing one arm of a comparison
