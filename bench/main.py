@@ -7021,6 +7021,8 @@ async def score_one_result(
                     detail=(
                         None if verdict["outcome"] == "answered" else verdict["error"]
                     ),
+                    prompt_tokens=verdict["prompt_tokens"],
+                    completion_tokens=verdict["completion_tokens"],
                 )
             except Exception as exc:
                 # The pass fails on this; its close records the call as

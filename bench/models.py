@@ -3274,6 +3274,8 @@ async def judge_response(
             "detail": "no response text: the trial did not complete",
             "generation_id": None,
             "billed_cost_usd": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
             "error": None,
             "outcome": None,
             "replied": False,
@@ -3284,6 +3286,8 @@ async def judge_response(
         "detail": None,
         "generation_id": None,
         "billed_cost_usd": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
         "error": None,
         "outcome": None,
         "replied": False,
@@ -3366,6 +3370,12 @@ async def judge_response(
     usage = data.get("usage")
     if isinstance(usage, dict):
         out["billed_cost_usd"] = as_money(usage.get("cost"))
+        # The reply's own usage counts, through the same field-type
+        # function run_model applies, so a call with no billed figure can
+        # be settled on the catalog's estimate from what the judge used,
+        # and that estimate can be audited from the call's record.
+        out["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
+        out["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
 
     # Through _flatten_content, the same extractor run_model uses, so a
     # provider that answers in content parts rather than a bare string is

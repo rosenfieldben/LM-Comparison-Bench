@@ -244,7 +244,9 @@ CREATE TABLE IF NOT EXISTS judge_calls (
     -- machine. Anything after the connection was established counts as
     -- sent, because money may have moved.
     outcome TEXT,
-    detail TEXT
+    detail TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER
 );
 """
 
@@ -349,8 +351,9 @@ END;
 # so an edit that forgets the rename fails there.
 # THE SEALS NO LONGER IN FORCE, dropped by connect() before SEALS is laid.
 # scoring_passes_sealed_v1 named every column of the table as 1e6f2ab
-# made it; the column unusable (ruling 4) made it v2.
-RETIRED_SEALS = ("scoring_passes_sealed_v1",)
+# made it; the column unusable (ruling 4) made it v2. judge_calls_sealed_v1
+# likewise, until P2's two usage-count columns made it v2.
+RETIRED_SEALS = ("scoring_passes_sealed_v1", "judge_calls_sealed_v1")
 
 SEALS = """
 CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2
@@ -388,7 +391,7 @@ BEFORE DELETE ON scoring_passes
 BEGIN
     SELECT RAISE(ABORT, 'a scoring pass record is never deleted');
 END;
-CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v1
+CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v2
 BEFORE UPDATE ON judge_calls
 BEGIN
     SELECT RAISE(ABORT,
@@ -406,7 +409,11 @@ BEGIN
         OR (OLD.billed_cost_usd IS NOT NULL
             AND NEW.billed_cost_usd IS NOT OLD.billed_cost_usd)
         OR (OLD.outcome IS NOT NULL AND NEW.outcome IS NOT OLD.outcome)
-        OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail);
+        OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail)
+        OR (OLD.prompt_tokens IS NOT NULL
+            AND NEW.prompt_tokens IS NOT OLD.prompt_tokens)
+        OR (OLD.completion_tokens IS NOT NULL
+            AND NEW.completion_tokens IS NOT OLD.completion_tokens);
     SELECT RAISE(ABORT,
         'a judge call ends once, and this one has already ended')
      WHERE OLD.outcome IS NOT NULL;
@@ -893,6 +900,16 @@ MIGRATIONS = [
     # such a pass, and none was released. Filled once, with the other
     # counts, in the statement that ends the pass.
     ("scoring_passes", "unusable", "INTEGER"),
+    # Phase P, P2: WHAT A JUDGE REPLY SAID IT USED, the two usage counts
+    # of the reply, filled with the rest of the answer in the call's one
+    # ending write (the operator's ruling at P1's checkpoint). A call
+    # whose reply carried no billed figure is settled against the spend
+    # ceiling on the catalog's estimate from these, as a trial is, and
+    # with them on the record that estimate can be audited. NULL when no
+    # reply arrived, when the reply did not report them, and on every call
+    # ended before P2, which recorded no counts at all.
+    ("judge_calls", "prompt_tokens", "INTEGER"),
+    ("judge_calls", "completion_tokens", "INTEGER"),
 ]
 
 
@@ -3771,6 +3788,8 @@ def record_judge_call_answer(
     generation_id: str | None = None,
     billed_cost_usd: float | None = None,
     detail: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
 ) -> None:
     """Record how a judge request ended: the second and last write.
 
@@ -3790,7 +3809,8 @@ def record_judge_call_answer(
         cur = conn.execute(
             """UPDATE judge_calls
                   SET answered_at = ?, generation_id = ?, billed_cost_usd = ?,
-                      outcome = ?, detail = ?
+                      outcome = ?, detail = ?, prompt_tokens = ?,
+                      completion_tokens = ?
                 WHERE id = ? AND outcome IS NULL""",
             (
                 _now() if replied else None,
@@ -3798,6 +3818,8 @@ def record_judge_call_answer(
                 as_money(billed_cost_usd),
                 outcome,
                 as_text(detail),
+                as_token_count(prompt_tokens),
+                as_token_count(completion_tokens),
                 call_id,
             ),
         )

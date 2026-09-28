@@ -4553,3 +4553,48 @@ def test_a_non_finite_price_degrades_to_no_figure_rather_than_to_a_nan():
     assert cost["input_usd"] is None
     assert cost["output_usd"] is None
     assert cost["total_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "usage,counts",
+    [
+        ({"prompt_tokens": 40, "completion_tokens": 12}, (40, 12)),
+        ({"prompt_tokens": "n/a", "completion_tokens": -3}, (None, None)),
+        ({"prompt_tokens": True, "completion_tokens": 7}, (None, 7)),
+        ("not a dict", (None, None)),
+        (None, (None, None)),
+    ],
+)
+@respx.mock
+async def test_the_judge_reply_s_usage_counts_are_captured(client, usage, counts):
+    """WINDOW: judge_response over a reply whose usage block reports the
+    two counts, reports junk in them, is not a dict, or is absent.
+
+    Phase P's P2 (the operator's rulings R2 and at P1's checkpoint): the
+    reply's own counts are captured, through the same field-type function
+    run_model applies, so an unbilled judge call can be settled on the
+    catalog's estimate and the call's record can say what the estimate
+    was made from. Junk is None rather than a guess, and a reply without
+    usage has no counts. PRE-STATE: the verdict itself parses in every
+    case, so only the counts vary."""
+    body = judge_body('{"score": 0.5, "reason": "half"}')
+    if usage is None:
+        body.pop("usage")
+    else:
+        body["usage"] = usage
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
+
+    assert out["score"] == 0.5
+    assert (out["prompt_tokens"], out["completion_tokens"]) == counts
+
+
+async def test_a_judge_asked_about_no_text_reports_no_counts(client):
+    """WINDOW: judge_response over a trial with no text, which makes no
+    request.
+
+    No request, no reply, no counts: both are None. PRE-STATE: none."""
+    out = await judge_response(client, "judge/one", "the rubric", None, "   ")
+    assert (out["prompt_tokens"], out["completion_tokens"]) == (None, None)
+    assert out["outcome"] is None

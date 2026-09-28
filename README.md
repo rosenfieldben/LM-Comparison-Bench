@@ -1433,7 +1433,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 10**. Each trial line carries the ordered
+An **export is schema version 11**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1456,11 +1456,13 @@ since version 9 has `judge_generation_id` and `judge_billed_cost_usd`
 null, because its call carries them: the figure is recorded once.
 Version 10 splits a pass's count of requests with no usable answer in
 two: `unanswered`, the requests nothing came back for, and `unusable`,
-the ones that got something back that could not be used. The manifest
-states the reason for the current bump in the file itself, and it names
-every field the earlier versions added, because a reader holding a v10
-artifact and a v2 parser needs the whole list from the file in their
-hand.
+the ones that got something back that could not be used. Version 11
+gives each judge call the two usage counts its reply reported, so the
+estimate a call with no billed figure was counted at can be derived
+again from the file. The manifest states the reason for the current bump
+in the file itself, and it names every field the earlier versions added,
+because a reader holding a v11 artifact and a v2 parser needs the whole
+list from the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -2744,8 +2746,9 @@ have held it failing, whose detail says what happened to the request
 and that only its record's write failed ("the answer arrived; its write
 failed: " and the error). The line between `not_sent` and the rest is the
 connection: anything after one was established counts as sent, because
-money may have moved. The generation id and the charge are on the call,
-recorded once, and a judged score cites its call. No value in either
+money may have moved. The generation id, the charge and the two usage
+counts the reply reported (`prompt_tokens`, `completion_tokens`) are on
+the call, recorded once, and a judged score cites its call. No value in either
 record ever changes once written: triggers in the database refuse a
 change, a second ending, a replacement or a delete, from any writer, a
 second connection or the sqlite3 prompt included.

@@ -5057,6 +5057,12 @@ def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_pat
         0.00002,
         "answered",
     )
+    # And, since P2, the usage counts the reply reported, on the call and
+    # on the exported call, so the estimate can be derived from the file.
+    assert (call["prompt_tokens"], call["completion_tokens"]) == (30, 9)
+    (line,) = [x for x in export_lines(client, eid, path) if x["type"] == "trial"]
+    (exported,) = line["judge_calls"]
+    assert (exported["prompt_tokens"], exported["completion_tokens"]) == (30, 9)
     assert call["answered_at"] >= call["sent_at"]
     assert (call["result_id"], call["pass_id"]) == (row["result_id"], row["pass_id"])
     # Judge spend is spend: it moves the same accumulator the ceiling
@@ -6481,16 +6487,19 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 10
+    assert manifest["export_schema_version"] == 11
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[10]
-    # Version 10 is the operator's ruling 4 at P1's checkpoint: a pass's
-    # unanswered count split from its unusable one, and the note says the
-    # meaning of unanswered changed and what a null unusable means.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[11]
+    # Version 11 is P2's: each judge call carries its reply's two usage
+    # counts, so an estimate it was settled on can be derived again.
+    for field in ("prompt_tokens", "completion_tokens"):
+        assert field in manifest["export_schema_change"]
+    # Version 10, carried: a pass's unanswered count split from its
+    # unusable one, and what a null unusable means.
     assert "unusable" in manifest["export_schema_change"]
-    assert "in version 9 unanswered counted both" in manifest["export_schema_change"]
+    assert "carries unusable null" in manifest["export_schema_change"]
     # Version 9, carried: Phase P's scoring records: the judge calls on each
     # trial line, the two citations on each score, the passes in the
     # manifest, and the two old judge columns null on a judged score
@@ -17239,7 +17248,7 @@ def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 10
+    assert manifest["export_schema_version"] == 11
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -20746,7 +20755,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 10
+    assert manifest["export_schema_version"] == 11
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(

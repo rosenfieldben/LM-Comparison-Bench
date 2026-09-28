@@ -1819,6 +1819,8 @@ CALL_FIELDS = (
     "billed_cost_usd",
     "outcome",
     "detail",
+    "prompt_tokens",
+    "completion_tokens",
 )
 
 
@@ -1843,7 +1845,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 10
+EXPORT_SCHEMA_VERSION = 11
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1982,6 +1984,11 @@ def _manifest_token_note() -> str:
 # version 9 file must be told; only builds on the phase's draft branch
 # ever wrote one. A pass closed by one of those carries unusable null,
 # and its unanswered counts its failed calls too.
+#
+# Version 11 is Phase P's P2: each judge call on a trial line gains the
+# two usage counts its reply reported, so the catalog estimate a call
+# with no billed figure was settled on against the spend ceiling can be
+# rederived from the artifact. A field addition, the first limb.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -2162,6 +2169,41 @@ EXPORT_SCHEMA_NOTES = {
         "manifest's captures from version 8, and the URL is deliberately not "
         "in the artifact; capture_id on pins and captures in the manifest, "
         "with head, dirty, patterns, excludes and captured_at for each, from "
+        "version 7; attachments and attachments_mode on each trial line and "
+        "attachments_referenced in the manifest from version 2, whose truth "
+        "conditions widened at version 5 because the manifest itself now "
+        "cites digests; renditions, the ordered pins each with digest, "
+        "extractor, extractor_version and kind, from version 3, and kind may "
+        "be snapshot from version 6; token_counts in the manifest and "
+        "is_byok on each trial line from version 4; task_attachments and "
+        "attachments_mode in the manifest from version 5."
+    ),
+    11: (
+        "each judge call on a trial line carries prompt_tokens and "
+        "completion_tokens, the counts the judge's reply reported, null when "
+        "no reply arrived, when the reply did not report them, and on every "
+        "call ended by a build before this version. A call whose reply "
+        "carried no billed figure was counted against the spend ceiling at "
+        "the catalog's estimate from these. A field addition, so the first "
+        "limb of the rule. Every field the earlier versions added is carried "
+        "with its meaning intact: unusable on each record in the manifest's "
+        "scoring_passes, the requests that got something back that could not "
+        "be used, beside unanswered, the requests nothing came back for, from "
+        "version 10 (a pass closed before version 10 carries unusable null "
+        "and its unanswered counts its failed calls too); judge_calls on each "
+        "trial line, each with id, pass_id, judge_model, sent_at, "
+        "answered_at, generation_id, billed_cost_usd, outcome and detail, "
+        "judge_call_id and pass_id on each score, and scoring_passes in the "
+        "manifest, from version 9, where a judged score written from then on "
+        "has judge_generation_id and judge_billed_cost_usd null because its "
+        "call carries them, so the figure is recorded once and a reader "
+        "summing judge spend reads the calls, plus the scores whose pass_id "
+        "is null; pass_id is null on a judge or deterministic score written "
+        "before version 9 and on every human rating; answered_at is set only "
+        "when a reply arrived; clone_id on each record in the manifest's "
+        "captures from version 8, and the URL is deliberately not in the "
+        "artifact; capture_id on pins and captures in the manifest, with "
+        "head, dirty, patterns, excludes and captured_at for each, from "
         "version 7; attachments and attachments_mode on each trial line and "
         "attachments_referenced in the manifest from version 2, whose truth "
         "conditions widened at version 5 because the manifest itself now "

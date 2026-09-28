@@ -4137,13 +4137,15 @@ PRE_P_SCHEMA_DIGEST = "7bba797726706e45793c31079a95be392d67431f3b6295dce6a590fdc
 # operator's ruling 4 at P1's checkpoint) made scoring_passes_sealed_v2,
 # and store.RETIRED_SEALS drops v1. The digest was
 # 79495beb0cf76b702e4105c16737b67d11a31da7ae59d94735fe26d1adb88d37 until then.
-SEALS_DIGEST = "dee963a5b1c8bf58b86b7b08231876e4ea232001eb39403d9d387098b3b0c8bf"
+# It moved again when P2's two usage-count columns made judge_calls_sealed_v2
+# (it was dee963a5b1c8bf58b86b7b08231876e4ea232001eb39403d9d387098b3b0c8bf).
+SEALS_DIGEST = "837d2ce40ad74a2736f5294b6ed2fff6c2ac9b5949aea2436e2b995a6be8cff5"
 
 SEAL_NAMES = [
     "scoring_passes_sealed_v2",
     "scoring_passes_never_replaced_v1",
     "scoring_passes_never_deleted_v1",
-    "judge_calls_sealed_v1",
+    "judge_calls_sealed_v2",
     "judge_calls_never_replaced_v1",
     "judge_calls_never_deleted_v1",
 ]
@@ -5056,5 +5058,152 @@ def test_migration_onto_a_p1_database_splits_the_counts_and_retires_the_seal(
         store.close_scoring_pass(conn, pass_id, "finished")
         made = _row(conn, "scoring_passes", pass_id)
         assert (made["unanswered"], made["unusable"]) == (1, 1)
+    finally:
+        conn.close()
+
+
+PRE_P2_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_p2_schema.sql"
+).read_text()
+
+# The sha256 of SCHEMA's body and then SEALS's body at b6c088c, as `git show
+# b6c088c:bench/store.py` gave them when the fixture was extracted.
+PRE_P2_SCHEMA_DIGEST = (
+    "fdb53426c446628168275941cfdfd6cf2d60728fda49f4f01394457f2ff07f49"
+)
+
+
+def test_the_pre_p2_fixture_is_the_schema_and_seals_at_b6c088c():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's and then SEALS's
+    text at b6c088c, pinned by digest. The right era: it has unusable and
+    scoring_passes_sealed_v2 (ruling 4), judge_calls_sealed_v1, and no
+    usage count on a judge call."""
+    body = "".join(
+        line
+        for line in PRE_P2_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == PRE_P2_SCHEMA_DIGEST
+    assert "unusable INTEGER" in body
+    assert "CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2" in body
+    assert "CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v1" in body
+    judge_calls = body[body.index("CREATE TABLE IF NOT EXISTS judge_calls") :]
+    judge_calls = judge_calls[: judge_calls.index(");")]
+    assert "prompt_tokens" not in judge_calls
+    assert "git show b6c088c:bench/store.py" in PRE_P2_SCHEMA
+
+
+def test_migration_onto_a_pre_p2_database_adds_the_counts_and_retires_the_seal(
+    tmp_path,
+):
+    """WINDOW: a database as b6c088c left it, holding a judge call answered
+    before P2, through connect() twice.
+
+    The two usage-count columns arrive by MIGRATIONS, NULL on the old
+    call, whose every other field is as it was; judge_calls_sealed_v1 is
+    dropped and v2 laid, so the old ended call refuses a late fill of a
+    count in v2's sentence; and a call answered on the migrated database
+    records the counts its reply reported, through the field-type
+    function, so junk is NULL. PRE-STATE: neither column, v1 in force."""
+    db_path = tmp_path / "pre_p2.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_P2_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p1', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES ('p', '2026-09-28')"
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               generation_id = 'gen-old', outcome = 'answered' WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.row_factory = sqlite3.Row
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(judge_calls)")]
+    assert not {"prompt_tokens", "completion_tokens"} & set(columns)
+    triggers = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    assert "judge_calls_sealed_v1" in triggers
+    before = dict(legacy.execute("SELECT * FROM judge_calls").fetchone())
+    legacy.close()
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            triggers = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert "judge_calls_sealed_v1" not in triggers
+            assert _seals_as_stored(conn) == sealed
+            assert _row(conn, "judge_calls", 1) == {
+                **before,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+            }
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            with conn:
+                conn.execute("UPDATE judge_calls SET prompt_tokens = 5 WHERE id = 1")
+        assert str(refused.value) == CALL_LATE
+        pass_id = store.open_scoring_pass(conn, 1, "j/x")
+        counted = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+        store.record_judge_call_answer(
+            conn,
+            counted,
+            "answered",
+            replied=True,
+            prompt_tokens=30,
+            completion_tokens=9,
+        )
+        junk = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+        store.record_judge_call_answer(
+            conn,
+            junk,
+            "answered",
+            replied=True,
+            prompt_tokens="n/a",
+            completion_tokens=-1,
+        )
+        assert [
+            (
+                _row(conn, "judge_calls", c)["prompt_tokens"],
+                _row(conn, "judge_calls", c)["completion_tokens"],
+            )
+            for c in (counted, junk)
+        ] == [(30, 9), (None, None)]
     finally:
         conn.close()
