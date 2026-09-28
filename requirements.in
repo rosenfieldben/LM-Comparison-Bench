@@ -10,7 +10,7 @@
 # proof; if a leg fails resolution, constrain the offender here and
 # recompile rather than dropping the hashes.
 fastapi==0.141.1
-uvicorn==0.52.4
+uvicorn==0.53.0
 httpx==0.28.1
 pydantic==2.13.5
 # PDF text extraction for attachments, and the only dependency Phase K
