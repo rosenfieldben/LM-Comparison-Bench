@@ -4205,6 +4205,17 @@ def _pre_p_database(path):
     return legacy
 
 
+def _record_triggers(conn):
+    """Every trigger on the two scoring-record tables, by name."""
+    return {
+        r[0]
+        for r in conn.execute(
+            """SELECT name FROM sqlite_master WHERE type = 'trigger'
+                  AND tbl_name IN ('scoring_passes', 'judge_calls')"""
+        )
+    }
+
+
 def _seals_as_stored(conn):
     """The seal triggers' SQL as the database holds it, reassembled in
     SEALS's own order, for comparison with the text in store.py. sqlite
@@ -5042,6 +5053,7 @@ def test_migration_onto_a_p1_database_splits_the_counts_and_retires_the_seal(
             assert "scoring_passes_sealed_v1" not in triggers
             assert _seals_as_stored(conn) == sealed
             assert _row(conn, "scoring_passes", 1) == {**before, "unusable": None}
+            assert _record_triggers(conn) == set(SEAL_NAMES)
         finally:
             conn.close()
 
@@ -5170,6 +5182,7 @@ def test_migration_onto_a_pre_p2_database_adds_the_counts_and_retires_the_seal(
                 "prompt_tokens": None,
                 "completion_tokens": None,
             }
+            assert _record_triggers(conn) == set(SEAL_NAMES)
         finally:
             conn.close()
 
@@ -5207,3 +5220,115 @@ def test_migration_onto_a_pre_p2_database_adds_the_counts_and_retires_the_seal(
         ] == [(30, 9), (None, None)]
     finally:
         conn.close()
+
+
+# ---- The seal swap (the external review's L1): the seals are laid before
+# ---- the retired ones are dropped, so no moment leaves a table unsealed.
+
+
+def _era_database_with_sealed_rows(path, fixture):
+    """A database from an era fixture holding an answered judge call and
+    an ended pass, the rows a forger would want to rewrite."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('e', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute("INSERT INTO runs (prompt_text, created_at) VALUES ('p', 'x')")
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               generation_id = 'gen-old', outcome = 'answered' WHERE id = 1"""
+    )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 1, failed = 0, unanswered = 0
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.close()
+
+
+@pytest.mark.parametrize("era", ["p1", "pre_p2"])
+def test_the_seal_swap_never_leaves_a_table_unsealed(monkeypatch, tmp_path, era):
+    """WINDOW: connect() over a database an earlier era sealed (P1's, whose
+    two seals v2 retires, and b6c088c's, whose judge_calls seal v2
+    retires), with a second connection trying to rewrite an answered call
+    and an ended pass at every statement the booting connection runs.
+
+    connect() lays SEALS before it drops the retired names, so at every
+    moment one seal holds each table and every attempt is refused (or
+    finds the database busy), and both rows are as they were. PRE-STATE:
+    the rows are sealed by the era's own seals when the boot begins; with
+    the retired seal dropped first, the synthesis measured 6 rewrites
+    landing in the gap."""
+    path = tmp_path / f"{era}.db"
+    _era_database_with_sealed_rows(
+        path, {"p1": P1_SCHEMA, "pre_p2": PRE_P2_SCHEMA}[era]
+    )
+    forger = sqlite3.connect(str(path), timeout=0)
+    landed = []
+
+    def forge(_statement):
+        for sql in (
+            "UPDATE judge_calls SET generation_id = 'gen-forged' WHERE id = 1",
+            "UPDATE scoring_passes SET scored = 9 WHERE id = 1",
+        ):
+            try:
+                with forger:
+                    if forger.execute(sql).rowcount:
+                        landed.append(sql)
+            except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                pass
+
+    real = sqlite3.connect
+
+    def traced(*args, **kwargs):
+        conn = real(*args, **kwargs)
+        conn.set_trace_callback(forge)
+        return conn
+
+    monkeypatch.setattr(store.sqlite3, "connect", traced)
+    conn = store.connect(str(path))
+    conn.set_trace_callback(None)
+    monkeypatch.undo()
+    try:
+        assert landed == []
+        call = conn.execute("SELECT generation_id FROM judge_calls").fetchone()[0]
+        scored = conn.execute("SELECT scored FROM scoring_passes").fetchone()[0]
+        assert (call, scored) == ("gen-old", 1)
+        assert _record_triggers(conn) == set(SEAL_NAMES)
+    finally:
+        conn.close()
+        forger.close()
+
+
+def test_no_seal_is_both_laid_and_retired():
+    """WINDOW: store.RETIRED_SEALS beside the seals SEALS lays.
+
+    A name in both would be laid and then dropped by the same connect(),
+    leaving its table unsealed. PRE-STATE: SEALS lays every name in
+    SEAL_NAMES."""
+    laid = set(re.findall(r"CREATE TRIGGER IF NOT EXISTS (\w+)", store.SEALS))
+    assert laid == set(SEAL_NAMES)
+    assert set(store.RETIRED_SEALS).isdisjoint(laid)

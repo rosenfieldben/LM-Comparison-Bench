@@ -346,10 +346,14 @@ END;
 # VERSIONED NAMES. CREATE TRIGGER IF NOT EXISTS keeps whatever body a
 # database already holds under that name, so changing a body in place
 # would change nothing on any database that booted before the change.
-# A changed seal gets a new name (_v2), and connect() drops the old one
-# in the same commit. The text below is pinned by digest in the tests,
-# so an edit that forgets the rename fails there.
-# THE SEALS NO LONGER IN FORCE, dropped by connect() before SEALS is laid.
+# A changed seal gets a new name (_v2), and connect() lays SEALS first
+# and drops the retired names after, both changes landing in the same
+# git commit. Laid first so that at every moment at least one seal holds
+# each table: a crash between the two steps leaves both, and the old
+# one's refusals are among the new one's, never neither. The text below
+# is pinned by digest in the tests, so an edit that forgets the rename
+# fails there.
+# THE SEALS NO LONGER IN FORCE, dropped by connect() after SEALS is laid.
 # scoring_passes_sealed_v1 named every column of the table as 1e6f2ab
 # made it; the column unusable (ruling 4) made it v2. judge_calls_sealed_v1
 # likewise, until P2's two usage-count columns made it v2.
@@ -1197,13 +1201,17 @@ def connect(path: str) -> sqlite3.Connection:
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
     conn.executescript(TRIGGERS)
-    # A seal whose body changed has a new name, and the old name is
-    # dropped here, first: CREATE TRIGGER IF NOT EXISTS would leave the
-    # old body in force under the old name on every database that booted
-    # before the change. See SEALS and RETIRED_SEALS.
+    # A seal whose body changed has a new name. SEALS is laid first and
+    # the retired names are dropped after, so at every moment at least one
+    # seal holds each table (the external review's L1: dropping first let
+    # a second connection rewrite a sealed row in the gap between the drop
+    # and the new seal). CREATE TRIGGER IF NOT EXISTS would otherwise leave
+    # the old body in force under the old name on every database that
+    # booted before the change. A name in both lists would drop the seal
+    # just laid; a test holds them apart. See SEALS and RETIRED_SEALS.
+    conn.executescript(SEALS)
     for retired in RETIRED_SEALS:
         conn.execute(f"DROP TRIGGER IF EXISTS {retired}")
-    conn.executescript(SEALS)
     # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
     # reader because of a real gap rather than for tidiness.
     #
