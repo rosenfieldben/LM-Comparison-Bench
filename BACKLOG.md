@@ -383,3 +383,20 @@ a23b257).
   an ending column, is a seal of its own with a versioned name and
   proofs.
 - **First written:** the commit that adds this entry.
+
+## A run cut off before a trial went out says one was persisted
+
+- **What:** `run_experiment`'s outer cancellation handler, for a cancel
+  that lands outside the shielded trial (while the lineup's routes are
+  resolved, before the first trial, is the reachable case), writes
+  `INTERRUPTED_BY_SHUTDOWN`, whose sentence says the trial in flight was
+  settled and persisted; no trial was in flight. Pre-existing since the
+  sentence arrived (cfe368e) and the route resolution before the first
+  trial (9096856). The case new in Phase P, a trial waiting for room on
+  the spend ceiling when shutdown's stop came, has a sentence of its own
+  since the external review's M10.
+- **Deferred by:** Phase P, found by the external review at 1d91670
+  beside M10; the entry ratified by the operator with the series.
+- **Reason:** it predates the phase, and the review asked for it here
+  marked pre-existing.
+- **First written:** the commit that adds this entry.

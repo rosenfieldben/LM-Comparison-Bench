@@ -1936,7 +1936,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # settlement replaces the claim with what the call counts, or the call
     # ends without one and gives it back. Kept per call rather than as a
     # running figure, so that when nothing is held the sum is exactly
-    # zero, and summed with fsum, so the order calls end in cannot move it.
+    # zero whatever order the calls ended in, and summed with fsum, so the
+    # figure is the correctly rounded sum of the live claims whatever order
+    # they were admitted in.
     # Keyed by identity rather than a counter, so a late finally from an
     # earlier boot of this module's app can never give back a claim of
     # this one. Process-local like the figure above, and empty after a
@@ -6688,18 +6690,30 @@ async def run_one_trial(
 
 
 # What a run says when the PROCESS ended rather than the run. Written by
-# the two cancellation handlers in run_experiment; the lifespan's
-# stale-row sweep says its own thing, because "a previous process left
-# this row behind" and "this process is shutting down now" are different
-# facts and the second one knows more.
+# the cancellation handlers in run_experiment; the lifespan's stale-row
+# sweep says its own thing, because "a previous process left this row
+# behind" and "this process is shutting down now" are different facts
+# and the second one knows more.
 #
 # Not "stopped" and not "failed". Nobody asked this experiment to end and
-# nothing about it went wrong: its completed trials are real, its
-# in-flight trial was paid for and persisted, and the rest never ran.
+# nothing about it went wrong: its completed trials are real, and the
+# rest never ran. INTERRUPTED_BY_SHUTDOWN is for a trial that went
+# upstream, which was paid for and persisted before the runner finished.
+# INTERRUPTED_WAITING_FOR_ROOM is for one that was waiting for room on
+# the spend ceiling when shutdown's stop came (the external review's M10):
+# it was never sent and has no row, and the other sentence would say it
+# was persisted. (The outer cancellation handler, a cancel landing
+# outside the trial, still writes the first; BACKLOG, "A run cut off
+# before a trial went out says one was persisted".)
 INTERRUPTED_BY_SHUTDOWN = (
     "this process shut down while the experiment was running; the trial "
     "in flight was settled and persisted before the runner finished, and "
     "the remaining trials never ran"
+)
+INTERRUPTED_WAITING_FOR_ROOM = (
+    "this process shut down while the experiment was running, while a "
+    "trial waited for room on the spend ceiling; that trial was never "
+    "sent and has no row, and the remaining trials never ran"
 )
 
 
@@ -6972,7 +6986,7 @@ async def run_experiment(experiment_id: int) -> None:
                     # counter, exactly as the stop between trials leaves
                     # the next one.
                     if interrupted:
-                        status, detail = "interrupted", INTERRUPTED_BY_SHUTDOWN
+                        status, detail = "interrupted", INTERRUPTED_WAITING_FOR_ROOM
                     else:
                         status, detail = "stopped", "stopped between trials"
                     halted = True

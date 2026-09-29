@@ -25823,6 +25823,51 @@ def test_two_streams_past_their_doors_race_the_last_dollar(monkeypatch, tmp_path
 
 
 @respx.mock
+def test_two_streams_claim_the_last_dollar_in_the_same_turns(monkeypatch, tmp_path):
+    """WINDOW: two /compare/stream requests past their doors with nothing
+    reserved, their first steps driven together by asyncio.gather, so each
+    runs its check and its claim in the same turns of the loop as the
+    other.
+
+    The room holds one claim: one stream starts holding W_ALPHA, and the
+    other is refused in its first frame. A door's check and its claim are
+    one synchronous step (the external review's M11: the proof above
+    drives the first stream to its started frame before the second runs,
+    so a claim split from its check by an await passed it). PRE-STATE:
+    both doors passed with nothing reserved."""
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gate = asyncio.Event()
+
+            async def reply(request):
+                calls.append(1)
+                await gate.wait()
+                return httpx.Response(200, stream=alpha_stream())
+
+            route.mock(side_effect=reply)
+            a = await opened_stream()
+            b = await opened_stream()
+            before = held()
+            firsts = await asyncio.gather(a.__anext__(), b.__anext__())
+            during = held()
+            gate.set()
+            rests = [[f async for f in stream] for stream in (a, b)]
+            return before, [frame(f) for f in firsts], during, rests
+
+        before, firsts, during, rests = c.portal.call(staged)
+        assert before == 0.0
+        assert sorted(f["type"] for f in firsts) == ["done", "started"]
+        (refused,) = [f for f in firsts if f["type"] == "done"]
+        assert refused["result"]["spend_refused"] is True
+        assert during == pytest.approx(W_ALPHA)
+        assert len(calls) == 1
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
 def test_the_door_refuses_what_a_call_in_flight_has_reserved(monkeypatch, tmp_path):
     """WINDOW: a /compare held at its upstream call, then a second /compare
     and a /compare/stream at their doors. PRE-STATE: nothing recorded and
@@ -27026,16 +27071,135 @@ def test_a_trial_that_cannot_fit_beside_recorded_spend_is_refused_at_once(
         )
 
 
+def test_a_call_that_would_fit_exactly_waits_for_room_rather_than_refusing(
+    monkeypatch, tmp_path
+):
+    """WINDOW: reserve_spend and spend_room_held_by_others at a 2**-2 limit
+    with 2**-3 recorded and a rival claim of 2**-4 held, asked about a call
+    whose worst case is 2**-3.
+
+    A call that fits exactly is admitted (spend_admits), so one that would
+    fit exactly beside recorded spend alone is refused only for the room
+    the rival holds, and waits for it rather than being refused for good
+    (the external review's L11: the boundary as a strict inequality
+    survived every proof). Dyadic figures, so every sum is exact.
+    PRE-STATE: the call is refused while the rival holds its claim, and
+    recorded spend and its worst case sum to the limit exactly."""
+    with ledger_client(monkeypatch, tmp_path, 2.0**-2) as c:
+        c.app.state.accumulated_spend_usd = 2.0**-3
+        rival = main.reserve_spend(2.0**-4)
+        assert rival is not None
+        assert main.reserve_spend(2.0**-3) is None
+        assert math.fsum((2.0**-3, 2.0**-3)) == 2.0**-2
+        assert main.spend_room_held_by_others(2.0**-3) is True
+        main.release_spend(rival)
+        assert main.reserve_spend(2.0**-3) is not None
+
+
 @respx.mock
-def test_shutdown_ends_a_trial_waiting_for_room_as_interrupted(monkeypatch, tmp_path):
-    """WINDOW: an experiment's one trial waiting for room a claim holds,
-    and the bench shut down. PRE-STATE: the trial is waiting when the
-    lifespan ends, and nothing will give the claim back, so only the stop
-    shutdown sets can end the wait; the run is interrupted with no row."""
+def test_an_unpriced_trial_at_the_reached_limit_is_refused_at_once(
+    monkeypatch, tmp_path
+):
+    """WINDOW: an experiment's one trial on a model the catalog cannot
+    price, with recorded spend exactly at the limit, started and driven
+    under a 5 s bound.
+
+    A reached limit refuses every call, the unpriced among them, and room
+    never comes back to it, so the trial is refused at once and does not
+    wait (the external review's L11: without the reached guard it waited
+    for room that cannot come, with nothing held). PRE-STATE: nothing is
+    reserved, and recorded spend is the limit."""
     route = respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())
     )
     waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.5) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/bare"])
+        ).json()["id"]
+        c.app.state.accumulated_spend_usd = 0.5
+        assert main.spend_reserved_usd() == 0.0
+        assert main.spend_room_held_by_others(None) is False
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        try:
+            drive_until(
+                c,
+                lambda: c.app.state.experiment_run["active"] is None,
+                "the trial waited for room that cannot come",
+                timeout_s=5.0,
+            )
+        finally:
+            if c.app.state.experiment_run["active"] is not None:
+                c.post(f"/experiments/{eid}/stop", json={})
+        final = c.get(f"/experiments/{eid}").json()
+        assert final["status"] == "halted_on_refusal"
+        assert waits == []
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_the_served_reserved_figure_is_the_exact_sum_of_the_claims(
+    monkeypatch, tmp_path
+):
+    """WINDOW: three live claims of 2**-2, 2**-55 and 2**-108 under a limit
+    of 1, read by spend_reserved_usd and GET /models.
+
+    The live claims are summed with fsum, so both read their correctly
+    rounded sum, 2**-2 + 2**-54 (the external review's L11: the comment's
+    claim had no proof, and 0.1, 0.2 and 0.3 cannot tell fsum from sum()
+    on Python 3.12 and later, which compensates). PRE-STATE: a running sum
+    and sum() of the three read 2**-2, fsum reads 0.25000000000000006, and
+    nothing is reserved before the claims."""
+    claims = (2.0**-2, 2.0**-55, 2.0**-108)
+    running = 0.0
+    for claim in claims:
+        running += claim
+    assert running == sum(claims) == 0.25
+    assert math.fsum(claims) == 0.25000000000000006
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        assert main.spend_reserved_usd() == 0.0
+        keys = [main.reserve_spend(w) for w in claims]
+        assert None not in keys
+        assert main.spend_reserved_usd() == 0.25000000000000006
+        assert c.get("/models").json()["spend"]["reserved_usd"] == 0.25000000000000006
+        for key in keys:
+            main.release_spend(key)
+
+
+@respx.mock
+def test_shutdown_ends_a_trial_waiting_for_room_as_interrupted(monkeypatch, tmp_path):
+    """WINDOW: an experiment's one trial waiting for room a claim holds,
+    and the bench shut down, the runner's shutdown under a 5 s bound.
+
+    Only the stop shutdown sets can end the wait, and the run is
+    interrupted with no row, in a sentence of its own that says the trial
+    was never sent (the external review's M10: the sentence for a trial
+    that went upstream, "settled and persisted", was written here). A
+    trial deaf to the stop fails this proof when the bound runs out, and
+    the claim is then given back so the lifespan can end, rather than
+    hanging it (the review's L12: without the bound this proof, the only
+    one of shutdown's stop for a waiting trial, could only hang).
+    PRE-STATE: the trial is waiting when the lifespan ends, and nothing
+    gives the claim back within the bound; at 5fd1a3b the detail was the
+    persisted sentence."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    waits = watched_waits(monkeypatch)
+    real_shutdown = main._shutdown_runner
+    standing, deaf = [], []
+
+    async def bounded_shutdown():
+        inner = asyncio.ensure_future(real_shutdown())
+        done, _ = await asyncio.wait({inner}, timeout=5.0)
+        if not done:
+            deaf.append(True)
+            give_back(standing[0])
+            await inner
+
+    monkeypatch.setattr(main, "_shutdown_runner", bounded_shutdown)
     db_path = tmp_path / "bench.db"
     with ledger_client(monkeypatch, tmp_path, 0.05) as c:
         path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
@@ -27044,16 +27208,23 @@ def test_shutdown_ends_a_trial_waiting_for_room_as_interrupted(monkeypatch, tmp_
         ).json()["id"]
 
         async def staged():
-            stand(0.02)
+            standing.append(stand(0.02))
             async with app_client() as r:
                 await r.post(f"/experiments/{eid}/start", json={"dataset_path": path})
             await spin(lambda: waits)
 
         c.portal.call(staged)
+    assert deaf == [], "shutdown's stop did not end the wait within 5 s"
     with store.connect(str(db_path)) as conn:
         final = store.get_experiment(conn, eid)
-        assert final["status"] == "interrupted"
+        assert (final["status"], final["status_detail"]) == (
+            "interrupted",
+            "this process shut down while the experiment was running, while a "
+            "trial waited for room on the spend ceiling; that trial was never "
+            "sent and has no row, and the remaining trials never ran",
+        )
         assert final["trials_done"] + final["trials_refused"] == 0
+        assert conn.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
     assert route.call_count == 0
 
 
@@ -27431,15 +27602,64 @@ def paid_call_sites():
     return found
 
 
+LEDGER_OWNERS = {"lifespan", "spend_reserved_usd", "reserve_spend", "release_spend"}
+LEDGER_FUNCTIONS = (
+    "spend_reserved_usd",
+    "spend_admits",
+    "reserve_spend",
+    "release_spend",
+    "settle_spend",
+    "spend_room_held_by_others",
+)
+
+
+def test_only_the_ledger_touches_the_ledger():
+    """WINDOW: bench/*.py as parsed: every function that names
+    app.state.spend_reservations, and how the ledger's functions are
+    defined.
+
+    One step of the event loop is the ledger's whole locking, so the dict
+    is named only where it is made (the lifespan) and by the three
+    functions that read it, claim in it and give back from it, and those
+    and the functions they are used through are plain defs, which cannot
+    await. A door that claimed around them, or a ledger function that
+    awaited, is found here (the external review's M11: an await between
+    the check and the claim at the stream, the trial and the judge call
+    survived every proof but /compare's). PRE-STATE: the walk finds the
+    four owners, so it reads the tree."""
+    owners, defined = set(), {}
+    for path in sorted(Path(main.__file__).parent.glob("*.py")):
+
+        def visit(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                    defined[child.name] = type(child).__name__
+                    visit(child, [*scope, child.name])
+                    continue
+                if (
+                    isinstance(child, ast.Attribute)
+                    and child.attr == "spend_reservations"
+                ):
+                    owners.add(scope[-1] if scope else "<module>")
+                visit(child, scope)
+
+        visit(ast.parse(path.read_text()), [])
+    assert owners == LEDGER_OWNERS, owners
+    for name in LEDGER_FUNCTIONS:
+        assert defined[name] == "FunctionDef", name
+
+
 def test_every_paid_call_is_claimed_and_released_in_a_finally():
     """WINDOW: bench/*.py as parsed. Every call of the three client
     functions that can spend sits in one of the four doors, after a
     reserve_spend in the same function, and it and every reserve_spend
     there sit inside a try whose finally calls release_spend, so a claim
-    is never held outside the block that gives it back. PRE-STATE: the
-    census finds exactly the four doors the network posture walk names,
-    and before P2 none of them claimed (measured at 1f143e3:
-    compare.limited has no reserve_spend)."""
+    is never held outside the block that gives it back. Each door's first
+    claim is itself a reserve_spend call (the external review's M11: the
+    wait loop's retry satisfied this census for a first claim written
+    inline). PRE-STATE: the census finds exactly the four doors the
+    network posture walk names, and before P2 none of them claimed
+    (measured at 1f143e3: compare.limited has no reserve_spend)."""
     sites = paid_call_sites()
     assert set(sites) == PAID_DOORS
     for key, (tree, calls) in sites.items():
@@ -27457,6 +27677,21 @@ def test_every_paid_call_is_claimed_and_released_in_a_finally():
             if isinstance(n, ast.Call) and called_name(n) == "reserve_spend"
         ]
         assert claims, f"{key}: no claim"
+        taken = sorted(
+            (
+                n
+                for n in ast.walk(node)
+                if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "held" for t in n.targets)
+                and not (isinstance(n.value, ast.Constant) and n.value.value is None)
+            ),
+            key=lambda n: n.lineno,
+        )
+        assert taken, f"{key}: no claim held"
+        first = taken[0].value
+        assert isinstance(first, ast.Call) and called_name(first) == "reserve_spend", (
+            key
+        )
         releasing = [
             t
             for t in ast.walk(node)

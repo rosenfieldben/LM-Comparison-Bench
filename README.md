@@ -468,17 +468,18 @@ completion budget to be left for the visible answer, sending
 `reasoning: {"max_tokens": N}` beside the cap: 8192 of the standard
 tier's 16384, 32768 of extended's 65536.
 
-**The judge reserves nothing**, and the arithmetic is why. Its budget is
-512 tokens. Half of that is 256, which the contract's Anthropic minimum
-raises to 1024 (*"that value is used directly with a minimum of 1024
-tokens"*), and the contract also requires that *"`max_tokens` must be
-strictly higher than the reasoning budget"*. 512 is not higher than
-1024, so the request is unsatisfiable by the contract's own rules.
-Raising the judge's budget past 2048 to make a half share legal would
-buy reasoning headroom for a task whose entire output is a number and a
-sentence. A judge that exhausts already records the trial as unscored,
-which is the true statement and a different situation from a comparison
-card that billed for thinking and showed nothing.
+**The judge sends no reasoning reservation**, and the arithmetic is why.
+Its budget is 512 tokens. Half of that is 256, which the contract's
+Anthropic minimum raises to 1024 (*"that value is used directly with a
+minimum of 1024 tokens"*), and the contract also requires that
+*"`max_tokens` must be strictly higher than the reasoning budget"*. 512
+is not higher than 1024, so the request is unsatisfiable by the
+contract's own rules. Raising the judge's budget past 2048 to make a
+half share legal would buy reasoning headroom for a task whose entire
+output is a number and a sentence. A judge that exhausts already records
+the trial as unscored, which is the true statement and a different
+situation from a comparison card that billed for thinking and showed
+nothing.
 
 "Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
 request schema says of the reasoning object's `enabled` key: "Default:
