@@ -23076,51 +23076,136 @@ def test_a_call_that_cannot_be_recorded_is_never_sent(client, tmp_path, monkeypa
     assert client.app.state.scoring_run["active"] is None
 
 
+class CutReply(httpx.AsyncByteStream):
+    """A 200's body that yields its first bytes and then fails as the
+    connection would: the reply's head arrived, and its body did not."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def __aiter__(self):
+        yield b'{"id":"gen-cut","usage":{"cost":0.001'
+        raise self.exc
+
+    async def aclose(self):
+        pass
+
+
+NO_REPLY = (1, False, None)
+UNUSABLE_REPLY = (1, True, 0)
+
+
 @pytest.mark.parametrize(
-    "ending,outcome,replied,detail",
+    "ending,outcome,facts,counts,detail",
     [
-        (httpx.ConnectError, "not_sent", False, "judge request failed: ConnectError"),
+        (
+            httpx.ConnectError,
+            "not_sent",
+            (0, False, None),
+            (0, 0, 0),
+            "judge request failed: ConnectError",
+        ),
         (
             httpx.ConnectTimeout,
             "not_sent",
-            False,
+            (0, False, None),
+            (0, 0, 0),
             "judge request failed: ConnectTimeout",
         ),
-        (httpx.PoolTimeout, "not_sent", False, "judge request failed: PoolTimeout"),
-        (httpx.ReadTimeout, "timed_out", False, "judge request failed: ReadTimeout"),
-        (httpx.WriteTimeout, "failed", False, "judge request failed: WriteTimeout"),
-        (httpx.ReadError, "failed", False, "judge request failed: ReadError"),
+        (
+            httpx.PoolTimeout,
+            "not_sent",
+            (0, False, None),
+            (0, 0, 0),
+            "judge request failed: PoolTimeout",
+        ),
+        (
+            httpx.ReadTimeout,
+            "timed_out",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: ReadTimeout",
+        ),
+        (
+            httpx.WriteTimeout,
+            "failed",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: WriteTimeout",
+        ),
+        (
+            httpx.ReadError,
+            "failed",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: ReadError",
+        ),
         (
             httpx.RemoteProtocolError,
             "failed",
-            False,
+            NO_REPLY,
+            (1, 0, 0),
             "judge request failed: RemoteProtocolError",
         ),
-        (500, "failed", True, "judge returned HTTP 500"),
-        ("not json", "failed", True, "judge returned a malformed body"),
+        (500, "failed", UNUSABLE_REPLY, (0, 1, 0), "judge returned HTTP 500"),
+        (
+            "not json",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge returned a malformed body",
+        ),
+        (
+            "charged, no choices",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge returned a malformed body",
+        ),
+        (
+            "cut mid-body",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge reply was cut off while it was read: RemoteProtocolError",
+        ),
+        (
+            "stalled mid-body",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge reply was cut off while it was read: ReadTimeout",
+        ),
+        ("a verdict", "answered", (1, True, 1), (0, 0, 0), None),
+        ("no verdict", "answered", (1, True, 1), (0, 0, 0), None),
     ],
 )
 @respx.mock
 def test_how_a_judge_request_ended_is_read_from_what_came_back(
-    client, tmp_path, ending, outcome, replied, detail
+    client, tmp_path, ending, outcome, facts, counts, detail
 ):
     """WINDOW: one judged trial whose judge request ends one way, the
-    call's row, and the report's counts.
+    call's row, and the pass's sealed counts.
 
     THE LINE IS THE CONNECTION (the operator's Q1). A failure raised while
-    a connection was being made left nothing, and the call says not_sent
-    and is counted nowhere. Anything after the connection counts as sent,
-    because money may have moved: a read timeout is timed_out, and a
-    write timeout, a broken read, a protocol error, an error status and a
-    body that cannot be read are failed. Two counts and two words (the
-    operator's ruling 4 at P1's checkpoint): the timeout is unanswered,
-    nothing came back; the five failed are unusable, and until the ruling
-    were counted unanswered with it. answered_at is set only where a reply
-    arrived (the error status and the unreadable body). The class decides,
-    never the detail string.
-    PRE-STATE: before this phase the three not_sent rows and the timeout
-    were the same score row; here the call row exists before the request
-    is made, with no ending."""
+    a connection was being made left nothing: the call says not_sent,
+    records sent 0, and is counted nowhere. Anything after the connection
+    counts as sent, because money may have moved.
+
+    THE COUNTS COME FROM THE FACTS, NEVER THE OUTCOME (the operator's
+    ruling H2 on the 1d91670 review, schema 12). answered_at is set
+    whenever a reply's head arrived, an error status, a body that could
+    not be read and a body cut off while it was read (by the connection
+    dropping or stalling) included, and usable says whether that reply
+    was read as an answer, a verdict that does not parse included (ruling
+    2: that is the score row's failure). So a read timeout, a write
+    timeout, a broken read and a protocol error before any reply are
+    unanswered; the error status, the unreadable body, the reply that
+    charged and carried no choices, and the two bodies cut off are
+    unusable; the class decides, never the detail string.
+    PRE-STATE at the parent (b3b4e48): the pass counted by b6c088c's
+    outcome list, so the write timeout, the broken read and the protocol
+    error were unusable, and no call carried sent or usable."""
 
     def route(request):
         if not is_judge(request):
@@ -23129,6 +23214,20 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
             return httpx.Response(500, json={"error": "upstream"})
         if ending == "not json":
             return httpx.Response(200, content=b"not json")
+        if ending == "charged, no choices":
+            return httpx.Response(200, json={"id": "gen-c", "usage": {"cost": 0.0002}})
+        if ending == "cut mid-body":
+            return httpx.Response(
+                200, stream=CutReply(httpx.RemoteProtocolError("peer closed"))
+            )
+        if ending == "stalled mid-body":
+            return httpx.Response(200, stream=CutReply(httpx.ReadTimeout("stalled")))
+        if ending == "a verdict":
+            return httpx.Response(200, json=judge_answer())
+        if ending == "no verdict":
+            body = judge_answer()
+            body["choices"][0]["message"]["content"] = "no verdict here"
+            return httpx.Response(200, json=body)
         raise ending("the judge request ended", request=request)
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
@@ -23138,21 +23237,22 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
 
     (call,) = calls_of(client.app.state.db, eid)
     assert (call["outcome"], call["detail"]) == (outcome, detail)
-    assert (call["answered_at"] is not None) is replied
-    assert call["sent_at"] and call["generation_id"] is None
-    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
-    assert (cost["unanswered_calls"], cost["unusable_answers"]) == {
-        "not_sent": (0, 0),
-        "timed_out": (1, 0),
-        "failed": (0, 1),
-    }[outcome]
-    assert (cost["billed_calls"], cost["in_flight_calls"]) == (0, 0)
-    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
-    assert (made["outcome"], made["failed"]) == ("finished", 1)
-    assert (made["unanswered"], made["unusable"]) == (
-        cost["unanswered_calls"],
-        cost["unusable_answers"],
+    sent, replied, usable = facts
+    assert (call["sent"], call["answered_at"] is not None, call["usable"]) == (
+        sent,
+        replied,
+        usable,
     )
+    assert call["sent_at"]
+    if ending == "charged, no choices":
+        assert (call["generation_id"], call["billed_cost_usd"]) == ("gen-c", 0.0002)
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "finished"
+    sealed = client.app.state.db.execute(
+        "SELECT unanswered, unusable, unknown FROM scoring_passes WHERE id = ?",
+        (made["id"],),
+    ).fetchone()
+    assert tuple(sealed) == counts
 
 
 @respx.mock
@@ -23193,31 +23293,114 @@ def test_a_closed_client_sends_nothing_and_the_call_says_so(client, tmp_path):
     assert made["outcome"] == "finished"
 
 
+def stepping_clock(monkeypatch):
+    """The store's clock, one microsecond further on at every read, so no
+    two stamps can be equal, and a spy on store.now: the times the scoring
+    pass took when a judge reply's head arrived, in order."""
+    ticks = iter(range(10**6))
+    monkeypatch.setattr(
+        store, "_now", lambda: f"2026-09-28T00:00:00.{next(ticks):06d}+00:00"
+    )
+    taken = []
+
+    def now():
+        taken.append(store._now())
+        return taken[-1]
+
+    monkeypatch.setattr(store, "now", now, raising=False)
+    return taken
+
+
+LOCKED = "; its write failed: OperationalError: database is locked"
+CALL_FACTS = (
+    "sent",
+    "answered_at",
+    "usable",
+    "generation_id",
+    "billed_cost_usd",
+    "prompt_tokens",
+    "completion_tokens",
+)
+
+
+@pytest.mark.parametrize(
+    "shape,happened,facts,counts",
+    [
+        (
+            "a charged answer",
+            "the answer arrived",
+            (1, True, 1, "gen-1", 0.00004, 30, 9),
+            (0, 0, 0),
+        ),
+        (
+            "an answer with no figure",
+            "the answer arrived",
+            (1, True, 1, "gen-2", None, None, None),
+            (0, 0, 0),
+        ),
+        (
+            "an error status",
+            "a reply arrived and could not be used",
+            (1, True, 0, None, None, None, None),
+            (0, 1, 0),
+        ),
+        (
+            "no reply",
+            "it failed after it was sent",
+            (1, False, None, None, None, None, None),
+            (1, 0, 0),
+        ),
+        (
+            "no connection",
+            "it was never sent",
+            (0, False, None, None, None, None, None),
+            (0, 0, 0),
+        ),
+    ],
+)
 @respx.mock
 def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
-    client, tmp_path, monkeypatch
+    client, tmp_path, monkeypatch, shape, happened, facts, counts
 ):
-    """WINDOW: a judge that answers with a charge, record_judge_call_answer
-    raising on that answer, the spend counter, and the records after.
+    """WINDOW: a judge request that ends one way, record_judge_call_answer
+    raising on that ending, the spend counter, and the records after.
 
     The charge is counted before the answer is written, so a failed write
     never un-counts money that left. The pass fails with the error as its
     detail, and its close finds the call still open and ends it as
     interrupted, so nothing reads as still in flight. What was interrupted
     is the record and not the request (the operator's ruling at P1's
-    checkpoint), and the detail says that: the answer arrived and its
-    write failed, with the error, which no reader can take for the boot
-    sweep's "found open at boot". PRE-STATE: the counter before the Score,
-    and the call open when the write raised."""
-    respx.post(OPENROUTER_URL).mock(
-        side_effect=lambda request: (
-            httpx.Response(200, json=judge_answer(cost=0.00004))
-            if is_judge(request)
-            else httpx.Response(200, stream=alpha_stream())
-        )
-    )
+    checkpoint), and the detail says what happened and that its write
+    failed, with the error, which no reader can take for the boot sweep's
+    "found open at boot". THE CLOSE RECORDS WHAT THE PASS KNEW (the
+    operator's ruling M1 on the 1d91670 review): whether it was sent,
+    whether a reply arrived and when its head did (the time the pass took
+    then, not the close's), whether it could be used, and the charge and
+    the two counts when it had them; so the counts place the call by what
+    happened to it, an answer that arrived as answered and not unanswered.
+    PRE-STATE at the parent (b3b4e48): the close wrote the sentence and no
+    fact, so every shape was counted unanswered, and no call carried its
+    answer time, its generation id or its charge."""
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        if shape == "a charged answer":
+            body = judge_answer(gen="gen-1", cost=0.00004)
+            body["usage"].update(prompt_tokens=30, completion_tokens=9)
+            return httpx.Response(200, json=body)
+        if shape == "an answer with no figure":
+            return httpx.Response(200, json=judge_answer(gen="gen-2"))
+        if shape == "an error status":
+            return httpx.Response(500, json={"error": "upstream"})
+        if shape == "no reply":
+            raise httpx.ReadError("the judge request ended", request=request)
+        raise httpx.ConnectError("the judge request ended", request=request)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
     eid, path = judged_experiment(client, tmp_path)
     before = client.app.state.accumulated_spend_usd
+    taken = stepping_clock(monkeypatch)
     seen = []
 
     def refusing(conn, call_id, *args, **kwargs):
@@ -23233,20 +23416,110 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     wait_pass_ended(client)
 
     assert seen == [None]
-    assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00004)
+    if shape == "a charged answer":
+        assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00004)
     (call,) = calls_of(client.app.state.db, eid)
-    assert (call["outcome"], call["detail"]) == (
-        "interrupted",
-        "the answer arrived; its write failed: OperationalError: database is locked",
-    )
+    assert (call["outcome"], call["detail"]) == ("interrupted", happened + LOCKED)
+    sent, replied, *rest = facts
+    assert [call[k] for k in CALL_FACTS] == [
+        sent,
+        taken[0] if replied else None,
+        *rest,
+    ]
+    assert taken == ([call["answered_at"]] if replied else [])
     (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
-    assert (made["outcome"], made["detail"], made["unanswered"]) == (
+    assert (made["outcome"], made["detail"]) == (
         "failed",
         "OperationalError: database is locked",
-        1,
     )
-    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
-    assert (cost["unanswered_calls"], cost["in_flight_calls"]) == (1, 0)
+    sealed = client.app.state.db.execute(
+        "SELECT unanswered, unusable, unknown, ended_at FROM scoring_passes"
+    ).fetchone()
+    assert tuple(sealed)[:3] == counts
+    if replied:
+        assert call["answered_at"] < sealed["ended_at"]
+
+
+class HeldReply(httpx.AsyncByteStream):
+    """A 200's body that yields its first bytes and then waits, as a reply
+    stalled mid-body does, until the bench's shutdown cuts it."""
+
+    async def __aiter__(self):
+        yield b'{"id":"gen-held"'
+        await asyncio.sleep(60)
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.parametrize("written", [True, False], ids=["its own write", "the close"])
+@pytest.mark.parametrize(
+    "head", [False, True], ids=["before its reply", "while replying"]
+)
+@respx.mock
+def test_a_call_cut_at_shutdown_records_whether_its_reply_had_begun(
+    monkeypatch, tmp_path, head, written
+):
+    """WINDOW: a judge call on the wire when the bench shuts down with the
+    bound shortened to 0.2 s, its reply not yet begun or begun and stalled
+    mid-body, its ending written by its own write or, when that write
+    fails, by the pass's close; and the records read by a fresh
+    connection after.
+
+    The call is stopped either way: the outcome says who ended it. The
+    facts say whether a reply had begun (the operator's rulings H2 and M1
+    on the 1d91670 review): cut before its reply, it has no answer time
+    and is counted unanswered; cut while its reply arrived, it carries the
+    time the reply's head arrived, in its own sentence, and is counted
+    unusable, a reply that could not be used. The close records the same
+    facts when the call's own write fails. PRE-STATE at the parent
+    (b3b4e48): a call cut while its reply arrived had no answer time, the
+    before-the-reply sentence, and was counted unanswered."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        if head:
+            return httpx.Response(200, stream=HeldReply())
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        taken = stepping_clock(monkeypatch)
+        if not written:
+
+            def refusing(*args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(store, "record_judge_call_answer", refusing)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        if head:
+            drive_until(c, lambda: taken, "the judge reply's head never arrived")
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+
+    (made,), (call,) = pass_rows(db_path, eid)
+    cut = main.CALL_CUT_WHILE_REPLYING if head else main.CALL_CUT_AT_SHUTDOWN
+    said = (
+        "it was cut off at shutdown while its reply was arriving"
+        if head
+        else "it was cut off at shutdown"
+    ) + LOCKED
+    assert (call["outcome"], call["detail"]) == (
+        ("stopped", cut) if written else ("interrupted", said)
+    )
+    assert (call["sent"], call["answered_at"], call["usable"]) == (
+        (1, taken[0], 0) if head else (1, None, None)
+    )
+    assert made["outcome"] == "stopped"
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == (
+        (0, 1, 0) if head else (1, 0, 0)
+    )
 
 
 @respx.mock
@@ -23722,8 +23995,10 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
 
     The next boot closes both as interrupted, "found open at boot", with
     no end time because none is known; the doors show the pass as ended
-    and not running, and the report counts the call as unanswered rather
-    than in flight. PRE-STATE: the pass and the call are open when the
+    and not running. Nothing is known of the call, so it carries no facts
+    and the pass counts it unknown, the one call the counts cannot place
+    (the operator's ruling M1 on the 1d91670 review), neither unanswered
+    nor in flight. PRE-STATE: the pass and the call are open when the
     database is booted."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
@@ -23741,7 +24016,6 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
 
     with boot_against(monkeypatch, db_path) as c:
         (made,) = c.get(f"/experiments/{eid}/scoring").json()["passes"]
-        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
         (call,) = calls_of(c.app.state.db, eid)
 
     assert (made["outcome"], made["detail"], made["ended_at"]) == (
@@ -23749,12 +24023,60 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
         store.FOUND_OPEN_AT_BOOT,
         None,
     )
-    assert (made["running"], made["unanswered"]) == (False, 1)
+    assert made["running"] is False
+    (swept,), _ = pass_rows(db_path, eid)
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
     assert (call["outcome"], call["detail"]) == (
         "interrupted",
         store.FOUND_OPEN_AT_BOOT,
     )
-    assert (cost["unanswered_calls"], cost["in_flight_calls"]) == (1, 0)
+    assert [call[k] for k in CALL_FACTS] == [None] * 7
+
+
+@respx.mock
+def test_a_call_whose_pass_could_not_close_is_unknown_at_the_next_boot(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a pass whose answer write fails and whose close then fails
+    too, so the call and the pass stay open and what the pass knew of the
+    call ends with its process; the next boot; and the records after.
+
+    The sweep knows nothing of the call, so it records none of what the
+    pass knew: interrupted, "found open at boot", no facts, and counted
+    unknown, though its answer had arrived (the operator's ruling M1 on
+    the 1d91670 review: the one call the counts cannot place). PRE-STATE:
+    the pass and the call are open when the first bench has stopped."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(200, json=judge_answer(gen="gen-1", cost=0.00004))
+            if is_judge(request)
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    db_path = tmp_path / "bench.db"
+
+    def refusing(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        with monkeypatch.context() as m:
+            m.setattr(store, "record_judge_call_answer", refusing)
+            m.setattr(store, "close_scoring_pass", refusing)
+            assert score(c, eid, path).status_code == 202
+            wait_pass_ended(c)
+    (left,), (open_call,) = pass_rows(db_path, eid)
+    assert (left["outcome"], open_call["outcome"]) == (None, None)
+
+    with boot_against(monkeypatch, db_path):
+        pass
+    (swept,), (call,) = pass_rows(db_path, eid)
+    assert (call["outcome"], call["detail"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert [call[k] for k in CALL_FACTS] == [None] * 7
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
 
 
 def seed_a_live_older_database(path):

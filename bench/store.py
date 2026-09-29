@@ -38,6 +38,7 @@ import sqlite3
 import stat
 import urllib.parse
 from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -226,7 +227,12 @@ CREATE TABLE IF NOT EXISTS scoring_passes (
     scored INTEGER,
     failed INTEGER,
     unanswered INTEGER,
-    unusable INTEGER
+    unusable INTEGER,
+    -- The pass's calls whose record could not be completed and does not
+    -- say whether their request went out (schema 12). NULL on a pass
+    -- closed before schema 12, which counted by the outcome list withdrawn
+    -- then; see MIGRATIONS.
+    unknown INTEGER
 );
 CREATE TABLE IF NOT EXISTS judge_calls (
     id INTEGER PRIMARY KEY,
@@ -235,7 +241,10 @@ CREATE TABLE IF NOT EXISTS judge_calls (
     result_id INTEGER NOT NULL REFERENCES results(id),
     judge_model TEXT NOT NULL,
     sent_at TEXT NOT NULL,
-    -- Filled only when a reply arrived, whatever the reply said.
+    -- Filled only when a reply's head arrived, with the time it did,
+    -- whatever the reply said and whether or not its body could be read.
+    -- On a call ended before schema 12 it is the time the ending was
+    -- written.
     answered_at TEXT,
     generation_id TEXT,
     billed_cost_usd REAL,
@@ -246,7 +255,21 @@ CREATE TABLE IF NOT EXISTS judge_calls (
     outcome TEXT,
     detail TEXT,
     prompt_tokens INTEGER,
-    completion_tokens INTEGER
+    completion_tokens INTEGER,
+    -- Schema 12, filled in the call's one ending write, from its outcome
+    -- and answered_at by call_facts. sent: 1 when a connection was
+    -- established, or when the request's leaving cannot be ruled out; 0
+    -- when none was, so nothing left. usable: 1 when the reply was read
+    -- as an answer (a verdict that does not parse included: that is the
+    -- score row's failure, not the call's), 0 when a reply arrived and
+    -- could not be used, NULL when no reply arrived. It describes the
+    -- reply, not the score. Both NULL on a call interrupted with nothing
+    -- known, and on every call ended before schema 12, which a count
+    -- places by CALL_ENDING_SQL's history arms. sent_at is when the call
+    -- was recorded, immediately before its request was handed to the
+    -- client, on every call, whether or not it left.
+    sent INTEGER,
+    usable INTEGER
 );
 """
 
@@ -323,8 +346,8 @@ END;
 # hold for every writer, a second connection and a person at the sqlite3
 # prompt included.
 #
-# FIVE REFUSALS PER TABLE, each in its own sentence, which is what a
-# reader of the error sees:
+# FIVE REFUSALS PER TABLE, AND A SIXTH ON judge_calls, each in its own
+# sentence, which is what a reader of the error sees:
 #
 #   a value once written changes (the first SELECT names every column,
 #   so a column added to either table has to be added here too, and a
@@ -332,13 +355,20 @@ END;
 #   anything is written after the ending (a late fill);
 #   an update leaves the outcome NULL (a partial fill: the ending is
 #   written whole, in the one write that names it);
+#   on judge_calls, an ending's facts are missing or disagree with its
+#   outcome (schema 12: sent, answered_at and usable, as call_facts
+#   decides them);
 #   an insert reuses an id, which is what INSERT OR REPLACE and REPLACE
 #   do (sqlite's REPLACE deletes the old row without firing a DELETE
 #   trigger unless recursive_triggers is on, so the insert is where it
 #   is caught);
 #   a row is deleted.
 #
-# One BEFORE UPDATE trigger holding three SELECTs rather than three
+# The first write's columns are held whatever their value, so a NULL
+# judge_model on a pass is the first write's fact, no judge; the
+# ending's columns are held once written.
+#
+# One BEFORE UPDATE trigger holding its SELECTs rather than several
 # triggers, because sqlite does not promise the order in which several
 # triggers on one event fire, and the sentence a refusal gives should
 # not depend on it. Statements inside one trigger body run in order.
@@ -346,7 +376,7 @@ END;
 # VERSIONED NAMES. CREATE TRIGGER IF NOT EXISTS keeps whatever body a
 # database already holds under that name, so changing a body in place
 # would change nothing on any database that booted before the change.
-# A changed seal gets a new name (_v2), and connect() lays SEALS first
+# A changed seal gets a new name (_v2, _v3), and connect() lays SEALS first
 # and drops the retired names after, both changes landing in the same
 # git commit. Laid first so that at every moment at least one seal holds
 # each table: a crash between the two steps leaves both, and the old
@@ -355,28 +385,37 @@ END;
 # fails there.
 # THE SEALS NO LONGER IN FORCE, dropped by connect() after SEALS is laid.
 # scoring_passes_sealed_v1 named every column of the table as 1e6f2ab
-# made it; the column unusable (ruling 4) made it v2. judge_calls_sealed_v1
-# likewise, until P2's two usage-count columns made it v2.
-RETIRED_SEALS = ("scoring_passes_sealed_v1", "judge_calls_sealed_v1")
+# made it; the column unusable (ruling 4) made it v2, and unknown with
+# judge_model held whatever its value (the operator's rulings H2 and M1
+# on the 1d91670 review, and the review's L2) made it v3.
+# judge_calls_sealed_v1 likewise, until P2's two usage-count columns made
+# it v2; sent and usable, and the refusal of an ending whose facts
+# disagree with its outcome, made it v3.
+RETIRED_SEALS = (
+    "scoring_passes_sealed_v1",
+    "judge_calls_sealed_v1",
+    "scoring_passes_sealed_v2",
+    "judge_calls_sealed_v2",
+)
 
 SEALS = """
-CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2
+CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v3
 BEFORE UPDATE ON scoring_passes
 BEGIN
     SELECT RAISE(ABORT,
         'a scoring pass record never changes a value once written')
      WHERE NEW.id IS NOT OLD.id
-        OR (OLD.experiment_id IS NOT NULL
-            AND NEW.experiment_id IS NOT OLD.experiment_id)
-        OR (OLD.judge_model IS NOT NULL AND NEW.judge_model IS NOT OLD.judge_model)
-        OR (OLD.started_at IS NOT NULL AND NEW.started_at IS NOT OLD.started_at)
+        OR NEW.experiment_id IS NOT OLD.experiment_id
+        OR NEW.judge_model IS NOT OLD.judge_model
+        OR NEW.started_at IS NOT OLD.started_at
         OR (OLD.ended_at IS NOT NULL AND NEW.ended_at IS NOT OLD.ended_at)
         OR (OLD.outcome IS NOT NULL AND NEW.outcome IS NOT OLD.outcome)
         OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail)
         OR (OLD.scored IS NOT NULL AND NEW.scored IS NOT OLD.scored)
         OR (OLD.failed IS NOT NULL AND NEW.failed IS NOT OLD.failed)
         OR (OLD.unanswered IS NOT NULL AND NEW.unanswered IS NOT OLD.unanswered)
-        OR (OLD.unusable IS NOT NULL AND NEW.unusable IS NOT OLD.unusable);
+        OR (OLD.unusable IS NOT NULL AND NEW.unusable IS NOT OLD.unusable)
+        OR (OLD.unknown IS NOT NULL AND NEW.unknown IS NOT OLD.unknown);
     SELECT RAISE(ABORT,
         'a scoring pass ends once, and this one has already ended')
      WHERE OLD.outcome IS NOT NULL;
@@ -395,18 +434,17 @@ BEFORE DELETE ON scoring_passes
 BEGIN
     SELECT RAISE(ABORT, 'a scoring pass record is never deleted');
 END;
-CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v2
+CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v3
 BEFORE UPDATE ON judge_calls
 BEGIN
     SELECT RAISE(ABORT,
         'a judge call record never changes a value once written')
      WHERE NEW.id IS NOT OLD.id
-        OR (OLD.pass_id IS NOT NULL AND NEW.pass_id IS NOT OLD.pass_id)
-        OR (OLD.experiment_id IS NOT NULL
-            AND NEW.experiment_id IS NOT OLD.experiment_id)
-        OR (OLD.result_id IS NOT NULL AND NEW.result_id IS NOT OLD.result_id)
-        OR (OLD.judge_model IS NOT NULL AND NEW.judge_model IS NOT OLD.judge_model)
-        OR (OLD.sent_at IS NOT NULL AND NEW.sent_at IS NOT OLD.sent_at)
+        OR NEW.pass_id IS NOT OLD.pass_id
+        OR NEW.experiment_id IS NOT OLD.experiment_id
+        OR NEW.result_id IS NOT OLD.result_id
+        OR NEW.judge_model IS NOT OLD.judge_model
+        OR NEW.sent_at IS NOT OLD.sent_at
         OR (OLD.answered_at IS NOT NULL AND NEW.answered_at IS NOT OLD.answered_at)
         OR (OLD.generation_id IS NOT NULL
             AND NEW.generation_id IS NOT OLD.generation_id)
@@ -417,13 +455,28 @@ BEGIN
         OR (OLD.prompt_tokens IS NOT NULL
             AND NEW.prompt_tokens IS NOT OLD.prompt_tokens)
         OR (OLD.completion_tokens IS NOT NULL
-            AND NEW.completion_tokens IS NOT OLD.completion_tokens);
+            AND NEW.completion_tokens IS NOT OLD.completion_tokens)
+        OR (OLD.sent IS NOT NULL AND NEW.sent IS NOT OLD.sent)
+        OR (OLD.usable IS NOT NULL AND NEW.usable IS NOT OLD.usable);
     SELECT RAISE(ABORT,
         'a judge call ends once, and this one has already ended')
      WHERE OLD.outcome IS NOT NULL;
     SELECT RAISE(ABORT,
         'a judge call ends in one write, and that write names its outcome')
      WHERE NEW.outcome IS NULL;
+    SELECT RAISE(ABORT,
+        'a judge call ends with sent, answered_at and usable agreeing with its outcome')
+     WHERE (NEW.sent IS NOT NULL AND NEW.sent NOT IN (0, 1))
+        OR (NEW.usable IS NOT NULL AND NEW.usable NOT IN (0, 1))
+        OR (NEW.outcome IS NOT 'interrupted' AND NEW.sent IS NULL)
+        OR (NEW.outcome = 'not_sent' AND NEW.sent IS NOT 0)
+        OR (NEW.outcome IN ('answered', 'timed_out', 'stopped', 'failed')
+            AND NEW.sent IS NOT 1)
+        OR (NEW.answered_at IS NOT NULL AND NEW.sent IS NOT 1)
+        OR ((NEW.answered_at IS NULL) <> (NEW.usable IS NULL))
+        OR (NEW.outcome IN ('timed_out', 'not_sent') AND NEW.answered_at IS NOT NULL)
+        OR (NEW.outcome = 'answered' AND NEW.usable IS NOT 1)
+        OR (NEW.outcome IN ('failed', 'stopped') AND NEW.usable IS 1);
 END;
 CREATE TRIGGER IF NOT EXISTS judge_calls_never_replaced_v1
 BEFORE INSERT ON judge_calls
@@ -896,13 +949,14 @@ MIGRATIONS = [
     ("scores", "pass_id", "INTEGER REFERENCES scoring_passes(id)"),
     # Phase P, the operator's ruling 4 at P1's checkpoint: TWO COUNTS, TWO
     # WORDS. A pass's end counted every sent request with no usable answer
-    # as unanswered; it now counts a request nothing came back for
-    # (timed_out, stopped, interrupted) as unanswered and one something
-    # came back for that could not be used (failed) as unusable, beside
-    # it. NULL on a pass closed before this column, whose unanswered then
-    # counted its failed calls too: only builds 95ee626 to 74ca55b wrote
-    # such a pass, and none was released. Filled once, with the other
-    # counts, in the statement that ends the pass.
+    # as unanswered; from b6c088c until schema 12 it counted a request
+    # nothing came back for (timed_out, stopped, interrupted) as
+    # unanswered and one that failed as unusable, by an outcome list the
+    # operator withdrew at schema 12 (see below). NULL on a pass closed
+    # before this column, whose unanswered then counted its failed calls
+    # too: only builds 95ee626 to 74ca55b wrote such a pass, and none was
+    # released. Filled once, with the other counts, in the statement that
+    # ends the pass.
     ("scoring_passes", "unusable", "INTEGER"),
     # Phase P, P2: WHAT A JUDGE REPLY SAID IT USED, the two usage counts
     # of the reply, filled with the rest of the answer in the call's one
@@ -914,6 +968,26 @@ MIGRATIONS = [
     # ended before P2, which recorded no counts at all.
     ("judge_calls", "prompt_tokens", "INTEGER"),
     ("judge_calls", "completion_tokens", "INTEGER"),
+    # Phase P, the operator's rulings H2 and M1 on the 1d91670 review:
+    # SCHEMA 12, THE FACTS THE COUNTS COME FROM. A judge call records
+    # whether it was sent and whether its reply could be used, beside
+    # answered_at, which says whether a reply arrived; a pass counts its
+    # calls from those three and never from the outcome word, and
+    # interrupted means only that the record of an ending could not be
+    # completed. NULL on every call ended before schema 12: only draft
+    # builds 1e6f2ab to b3b4e48 wrote one, and a count places it by
+    # CALL_ENDING_SQL's history arms. Filled once, in the call's one
+    # ending write.
+    ("judge_calls", "sent", "INTEGER"),
+    ("judge_calls", "usable", "INTEGER"),
+    # unknown: the calls of a pass whose record does not say whether the
+    # request went out. NULL on a pass closed before schema 12, which
+    # counted by the outcome list ruling 4 gave and H2 withdrew: its
+    # unusable held every failed call, a reply or none, and its unanswered
+    # every timed_out, stopped and interrupted call, the never sent and
+    # the answered among them. Filled once, with the other counts, in the
+    # statement that ends the pass.
+    ("scoring_passes", "unknown", "INTEGER"),
 ]
 
 
@@ -3631,19 +3705,21 @@ PASS_OUTCOMES = ("finished", "stopped", "failed", "interrupted")
 # How one judge request ended. The line between not_sent and the rest is
 # the connection: see the outcome column in SCHEMA.
 #
-#   answered     a reply came back and was read.
+#   answered     a reply came back and was read as an answer.
 #   timed_out    the request went out and no reply came within the
 #                judge's timeout.
 #   stopped      the request went out and the bench's own shutdown cut
-#                it before a reply.
+#                it, before its reply or while its reply was arriving;
+#                answered_at says which.
 #   failed       the request went out and no usable reply came back: a
 #                transport error after sending, an error status, or a
-#                body that could not be read.
+#                body that could not be read or was cut off.
 #   not_sent     no connection was established, so nothing left.
-#   interrupted  the request went out and the record of its ending was
-#                cut off, by the process ending or by the write that
-#                should have held it failing. Only the sweep and a
-#                pass's own close write it.
+#   interrupted  the record of the call's ending could not be completed,
+#                by the process ending or by the write that should have
+#                held it failing. sent, answered_at and usable say what
+#                the pass knew, and are NULL when nothing was. Only the
+#                sweep and a pass's own close write it.
 CALL_OUTCOMES = (
     "answered",
     "timed_out",
@@ -3653,11 +3729,12 @@ CALL_OUTCOMES = (
     "interrupted",
 )
 
-# TWO COUNTS, TWO WORDS (the operator's ruling 4 at P1's checkpoint).
-# Unanswered: the request was sent and nothing came back, because it
-# timed out, was cut at shutdown, or had its record cut off. Unusable:
-# something came back and could not be used (failed). Neither is answered,
-# which came back usable, or not_sent, which never left.
+# WITHDRAWN (the operator's ruling H2 on the 1d91670 review): ruling 4's
+# outcome list, made by b6c088c, which counted every failed call as
+# unusable whether or not a reply came, and every interrupted one as
+# unanswered. No count in the store reads it now; CALL_ENDING_SQL below
+# places a call by its facts. report._judge_cost still reads it, and
+# moves onto call_ending with the doors that read schema 12.
 UNANSWERED_CALL_OUTCOMES = ("timed_out", "stopped", "interrupted")
 UNUSABLE_CALL_OUTCOMES = ("failed",)
 
@@ -3683,11 +3760,139 @@ class AlreadyRecorded(Exception):
     """
 
 
+def now() -> str:
+    """The store's clock, as every record's times are written, for a
+    caller that stamps a moment the store records later: the scoring pass
+    takes a judge reply's time with it when the reply's head arrives."""
+    return _now()
+
+
+def call_facts(outcome: str, answered_at: str | None) -> tuple[int, int | None]:
+    """sent and usable for a judge call that ended as outcome, with a
+    reply whose head arrived at answered_at or none: the facts the counts
+    read (the operator's rulings H2 and M1 on the 1d91670 review), decided
+    here and only here, so a call's own ending and a pass's close cannot
+    disagree about them. judge_calls_sealed_v3 holds the same rule for
+    every writer."""
+    replied = answered_at is not None
+    if outcome == "answered":
+        if not replied:
+            raise ValueError("an answered call had a reply")
+        return 1, 1
+    if outcome in ("timed_out", "not_sent"):
+        if replied:
+            raise ValueError(f"a call that ended as {outcome!r} had no reply")
+        return (1 if outcome == "timed_out" else 0), None
+    if outcome in ("failed", "stopped"):
+        return 1, (0 if replied else None)
+    raise ValueError(f"a judge call cannot end as {outcome!r}")
+
+
+@dataclass(frozen=True)
+class UnwrittenEnding:
+    """What a pass knew of a call whose ending write failed (the
+    operator's ruling M1 on the 1d91670 review): the ending it tried to
+    write, and the sentence its close records as the call's detail.
+    Checked when made, so a close never meets an ending no call can
+    have."""
+
+    outcome: str
+    answered_at: str | None
+    detail: str
+    generation_id: str | None = None
+    billed_cost_usd: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        call_facts(self.outcome, self.answered_at)
+
+
+# WHERE A CALL IS COUNTED, from its facts and never from its outcome
+# (the operator's ruling H2 on the 1d91670 review, which withdrew ruling
+# 4's outcome list, made by b6c088c). One word per call, by the first arm
+# that holds:
+#   in_flight   no ending yet.
+#   unknown     its record does not say whether the request went out:
+#               interrupted with nothing known.
+#   never_sent  no connection was made, so nothing left. In no count.
+#   unanswered  sent, and no reply came back.
+#   answered    a reply came back and was read as an answer.
+#   unusable    a reply came back and could not be used: an error status,
+#               or a body that could not be read or was cut off.
+# THE HISTORY ARMS, the one place a count reads the outcome word. A call
+# ended before schema 12 has sent and usable NULL, because the columns
+# did not exist; its facts were recorded in the outcome word, under the
+# connection line, and in answered_at. So for a row whose sent is NULL,
+# and only there: interrupted is unknown, not_sent never left, any other
+# outcome left, and a reply was usable when the outcome was answered.
+# judge_calls_sealed_v3 refuses every later ending that leaves sent NULL
+# other than interrupted, so the arms reach no call ended since.
+# call_ending is the same arms in Python, for the report, which counts
+# over records with no database in reach; a test holds the two equal.
+CALL_ENDING_SQL = """CASE
+        WHEN judge_calls.outcome IS NULL THEN 'in_flight'
+        WHEN judge_calls.sent IS NULL THEN
+            CASE WHEN judge_calls.outcome = 'interrupted' THEN 'unknown'
+                 WHEN judge_calls.outcome = 'not_sent' THEN 'never_sent'
+                 WHEN judge_calls.answered_at IS NULL THEN 'unanswered'
+                 WHEN judge_calls.outcome = 'answered' THEN 'answered'
+                 ELSE 'unusable' END
+        WHEN judge_calls.sent = 0 THEN 'never_sent'
+        WHEN judge_calls.answered_at IS NULL THEN 'unanswered'
+        WHEN judge_calls.usable = 1 THEN 'answered'
+        ELSE 'unusable'
+    END"""
+CALL_ENDINGS = (
+    "in_flight",
+    "unknown",
+    "never_sent",
+    "unanswered",
+    "answered",
+    "unusable",
+)
+
+
+def call_ending(call: Mapping[str, Any]) -> str:
+    """Where one call is counted, one of CALL_ENDINGS: CALL_ENDING_SQL's
+    arms, in the same order, over a call record read back from the store
+    or an export. Every key is read by subscript, so a record missing one
+    of the four is an error here, never a call counted by a default."""
+    outcome = call["outcome"]
+    sent = as_flag(call["sent"])
+    replied = call["answered_at"] is not None
+    usable = as_flag(call["usable"])
+    if outcome is None:
+        return "in_flight"
+    if sent is None:
+        if outcome == "interrupted":
+            return "unknown"
+        if outcome == "not_sent":
+            return "never_sent"
+        if not replied:
+            return "unanswered"
+        return "answered" if outcome == "answered" else "unusable"
+    if sent is False:
+        return "never_sent"
+    if not replied:
+        return "unanswered"
+    return "answered" if usable is True else "unusable"
+
+
+def _placed(ending: str) -> str:
+    """The count of a pass's calls CALL_ENDING_SQL places at ending."""
+    return f"""(SELECT COUNT(*) FROM judge_calls
+                 WHERE judge_calls.pass_id = scoring_passes.id
+                   AND {CALL_ENDING_SQL} = '{ending}')"""
+
+
 # The end counts, computed from the pass's own rows in the statement that
 # seals it, so they are what the records say and not what the process
 # remembered. scored is a trial the pass gave a score; failed is a trial
 # whose row it wrote with none; unanswered is a request it sent that got
-# nothing back, and unusable one that got something back it could not use.
+# no reply, unusable one that got a reply it could not use, and unknown
+# one whose record does not say whether it went out, each as
+# CALL_ENDING_SQL places it.
 _PASS_COUNTS = f"""
     scored = (SELECT COUNT(*) FROM scores
                WHERE scores.pass_id = scoring_passes.id
@@ -3695,14 +3900,9 @@ _PASS_COUNTS = f"""
     failed = (SELECT COUNT(*) FROM scores
                WHERE scores.pass_id = scoring_passes.id
                  AND scores.score IS NULL),
-    unanswered = (SELECT COUNT(*) FROM judge_calls
-                   WHERE judge_calls.pass_id = scoring_passes.id
-                     AND judge_calls.outcome IN
-                         ({", ".join(f"'{o}'" for o in UNANSWERED_CALL_OUTCOMES)})),
-    unusable = (SELECT COUNT(*) FROM judge_calls
-                 WHERE judge_calls.pass_id = scoring_passes.id
-                   AND judge_calls.outcome IN
-                       ({", ".join(f"'{o}'" for o in UNUSABLE_CALL_OUTCOMES)}))"""
+    unanswered = {_placed("unanswered")},
+    unusable = {_placed("unusable")},
+    unknown = {_placed("unknown")}"""
 
 
 def open_scoring_pass(
@@ -3729,7 +3929,7 @@ def close_scoring_pass(
     outcome: str,
     detail: str | None = None,
     *,
-    unrecorded: Mapping[int, str] | None = None,
+    unrecorded: Mapping[int, UnwrittenEnding] | None = None,
 ) -> None:
     """Record how a pass ended, once, with its counts.
 
@@ -3740,11 +3940,16 @@ def close_scoring_pass(
     request still in flight long after anything was.
 
     WHAT WAS INTERRUPTED IS THE RECORD, NOT THE REQUEST (the operator's
-    ruling at P1's checkpoint), so the detail says so: unrecorded maps a
-    call's id to the pass's own sentence for it, what arrived and that
-    its write failed, with the error ("the answer arrived; its write
-    failed: <error>"). A call the map does not name gets CALL_LEFT_OPEN.
-    Neither is the boot sweep's "found open at boot".
+    ruling at P1's checkpoint), so the detail says so, and since the
+    operator's ruling M1 on the 1d91670 review the facts do too:
+    unrecorded maps a call's id to what the pass knew of it. The close
+    writes interrupted, the pass's sentence as the detail (what happened
+    and that its write failed, with the error: "the answer arrived; its
+    write failed: <error>"), and every fact it had, in the call's one
+    ending write, so the counts place the call by what happened to it. A
+    call the map does not name gets CALL_LEFT_OPEN and no facts, and is
+    counted unknown, as the boot sweep's calls are. Neither sentence is
+    the boot sweep's "found open at boot".
     """
     if outcome not in PASS_OUTCOMES or outcome == "interrupted":
         raise ValueError(f"a pass cannot close as {outcome!r}")
@@ -3758,10 +3963,33 @@ def close_scoring_pass(
             )
         ]
         for call_id in left:
+            known = said.get(call_id)
+            if known is None:
+                conn.execute(
+                    """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
+                       WHERE id = ? AND outcome IS NULL""",
+                    (CALL_LEFT_OPEN, call_id),
+                )
+                continue
+            sent, usable = call_facts(known.outcome, known.answered_at)
             conn.execute(
-                """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
-                   WHERE id = ? AND outcome IS NULL""",
-                (as_text(said.get(call_id, CALL_LEFT_OPEN)), call_id),
+                """UPDATE judge_calls
+                      SET outcome = 'interrupted', detail = ?, sent = ?,
+                          answered_at = ?, usable = ?, generation_id = ?,
+                          billed_cost_usd = ?, prompt_tokens = ?,
+                          completion_tokens = ?
+                    WHERE id = ? AND outcome IS NULL""",
+                (
+                    as_text(known.detail),
+                    sent,
+                    as_text(known.answered_at),
+                    usable,
+                    as_text(known.generation_id),
+                    as_money(known.billed_cost_usd),
+                    as_token_count(known.prompt_tokens),
+                    as_token_count(known.completion_tokens),
+                    call_id,
+                ),
             )
         cur = conn.execute(
             f"""UPDATE scoring_passes
@@ -3809,7 +4037,7 @@ def record_judge_call_answer(
     call_id: int,
     outcome: str,
     *,
-    replied: bool,
+    answered_at: str | None,
     generation_id: str | None = None,
     billed_cost_usd: float | None = None,
     detail: str | None = None,
@@ -3819,32 +4047,30 @@ def record_judge_call_answer(
     """Record how a judge request ended: the second and last write.
 
     Fills the columns the first write left NULL and nothing else, and
-    only on a call whose ending is still NULL. replied says whether an
-    HTTP reply arrived; answered_at is stamped only then, whatever the
-    reply said, so a timed-out, stopped or never-sent call has no answer
-    time to show.
+    only on a call whose ending is still NULL. answered_at is when the
+    reply's head arrived, taken by the caller when it did (store.now),
+    or None when no reply arrived, whatever the reply said; sent and
+    usable follow from it and the outcome, by call_facts, which refuses
+    a contradiction before anything is written.
     """
-    if outcome not in CALL_OUTCOMES or outcome == "interrupted":
-        raise ValueError(f"a judge call cannot end as {outcome!r}")
-    if replied and outcome in ("timed_out", "stopped", "not_sent"):
-        raise ValueError(f"a call that ended as {outcome!r} had no reply")
-    if not replied and outcome == "answered":
-        raise ValueError("an answered call had a reply")
+    sent, usable = call_facts(outcome, answered_at)
     with conn:
         cur = conn.execute(
             """UPDATE judge_calls
                   SET answered_at = ?, generation_id = ?, billed_cost_usd = ?,
                       outcome = ?, detail = ?, prompt_tokens = ?,
-                      completion_tokens = ?
+                      completion_tokens = ?, sent = ?, usable = ?
                 WHERE id = ? AND outcome IS NULL""",
             (
-                _now() if replied else None,
+                as_text(answered_at),
                 as_text(generation_id),
                 as_money(billed_cost_usd),
                 outcome,
                 as_text(detail),
                 as_token_count(prompt_tokens),
                 as_token_count(completion_tokens),
+                sent,
+                usable,
                 call_id,
             ),
         )

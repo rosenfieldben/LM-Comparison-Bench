@@ -363,3 +363,23 @@ a23b257).
   with its own refusal and its own proofs, for a sharing no single
   database's lock can see.
 - **First written:** the commit that adds this entry.
+
+## An insert that fills a scoring record's ending
+
+- **What:** the seals on `scoring_passes` and `judge_calls` refuse a
+  change to a written value, a second ending, a partial ending, a
+  replacement and a delete, but not an insert that names an ending
+  column. A call inserted by direct SQL with `sent` 0 and `usable` 1
+  has its true ending refused, and a pass inserted with a count already
+  filled makes the boot sweep raise, so the server will not start until
+  the row is dealt with by hand (both measured on schema 12). Only a
+  writer going around the store reaches it: the store's own inserts name
+  the first write's columns alone. Pre-existing since the seals arrived
+  (1e6f2ab): a pass inserted with `scored` filled does the same.
+- **Deferred by:** Phase P, in the design of schema 12, found by its
+  critique of the record; not ruled by the operator.
+- **Reason:** it predates the series and no writer of the bench's own
+  can reach it; the fix, an insert seal that also refuses a row naming
+  an ending column, is a seal of its own with a versioned name and
+  proofs.
+- **First written:** the commit that adds this entry.

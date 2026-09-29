@@ -7199,6 +7199,9 @@ def pass_cut_at_shutdown() -> str:
 
 
 CALL_CUT_AT_SHUTDOWN = "cut off before a reply because the bench was shutting down"
+CALL_CUT_WHILE_REPLYING = (
+    "cut off while its reply was arriving, because the bench was shutting down"
+)
 
 
 def unwritten_ending(outcome: str, replied: bool, exc: Exception) -> str:
@@ -7215,10 +7218,15 @@ def unwritten_ending(outcome: str, replied: bool, exc: Exception) -> str:
             if replied
             else "it failed after it was sent"
         )
+    elif outcome == "stopped":
+        happened = (
+            "it was cut off at shutdown while its reply was arriving"
+            if replied
+            else "it was cut off at shutdown"
+        )
     else:
         happened = {
             "timed_out": "it timed out",
-            "stopped": "it was cut off at shutdown",
             "not_sent": "it was never sent",
         }.get(outcome, f"it ended {outcome}")
     return f"{happened}; its write failed: {type(exc).__name__}: {exc}"
@@ -7300,8 +7308,8 @@ async def score_experiment(
     state = app.state.scoring_run
     outcome, detail = "finished", None
     # A call whose ending could not be written, by id, with what the pass
-    # knows happened to it; the close records that as the call's detail.
-    unrecorded: dict[int, str] = {}
+    # knew of it; the close records that in the call's ending.
+    unrecorded: dict[int, store.UnwrittenEnding] = {}
     # EVERYTHING THE PASS DOES IS INSIDE THE TRY, its first read included.
     # The finally below is the only thing that ever frees the one scoring
     # slot, so a statement that could raise before it would leave the slot
@@ -7370,7 +7378,7 @@ async def score_one_result(
     result: dict[str, Any],
     judge_model: str | None,
     self_judged: bool,
-    unrecorded: dict[int, str],
+    unrecorded: dict[int, store.UnwrittenEnding],
 ) -> bool:
     """Score one stored result, writing exactly one row. Returns False,
     having written nothing, only when a stop arrived while the trial
@@ -7480,12 +7488,20 @@ async def score_one_result(
     # request: a timeout, a cut at shutdown, a crash. If the record cannot
     # be written the request is not made, and the pass fails.
     call_id: int | None = None
+    # When the judge's reply began to arrive, on the store's clock: the
+    # call's answer time, written by whichever write ends the call, its own
+    # or the pass's close, so no later time is ever recorded for it.
+    replied_at: str | None = None
 
     def sending() -> None:
         nonlocal call_id
         call_id = store.record_judge_call_sent(db, pass_id, result["id"], judge_model)
 
-    def end_call_unanswered(outcome: str, detail: str) -> None:
+    def replying() -> None:
+        nonlocal replied_at
+        replied_at = store.now()
+
+    def end_call_unsettled(outcome: str, detail: str) -> None:
         # For the paths that leave this function by an exception: the
         # call's ending is written if it can be, and the exception that is
         # propagating is never replaced by a failure to write it.
@@ -7493,13 +7509,17 @@ async def score_one_result(
             return
         try:
             store.record_judge_call_answer(
-                db, call_id, outcome, replied=False, detail=detail
+                db, call_id, outcome, answered_at=replied_at, detail=detail
             )
         except Exception as exc:
             logger.exception(
                 "the ending of judge call %s could not be recorded", call_id
             )
-            unrecorded[call_id] = unwritten_ending(outcome, False, exc)
+            unrecorded[call_id] = store.UnwrittenEnding(
+                outcome=outcome,
+                answered_at=replied_at,
+                detail=unwritten_ending(outcome, replied_at is not None, exc),
+            )
 
     def settle(verdict: dict[str, Any]) -> None:
         # Post-spend. The call has happened, so its claim is replaced with
@@ -7517,7 +7537,7 @@ async def score_one_result(
                     db,
                     call_id,
                     verdict["outcome"],
-                    replied=verdict["replied"],
+                    answered_at=replied_at,
                     generation_id=verdict["generation_id"],
                     billed_cost_usd=verdict["billed_cost_usd"],
                     detail=(
@@ -7528,10 +7548,19 @@ async def score_one_result(
                 )
             except Exception as exc:
                 # The pass fails on this; its close records the call as
-                # interrupted with this sentence, so the record says the
-                # request came back and only its record was cut off.
-                unrecorded[call_id] = unwritten_ending(
-                    verdict["outcome"], verdict["replied"], exc
+                # interrupted with this sentence and everything the verdict
+                # knew, so the record says what came back and that only its
+                # record's write failed, and the counts place it by that.
+                unrecorded[call_id] = store.UnwrittenEnding(
+                    outcome=verdict["outcome"],
+                    answered_at=replied_at,
+                    detail=unwritten_ending(
+                        verdict["outcome"], replied_at is not None, exc
+                    ),
+                    generation_id=verdict["generation_id"],
+                    billed_cost_usd=verdict["billed_cost_usd"],
+                    prompt_tokens=verdict["prompt_tokens"],
+                    completion_tokens=verdict["completion_tokens"],
                 )
                 raise
         store.add_score(
@@ -7617,7 +7646,8 @@ async def score_one_result(
             # SHIELDED, so the only cancellation that reaches the call is the
             # one decided below. A reply that arrived in the same turn as
             # shutdown's cut is kept and recorded as answered; one still on
-            # the wire is abandoned and recorded as stopped.
+            # the wire is abandoned and recorded as stopped, with the time
+            # its reply began to arrive when it had.
             judging = asyncio.ensure_future(
                 judge_response(
                     app.state.client,
@@ -7632,6 +7662,7 @@ async def score_one_result(
                     # somebody else's lineup would be a claim nobody made.
                     provider_prefs=app.state.provider_prefs,
                     sending=sending,
+                    replying=replying,
                 )
             )
             try:
@@ -7639,9 +7670,14 @@ async def score_one_result(
             except asyncio.CancelledError:
                 if not judging.done():
                     judging.cancel()
-                    end_call_unanswered("stopped", CALL_CUT_AT_SHUTDOWN)
+                    end_call_unsettled(
+                        "stopped",
+                        CALL_CUT_AT_SHUTDOWN
+                        if replied_at is None
+                        else CALL_CUT_WHILE_REPLYING,
+                    )
                 elif judging.cancelled() or judging.exception() is not None:
-                    end_call_unanswered(
+                    end_call_unsettled(
                         "failed", "the judge call ended as the pass was cut"
                     )
                 else:
@@ -7656,7 +7692,7 @@ async def score_one_result(
                 # Nothing judge_response raises is an HTTP outcome (those it
                 # returns), so whether this request left is not known: counted
                 # as sent, the side on which money may have moved.
-                end_call_unanswered(
+                end_call_unsettled(
                     "failed", f"judge request failed: {type(exc).__name__}"
                 )
                 raise
