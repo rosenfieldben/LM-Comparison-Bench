@@ -30,13 +30,15 @@ about the one process that holds this connection.
 """
 
 import contextlib
+import fcntl
 import json
 import logging
 import os
 import sqlite3
 import stat
 import urllib.parse
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -100,7 +102,9 @@ CREATE TABLE IF NOT EXISTS scores (
     judge_billed_cost_usd REAL,
     blind INTEGER,
     self_judged INTEGER,
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    judge_call_id INTEGER REFERENCES judge_calls(id),
+    pass_id INTEGER REFERENCES scoring_passes(id)
 );
 CREATE TABLE IF NOT EXISTS groups (
     id INTEGER PRIMARY KEY,
@@ -211,11 +215,77 @@ CREATE TABLE IF NOT EXISTS results (
     upstream_inference_cost_usd TEXT,
     is_byok INTEGER
 );
+CREATE TABLE IF NOT EXISTS scoring_passes (
+    id INTEGER PRIMARY KEY,
+    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+    judge_model TEXT,
+    started_at TEXT NOT NULL,
+    ended_at TEXT,
+    -- NULL while the pass runs; then one of PASS_OUTCOMES in store.py.
+    outcome TEXT,
+    detail TEXT,
+    scored INTEGER,
+    failed INTEGER,
+    unanswered INTEGER,
+    unusable INTEGER,
+    -- The pass's calls whose record could not be completed and does not
+    -- say whether their request went out (schema 12). NULL on a pass
+    -- closed before schema 12, which counted by the outcome list withdrawn
+    -- then; see MIGRATIONS.
+    unknown INTEGER
+);
+CREATE TABLE IF NOT EXISTS judge_calls (
+    id INTEGER PRIMARY KEY,
+    pass_id INTEGER NOT NULL REFERENCES scoring_passes(id),
+    experiment_id INTEGER NOT NULL REFERENCES experiments(id),
+    result_id INTEGER NOT NULL REFERENCES results(id),
+    judge_model TEXT NOT NULL,
+    sent_at TEXT NOT NULL,
+    -- Filled only when a reply's head arrived, with the time it did,
+    -- whatever the reply said and whether or not its body could be read.
+    -- On a call ended before schema 12 it is the time the ending was
+    -- written.
+    answered_at TEXT,
+    generation_id TEXT,
+    billed_cost_usd REAL,
+    -- NULL until the call ends; then one of CALL_OUTCOMES in store.py.
+    -- not_sent means no connection was established, so nothing left the
+    -- machine. Anything after the connection was established counts as
+    -- sent, because money may have moved.
+    outcome TEXT,
+    detail TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    -- Schema 12, filled in the call's one ending write, from its outcome
+    -- and answered_at by call_facts. sent: 1 when a connection was
+    -- established, or when the request's leaving cannot be ruled out; 0
+    -- when none was, so nothing left. usable: 1 when the reply was read
+    -- as an answer (a verdict that does not parse included: that is the
+    -- score row's failure, not the call's), 0 when a reply arrived and
+    -- could not be used, NULL when no reply arrived. It describes the
+    -- reply, not the score. Both NULL on a call interrupted with nothing
+    -- known, and on every call ended before schema 12, which a count
+    -- places by CALL_ENDING_SQL's history arms. sent_at is when the call
+    -- was recorded, immediately before its request was handed to the
+    -- client, on every call, whether or not it left.
+    sent INTEGER,
+    usable INTEGER
+);
 """
 
 # History reads join results by run and replay groups by scanning runs
 # by group; both tables grow monotonically, so without these indexes
 # every replay degrades into a full-table scan as bench.db accumulates.
+#
+# Phase P's four follow the same argument for the scoring records: the
+# panel reads the passes by experiment, the report and the export read
+# the calls by experiment, and a pass's end counts its own scores and
+# calls. The fifth is not for speed. UNIQUE on scores(judge_call_id) is
+# the rule that one request has one verdict row: a second scores row
+# citing the same call would be the same answer recorded twice. sqlite
+# lets any number of NULLs through a UNIQUE index, so the rows that cite
+# no call (every row before Phase P, and every row that never sent) are
+# untouched by it.
 INDEXES = """
 CREATE INDEX IF NOT EXISTS idx_results_run_id ON results(run_id);
 CREATE INDEX IF NOT EXISTS idx_runs_group_id ON runs(group_id);
@@ -223,6 +293,12 @@ CREATE INDEX IF NOT EXISTS idx_groups_experiment_id ON groups(experiment_id);
 CREATE INDEX IF NOT EXISTS idx_scores_result_id ON scores(result_id);
 CREATE INDEX IF NOT EXISTS idx_snapshot_captures_rendition
     ON snapshot_captures(digest, extractor, extractor_version);
+CREATE INDEX IF NOT EXISTS idx_scoring_passes_experiment_id
+    ON scoring_passes(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_judge_calls_experiment_id ON judge_calls(experiment_id);
+CREATE INDEX IF NOT EXISTS idx_judge_calls_pass_id ON judge_calls(pass_id);
+CREATE INDEX IF NOT EXISTS idx_scores_pass_id ON scores(pass_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scores_judge_call_id ON scores(judge_call_id);
 """
 
 # Deleting an attachment deletes every reading of it.
@@ -258,6 +334,160 @@ CREATE TRIGGER IF NOT EXISTS attachments_delete_cascades_extractions
 AFTER DELETE ON attachments
 BEGIN
     DELETE FROM attachment_extractions WHERE digest = OLD.digest;
+END;
+"""
+
+# THE SEALS ON THE SCORING RECORDS, Phase P. A judge call and a scoring
+# pass are each one row written twice: once when the thing starts, with
+# its identity, and once when it ends, filling the columns the first
+# write left NULL. The law is that no written value changes, and these
+# triggers make it a property of the database rather than of the one
+# writer that knows it, for the reason the trigger above gives: they
+# hold for every writer, a second connection and a person at the sqlite3
+# prompt included.
+#
+# FIVE REFUSALS PER TABLE, AND A SIXTH ON judge_calls, each in its own
+# sentence, which is what a reader of the error sees:
+#
+#   a value once written changes (the first SELECT names every column,
+#   so a column added to either table has to be added here too, and a
+#   test holds the two lists equal);
+#   anything is written after the ending (a late fill);
+#   an update leaves the outcome NULL (a partial fill: the ending is
+#   written whole, in the one write that names it);
+#   on judge_calls, an ending's facts are missing or disagree with its
+#   outcome (schema 12: sent, answered_at and usable, as call_facts
+#   decides them);
+#   an insert reuses an id, which is what INSERT OR REPLACE and REPLACE
+#   do (sqlite's REPLACE deletes the old row without firing a DELETE
+#   trigger unless recursive_triggers is on, so the insert is where it
+#   is caught);
+#   a row is deleted.
+#
+# The first write's columns are held whatever their value, so a NULL
+# judge_model on a pass is the first write's fact, no judge; the
+# ending's columns are held once written.
+#
+# One BEFORE UPDATE trigger holding its SELECTs rather than several
+# triggers, because sqlite does not promise the order in which several
+# triggers on one event fire, and the sentence a refusal gives should
+# not depend on it. Statements inside one trigger body run in order.
+#
+# VERSIONED NAMES. CREATE TRIGGER IF NOT EXISTS keeps whatever body a
+# database already holds under that name, so changing a body in place
+# would change nothing on any database that booted before the change.
+# A changed seal gets a new name (_v2, _v3), and connect() lays SEALS first
+# and drops the retired names after, both changes landing in the same
+# git commit. Laid first so that at every moment at least one seal holds
+# each table: a crash between the two steps leaves both, and the old
+# one's refusals are among the new one's, never neither. The text below
+# is pinned by digest in the tests, so an edit that forgets the rename
+# fails there.
+# THE SEALS NO LONGER IN FORCE, dropped by connect() after SEALS is laid.
+# scoring_passes_sealed_v1 named every column of the table as 1e6f2ab
+# made it; the column unusable (ruling 4) made it v2, and unknown with
+# judge_model held whatever its value (the operator's rulings H2 and M1
+# on the 1d91670 review, and the review's L2) made it v3.
+# judge_calls_sealed_v1 likewise, until P2's two usage-count columns made
+# it v2; sent and usable, and the refusal of an ending whose facts
+# disagree with its outcome, made it v3.
+RETIRED_SEALS = (
+    "scoring_passes_sealed_v1",
+    "judge_calls_sealed_v1",
+    "scoring_passes_sealed_v2",
+    "judge_calls_sealed_v2",
+)
+
+SEALS = """
+CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v3
+BEFORE UPDATE ON scoring_passes
+BEGIN
+    SELECT RAISE(ABORT,
+        'a scoring pass record never changes a value once written')
+     WHERE NEW.id IS NOT OLD.id
+        OR NEW.experiment_id IS NOT OLD.experiment_id
+        OR NEW.judge_model IS NOT OLD.judge_model
+        OR NEW.started_at IS NOT OLD.started_at
+        OR (OLD.ended_at IS NOT NULL AND NEW.ended_at IS NOT OLD.ended_at)
+        OR (OLD.outcome IS NOT NULL AND NEW.outcome IS NOT OLD.outcome)
+        OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail)
+        OR (OLD.scored IS NOT NULL AND NEW.scored IS NOT OLD.scored)
+        OR (OLD.failed IS NOT NULL AND NEW.failed IS NOT OLD.failed)
+        OR (OLD.unanswered IS NOT NULL AND NEW.unanswered IS NOT OLD.unanswered)
+        OR (OLD.unusable IS NOT NULL AND NEW.unusable IS NOT OLD.unusable)
+        OR (OLD.unknown IS NOT NULL AND NEW.unknown IS NOT OLD.unknown);
+    SELECT RAISE(ABORT,
+        'a scoring pass ends once, and this one has already ended')
+     WHERE OLD.outcome IS NOT NULL;
+    SELECT RAISE(ABORT,
+        'a scoring pass ends in one write, and that write names its outcome')
+     WHERE NEW.outcome IS NULL;
+END;
+CREATE TRIGGER IF NOT EXISTS scoring_passes_never_replaced_v1
+BEFORE INSERT ON scoring_passes
+WHEN NEW.id IN (SELECT id FROM scoring_passes)
+BEGIN
+    SELECT RAISE(ABORT, 'a scoring pass record is never replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS scoring_passes_never_deleted_v1
+BEFORE DELETE ON scoring_passes
+BEGIN
+    SELECT RAISE(ABORT, 'a scoring pass record is never deleted');
+END;
+CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v3
+BEFORE UPDATE ON judge_calls
+BEGIN
+    SELECT RAISE(ABORT,
+        'a judge call record never changes a value once written')
+     WHERE NEW.id IS NOT OLD.id
+        OR NEW.pass_id IS NOT OLD.pass_id
+        OR NEW.experiment_id IS NOT OLD.experiment_id
+        OR NEW.result_id IS NOT OLD.result_id
+        OR NEW.judge_model IS NOT OLD.judge_model
+        OR NEW.sent_at IS NOT OLD.sent_at
+        OR (OLD.answered_at IS NOT NULL AND NEW.answered_at IS NOT OLD.answered_at)
+        OR (OLD.generation_id IS NOT NULL
+            AND NEW.generation_id IS NOT OLD.generation_id)
+        OR (OLD.billed_cost_usd IS NOT NULL
+            AND NEW.billed_cost_usd IS NOT OLD.billed_cost_usd)
+        OR (OLD.outcome IS NOT NULL AND NEW.outcome IS NOT OLD.outcome)
+        OR (OLD.detail IS NOT NULL AND NEW.detail IS NOT OLD.detail)
+        OR (OLD.prompt_tokens IS NOT NULL
+            AND NEW.prompt_tokens IS NOT OLD.prompt_tokens)
+        OR (OLD.completion_tokens IS NOT NULL
+            AND NEW.completion_tokens IS NOT OLD.completion_tokens)
+        OR (OLD.sent IS NOT NULL AND NEW.sent IS NOT OLD.sent)
+        OR (OLD.usable IS NOT NULL AND NEW.usable IS NOT OLD.usable);
+    SELECT RAISE(ABORT,
+        'a judge call ends once, and this one has already ended')
+     WHERE OLD.outcome IS NOT NULL;
+    SELECT RAISE(ABORT,
+        'a judge call ends in one write, and that write names its outcome')
+     WHERE NEW.outcome IS NULL;
+    SELECT RAISE(ABORT,
+        'a judge call ends with sent, answered_at and usable agreeing with its outcome')
+     WHERE (NEW.sent IS NOT NULL AND NEW.sent NOT IN (0, 1))
+        OR (NEW.usable IS NOT NULL AND NEW.usable NOT IN (0, 1))
+        OR (NEW.outcome IS NOT 'interrupted' AND NEW.sent IS NULL)
+        OR (NEW.outcome = 'not_sent' AND NEW.sent IS NOT 0)
+        OR (NEW.outcome IN ('answered', 'timed_out', 'stopped', 'failed')
+            AND NEW.sent IS NOT 1)
+        OR (NEW.answered_at IS NOT NULL AND NEW.sent IS NOT 1)
+        OR ((NEW.answered_at IS NULL) <> (NEW.usable IS NULL))
+        OR (NEW.outcome IN ('timed_out', 'not_sent') AND NEW.answered_at IS NOT NULL)
+        OR (NEW.outcome = 'answered' AND NEW.usable IS NOT 1)
+        OR (NEW.outcome IN ('failed', 'stopped') AND NEW.usable IS 1);
+END;
+CREATE TRIGGER IF NOT EXISTS judge_calls_never_replaced_v1
+BEFORE INSERT ON judge_calls
+WHEN NEW.id IN (SELECT id FROM judge_calls)
+BEGIN
+    SELECT RAISE(ABORT, 'a judge call record is never replaced');
+END;
+CREATE TRIGGER IF NOT EXISTS judge_calls_never_deleted_v1
+BEFORE DELETE ON judge_calls
+BEGIN
+    SELECT RAISE(ABORT, 'a judge call record is never deleted');
 END;
 """
 
@@ -681,6 +911,83 @@ MIGRATIONS = [
     # non-NULL default on a table that has rows, which is every database
     # holding one snapshot.
     ("snapshot_captures", "clone_id", "INTEGER REFERENCES clones(id)"),
+    # Phase P, the scoring pass as a record. The two new tables need no
+    # entry here, for Phase N's reason: scoring_passes and judge_calls
+    # are whole new tables, created on any database by CREATE TABLE IF
+    # NOT EXISTS in SCHEMA, and SEALS guards them from the first boot.
+    # Proven against tests/fixtures/pre_p_schema.sql.
+    #
+    # A PASS IS ONE ROW and a REQUEST IS ONE ROW, each written twice:
+    # when it starts, and once more with how it ended. A judge call's
+    # first write lands before the request goes out, so a call that
+    # never comes back still says it was sent; see SEALS for why the
+    # second write can only fill what the first left NULL.
+    #
+    # TWO COLUMNS ON scores, the first entries this table has had here:
+    # it came in whole with Phase I and kept the same twelve columns in
+    # every era since.
+    #
+    # scores.judge_call_id is WHICH REQUEST the verdict came back on, and
+    # the figure lives there and only there. A post-P judged row leaves
+    # judge_generation_id and judge_billed_cost_usd NULL and cites the
+    # call instead, so the money is recorded once and the report reads it
+    # from one place; the two old columns are what pre-P rows carry.
+    #
+    # scores.pass_id is WHICH PASS WROTE THE ROW, and it is the era
+    # marker, not judge_call_id. A post-P judge row that never sent (no
+    # judge given, or refused by the ceiling) has no call to cite, so a
+    # NULL judge_call_id says "no request" as often as it says "before
+    # Phase P". Every row a post-P pass writes carries pass_id, so on a
+    # judge or deterministic row a NULL here means exactly one thing: the
+    # row was written before Phase P, by a pass that left no record of
+    # itself. Human ratings are not written by a pass and carry NULL in
+    # every era, which is why a reader asks the scorer first.
+    #
+    # Plain references with no ON DELETE action and a NULL default, for
+    # clone_id's reasons above.
+    ("scores", "judge_call_id", "INTEGER REFERENCES judge_calls(id)"),
+    ("scores", "pass_id", "INTEGER REFERENCES scoring_passes(id)"),
+    # Phase P, the operator's ruling 4 at P1's checkpoint: TWO COUNTS, TWO
+    # WORDS. A pass's end counted every sent request with no usable answer
+    # as unanswered; from b6c088c until schema 12 it counted a request
+    # nothing came back for (timed_out, stopped, interrupted) as
+    # unanswered and one that failed as unusable, by an outcome list the
+    # operator withdrew at schema 12 (see below). NULL on a pass closed
+    # before this column, whose unanswered then counted its failed calls
+    # too: only builds 95ee626 to 74ca55b wrote such a pass, and none was
+    # released. Filled once, with the other counts, in the statement that
+    # ends the pass.
+    ("scoring_passes", "unusable", "INTEGER"),
+    # Phase P, P2: WHAT A JUDGE REPLY SAID IT USED, the two usage counts
+    # of the reply, filled with the rest of the answer in the call's one
+    # ending write (the operator's ruling at P1's checkpoint). A call
+    # whose reply carried no billed figure is settled against the spend
+    # ceiling on the catalog's estimate from these, as a trial is, and
+    # with them on the record that estimate can be audited. NULL when no
+    # reply arrived, when the reply did not report them, and on every call
+    # ended before P2, which recorded no counts at all.
+    ("judge_calls", "prompt_tokens", "INTEGER"),
+    ("judge_calls", "completion_tokens", "INTEGER"),
+    # Phase P, the operator's rulings H2 and M1 on the 1d91670 review:
+    # SCHEMA 12, THE FACTS THE COUNTS COME FROM. A judge call records
+    # whether it was sent and whether its reply could be used, beside
+    # answered_at, which says whether a reply arrived; a pass counts its
+    # calls from those three and never from the outcome word, and
+    # interrupted means only that the record of an ending could not be
+    # completed. NULL on every call ended before schema 12: only draft
+    # builds 1e6f2ab to b3b4e48 wrote one, and a count places it by
+    # CALL_ENDING_SQL's history arms. Filled once, in the call's one
+    # ending write.
+    ("judge_calls", "sent", "INTEGER"),
+    ("judge_calls", "usable", "INTEGER"),
+    # unknown: the calls of a pass whose record does not say whether the
+    # request went out. NULL on a pass closed before schema 12, which
+    # counted by the outcome list ruling 4 gave and H2 withdrew: its
+    # unusable held every failed call, a reply or none, and its unanswered
+    # every timed_out, stopped and interrupted call, the never sent and
+    # the answered among them. Filled once, with the other counts, in the
+    # statement that ends the pass.
+    ("scoring_passes", "unknown", "INTEGER"),
 ]
 
 
@@ -757,6 +1064,108 @@ def _disk_path(path: str) -> str | None:
     # An empty path with no authority is sqlite's private temporary
     # database ("file:?cache=shared" style): no file to harden.
     return decoded or None
+
+
+def lock_path(path: str) -> str | None:
+    """Where the bench's one-writer lock for this database lives: beside
+    the file the path RESOLVES to, or None for a memory database, which
+    no second process can open. See hold_lock.
+
+    Resolved, so every name that reaches the database through a symbolic
+    link finds the one lock (the external review's M2: a lock named by
+    the path as given let a second server reach a live database through
+    a link, take a lock of its own, and sweep the first one's running
+    pass and call). A hard link is a second name the resolution cannot
+    join to the first; it is on BACKLOG. The lock is not taken on the
+    database file itself, which would join every name: on macOS an
+    exclusive flock on a file conflicts with sqlite's own locks on it
+    (measured: a process could not flock its own database in WAL mode
+    while its connection held it)."""
+    disk = _disk_path(path)
+    return None if disk is None else os.path.realpath(disk) + ".lock"
+
+
+# ONE PROCESS WRITES TO A BENCH DATABASE AT A TIME (Phase P). Who can hold
+# the lock, as the refusal names them. The server holds it for its whole
+# life, because its startup records as interrupted whatever the database
+# says is running, which is true only when nothing else is writing; and
+# reconcile holds it while --apply writes, since it is the one other
+# writer the bench ships. reconcile's dry run writes no row and takes no
+# lock (on a database an older bench wrote, its connect still migrates
+# it: BACKLOG).
+LOCK_HOLDERS = {
+    "server": "a bench server",
+    "reconcile": "python -m bench.reconcile --apply",
+}
+
+
+class LockHeld(RuntimeError):
+    """The database's lock is held by another process; the message is the
+    sentence the refused process prints."""
+
+
+def _lock_refusal(lock: str, held: list[str], holder: str) -> str:
+    pid = held[0] if held and held[0].isdigit() else None
+    kind = LOCK_HOLDERS.get(held[1]) if len(held) > 1 else None
+    if pid is None:
+        who = "another process,"
+    elif kind is None:
+        who = f"process {pid},"
+    else:
+        who = f"process {pid}, {kind},"
+    opening = (
+        f"{lock} is held by {who} which is using this database, and one "
+        "process writes to a bench database at a time"
+    )
+    if holder == "server":
+        return (
+            opening + ", so this server will not start: its startup records "
+            "as interrupted whatever the database says is running, which is "
+            "true only when nothing else is writing to it. Stop that process "
+            "first."
+        )
+    return (
+        opening + ", so reconcile --apply will not start. Stop that process "
+        "first, or run without --apply, which writes nothing."
+    )
+
+
+def hold_lock(path: str, holder: str) -> int | None:
+    """Take the database's lock for `holder` (a key of LOCK_HOLDERS), or
+    raise LockHeld in the sentence the refused process prints.
+
+    An exclusive flock on the file lock_path names, taken without waiting
+    and held until release_lock or the process's end: the kernel lets it
+    go however the process dies, so a crash never leaves a lock behind.
+    The holder writes its process id and what it is into the file, which
+    is how a refusal can name what holds it. A memory database has no
+    lock, since no second process can open it.
+    """
+    if holder not in LOCK_HOLDERS:
+        raise ValueError(f"no lock holder is called {holder!r}")
+    lock = lock_path(path)
+    if lock is None:
+        return None
+    # Taken before connect (which used to make this directory), so it makes
+    # the directory itself, private as connect makes it.
+    directory = os.path.dirname(lock)
+    if not os.path.isdir(directory):
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        held = os.read(fd, 64).decode("ascii", "replace").split()
+        os.close(fd)
+        raise LockHeld(_lock_refusal(lock, held, holder)) from None
+    os.ftruncate(fd, 0)
+    os.write(fd, f"{os.getpid()} {holder}\n".encode())
+    return fd
+
+
+def release_lock(fd: int | None) -> None:
+    if fd is not None:
+        os.close(fd)
 
 
 def connect(path: str) -> sqlite3.Connection:
@@ -866,6 +1275,17 @@ def connect(path: str) -> sqlite3.Connection:
     # once the ALTERs above have run on an old database.
     conn.executescript(INDEXES)
     conn.executescript(TRIGGERS)
+    # A seal whose body changed has a new name. SEALS is laid first and
+    # the retired names are dropped after, so at every moment at least one
+    # seal holds each table (the external review's L1: dropping first let
+    # a second connection rewrite a sealed row in the gap between the drop
+    # and the new seal). CREATE TRIGGER IF NOT EXISTS would otherwise leave
+    # the old body in force under the old name on every database that
+    # booted before the change. A name in both lists would drop the seal
+    # just laid; a test holds them apart. See SEALS and RETIRED_SEALS.
+    conn.executescript(SEALS)
+    for retired in RETIRED_SEALS:
+        conn.execute(f"DROP TRIGGER IF EXISTS {retired}")
     # PHASE K.1 BACKFILL, idempotent, and it is here rather than in a
     # reader because of a real gap rather than for tidiness.
     #
@@ -1091,9 +1511,12 @@ def read_snapshot(conn: sqlite3.Connection) -> Iterator[None]:
     The writer this defends against is another CONNECTION, not another
     task. Nothing inside awaits, so the store's synchronous contract
     already rules out an interleaving on this connection. What it cannot
-    rule out is `python -m bench.reconcile --apply` against a live bench,
-    which is a second connection by design and is the reason this file
-    turns WAL on at all.
+    rule out is a write from another connection: a person at the sqlite3
+    prompt, or a script of their own. (`python -m bench.reconcile
+    --apply` was the bench's own such writer until Phase P gave it the
+    server's lock, see hold_lock; its dry run still reads beside a live
+    bench, and letting a reader and the server's writes coexist is what
+    this file turns WAL on for.)
 
     rollback rather than commit, because nothing was written and rollback
     is the honest close for a read. It also cannot fail on a busy
@@ -3204,14 +3627,17 @@ def add_score(conn: sqlite3.Connection, result_id: int, record: dict[str, Any]) 
     in, judge output included: a judge is an upstream service like any
     other, and a verdict carrying "score": "high" must land as None rather
     than as a string in a REAL column.
+
+    judge_call_id and pass_id are the Phase P citations; see MIGRATIONS
+    for what each NULL means and why the figure is on the call.
     """
     with conn:
         cur = conn.execute(
             """INSERT INTO scores
                (result_id, scorer, score, passed, detail, judge_model,
                 judge_generation_id, judge_billed_cost_usd, blind,
-                self_judged, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                self_judged, created_at, judge_call_id, pass_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 result_id,
                 record["scorer"],
@@ -3226,6 +3652,8 @@ def add_score(conn: sqlite3.Connection, result_id: int, record: dict[str, Any]) 
                 if record.get("self_judged") is None
                 else int(bool(record["self_judged"])),
                 _now(),
+                record.get("judge_call_id"),
+                record.get("pass_id"),
             ),
         )
     assert cur.lastrowid is not None
@@ -3264,3 +3692,517 @@ def scores_for_results(
         item["judge_billed_cost_usd"] = as_money(item["judge_billed_cost_usd"])
         out.setdefault(item["result_id"], []).append(item)
     return out
+
+
+# THE SCORING RECORDS, Phase P: a pass, and every judge request it sent.
+#
+# How a pass ended. "interrupted" is the record of the pass's ending cut
+# off rather than the pass ending: a pass the boot sweep finds with no
+# ending was either left open by a process that ended (a crash or a
+# kill), or had its own ending write fail while the process ran on
+# (score_experiment's finally frees the slot and leaves it for the
+# sweep; the external review's L7). In the second case what the pass knew
+# of its ending, its error included, is in the log and not the record.
+# Only the sweep writes it.
+PASS_OUTCOMES = ("finished", "stopped", "failed", "interrupted")
+
+# How one judge request ended. The line between not_sent and the rest is
+# the connection: see the outcome column in SCHEMA.
+#
+#   answered     a reply came back and was read as an answer.
+#   timed_out    the request went out and no reply came within the
+#                judge's timeout.
+#   stopped      the request went out and the bench's own shutdown cut
+#                it, before its reply or while its reply was arriving;
+#                answered_at says which.
+#   failed       the request went out and no usable reply came back: a
+#                transport error after sending, an error status, or a
+#                body that could not be read or was cut off.
+#   not_sent     no connection was established, so nothing left.
+#   interrupted  the record of the call's ending could not be completed,
+#                by the process ending or by the write that should have
+#                held it failing. sent, answered_at and usable say what
+#                the pass knew, and are NULL when nothing was. Only the
+#                sweep and a pass's own close write it.
+CALL_OUTCOMES = (
+    "answered",
+    "timed_out",
+    "stopped",
+    "failed",
+    "not_sent",
+    "interrupted",
+)
+
+FOUND_OPEN_AT_BOOT = "found open at boot"
+
+# A call a pass's close finds open, when the pass said nothing of why:
+# every path through a pass either writes a call's ending or records why
+# that write failed (close_scoring_pass's unrecorded), so this is the
+# fallback no path is expected to reach.
+CALL_LEFT_OPEN = "the pass ended before this call's ending was recorded"
+
+
+class AlreadyRecorded(Exception):
+    """A write that would fill an ending already written, or start a call
+    under a pass that has ended.
+
+    The store's own refusal, raised when its guarded UPDATE matched no
+    open row, and distinct on purpose from the IntegrityError a seal
+    raises: the writers never reach a seal, because they only ever touch
+    a row whose ending is still NULL. Raised rather than asserted, since
+    python -O strips an assert and this is the check that keeps a second
+    ending from being lost silently.
+    """
+
+
+def now() -> str:
+    """The store's clock, as every record's times are written, for a
+    caller that stamps a moment the store records later: the scoring pass
+    takes a judge reply's time with it when the reply's head arrives."""
+    return _now()
+
+
+def call_facts(outcome: str, answered_at: str | None) -> tuple[int, int | None]:
+    """sent and usable for a judge call that ended as outcome, with a
+    reply whose head arrived at answered_at or none: the facts the counts
+    read (the operator's rulings H2 and M1 on the 1d91670 review), decided
+    here and only here, so a call's own ending and a pass's close cannot
+    disagree about them. judge_calls_sealed_v3 holds the same rule for
+    every writer."""
+    replied = answered_at is not None
+    if outcome == "answered":
+        if not replied:
+            raise ValueError("an answered call had a reply")
+        return 1, 1
+    if outcome in ("timed_out", "not_sent"):
+        if replied:
+            raise ValueError(f"a call that ended as {outcome!r} had no reply")
+        return (1 if outcome == "timed_out" else 0), None
+    if outcome in ("failed", "stopped"):
+        return 1, (0 if replied else None)
+    raise ValueError(f"a judge call cannot end as {outcome!r}")
+
+
+@dataclass(frozen=True)
+class UnwrittenEnding:
+    """What a pass knew of a call whose ending write failed (the
+    operator's ruling M1 on the 1d91670 review): the ending it tried to
+    write, and the sentence its close records as the call's detail.
+    Checked when made, so a close never meets an ending no call can
+    have."""
+
+    outcome: str
+    answered_at: str | None
+    detail: str
+    generation_id: str | None = None
+    billed_cost_usd: float | None = None
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        call_facts(self.outcome, self.answered_at)
+
+
+# WHERE A CALL IS COUNTED, from its facts and never from its outcome
+# (the operator's ruling H2 on the 1d91670 review, which withdrew ruling
+# 4's outcome list, made by b6c088c). One word per call, by the first arm
+# that holds:
+#   in_flight   no ending yet.
+#   unknown     its record does not say whether the request went out:
+#               interrupted with nothing known.
+#   never_sent  no connection was made, so nothing left. In no count.
+#   unanswered  sent, and no reply came back.
+#   answered    a reply came back and was read as an answer.
+#   unusable    a reply came back and could not be used: an error status,
+#               or a body that could not be read or was cut off.
+# THE HISTORY ARMS, the one place a count reads the outcome word. A call
+# ended before schema 12 has sent and usable NULL, because the columns
+# did not exist; its facts were recorded in the outcome word, under the
+# connection line, and in answered_at. So for a row whose sent is NULL,
+# and only there: interrupted is unknown, not_sent never left, any other
+# outcome left, and a reply was usable when the outcome was answered.
+# judge_calls_sealed_v3 refuses every later ending that leaves sent NULL
+# other than interrupted, so the arms reach no call ended since.
+# call_ending is the same arms in Python, for the report, which counts
+# over records with no database in reach; a test holds the two equal.
+CALL_ENDING_SQL = """CASE
+        WHEN judge_calls.outcome IS NULL THEN 'in_flight'
+        WHEN judge_calls.sent IS NULL THEN
+            CASE WHEN judge_calls.outcome = 'interrupted' THEN 'unknown'
+                 WHEN judge_calls.outcome = 'not_sent' THEN 'never_sent'
+                 WHEN judge_calls.answered_at IS NULL THEN 'unanswered'
+                 WHEN judge_calls.outcome = 'answered' THEN 'answered'
+                 ELSE 'unusable' END
+        WHEN judge_calls.sent = 0 THEN 'never_sent'
+        WHEN judge_calls.answered_at IS NULL THEN 'unanswered'
+        WHEN judge_calls.usable = 1 THEN 'answered'
+        ELSE 'unusable'
+    END"""
+CALL_ENDINGS = (
+    "in_flight",
+    "unknown",
+    "never_sent",
+    "unanswered",
+    "answered",
+    "unusable",
+)
+
+
+def call_ending(call: Mapping[str, Any]) -> str:
+    """Where one call is counted, one of CALL_ENDINGS: CALL_ENDING_SQL's
+    arms, in the same order, over a call record read back from the store
+    or an export. Every key is read by subscript, so a record missing one
+    of the four is an error here, never a call counted by a default."""
+    outcome = call["outcome"]
+    sent = as_flag(call["sent"])
+    replied = call["answered_at"] is not None
+    usable = as_flag(call["usable"])
+    if outcome is None:
+        return "in_flight"
+    if sent is None:
+        if outcome == "interrupted":
+            return "unknown"
+        if outcome == "not_sent":
+            return "never_sent"
+        if not replied:
+            return "unanswered"
+        return "answered" if outcome == "answered" else "unusable"
+    if sent is False:
+        return "never_sent"
+    if not replied:
+        return "unanswered"
+    return "answered" if usable is True else "unusable"
+
+
+# THE CALLS A COUNT PLACES BY THE HISTORY ARMS INTO WHAT CAME BACK: ended
+# before schema 12 (sent NULL) and placed unanswered or unusable. The
+# operator's second pass at 3a9f3e6 ratified the history arms provided the
+# page says when a pass's counts rest on them. A pass sealed before schema
+# 12 says so in its one clause ("ended with no usable answer on record");
+# this count says it for a pass an older build left open and the boot
+# sweep sealed, and for the report's spend line, which counts every call.
+# A later ending leaves sent NULL only as interrupted (judge_calls_sealed_v3),
+# so no call ended since is one of these. Not counted here: answered and
+# never_sent, whose old words say what the facts would; and unknown, which
+# the arms also give every call interrupted before schema 12, including a
+# close whose write failed over an answer, a failure, a timeout, a stop or
+# a call never sent (its detail, which no count reads, may say more). The
+# page's own words for unknown, "cannot say whether it went out", are
+# true of those calls as they stand, and sent and usable could not tell
+# them from a later call interrupted with nothing known in any case.
+# history_counted is the same test in Python; a test holds the two equal
+# for every sent a seal admits (NULL, 0 and 1).
+HISTORY_COUNTED_SQL = f"""(judge_calls.sent IS NULL
+        AND {CALL_ENDING_SQL} IN ('unanswered', 'unusable'))"""
+
+
+def history_counted(call: Mapping[str, Any]) -> bool:
+    """Whether a count places this call by the history arms: ended before
+    schema 12 and placed unanswered or unusable (HISTORY_COUNTED_SQL)."""
+    return as_flag(call["sent"]) is None and call_ending(call) in (
+        "unanswered",
+        "unusable",
+    )
+
+
+def _placed(ending: str) -> str:
+    """The count of a pass's calls CALL_ENDING_SQL places at ending."""
+    return f"""(SELECT COUNT(*) FROM judge_calls
+                 WHERE judge_calls.pass_id = scoring_passes.id
+                   AND {CALL_ENDING_SQL} = '{ending}')"""
+
+
+# The end counts, computed from the pass's own rows in the statement that
+# seals it, so they are what the records say and not what the process
+# remembered. scored is a trial the pass gave a score; failed is a trial
+# whose row it wrote with none; unanswered is a request it sent that got
+# no reply, unusable one that got a reply it could not use, and unknown
+# one whose record does not say whether it went out, each as
+# CALL_ENDING_SQL places it.
+_PASS_COUNTS = f"""
+    scored = (SELECT COUNT(*) FROM scores
+               WHERE scores.pass_id = scoring_passes.id
+                 AND scores.score IS NOT NULL),
+    failed = (SELECT COUNT(*) FROM scores
+               WHERE scores.pass_id = scoring_passes.id
+                 AND scores.score IS NULL),
+    unanswered = {_placed("unanswered")},
+    unusable = {_placed("unusable")},
+    unknown = {_placed("unknown")}"""
+
+
+def open_scoring_pass(
+    conn: sqlite3.Connection, experiment_id: int, judge_model: str | None
+) -> int:
+    """Record that a scoring pass started. Returns the pass id.
+
+    judge_model is None for a pass given no judge, which still scores
+    every deterministic trial and writes a row for every judge one.
+    """
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+               VALUES (?, ?, ?)""",
+            (experiment_id, as_text(judge_model), _now()),
+        )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def close_scoring_pass(
+    conn: sqlite3.Connection,
+    pass_id: int,
+    outcome: str,
+    detail: str | None = None,
+    *,
+    unrecorded: Mapping[int, UnwrittenEnding] | None = None,
+) -> None:
+    """Record how a pass ended, once, with its counts.
+
+    Any call of this pass still without an ending is closed first, in
+    the same transaction, as interrupted: every path through the pass
+    writes a call's ending, so one left open means that write itself
+    failed, and a sealed pass holding an open call would be read as a
+    request still in flight long after anything was.
+
+    WHAT WAS INTERRUPTED IS THE RECORD, NOT THE REQUEST (the operator's
+    ruling at P1's checkpoint), so the detail says so, and since the
+    operator's ruling M1 on the 1d91670 review the facts do too:
+    unrecorded maps a call's id to what the pass knew of it. The close
+    writes interrupted, the pass's sentence as the detail (what happened
+    and that its write failed, with the error: "the answer arrived; its
+    write failed: <error>"), and every fact it had, in the call's one
+    ending write, so the counts place the call by what happened to it. A
+    call the map does not name gets CALL_LEFT_OPEN and no facts, and is
+    counted unknown, as the boot sweep's calls are. Neither sentence is
+    the boot sweep's "found open at boot".
+    """
+    if outcome not in PASS_OUTCOMES or outcome == "interrupted":
+        raise ValueError(f"a pass cannot close as {outcome!r}")
+    said = unrecorded or {}
+    with conn:
+        left = [
+            row[0]
+            for row in conn.execute(
+                "SELECT id FROM judge_calls WHERE pass_id = ? AND outcome IS NULL",
+                (pass_id,),
+            )
+        ]
+        for call_id in left:
+            known = said.get(call_id)
+            if known is None:
+                conn.execute(
+                    """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
+                       WHERE id = ? AND outcome IS NULL""",
+                    (CALL_LEFT_OPEN, call_id),
+                )
+                continue
+            sent, usable = call_facts(known.outcome, known.answered_at)
+            conn.execute(
+                """UPDATE judge_calls
+                      SET outcome = 'interrupted', detail = ?, sent = ?,
+                          answered_at = ?, usable = ?, generation_id = ?,
+                          billed_cost_usd = ?, prompt_tokens = ?,
+                          completion_tokens = ?
+                    WHERE id = ? AND outcome IS NULL""",
+                (
+                    as_text(known.detail),
+                    sent,
+                    as_text(known.answered_at),
+                    usable,
+                    as_text(known.generation_id),
+                    as_money(known.billed_cost_usd),
+                    as_token_count(known.prompt_tokens),
+                    as_token_count(known.completion_tokens),
+                    call_id,
+                ),
+            )
+        cur = conn.execute(
+            f"""UPDATE scoring_passes
+                   SET ended_at = ?, outcome = ?, detail = ?, {_PASS_COUNTS}
+                 WHERE id = ? AND outcome IS NULL""",
+            (_now(), outcome, as_text(detail), pass_id),
+        )
+        if cur.rowcount != 1:
+            raise AlreadyRecorded(
+                f"scoring pass {pass_id} has already ended, or does not exist"
+            )
+
+
+def record_judge_call_sent(
+    conn: sqlite3.Connection, pass_id: int, result_id: int, judge_model: str
+) -> int:
+    """Record that a judge request is going out. Returns the call id.
+
+    Called immediately before the request is handed to the client, so
+    the row exists whatever happens to the request. The experiment is
+    read from the pass rather than passed in, so a call cannot name one
+    experiment and a pass of another; and only an open pass takes a
+    call, since a call under an ended pass would be a request the pass's
+    counts never saw.
+    """
+    with conn:
+        cur = conn.execute(
+            """INSERT INTO judge_calls
+                   (pass_id, experiment_id, result_id, judge_model, sent_at)
+               SELECT id, experiment_id, ?, ?, ? FROM scoring_passes
+                WHERE id = ? AND outcome IS NULL""",
+            (result_id, judge_model, _now(), pass_id),
+        )
+        if cur.rowcount != 1:
+            raise AlreadyRecorded(
+                f"scoring pass {pass_id} has ended, or does not exist, "
+                "so no call can be recorded under it"
+            )
+    assert cur.lastrowid is not None
+    return cur.lastrowid
+
+
+def record_judge_call_answer(
+    conn: sqlite3.Connection,
+    call_id: int,
+    outcome: str,
+    *,
+    answered_at: str | None,
+    generation_id: str | None = None,
+    billed_cost_usd: float | None = None,
+    detail: str | None = None,
+    prompt_tokens: int | None = None,
+    completion_tokens: int | None = None,
+) -> None:
+    """Record how a judge request ended: the second and last write.
+
+    Fills the columns the first write left NULL and nothing else, and
+    only on a call whose ending is still NULL. answered_at is when the
+    reply's head arrived, taken by the caller when it did (store.now),
+    or None when no reply arrived, whatever the reply said; sent and
+    usable follow from it and the outcome, by call_facts, which refuses
+    a contradiction before anything is written.
+    """
+    sent, usable = call_facts(outcome, answered_at)
+    with conn:
+        cur = conn.execute(
+            """UPDATE judge_calls
+                  SET answered_at = ?, generation_id = ?, billed_cost_usd = ?,
+                      outcome = ?, detail = ?, prompt_tokens = ?,
+                      completion_tokens = ?, sent = ?, usable = ?
+                WHERE id = ? AND outcome IS NULL""",
+            (
+                as_text(answered_at),
+                as_text(generation_id),
+                as_money(billed_cost_usd),
+                outcome,
+                as_text(detail),
+                as_token_count(prompt_tokens),
+                as_token_count(completion_tokens),
+                sent,
+                usable,
+                call_id,
+            ),
+        )
+        if cur.rowcount != 1:
+            raise AlreadyRecorded(
+                f"judge call {call_id} has already ended, or does not exist"
+            )
+
+
+def sweep_open_scoring_records(conn: sqlite3.Connection) -> tuple[int, int]:
+    """Close every pass and call a previous process left without an
+    ending, as interrupted. Returns (passes, calls) swept.
+
+    For boot, and safe only because the lifespan holds the bench's lock
+    first: a second server sweeping the first one's live pass would seal
+    it under a request whose answer then had nowhere to go. ended_at
+    stays NULL on a swept pass, because when it ended is not known; the
+    detail says where the ending came from, and the counts come from the
+    pass's own rows like any other ending.
+    """
+    with conn:
+        calls = conn.execute(
+            """UPDATE judge_calls SET outcome = 'interrupted', detail = ?
+               WHERE outcome IS NULL""",
+            (FOUND_OPEN_AT_BOOT,),
+        ).rowcount
+        passes = conn.execute(
+            f"""UPDATE scoring_passes
+                   SET outcome = 'interrupted', detail = ?, {_PASS_COUNTS}
+                 WHERE outcome IS NULL""",
+            (FOUND_OPEN_AT_BOOT,),
+        ).rowcount
+    return passes, calls
+
+
+# The readers below are plain SELECTs with no `with conn`, because the
+# export reads them inside read_snapshot, which refuses a commit in its
+# block. Ascending by id: the order the records were written in.
+
+
+def _call_row(row: sqlite3.Row) -> dict[str, Any]:
+    item = dict(row)
+    # Repair on read, as scores_for_results does for the judge figure, and
+    # the two facts as the flags they are, as is_byok is read, so the
+    # export carries true and false rather than sqlite's 1 and 0.
+    item["billed_cost_usd"] = as_money(item["billed_cost_usd"])
+    item["sent"] = as_flag(item["sent"])
+    item["usable"] = as_flag(item["usable"])
+    return item
+
+
+# A pass as the readers give it: the record, and beside it how many of its
+# calls its counts place by the history arms (HISTORY_COUNTED_SQL), read
+# from its sealed calls. NULL where unknown is NULL: a pass not yet ended,
+# whose counts are not made, and a pass sealed before schema 12, whose
+# counts were made by the outcome list withdrawn then and place nothing by
+# these arms (its page clause says so). Not a column: nothing writes it,
+# so it cannot drift from the calls, and the report and the export, which
+# take a pass's fields by name (report.PASS_FIELDS), never carry it.
+_PASS_ROWS = f"""SELECT scoring_passes.*,
+       CASE WHEN scoring_passes.unknown IS NULL THEN NULL
+            ELSE (SELECT COUNT(*) FROM judge_calls
+                   WHERE judge_calls.pass_id = scoring_passes.id
+                     AND {HISTORY_COUNTED_SQL})
+       END AS history_counted
+  FROM scoring_passes"""
+
+
+def scoring_passes_for(
+    conn: sqlite3.Connection, experiment_id: int
+) -> list[dict[str, Any]]:
+    """Every pass over one experiment, oldest first, each with its
+    history_counted (see _PASS_ROWS)."""
+    rows = conn.execute(
+        f"{_PASS_ROWS} WHERE experiment_id = ? ORDER BY id",
+        (experiment_id,),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def latest_scoring_passes(
+    conn: sqlite3.Connection, experiment_ids: list[int]
+) -> dict[int, dict[str, Any]]:
+    """The newest pass of each experiment that has one, keyed by
+    experiment id: one query for a whole list page. Each carries its
+    history_counted (see _PASS_ROWS)."""
+    if not experiment_ids:
+        return {}
+    marks = ",".join("?" for _ in experiment_ids)
+    rows = conn.execute(
+        f"""{_PASS_ROWS} WHERE id IN (
+                SELECT MAX(id) FROM scoring_passes
+                 WHERE experiment_id IN ({marks})
+                 GROUP BY experiment_id)""",
+        tuple(experiment_ids),
+    ).fetchall()
+    return {r["experiment_id"]: dict(r) for r in rows}
+
+
+def judge_calls_for(
+    conn: sqlite3.Connection, experiment_id: int
+) -> list[dict[str, Any]]:
+    """Every judge request sent while scoring one experiment, in the
+    order they were recorded."""
+    rows = conn.execute(
+        "SELECT * FROM judge_calls WHERE experiment_id = ? ORDER BY id",
+        (experiment_id,),
+    ).fetchall()
+    return [_call_row(r) for r in rows]

@@ -476,8 +476,13 @@
         </span>
       </div>
       <button id="experiment-score" data-testid="experiment-score" type="button"
-              aria-describedby="experiment-score-nudge experiment-score-note" disabled>Score</button>
+              aria-describedby="experiment-score-nudge experiment-score-pass experiment-score-note" disabled>Score</button>
       <span id="experiment-score-nudge" data-testid="experiment-score-nudge" role="status"></span>
+      <!-- Present only while this experiment's scoring pass runs, as the
+           server says on the list. The door is the rule: a Stop for a
+           pass that is not running is refused in its words. -->
+      <button id="experiment-score-stop" data-testid="experiment-score-stop" type="button"
+              aria-describedby="experiment-score-pass" hidden>Stop scoring</button>
       <!-- Present only when reading the experiment's dataset failed: it
            asks the store again now. Selecting an experiment with that
            digest asks again too, as does any reload of the list (the
@@ -487,6 +492,7 @@
       <button id="experiment-score-retry" data-testid="experiment-score-retry" type="button"
               aria-describedby="experiment-score-nudge" hidden>Retry</button>
       <div id="experiment-score-notes">
+        <span id="experiment-score-pass" data-testid="experiment-score-pass"></span>
         <span id="experiment-judge-note" data-testid="experiment-judge-note"></span>
         <span id="experiment-score-note" data-testid="experiment-score-note"></span>
       </div>

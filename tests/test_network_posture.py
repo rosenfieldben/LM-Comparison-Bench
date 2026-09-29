@@ -763,9 +763,12 @@ NETWORK_CALLS = {
     # ---- OpenRouter, through the one client the lifespan builds. ----
     # The client, its transport (TCP keepalive; no proxy is read, since
     # an explicit transport makes httpx skip the proxy variables), and
-    # its close; the catalog is fetched through it at boot.
+    # its close; the catalog is fetched through it at boot. Made and closed
+    # by _serve, which runs only once the database's lock is held (Phase
+    # P, the external review's M3), so a server refused the lock makes no
+    # client and closes none; closed at shutdown.
     ("main.py", "<imports>"): Counter({"asyncio": 1, "httpx": 1, "subprocess": 1}),
-    ("main.py", "lifespan"): Counter(
+    ("main.py", "_serve"): Counter(
         {
             "httpx.AsyncClient": 1,
             "httpx.AsyncHTTPTransport": 1,
@@ -787,7 +790,12 @@ NETWORK_CALLS = {
     ("models.py", "fetch_endpoints"): Counter({"client.get": 1}),
     ("models.py", "fetch_generation"): Counter({"client.get": 1}),
     ("models.py", "run_model"): Counter({"client.post": 1}),
-    ("models.py", "judge_response"): Counter({"client.post": 1}),
+    # The judge's request, built and sent streamed so its reply is seen
+    # from its head (the operator's ruling H2 on the 1d91670 review): one
+    # request to OpenRouter, as client.post was.
+    ("models.py", "judge_response"): Counter(
+        {"client.build_request": 1, "client.send": 1}
+    ),
     ("models.py", "stream_model"): Counter({"client.stream": 1}),
     # The reconcile CLI's own client, to OpenRouter's generation lookup;
     # a command an operator runs, not a door.
@@ -922,7 +930,7 @@ PLANTS = [
     ("_git fetch of a variable", _planted_module("def door(u):\n    _git(['status', u])\n"), "not all literal"),
     ("_git_clone ls-remote", _planted_main("\n\ndef _remove_tree(", "\n\nasync def peek(u):\n    await _git_clone('/t', ['ls-remote'], [u], env={}, deadline=0)\n\n\ndef _remove_tree("), "verb 'ls-remote' not in _git_clone's allowlist"),
     ("_git_clone --upload-pack", _planted_main('["fetch", "-q", "--depth", "1"', '["fetch", "--upload-pack=x", "-q", "--depth", "1"'), "forbidden option '--upload-pack=x'"),
-    ("a second client in lifespan", _planted_main("    app.state.db = store.connect(", "    app.state.http = httpx.AsyncClient()\n    app.state.db = store.connect("), ("main.py", "lifespan")),
+    ("a second client in _serve", _planted_main("    app.state.db = store.connect(", "    app.state.http = httpx.AsyncClient()\n    app.state.db = store.connect("), ("main.py", "_serve")),
     ("a second client used elsewhere", _planted_main("\n\ndef _remove_tree(", "\n\nasync def elsewhere(u):\n    return await app.state.http.get(u)\n\n\ndef _clone_http():\n    app.state.http = httpx.AsyncClient()\n\n\ndef _remove_tree("), ("main.py", "elsewhere")),
     ("loop.create_connection", _planted_module("import asyncio\nasync def door():\n    await asyncio.get_running_loop().create_connection(None, 'x', 1)\n"), ("planted.py", "door")),
     ("the composer calls the clone worker", _planted_main("        head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))\n", "        await _fetch_into(root, 'u', 'r', env={}, deadline=0)\n        head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))\n"), "reach"),

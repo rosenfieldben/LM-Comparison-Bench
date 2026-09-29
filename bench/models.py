@@ -7,7 +7,7 @@ import math
 import os
 import socket
 import time
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from typing import Any
 
 import httpx
@@ -1152,10 +1152,18 @@ def endpoint_rates(
     total until a caller supplies token counts.
 
     (None, names) when the listing never fetched, when no endpoint
-    matched the pin, when a matched endpoint's rates cannot be read, or
-    when one charges a dimension this cannot price. The caller must not
-    fall back to the model level on any of them: falling back is exactly
-    the substitution this function exists to stop.
+    matched the pin, or when a matched endpoint's rates cannot be read.
+    The caller must not fall back to the model level for the projection
+    on any of them: falling back is exactly the substitution this
+    function exists to stop. (The spend ceiling's reservation does, and
+    says so: see experiment_prices.)
+
+    (rates, names) when a matched endpoint charges a dimension this
+    cannot price: the rates are still what the route charges per unit,
+    and the names say what else it charges. The projection refuses on
+    the names as before; the reservation needs the rates (Phase P, the
+    external review's H1: returning None here made a pinned trial
+    reserve nothing while its settlement counted it).
     """
     if not listing.get("fetched") or provider is None:
         return None, []
@@ -1179,9 +1187,7 @@ def endpoint_rates(
             if best is None
             else {name: max(best[name], rates[name]) for name in TOKEN_PRICE_DIMENSIONS}
         )
-    if beyond:
-        return None, sorted(beyond)
-    return best, []
+    return best, sorted(beyond)
 
 
 def endpoint_completion_cap(
@@ -1339,6 +1345,31 @@ def _named(model: str, beyond: list[str]) -> str:
     return f"{model} (charges {', '.join(beyond)})"
 
 
+# A pinned route whose endpoint listing gave no rates the bench could
+# read, named in the projection with what the spend ceiling does instead
+# (Phase P, the operator's ruling on the external review's H1): its trial
+# reserves at the catalog's model rates, the rates its settlement will
+# count, rather than reserving nothing.
+UNREAD_ROUTE = (
+    "its pinned endpoint published no price the bench could read, so the "
+    "spend ceiling reserves for it at the catalog's model rates"
+)
+
+
+def _unpriced_name(model: str, price: Mapping[str, Any] | None) -> str | None:
+    """Why projected_cost cannot price one model, as the projection names
+    it, or None when it can."""
+    if price is None:
+        return model
+    beyond = price.get("beyond") or []
+    if price.get("unread"):
+        charges = f"charges {', '.join(beyond)}; " if beyond else ""
+        return f"{model} ({charges}{UNREAD_ROUTE})"
+    if beyond:
+        return _named(model, beyond)
+    return None
+
+
 def projected_cost(
     tasks_total: int,
     task_chars: Mapping[str, Mapping[str, int]] | None,
@@ -1410,11 +1441,9 @@ def projected_cost(
     """
     unpriced = sorted(
         {
-            model
-            if not (prices.get(model) or {}).get("beyond")
-            else _named(model, prices[model]["beyond"])
+            named
             for model in lineup
-            if prices.get(model) is None or prices[model].get("beyond")
+            if (named := _unpriced_name(model, prices.get(model))) is not None
         }
     )
     if unpriced:
@@ -3224,6 +3253,15 @@ def parse_verdict(text: str | None) -> dict[str, Any]:
     return {"score": score, "reason": as_text(data.get("reason"))}
 
 
+def judge_would_send(response_text: str | None) -> bool:
+    """Whether judge_response makes a request for this text: not for none,
+    and not for whitespace, which is not an answer. Written once, because
+    the spend ceiling's ledger asks it too, and a call it claimed for that
+    was never made, or one it did not claim for that was, would be the
+    ledger disagreeing with the wire."""
+    return response_text is not None and bool(response_text.strip())
+
+
 async def judge_response(
     client: httpx.AsyncClient,
     judge_model: str,
@@ -3231,12 +3269,47 @@ async def judge_response(
     reference: str | None,
     response_text: str | None,
     provider_prefs: dict[str, Any] | None = None,
+    *,
+    sending: Callable[[], object] | None = None,
+    replying: Callable[[], object] | None = None,
 ) -> dict[str, Any]:
     """One rubric score from a judge model, or an error saying why not.
 
-    Never raises, the same contract run_model and stream_model carry, for
-    the same reason: this runs in a loop over many results and one bad
-    reply must not end the pass.
+    Never raises for anything the judge or the wire does, the contract
+    run_model and stream_model carry, for the same reason: this runs in a
+    loop over many results and one bad reply must not end the pass. What
+    does raise is not the judge's: `sending` and `replying` are the
+    caller's, and what they raise is the caller's to handle; and a
+    RuntimeError from an open client is not the closed-client refusal
+    below, so it is not guessed at and propagates (the scoring pass
+    records such a call failed and fails).
+
+    sending is called immediately before the request is handed to the
+    client, and only when a request is going to be made: never for a
+    trial with no text. The scoring pass records the call there, so the
+    record exists before anything can leave, whatever happens next.
+
+    replying is called once, when a reply's head arrives and before its
+    body is read, and never when none arrives. Like sending, it is the
+    caller's, and what it raises is the caller's to handle. The scoring
+    pass takes the reply's time there.
+
+    outcome says how the request ended, in the store's words (answered,
+    timed_out, failed, not_sent), and replied whether a reply's head
+    arrived; both are None and False when no request was made. A body
+    that is then cut off or stalls is failed with a reply ("judge reply
+    was cut off while it was read: <Class>"), not timed_out: the timeout
+    that makes a call timed_out is one in which no reply arrived.
+
+    A REPLY IS A REPLY FROM ITS HEAD (the operator's ruling H2 on the
+    1d91670 review: bytes came back, an unreadable body included). The
+    request is sent streamed so that the head, the status line and the
+    headers, is seen when it arrives, before the body is read; a whole
+    read, as client.post does, would have recorded a reply whose body was
+    cut off as no reply at all.
+    They are decided here, where the exception is caught, because the
+    class is the only evidence of which side of the connection it came
+    from, and a reader of the error string would be guessing.
 
     provider_prefs carries the boot data policy exactly as it rides every
     other payload. A judge call sends the response text of a run, which is
@@ -3248,7 +3321,7 @@ async def judge_response(
     # money spent on a verdict nobody can use. parse_verdict at the
     # other end of this file already applies the same test to what comes
     # back; this applies it to what goes out.
-    if response_text is None or not response_text.strip():
+    if response_text is None or not judge_would_send(response_text):
         # A trial that produced no text. Scored without asking anyone,
         # because there is nothing to grade and paying a judge to say so
         # would be spending money to learn what the row already says.
@@ -3258,7 +3331,11 @@ async def judge_response(
             "detail": "no response text: the trial did not complete",
             "generation_id": None,
             "billed_cost_usd": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
             "error": None,
+            "outcome": None,
+            "replied": False,
         }
     out: dict[str, Any] = {
         "score": None,
@@ -3266,7 +3343,11 @@ async def judge_response(
         "detail": None,
         "generation_id": None,
         "billed_cost_usd": None,
+        "prompt_tokens": None,
+        "completion_tokens": None,
         "error": None,
+        "outcome": None,
+        "replied": False,
     }
     payload: dict[str, Any] = {
         "model": judge_model,
@@ -3286,13 +3367,65 @@ async def judge_response(
     }
     if provider_prefs:
         payload["provider"] = provider_prefs
+    if sending is not None:
+        sending()
     try:
-        response = await client.post(
-            OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
+        request = client.build_request(
+            "POST", OPENROUTER_URL, json=payload, timeout=JUDGE_TIMEOUT_S
         )
+        response = await client.send(request, stream=True)
+    # WHICH FAILURES LEFT NOTHING, by class, and the line is the
+    # connection. A request that failed before a connection was
+    # established never left the machine and cannot have been charged:
+    # httpx raises these three while opening one (a refused or
+    # unresolvable host, the connect timeout, the wait for a pooled
+    # connection). Every other transport failure comes after the
+    # connection existed, when the request may be on the wire and money
+    # may have moved, so it counts as sent. That includes WriteTimeout:
+    # some of the request went out. The judge_calls outcome column states
+    # the same boundary.
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "not_sent"
+        return out
+    except httpx.ReadTimeout as exc:
+        out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "timed_out"
+        return out
     except httpx.HTTPError as exc:
         out["error"] = f"judge request failed: {type(exc).__name__}"
+        out["outcome"] = "failed"
         return out
+    except RuntimeError:
+        # httpx refuses a closed client with a bare RuntimeError, before
+        # any connection: nothing left. Any other RuntimeError is not
+        # this one and is not guessed at.
+        if not client.is_closed:
+            raise
+        out["error"] = "judge request not sent: the bench's HTTP client was closed"
+        out["outcome"] = "not_sent"
+        return out
+    # A REPLY ARRIVED. Its head is the first point httpx hands a reply
+    # over, and from here bytes have come back, an unreadable body
+    # included; a reply cut inside its own head raised above and is
+    # recorded as no reply, since httpx shows nothing finer. From here
+    # every return is "failed" (sent, and no usable reply) until the body
+    # proves to be one the judge answered. The body is read here, and the
+    # response closed whatever happens to the read.
+    try:
+        if replying is not None:
+            replying()
+        out["replied"] = True
+        out["outcome"] = "failed"
+        try:
+            await response.aread()
+        except httpx.HTTPError as exc:
+            out["error"] = (
+                f"judge reply was cut off while it was read: {type(exc).__name__}"
+            )
+            return out
+    finally:
+        await response.aclose()
     if response.status_code != 200:
         out["error"] = f"judge returned HTTP {response.status_code}"
         return out
@@ -3312,6 +3445,12 @@ async def judge_response(
     usage = data.get("usage")
     if isinstance(usage, dict):
         out["billed_cost_usd"] = as_money(usage.get("cost"))
+        # The reply's own usage counts, through the same field-type
+        # function run_model applies, so a call with no billed figure can
+        # be settled on the catalog's estimate from what the judge used,
+        # and that estimate can be audited from the call's record.
+        out["prompt_tokens"] = as_token_count(usage.get("prompt_tokens"))
+        out["completion_tokens"] = as_token_count(usage.get("completion_tokens"))
 
     # Through _flatten_content, the same extractor run_model uses, so a
     # provider that answers in content parts rather than a bare string is
@@ -3322,6 +3461,10 @@ async def judge_response(
     except (LookupError, TypeError):
         out["error"] = "judge returned a malformed body"
         return out
+    # Answered: the judge replied with a message. A verdict that does not
+    # parse is still an answer, and a paid one; its failure is the score
+    # row's to record, not the call's.
+    out["outcome"] = "answered"
     verdict = parse_verdict(_flatten_content(content))
     if "error" in verdict:
         out["error"] = verdict["error"]

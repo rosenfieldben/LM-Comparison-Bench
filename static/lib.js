@@ -979,6 +979,251 @@
     return judgeTasks(summary) ? "Score · pays the judge" : "Score · free";
   }
 
+  // How a scoring pass can end, mirrored from bench.store.PASS_OUTCOMES;
+  // a test executes this file and holds the two equal.
+  const PASS_OUTCOMES = ["finished", "stopped", "failed", "interrupted"];
+
+  // A recorded time in the list's form: the UTC the server wrote, and
+  // saying so, whatever zone the page is in.
+  function utcStamp(iso) {
+    return iso.slice(0, 19).replace("T", " ") + " UTC";
+  }
+
+  // A pass's judge calls in words, each count by the calls' facts (the
+  // operator's ruling H2 on the 1d91670 review). A pass closed before
+  // schema 12 (unknown null) was counted by the outcome list the operator
+  // withdrew then, so its two counts are shown as one, in words true of
+  // every call either held; one closed before schema 10 has no unusable,
+  // and its unanswered held both. Any other pass whose unanswered and
+  // unusable place calls ended before schema 12 by the words their records
+  // used (a pass an older build left open, closed at boot) says how many
+  // of those calls do, right after them, naming them (the operator's
+  // second pass at 3a9f3e6: the page says when a pass's counts rest on
+  // those rules).
+  function callCounts(pass) {
+    const counted = (n, one, many) => n + (n === 1 ? one : many);
+    if (pass.unknown === null) {
+      const noUsable = pass.unanswered + (pass.unusable ?? 0);
+      return noUsable > 0
+        ? ", " +
+            counted(
+              noUsable,
+              " judge call ended with no usable answer on record",
+              " judge calls ended with no usable answer on record",
+            )
+        : "";
+    }
+    return (
+      (pass.unanswered > 0
+        ? ", " +
+          counted(
+            pass.unanswered,
+            " judge call got no answer",
+            " judge calls got no answer",
+          )
+        : "") +
+      (pass.unusable > 0
+        ? ", " +
+          counted(
+            pass.unusable,
+            " judge reply could not be used",
+            " judge replies could not be used",
+          )
+        : "") +
+      (pass.history_counted > 0
+        ? ", " +
+          counted(
+            pass.history_counted,
+            " judge call among those that got no answer or an unusable " +
+              "reply ended before the bench recorded whether a call was sent " +
+              "and whether its reply could be used, so it is counted by the " +
+              "word its record used",
+            " judge calls among those that got no answer or an unusable " +
+              "reply ended before the bench recorded whether a call was sent " +
+              "and whether its reply could be used, so they are counted by " +
+              "the words their records used",
+          )
+        : "") +
+      (pass.unknown > 0
+        ? ", " +
+          counted(
+            pass.unknown,
+            " judge call's record could not be completed, so this line " +
+              "cannot say whether it went out",
+            " judge calls' records could not be completed, so this line " +
+              "cannot say whether they went out",
+          )
+        : "")
+    );
+  }
+
+  // The Score row's line about the latest scoring pass, from the list's
+  // experiment.scoring, or "" when there is none. A null makes no claim:
+  // it says no pass has been recorded, and scores written before passes
+  // were recorded may still exist, so "not scored" would be a guess.
+  // running and stopping are the server's; outcome, detail and the
+  // counts are the record's, and the detail is the server's sentence,
+  // shown as it is.
+  function scoringPassLine(pass) {
+    if (!pass) return "";
+    const counted = (n, one, many) => n + (n === 1 ? one : many);
+    const by =
+      pass.judge_model === null
+        ? "with no judge"
+        : "judged by " + pass.judge_model;
+    if (pass.running) {
+      return (
+        "a scoring pass " +
+        by +
+        ", started " +
+        utcStamp(pass.started_at) +
+        (pass.stopping
+          ? ", is stopping after the trial being scored"
+          : ", is running")
+      );
+    }
+    if (pass.outcome === null) {
+      return (
+        "a scoring pass started " +
+        utcStamp(pass.started_at) +
+        " has no recorded end"
+      );
+    }
+    const counts =
+      counted(pass.scored, " trial scored", " trials scored") +
+      (pass.failed > 0
+        ? ", " + counted(pass.failed, " with no score", " with no score")
+        : "") +
+      callCounts(pass);
+    if (pass.outcome === "finished") {
+      return "scored " + utcStamp(pass.ended_at) + ", " + by + ": " + counts;
+    }
+    if (pass.outcome === "failed") {
+      return (
+        "the last scoring pass failed " +
+        utcStamp(pass.ended_at) +
+        ": " +
+        pass.detail
+      );
+    }
+    // stopped and interrupted: the record's own sentence says who ended
+    // it. An interrupted pass has no end time, so its start is given.
+    const when =
+      pass.ended_at === null
+        ? "started " + utcStamp(pass.started_at)
+        : utcStamp(pass.ended_at);
+    return (
+      "the last scoring pass " +
+      (pass.outcome === "stopped" ? "stopped" : "was interrupted") +
+      " (" +
+      when +
+      ", " +
+      by +
+      "): " +
+      pass.detail +
+      "; " +
+      counts
+    );
+  }
+
+  // The report's judge spend as one line, from report.judge_cost. What the
+  // judging cost first, then each request it cannot speak for, each count in
+  // words true of every request counted: an unpriced call came back with an
+  // answer and no price; an unanswered one went out and no reply came back;
+  // an unusable one got a reply that could not be used (an error status, a
+  // body that could not be read or was cut off); how many of those that got
+  // no answer or an unusable reply ended before schema 12 and are counted by
+  // the words their records used (the operator's second pass at 3a9f3e6); an
+  // unknown one's record could not be completed and does not say whether it
+  // went out (the operator's ruling M1 on the 1d91670 review gives it its
+  // own clause); one in flight had not come back when the report was read;
+  // and a judge row written before the bench recorded its requests has no
+  // figure, and this line cannot say whether its request went out. A request
+  // never sent is in none of them. Every key it reads is a key of the
+  // report's judge_cost, which a test holds.
+  function judgeSpendLine(spend) {
+    const counted = (n, one, many) => n + (n === 1 ? one : many);
+    const unpriced = spend.unpriced_calls;
+    let line =
+      spend.billed_calls > 0
+        ? "judge spend: $" +
+          spend.total_usd.toFixed(4) +
+          " over " +
+          counted(spend.billed_calls, " billed call", " billed calls") +
+          (unpriced > 0 ? ", " + unpriced + " unpriced" : "")
+        : "judge spend: none billed" +
+          (unpriced > 0
+            ? ", " + counted(unpriced, " call unpriced", " calls unpriced")
+            : "");
+    if (spend.unanswered_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.unanswered_calls,
+          " judge call went out and got no answer",
+          " judge calls went out and got no answer",
+        );
+    }
+    if (spend.unusable_answers > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.unusable_answers,
+          " judge call got a reply that could not be used",
+          " judge calls got replies that could not be used",
+        );
+    }
+    if (spend.history_counted_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.history_counted_calls,
+          " judge call among those that got no answer or an unusable reply " +
+            "ended before the bench recorded whether a call was sent and " +
+            "whether its reply could be used, so this line counts it by the " +
+            "word its record used",
+          " judge calls among those that got no answer or an unusable reply " +
+            "ended before the bench recorded whether a call was sent and " +
+            "whether its reply could be used, so this line counts them by " +
+            "the words their records used",
+        );
+    }
+    if (spend.unknown_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.unknown_calls,
+          " judge call's record could not be completed, so this line " +
+            "cannot say whether it went out",
+          " judge calls' records could not be completed, so this line " +
+            "cannot say whether they went out",
+        );
+    }
+    if (spend.in_flight_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.in_flight_calls,
+          " judge call had not come back when this report was read",
+          " judge calls had not come back when this report was read",
+        );
+    }
+    if (spend.rows_before_call_records > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.rows_before_call_records,
+          " judge row written before the bench recorded its requests " +
+            "has no figure, and this line cannot say whether its " +
+            "request went out",
+          " judge rows written before the bench recorded its requests " +
+            "have no figure, and this line cannot say whether their " +
+            "requests went out",
+        );
+    }
+    return line;
+  }
+
   // ---- The member listing (Phase O): what a snapshot would select,
   // ---- and patterns written from the rows a person checks.
 
@@ -1255,6 +1500,10 @@
     scoreBody,
     scoreNudge,
     scoreLabel,
+    judgeSpendLine,
+    PASS_OUTCOMES,
+    utcStamp,
+    scoringPassLine,
     SNAPSHOT_LIMITS,
     PATTERN_TRIMMED,
     patternFor,

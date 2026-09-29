@@ -27,6 +27,7 @@ than fifteen times.
 
 import io
 import json
+import os
 
 import httpx
 import pytest
@@ -600,3 +601,78 @@ async def test_review_repro_a_digest_placeholder_survives_reconciliation(conn):
     # and which this asserts so a future column addition cannot quietly
     # acquire one.
     assert "extracted_text" not in row["request_json"]
+
+
+# ---- Phase P: one process writes to a bench database at a time.
+
+
+def test_apply_takes_the_lock_a_server_holds_and_the_dry_run_does_not(
+    tmp_path, monkeypatch, capsys
+):
+    """WINDOW: python -m bench.reconcile's main, with --apply and without,
+    over a database whose lock a server holds, then with the lock free,
+    and what the lock says while each run is in progress.
+
+    --apply writes, so it takes the lock a server takes (the operator's
+    ruling at P1's checkpoint): beside a live server it refuses in a
+    sentence naming what holds the lock, before any lookup and without
+    running the pass; with the lock free it holds the lock for its run,
+    under its own name, and lets it go after, so a server can start. The
+    dry run writes no row and takes no lock, so it runs beside the
+    server. Refused, --apply has written nothing (the external review's
+    M3): it takes the lock before it connects, so a database an older
+    bench wrote, holding a pass and a call a live server has open, keeps
+    its bytes. PRE-STATE: the lock is held, by a server's record, when the
+    first two runs start; before this series --apply connected, and so
+    migrated the older database, before it asked for the lock."""
+    import hashlib
+    from pathlib import Path
+
+    from test_api import seed_a_live_older_database
+
+    from bench import reconcile as reconcile_module
+    from bench.reconcile import main
+
+    path = str(tmp_path / "bench.db")
+    before = seed_a_live_older_database(path)
+    lock = store.lock_path(path)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", path)
+    seen = []
+
+    async def pass_that_looks(conn, client, *, apply, limit, delay_s):
+        # What the lock file says, and whether a server could take the
+        # lock, while the pass runs.
+        try:
+            probe = store.hold_lock(path, "server")
+        except store.LockHeld:
+            seen.append((apply, open(lock).read().split()[1], "held"))
+        else:
+            store.release_lock(probe)
+            seen.append((apply, None, "free"))
+        return {}
+
+    monkeypatch.setattr(reconcile_module, "reconcile", pass_that_looks)
+    server = store.hold_lock(path, "server")
+    try:
+        assert main(["--apply"]) == 3
+        refused = capsys.readouterr().err.strip()
+        assert seen == []
+        assert hashlib.sha256(Path(path).read_bytes()).hexdigest() == before
+        assert main([]) == 0
+    finally:
+        store.release_lock(server)
+    assert refused == (
+        f"{lock} is held by process {os.getpid()}, a bench server, which is "
+        "using this database, and one process writes to a bench database at "
+        "a time, so reconcile --apply will not start. Stop that process "
+        "first, or run without --apply, which writes nothing."
+    )
+    # The dry run ran beside the server, and the lock was still the
+    # server's while it did: the dry run took nothing.
+    assert seen == [(False, "server", "held")]
+
+    assert main(["--apply"]) == 0
+
+    assert seen[1] == (True, "reconcile", "held")
+    store.release_lock(store.hold_lock(path, "server"))

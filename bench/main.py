@@ -67,6 +67,7 @@ from bench.models import (
     BUDGET_EXTENDED,
     BUDGET_STANDARD,
     DATA_POLICY_PREFS,
+    JUDGE_MAX_TOKENS,
     QUANTIZATION_LEVELS,
     as_money,
     as_text,
@@ -76,7 +77,9 @@ from bench.models import (
     endpoint_supports_reasoning,
     fetch_catalog,
     fetch_endpoints,
+    judge_messages,
     judge_response,
+    judge_would_send,
     keepalive_socket_options,
     missing_parameters,
     normalized_provider_slug,
@@ -116,7 +119,9 @@ UNKNOWN_CAP_BUDGET = BUDGET_STANDARD
 # paid calls in flight. The semaphore enforces the cap where the money
 # actually moves: around the upstream HTTP exchange, in both endpoints.
 # Saturation queues quietly; a sixth model simply starts when a slot
-# frees, with no error and no acquisition timeout.
+# frees, with no error and no acquisition timeout. (Under a spend ceiling
+# it may be refused before it queues instead, for room the calls ahead of
+# it have claimed: see reserve_spend.)
 MAX_CONCURRENT_UPSTREAM = 5
 
 # SQLite stores rowids in a signed 64-bit integer. Pydantic accepted
@@ -1358,6 +1363,55 @@ class ScoringStart(BaseModel):
     judge_model: str | None = Field(default=None, min_length=1, max_length=200)
 
 
+class ScoringPass(BaseModel):
+    """One scoring pass as the record holds it, and whether it is the one
+    this process is running.
+
+    The first eleven fields are the scoring_passes row: outcome, ended_at
+    and the five counts are null until the pass ends, and a pass the
+    boot sweep closed has an outcome and no ended_at, because when it
+    ended is not known. running and stopping are this process's, not the
+    record's: running says the pass is the one the scoring slot holds,
+    and stopping that it has been asked to stop and has not yet. A pass
+    whose outcome is null and which is not running has no recorded end;
+    the boot sweep gives it one.
+    """
+
+    id: int
+    judge_model: str | None
+    started_at: str
+    ended_at: str | None
+    outcome: str | None
+    detail: str | None
+    scored: int | None
+    failed: int | None
+    unanswered: int | None
+    # Null only on a pass closed before this count existed, whose
+    # unanswered counted its failed calls too; see store.MIGRATIONS.
+    unusable: int | None
+    # Null only on a pass closed before schema 12, whose unanswered and
+    # unusable were counted by the outcome list withdrawn then; see
+    # store.MIGRATIONS.
+    unknown: int | None
+    # Not the record's: how many of the calls behind unanswered and
+    # unusable those counts place by the rules for a call ended before
+    # schema 12 (store.HISTORY_COUNTED_SQL), read from the pass's sealed
+    # calls, so the page can say when its counts rest on them. Null where
+    # unknown is null: a pass not yet ended, and one sealed before schema
+    # 12, whose counts rest on the withdrawn list and not these rules.
+    history_counted: int | None
+    running: bool
+    stopping: bool
+
+
+class ScoringRecord(BaseModel):
+    experiment_id: int
+    # The running pass, in the same shape as the list's, or null.
+    active: ScoringPass | None
+    # Every pass over this experiment, newest first.
+    passes: list[ScoringPass]
+
+
 class ExperimentDetail(BaseModel):
     id: int
     name: str
@@ -1390,6 +1444,11 @@ class ExperimentDetail(BaseModel):
     trials_done: int
     trials_refused: int
     trials_failed: int
+    # The latest scoring pass, so the panel can say how the last one
+    # ended from the list it already reads. Null when no pass has run
+    # since Phase P recorded them: a null says nothing about the scores
+    # an older pass may have written.
+    scoring: ScoringPass | None = None
 
 
 class ExperimentList(BaseModel):
@@ -1442,6 +1501,13 @@ class CatalogResponse(BaseModel):
     # both variables when it is not one of BENCH_REPO_ROOTS.
     clones_enabled: bool = False
     clones_off_reason: str = ""
+    # THE CEILING'S FIGURES (Phase P, P2), process-wide and reset at a
+    # restart: accumulated_usd always, and limit_usd and reserved_usd only
+    # when a ceiling is set, since blank is not sent. reserved_usd is what
+    # admitted calls not yet settled have claimed, those still queued for
+    # a slot as well as those on the wire. A dict rather than a model so a
+    # key that is absent is absent on the wire.
+    spend: dict[str, float] = Field(default_factory=dict)
 
 
 class StoredModelResult(ModelResult):
@@ -1560,12 +1626,16 @@ def _git_argv(args: Sequence[str]) -> list[str]:
       root ("/post-index-change", asked of `git rev-parse --git-path`);
     - no helper git would ask for sign-in details, from any source (an
       empty helper clears the list), as the clone runner has;
-    - no bare repository found by searching (safe.bareRepository), so a
-      directory inside a bare repository, which the walk does not refuse
-      (BACKLOG, "A snapshot root inside a git directory"), is not a
-      repository git will read. A command-line setting is protected
-      configuration, which a repository's own cannot override; git
-      older than 2.38 ignores the setting.
+    - no bare repository found by searching (safe.bareRepository). Since
+      f123525 both snapshot doors refuse a root inside a git directory, a
+      bare repository among them, up to and including its allowlist
+      entry (snapshot.look_above, ROOT_INSIDE_GIT_DIRECTORY), and boot
+      refuses an entry that sits inside one (_refuse_entries_inside_git);
+      this setting is git's own second guard behind those, so a directory
+      inside a bare repository is not a repository git will read. A
+      command-line setting is protected configuration, which a
+      repository's own cannot override; git older than 2.38 ignores the
+      setting.
 
     WHAT THEY DO NOT TURN OFF: a filter driver a repository's own
     configuration names, which status runs on a file whose stat data
@@ -1871,6 +1941,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         os.environ.get("BENCH_SPEND_LIMIT_USD")
     )
     app.state.accumulated_spend_usd = 0.0
+    # THE RESERVATION LEDGER (Phase P, P2). Every admitted call that has
+    # not yet settled holds its worst case here, keyed by an object of its
+    # own, from its admission (before it queues for an upstream slot) until
+    # settlement replaces the claim with what the call counts, or the call
+    # ends without one and gives it back. Kept per call rather than as a
+    # running figure, so that when nothing is held the sum is exactly
+    # zero whatever order the calls ended in, and summed with fsum, so the
+    # figure is the correctly rounded sum of the live claims whatever order
+    # they were admitted in.
+    # Keyed by identity rather than a counter, so a late finally from an
+    # earlier boot of this module's app can never give back a claim of
+    # this one. Process-local like the figure above, and empty after a
+    # restart. Read and written only by the functions beside ceiling_cost,
+    # none of which awaits: on one event loop that is the whole of its
+    # locking, the same argument the figure above has always made.
+    app.state.spend_reservations = {}
+    # Set, and replaced, whenever a claim leaves the ledger: what a trial
+    # or a judge call waiting for room another call holds waits on.
+    app.state.spend_room_freed = asyncio.Event()
     # The one experiment runner. Per process, because the semaphore and
     # the ceiling it competes for are per process: two runners would
     # interleave through the same five slots and each would measure the
@@ -1891,10 +1980,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # separate because they are separately useful: a finished experiment
     # can be re-scored while nothing is running, and a running experiment
     # must not be scored while its results are still arriving.
+    #
+    # pass_id is the running pass's scoring_passes row, the record that
+    # outlives this dict. stop_reason says who asked it to stop, "request"
+    # (the stop door) or "shutdown" (the lifespan), because the pass's
+    # recorded ending says which.
     app.state.scoring_run = {
         "active": None,
+        "pass_id": None,
         "task": None,
         "stop": asyncio.Event(),
+        "stop_reason": None,
         "tasks": {},
         "error": None,
     }
@@ -1908,6 +2004,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repo_roots = _parse_repo_roots(
         os.environ.get("BENCH_REPO_ROOTS"), resolved=_resolved_directory
     )
+    # An entry inside a git directory is refused here, since the doors'
+    # look above a root stops at its entry and so never sees one above it.
+    _refuse_entries_inside_git(app.state.repo_roots)
+    # Each entry's device and inode, read once here: where the snapshot
+    # doors' look above a root stops (snapshot.look_above). Read at boot,
+    # as the clone root's identity is (_clone_root_as_entry), so an entry
+    # replaced later is not what the look stops at, and it climbs on.
+    app.state.repo_root_identities = _root_identities(app.state.repo_roots)
     if app.state.repo_roots:
         logger.info("snapshot roots: %s", ", ".join(app.state.repo_roots))
     # Where POST /clones may put what it fetches, from which hosts, and
@@ -1925,8 +2029,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.clone_cainfo = _parse_clone_cainfo(os.environ.get("BENCH_CLONE_CAINFO"))
     app.state.clone_run = {"paths": None}
-    if app.state.clone_root is not None:
-        _sweep_clone_work(app.state.clone_root)
     app.state.data_policy = _parse_data_policy(os.environ.get("BENCH_DATA_POLICY"))
     app.state.provider_prefs = provider_preferences(app.state.data_policy)
     if app.state.data_policy != "standard":
@@ -1935,6 +2037,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             app.state.data_policy,
             app.state.provider_prefs,
         )
+    db_path = os.environ.get("BENCH_DB", "./bench.db")
+    # ONE WRITER PER DATABASE, the server holding it from here to the
+    # process's end (store.hold_lock; reconcile --apply takes the same lock
+    # while it writes). Taken once the environment is read and BEFORE
+    # ANYTHING WRITES (the external review's M3): the clone door's
+    # leftovers are removed and the database is connected, and so
+    # migrated, only by the process that holds it. A server refused here
+    # has written nothing, not a column onto an older database and not a
+    # live clone's work directory away. What holds it is named in the
+    # refusal. The sweeps inside mark whatever the database says is
+    # running as interrupted, which is true only if nothing is: a second
+    # server on a live bench's database would record the first one's
+    # running experiment and scoring pass as interrupted while they ran.
+    # Released however boot or shutdown ends.
+    app.state.bench_lock = store.hold_lock(db_path, "server")
+    try:
+        async with _serve(app, db_path, api_key):
+            yield
+    finally:
+        store.release_lock(app.state.bench_lock)
+
+
+@asynccontextmanager
+async def _serve(app: FastAPI, db_path: str, api_key: str) -> AsyncIterator[None]:
+    """Everything the server does while it holds its database's lock: the
+    clone door's leftovers, the client, the database and its sweeps, and
+    on the way out the same in reverse. See lifespan for why the lock
+    comes first."""
+    if app.state.clone_root is not None:
+        _sweep_clone_work(app.state.clone_root)
     # One shared client: connection pooling across the fan-out, and the
     # auth header lives in exactly one place. The explicit transport
     # exists to carry TCP keepalive options: extended-budget streams go
@@ -1953,7 +2085,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         headers={"Authorization": f"Bearer {api_key}"},
         transport=httpx.AsyncHTTPTransport(socket_options=keepalive_socket_options()),
     )
-    app.state.db = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    app.state.db = store.connect(db_path)
     # One shared gate for every paid upstream call this process makes;
     # see MAX_CONCURRENT_UPSTREAM for why it exists.
     app.state.upstream_semaphore = asyncio.Semaphore(MAX_CONCURRENT_UPSTREAM)
@@ -2037,6 +2169,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "finished; its completed trials are real and its "
                 "remaining trials never ran",
             )
+    # The same correction for scoring: a pass and its calls have rows now,
+    # and a crash or a kill leaves them with no ending, as does a pass
+    # whose own ending write failed (score_experiment's finally). Closed as
+    # interrupted, "found open at boot", safe for the reason the sweep
+    # above is and only because the lock is held.
+    swept_passes, swept_calls = store.sweep_open_scoring_records(app.state.db)
+    if swept_passes or swept_calls:
+        logger.warning(
+            "%s scoring pass(es) and %s judge call(s) were left open by a "
+            "previous process; recorded as interrupted",
+            swept_passes,
+            swept_calls,
+        )
     yield
     # The runner outlives the request that started it, deliberately, but
     # it must not outlive the process. Without this the task is cancelled
@@ -2044,12 +2189,44 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # middle of a settlement: the money is spent and the row is not
     # written. Asking it to stop between trials and then waiting is the
     # same contract the stop endpoint offers.
-    await _shutdown_runner()
-    # After the runner, not before. The client is what the in-flight
-    # trial is streaming through, so closing it first would break the
-    # exchange this line just finished waiting for.
+    #
+    # The scoring pass is asked the same way and waited for beside the
+    # runner, not after it, so neither wait adds to the other; its wait
+    # is bounded (see SCORING_SHUTDOWN_SECONDS), the runner's is not.
+    _ask_scoring_to_stop("shutdown")
+    await asyncio.gather(_shutdown_scoring(), _shutdown_runner())
+    # After both, not before. The client is what the in-flight trial and
+    # judge call are going through, so closing it first would break the
+    # exchanges these lines just finished waiting for.
     await app.state.client.aclose()
     app.state.db.close()
+
+
+def _ask_scoring_to_stop(reason: str) -> None:
+    """Set the running pass's stop, recording who asked first."""
+    state = app.state.scoring_run
+    if state["stop_reason"] is None:
+        state["stop_reason"] = reason
+    state["stop"].set()
+
+
+async def _shutdown_scoring() -> None:
+    """Wait for the scoring pass to stop, then cut it.
+
+    The pass has been asked to stop, and stops between trials, which
+    takes as long as the trial in hand. SCORING_SHUTDOWN_SECONDS bounds
+    that wait; past it wait_for cancels the pass, whose in-flight judge
+    call is then recorded stopped and its pass stopped, both before the
+    database closes, since wait_for returns only once the cancelled pass
+    has finished. Never raises: shutdown goes on to the client and the
+    database whatever the pass did.
+    """
+    state = getattr(app.state, "scoring_run", None) or {}
+    task = state.get("task")
+    if task is None or task.done():
+        return
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        await asyncio.wait_for(task, SCORING_SHUTDOWN_SECONDS)
 
 
 async def _shutdown_runner() -> None:
@@ -2649,10 +2826,11 @@ def format_usd(value: float) -> str:
 def spend_ceiling_reached() -> bool:
     """True when an active ceiling has been reached by accumulated spend.
 
-    The shared predicate behind the entry check and the post-admission
-    recheck. Results the bench could price neither from the platform's
-    billed figure nor from the catalog never moved the counter, so this
-    bounds known spend, not all spend.
+    The recheck every call makes in its held slot, the judge's check
+    before it queues, and, through spend_admits, part of every claim.
+    Results the bench could price neither from the platform's billed
+    figure nor from the catalog never moved the counter, so this bounds
+    known spend, not all spend.
     """
     limit = app.state.spend_limit_usd
     if limit is None:
@@ -2663,12 +2841,14 @@ def spend_ceiling_reached() -> bool:
 def enforce_spend_limit() -> None:
     """Refuse a run at the boundary once recorded spend hits the ceiling.
 
-    Checked at endpoint entry, before the semaphore and before any
-    upstream call, so a refusal costs nothing. Money already in flight
-    is never interrupted. The 402 names both figures so the operator
-    knows how far over the intent they are. A second recheck runs after
-    admission (spend_refusal_result) to close the gap where runs admitted
-    below the limit would all execute once an earlier one crossed it.
+    Checked at endpoint entry, before the semaphore, before any upstream
+    call and before the request's other checks, so a refusal costs
+    nothing and a ceiling already reached is the first thing a caller
+    hears, as it always was. A ceiling not yet reached can still have no
+    room for the request's calls, which enforce_spend_room answers once
+    their worst cases are known, and each call claims for itself after
+    that. Money already in flight is never interrupted. The 402 names both
+    figures so the operator knows how far over the intent they are.
     """
     if spend_ceiling_reached():
         raise HTTPException(
@@ -2715,6 +2895,265 @@ def ceiling_cost(result: dict[str, Any]) -> float | None:
     """
     billed = as_money(result.get("billed_cost_usd"))
     return billed if billed is not None else as_money(result.get("cost_usd"))
+
+
+# THE LEDGER'S STEPS (Phase P, P2). Each is one plain function with no
+# await, so on the event loop each is atomic: nothing runs between a check
+# and the claim it admits, nor between a claim leaving and a cost arriving.
+# That is the whole of the ledger's locking, and all it needs. An
+# asyncio.Lock would add nothing on one loop, and a lock that could be
+# contended would give settlement a place to pause.
+
+
+def spend_reserved_usd() -> float:
+    """What calls admitted and not yet settled have claimed, queued or on
+    the wire: exactly zero when none is held."""
+    return math.fsum(app.state.spend_reservations.values())
+
+
+def spend_admits(worst: float) -> bool:
+    """Whether a call that could cost `worst` fits under the ceiling now.
+
+    Recorded spend plus what is reserved plus this call's worst case must
+    stay at or under the limit; a call that fits exactly is admitted. A
+    limit already reached refuses every call, the unpriced among them, as
+    spend_ceiling_reached always has.
+    """
+    limit = app.state.spend_limit_usd
+    if limit is None:
+        return True
+    accumulated = app.state.accumulated_spend_usd
+    total = math.fsum((accumulated, spend_reserved_usd(), worst))
+    return bool(accumulated < limit and total <= limit)
+
+
+def reserve_spend(worst: float | None) -> object | None:
+    """Admit one call against the ceiling, claiming its worst case.
+
+    Returns the claim's key when the call is admitted and None when it is
+    refused. A call the catalog cannot price (worst None) claims nothing,
+    and is refused only when the limit is reached or recorded spend and
+    the live claims already pass it; with no limit set nothing is claimed
+    at all. The key goes to release_spend or settle_spend, and both ignore
+    a key they no longer hold, so a finally may always release.
+    """
+    claim = worst if worst is not None else 0.0
+    if not spend_admits(claim):
+        return None
+    key = object()
+    if claim > 0 and app.state.spend_limit_usd is not None:
+        app.state.spend_reservations[key] = claim
+    return key
+
+
+def release_spend(key: object | None) -> None:
+    """Give a claim back uncounted: the call ended without a cost to
+    settle. Idempotent, and a no-op for a refused call's None. A claim
+    that leaves wakes whatever is waiting for room."""
+    if key is not None and app.state.spend_reservations.pop(key, None) is not None:
+        app.state.spend_room_freed.set()
+        app.state.spend_room_freed = asyncio.Event()
+
+
+def spend_room_held_by_others(worst: float | None) -> bool:
+    """Whether a claim just refused was refused only for what calls not
+    yet settled hold: the ceiling is not reached, and this call's worst
+    case fits beside recorded spend alone. That room comes back as those
+    calls settle or give their claims back; room recorded spend has used
+    never does."""
+    limit = app.state.spend_limit_usd
+    if limit is None:
+        return False
+    accumulated = app.state.accumulated_spend_usd
+    alone = math.fsum((accumulated, worst or 0.0))
+    return bool(accumulated < limit and alone <= limit)
+
+
+async def wait_for_spend_room(stop: asyncio.Event) -> None:
+    """Wait, holding nothing, until a claim leaves the ledger or stop is
+    set. For the two callers that can wait, a trial and a judge call: a
+    refusal for room another call holds would halt an experiment whose
+    money has not run out, or write the rest of a scoring pass as gaps in
+    one step of the loop, and in either case the room comes back.
+
+    WHY THE WAIT ENDS, AND THE BOUND IT HAS. A waiter holds nothing, so
+    no call waits on it; what it waits on are the calls holding claims,
+    and each gives its claim back, settled or released, when it ends. A
+    call on the wire ends when its answer is complete, when its upstream
+    falls silent past its read timeout (models.JUDGE_TIMEOUT_S, 60 s, for
+    a judge call; models.STREAM_READ_TIMEOUT_S, 300 s, for a trial or a
+    stream; models.COMPLETION_READ_TIMEOUT_S, 300 s, for a /compare
+    member), or when it is cancelled: a browser stream by its reader
+    going away, a judge call by shutdown's cut. A call still queued for a
+    slot holds its claim while it waits, and ends the same ways once the
+    calls ahead of it free their slots. Every release and every
+    settlement wakes each waiter, which tries its claim again. Those
+    timeouts bound a silence, not a call, so the wait has no fixed
+    wall-clock bound: an answer that keeps arriving holds its claim until
+    it is complete. The stop ends the wait at once, whatever the others
+    do: the Stop control's, or shutdown's, which sets the runner's and the
+    pass's before it waits on either."""
+    freed = asyncio.ensure_future(app.state.spend_room_freed.wait())
+    stopped = asyncio.ensure_future(stop.wait())
+    try:
+        await asyncio.wait((freed, stopped), return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        freed.cancel()
+        stopped.cancel()
+
+
+def settle_spend(key: object | None, cost: float | None) -> None:
+    """Replace a call's claim with what it counts, in one step: the claim
+    leaves and the cost arrives with nothing between them."""
+    release_spend(key)
+    record_spend(cost)
+
+
+def call_chars(composed: object, system: object) -> dict[str, int] | None:
+    """A call's two messages, weighed as projected_cost weighs a task's:
+    None when the composed content is not text (a native request, whose
+    documents go as images), and a system prompt of 0 when none is sent."""
+    if not isinstance(composed, str):
+        return None
+    return {
+        "prompt": len(composed),
+        "system": len(system) if isinstance(system, str) and system else 0,
+    }
+
+
+def call_worst_case(
+    model: str,
+    budget: int,
+    chars: dict[str, int] | None,
+    prices: Mapping[str, Any],
+) -> float | None:
+    """The worst case one call is admitted against (P2): projected_cost's
+    arithmetic for that one call, at the model's two per-unit rates.
+
+    The completion budget at the completion rate, plus both messages at
+    the prompt rate, weighed from characters as projected_cost weighs
+    them; chars None (a native request, whose documents go as images)
+    counts the completion half alone, as projected_cost does. It is not a
+    ceiling on the bill: the messages are an estimate that can err low,
+    and a route dearer than the listed rate can charge more.
+
+    PRICED AS THE CEILING COUNTS, not as the projection refuses. A price
+    that also names a charge the two rates cannot count (beyond) is still
+    claimed at the two rates, because the settlement that will replace the
+    claim, cost_usd's estimate, reads the same two rates and counts that
+    call; projected_cost refuses such a model, and following it here
+    would admit about two thirds of the catalog claiming nothing (131 of
+    396 models published only the two rates; see TOKEN_PRICE_DIMENSIONS).
+    None when there are not two rates, which is a call the catalog cannot
+    price, and it claims nothing.
+    """
+    price = prices.get(model) or {}
+    rates = {key: price.get(key) for key in ("prompt", "completion")}
+    if not all(
+        isinstance(rate, int | float) and not isinstance(rate, bool)
+        for rate in rates.values()
+    ):
+        return None
+    cost = projected_cost(
+        1,
+        None if chars is None else {"call": chars},
+        [model],
+        1,
+        {model: budget},
+        {model: rates},
+        chars_per_token=CHARS_PER_TOKEN,
+    )
+    total = cost["total_usd"] if chars is not None else cost["output_usd"]
+    return None if total is None else float(total)
+
+
+def spend_claim_phrase(worst: float | None, what: str) -> str:
+    """The refused call as a refusal names it: by what it reserves, or as
+    a call the catalog cannot price, which reserves nothing. "What it
+    reserves" and never "the most it could cost": a reservation is the
+    completion budget and the messages at the catalog's rates, not a
+    bound on the bill."""
+    if worst is None:
+        return f"{what}, which the catalog cannot price"
+    return f"the {format_usd(worst)} {what} reserves"
+
+
+def spend_no_room(claim: str) -> str:
+    """Why a call was refused for want of room, in the ceiling's four
+    figures: recorded spend, the limit, what calls not yet settled have
+    reserved, and what the refused call reserves, the term that decided
+    it. The refused call's own claim is never in the reserved figure: it
+    was refused before it held one, or gave it back first."""
+    return (
+        f"recorded {format_usd(app.state.accumulated_spend_usd)} of "
+        f"{format_usd(app.state.spend_limit_usd)} limit (BENCH_SPEND_LIMIT_USD) "
+        f"and {format_usd(spend_reserved_usd())} reserved by calls not yet "
+        f"settled leave no room for {claim}"
+    )
+
+
+def enforce_spend_room(worsts: list[float | None]) -> None:
+    """Refuse a request at its door when none of its calls would be admitted.
+
+    After enforce_spend_limit, so the ceiling is not reached here: this
+    refuses for room, which recorded spend and the claims of calls not yet
+    settled have taken. Checked before the semaphore and before any
+    upstream call, so a refusal costs nothing. It claims nothing: each
+    call claims for itself when it starts, in the coroutine that makes it,
+    so that its release runs whatever ends it. That leaves the door
+    advisory. A call that passed it can still be refused at its own claim
+    if another took the room between the two, and then it is a refusal row
+    or a refusal frame. A batch some of whose calls fit runs those, and
+    the rest are refusal rows in its history, the shape a batch cut short
+    has always had.
+    """
+    if any(spend_admits(worst or 0.0) for worst in worsts):
+        return
+    if len(worsts) == 1:
+        claim = spend_claim_phrase(worsts[0], "this run")
+    elif any(worst is None for worst in worsts):
+        claim = "any of this batch's calls, even one the catalog cannot price"
+    else:
+        least = min(worst for worst in worsts if worst is not None)
+        claim = (
+            "any of this batch's calls, the least of which reserves "
+            f"{format_usd(least)}"
+        )
+    raise HTTPException(
+        402,
+        f"spend ceiling: {spend_no_room(claim)}; recorded spend leaves out "
+        "what could not be priced",
+    )
+
+
+def judge_ceiling_cost(verdict: dict[str, Any], judge_model: str) -> float | None:
+    """What a judge call counts against the ceiling (the operator's ruling
+    R2): its billed figure, or, when the reply carried none, the catalog
+    estimate over the counts the reply reported, which is what
+    ceiling_cost decides for a trial. None when neither can be had, which
+    counts nothing, as for any call unpriced by both routes."""
+    estimate = cost_usd(
+        {
+            "model": judge_model,
+            "prompt_tokens": verdict["prompt_tokens"],
+            "completion_tokens": verdict["completion_tokens"],
+        },
+        app.state.prices,
+    )
+    return ceiling_cost(
+        {"billed_cost_usd": verdict["billed_cost_usd"], "cost_usd": estimate}
+    )
+
+
+def spend_figures() -> dict[str, float]:
+    """GET /models' spend: recorded spend always, and the limit and what
+    is reserved against it only when a ceiling is set."""
+    figures = {"accumulated_usd": app.state.accumulated_spend_usd}
+    limit = app.state.spend_limit_usd
+    if limit is not None:
+        figures["limit_usd"] = limit
+        figures["reserved_usd"] = spend_reserved_usd()
+    return figures
 
 
 def visible_or_none(parts: list[str]) -> str | None:
@@ -2808,6 +3247,29 @@ def spend_refusal_result(model: str, max_tokens: int) -> dict[str, Any]:
         "provider": None,
         "native_finish_reason": None,
     }
+
+
+def admission_refusal_result(
+    model: str, max_tokens: int, worst: float | None
+) -> dict[str, Any]:
+    """A synthetic result for a run refused at its own claim on the ceiling.
+
+    spend_refusal_result's shape, carried by the same three callers in the
+    same three ways, with the error that says why: recorded spend and the
+    live claims left no room for this run's worst case, which is not the
+    ceiling reached, so the reached sentence would be false here.
+    """
+    result = spend_refusal_result(model, max_tokens)
+    if spend_ceiling_reached():
+        # Refused because the ceiling is reached, which says it in its own
+        # words: the room sentence would be true but would bury the fact.
+        return result
+    result["error"] = (
+        "run refused before reaching upstream: "
+        f"{spend_no_room(spend_claim_phrase(worst, 'this run'))}; no upstream "
+        "call was made"
+    )
+    return result
 
 
 def _excerpt(text: str, limit: int = 60) -> str:
@@ -4210,6 +4672,18 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         enforce_context_window(
             composed, request.models, request.budget, controls.get("system")
         )
+    # THE CEILING'S SECOND DOOR (P2), after the checks above because a
+    # member's worst case needs its budget and the composed text: room for
+    # at least one of the batch's calls. It claims nothing; each member
+    # claims for itself in limited(), below.
+    chars = call_chars(composed, controls.get("system"))
+    worst = {
+        model: call_worst_case(
+            model, effective_budget(request.budget, model), chars, app.state.prices
+        )
+        for model in request.models
+    }
+    enforce_spend_room([worst[model] for model in request.models])
 
     async def limited(model: str) -> dict[str, Any]:
         # One slot per model inside the fan-out, not one around the
@@ -4220,59 +4694,62 @@ async def compare(request: CompareRequest) -> dict[str, Any]:
         # the slot is already held, so a queued model never reports
         # queue wait as model latency.
         budget = effective_budget(request.budget, model)
-        async with app.state.upstream_semaphore:
-            # Recheck under the held slot, before run_model spends.
-            #
-            # Settlement now happens below, inside this same held slot, so
-            # this recheck observes every result that has already settled,
-            # including earlier members of this very batch. That is the
-            # property the old comment lacked. It reasoned correctly about
-            # one batch and was never re-derived for N: settlement used to
-            # run after gather, so a fast member released its slot with
-            # nothing recorded, and a model from a concurrent batch took
-            # that slot and rechecked against a counter that had not moved.
-            # Eight concurrent five-model batches against a ceiling worth
-            # half a result put 23 calls upstream here (stable across five
-            # runs; the external report's figure was 28, and the exact
-            # number depends on scheduling) where the documented bound
-            # promised about five.
-            #
-            # With per-result settlement the bound is real and derivable: a
-            # freed slot implies a recorded settlement, so once accumulated
-            # spend crosses the ceiling, every subsequent slot acquisition
-            # sees it and refuses. Only the calls already executing when
-            # the ceiling tripped can overshoot, and there are at most
-            # MAX_CONCURRENT_UPSTREAM of those by construction.
-            #
-            # On refusal return a synthetic result shaped like run_model's,
-            # error set, with no upstream call. The batch persists as usual
-            # with the refusal row included: honest history for a cut-short
-            # run.
-            if spend_ceiling_reached():
-                return spend_refusal_result(model, budget)
-            result = await run_model(
-                composed,
-                model,
-                app.state.client,
-                max_tokens=budget,
-                provider_prefs=request_provider_prefs(controls),
-                controls=controls,
-                record_prompt=recorded,
-                may_send_reasoning_cap=model in app.state.reasoning_defaults,
-            )
-            # Settle before the slot releases. This block is post-spend, so
-            # it carries its own fault boundary: the upstream call has
-            # already happened and nothing here may turn a paid result into
-            # an error. A failure pricing or recording degrades this
-            # result's cost to None, which contributes nothing to the
-            # ceiling, exactly as an unpriced result already does.
-            try:
-                result["cost_usd"] = cost_usd(result, app.state.prices)
-                record_spend(ceiling_cost(result))
-            except Exception:
-                logger.exception("settlement failed for %s", model)
-                result["cost_usd"] = None
-            return result
+        # THE CLAIM (P2): this member's worst case against the ceiling,
+        # taken before it queues for a slot, with nothing awaited between
+        # the check and the claim, so two members racing for the last
+        # dollar, in this batch or any other request, cannot both be
+        # admitted. Taken as the first step of the try whose finally gives
+        # it back, so no way out of this call keeps it: settlement consumes
+        # it, and a refusal in the slot, a raise before or after the
+        # request, or a cancel releases it. Refused, it is a refusal row in
+        # the batch, holding nothing.
+        held: object | None = None
+        try:
+            held = reserve_spend(worst[model])
+            if held is None:
+                return admission_refusal_result(model, budget, worst[model])
+            async with app.state.upstream_semaphore:
+                # Recheck under the held slot, before run_model spends. A
+                # claim that fit at admission fits still unless something
+                # settled above its own claim, or unpriced, while this one
+                # waited; if that carried recorded spend to the limit, this
+                # call is refused before it spends. Only then: the claims
+                # keep a priced call within the limit, and this is the bound
+                # for what claims nothing, at most MAX_CONCURRENT_UPSTREAM
+                # calls executing when recorded spend reaches the limit.
+                #
+                # On refusal return a synthetic result shaped like
+                # run_model's, error set, with no upstream call. The batch
+                # persists as usual with the refusal row included: honest
+                # history for a cut-short run.
+                if spend_ceiling_reached():
+                    return spend_refusal_result(model, budget)
+                result = await run_model(
+                    composed,
+                    model,
+                    app.state.client,
+                    max_tokens=budget,
+                    provider_prefs=request_provider_prefs(controls),
+                    controls=controls,
+                    record_prompt=recorded,
+                    may_send_reasoning_cap=model in app.state.reasoning_defaults,
+                )
+                # Settle before the slot releases. This block is post-spend,
+                # so it carries its own fault boundary: the upstream call
+                # has already happened and nothing here may turn a paid
+                # result into an error. A failure pricing or recording
+                # degrades this result's cost to None, which contributes
+                # nothing to the ceiling, exactly as an unpriced result
+                # already does, and the finally gives the claim back.
+                try:
+                    result["cost_usd"] = cost_usd(result, app.state.prices)
+                    settle_spend(held, ceiling_cost(result))
+                except Exception:
+                    logger.exception("settlement failed for %s", model)
+                    result["cost_usd"] = None
+                return result
+        finally:
+            release_spend(held)
 
     # gather preserves input order, which the frontend relies on to map
     # result columns by position. run_model never raises, so no
@@ -4367,6 +4844,18 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
             composed, [request.model], request.budget, controls.get("system")
         )
     max_tokens = effective_budget(request.budget, request.model)
+    # THE CEILING'S SECOND DOOR (P2), still before the generator runs: room
+    # for this run's worst case. Advisory, as /compare's is: the claim is
+    # taken in the generator, below, and a stream the door admitted can
+    # still find the room taken there. composed is None here on the native
+    # path, so its worst case is the completion half alone.
+    worst = call_worst_case(
+        request.model,
+        max_tokens,
+        call_chars(composed, controls.get("system")),
+        app.state.prices,
+    )
+    enforce_spend_room([worst])
 
     async def events() -> AsyncIterator[str]:
         # Rebound inside the held slot for native mode; see the acquire
@@ -4388,6 +4877,12 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
         # locally, so it is the row most in need of an id to reconcile
         # against and of a record of what it asked for.
         holder: dict[str, Any] = {}
+        # This stream's claim on the ceiling, taken as the try's first step
+        # and given back in its finally. In here and not at entry because a
+        # generator that never starts runs no finally: a claim taken at
+        # entry by a response that is never iterated would be held for the
+        # life of the process.
+        held: object | None = None
 
         def release_slot() -> None:
             # Idempotent so the done branch and the finally below can
@@ -4399,6 +4894,27 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 app.state.upstream_semaphore.release()
 
         try:
+            # THE CLAIM (P2), before the queued frame and the semaphore, with
+            # nothing awaited between its check and its taking. Refused, the
+            # stream ends with one done frame carrying the refusal, run_id
+            # null and nothing persisted, as a refusal in the slot does: the
+            # response has begun, so a 402 is no longer possible.
+            held = reserve_spend(worst)
+            if held is None:
+                yield (
+                    "data: "
+                    + json.dumps(
+                        {
+                            "type": "done",
+                            "result": admission_refusal_result(
+                                request.model, max_tokens, worst
+                            ),
+                            "run_id": None,
+                        }
+                    )
+                    + "\n\n"
+                )
+                return
             # A saturated semaphore means this run waits for a slot.
             # Tell the client so its column reads "queued" instead of
             # pretending the model is already thinking; locked() is true
@@ -4429,18 +4945,22 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                     renditions=request.renditions,
                 )
             # Recheck the ceiling now that a slot is held, before started is
-            # set, before the clock, and before the started frame. The entry
-            # check admits every queued run below the limit; without this
-            # recheck an earlier run crossing the ceiling would not stop the
-            # ones already admitted, so overshoot would be bounded by lineup
-            # size, not by the semaphore. On refusal return the slot, emit
+            # set, before the clock, and before the started frame. The claim
+            # above still fits unless something settled above its own claim,
+            # or unpriced, while this run waited; if that carried recorded
+            # spend to the limit, this run is refused before it spends, and
+            # for runs that claim nothing this is the whole bound. On
+            # refusal return the slot, emit
             # one done frame carrying the synthetic refusal result with
             # run_id null, and persist nothing: the refusal happened before
             # any upstream call, exactly like a queued cancel, so there is
             # nothing truthful to record. started stays false so the
             # finally's abort-persist path never fires.
             if spend_ceiling_reached():
+                # Both given back before the frame is yielded, so a reader
+                # slow to take it holds neither a slot nor a claim.
                 release_slot()
+                release_spend(held)
                 yield (
                     "data: "
                     + json.dumps(
@@ -4496,7 +5016,7 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 # failure degrades to run_id null with links dropped.
                 try:
                     result["cost_usd"] = cost_usd(result, app.state.prices)
-                    record_spend(ceiling_cost(result))
+                    settle_spend(held, ceiling_cost(result))
                     prompt_id, group_id = resolve_links(
                         app.state.db, request.prompt_id, request.group_id
                     )
@@ -4521,6 +5041,9 @@ async def compare_stream(request: StreamCompareRequest) -> StreamingResponse:
                 )
         finally:
             release_slot()
+            # Whatever ended the stream, its claim goes back: settled above,
+            # this is a no-op; otherwise the call counts nothing.
+            release_spend(held)
             # A client disconnect cancels this generator at a yield
             # before the done branch ever runs. Persist what the server
             # saw (no awaits or yields are legal here, sqlite is sync,
@@ -5662,7 +6185,14 @@ async def create_experiment(body: ExperimentCreate) -> dict[str, Any]:
 
 @app.get("/experiments", response_model=ExperimentList)
 async def list_experiments() -> dict[str, Any]:
-    return {"experiments": store.list_experiments(app.state.db)}
+    experiments = store.list_experiments(app.state.db)
+    latest = store.latest_scoring_passes(
+        app.state.db, [experiment["id"] for experiment in experiments]
+    )
+    for experiment in experiments:
+        found = latest.get(experiment["id"])
+        experiment["scoring"] = _pass_view(found) if found is not None else None
+    return {"experiments": experiments}
 
 
 @app.get("/experiments/{experiment_id}", response_model=ExperimentDetail)
@@ -5671,6 +6201,9 @@ async def experiment_detail(experiment_id: int) -> dict[str, Any]:
     experiment = store.get_experiment(app.state.db, experiment_id)
     if experiment is None:
         raise HTTPException(404, "no such experiment")
+    found = store.latest_scoring_passes(app.state.db, [experiment_id])
+    latest = found.get(experiment_id)
+    experiment["scoring"] = _pass_view(latest) if latest is not None else None
     return experiment
 
 
@@ -5707,28 +6240,39 @@ def experiment_prices(
     projected_cost.
 
     THAT LAST CLAUSE WAS FALSE UNTIL THE PANEL FOUND IT, and five lenses
-    found it. endpoint_rates returns rates None whenever the route
-    charges an uncountable dimension, which is precisely when beyond is
-    non-empty, and this function collapsed rates None to a bare None and
-    threw the names away. So the pinned path produced the same bare
-    model id as a route whose listing could not answer at all, the two
+    found it. endpoint_rates returned rates None whenever the route
+    charged an uncountable dimension (until Phase P's external review,
+    H1, whose fix returns the rates beside the names), which was
+    precisely when beyond was non-empty, and this function collapsed
+    rates None to a bare None and threw the names away. So the pinned
+    path produced the same bare model id as a route whose listing could
+    not answer at all, the two
     causes were indistinguishable, and the README's unqualified promise
     that the dimension is named was true only of unpinned models.
 
-    THREE ANSWERS, NOT TWO, which is what the entry shapes below mean:
+    TWO SHAPES FOR A PINNED ROUTE, which is what the entries below mean:
 
-      a mapping with rates      priceable, and beyond is empty
-      a mapping with only
-      beyond                    the route charges something this cannot
-                                count, and here is what
-      None                      nothing is known about this route's
-                                price at all
+      rates and beyond          the route's own two rates, and what else
+                                it charges (priceable when beyond is
+                                empty; the projection refuses and names
+                                the charges when it is not)
+      unread, and beyond        the route's listing gave no rates the
+                                bench could read: never fetched, no
+                                endpoint matched the pin, or a matched
+                                endpoint's rates unreadable
 
-    The third stays None rather than borrowing the catalog, for the
+    The second never borrows the catalog for the PROJECTION, for the
     reason above: falling back is the substitution the pin exists to
-    prevent. This mapping is built for projected_cost and read by
-    nothing else, which is why the middle shape may omit the rate keys:
-    projected_cost's unpriced pass returns before any reader of them.
+    prevent, so it is unpriced and projected_cost names it, with what
+    the spend ceiling does instead (models.UNREAD_ROUTE). The ceiling's
+    reservation does borrow it (trial_worst_case), by the operator's
+    ruling on the external review's H1: reserving nothing is how the
+    ceiling was passed, and the catalog's model rates are what the
+    trial's settlement will count. An unpinned model's entry is the
+    catalog's, None when the catalog has none.
+
+    Built for projected_cost, and read besides only by a trial's
+    reservation (trial_worst_case).
     """
     out: dict[str, Any] = {}
     for model in lineup:
@@ -5738,11 +6282,26 @@ def experiment_prices(
         rates, beyond = routes[model]["rates"], routes[model]["beyond"]
         if rates is not None:
             out[model] = {**rates, "beyond": beyond}
-        elif beyond:
-            out[model] = {"beyond": beyond}
         else:
-            out[model] = None
+            out[model] = {"unread": True, "beyond": beyond}
     return out
+
+
+def trial_worst_case(
+    model: str, budget: int, chars: dict[str, int] | None, route: dict[str, Any]
+) -> float | None:
+    """What one trial reserves against the spend ceiling: its route's two
+    rates, as its experiment's projection reads them (experiment_prices);
+    and, for a pinned route whose listing gave no rates the bench could
+    read, the catalog's model rates, which are what the trial's
+    settlement will count (the operator's ruling on the external review's
+    H1: a documented estimate over a documented overshoot). The
+    projection names that route as unpriced and says so
+    (models.UNREAD_ROUTE)."""
+    prices = experiment_prices([model], {model: route}, app.state.prices)
+    if (prices.get(model) or {}).get("unread"):
+        prices = app.state.prices
+    return call_worst_case(model, budget, chars, prices)
 
 
 async def trial_route(experiment: dict[str, Any], model: str) -> dict[str, Any]:
@@ -5932,7 +6491,7 @@ async def run_one_trial(
     controls: dict[str, Any],
     route: dict[str, Any],
     content: dict[str, Any],
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """One model against one task, through the machinery every run uses.
 
     content is the CELL'S composition, built once by the caller and
@@ -5949,9 +6508,10 @@ async def run_one_trial(
     cannot describe; a redacted form without the pins is a reference to
     documents nothing names.
 
-    The same semaphore, the same post-admission ceiling recheck, the same
-    settlement inside the held slot, the same never-raises client. The
-    runner gets no faster path and no larger share: an experiment
+    The same claim on the spend ceiling before it queues, the same
+    semaphore, the same recheck in the held slot, the same settlement
+    replacing the claim when the call ends, the same never-raises client.
+    The runner gets no faster path and no larger share: an experiment
     competing with a browser run for the five slots is correct, because
     both are spending the same money against the same ceiling.
 
@@ -5963,7 +6523,9 @@ async def run_one_trial(
 
     Returns the result dict. Never raises for an upstream failure, which
     is the same contract run_model and stream_model carry, because a
-    failed trial is data and must not end the experiment.
+    failed trial is data and must not end the experiment. None only when
+    the runner's stop arrived while the trial waited for room on the
+    spend ceiling: it never ran, and has no row.
     """
     # RESOLVED BEFORE THE BUDGET, which is the whole of U1's repair: the
     # pinned endpoint's published ceiling is an input to the arithmetic
@@ -5974,145 +6536,199 @@ async def run_one_trial(
     max_tokens = route_budget(
         effective_budget(experiment["budget"], model), route["completion_cap"]
     )
-    holder: dict[str, Any] = {}
-    parts: list[str] = []
-    first_delta_ms: float | None = None
-    acquired = False
-    result: dict[str, Any] | None = None
+    # THE CLAIM (P2): this trial's worst case against the ceiling, before
+    # it queues for a slot, priced at the rates of the route it will take,
+    # which is the figure the experiment's projection quoted for it: a
+    # pinned trial at its endpoint's own rates, with no fallback to the
+    # model's. Taken as the first step of a try that runs to the end of
+    # the function, because settlement comes after the slot is given back,
+    # so the finally that returns the claim has to outlast both.
+    worst = trial_worst_case(
+        model,
+        max_tokens,
+        call_chars(content["composed"], controls.get("system")),
+        route,
+    )
+    # A claim refused only for room that calls not yet settled hold waits
+    # for it, holding nothing, rather than being refused: that refusal
+    # would halt an experiment whose money has not run out. A Stop, or
+    # shutdown's, ends the wait before the trial ran, and it returns None,
+    # which the runner reads as a trial it never reached. A claim refused
+    # because this trial's worst case no longer fits beside recorded spend
+    # is refused at once, below, and by default halts the experiment.
+    stop = app.state.experiment_run["stop"]
+    held: object | None = None
     try:
-        await app.state.upstream_semaphore.acquire()
-        acquired = True
-        # The recheck every admitted run gets, before the clock and before
-        # any upstream call. An experiment is exactly the case this
-        # protects against: hundreds of trials admitted over minutes, with
-        # the ceiling crossed somewhere in the middle.
-        if spend_ceiling_reached():
-            # Set rather than returned, so the refusal falls through to
-            # the same persistence the other outcomes get. The endpoints
-            # deliberately persist nothing for a refusal; the runner must,
-            # because an experiment's report classifies every cell of its
-            # plan and a refusal with no row is indistinguishable from a
-            # cell that was never reached. The row is the refusal's only
-            # evidence: error text beside a NULL request_json, which is
-            # exactly what the era-gated derivation reads as "refused".
-            result = spend_refusal_result(model, max_tokens)
-        else:
-            start = time.perf_counter()
-            async for event in stream_model(
-                content["composed"],
-                model,
-                app.state.client,
-                max_tokens=max_tokens,
-                holder=holder,
-                provider_prefs=trial_provider_prefs(experiment, model, controls),
-                controls=controls,
-                # Rule two, exactly as both endpoints keep it: the record
-                # carries the composed STRUCTURE with a digest reference
-                # where each document sat, never a second copy of the
-                # content. None when nothing is attached, and the payload
-                # is then byte for byte what it was before this phase.
-                record_prompt=content["recorded"],
-                # Resolved above, from the same listing the budget was
-                # clamped against; see trial_route.
-                may_send_reasoning_cap=route["may_send_reasoning_cap"],
-            ):
-                if event["type"] == "done":
-                    result = event["result"]
-                    break
-                if first_delta_ms is None:
-                    first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
-                parts.append(event["text"])
-    finally:
-        # Released before persistence, exactly as the streaming endpoint
-        # releases before saving: a slot is for the upstream exchange, and
-        # holding one through a database write is a lie about how many
-        # paid calls are in flight.
-        if acquired:
-            app.state.upstream_semaphore.release()
-
-    if result is None:
-        # stream_model ended without a done event. Its own contract makes
-        # that nearly impossible, but "nearly" is not a thing to persist a
-        # silent success for: build the same shape the disconnect path
-        # builds, so the trial lands as the failure it was.
-        result = {
-            "model": model,
-            # The same predicate the client applies: whitespace is
-            # not a visible answer, so it is not stored as one.
-            # These rows already carry an explicit error, but
-            # response_text has to mean one thing everywhere or
-            # the judge and the scorer disagree with the card.
-            "response_text": visible_or_none(parts),
-            "latency_ms": None,
-            "prompt_tokens": None,
-            "completion_tokens": None,
-            "error": "stream ended without a terminal event",
-            # PARITY WITH A REAL RESULT. A field is omitted here
-            # only when a value would be a claim the server
-            # cannot make, and None is not a claim. The SSE done
-            # frame serializes this dict directly, so without
-            # these a stream client sees the keys on every real
-            # run and not on an aborted one.
-            "upstream_inference_cost_usd": None,
-            "is_byok": None,
-            "cost_usd": None,
-            "ttft_ms": first_delta_ms,
-            "max_tokens": max_tokens,
-            "generation_id": holder.get("generation_id"),
-            "request_json": holder.get("request_json"),
-            "provider": holder.get("provider"),
-        }
-    result["position"] = position
-    # Post-spend, so its own fault boundary: the call has happened and
-    # nothing here may turn a paid result into an error. A refusal skips
-    # it entirely rather than settling to zero: no call happened, so there
-    # is nothing to price and nothing to add to the ceiling, and running
-    # the settlement anyway would put a refusal into the spend record as
-    # a zero-cost call that was made.
-    if not result.get("spend_refused"):
+        held = reserve_spend(worst)
+        # Why this wait ends, and why no timeout bounds it: see
+        # wait_for_spend_room.
+        while held is None and spend_room_held_by_others(worst) and not stop.is_set():
+            await wait_for_spend_room(stop)
+            held = reserve_spend(worst)
+        if held is None and stop.is_set():
+            return None
+        holder: dict[str, Any] = {}
+        parts: list[str] = []
+        first_delta_ms: float | None = None
+        acquired = False
+        result: dict[str, Any] | None = None
         try:
-            result["cost_usd"] = cost_usd(result, app.state.prices)
-            record_spend(ceiling_cost(result))
+            if held is None:
+                # Refused at its claim, and nothing is held. Set rather
+                # than returned, for the reason the refusal below gives.
+                result = admission_refusal_result(model, max_tokens, worst)
+            else:
+                await app.state.upstream_semaphore.acquire()
+                acquired = True
+                # The recheck every admitted run gets, before the clock and
+                # before any upstream call. The claim above still fits
+                # unless something settled above its own claim, or claimed
+                # nothing, while this trial waited; if that carried recorded
+                # spend to the limit, the trial is refused before it spends.
+                if spend_ceiling_reached():
+                    # Set rather than returned, so the refusal falls through
+                    # to the same persistence the other outcomes get. The
+                    # endpoints deliberately persist nothing for a refusal;
+                    # the runner must, because an experiment's report
+                    # classifies every cell of its plan and a refusal with
+                    # no row is indistinguishable from a cell that was never
+                    # reached. The row is the refusal's only evidence: error
+                    # text beside a NULL request_json, which is exactly what
+                    # the era-gated derivation reads as "refused".
+                    result = spend_refusal_result(model, max_tokens)
+            if result is None:
+                start = time.perf_counter()
+                async for event in stream_model(
+                    content["composed"],
+                    model,
+                    app.state.client,
+                    max_tokens=max_tokens,
+                    holder=holder,
+                    provider_prefs=trial_provider_prefs(experiment, model, controls),
+                    controls=controls,
+                    # Rule two, exactly as both endpoints keep it: the record
+                    # carries the composed STRUCTURE with a digest reference
+                    # where each document sat, never a second copy of the
+                    # content. None when nothing is attached, and the payload
+                    # is then byte for byte what it was before this phase.
+                    record_prompt=content["recorded"],
+                    # Resolved above, from the same listing the budget was
+                    # clamped against; see trial_route.
+                    may_send_reasoning_cap=route["may_send_reasoning_cap"],
+                ):
+                    if event["type"] == "done":
+                        result = event["result"]
+                        break
+                    if first_delta_ms is None:
+                        first_delta_ms = round((time.perf_counter() - start) * 1000, 1)
+                    parts.append(event["text"])
+        finally:
+            # Released before persistence, exactly as the streaming endpoint
+            # releases before saving: a slot is for the upstream exchange, and
+            # holding one through a database write is a lie about how many
+            # paid calls are in flight.
+            if acquired:
+                app.state.upstream_semaphore.release()
+
+        if result is None:
+            # stream_model ended without a done event. Its own contract makes
+            # that nearly impossible, but "nearly" is not a thing to persist a
+            # silent success for: build the same shape the disconnect path
+            # builds, so the trial lands as the failure it was.
+            result = {
+                "model": model,
+                # The same predicate the client applies: whitespace is
+                # not a visible answer, so it is not stored as one.
+                # These rows already carry an explicit error, but
+                # response_text has to mean one thing everywhere or
+                # the judge and the scorer disagree with the card.
+                "response_text": visible_or_none(parts),
+                "latency_ms": None,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "error": "stream ended without a terminal event",
+                # PARITY WITH A REAL RESULT. A field is omitted here
+                # only when a value would be a claim the server
+                # cannot make, and None is not a claim. The SSE done
+                # frame serializes this dict directly, so without
+                # these a stream client sees the keys on every real
+                # run and not on an aborted one.
+                "upstream_inference_cost_usd": None,
+                "is_byok": None,
+                "cost_usd": None,
+                "ttft_ms": first_delta_ms,
+                "max_tokens": max_tokens,
+                "generation_id": holder.get("generation_id"),
+                "request_json": holder.get("request_json"),
+                "provider": holder.get("provider"),
+            }
+        result["position"] = position
+        # Post-spend, so its own fault boundary: the call has happened and
+        # nothing here may turn a paid result into an error. A refusal skips
+        # it entirely rather than settling to zero: no call happened, so there
+        # is nothing to price and nothing to add to the ceiling, and running
+        # the settlement anyway would put a refusal into the spend record as
+        # a zero-cost call that was made.
+        if not result.get("spend_refused"):
+            try:
+                result["cost_usd"] = cost_usd(result, app.state.prices)
+                settle_spend(held, ceiling_cost(result))
+            except Exception:
+                logger.exception("settlement failed for %s", model)
+                result["cost_usd"] = None
+        try:
+            store.save_run(
+                app.state.db,
+                task["prompt"],
+                [result],
+                None,
+                group_id,
+                run_provenance(),
+                # What THIS trial actually sent. Redundant with the group's
+                # pin here, since the runner writes both from one frozen
+                # declaration, and recorded anyway because every other
+                # writer records it and a row that answered differently
+                # depending on who wrote it would be a worse record than one
+                # that repeats itself.
+                renditions=content["pins"] or None,
+            )
         except Exception:
-            logger.exception("settlement failed for %s", model)
-            result["cost_usd"] = None
-    try:
-        store.save_run(
-            app.state.db,
-            task["prompt"],
-            [result],
-            None,
-            group_id,
-            run_provenance(),
-            # What THIS trial actually sent. Redundant with the group's
-            # pin here, since the runner writes both from one frozen
-            # declaration, and recorded anyway because every other
-            # writer records it and a row that answered differently
-            # depending on who wrote it would be a worse record than one
-            # that repeats itself.
-            renditions=content["pins"] or None,
-        )
-    except Exception:
-        # Same rule as both endpoints: the money is already spent, and
-        # losing history must not lose the response. The counters still
-        # move, so progress stays honest about what was attempted.
-        logger.exception("failed to persist experiment trial for %s", model)
-    return result
+            # Same rule as both endpoints: the money is already spent, and
+            # losing history must not lose the response. The counters still
+            # move, so progress stays honest about what was attempted.
+            logger.exception("failed to persist experiment trial for %s", model)
+        return result
+    finally:
+        # Whatever ended the trial, its claim goes back: settled above,
+        # this is a no-op; otherwise the trial counts nothing.
+        release_spend(held)
 
 
 # What a run says when the PROCESS ended rather than the run. Written by
-# the two cancellation handlers in run_experiment; the lifespan's
-# stale-row sweep says its own thing, because "a previous process left
-# this row behind" and "this process is shutting down now" are different
-# facts and the second one knows more.
+# the cancellation handlers in run_experiment; the lifespan's stale-row
+# sweep says its own thing, because "a previous process left this row
+# behind" and "this process is shutting down now" are different facts
+# and the second one knows more.
 #
 # Not "stopped" and not "failed". Nobody asked this experiment to end and
-# nothing about it went wrong: its completed trials are real, its
-# in-flight trial was paid for and persisted, and the rest never ran.
+# nothing about it went wrong: its completed trials are real, and the
+# rest never ran. INTERRUPTED_BY_SHUTDOWN is for a trial that went
+# upstream, which was paid for and persisted before the runner finished.
+# INTERRUPTED_WAITING_FOR_ROOM is for one that was waiting for room on
+# the spend ceiling when shutdown's stop came (the external review's M10):
+# it was never sent and has no row, and the other sentence would say it
+# was persisted. (The outer cancellation handler, a cancel landing
+# outside the trial, still writes the first; BACKLOG, "A run cut off
+# before a trial went out says one was persisted".)
 INTERRUPTED_BY_SHUTDOWN = (
     "this process shut down while the experiment was running; the trial "
     "in flight was settled and persisted before the runner finished, and "
     "the remaining trials never ran"
+)
+INTERRUPTED_WAITING_FOR_ROOM = (
+    "this process shut down while the experiment was running, while a "
+    "trial waited for room on the spend ceiling; that trial was never "
+    "sent and has no row, and the remaining trials never ran"
 )
 
 
@@ -6378,6 +6994,18 @@ async def run_experiment(experiment_id: int) -> None:
                 except asyncio.CancelledError:
                     result = await trial
                     interrupted = True
+                if result is None:
+                    # Stopped while it waited for room on the spend
+                    # ceiling, before it claimed any or went upstream: a
+                    # trial this run never reached, with no row and no
+                    # counter, exactly as the stop between trials leaves
+                    # the next one.
+                    if interrupted:
+                        status, detail = "interrupted", INTERRUPTED_WAITING_FOR_ROOM
+                    else:
+                        status, detail = "stopped", "stopped between trials"
+                    halted = True
+                    break
                 refused = bool(result.get("spend_refused"))
                 failed = not refused and result.get("error") is not None
                 # Three disjoint buckets, which is what the conservation
@@ -6411,17 +7039,23 @@ async def run_experiment(experiment_id: int) -> None:
                     break
                 if refused and experiment["halt_on_refusal"]:
                     # The default. A ceiling refusal means the money ran
-                    # out, and continuing would produce a record whose
-                    # later rows are all refusals: technically honest,
-                    # practically noise, and expensive in wall time. The
+                    # out, for this trial's worst case at least, since a
+                    # trial waits out room that other calls hold rather
+                    # than being refused for it; continuing would produce a
+                    # record whose later rows are all refusals: technically
+                    # honest, practically noise, and expensive in wall
+                    # time. The
                     # un-run remainder is visible through the same
                     # declared-but-missing machinery a partial comparison
                     # already uses.
                     status = "halted_on_refusal"
+                    # Said without saying which check refused it: the
+                    # ceiling reached, or no room left for this trial's
+                    # worst case. The trial's own row names the figures.
                     detail = (
-                        "the per-boot spend ceiling was reached; "
-                        f"{model} on task {task['id']} was refused before "
-                        "reaching upstream"
+                        f"the per-boot spend ceiling refused {model} on task "
+                        f"{task['id']} before it reached upstream; the "
+                        "trial's row names the figures"
                     )
                     halted = True
                     break
@@ -6572,7 +7206,112 @@ async def experiment_progress(experiment_id: int) -> StreamingResponse:
     return StreamingResponse(frames(), media_type="text/event-stream")
 
 
-async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
+# HOW LONG SHUTDOWN WAITS FOR A SCORING PASS before cutting it. Asked to
+# stop, a pass finishes the trial in hand and stops; this bounds that
+# wait. Two facts fix it between two numbers. It is shorter than the
+# judge's own timeout (models.JUDGE_TIMEOUT_S, 60 s), so a slow judge
+# call does not hold shutdown for its whole timeout: it is cut, and
+# recorded as stopped with its pass. It is longer than the ten seconds a
+# typical supervisor allows between asking a process to stop and killing
+# it, so under one of those the kill usually comes first, and then
+# nothing here runs at all: the pass and its open call are left for the
+# next boot's sweep, which records them interrupted. Read at call time,
+# so a test can shorten it.
+SCORING_SHUTDOWN_SECONDS = 30.0
+
+# A pass's recorded endings, each saying who ended it.
+PASS_STOPPED_ON_REQUEST = "stopped on request, between trials"
+PASS_STOPPED_AT_SHUTDOWN = "stopped between trials because the bench was shutting down"
+
+
+def pass_cut_at_shutdown() -> str:
+    return (
+        "cut off because the bench was shutting down and the trial in hand "
+        f"had not finished within {SCORING_SHUTDOWN_SECONDS:g} seconds"
+    )
+
+
+CALL_CUT_AT_SHUTDOWN = "cut off before a reply because the bench was shutting down"
+CALL_CUT_WHILE_REPLYING = (
+    "cut off while its reply was arriving, because the bench was shutting down"
+)
+
+
+def unwritten_ending(outcome: str, replied: bool, exc: Exception) -> str:
+    """The detail of a judge call whose ending could not be written: what
+    happened to the request, then that its record's write failed and why.
+    The request was not interrupted; its record was (the operator's ruling
+    at P1's checkpoint), and a reader must not take this for the boot
+    sweep's "found open at boot"."""
+    if outcome == "answered":
+        happened = "the answer arrived"
+    elif outcome == "failed":
+        happened = (
+            "a reply arrived and could not be used"
+            if replied
+            else "it failed after it was sent"
+        )
+    elif outcome == "stopped":
+        happened = (
+            "it was cut off at shutdown while its reply was arriving"
+            if replied
+            else "it was cut off at shutdown"
+        )
+    else:
+        happened = {
+            "timed_out": "it timed out",
+            "not_sent": "it was never sent",
+        }.get(outcome, f"it ended {outcome}")
+    return f"{happened}; its write failed: {type(exc).__name__}: {exc}"
+
+
+def _pass_view(row: dict[str, Any]) -> dict[str, Any]:
+    """A scoring_passes row as ScoringPass, with this process's flags."""
+    state = app.state.scoring_run
+    running = state["pass_id"] is not None and state["pass_id"] == row["id"]
+    return {
+        "id": row["id"],
+        "judge_model": row["judge_model"],
+        "started_at": row["started_at"],
+        "ended_at": row["ended_at"],
+        "outcome": row["outcome"],
+        "detail": row["detail"],
+        "scored": row["scored"],
+        "failed": row["failed"],
+        "unanswered": row["unanswered"],
+        "unusable": row["unusable"],
+        "unknown": row["unknown"],
+        "history_counted": row["history_counted"],
+        "running": running,
+        "stopping": running and state["stop"].is_set(),
+    }
+
+
+def _scorable_trials(
+    db: sqlite3.Connection, experiment_id: int, tasks: dict[str, dict[str, Any]]
+) -> Iterator[tuple[dict[str, Any], dict[str, Any]]]:
+    """Every trial the pass will score, with its task, in trial order.
+
+    A task the dataset no longer has, or one with no scorer, contributes
+    nothing and writes no row. Each store call inside materializes before
+    it returns, so this generator holds no cursor across the awaits of
+    the loop that drives it.
+    """
+    for group in store.experiment_groups(db, experiment_id):
+        task = tasks.get(group["task_id"])
+        if task is None or task["scorer"] is None:
+            continue
+        detail = store.get_group(db, group["id"])
+        if detail is None:
+            continue
+        for run in detail["runs"]:
+            for result in run["results"]:
+                yield task, result
+
+
+async def score_experiment(
+    experiment_id: int, pass_id: int, judge_model: str | None
+) -> None:
     """Score every trial of an experiment, deterministic and judged alike.
 
     Re-runnable and idempotent per (result, scorer, judge_model): a second
@@ -6591,9 +7330,21 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
     pass for one would trade a complete scoring run for nothing. That
     later pass sends every judge result that has response text to the
     judge again, not only the gaps, and pays for each call.
+
+    THE PASS IS A RECORD. pass_id is its scoring_passes row, opened by the
+    Score door, and this function ends it exactly once, in the finally,
+    with the outcome of what actually happened: stopped only when a stop
+    was found with a trial still to score, or when shutdown cut the pass;
+    failed when something raised; finished otherwise. A Stop that lands
+    after the last trial began changes nothing about a pass that then
+    scored every trial, so it is not read after the loop.
     """
     db = app.state.db
     state = app.state.scoring_run
+    outcome, detail = "finished", None
+    # A call whose ending could not be written, by id, with what the pass
+    # knew of it; the close records that in the call's ending.
+    unrecorded: dict[int, store.UnwrittenEnding] = {}
     # EVERYTHING THE PASS DOES IS INSIDE THE TRY, its first read included.
     # The finally below is the only thing that ever frees the one scoring
     # slot, so a statement that could raise before it would leave the slot
@@ -6610,41 +7361,72 @@ async def score_experiment(experiment_id: int, judge_model: str | None) -> None:
         # the report rather than to refuse the pass: the user may have
         # good reason, and a silent absorption is what would be wrong.
         self_judged = judge_model is not None and judge_model in experiment["lineup"]
-        for group in store.experiment_groups(db, experiment_id):
-            if state["stop"].is_set():
+        # Between trials, and a stop found with a trial still to score is
+        # the only way this loop ends early.
+        for task, result in _scorable_trials(db, experiment_id, state["tasks"]):
+            if state["stop"].is_set() or not await score_one_result(
+                experiment_id,
+                pass_id,
+                task,
+                result,
+                judge_model,
+                self_judged,
+                unrecorded,
+            ):
+                outcome = "stopped"
+                detail = (
+                    PASS_STOPPED_AT_SHUTDOWN
+                    if state["stop_reason"] == "shutdown"
+                    else PASS_STOPPED_ON_REQUEST
+                )
                 break
-            task = state["tasks"].get(group["task_id"])
-            if task is None or task["scorer"] is None:
-                continue
-            detail = store.get_group(db, group["id"])
-            if detail is None:
-                continue
-            for run in detail["runs"]:
-                for result in run["results"]:
-                    await score_one_result(
-                        experiment_id, task, result, judge_model, self_judged
-                    )
+    except asyncio.CancelledError:
+        # Only shutdown cancels a pass, and only once its bound ran out.
+        outcome, detail = "stopped", pass_cut_at_shutdown()
+        raise
     except Exception as exc:
         logger.exception("scoring pass for experiment %s failed", experiment_id)
         state["error"] = f"{type(exc).__name__}: {exc}"
+        outcome, detail = "failed", state["error"]
     finally:
-        state["active"] = None
+        # The ending is written once, here, and a failure to write it must
+        # not keep the slot: that would be L8's defect one line later. The
+        # pass then stays open in the record, and the next boot's sweep
+        # closes it as interrupted.
+        try:
+            store.close_scoring_pass(
+                db, pass_id, outcome, detail, unrecorded=unrecorded
+            )
+        except Exception:
+            logger.exception(
+                "the end of scoring pass %s could not be recorded", pass_id
+            )
+        finally:
+            state["active"] = None
+            state["pass_id"] = None
 
 
 async def score_one_result(
     experiment_id: int,
+    pass_id: int,
     task: dict[str, Any],
     result: dict[str, Any],
     judge_model: str | None,
     self_judged: bool,
-) -> None:
-    """Score one stored result, writing exactly one row.
+    unrecorded: dict[int, store.UnwrittenEnding],
+) -> bool:
+    """Score one stored result, writing exactly one row. Returns False,
+    having written nothing, only when a stop arrived while the trial
+    waited for a slot and before any request was made for it.
 
     Every path writes a row, including the failures. A scoring pass that
     silently skipped what it could not score would leave the report
     unable to tell "not scored yet" from "scored and unscorable", and
-    those are different facts about the same trial.
+    those are different facts about the same trial. Every row cites the
+    pass; a judged row cites the judge call too, and the call, not the
+    row, holds the generation id and the charge.
     """
+    db = app.state.db
     spec = task["scorer"]
     kind = spec["kind"]
     if kind != "judge":
@@ -6659,7 +7441,7 @@ async def score_one_result(
             score_response, spec, task["reference"], result["response_text"]
         )
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": kind,
@@ -6668,29 +7450,31 @@ async def score_one_result(
                 "detail": verdict["detail"],
                 "blind": None,
                 "self_judged": None,
+                "pass_id": pass_id,
             },
         )
-        return
+        return True
 
     if judge_model is None:
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": "judge",
                 "score": None,
                 "passed": None,
                 "detail": "no judge model was given for this scoring pass",
+                "pass_id": pass_id,
             },
         )
-        return
+        return True
 
     # The ceiling applies to judge calls because judge calls are spend.
     # A refusal here is this result's scoring failure and the pass goes
     # on; see score_experiment for why that differs from a trial refusal.
     def refuse_for_ceiling() -> None:
         store.add_score(
-            app.state.db,
+            db,
             result["id"],
             {
                 "scorer": "judge",
@@ -6703,6 +7487,7 @@ async def score_one_result(
                 ),
                 "judge_model": judge_model,
                 "self_judged": self_judged,
+                "pass_id": pass_id,
             },
         )
 
@@ -6710,55 +7495,246 @@ async def score_one_result(
     # not spend minutes waiting for slots it will refuse anyway.
     if spend_ceiling_reached():
         refuse_for_ceiling()
-        return
+        return True
 
-    async with app.state.upstream_semaphore:
-        # And again inside the held slot, which is the check that actually
-        # protects the money. Admission is not permission to spend: this
-        # call can sit behind five others for as long as they take, and a
-        # pass over three hundred results is exactly the case where the
-        # ceiling is crossed during that wait. Checking only before the
-        # queue is the F1.2 defect, one layer up.
-        if spend_ceiling_reached():
-            refuse_for_ceiling()
-            return
-        verdict = await judge_response(
-            app.state.client,
-            judge_model,
-            task["rubric"],
-            task["reference"],
-            result["response_text"],
-            # Routed-service prefs even under the underlying-model
-            # estimand. The estimand is a claim about the models being
-            # MEASURED; the judge is the bench's own instrument and is
-            # not one of them, and pinning it to a provider chosen for
-            # somebody else's lineup would be a claim nobody made.
-            provider_prefs=app.state.provider_prefs,
+    # THE CALL'S CLAIM ON THE CEILING (P2, the operator's ruling R2): a
+    # judge call reserves and settles like a trial, at its own completion
+    # budget (JUDGE_MAX_TOKENS) and the judge's catalog price, plus the two
+    # messages it will send, weighed as a trial's are. A trial with no text
+    # makes no request, so it claims nothing and cannot be refused for
+    # want of room.
+    sends = judge_would_send(result["response_text"])
+    worst: float | None = None
+    if sends:
+        system, user = judge_messages(
+            task["rubric"], task["reference"], result["response_text"]
         )
-    # Post-spend. The call has happened, so nothing below may turn a paid
-    # verdict into an exception, and the charge is recorded whether or not
-    # the verdict parsed.
+        worst = call_worst_case(
+            judge_model,
+            JUDGE_MAX_TOKENS,
+            {"prompt": len(user["content"]), "system": len(system["content"])},
+            app.state.prices,
+        )
+    held: object | None = None
+
+    # THE CALL IS RECORDED BEFORE IT GOES OUT. judge_response calls this
+    # immediately before handing the request to the client, and only when
+    # it is about to make one, so the row exists whatever happens to the
+    # request: a timeout, a cut at shutdown, a crash. If the record cannot
+    # be written the request is not made, and the pass fails.
+    call_id: int | None = None
+    # When the judge's reply began to arrive, on the store's clock: the
+    # call's answer time, written by whichever write ends the call, its own
+    # or the pass's close, so no later time is ever recorded for it.
+    replied_at: str | None = None
+
+    def sending() -> None:
+        nonlocal call_id
+        call_id = store.record_judge_call_sent(db, pass_id, result["id"], judge_model)
+
+    def replying() -> None:
+        nonlocal replied_at
+        replied_at = store.now()
+
+    def end_call_unsettled(outcome: str, detail: str) -> None:
+        # For the paths that leave this function by an exception: the
+        # call's ending is written if it can be, and the exception that is
+        # propagating is never replaced by a failure to write it.
+        if call_id is None:
+            return
+        try:
+            store.record_judge_call_answer(
+                db, call_id, outcome, answered_at=replied_at, detail=detail
+            )
+        except Exception as exc:
+            logger.exception(
+                "the ending of judge call %s could not be recorded", call_id
+            )
+            unrecorded[call_id] = store.UnwrittenEnding(
+                outcome=outcome,
+                answered_at=replied_at,
+                detail=unwritten_ending(outcome, replied_at is not None, exc),
+            )
+
+    def settle(verdict: dict[str, Any]) -> None:
+        # Post-spend. The call has happened, so its claim is replaced with
+        # what it cost first, whether or not the verdict parsed and whether
+        # or not the writes after it succeed: the billed figure, or, when
+        # the reply carried none, the catalog estimate over the counts the
+        # reply reported, as ceiling_cost decides for a trial (R2).
+        try:
+            settle_spend(held, judge_ceiling_cost(verdict, judge_model))
+        except Exception:
+            logger.exception("judge settlement failed")
+        if call_id is not None:
+            try:
+                store.record_judge_call_answer(
+                    db,
+                    call_id,
+                    verdict["outcome"],
+                    answered_at=replied_at,
+                    generation_id=verdict["generation_id"],
+                    billed_cost_usd=verdict["billed_cost_usd"],
+                    detail=(
+                        None if verdict["outcome"] == "answered" else verdict["error"]
+                    ),
+                    prompt_tokens=verdict["prompt_tokens"],
+                    completion_tokens=verdict["completion_tokens"],
+                )
+            except Exception as exc:
+                # The pass fails on this; its close records the call as
+                # interrupted with this sentence and everything the verdict
+                # knew, so the record says what came back and that only its
+                # record's write failed, and the counts place it by that.
+                unrecorded[call_id] = store.UnwrittenEnding(
+                    outcome=verdict["outcome"],
+                    answered_at=replied_at,
+                    detail=unwritten_ending(
+                        verdict["outcome"], replied_at is not None, exc
+                    ),
+                    generation_id=verdict["generation_id"],
+                    billed_cost_usd=verdict["billed_cost_usd"],
+                    prompt_tokens=verdict["prompt_tokens"],
+                    completion_tokens=verdict["completion_tokens"],
+                )
+                raise
+        store.add_score(
+            db,
+            result["id"],
+            {
+                "scorer": "judge",
+                "score": verdict["score"],
+                # From the task's own threshold when its author declared
+                # one, and None otherwise. judge_response cannot decide
+                # this: it is a client function and has never seen the
+                # dataset spec.
+                "passed": judged_pass(spec, verdict["score"]),
+                "detail": verdict["error"] or verdict["detail"],
+                "judge_model": judge_model,
+                "self_judged": self_judged,
+                "judge_call_id": call_id,
+                "pass_id": pass_id,
+            },
+        )
+
+    # THE CLAIM IS TAKEN AS THE FIRST STEP INSIDE THE TRY WHOSE FINALLY
+    # GIVES IT BACK, so every way out of this call, a refusal, a stop, a
+    # raise before or after the request, a cut at shutdown, releases what
+    # settlement did not consume.
+    stop = app.state.scoring_run["stop"]
     try:
-        record_spend(as_money(verdict["billed_cost_usd"]))
-    except Exception:
-        logger.exception("judge settlement failed")
-    store.add_score(
-        app.state.db,
-        result["id"],
-        {
-            "scorer": "judge",
-            "score": verdict["score"],
-            # From the task's own threshold when its author declared one,
-            # and None otherwise. judge_response cannot decide this: it is
-            # a client function and has never seen the dataset spec.
-            "passed": judged_pass(spec, verdict["score"]),
-            "detail": verdict["error"] or verdict["detail"],
-            "judge_model": judge_model,
-            "judge_generation_id": verdict["generation_id"],
-            "judge_billed_cost_usd": verdict["billed_cost_usd"],
-            "self_judged": self_judged,
-        },
-    )
+        if sends:
+            held = reserve_spend(worst)
+            # Room that calls not yet settled hold is waited for, holding
+            # nothing, as a trial waits: refusing for it would write every
+            # remaining trial of the pass as a gap in one step of the loop,
+            # since nothing else runs between them. A Stop, or shutdown's,
+            # ends the wait, and this call was never sent. Why the wait
+            # ends, and why no timeout bounds it: see wait_for_spend_room.
+            while (
+                held is None and spend_room_held_by_others(worst) and not stop.is_set()
+            ):
+                await wait_for_spend_room(stop)
+                held = reserve_spend(worst)
+            if held is None and stop.is_set():
+                return False
+            if held is None and spend_ceiling_reached():
+                refuse_for_ceiling()
+                return True
+            if held is None:
+                store.add_score(
+                    db,
+                    result["id"],
+                    {
+                        "scorer": "judge",
+                        "score": None,
+                        "passed": None,
+                        "detail": (
+                            "the per-boot spend ceiling had no room for this "
+                            "judge call before this result could be judged: "
+                            f"{spend_no_room(spend_claim_phrase(worst, 'this call'))}"
+                            "; re-run the scoring pass to fill it in"
+                        ),
+                        "judge_model": judge_model,
+                        "self_judged": self_judged,
+                        "pass_id": pass_id,
+                    },
+                )
+                return True
+        async with app.state.upstream_semaphore:
+            # And again inside the held slot. Admission is not permission to
+            # spend: this call can sit behind five others for as long as they
+            # take, and a call that settled above its claim, or claimed
+            # nothing, can carry recorded spend to the limit during that
+            # wait; a pass over three hundred results is exactly the case
+            # where it happens. Checking only before the queue is the F1.2
+            # defect, one layer up.
+            if spend_ceiling_reached():
+                refuse_for_ceiling()
+                return True
+            # And the stop, for the same reason: a Stop that arrived while
+            # this trial waited for a slot is honoured before anything is
+            # sent, so nothing is lost by not sending it. A call already in
+            # flight is never cut by a Stop; only shutdown's bound does that.
+            if stop.is_set():
+                return False
+            # SHIELDED, so the only cancellation that reaches the call is the
+            # one decided below. A reply that arrived in the same turn as
+            # shutdown's cut is kept and recorded as answered; one still on
+            # the wire is abandoned and recorded as stopped, with the time
+            # its reply began to arrive when it had.
+            judging = asyncio.ensure_future(
+                judge_response(
+                    app.state.client,
+                    judge_model,
+                    task["rubric"],
+                    task["reference"],
+                    result["response_text"],
+                    # Routed-service prefs even under the underlying-model
+                    # estimand. The estimand is a claim about the models being
+                    # MEASURED; the judge is the bench's own instrument and is
+                    # not one of them, and pinning it to a provider chosen for
+                    # somebody else's lineup would be a claim nobody made.
+                    provider_prefs=app.state.provider_prefs,
+                    sending=sending,
+                    replying=replying,
+                )
+            )
+            try:
+                verdict = await asyncio.shield(judging)
+            except asyncio.CancelledError:
+                if not judging.done():
+                    judging.cancel()
+                    end_call_unsettled(
+                        "stopped",
+                        CALL_CUT_AT_SHUTDOWN
+                        if replied_at is None
+                        else CALL_CUT_WHILE_REPLYING,
+                    )
+                elif judging.cancelled() or judging.exception() is not None:
+                    end_call_unsettled(
+                        "failed", "the judge call ended as the pass was cut"
+                    )
+                else:
+                    try:
+                        settle(judging.result())
+                    except Exception:
+                        logger.exception(
+                            "a judge answer at shutdown could not be recorded"
+                        )
+                raise
+            except Exception as exc:
+                # Nothing judge_response raises is an HTTP outcome (those it
+                # returns), so whether this request left is not known: counted
+                # as sent, the side on which money may have moved.
+                end_call_unsettled(
+                    "failed", f"judge request failed: {type(exc).__name__}"
+                )
+                raise
+        settle(verdict)
+        return True
+    finally:
+        release_spend(held)
 
 
 @app.post("/experiments/{experiment_id}/score", status_code=202)
@@ -6782,6 +7758,8 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
     # and the claim) await, and two requests can both pass this check and
     # start two passes over the one slot, one graded against the other's
     # tasks. test_two_scores_sent_at_once_start_one_pass sends two at once.
+    # The pass's record is opened in the same step, and the store is
+    # synchronous by contract, which is what keeps that true.
     if state["active"] is not None:
         raise HTTPException(
             409, f"a scoring pass for experiment {state['active']} is running"
@@ -6793,14 +7771,58 @@ async def start_scoring(experiment_id: int, body: ScoringStart) -> dict[str, Any
         "Scoring against different tasks would attribute one rubric's "
         "verdict to another's trial.",
     )
+    pass_id = store.open_scoring_pass(app.state.db, experiment_id, body.judge_model)
     state["active"] = experiment_id
+    state["pass_id"] = pass_id
     state["stop"] = asyncio.Event()
+    state["stop_reason"] = None
     state["error"] = None
     state["tasks"] = {t["id"]: t for t in dataset["tasks"]}
     state["task"] = asyncio.create_task(
-        score_experiment(experiment_id, body.judge_model)
+        score_experiment(experiment_id, pass_id, body.judge_model)
     )
-    return {"id": experiment_id, "status": "scoring"}
+    return {"id": experiment_id, "status": "scoring", "pass_id": pass_id}
+
+
+@app.post("/experiments/{experiment_id}/scoring/stop", status_code=202)
+async def stop_scoring(experiment_id: int) -> dict[str, Any]:
+    """Ask the running scoring pass to stop between trials.
+
+    Between trials, never inside one, as the runner's Stop is: a judge
+    call already sent has already cost money, and abandoning it would
+    throw away a verdict that was paid for. A trial still waiting for a
+    slot, or for room on the spend ceiling, sends nothing. If a trial is
+    left unscored, the pass then ends as stopped, and the record says it
+    was asked to. A Stop that comes after the last trial's call was sent
+    leaves nothing unscored, and the pass ends as finished, as
+    score_experiment's docstring says (the external review's L5).
+    """
+    ensure_rowid(experiment_id)
+    state = app.state.scoring_run
+    if state["active"] != experiment_id:
+        raise HTTPException(
+            409, f"no scoring pass for experiment {experiment_id} is running"
+        )
+    _ask_scoring_to_stop("request")
+    return {"id": experiment_id, "pass_id": state["pass_id"], "status": "stopping"}
+
+
+@app.get("/experiments/{experiment_id}/scoring", response_model=ScoringRecord)
+async def experiment_scoring(experiment_id: int) -> dict[str, Any]:
+    """Every scoring pass over an experiment, newest first, and the one
+    running now if any, from the record."""
+    ensure_rowid(experiment_id)
+    if store.get_experiment(app.state.db, experiment_id) is None:
+        raise HTTPException(404, "no such experiment")
+    passes = [
+        _pass_view(row)
+        for row in reversed(store.scoring_passes_for(app.state.db, experiment_id))
+    ]
+    return {
+        "experiment_id": experiment_id,
+        "active": next((p for p in passes if p["running"]), None),
+        "passes": passes,
+    }
 
 
 @app.get("/models", response_model=CatalogResponse)
@@ -6817,6 +7839,7 @@ async def get_models() -> dict[str, Any]:
         "snapshots_off_reason": "" if enabled else SNAPSHOTS_OFF,
         "clones_enabled": not clones_off,
         "clones_off_reason": clones_off,
+        "spend": spend_figures(),
     }
 
 
@@ -7418,10 +8441,96 @@ def enforce_snapshot_root(
             "rather than whatever path a request names.",
         )
     # Below the deepest entry holding it, which is the one the operator
-    # named most exactly: an entry named inside .git is theirs to walk.
+    # named most exactly: an entry named inside .hg or .svn is theirs to
+    # walk, and one inside .git never booted (_refuse_entries_inside_git).
     if snapshot.vcs_below(real, snapshot_entry(real, holding)):
         raise HTTPException(403, ROOT_IN_VCS)
     return real
+
+
+def _root_identities(roots: Sequence[str]) -> dict[str, snapshot.Identity]:
+    """Each allowlist entry's (device, inode) as boot finds it, for the
+    look above a snapshot root (Phase P, P3). An entry that cannot be
+    described is left out, and the look then climbs past where it would
+    have stopped, to the top of the filesystem, refusing more and never
+    less."""
+    identities: dict[str, snapshot.Identity] = {}
+    for entry in roots:
+        try:
+            seen = os.stat(entry)
+        except OSError:
+            continue
+        identities[entry] = (seen.st_dev, seen.st_ino)
+    return identities
+
+
+# What boot says of an entry the climb above it refuses or cannot
+# finish. The first is the operator's ruling on the external review at
+# 1d91670; the others follow the look's rule that what it cannot clear
+# it refuses, never walks.
+ENTRY_INSIDE_GIT_DIRECTORY = (
+    "sits inside a git directory: a directory above it holds HEAD, config, "
+    "objects and refs, so every root under it would be inside one, and the "
+    "snapshot doors look above a root only as far as its entry. Name a "
+    "directory that is not inside a repository's git directory."
+)
+ENTRY_NOT_CLEARED = (
+    "could not be checked for a git directory above it, so it is not allowed unchecked"
+)
+
+
+def _refuse_entries_inside_git(roots: Sequence[str]) -> None:
+    """Refuse at boot an allowlist entry that sits inside a git directory.
+
+    The look above a snapshot root (snapshot.look_above) stops at the
+    root's entry, as the commission asked, so a git directory above an
+    entry is one no request looks for: every root under that entry would
+    be walked, git's own files among them. The operator ruled such an
+    entry refused at boot (on the external review at 1d91670), so each
+    entry is climbed once here, by the look itself, from the entry's own
+    handle to the top of the filesystem. An entry that is itself a git
+    directory is not refused here: the look checks the entry, and the
+    walk refuses a root that is one, so every root under it is refused
+    at the doors. A climb that cannot finish (a directory above
+    unreadable, or past the look's width or depth) refuses the entry
+    too, in ENTRY_NOT_CLEARED's words and the look's own.
+    """
+    for entry in roots:
+        tree = DescriptorTree(entry)
+        try:
+            handle = tree.open_root()
+        except snapshot.SnapshotError as exc:
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_NOT_CLEARED}: {exc}"
+            ) from None
+        try:
+            snapshot.look_above(tree, handle, None)
+        except snapshot.SnapshotError as exc:
+            if str(exc) == snapshot.ROOT_INSIDE_GIT_DIRECTORY:
+                raise RuntimeError(
+                    f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_INSIDE_GIT_DIRECTORY}"
+                ) from None
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_NOT_CLEARED}: {exc}"
+            ) from None
+        finally:
+            tree.close_handle(handle)
+
+
+def entry_identity(root: str) -> snapshot.Identity | None:
+    """The identity of the entry a resolved root was admitted under, where
+    the look above it stops: boot's, and nothing read now. None when boot
+    did not record the entry (an allowlist set after boot, which only a
+    test does, or an entry boot could not describe), and the look then
+    climbs to the top of the filesystem, which refuses more and never
+    less. A read made here, by the entry's name, could be raced into
+    stopping the climb short of a git directory above the root (the
+    external review's L15), which is why there is none."""
+    entry = snapshot_entry(root, app.state.repo_roots)
+    identities: dict[str, snapshot.Identity] = getattr(
+        app.state, "repo_root_identities", {}
+    )
+    return identities.get(entry)
 
 
 def snapshot_entry(real: str, roots: Sequence[str]) -> str:
@@ -7542,6 +8651,18 @@ class DescriptorTree:
         except OSError as exc:
             raise self._could_not(handle.path, "listed", exc) from None
 
+    def names(self, handle: snapshot.Handle) -> Iterator[str]:
+        # The look's listing: names from readdir, and no child described,
+        # so a sibling gone between the two is not the look's refusal (the
+        # external review's M12). scandir rather than listdir, so a
+        # directory too wide is refused before it is materialised.
+        try:
+            with os.scandir(handle.token) as listing:
+                for entry in listing:
+                    yield entry.name
+        except OSError as exc:
+            raise self._could_not(handle.path, "listed", exc) from None
+
     def descend(
         self, handle: snapshot.Handle, entry: snapshot.Entry
     ) -> snapshot.Handle:
@@ -7600,6 +8721,14 @@ class DescriptorTree:
             # and a refusal raised from inside a close would hide the
             # refusal that was already on its way.
             pass
+
+    def parent(self, handle: snapshot.Handle) -> snapshot.Handle:
+        # '..' through the handle's descriptor, with the same flags as
+        # every directory open: what this directory's own entry says holds
+        # it, whatever any name above now points to. The path is for
+        # messages only, as every Handle's is.
+        path = f"{handle.path}/.." if handle.path else ".."
+        return self._directory(path, "..", handle.token)
 
     def link_target(self, handle: snapshot.Handle, entry: snapshot.Entry) -> str:
         path = f"{handle.path}/{entry.name}" if handle.path else entry.name
@@ -7789,7 +8918,11 @@ async def create_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     )
     refuse_while_cloning(root)
     try:
-        members = snapshot.walk(tree=DescriptorTree(root), patterns=body.patterns)
+        members = snapshot.walk(
+            tree=DescriptorTree(root),
+            patterns=body.patterns,
+            entry=entry_identity(root),
+        )
         head, dirty = _clone_state(root, snapshot_entry(root, app.state.repo_roots))
         built = snapshot.compose(
             members, patterns=body.patterns, head=head, dirty=dirty
@@ -7884,7 +9017,11 @@ async def list_snapshot(body: SnapshotCreate) -> dict[str, Any]:
     )
     refuse_while_cloning(root)
     try:
-        return snapshot.list_members(tree=DescriptorTree(root), patterns=body.patterns)
+        return snapshot.list_members(
+            tree=DescriptorTree(root),
+            patterns=body.patterns,
+            entry=entry_identity(root),
+        )
     except snapshot.SnapshotError as exc:
         # Only a malformed pattern reaches here: every refusal about the
         # tree is reported in the listing rather than raised.
@@ -9544,6 +10681,8 @@ def _report_inputs(
         "groups": groups,
         "runs_by_group": runs_by_group,
         "scores_by_result": store.scores_for_results(db, result_ids),
+        "judge_calls": store.judge_calls_for(db, experiment_id),
+        "scoring_passes": store.scoring_passes_for(db, experiment_id),
         "tasks_by_id": tasks_by_id,
         "thresholds_source": thresholds_source,
         "dataset_unreadable": dataset_unreadable,
@@ -9588,9 +10727,11 @@ def _export_lines(
     Two DIFFERENT protections, and conflating them is what hid this. The
     store's synchronous contract rules out another TASK interleaving on
     this connection, and it did that correctly the whole time. It says
-    nothing about another CONNECTION, and `python -m bench.reconcile
-    --apply` against a live bench is exactly that, by design: it is the
-    reason connect() turns WAL on.
+    nothing about another CONNECTION writing: a person at the sqlite3
+    prompt, or a script of their own. (`python -m bench.reconcile --apply`
+    was that connection by design until Phase P gave it the server's lock;
+    its dry run still reads beside a live bench, which is what WAL is
+    for.)
     """
     db = app.state.db
     # Trials first, manifest prepended after, and the order of the OUTPUT
@@ -9603,6 +10744,12 @@ def _export_lines(
     out: list[dict[str, Any]] = []
     with store.read_snapshot(db):
         groups = store.experiment_groups(db, experiment_id)
+        # The scoring records, in the same snapshot as the scores that
+        # cite them, grouped by trial as the lines are.
+        calls_by_result: dict[int, list[dict[str, Any]]] = {}
+        for call in store.judge_calls_for(db, experiment_id):
+            calls_by_result.setdefault(call["result_id"], []).append(call)
+        scoring_passes = store.scoring_passes_for(db, experiment_id)
         for group in groups:
             detail = store.get_group(db, group["id"])
             if detail is None:
@@ -9624,7 +10771,13 @@ def _export_lines(
             score_rows = store.scores_for_results(db, [r["id"] for _, r in rows])
             for run, result in rows:
                 out.append(
-                    export_trial(group, run, result, score_rows.get(result["id"], []))
+                    export_trial(
+                        group,
+                        run,
+                        result,
+                        score_rows.get(result["id"], []),
+                        judge_calls=calls_by_result.get(result["id"], []),
+                    )
                 )
         # AN ARTIFACT IS DESCRIBED BY WHAT IS IN IT, which is why the
         # trial half is read from the emitted LINES rather than from the
@@ -9652,6 +10805,7 @@ def _export_lines(
                 thresholds,
                 referenced,
                 _captures_named(groups, experiment.get("task_attachments")),
+                scoring_passes=scoring_passes,
             ),
         )
     return out

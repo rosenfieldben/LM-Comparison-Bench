@@ -16,8 +16,17 @@ it did not ask for. The rows it touches are the audit columns only
 (store.RECONCILABLE_COLUMNS), never text, errors, timings, or the local
 estimate.
 
-Safe to run against a live bench. store.connect opens the same database
-in WAL mode, which is what lets a reader and a writer coexist.
+ONE WRITER AT A TIME (Phase P). `--apply` writes, so it takes the lock
+a server holds (store.hold_lock) and will not run beside a live bench,
+nor a bench start beside it; each refuses in a sentence naming what
+holds the lock. The dry run writes no row, takes no lock, and runs
+beside a live bench: store.connect opens the database in WAL mode, which
+is what lets a reader and the server's writes coexist. Its connect()
+adds any column, index, trigger or seal a database older than this build
+lacks, as a server's boot does, which is nothing on a database a live
+server has already opened and a migration on one an older bench wrote:
+a dry run that writes is not a dry run, and it is on the BACKLOG,
+pre-existing since this command arrived.
 """
 
 import argparse
@@ -78,7 +87,7 @@ async def reconcile(
         print("nothing to reconcile", file=out)
         return counts
 
-    mode = "applying" if apply else "dry run, nothing will be written"
+    mode = "applying" if apply else "dry run, no row will be written"
     print(f"{len(pending)} result(s) to reconcile ({mode})", file=out)
     for index, row in enumerate(pending):
         record = await fetch_generation(client, row["generation_id"])
@@ -107,7 +116,17 @@ async def reconcile(
 
 
 async def _run(args: argparse.Namespace, api_key: str) -> dict[str, int]:
-    conn = store.connect(os.environ.get("BENCH_DB", "./bench.db"))
+    path = os.environ.get("BENCH_DB", "./bench.db")
+    # Before connect, as the server takes it (the external review's M3):
+    # --apply refused beside a live server has written nothing, not even
+    # the migration connect would lay on an older database; and before any
+    # lookup, so a refusal costs no upstream call.
+    lock = store.hold_lock(path, "reconcile") if args.apply else None
+    try:
+        conn = store.connect(path)
+    except BaseException:
+        store.release_lock(lock)
+        raise
     try:
         async with httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_key}"},
@@ -120,6 +139,7 @@ async def _run(args: argparse.Namespace, api_key: str) -> dict[str, int]:
             )
     finally:
         conn.close()
+        store.release_lock(lock)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -134,7 +154,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--apply",
         action="store_true",
-        help="perform the writes (default is a dry run that writes nothing)",
+        help="perform the writes (default is a dry run that writes no row)",
     )
     parser.add_argument(
         "--limit",
@@ -159,7 +179,11 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 2
-    asyncio.run(_run(args, api_key))
+    try:
+        asyncio.run(_run(args, api_key))
+    except store.LockHeld as held:
+        print(str(held), file=sys.stderr)
+        return 3
     return 0
 
 

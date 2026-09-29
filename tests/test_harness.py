@@ -135,3 +135,54 @@ def test_the_guard_can_see_the_clients_it_is_guarding():
         "tests/test_models.py",
         "tests/test_properties.py",
     }
+
+
+def test_the_two_unit_shards_run_every_test_once():
+    """WINDOW: the unit job in .github/workflows/tests.yml, read as text:
+    its shard list and the one pytest command each shard runs.
+
+    The unit suite runs in two shards per interpreter since the 3.14 leg
+    crossed 240 s at 2e8bd02 (split, not the limit raised). The split is
+    only safe while the shards are exact complements: one runs a file and
+    the other ignores exactly that file, so every test runs in one shard
+    and none in both or neither. A second file moved into one shard
+    without the matching ignore in the other would run twice or not at
+    all, and this fails first. So would a leg dropped, doubled or turned
+    off: the job's lines, comments set aside, name the four interpreters
+    and the two shards, no include or exclude, and exactly two
+    conditions, each the step of its own command (the external review's
+    L22: the conditions were counted by substring, so a condition
+    narrowed, widened, commented or given a job-level twin passed).
+    PRE-STATE: the job lists exactly two shards."""
+    workflow = (
+        Path(__file__).parent.parent / ".github/workflows/tests.yml"
+    ).read_text()
+    job = workflow[workflow.index("\n  tests:\n") : workflow.index("\n  js:\n")]
+    lines = [
+        line.strip()
+        for line in job.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    assert 'shard: ["api", "rest"]' in lines
+    assert 'python-version: ["3.11", "3.12", "3.13", "3.14"]' in lines
+    assert not [
+        line for line in lines if line.lstrip("- ").startswith(("include:", "exclude:"))
+    ]
+    conditions = [line for line in lines if line.lstrip("- ").startswith("if:")]
+    assert conditions == [
+        "- if: matrix.shard == 'api'",
+        "- if: matrix.shard == 'rest'",
+    ]
+    steps = [(line, lines[i + 1]) for i, line in enumerate(lines) if line in conditions]
+    assert steps == [
+        (
+            "- if: matrix.shard == 'api'",
+            "run: pytest -rs --durations=10 tests/test_api.py",
+        ),
+        (
+            "- if: matrix.shard == 'rest'",
+            "run: pytest -rs --durations=10 --ignore=tests/test_api.py",
+        ),
+    ]
+    commands = [line for line in lines if "pytest" in line and "run:" in line]
+    assert commands == [step[1] for step in steps]

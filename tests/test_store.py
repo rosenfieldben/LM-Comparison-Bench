@@ -1,6 +1,8 @@
 import hashlib
+import itertools
 import json
 import pathlib
+import re
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -4115,3 +4117,1983 @@ def test_a_listed_row_names_the_latest_capture_of_its_own_reading(db):
     assert rows["cc" * 32]["latest_capture_id"] == own["id"]
     assert rows["dd" * 32]["latest_capture_id"] is None
     assert store.latest_capture(db, "cc" * 32, "snapshot", "1")["id"] == own["id"]
+
+
+# Phase P, the scoring pass as a record.
+
+PRE_P_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_p_schema.sql"
+).read_text()
+
+# The sha256 of SCHEMA's body at ed00174, as `git show ed00174:bench/store.py`
+# gave it when the fixture was extracted; see PRE_O_SCHEMA_DIGEST.
+PRE_P_SCHEMA_DIGEST = "7bba797726706e45793c31079a95be392d67431f3b6295dce6a590fdc90e46f5"
+
+# The sha256 of store.SEALS, the triggers that seal the two scoring
+# tables. A seal is schema, and CREATE TRIGGER IF NOT EXISTS keeps an old
+# body on every database that already booted, so a changed body under
+# the old name would change nothing in the field. An edit here without a
+# new trigger name (and the old one dropped) is the mistake this catches.
+# It moved once, and the rule was followed: the column unusable (the
+# operator's ruling 4 at P1's checkpoint) made scoring_passes_sealed_v2,
+# and store.RETIRED_SEALS drops v1. The digest was
+# 79495beb0cf76b702e4105c16737b67d11a31da7ae59d94735fe26d1adb88d37 until then.
+# It moved again when P2's two usage-count columns made judge_calls_sealed_v2
+# (it was dee963a5b1c8bf58b86b7b08231876e4ea232001eb39403d9d387098b3b0c8bf),
+# and again at schema 12, when sent, usable and unknown, the refusal of an
+# ending whose facts disagree with its outcome, and the first write's
+# columns held whatever their value (the operator's rulings H2 and M1 on
+# the 1d91670 review, and the review's L2) made both update seals v3 (it
+# was 837d2ce40ad74a2736f5294b6ed2fff6c2ac9b5949aea2436e2b995a6be8cff5).
+SEALS_DIGEST = "89d7ce55aea5b30492c1e65379f6370c73c580abbcfeec953ef22e7ad41e3317"
+
+SEAL_NAMES = [
+    "scoring_passes_sealed_v3",
+    "scoring_passes_never_replaced_v1",
+    "scoring_passes_never_deleted_v1",
+    "judge_calls_sealed_v3",
+    "judge_calls_never_replaced_v1",
+    "judge_calls_never_deleted_v1",
+]
+
+
+def _pre_p_database(path):
+    """A database as ed00174 left it: its SCHEMA, plus the two columns
+    only its MIGRATIONS added, holding an experiment, one result and the
+    score rows a pre-P pass wrote: a judge row with a figure, one with a
+    generation id and no figure, one with neither, a ceiling refusal, a
+    deterministic row and a human rating."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(PRE_P_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('old', '2026-09-01T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO runs (prompt_text, created_at)
+           VALUES ('p', '2026-09-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    rows = [
+        ("judge", 0.5, "fine", "j/x", "gen-1", 0.002),
+        ("judge", 1.0, "good", "j/x", "gen-2", None),
+        ("judge", None, "judge request failed: ReadTimeout", "j/x", None, None),
+        (
+            "judge",
+            None,
+            "the per-boot spend ceiling was reached before this result "
+            "could be judged; re-run the scoring pass to fill it in",
+            "j/x",
+            None,
+            None,
+        ),
+        ("exact_match", 1.0, "matched", None, None, None),
+        ("human", 0.75, "rated 4 of 5", None, None, None),
+    ]
+    for scorer, score, detail, judge, gen, billed in rows:
+        legacy.execute(
+            """INSERT INTO scores (result_id, scorer, score, detail, judge_model,
+                   judge_generation_id, judge_billed_cost_usd, created_at)
+               VALUES (1, ?, ?, ?, ?, ?, ?, '2026-09-01T00:00:00+00:00')""",
+            (scorer, score, detail, judge, gen, billed),
+        )
+    legacy.commit()
+    return legacy
+
+
+def _record_triggers(conn):
+    """Every trigger on the two scoring-record tables, by name."""
+    return {
+        r[0]
+        for r in conn.execute(
+            """SELECT name FROM sqlite_master WHERE type = 'trigger'
+                  AND tbl_name IN ('scoring_passes', 'judge_calls')"""
+        )
+    }
+
+
+def _seals_as_stored(conn):
+    """The seal triggers' SQL as the database holds it, reassembled in
+    SEALS's own order, for comparison with the text in store.py. sqlite
+    stores each CREATE TRIGGER without its IF NOT EXISTS."""
+    sql = {
+        r[0]: r[1]
+        for r in conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='trigger'"
+        )
+    }
+    return "\n" + "".join(sql[n] + ";\n" for n in SEAL_NAMES if n in sql)
+
+
+def _scoring_setup(conn, results=2):
+    """An experiment and `results` stored results to score, as ids."""
+    eid = store.create_experiment(conn, experiment_spec())
+    run_id = store.save_run(conn, "p", [make_result() for _ in range(results)])
+    rids = [
+        r[0]
+        for r in conn.execute(
+            "SELECT id FROM results WHERE run_id = ? ORDER BY id", (run_id,)
+        )
+    ]
+    return eid, rids
+
+
+def _row(conn, table, row_id):
+    return dict(
+        conn.execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,)).fetchone()
+    )
+
+
+def test_the_pre_p_fixture_is_the_schema_as_it_stood_before_phase_p():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's text at
+    ed00174, pinned by digest. The right era and not merely an old one:
+    it has Phase O's clones table and neither of Phase P's, and its
+    scores table has no citation column."""
+    body = "".join(
+        line
+        for line in PRE_P_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == PRE_P_SCHEMA_DIGEST
+    assert "CREATE TABLE IF NOT EXISTS clones" in PRE_P_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS scoring_passes" not in PRE_P_SCHEMA
+    assert "CREATE TABLE IF NOT EXISTS judge_calls" not in PRE_P_SCHEMA
+    assert "judge_call_id" not in PRE_P_SCHEMA
+    assert "git show ed00174:bench/store.py" in PRE_P_SCHEMA
+
+
+def test_the_seals_are_the_pinned_text():
+    """WINDOW: store.SEALS as imported, and a fresh database's
+    sqlite_master.
+
+    The seals are schema, pinned by digest the way an era's SCHEMA is,
+    and a new database holds exactly that text: six triggers, in
+    SEALS's order, and nothing of theirs missing. PRE-STATE: SEALS names
+    exactly the six triggers this file lists."""
+    assert re.findall(r"CREATE TRIGGER IF NOT EXISTS (\w+)", store.SEALS) == SEAL_NAMES
+    assert hashlib.sha256(store.SEALS.encode()).hexdigest() == SEALS_DIGEST
+    conn = store.connect(":memory:")
+    try:
+        assert _seals_as_stored(conn) == store.SEALS.replace(
+            "CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER "
+        )
+    finally:
+        conn.close()
+
+
+# The columns each table's first write fills. The seal holds these
+# whatever their value, NULL included, and every other column once it is
+# written.
+FIRST_WRITE_COLUMNS = {
+    "scoring_passes": {"id", "experiment_id", "judge_model", "started_at"},
+    "judge_calls": {
+        "id",
+        "pass_id",
+        "experiment_id",
+        "result_id",
+        "judge_model",
+        "sent_at",
+    },
+}
+
+
+@pytest.mark.parametrize(
+    "table,seal", [("scoring_passes", SEAL_NAMES[0]), ("judge_calls", SEAL_NAMES[3])]
+)
+def test_every_column_of_a_sealed_table_is_named_in_its_seal(db, table, seal):
+    """WINDOW: the table's columns as the database reports them, and the
+    first refusal of its update seal.
+
+    The first refusal lists its columns one by one, so a column added to
+    either table later would be one no seal protects. This holds the two
+    lists equal, and holds the two kinds of column apart: a column the
+    first write fills is held whatever its value, and one the ending
+    fills is held once written (the external review's L2: v2 held a
+    pass's judge_model only when it was not NULL, so the ending could
+    fill one a pass began without). PRE-STATE: the table has columns
+    beyond its first write's, so both sets have members."""
+    columns = {r[1] for r in db.execute(f"PRAGMA table_info({table})")}
+    assert columns > FIRST_WRITE_COLUMNS[table]
+    (sql,) = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name = ?", (seal,)
+    ).fetchone()
+    first = sql[: sql.index("SELECT RAISE", sql.index("SELECT RAISE") + 1)]
+    held = set(re.findall(r"(?:WHERE|OR) NEW\.(\w+) IS NOT OLD\.\1", first))
+    guarded = set(
+        re.findall(r"OLD\.(\w+) IS NOT NULL\s+AND\s+NEW\.\1 IS NOT OLD\.\1", first)
+    )
+    assert held == FIRST_WRITE_COLUMNS[table]
+    assert guarded == columns - held
+
+
+def test_migration_onto_pre_p_database_adds_the_records_and_touches_nothing(
+    tmp_path,
+):
+    """WINDOW: a database whose schema is ed00174's, holding an
+    experiment, a result and six score rows, through connect(), and a
+    second boot.
+
+    Two whole new tables with no MIGRATIONS entry, two columns on scores
+    by MIGRATIONS, and the seals. Every old score row survives field for
+    field with both new columns NULL, which on a judge row is the fact
+    that it was written before Phase P; the new tables start empty; the
+    database holds the seals' pinned text; a pass and a call recorded on
+    the migrated database read back; and a second connect disturbs
+    nothing. PRE-STATE: neither table, neither column and no seal."""
+    db_path = tmp_path / "pre_p.db"
+    legacy = _pre_p_database(db_path)
+    tables = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+    assert not {"scoring_passes", "judge_calls"} & tables
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(scores)")]
+    assert not {"judge_call_id", "pass_id"} & set(columns)
+    assert _seals_as_stored(legacy) == "\n"
+    legacy.row_factory = sqlite3.Row
+    before = {
+        t: [dict(r) for r in legacy.execute(f"SELECT * FROM {t}")]
+        for t in ("experiments", "results", "scores")
+    }
+    assert len(before["scores"]) == 6
+    legacy.close()
+    after = {
+        **before,
+        "scores": [
+            {**r, "judge_call_id": None, "pass_id": None} for r in before["scores"]
+        ],
+    }
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    conn = store.connect(str(db_path))
+    try:
+        assert store.scoring_passes_for(conn, 1) == []
+        assert store.judge_calls_for(conn, 1) == []
+        for table, rows in after.items():
+            assert [dict(r) for r in conn.execute(f"SELECT * FROM {table}")] == rows
+        assert _seals_as_stored(conn) == sealed
+        pass_id = store.open_scoring_pass(conn, 1, "j/y")
+        call_id = store.record_judge_call_sent(conn, pass_id, 1, "j/y")
+        store.record_judge_call_answer(
+            conn,
+            call_id,
+            "answered",
+            answered_at=store.now(),
+            generation_id="gen-3",
+        )
+        store.add_score(
+            conn,
+            1,
+            {
+                "scorer": "judge",
+                "score": 0.25,
+                "judge_model": "j/y",
+                "judge_call_id": call_id,
+                "pass_id": pass_id,
+            },
+        )
+        store.close_scoring_pass(conn, pass_id, "finished")
+    finally:
+        conn.close()
+
+    again = store.connect(str(db_path))
+    try:
+        for table, rows in after.items():
+            got = [
+                dict(r) for r in again.execute(f"SELECT * FROM {table} WHERE id <= 6")
+            ]
+            assert got == rows
+        assert _seals_as_stored(again) == sealed
+        (made,) = store.scoring_passes_for(again, 1)
+        assert (made["outcome"], made["scored"], made["failed"]) == ("finished", 1, 0)
+        assert [c["generation_id"] for c in store.judge_calls_for(again, 1)] == [
+            "gen-3"
+        ]
+    finally:
+        again.close()
+
+
+def test_a_score_cites_its_pass_and_its_call_and_a_call_has_one_score(db):
+    """WINDOW: add_score with and without the two citations, read back by
+    scores_for_results, and a second row citing the same call.
+
+    The citations travel on the score record; any number of rows cite no
+    call; two rows citing one call are refused by the unique index, since
+    that would be one answer recorded twice. PRE-STATE: foreign keys are
+    on, and the call exists."""
+    assert db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    cited = {"scorer": "judge", "judge_call_id": call_id, "pass_id": pass_id}
+    store.add_score(db, rid, cited)
+    store.add_score(db, rid, {"scorer": "judge", "pass_id": pass_id})
+    store.add_score(db, rid, {"scorer": "human", "score": 0.5})
+    rows = store.scores_for_results(db, [rid])[rid]
+    assert [(r["judge_call_id"], r["pass_id"]) for r in rows] == [
+        (call_id, pass_id),
+        (None, pass_id),
+        (None, None),
+    ]
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        store.add_score(db, rid, cited)
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        store.add_score(db, rid, {"scorer": "judge", "judge_call_id": call_id + 99})
+
+
+def test_the_answer_fills_only_what_the_sent_write_left_null(db):
+    """WINDOW: record_judge_call_sent, then record_judge_call_answer, then
+    a second answer for the same call.
+
+    The two-write rule. The sent write holds the identity and the time;
+    the answer fills the columns the first left NULL, schema 12's two
+    facts among them, and changes none it wrote. A second answer is the store's own refusal, not the
+    seal's, because the writer only ever touches an open row, and the
+    row is as the first answer left it. PRE-STATE: after the sent write
+    every answer column is NULL and the experiment came from the pass."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    sent = _row(db, "judge_calls", call_id)
+    answer_columns = [
+        "answered_at",
+        "generation_id",
+        "billed_cost_usd",
+        "outcome",
+        "detail",
+        "sent",
+        "usable",
+    ]
+    assert all(sent[c] is None for c in answer_columns)
+    assert (sent["experiment_id"], sent["pass_id"], sent["result_id"]) == (
+        eid,
+        pass_id,
+        rid,
+    )
+    assert sent["sent_at"]
+
+    store.record_judge_call_answer(
+        db,
+        call_id,
+        "answered",
+        answered_at=store.now(),
+        generation_id="gen-1",
+        billed_cost_usd=0.003,
+        detail="ok",
+    )
+    answered = _row(db, "judge_calls", call_id)
+    assert {c: answered[c] for c in sent if c not in answer_columns} == {
+        c: sent[c] for c in sent if c not in answer_columns
+    }
+    assert answered["answered_at"] >= sent["sent_at"]
+    assert (
+        answered["generation_id"],
+        answered["billed_cost_usd"],
+        answered["outcome"],
+        answered["detail"],
+        answered["sent"],
+        answered["usable"],
+    ) == ("gen-1", 0.003, "answered", "ok", 1, 1)
+
+    with pytest.raises(store.AlreadyRecorded, match=f"judge call {call_id} has"):
+        store.record_judge_call_answer(
+            db, call_id, "failed", answered_at=store.now(), detail="x"
+        )
+    assert _row(db, "judge_calls", call_id) == answered
+
+
+@pytest.mark.parametrize(
+    "outcome,replied,sent,usable",
+    [
+        ("answered", True, 1, 1),
+        ("failed", True, 1, 0),
+        ("failed", False, 1, None),
+        ("timed_out", False, 1, None),
+        ("stopped", False, 1, None),
+        ("stopped", True, 1, 0),
+        ("not_sent", False, 0, None),
+    ],
+)
+def test_the_answer_time_is_the_callers_and_the_facts_follow(
+    db, outcome, replied, sent, usable
+):
+    """WINDOW: one call's answer write, for each ending a pass can write.
+
+    answered_at is the time the caller took when a reply's head arrived,
+    written as given, and absent exactly when no reply arrived, whatever
+    the reply said: an error status is a reply, a timeout is not. sent
+    and usable follow from it and the outcome (schema 12): a reply read
+    as an answer is usable, any other reply is not, and no reply has no
+    usable at all. A shutdown cut while the reply arrived keeps its
+    time. PRE-STATE: the call is open, with no facts."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    opened = _row(db, "judge_calls", call_id)
+    assert (opened["outcome"], opened["sent"], opened["usable"]) == (None,) * 3
+    stamp = "2026-09-28T00:00:05+00:00" if replied else None
+    store.record_judge_call_answer(db, call_id, outcome, answered_at=stamp)
+    row = _row(db, "judge_calls", call_id)
+    assert (row["outcome"], row["answered_at"]) == (outcome, stamp)
+    assert (row["sent"], row["usable"]) == (sent, usable)
+
+
+@pytest.mark.parametrize(
+    "outcome,replied,refusal",
+    [
+        ("answered", False, "an answered call had a reply"),
+        ("timed_out", True, "had no reply"),
+        ("not_sent", True, "had no reply"),
+        ("interrupted", False, "cannot end as 'interrupted'"),
+        ("interrupted", True, "cannot end as 'interrupted'"),
+        ("lost", False, "cannot end as 'lost'"),
+    ],
+)
+def test_an_answer_that_contradicts_itself_is_refused(db, outcome, replied, refusal):
+    """WINDOW: the answer writer's argument checks, before any write, and
+    the same checks where the pass's close gets what it knew of a call.
+
+    interrupted belongs to the sweep and a pass's own close, and the
+    answer time must agree with the outcome: call_facts decides both for
+    the writer and for store.UnwrittenEnding, which refuses when made.
+    stopped with a reply is not here: since schema 12 it is a shutdown
+    cut while the reply arrived. The call stays open. PRE-STATE: the
+    call is open."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+    stamp = "2026-09-28T00:00:05+00:00" if replied else None
+    with pytest.raises(ValueError, match=refusal):
+        store.record_judge_call_answer(db, call_id, outcome, answered_at=stamp)
+    with pytest.raises(ValueError, match=refusal):
+        store.call_facts(outcome, stamp)
+    with pytest.raises(ValueError, match=refusal):
+        store.UnwrittenEnding(outcome=outcome, answered_at=stamp, detail="d")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+
+
+def test_a_call_is_recorded_only_under_an_open_pass(db):
+    """WINDOW: record_judge_call_sent under a pass that has ended, and
+    under one that does not exist.
+
+    A call under an ended pass would be a request that pass's counts
+    never saw. Refused by the store, and nothing written. PRE-STATE: the
+    pass has ended and holds no call."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, pass_id, "finished")
+    assert _row(db, "scoring_passes", pass_id)["outcome"] == "finished"
+    assert store.judge_calls_for(db, eid) == []
+    with pytest.raises(store.AlreadyRecorded, match=f"scoring pass {pass_id} has"):
+        store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    with pytest.raises(store.AlreadyRecorded):
+        store.record_judge_call_sent(db, pass_id + 9, rid, "j/x")
+    assert store.judge_calls_for(db, eid) == []
+
+
+def test_a_pass_ends_once_with_counts_from_its_own_rows(db):
+    """WINDOW: open_scoring_pass, the rows a pass writes, and
+    close_scoring_pass twice.
+
+    The counts are read from the records in the statement that seals the
+    pass: scored is a row with a score, failed a row with none,
+    unanswered a call that went out and got no reply, unusable one that
+    got a reply it could not use, each by the call's facts and never its
+    outcome (the operator's ruling H2 on the 1d91670 review), so a call
+    that failed with no reply is unanswered beside the timeout, not
+    unusable beside the error status, as b6c088c's outcome list counted
+    it. A call that was never sent and one that was answered are neither,
+    no call here is unknown, and another pass's rows count toward nothing
+    here. The second close is the store's refusal and leaves the row as
+    it was. PRE-STATE: the pass is open with no counts, and the other
+    pass has rows of its own."""
+    eid, (r1, r2) = _scoring_setup(db)
+    other = store.open_scoring_pass(db, eid, "j/x")
+    store.add_score(db, r1, {"scorer": "judge", "score": 1.0, "pass_id": other})
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    opened = _row(db, "scoring_passes", pass_id)
+    assert opened["started_at"] and opened["ended_at"] is None
+    counts = ("outcome", "scored", "failed", "unanswered", "unusable", "unknown")
+    assert [opened[k] for k in counts] == [None] * 6
+
+    ends = [
+        ("answered", True),
+        ("timed_out", False),
+        ("not_sent", False),
+        ("failed", True),
+        ("failed", False),
+    ]
+    for outcome, replied in ends:
+        call_id = store.record_judge_call_sent(db, pass_id, r1, "j/x")
+        store.record_judge_call_answer(
+            db, call_id, outcome, answered_at=store.now() if replied else None
+        )
+    store.add_score(db, r1, {"scorer": "judge", "score": 0.5, "pass_id": pass_id})
+    store.add_score(db, r2, {"scorer": "exact_match", "score": 0.0, "pass_id": pass_id})
+    store.add_score(db, r2, {"scorer": "judge", "score": None, "pass_id": pass_id})
+
+    store.close_scoring_pass(db, pass_id, "finished")
+    ended = _row(db, "scoring_passes", pass_id)
+    assert ended["ended_at"] >= ended["started_at"]
+    assert (ended["outcome"], ended["detail"]) == ("finished", None)
+    assert (ended["scored"], ended["failed"]) == (2, 1)
+    assert (ended["unanswered"], ended["unusable"], ended["unknown"]) == (2, 1, 0)
+    with pytest.raises(store.AlreadyRecorded, match=f"scoring pass {pass_id} has"):
+        store.close_scoring_pass(db, pass_id, "failed", "late")
+    assert _row(db, "scoring_passes", pass_id) == ended
+    assert _row(db, "scoring_passes", other)["outcome"] is None
+
+
+def test_closing_a_pass_closes_a_call_it_left_open(db):
+    """WINDOW: close_scoring_pass over a pass holding a call whose ending
+    was never written.
+
+    Every path through a pass writes a call's ending, so an open one at
+    the close means that write failed. It is closed as interrupted in
+    the same transaction, with a detail saying why; the pass said nothing
+    of it, so it carries no facts and is counted unknown, not unanswered
+    (the operator's ruling M1 on the 1d91670 review); a sealed pass never
+    holds a call that reads as still in flight. PRE-STATE: the call is
+    open."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", call_id)["outcome"] is None
+    store.close_scoring_pass(db, pass_id, "failed", "the answer could not be written")
+    call = _row(db, "judge_calls", call_id)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        store.CALL_LEFT_OPEN,
+        None,
+    )
+    assert (call["sent"], call["usable"]) == (None, None)
+    ended = _row(db, "scoring_passes", pass_id)
+    assert (ended["outcome"], ended["detail"]) == (
+        "failed",
+        "the answer could not be written",
+    )
+    assert (ended["unanswered"], ended["unusable"], ended["unknown"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("outcome", ["interrupted", "done"])
+def test_a_pass_cannot_close_as_what_only_the_sweep_writes(db, outcome):
+    """WINDOW: close_scoring_pass's argument check.
+
+    interrupted belongs to the boot sweep, and an outcome outside the
+    vocabulary is not an ending. PRE-STATE: the pass is open, and stays
+    open."""
+    eid, _ = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, None)
+    with pytest.raises(ValueError, match=f"cannot close as {outcome!r}"):
+        store.close_scoring_pass(db, pass_id, outcome)
+    assert _row(db, "scoring_passes", pass_id)["outcome"] is None
+
+
+def test_the_boot_sweep_closes_what_a_dead_process_left_open(db):
+    """WINDOW: sweep_open_scoring_records over a pass a crash left open
+    (one call answered, one still open) beside a pass that ended, and a
+    second sweep.
+
+    The open pass becomes interrupted with ended_at still NULL, since
+    when it ended is not known, and its counts from its own rows; its
+    open call becomes interrupted with no answer time and no facts, since
+    nothing is known of it, and is counted unknown, the one call the
+    counts cannot place (the operator's ruling M1 on the 1d91670 review);
+    the answered call and the ended pass are untouched; the second sweep
+    finds nothing. PRE-STATE: one pass and one call are open."""
+    eid, (r1, r2) = _scoring_setup(db)
+    done = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, done, "finished")
+    done_row = _row(db, "scoring_passes", done)
+    live = store.open_scoring_pass(db, eid, "j/x")
+    answered = store.record_judge_call_sent(db, live, r1, "j/x")
+    store.record_judge_call_answer(db, answered, "answered", answered_at=store.now())
+    store.add_score(db, r1, {"scorer": "judge", "score": 1.0, "pass_id": live})
+    answered_row = _row(db, "judge_calls", answered)
+    left = store.record_judge_call_sent(db, live, r2, "j/x")
+    open_passes = db.execute("SELECT id FROM scoring_passes WHERE outcome IS NULL")
+    assert [r[0] for r in open_passes] == [live]
+    open_calls = db.execute("SELECT id FROM judge_calls WHERE outcome IS NULL")
+    assert [r[0] for r in open_calls] == [left]
+
+    assert store.sweep_open_scoring_records(db) == (1, 1)
+    swept = _row(db, "scoring_passes", live)
+    assert (swept["outcome"], swept["ended_at"], swept["detail"]) == (
+        "interrupted",
+        None,
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert (swept["scored"], swept["failed"]) == (1, 0)
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+    call = _row(db, "judge_calls", left)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+        None,
+    )
+    assert (call["sent"], call["usable"]) == (None, None)
+    assert _row(db, "judge_calls", answered) == answered_row
+    assert _row(db, "scoring_passes", done) == done_row
+    assert store.sweep_open_scoring_records(db) == (0, 0)
+
+
+def test_the_readers_are_plain_reads_that_run_inside_a_snapshot(db):
+    """WINDOW: the three scoring readers inside read_snapshot, which
+    raises on a commit in its block.
+
+    The export reads calls and passes inside one snapshot, so none of
+    the readers may write. latest_scoring_passes names each
+    experiment's newest pass in one query and leaves out an experiment
+    with none. PRE-STATE: the first experiment has two passes and the
+    second none."""
+    eid, (rid, _) = _scoring_setup(db)
+    bare = store.create_experiment(db, experiment_spec())
+    first = store.open_scoring_pass(db, eid, "j/x")
+    call_id = store.record_judge_call_sent(db, first, rid, "j/x")
+    store.close_scoring_pass(db, first, "stopped")
+    second = store.open_scoring_pass(db, eid, None)
+    assert store.scoring_passes_for(db, bare) == []
+    with store.read_snapshot(db):
+        passes = store.scoring_passes_for(db, eid)
+        latest = store.latest_scoring_passes(db, [eid, bare])
+        calls = store.judge_calls_for(db, eid)
+    assert [p["id"] for p in passes] == [first, second]
+    assert list(latest) == [eid] and latest[eid]["id"] == second
+    assert [c["id"] for c in calls] == [call_id]
+    assert calls[0]["outcome"] == "interrupted"
+    assert store.latest_scoring_passes(db, []) == {}
+
+
+# THE SEALS BY DIRECT SQL. The writers never reach a seal, so these go
+# around them, as a second connection or a person at the sqlite3 prompt
+# would, and each refusal is the trigger's own sentence.
+
+
+def _open_and_ended_call(conn):
+    eid, (r1, r2) = _scoring_setup(conn)
+    pass_id = store.open_scoring_pass(conn, eid, "j/x")
+    open_call = store.record_judge_call_sent(conn, pass_id, r1, "j/x")
+    ended_call = store.record_judge_call_sent(conn, pass_id, r2, "j/x")
+    store.record_judge_call_answer(conn, ended_call, "timed_out", answered_at=None)
+    return pass_id, open_call, ended_call
+
+
+CALL_HELD = "a judge call record never changes a value once written"
+CALL_LATE = "a judge call ends once, and this one has already ended"
+CALL_PARTIAL = "a judge call ends in one write, and that write names its outcome"
+PASS_HELD = "a scoring pass record never changes a value once written"
+PASS_LATE = "a scoring pass ends once, and this one has already ended"
+PASS_PARTIAL = "a scoring pass ends in one write, and that write names its outcome"
+
+
+@pytest.mark.parametrize(
+    "which,sql,refusal",
+    [
+        ("open", "UPDATE judge_calls SET sent_at = 'x' WHERE id = ?", CALL_HELD),
+        ("open", "UPDATE judge_calls SET result_id = 2 WHERE id = ?", CALL_HELD),
+        (
+            "open",
+            "UPDATE judge_calls SET sent_at = 'x', outcome = 'answered' WHERE id = ?",
+            CALL_HELD,
+        ),
+        ("open", "UPDATE judge_calls SET id = 99 WHERE id = ?", CALL_HELD),
+        (
+            "ended",
+            "UPDATE judge_calls SET outcome = 'answered' WHERE id = ?",
+            CALL_HELD,
+        ),
+        (
+            "open",
+            "UPDATE judge_calls SET generation_id = 'g' WHERE id = ?",
+            CALL_PARTIAL,
+        ),
+        ("ended", "UPDATE judge_calls SET generation_id = 'g' WHERE id = ?", CALL_LATE),
+        ("ended", "UPDATE judge_calls SET detail = 'late' WHERE id = ?", CALL_LATE),
+        ("open", "UPDATE judge_calls SET sent = 1 WHERE id = ?", CALL_PARTIAL),
+        ("open", "UPDATE judge_calls SET usable = 1 WHERE id = ?", CALL_PARTIAL),
+        ("ended", "UPDATE judge_calls SET sent = 0 WHERE id = ?", CALL_HELD),
+        ("ended", "UPDATE judge_calls SET usable = 1 WHERE id = ?", CALL_LATE),
+        (
+            "ended",
+            "UPDATE judge_calls SET billed_cost_usd = 0.1 WHERE id = ?",
+            CALL_LATE,
+        ),
+    ],
+)
+def test_a_judge_call_refuses_an_update_by_direct_sql(db, which, sql, refusal):
+    """WINDOW: one UPDATE statement on judge_calls, not through the store.
+
+    A change to a held value, a partial fill (answer columns with no
+    outcome) and a late fill (anything after the ending) are each
+    refused in the seal's own sentence, and the row is unchanged.
+    PRE-STATE: the open call's answer columns are NULL and the ended
+    call's outcome is timed_out."""
+    _, open_call, ended_call = _open_and_ended_call(db)
+    call_id = open_call if which == "open" else ended_call
+    before = _row(db, "judge_calls", call_id)
+    assert before["outcome"] == (None if which == "open" else "timed_out")
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(sql, (call_id,))
+    assert str(refused.value) == refusal
+    assert _row(db, "judge_calls", call_id) == before
+
+
+@pytest.mark.parametrize(
+    "which,sql,refusal",
+    [
+        ("open", "UPDATE scoring_passes SET started_at = 'x' WHERE id = ?", PASS_HELD),
+        ("open", "UPDATE scoring_passes SET experiment_id = 2 WHERE id = ?", PASS_HELD),
+        ("ended", "UPDATE scoring_passes SET scored = 9 WHERE id = ?", PASS_HELD),
+        ("open", "UPDATE scoring_passes SET scored = 9 WHERE id = ?", PASS_PARTIAL),
+        ("ended", "UPDATE scoring_passes SET detail = 'late' WHERE id = ?", PASS_LATE),
+        ("ended", "UPDATE scoring_passes SET unknown = 5 WHERE id = ?", PASS_HELD),
+        ("open", "UPDATE scoring_passes SET unknown = 0 WHERE id = ?", PASS_PARTIAL),
+    ],
+)
+def test_a_scoring_pass_refuses_an_update_by_direct_sql(db, which, sql, refusal):
+    """WINDOW: one UPDATE statement on scoring_passes, not through the
+    store.
+
+    The same three refusals as a call's, in the pass's own sentences.
+    PRE-STATE: the open pass has no ending and the ended one has its
+    counts."""
+    eid, _ = _scoring_setup(db)
+    open_pass = store.open_scoring_pass(db, eid, "j/x")
+    ended_pass = store.open_scoring_pass(db, eid, "j/x")
+    store.close_scoring_pass(db, ended_pass, "finished")
+    pass_id = open_pass if which == "open" else ended_pass
+    before = _row(db, "scoring_passes", pass_id)
+    assert (before["outcome"], before["scored"]) == (
+        (None, None) if which == "open" else ("finished", 0)
+    )
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(sql, (pass_id,))
+    assert str(refused.value) == refusal
+    assert _row(db, "scoring_passes", pass_id) == before
+
+
+CALL_FACTS_DISAGREE = (
+    "a judge call ends with sent, answered_at and usable agreeing with its outcome"
+)
+REPLY = "2026-09-28T00:00:05+00:00"
+
+
+@pytest.mark.parametrize(
+    "outcome,sent,answered_at,usable",
+    [
+        ("answered", None, None, None),
+        ("answered", None, REPLY, None),
+        ("failed", 1, REPLY, None),
+        ("failed", 1, None, 0),
+        ("not_sent", 1, None, None),
+        ("interrupted", 0, REPLY, 1),
+        ("answered", 1, REPLY, 0),
+        ("failed", 1, REPLY, 1),
+        ("stopped", 1, REPLY, 1),
+        ("timed_out", 1, REPLY, 0),
+        ("not_sent", 0, REPLY, 0),
+        ("answered", "yes", REPLY, 1),
+        ("answered", 2, REPLY, 1),
+        ("answered", 1, REPLY, 2),
+        ("interrupted", 2, None, None),
+        ("interrupted", 1, REPLY, 2),
+        ("lost", None, None, None),
+        ("timed_out", 0, None, None),
+    ],
+)
+def test_an_ending_whose_facts_disagree_with_its_outcome_is_refused_by_direct_sql(
+    db, outcome, sent, answered_at, usable
+):
+    """WINDOW: one ending write on an open call, not through the store,
+    naming an outcome and facts that do not agree.
+
+    judge_calls_sealed_v3's fourth refusal (schema 12): an ending says
+    whether the request was sent, whether a reply arrived and whether it
+    could be used, as call_facts decides them, for every writer. Refused
+    in its own sentence, and the call stays open. PRE-STATE: the call is
+    open, with no facts."""
+    _, open_call, _ = _open_and_ended_call(db)
+    before = _row(db, "judge_calls", open_call)
+    assert (before["outcome"], before["sent"], before["usable"]) == (None,) * 3
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(
+                """UPDATE judge_calls SET outcome = ?, sent = ?, answered_at = ?,
+                       usable = ? WHERE id = ?""",
+                (outcome, sent, answered_at, usable, open_call),
+            )
+    assert str(refused.value) == CALL_FACTS_DISAGREE
+    assert _row(db, "judge_calls", open_call) == before
+
+
+def _every_ending():
+    """Every ending a writer can make: each outcome call_facts admits,
+    with a reply and without, and as the close writes each of those, plus
+    interrupted with nothing known."""
+    endings = []
+    for outcome in ("answered", "timed_out", "stopped", "failed", "not_sent"):
+        for answered_at in (REPLY, None):
+            try:
+                sent, usable = store.call_facts(outcome, answered_at)
+            except ValueError:
+                continue
+            endings.append((outcome, sent, answered_at, usable))
+            endings.append(("interrupted", sent, answered_at, usable))
+    return endings + [("interrupted", None, None, None)]
+
+
+def test_every_ending_a_writer_makes_is_admitted_by_the_seal(db):
+    """WINDOW: every ending call_facts admits, as its own write and as the
+    close's, and the sweep's, each written by direct SQL on an open call.
+
+    The fourth refusal refuses no ending the store can write. PRE-STATE:
+    fifteen endings, each on a call opened for it."""
+    endings = _every_ending()
+    assert len(endings) == 15
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    for outcome, sent, answered_at, usable in endings:
+        call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+        with db:
+            db.execute(
+                """UPDATE judge_calls SET outcome = ?, sent = ?, answered_at = ?,
+                       usable = ? WHERE id = ?""",
+                (outcome, sent, answered_at, usable, call_id),
+            )
+        row = _row(db, "judge_calls", call_id)
+        assert (row["outcome"], row["sent"], row["answered_at"], row["usable"]) == (
+            outcome,
+            sent,
+            answered_at,
+            usable,
+        )
+
+
+def test_a_pass_begun_with_no_judge_keeps_none_by_direct_sql(db):
+    """WINDOW: a scoring pass opened with no judge, and an ending written
+    by direct SQL that also names a judge.
+
+    The first write's columns are held whatever their value (the external
+    review's L2: scoring_passes_sealed_v2 held judge_model only when it
+    was not NULL, so an ending could fill in a judge the pass never had).
+    Refused in the first refusal's sentence, and the pass is as it was.
+    PRE-STATE: the pass is open with judge_model NULL; the same write
+    under v2 lands (test_migration_onto_a_p2_database_keeps_what_it_holds
+    shows it on a p2 database)."""
+    eid, _ = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, None)
+    before = _row(db, "scoring_passes", pass_id)
+    assert (before["judge_model"], before["outcome"]) == (None, None)
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(
+                """UPDATE scoring_passes SET judge_model = 'j/other',
+                       outcome = 'finished' WHERE id = ?""",
+                (pass_id,),
+            )
+    assert str(refused.value) == PASS_HELD
+    assert _row(db, "scoring_passes", pass_id) == before
+
+
+# THE CLASSIFIER, by literal: every shape a call can be in, as its ending
+# write or the close or the sweep leaves it, and as a draft build before
+# schema 12 left it, with the word each is counted by. The word is pinned
+# here, not derived, so a test cannot agree with the code by construction.
+CLASSIFIER_SHAPES = [
+    # (shape, outcome, sent, answered_at, usable, word)
+    ("in flight", None, None, None, None, "in_flight"),
+    ("answered", "answered", 1, REPLY, 1, "answered"),
+    ("a verdict that does not parse", "answered", 1, REPLY, 1, "answered"),
+    ("timed out", "timed_out", 1, None, None, "unanswered"),
+    ("stopped before its reply", "stopped", 1, None, None, "unanswered"),
+    ("stopped while replying", "stopped", 1, REPLY, 0, "unusable"),
+    ("failed with a reply", "failed", 1, REPLY, 0, "unusable"),
+    ("failed with none", "failed", 1, None, None, "unanswered"),
+    ("never sent", "not_sent", 0, None, None, "never_sent"),
+    ("closed: the answer arrived", "interrupted", 1, REPLY, 1, "answered"),
+    ("closed: an unusable reply", "interrupted", 1, REPLY, 0, "unusable"),
+    ("closed: no reply", "interrupted", 1, None, None, "unanswered"),
+    ("closed: never sent", "interrupted", 0, None, None, "never_sent"),
+    ("closed, the pass said nothing", "interrupted", None, None, None, "unknown"),
+    ("found open at boot", "interrupted", None, None, None, "unknown"),
+    ("before 12: answered", "answered", None, REPLY, None, "answered"),
+    ("before 12: an error status", "failed", None, REPLY, None, "unusable"),
+    ("before 12: failed with none", "failed", None, None, None, "unanswered"),
+    ("before 12: timed out", "timed_out", None, None, None, "unanswered"),
+    ("before 12: stopped", "stopped", None, None, None, "unanswered"),
+    ("before 12: never sent", "not_sent", None, None, None, "never_sent"),
+    ("before 12: swept", "interrupted", None, None, None, "unknown"),
+    (
+        "before 12: the answer's write failed",
+        "interrupted",
+        None,
+        None,
+        None,
+        "unknown",
+    ),
+]
+
+
+def _unsealed_calls(rows):
+    """A memory database holding SCHEMA alone, no seals and no foreign
+    keys, with one judge call per row as given, so any combination of
+    facts can be held and read back by both classifiers."""
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(store.SCHEMA)
+    conn.executemany(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at, outcome, sent, answered_at, usable)
+           VALUES (1, 1, 1, 'j/x', 'x', ?, ?, ?, ?)""",
+        rows,
+    )
+    return conn
+
+
+def _both_words(conn):
+    """Each call's word by CALL_ENDING_SQL and by call_ending, by id."""
+    by_sql = dict(
+        conn.execute(
+            f"SELECT id, {store.CALL_ENDING_SQL} FROM judge_calls ORDER BY id"
+        ).fetchall()
+    )
+    by_python = {
+        r["id"]: store.call_ending(dict(r))
+        for r in conn.execute("SELECT * FROM judge_calls ORDER BY id")
+    }
+    return by_sql, by_python
+
+
+def test_every_call_is_counted_by_its_facts_in_one_place():
+    """WINDOW: CALL_ENDING_SQL and store.call_ending over every shape a
+    call can be in, read from a database holding no seal.
+
+    One word per call, the same from the SQL the pass's close counts by
+    and from the Python the report counts by, and the word pinned for
+    each shape: by the facts (the operator's ruling H2 on the 1d91670
+    review), so an answer whose record's write failed is answered and a
+    failure with no reply unanswered; and, for a call ended before schema
+    12, by the history arms, where both interrupted shapes are unknown.
+    PRE-STATE: every word in CALL_ENDINGS but none is pinned for some
+    shape."""
+    assert {shape[-1] for shape in CLASSIFIER_SHAPES} == set(store.CALL_ENDINGS)
+    conn = _unsealed_calls([shape[1:5] for shape in CLASSIFIER_SHAPES])
+    by_sql, by_python = _both_words(conn)
+    assert by_sql == by_python
+    assert [by_sql[i + 1] for i in range(len(CLASSIFIER_SHAPES))] == [
+        shape[-1] for shape in CLASSIFIER_SHAPES
+    ]
+
+
+def test_once_a_call_records_its_facts_its_outcome_word_changes_no_count():
+    """WINDOW: every combination of outcome, sent, answer time and usable,
+    126 in all, read by both classifiers.
+
+    The two agree on all of them. And where sent is recorded, the word
+    depends on the facts alone: no two outcomes holding the same facts
+    are counted apart, so the outcome word decides no count for any call
+    ended since schema 12. PRE-STATE: 84 of the combinations record sent,
+    across six outcomes."""
+    outcomes = [None, *store.CALL_OUTCOMES]
+    rows = list(itertools.product(outcomes, [None, 0, 1], [None, REPLY], [None, 0, 1]))
+    assert len(rows) == 126
+    conn = _unsealed_calls(rows)
+    by_sql, by_python = _both_words(conn)
+    assert by_sql == by_python
+    recorded = [
+        (row, by_sql[i + 1])
+        for i, row in enumerate(rows)
+        if row[0] is not None and row[1] is not None
+    ]
+    assert len(recorded) == 72
+    words = {}
+    for (_, *facts), word in recorded:
+        words.setdefault(tuple(facts), set()).add(word)
+    assert all(len(found) == 1 for found in words.values())
+
+
+# The classifier's shapes a count places by the history arms, among the
+# unanswered and unusable: pinned by name, not derived.
+HISTORY_COUNTED_SHAPES = {
+    "before 12: an error status",
+    "before 12: failed with none",
+    "before 12: timed out",
+    "before 12: stopped",
+}
+
+
+def test_the_calls_counted_by_the_history_rules_are_one_test_in_sql_and_python():
+    """WINDOW: HISTORY_COUNTED_SQL and store.history_counted over every
+    shape a call can be in, and over every combination of outcome, sent,
+    answer time and usable, read from a database holding no seal.
+
+    One test in both, the SQL the pass door reads a pass's count by and
+    the Python the report counts by: a call ended before schema 12 and
+    placed unanswered or unusable, and nothing else, so no call ended
+    since, no call answered, never sent or unknown, and no call in flight
+    is counted (the operator's second pass at 3a9f3e6: the page says when
+    a pass's counts rest on the history rules). PRE-STATE: four of the
+    classifier's shapes are such calls, and the 126 combinations hold
+    calls of every word."""
+    assert HISTORY_COUNTED_SHAPES <= {shape[0] for shape in CLASSIFIER_SHAPES}
+    conn = _unsealed_calls([shape[1:5] for shape in CLASSIFIER_SHAPES])
+    by_sql = dict(
+        conn.execute(
+            f"SELECT id, {store.HISTORY_COUNTED_SQL} FROM judge_calls ORDER BY id"
+        ).fetchall()
+    )
+    by_python = {
+        r["id"]: store.history_counted(dict(r))
+        for r in conn.execute("SELECT * FROM judge_calls ORDER BY id")
+    }
+    assert {i: bool(v) for i, v in by_sql.items()} == by_python
+    assert [
+        shape[0] for i, shape in enumerate(CLASSIFIER_SHAPES) if by_python[i + 1]
+    ] == sorted(
+        HISTORY_COUNTED_SHAPES,
+        key=[shape[0] for shape in CLASSIFIER_SHAPES].index,
+    )
+    rows = list(
+        itertools.product(
+            [None, *store.CALL_OUTCOMES], [None, 0, 1], [None, REPLY], [None, 0, 1]
+        )
+    )
+    assert len(rows) == 126
+    everything = _unsealed_calls(rows)
+    assert {
+        store.call_ending(dict(r))
+        for r in everything.execute("SELECT * FROM judge_calls")
+    } == set(store.CALL_ENDINGS)
+    by_sql = dict(
+        everything.execute(
+            f"SELECT id, {store.HISTORY_COUNTED_SQL} FROM judge_calls ORDER BY id"
+        ).fetchall()
+    )
+    for i, row in enumerate(
+        everything.execute("SELECT * FROM judge_calls ORDER BY id")
+    ):
+        expected = row["sent"] is None and store.call_ending(dict(row)) in (
+            "unanswered",
+            "unusable",
+        )
+        assert bool(by_sql[i + 1]) is store.history_counted(dict(row)) is expected
+    assert sum(bool(v) for v in by_sql.values()) == 21
+
+
+def test_each_pass_is_served_the_count_of_its_own_calls_the_old_words_place():
+    """WINDOW: store.scoring_passes_for and store.latest_scoring_passes over
+    five passes across three experiments, holding between them calls of
+    the classifier's shapes, read from a database holding no seal.
+
+    Each pass ended in schema 12's form is served the count of its own
+    calls HISTORY_COUNTED_SQL takes: by pass, not by experiment or
+    database. A pass sealed before schema 12 and a pass not yet ended
+    (unknown NULL) are served NULL, since their counts rest on nothing
+    these rules placed (the external review of this change: three wrong
+    correlations passed every proof). PRE-STATE: pass 1 holds every
+    history-counted shape and pass 2, in the same experiment, none; pass 3
+    is sealed before schema 12 and pass 4, in the same experiment, holds
+    two; pass 5 has not ended."""
+    shape = {name: rest for name, *rest in CLASSIFIER_SHAPES}
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(store.SCHEMA)
+    passes = [(1, "finished", 0), (1, "finished", 0), (2, "finished", None)]
+    passes += [(2, "finished", 0), (3, None, None)]
+    for experiment, outcome, unknown in passes:
+        conn.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at,
+                   outcome, unknown) VALUES (?, 'j/x', 't', ?, ?)""",
+            (experiment, outcome, unknown),
+        )
+    held = {
+        1: [*sorted(HISTORY_COUNTED_SHAPES), "before 12: answered", "before 12: swept"],
+        2: [n for n, rest in shape.items() if rest[1] is not None],
+        3: ["before 12: failed with none", "before 12: an error status"],
+        4: ["before 12: timed out", "before 12: stopped", "found open at boot"],
+        5: ["in flight"],
+    }
+    for pass_id, names in held.items():
+        for name in names:
+            outcome, sent, answered_at, usable, _ = shape[name]
+            conn.execute(
+                """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                       judge_model, sent_at, outcome, sent, answered_at, usable)
+                   VALUES (?, 0, 1, 'j/x', 't', ?, ?, ?, ?)""",
+                (pass_id, outcome, sent, answered_at, usable),
+            )
+    calls = [dict(r) for r in conn.execute("SELECT * FROM judge_calls")]
+    assert sum(1 for c in calls if c["pass_id"] == 1 and store.history_counted(c)) == 4
+    assert not any(store.history_counted(c) for c in calls if c["pass_id"] == 2)
+    served = {
+        e: [p["history_counted"] for p in store.scoring_passes_for(conn, e)]
+        for e in (1, 2, 3)
+    }
+    assert served == {1: [4, 0], 2: [None, 2], 3: [None]}
+    latest = store.latest_scoring_passes(conn, [1, 2, 3])
+    assert {e: p["history_counted"] for e, p in latest.items()} == {
+        1: 0,
+        2: 2,
+        3: None,
+    }
+
+
+def test_a_pass_seals_the_counts_its_calls_recount_to(db):
+    """WINDOW: a pass holding a call of every shape a pass can leave, its
+    own endings and the close's, closed, and a recount of its calls read
+    back by call_ending.
+
+    The counts sealed with the pass are the counts of its calls by the
+    same arms, so a reader recounting a post-12 pass's calls gets its
+    sealed counts. PRE-STATE: one call is left open for the close, and
+    the rest ended by the store's own writer."""
+    eid, (rid, _) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    for outcome, sent, answered_at, usable in _every_ending():
+        if outcome == "interrupted":
+            continue
+        call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+        store.record_judge_call_answer(db, call_id, outcome, answered_at=answered_at)
+    unwritten = {}
+    for outcome, answered_at in (("answered", REPLY), ("failed", None)):
+        call_id = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+        unwritten[call_id] = store.UnwrittenEnding(
+            outcome=outcome, answered_at=answered_at, detail="its write failed"
+        )
+    left = store.record_judge_call_sent(db, pass_id, rid, "j/x")
+    assert _row(db, "judge_calls", left)["outcome"] is None
+    store.close_scoring_pass(db, pass_id, "failed", "x", unrecorded=unwritten)
+
+    words = [store.call_ending(c) for c in store.judge_calls_for(db, eid)]
+    sealed = _row(db, "scoring_passes", pass_id)
+    assert (sealed["unanswered"], sealed["unusable"], sealed["unknown"]) == (
+        words.count("unanswered"),
+        words.count("unusable"),
+        words.count("unknown"),
+    )
+    # By hand: timed out, stopped before its reply, failed with none, and
+    # the close's failure with none; stopped while replying and failed with
+    # a reply; the call the pass said nothing of.
+    assert (sealed["unanswered"], sealed["unusable"], sealed["unknown"]) == (4, 2, 1)
+
+
+@pytest.mark.parametrize("verb", ["INSERT OR REPLACE", "REPLACE", "INSERT"])
+@pytest.mark.parametrize("table", ["judge_calls", "scoring_passes"])
+def test_a_scoring_record_is_never_replaced_by_direct_sql(db, verb, table):
+    """WINDOW: an insert naming an id the table already holds.
+
+    REPLACE deletes the old row without firing a DELETE trigger, so the
+    insert's seal is what catches it: refused in the seal's sentence and
+    the row as it was. PRE-STATE: the row exists, with its sent time or
+    start time written."""
+    pass_id, open_call, _ = _open_and_ended_call(db)
+    row_id = open_call if table == "judge_calls" else pass_id
+    before = _row(db, table, row_id)
+    stamp = "sent_at" if table == "judge_calls" else "started_at"
+    assert before[stamp]
+    columns = ", ".join(before)
+    marks = ", ".join("?" for _ in before)
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(
+                f"{verb} INTO {table} ({columns}) VALUES ({marks})",
+                tuple({**before, stamp: "1999-01-01T00:00:00+00:00"}.values()),
+            )
+    noun = "judge call" if table == "judge_calls" else "scoring pass"
+    assert str(refused.value) == f"a {noun} record is never replaced"
+    assert _row(db, table, row_id) == before
+
+
+@pytest.mark.parametrize("table", ["judge_calls", "scoring_passes"])
+def test_a_scoring_record_is_never_deleted_by_direct_sql(db, table):
+    """WINDOW: a DELETE of one row nothing cites: an ended call no score
+    row names, or a pass no call belongs to.
+
+    Refused in the seal's sentence, and the row is still there. Nothing
+    cites the row, so no foreign key stands between the statement and
+    the delete: the seal is the only thing that can refuse it.
+    PRE-STATE: no row of scores or judge_calls cites the target."""
+    _, _, ended_call = _open_and_ended_call(db)
+    if table == "judge_calls":
+        target = ended_call
+        citing = db.execute(
+            "SELECT COUNT(*) FROM scores WHERE judge_call_id = ?", (target,)
+        )
+    else:
+        eid = db.execute("SELECT MAX(id) FROM experiments").fetchone()[0]
+        target = store.open_scoring_pass(db, eid, None)
+        citing = db.execute(
+            """SELECT (SELECT COUNT(*) FROM judge_calls WHERE pass_id = ?)
+                    + (SELECT COUNT(*) FROM scores WHERE pass_id = ?)""",
+            (target, target),
+        )
+    assert citing.fetchone()[0] == 0
+    before = _row(db, table, target)
+    with pytest.raises(sqlite3.IntegrityError) as refused:
+        with db:
+            db.execute(f"DELETE FROM {table} WHERE id = ?", (target,))
+    noun = "judge call" if table == "judge_calls" else "scoring pass"
+    assert str(refused.value) == f"a {noun} record is never deleted"
+    assert _row(db, table, target) == before
+
+
+def test_a_close_names_why_each_open_call_was_left_open(db):
+    """WINDOW: close_scoring_pass over a pass holding two open calls, one
+    the pass says the write of whose answer failed and one it says
+    nothing of.
+
+    What was interrupted is the record, not the request (the operator's
+    ruling at P1's checkpoint): the call the pass names gets the pass's
+    sentence and, since the operator's ruling M1 on the 1d91670 review,
+    everything the pass knew of it (sent, the answer time, usable, the
+    generation id, the charge and the two counts), so it is counted where
+    what happened to it puts it, answered, and not unanswered. The other
+    gets the fallback and no facts, and is counted unknown. Both are
+    interrupted, and neither sentence is the boot sweep's. PRE-STATE:
+    both calls are open."""
+    eid, (r1, r2) = _scoring_setup(db)
+    pass_id = store.open_scoring_pass(db, eid, "j/x")
+    named = store.record_judge_call_sent(db, pass_id, r1, "j/x")
+    silent = store.record_judge_call_sent(db, pass_id, r2, "j/x")
+    assert [_row(db, "judge_calls", c)["outcome"] for c in (named, silent)] == [
+        None
+    ] * 2
+    stamp = "2026-09-28T00:00:05+00:00"
+    said = store.UnwrittenEnding(
+        outcome="answered",
+        answered_at=stamp,
+        detail="the answer arrived; its write failed: OperationalError: disk I/O error",
+        generation_id="gen-9",
+        billed_cost_usd=0.004,
+        prompt_tokens=30,
+        completion_tokens=9,
+    )
+
+    store.close_scoring_pass(db, pass_id, "failed", "x", unrecorded={named: said})
+
+    rows = {c: _row(db, "judge_calls", c) for c in (named, silent)}
+    assert [(r["outcome"], r["detail"]) for r in rows.values()] == [
+        ("interrupted", said.detail),
+        ("interrupted", store.CALL_LEFT_OPEN),
+    ]
+    facts = (
+        "sent",
+        "answered_at",
+        "usable",
+        "generation_id",
+        "billed_cost_usd",
+        "prompt_tokens",
+        "completion_tokens",
+    )
+    assert [rows[named][k] for k in facts] == [1, stamp, 1, "gen-9", 0.004, 30, 9]
+    assert [rows[silent][k] for k in facts] == [None] * 7
+    ended = _row(db, "scoring_passes", pass_id)
+    assert (ended["unanswered"], ended["unusable"], ended["unknown"]) == (0, 0, 1)
+    assert store.FOUND_OPEN_AT_BOOT not in (said.detail, store.CALL_LEFT_OPEN)
+
+
+@pytest.mark.parametrize(
+    "record,holder,who",
+    [
+        ("4242 server", "server", "process 4242, a bench server,"),
+        (
+            "4242 reconcile",
+            "server",
+            "process 4242, python -m bench.reconcile --apply,",
+        ),
+        ("4242", "server", "process 4242,"),
+        ("4242 script", "server", "process 4242,"),
+        ("", "reconcile", "another process,"),
+        ("x y", "reconcile", "another process,"),
+    ],
+)
+def test_the_lock_refusal_names_what_the_lock_file_says(record, holder, who):
+    """WINDOW: the refusal store.hold_lock raises, for each record a lock
+    file can hold (a server's, reconcile's, a bare process id as P1's
+    builds wrote, nothing, and junk) and each kind of process refused.
+
+    The sentence names what the file says holds the lock and no more: an
+    unknown kind is left unnamed and an unreadable record is "another
+    process", never a guess. PRE-STATE:
+    none; the sentence is a pure function of the record."""
+    sentence = store._lock_refusal("/x/bench.db.lock", record.split(), holder)
+    assert sentence.startswith(f"/x/bench.db.lock is held by {who} which is using")
+    ending = (
+        "so this server will not start"
+        if holder == "server"
+        else "so reconcile --apply will not start"
+    )
+    assert ending in sentence
+
+
+def test_a_lock_is_held_only_under_a_name_it_knows(tmp_path):
+    """WINDOW: store.hold_lock asked for a holder it does not name, and for
+    a memory database.
+
+    A lock record names a known kind of process or the refusal could not
+    say what holds it; a memory database takes no lock. PRE-STATE: no
+    lock file exists."""
+    path = str(tmp_path / "bench.db")
+    with pytest.raises(ValueError, match="no lock holder is called 'script'"):
+        store.hold_lock(path, "script")
+    assert not (tmp_path / "bench.db.lock").exists()
+    assert store.hold_lock(":memory:", "server") is None
+
+
+P1_SCHEMA = (pathlib.Path(__file__).parent / "fixtures" / "p1_schema.sql").read_text()
+
+# The sha256 of SCHEMA's body and then SEALS's body at 74ca55b, as `git show
+# 74ca55b:bench/store.py` gave them when the fixture was extracted.
+P1_SCHEMA_DIGEST = "75003702eab206f77c91417c5efb38bb8a4d5f14329fa10bb179f79352cd0d70"
+
+
+def test_the_p1_fixture_is_the_schema_and_seals_before_the_split():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's and then SEALS's
+    text at 74ca55b, pinned by digest. The right era: it has the scoring
+    tables and scoring_passes_sealed_v1, and no unusable column."""
+    body = "".join(
+        line
+        for line in P1_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == P1_SCHEMA_DIGEST
+    assert "CREATE TABLE IF NOT EXISTS scoring_passes" in body
+    assert "CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v1" in body
+    assert "unusable" not in body
+    assert "git show 74ca55b:bench/store.py" in P1_SCHEMA
+
+
+def test_migration_onto_a_p1_database_splits_the_counts_and_retires_the_seal(
+    tmp_path,
+):
+    """WINDOW: a database as P1's builds left it (74ca55b's SCHEMA and
+    SEALS, plus the two columns only MIGRATIONS added), holding a pass
+    closed with one failed call counted as unanswered, through connect()
+    twice.
+
+    The column arrives by MIGRATIONS, NULL on the old pass, whose every
+    other field is as it was: its unanswered still counts the failed call,
+    and the NULL is what says so (see store.MIGRATIONS). The v1 seal is
+    dropped and the seal in force laid (v2 when this was written, v3
+    since schema 12), so the new column is sealed too: the old pass,
+    having ended, refuses a late fill of it in the seal's sentence. A pass closed
+    on the migrated database counts the two apart. PRE-STATE: no unusable
+    column, v1 in force and v2 absent, and the old pass's unanswered is
+    1 for its one failed call."""
+    db_path = tmp_path / "p1.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(P1_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p1', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES ('p', '2026-09-28')"
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               outcome = 'failed', detail = 'judge returned HTTP 500'
+            WHERE id = 1"""
+    )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 0, failed = 1, unanswered = 1
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.row_factory = sqlite3.Row
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(scoring_passes)")]
+    assert "unusable" not in columns
+    triggers = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    assert "scoring_passes_sealed_v1" in triggers
+    assert "scoring_passes_sealed_v2" not in triggers
+    before = dict(legacy.execute("SELECT * FROM scoring_passes").fetchone())
+    assert before["unanswered"] == 1
+    legacy.close()
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            triggers = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert "scoring_passes_sealed_v1" not in triggers
+            assert _seals_as_stored(conn) == sealed
+            assert _row(conn, "scoring_passes", 1) == {
+                **before,
+                "unusable": None,
+                "unknown": None,
+            }
+            assert _record_triggers(conn) == set(SEAL_NAMES)
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            with conn:
+                conn.execute("UPDATE scoring_passes SET unusable = 1 WHERE id = 1")
+        assert str(refused.value) == PASS_LATE
+        pass_id = store.open_scoring_pass(conn, 1, "j/x")
+        for outcome, replied in (("failed", True), ("timed_out", False)):
+            call_id = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+            store.record_judge_call_answer(
+                conn,
+                call_id,
+                outcome,
+                answered_at=store.now() if replied else None,
+            )
+        store.close_scoring_pass(conn, pass_id, "finished")
+        made = _row(conn, "scoring_passes", pass_id)
+        assert (made["unanswered"], made["unusable"]) == (1, 1)
+    finally:
+        conn.close()
+
+
+PRE_P2_SCHEMA = (
+    pathlib.Path(__file__).parent / "fixtures" / "pre_p2_schema.sql"
+).read_text()
+
+# The sha256 of SCHEMA's body and then SEALS's body at b6c088c, as `git show
+# b6c088c:bench/store.py` gave them when the fixture was extracted.
+PRE_P2_SCHEMA_DIGEST = (
+    "fdb53426c446628168275941cfdfd6cf2d60728fda49f4f01394457f2ff07f49"
+)
+
+
+def test_the_pre_p2_fixture_is_the_schema_and_seals_at_b6c088c():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's and then SEALS's
+    text at b6c088c, pinned by digest. The right era: it has unusable and
+    scoring_passes_sealed_v2 (ruling 4), judge_calls_sealed_v1, and no
+    usage count on a judge call."""
+    body = "".join(
+        line
+        for line in PRE_P2_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == PRE_P2_SCHEMA_DIGEST
+    assert "unusable INTEGER" in body
+    assert "CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2" in body
+    assert "CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v1" in body
+    judge_calls = body[body.index("CREATE TABLE IF NOT EXISTS judge_calls") :]
+    judge_calls = judge_calls[: judge_calls.index(");")]
+    assert "prompt_tokens" not in judge_calls
+    assert "git show b6c088c:bench/store.py" in PRE_P2_SCHEMA
+
+
+def test_migration_onto_a_pre_p2_database_adds_the_counts_and_retires_the_seal(
+    tmp_path,
+):
+    """WINDOW: a database as b6c088c left it, holding a judge call answered
+    before P2, through connect() twice.
+
+    The two usage-count columns arrive by MIGRATIONS, NULL on the old
+    call, whose every other field is as it was; judge_calls_sealed_v1 is
+    dropped and the seal in force laid (v2 when this was written, v3 since
+    schema 12), so the old ended call refuses a late fill of a count in
+    the seal's sentence; and a call answered on the migrated database
+    records the counts its reply reported, through the field-type
+    function, so junk is NULL. PRE-STATE: neither column, v1 in force."""
+    db_path = tmp_path / "pre_p2.db"
+    legacy = sqlite3.connect(str(db_path))
+    legacy.executescript(PRE_P2_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p1', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        "INSERT INTO runs (prompt_text, created_at) VALUES ('p', '2026-09-28')"
+    )
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               generation_id = 'gen-old', outcome = 'answered' WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.row_factory = sqlite3.Row
+    columns = [r[1] for r in legacy.execute("PRAGMA table_info(judge_calls)")]
+    assert not {"prompt_tokens", "completion_tokens"} & set(columns)
+    triggers = {
+        r[0]
+        for r in legacy.execute("SELECT name FROM sqlite_master WHERE type='trigger'")
+    }
+    assert "judge_calls_sealed_v1" in triggers
+    before = dict(legacy.execute("SELECT * FROM judge_calls").fetchone())
+    legacy.close()
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            triggers = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='trigger'"
+                )
+            }
+            assert "judge_calls_sealed_v1" not in triggers
+            assert _seals_as_stored(conn) == sealed
+            assert _row(conn, "judge_calls", 1) == {
+                **before,
+                "prompt_tokens": None,
+                "completion_tokens": None,
+                "sent": None,
+                "usable": None,
+            }
+            assert _record_triggers(conn) == set(SEAL_NAMES)
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        with pytest.raises(sqlite3.IntegrityError) as refused:
+            with conn:
+                conn.execute("UPDATE judge_calls SET prompt_tokens = 5 WHERE id = 1")
+        assert str(refused.value) == CALL_LATE
+        pass_id = store.open_scoring_pass(conn, 1, "j/x")
+        counted = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+        store.record_judge_call_answer(
+            conn,
+            counted,
+            "answered",
+            answered_at=store.now(),
+            prompt_tokens=30,
+            completion_tokens=9,
+        )
+        junk = store.record_judge_call_sent(conn, pass_id, 1, "j/x")
+        store.record_judge_call_answer(
+            conn,
+            junk,
+            "answered",
+            answered_at=store.now(),
+            prompt_tokens="n/a",
+            completion_tokens=-1,
+        )
+        assert [
+            (
+                _row(conn, "judge_calls", c)["prompt_tokens"],
+                _row(conn, "judge_calls", c)["completion_tokens"],
+            )
+            for c in (counted, junk)
+        ] == [(30, 9), (None, None)]
+    finally:
+        conn.close()
+
+
+P2_SCHEMA = (pathlib.Path(__file__).parent / "fixtures" / "p2_schema.sql").read_text()
+
+# The sha256 of SCHEMA's body and then SEALS's body at b3b4e48, as `git show
+# b3b4e48:bench/store.py` gave them when the fixture was extracted.
+P2_SCHEMA_DIGEST = "cbb2f5026fa9d067bfb001b84e8bb7da587bf7c119b4ab078da4f7f91e27ab17"
+
+
+def test_the_p2_fixture_is_the_schema_and_seals_before_schema_12():
+    """WINDOW: the fixture file on disk, read at assert time.
+
+    Its provenance asserted rather than trusted: SCHEMA's and then SEALS's
+    text at b3b4e48, pinned by digest, and its SEALS part is the text the
+    seal pin held before schema 12 (SEALS_DIGEST's previous value). The
+    right era: both v2 seals, the usage counts on a judge call, and none
+    of schema 12's three columns."""
+    body = "".join(
+        line
+        for line in P2_SCHEMA.splitlines(keepends=True)
+        if not line.startswith("--")
+    )
+    assert hashlib.sha256(body.encode()).hexdigest() == P2_SCHEMA_DIGEST
+    seals = body[body.index("CREATE TRIGGER IF NOT EXISTS scoring_passes_sealed_v2") :]
+    assert (
+        hashlib.sha256(("\n" + seals).encode()).hexdigest()
+        == "837d2ce40ad74a2736f5294b6ed2fff6c2ac9b5949aea2436e2b995a6be8cff5"
+    )
+    assert "CREATE TRIGGER IF NOT EXISTS judge_calls_sealed_v2" in body
+    judge_calls = body[body.index("CREATE TABLE IF NOT EXISTS judge_calls") :]
+    judge_calls = judge_calls[: judge_calls.index(");")]
+    assert "prompt_tokens INTEGER" in judge_calls
+    assert not re.search(r"^\s+(sent|usable|unknown) INTEGER", body, re.M)
+    assert "git show b3b4e48:bench/store.py" in P2_SCHEMA
+
+
+def _p2_database(path):
+    """A database as P2's builds left it (2e8bd02 to b3b4e48), holding
+    pass A, closed with a call of each ending those builds wrote and
+    counted by b6c088c's outcome list; pass B, open, with one call
+    answered and one open; and pass C, open, begun with no judge."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(P2_SCHEMA)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p2', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute("INSERT INTO runs (prompt_text, created_at) VALUES ('p', 'x')")
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    for judge in ("j/x", "j/x", None):
+        legacy.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+               VALUES (1, ?, '2026-09-28T00:00:00+00:00')""",
+            (judge,),
+        )
+    endings = [
+        (1, "answered", "2026-09-28T00:00:02+00:00", "gen-1", 0.002, None),
+        (
+            1,
+            "failed",
+            "2026-09-28T00:00:02+00:00",
+            None,
+            None,
+            "judge returned HTTP 500",
+        ),
+        (1, "failed", None, None, None, "judge request failed: RemoteProtocolError"),
+        (1, "timed_out", None, None, None, "judge request failed: ReadTimeout"),
+        (1, "not_sent", None, None, None, "judge request failed: ConnectError"),
+        (
+            1,
+            "interrupted",
+            None,
+            None,
+            None,
+            "the answer arrived; its write failed: OperationalError: disk I/O error",
+        ),
+        (2, "answered", "2026-09-28T00:00:02+00:00", "gen-2", None, None),
+        (2, None, None, None, None, None),
+    ]
+    for pass_id, outcome, answered_at, gen, billed, detail in endings:
+        cur = legacy.execute(
+            """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                   judge_model, sent_at)
+               VALUES (?, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')""",
+            (pass_id,),
+        )
+        if outcome is not None:
+            legacy.execute(
+                """UPDATE judge_calls SET answered_at = ?, generation_id = ?,
+                       billed_cost_usd = ?, outcome = ?, detail = ?
+                    WHERE id = ?""",
+                (answered_at, gen, billed, outcome, detail, cur.lastrowid),
+            )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'failed', detail = 'x', scored = 1, failed = 0,
+               unanswered = 2, unusable = 2
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    return legacy
+
+
+def test_migration_onto_a_p2_database_keeps_what_it_holds(tmp_path):
+    """WINDOW: a database as P2's builds left it, holding a pass sealed with
+    a call of every ending those builds wrote, a pass left open with one
+    call answered and one open, and a pass begun with no judge, through
+    connect() twice and then the boot sweep.
+
+    Schema 12's three columns arrive by MIGRATIONS, NULL on every old
+    row, whose every other field is as it was; both v2 seals are dropped
+    and v3 laid, so exactly SEALS holds the tables. The sealed pass keeps
+    its counts as sealed, unknown NULL marking the list they were counted
+    by, and refuses a late fill of a fact or of unknown; the pass begun
+    with no judge now refuses one filled in (the external review's L2).
+    Its old calls are placed by the history arms: the failure with no
+    reply unanswered beside the timeout, the error status unusable, the
+    interrupted call unknown, the never sent nowhere. The sweep counts the
+    open pass's answered call answered and its open call unknown, so a
+    pass open across the upgrade is not counted as if its old calls said
+    nothing. A migrated table has a fresh one's columns. PRE-STATE: none
+    of the three columns, both v2 seals in force, the sealed pass's
+    counts 2 and 2, and the fill of a judge into the no-judge pass
+    landing under v2 (inside a savepoint, rolled back)."""
+    db_path = tmp_path / "p2.db"
+    legacy = _p2_database(db_path)
+    legacy.row_factory = sqlite3.Row
+    for table, column in (
+        ("judge_calls", "sent"),
+        ("judge_calls", "usable"),
+        ("scoring_passes", "unknown"),
+    ):
+        assert column not in [
+            r[1] for r in legacy.execute(f"PRAGMA table_info({table})")
+        ]
+    assert {"scoring_passes_sealed_v2", "judge_calls_sealed_v2"} <= _record_triggers(
+        legacy
+    )
+    assert (
+        legacy.execute(
+            "SELECT unanswered, unusable FROM scoring_passes WHERE id = 1"
+        ).fetchone()[:]
+    ) == (2, 2)
+    legacy.isolation_level = None
+    legacy.execute("SAVEPOINT under_v2")
+    legacy.execute(
+        "UPDATE scoring_passes SET judge_model = 'j/other', outcome = 'finished' WHERE id = 3"
+    )
+    assert (
+        legacy.execute(
+            "SELECT judge_model FROM scoring_passes WHERE id = 3"
+        ).fetchone()[0]
+        == "j/other"
+    )
+    legacy.execute("ROLLBACK TO under_v2")
+    legacy.execute("RELEASE under_v2")
+    before = {
+        t: [dict(r) for r in legacy.execute(f"SELECT * FROM {t} ORDER BY id")]
+        for t in ("scoring_passes", "judge_calls")
+    }
+    assert before["scoring_passes"][2]["judge_model"] is None
+    legacy.close()
+    sealed = store.SEALS.replace("CREATE TRIGGER IF NOT EXISTS ", "CREATE TRIGGER ")
+    grown = {
+        "scoring_passes": {"unknown": None},
+        "judge_calls": {"sent": None, "usable": None},
+    }
+
+    for _ in range(2):
+        conn = store.connect(str(db_path))
+        try:
+            for table, rows in before.items():
+                got = [
+                    dict(r) for r in conn.execute(f"SELECT * FROM {table} ORDER BY id")
+                ]
+                assert got == [{**r, **grown[table]} for r in rows]
+            assert _record_triggers(conn) == set(SEAL_NAMES)
+            assert _seals_as_stored(conn) == sealed
+        finally:
+            conn.close()
+
+    conn = store.connect(str(db_path))
+    try:
+        for sql, refusal in (
+            ("UPDATE judge_calls SET sent = 1 WHERE id = 1", CALL_LATE),
+            ("UPDATE scoring_passes SET unknown = 0 WHERE id = 1", PASS_LATE),
+            (
+                "UPDATE scoring_passes SET judge_model = 'j/other', "
+                "outcome = 'finished' WHERE id = 3",
+                PASS_HELD,
+            ),
+        ):
+            with pytest.raises(sqlite3.IntegrityError) as refused:
+                with conn:
+                    conn.execute(sql)
+            assert str(refused.value) == refusal
+        old = _row(conn, "scoring_passes", 1)
+        assert (old["unanswered"], old["unusable"], old["unknown"]) == (2, 2, None)
+        words = [
+            store.call_ending(c)
+            for c in store.judge_calls_for(conn, 1)
+            if c["pass_id"] == 1
+        ]
+        assert words == [
+            "answered",
+            "unusable",
+            "unanswered",
+            "unanswered",
+            "never_sent",
+            "unknown",
+        ]
+        assert store.sweep_open_scoring_records(conn) == (2, 1)
+        swept = _row(conn, "scoring_passes", 2)
+        assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+        assert [
+            store.call_ending(c)
+            for c in store.judge_calls_for(conn, 1)
+            if c["pass_id"] == 2
+        ] == ["answered", "unknown"]
+        fresh = store.connect(":memory:")
+        try:
+            for table in ("scoring_passes", "judge_calls"):
+                shape = "SELECT name, type FROM pragma_table_info(?)"
+                assert (
+                    conn.execute(shape, (table,)).fetchall()
+                    == fresh.execute(shape, (table,)).fetchall()
+                )
+        finally:
+            fresh.close()
+    finally:
+        conn.close()
+
+
+# ---- The seal swap (the external review's L1): the seals are laid before
+# ---- the retired ones are dropped, so no moment leaves a table unsealed.
+
+
+def _era_database_with_sealed_rows(path, fixture):
+    """A database from an era fixture holding an answered judge call and
+    an ended pass, the rows a forger would want to rewrite."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('e', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'done',
+                   1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute("INSERT INTO runs (prompt_text, created_at) VALUES ('p', 'x')")
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.execute(
+        """UPDATE judge_calls SET answered_at = '2026-09-28T00:00:02+00:00',
+               generation_id = 'gen-old', outcome = 'answered' WHERE id = 1"""
+    )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 1, failed = 0, unanswered = 0
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.close()
+
+
+@pytest.mark.parametrize("era", ["p1", "pre_p2", "p2"])
+def test_the_seal_swap_never_leaves_a_table_unsealed(monkeypatch, tmp_path, era):
+    """WINDOW: connect() over a database an earlier era sealed (P1's, whose
+    two seals v1 are retired, b6c088c's, whose judge_calls seal v1 is,
+    and P2's, whose two seals v2 schema 12 retires), with a second
+    connection trying to rewrite an answered call and an ended pass at
+    every statement the booting connection runs.
+
+    connect() lays SEALS before it drops the retired names, so at every
+    moment one seal holds each table and every attempt is refused (or
+    finds the database busy), and both rows are as they were. PRE-STATE:
+    the rows are sealed by the era's own seals when the boot begins; with
+    the retired seal dropped first, the synthesis measured 6 rewrites
+    landing in the gap."""
+    path = tmp_path / f"{era}.db"
+    _era_database_with_sealed_rows(
+        path, {"p1": P1_SCHEMA, "pre_p2": PRE_P2_SCHEMA, "p2": P2_SCHEMA}[era]
+    )
+    forger = sqlite3.connect(str(path), timeout=0)
+    landed = []
+
+    def forge(_statement):
+        for sql in (
+            "UPDATE judge_calls SET generation_id = 'gen-forged' WHERE id = 1",
+            "UPDATE scoring_passes SET scored = 9 WHERE id = 1",
+        ):
+            try:
+                with forger:
+                    if forger.execute(sql).rowcount:
+                        landed.append(sql)
+            except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                pass
+
+    real = sqlite3.connect
+
+    def traced(*args, **kwargs):
+        conn = real(*args, **kwargs)
+        conn.set_trace_callback(forge)
+        return conn
+
+    monkeypatch.setattr(store.sqlite3, "connect", traced)
+    conn = store.connect(str(path))
+    conn.set_trace_callback(None)
+    monkeypatch.undo()
+    try:
+        assert landed == []
+        call = conn.execute("SELECT generation_id FROM judge_calls").fetchone()[0]
+        scored = conn.execute("SELECT scored FROM scoring_passes").fetchone()[0]
+        assert (call, scored) == ("gen-old", 1)
+        assert _record_triggers(conn) == set(SEAL_NAMES)
+    finally:
+        conn.close()
+        forger.close()
+
+
+def test_no_seal_is_both_laid_and_retired():
+    """WINDOW: store.RETIRED_SEALS beside the seals SEALS lays.
+
+    A name in both would be laid and then dropped by the same connect(),
+    leaving its table unsealed. PRE-STATE: SEALS lays every name in
+    SEAL_NAMES."""
+    laid = set(re.findall(r"CREATE TRIGGER IF NOT EXISTS (\w+)", store.SEALS))
+    assert laid == set(SEAL_NAMES)
+    assert set(store.RETIRED_SEALS).isdisjoint(laid)

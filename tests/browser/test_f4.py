@@ -226,9 +226,11 @@ def test_review_repro_refused_card_is_not_a_save_failure(bench):
     expect(row).to_have_class(re.compile(r"\brefused\b"))
     expect(row).not_to_have_class(re.compile(r"\berror\b"))
     expect(page.locator(".race-val")).to_have_text("refused")
-    # No rerun either: the ceiling holds for the life of the process, so a
-    # rerun could only be refused again, and the first click would turn this
-    # honest card into a red error card.
+    # No rerun either: this refusal is the ceiling reached, which holds for
+    # the life of the process, so a rerun could only be refused again, and
+    # the first click would turn this honest card into a red error card. A
+    # refusal for room other calls had reserved can clear, but it arrives
+    # as the same marker (BACKLOG: a rerun on a card refused for room).
     expect(card.get_by_test_id("tool-rerun")).to_have_count(0)
 
 

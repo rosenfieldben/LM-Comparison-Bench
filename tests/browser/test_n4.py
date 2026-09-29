@@ -25,11 +25,13 @@ EVERY PAGE HERE RUNS IN Asia/Kolkata (UTC+05:30), so a stamp that said
 UTC while printing local time would be off by five and a half hours and
 fail, whatever zone the host is in.
 
-THE BENCH HAS ONE SCORING SLOT, NO DOOR SAYS WHEN A PASS ENDS, AND NONE
-CAN STOP ONE. Every test that scores takes the `scorings` fixture, whose
-teardown waits for the slot (test_n3.py's idle probe) and fails loudly if
-it stays busy; a pass is held open only by the stub's judge gate, which
-the `judge_gate` fixture always releases before that wait.
+THE BENCH HAS ONE SCORING SLOT. Every test that scores takes the
+`scorings` fixture, whose teardown waits for the slot (test_n3.py's idle
+probe) and fails loudly if it stays busy; a pass is held open only by the
+stub's judge gate, which the `judge_gate` fixture always releases before
+that wait. Since Phase P a pass is a record and a door stops one; a
+waiting test still releases the gate, because a Stop lets the call in
+flight finish.
 """
 
 import hashlib
@@ -714,7 +716,9 @@ def test_the_report_is_read_again_after_the_202(page, bench, bench_url, scorings
     After scoring, the report opens: select() had already opened it, so
     the proof is a NEW read of the report, made after the answer and not
     before it, and the line beside Score says when the pass started and
-    that no door says when it ends or whether it failed."""
+    how to read what it has scored since. It said until Phase P that no
+    door says when a pass ends or whether it failed; GET
+    /experiments/{id}/scoring says both now, so that clause went."""
     eid, _ = finished(page, bench_url, PLAIN)
     bench(["stub/fast"])
     open_experiments(page)
@@ -734,9 +738,8 @@ def test_the_report_is_read_again_after_the_202(page, bench, bench_url, scorings
 
     expect(page.get_by_test_id("experiment-action-msg")).to_have_text(
         re.compile(
-            rf"^a scoring pass was started at {UTC}; no door says when it ends "
-            r"or whether it failed, so select the experiment again to read what "
-            r"it has scored since$"
+            rf"^a scoring pass was started at {UTC}; select the experiment "
+            r"again to read what it has scored since$"
         )
     )
 
@@ -767,7 +770,8 @@ def test_a_late_score_answer_does_not_open_its_report_under_another(
         (lambda route: settle(page, route), r"^a scoring pass was started at "),
         (
             lambda route: route.abort(),
-            rf"^no answer came back at {UTC} \(.+\); no door says whether a pass started$",
+            rf"^no answer came back at {UTC} \(.+\); the line beside Score says "
+            r"whether a pass started$",
         ),
     ):
         row_for(page, b).click()
@@ -1089,9 +1093,12 @@ def test_a_lost_score_answer_reads_the_report_again(
     """WINDOW: GET /experiments/{id}/report requests while Score's POST is
     held, and after that POST is lost with the row still selected.
 
-    No door says whether a pass started, so the page says so, in full and
-    stamped, reads the report again for whatever it now holds, and leaves
-    Score live. Pre-state: no read of the report while the POST is out."""
+    The page cannot know whether a pass started, so it says where to look
+    (the line beside Score, which the list read after the answer fills
+    from the server's record; until Phase P it said no door says), in
+    full and stamped, reads the report again for whatever it now holds,
+    and leaves Score live. Pre-state: no read of the report while the
+    POST is out."""
     collectors.extend([ABORTED_RESOURCE, "bench: scoring an experiment failed"])
     eid, _ = finished(page, bench_url, PLAIN)
     bench(["stub/fast"])
@@ -1112,7 +1119,8 @@ def test_a_lost_score_answer_reads_the_report_again(
 
     expect(page.get_by_test_id("experiment-action-msg")).to_have_text(
         re.compile(
-            rf"^no answer came back at {UTC} \(.+\); no door says whether a pass started$"
+            rf"^no answer came back at {UTC} \(.+\); the line beside Score says "
+            r"whether a pass started$"
         )
     )
     expect(page.get_by_test_id("experiment-score")).to_be_enabled()
@@ -1224,35 +1232,59 @@ def test_the_report_states_judge_spend_on_its_own_line(
 
 
 def test_the_judge_spend_line_counts_what_it_cannot_price(
-    page, bench, bench_url, scorings
+    page, bench, bench_url, bench_db, scorings
 ):
     """WINDOW: the report banner's judge-spend line for two judged
     experiments, each read against GET /experiments/{id}/report: A, two
     arms judged by stub/nousage, whose replies carry a generation id and
     no usage; B, one arm judged by stub/html (billed), then by
-    stub/nousage, then scored with no judge.
+    stub/nousage, then by stub/judge-500, then scored with no judge, and
+    holding one judge row written as a pass before Phase P left it.
 
     A reply with no price is a call that went out, so the line names it
     as unpriced rather than reading "none billed" as if nothing had been
-    spent; and every judge row with no billing figure is counted after
-    the spend, whatever the reason (a reply with no price, a pass with no
-    judge to call), the unpriced call among them, so the line never
-    reads as the whole cost of judging when it may not be. The expected
-    text is built here from the payload's numbers, not by the page's own
-    code. PRE-STATE: A's payload holds two unpriced calls and nothing
-    billed, and B's one billed call, one unpriced and two rows with no
-    figure, so each count the line states is one the rows hold."""
+    spent. Since Phase P each request the figure cannot speak for is
+    named for what it is: the judge's 500 as a call that got a reply that
+    could not be used (counted with the unanswered until the operator's
+    ruling 4 at P1's checkpoint, and placed by its facts since schema
+    12), the old row as one with no figure of which the line cannot say
+    whether its request went out (the external review's L10), and the
+    pass with no judge as nothing, since it sent nothing. Until then the line counted every judge row with no
+    figure together ("judge rows carry no billing figure"), the unpriced
+    call and the no-judge rows among them. The expected text is built
+    here from the payload's numbers, not by the page's own code.
+    PRE-STATE: A's payload holds two unpriced calls and nothing else, and
+    B's one billed call, one unpriced, one unusable and one old row, so
+    each count the line states is one the records hold."""
     a, a_digest = finished(page, bench_url, JUDGED, lineup=("stub/fast", "stub/slow"))
     b, b_digest = finished(page, bench_url, JUDGED)
     for eid, body in (
         (a, {"dataset_digest": a_digest, "judge_model": "stub/nousage"}),
         (b, {"dataset_digest": b_digest, "judge_model": "stub/html"}),
         (b, {"dataset_digest": b_digest, "judge_model": "stub/nousage"}),
+        (b, {"dataset_digest": b_digest, "judge_model": "stub/judge-500"}),
         (b, {"dataset_digest": b_digest}),
     ):
         started = page.request.post(f"{bench_url}/experiments/{eid}/score", data=body)
         assert started.status == 202, started.text()
         wait_scoring_idle(page, bench_url)
+    db = sqlite3.connect(bench_db)
+    try:
+        (result_id,) = db.execute(
+            """SELECT r.id FROM results r JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id WHERE g.experiment_id = ?""",
+            (b,),
+        ).fetchone()
+        db.execute(
+            """INSERT INTO scores (result_id, scorer, detail, judge_model,
+                   created_at)
+               VALUES (?, 'judge', 'judge request failed: ReadTimeout',
+                       'stub/html', '2026-09-01T00:00:00+00:00')""",
+            (result_id,),
+        )
+        db.commit()
+    finally:
+        db.close()
     a_spend = page.request.get(f"{bench_url}/experiments/{a}/report").json()[
         "judge_cost"
     ]
@@ -1263,13 +1295,23 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         "total_usd": 0,
         "billed_calls": 0,
         "unpriced_calls": 2,
-        "rows_without_figure": 2,
+        "unanswered_calls": 0,
+        "unusable_answers": 0,
+        "unknown_calls": 0,
+        "history_counted_calls": 0,
+        "in_flight_calls": 0,
+        "rows_before_call_records": 0,
     }, a_spend
     assert (
         b_spend["billed_calls"],
         b_spend["unpriced_calls"],
-        b_spend["rows_without_figure"],
-    ) == (1, 1, 2), b_spend
+        b_spend["unanswered_calls"],
+        b_spend["unusable_answers"],
+        b_spend["unknown_calls"],
+        b_spend["history_counted_calls"],
+        b_spend["in_flight_calls"],
+        b_spend["rows_before_call_records"],
+    ) == (1, 1, 0, 1, 0, 0, 0, 1), b_spend
     bench(["stub/fast"])
     open_experiments(page)
     line = page.get_by_test_id("report-judge-spend")
@@ -1277,15 +1319,18 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
     row_for(page, a).click()
 
     expect(line).to_have_text(
-        f"judge spend: none billed, {a_spend['unpriced_calls']} calls unpriced; "
-        f"{a_spend['rows_without_figure']} judge rows carry no billing figure"
+        f"judge spend: none billed, {a_spend['unpriced_calls']} calls unpriced"
     )
     row_for(page, b).click()
     expect(line).to_have_text(
         f"judge spend: ${b_spend['total_usd']:.4f} over "
         f"{b_spend['billed_calls']} billed call, "
         f"{b_spend['unpriced_calls']} unpriced; "
-        f"{b_spend['rows_without_figure']} judge rows carry no billing figure"
+        f"{b_spend['unusable_answers']} judge call got a reply that could not "
+        "be used; "
+        f"{b_spend['rows_before_call_records']} judge row written before the "
+        "bench recorded its requests has no figure, and this line cannot say "
+        "whether its request went out"
     )
 
 
@@ -1300,10 +1345,11 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
 
     The select is named by its caption alone and described by the note
     that says the list is unfiltered and unchecked; Score is described
-    by why it waits and by what a press pays for, which says that every
-    press sends every judge trial with response text to the judge again.
-    The nudge is a polite live region, and stays rendered while empty so
-    a reason that arrives later is announced; the notes are not live.
+    by why it waits, by the latest scoring pass (Phase P), and by what a
+    press pays for, which says that every press sends every judge trial
+    with response text to the judge again. The nudge is a polite live
+    region, and stays rendered while empty so a reason that arrives later
+    is announced; the notes and the pass line are not live.
     With no judge tasks the select, its note and the paying sentence are
     gone."""
     a, _ = finished(page, bench_url, JUDGED)
@@ -1317,7 +1363,8 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
     expect(judge).to_have_attribute("aria-describedby", "experiment-judge-note")
     score = page.get_by_test_id("experiment-score")
     expect(score).to_have_attribute(
-        "aria-describedby", "experiment-score-nudge experiment-score-note"
+        "aria-describedby",
+        "experiment-score-nudge experiment-score-pass experiment-score-note",
     )
     expect(page.get_by_test_id("experiment-judge-note")).to_contain_text("unfiltered")
     expect(page.get_by_test_id("experiment-score-note")).to_have_text(
@@ -1335,7 +1382,11 @@ def test_the_score_row_is_named_and_described(page, bench, bench_url, scorings):
     assert nudge.evaluate("el => getComputedStyle(el).display") != "none"
     page.get_by_test_id("experiment-judge").select_option("")
     expect(nudge).to_have_text(WAITS_FOR_JUDGE)
-    for testid in ("experiment-judge-note", "experiment-score-note"):
+    for testid in (
+        "experiment-judge-note",
+        "experiment-score-note",
+        "experiment-score-pass",
+    ):
         assert page.get_by_test_id(testid).get_attribute("role") is None
 
     row_for(page, p).click()

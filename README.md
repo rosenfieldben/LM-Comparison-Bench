@@ -58,6 +58,31 @@ directory. Older bench.db files are upgraded in place at startup
 (missing columns are added; existing rows are untouched and legacy
 ungrouped runs keep rendering as before).
 
+**One server per database.** At startup, once it has read its
+environment and before it writes anything, the server takes an
+exclusive lock on a file beside the database (`bench.db.lock` for
+`./bench.db`; beside the file a symbolic link resolves to, so every
+link to one database finds one lock) and holds it until it exits; the
+kernel lets it go if the process dies, however it dies, so a crash never
+leaves a lock for the next start to trip over. A second server started
+on the same database refuses to boot, naming the lock and the process
+that holds it, and has written nothing: it has not connected to the
+database, so an older one is not migrated, and it has not removed the
+clone door's leftover work directories, which a live clone may still be
+writing. (A hard link is a second name the lock cannot see: BACKLOG.)
+The lock is what
+makes startup's two corrections safe: the bench records as interrupted
+an experiment the database says is running and a scoring pass or judge
+call it says is still open, which is true only when no other server is
+running them. Before the lock, a second server started by mistake, even
+one that then failed to bind its port, would have recorded the first
+one's live experiment as interrupted while it ran. `python -m
+bench.reconcile --apply` writes, so it takes the same lock while it
+runs; its dry run writes no row, takes no lock, and runs beside a live
+bench (on a database an older bench wrote, its connection still adds
+what that database lacks: BACKLOG, "A reconcile dry run migrates an
+older database").
+
 OpenRouter attaches a `usage` object to every response reporting what it
 actually charged, and that billed figure is the number a card and the
 session total show, without a tilde. The bench still degrades gracefully
@@ -193,40 +218,93 @@ Set `BENCH_SPEND_LIMIT_USD` (a positive float; unset means no limit) to
 cap recorded spend for the life of the process. An invalid value
 (unparseable, non-finite, negative, or zero) fails boot with a message
 naming the variable, rather than silently producing a ceiling that never
-trips. Once accumulated
-spend reaches the ceiling, `/compare` and `/compare/stream`
-refuse new runs with HTTP 402 and a message naming both figures,
-checked at entry before any upstream call so a refusal costs nothing;
-runs already in flight are never interrupted. Admission is rechecked
-once more the instant a run acquires its upstream slot, so a run admitted
-below the ceiling is still refused (before it spends) if a concurrent run
-crossed the ceiling in the meantime; that refusal costs nothing and lands
-in history as an honest cut-short row.
+trips.
 
-Each result is settled against the ceiling inside the slot it holds,
-before that slot is released. That ordering is what makes the bound below
-true rather than merely intended: a freed slot implies a recorded
-settlement, so once spend crosses the ceiling every later acquisition sees
-it and refuses. Worst-case overshoot is therefore bounded by the runs
-already executing at the moment the ceiling trips, at most
-`MAX_CONCURRENT_UPSTREAM` of them each completing at up to its budgeted
-cost, whatever the size of the lineup and however many comparisons are in
-flight at once.
+Every paid upstream call reserves against the ceiling before it queues
+for an upstream slot: its completion budget at the catalog's completion
+rate, plus its system and user messages at the catalog's prompt rate,
+weighed by the bench's characters-over-four estimate. That is the
+arithmetic `projected_cost` quotes for the same call, and like the
+projection it is not a bound on the bill: the messages are an estimate,
+and a route dearer than the listed rate can charge more. A pinned trial
+reserves, as its experiment's projection is priced, at its endpoint's
+own rates; one whose endpoint published no price the bench could read
+reserves at the catalog's model rates, and the projection, which never
+borrows them, says so where it names that model unpriced. A native-mode
+call, whose documents go as images, reserves the completion half alone.
+A model whose listing also names a charge the two rates cannot count,
+pinned or not, still reserves at the two rates, because that is what
+its settlement will count; the projection refuses such a model, and the
+ceiling following it would admit most of the catalog reserving nothing
+(BACKLOG: "The projection and the ledger disagree about a model with
+charges beyond its two rates"). A call is refused when recorded spend, what
+calls not yet settled have reserved, and what it would reserve would
+together pass the limit; a call that fits exactly is admitted. The check
+and the reservation are one step with nothing awaited between them, on
+the process's one event loop, so two calls racing for the last dollar
+cannot both be admitted. When a call ends, its reservation is replaced
+by what it counts: its billed cost when the platform reported one, and
+the catalog estimate otherwise. A call that ends any other way (refused
+in its slot, cancelled while queued, cut off mid-answer, timed out, or
+raising before its request went out) gives its reservation back and
+counts nothing. A call the catalog cannot price reserves nothing, and is
+refused only once recorded spend has reached the limit, or recorded
+spend and the reservations already pass it.
 
-That last clause is the correction. Settlement used to run after a batch's
-whole fan-out completed, so a fast member released its slot having recorded
-nothing and a model from a concurrent batch rechecked against a counter
-that had not moved. The bound held for one comparison at a time and failed
-for several: eight concurrent five-model batches against a ceiling worth
-half a result put 23 calls upstream where this paragraph promised five. The
-documentation and the mechanism now state the same fact, and a regression
-test measures it. A full reservation ledger (atomic admission) is
-deliberately deferred. The ceiling counts each result
+A refusal costs nothing and names the figures: recorded spend, the
+limit, what calls not yet settled have reserved, and what the refused
+call reserves. Once recorded spend reaches the limit, `/compare` and
+`/compare/stream` refuse at entry with HTTP 402, before any other check,
+as they always have; short of that, they refuse with a 402 when none of
+the request's calls would fit. A batch some of whose members fit runs
+those, and the others are refusal rows in its history; a stream
+admitted at entry reserves when it starts, and if another call took the
+room in between it ends with a refusal frame. A trial or a judge call
+refused only for room that calls not yet settled have reserved waits
+for it, holding nothing, since that room comes back as they settle; a
+Stop, or shutdown, ends the wait with nothing sent. A trial whose own
+reservation no longer fits beside recorded spend is a refusal row and by
+default halts its experiment; a judge call in that case is that
+result's scoring failure, and the pass goes on. Judge calls reserve and
+settle like trials: at the judge's own completion budget
+(`JUDGE_MAX_TOKENS`) and its catalog rates, settled on the billed cost
+or, when the reply carried none, on the catalog estimate over the counts
+the reply reported, which the judge call's record keeps. Admission is
+also rechecked the instant a call holds its upstream slot, so a call
+admitted below the ceiling is still refused, before it spends, if
+recorded spend reached the limit while it waited. Runs already in
+flight are never interrupted.
+
+For what the catalog can price, the bound is exact to the reservations:
+recorded spend passes the limit only by what calls counted beyond what
+they reserved. That is a billed charge above the catalog's rates,
+messages the characters-over-four estimate weighed low, the images a
+native-mode call sent, a pinned trial the platform did not bill, which
+settles at the catalog's model rates (the rates the estimate reads)
+where it reserved at its endpoint's, and a call the catalog cannot
+price, which
+reserves nothing and is held only by the older bound, the recheck in its
+slot. A call cut short counts nothing, since nothing records what it
+cost, so it is outside recorded spend altogether. With a ceiling worth
+half of one result, one call goes upstream, the one whose reservation
+fit, however many comparisons, trials and judge calls are in flight:
+eight concurrent five-model batches against such a ceiling send one
+call, and a regression test measures it. That one call's charge is by
+construction above its reservation (a result worth twice the limit,
+against a reservation within it), so recorded spend ends at twice the
+limit, the first overshoot named above. Settling each result inside its
+slot, which the reservations replaced, bounded the overshoot by the
+calls already executing when the ceiling tripped, at most
+`MAX_CONCURRENT_UPSTREAM` of them, and against these batches it sent
+five; settling after a batch's whole fan-out, before that, sent 23
+against the batches the test used then. The ceiling counts each result
 once, using its billed cost when the platform reported one and the
 catalog estimate otherwise: it is advisory, and advising from real
 charges beats advising from catalog arithmetic. Results that are
 unpriced by both routes do not count against it. It resets when the
-process restarts.
+process restarts, and so do its reservations. `GET /models` reports the
+figures under `spend`: `accumulated_usd` always, and `reserved_usd` and
+`limit_usd` when a ceiling is set.
 
 The interface serves entirely from the bench: the fonts are vendored
 under `static/fonts` (JetBrains Mono and Space Grotesk, both under the
@@ -390,17 +468,18 @@ completion budget to be left for the visible answer, sending
 `reasoning: {"max_tokens": N}` beside the cap: 8192 of the standard
 tier's 16384, 32768 of extended's 65536.
 
-**The judge reserves nothing**, and the arithmetic is why. Its budget is
-512 tokens. Half of that is 256, which the contract's Anthropic minimum
-raises to 1024 (*"that value is used directly with a minimum of 1024
-tokens"*), and the contract also requires that *"`max_tokens` must be
-strictly higher than the reasoning budget"*. 512 is not higher than
-1024, so the request is unsatisfiable by the contract's own rules.
-Raising the judge's budget past 2048 to make a half share legal would
-buy reasoning headroom for a task whose entire output is a number and a
-sentence. A judge that exhausts already records the trial as unscored,
-which is the true statement and a different situation from a comparison
-card that billed for thinking and showed nothing.
+**The judge sends no reasoning reservation**, and the arithmetic is why.
+Its budget is `JUDGE_MAX_TOKENS`, 512. Half is 256, which the contract's
+Anthropic minimum raises to 1024 (*"that value is used directly with a
+minimum of 1024 tokens"*), and the contract also requires that
+*"`max_tokens` must be strictly higher than the reasoning budget"*. 512
+is not higher than 1024, so the request is unsatisfiable by the
+contract's own rules. Raising the judge's budget past 2048 to make a
+half share legal would buy reasoning headroom for a task whose entire
+output is a number and a sentence. A judge that exhausts already records
+the trial as unscored, which is the true statement and a different
+situation from a comparison card that billed for thinking and showed
+nothing.
 
 "Already reasons" is the whole gate, and it is not a nicety. OpenRouter's
 request schema says of the reasoning object's `enabled` key: "Default:
@@ -937,7 +1016,9 @@ had been surfacing as mixed ReadError and stall failures mid-lineup.
 At most five paid upstream calls run at once across everything in
 flight (`MAX_CONCURRENT_UPSTREAM` in `bench/main.py`); extra models
 queue quietly for a slot, and the wait never counts toward a model's
-measured latency or ttft. Every result also records OpenRouter's
+measured latency or ttft. Under a spend ceiling a model can also be
+refused before it queues, when what the calls ahead of it have reserved
+leaves no room for what it would reserve (see Setup). Every result also records OpenRouter's
 generation id and the provider's finish_reason, which make historical
 runs auditable against OpenRouter's generation API (actual provider,
 authoritative cost) and let budget analysis see
@@ -1066,7 +1147,7 @@ close (no trustworthy billed cost, or no `provider`, or no
 write:
 
 ```sh
-.venv/bin/python -m bench.reconcile          # dry run, writes nothing
+.venv/bin/python -m bench.reconcile          # dry run, writes no row
 .venv/bin/python -m bench.reconcile --apply  # take the writes
 ```
 
@@ -1080,8 +1161,12 @@ leaves whatever was captured live in place (an unreported charge clears
 only a stored one no reader would trust anyway), and a row the endpoint
 cannot fill stays on the list and is asked about again next pass. An
 expired record (the endpoint 404s for old generations) is reported and
-skipped. It is safe
-to run against a live bench, since the database is in WAL mode.
+skipped. The dry run is safe
+to run against a live bench, since the database is in WAL mode, and
+takes no lock. `--apply` writes, so it takes the lock a server holds
+(see Setup): it refuses while a bench is running on the database, and a
+bench refuses to start while it writes, each in a sentence naming what
+holds the lock.
 `--limit N` walks the oldest rows first, and `--delay` sets the pause.
 
 Nothing runs it for you. Reconciliation is one upstream call per row, and
@@ -1413,7 +1498,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 8**. Each trial line carries the ordered
+An **export is schema version 12**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1427,11 +1512,33 @@ to the manifest, the records those ids name, so a reader can say which
 bytes. Version 8 adds `clone_id` to each of those capture records: the
 clones row the walked root was in, null when it was in none, so a
 reader holding this bench's database can say which repository and ref a
-snapshot was of; the URL itself stays out of the file. The manifest
-states the reason for the current bump in the file itself, and it names
-every field the earlier versions added, because a reader holding a v8
-artifact and a v2 parser needs the whole list from the file in their
-hand.
+snapshot was of; the URL itself stays out of the file. Version 9 adds
+the scoring records: each trial line's `judge_calls`, every judge request
+sent for that trial with how it ended, so an artifact can be audited
+against a provider's bill line by line; `judge_call_id` and `pass_id` on
+each score; and the manifest's `scoring_passes`. A judged score written
+since version 9 has `judge_generation_id` and `judge_billed_cost_usd`
+null, because its call carries them: the figure is recorded once.
+Version 10 splits a pass's count of requests with no usable answer in
+two: `unanswered`, the requests nothing came back for, and `unusable`,
+the ones that got something back that could not be used. Version 11
+gives each judge call the two usage counts its reply reported, the
+counts the estimate a call with no billed figure was counted at was
+computed from; the rates it was priced at are not in the file (see
+BACKLOG, "The catalog a scoring pass priced against"). Version 12
+records the facts a scoring pass counts its judge calls by, and counts
+every call ended since by nothing else: each call's `sent` (whether the
+request left, or may have) and `usable` (whether its reply could be
+used), beside
+`answered_at`, now set whenever a reply's head arrived, a body cut off
+included; and each pass's `unknown`, the calls whose record could not be
+completed and does not say whether they went out. `interrupted` now
+means only that. A pass closed before version 12 keeps the counts it was
+sealed with, made by an outcome list withdrawn then, and carries
+`unknown` null. The manifest states the reason for the current bump in
+the file itself, and it names every field the earlier versions added,
+because a reader holding a v12 artifact and a v2 parser needs the whole
+list from the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
 version. Upload the same file after a parser upgrade and the bench
@@ -1714,9 +1821,10 @@ refuse, with `403`, any root whose path below its `BENCH_REPO_ROOTS`
 entry passes through `.git`, `.hg` or `.svn` (compared without regard to
 case, since a disk that folds case reaches `.git` as `.GIT` too); the
 refusal names the rule and not the path. It is measured from the deepest
-entry holding the root, so an entry you name inside `.git` yourself is
-walked, unless the root is itself a git directory (below). This was
-possible from Phase L until Phase O.
+entry holding the root, so an entry you name inside `.hg` or `.svn`
+yourself is walked; one inside `.git` sits inside a git directory, and
+the bench refuses to start with it (below). This was possible from
+Phase L until Phase O.
 
 **A git directory is refused wherever the walk meets it.** A bare
 repository (`repo.git`), a mirror, a `--separate-git-dir` and a
@@ -1734,6 +1842,49 @@ the rule and not the path; the listing's row says where. A tree that
 keeps a bare repository anywhere the walk goes, as some projects keep
 test fixtures, is refused whatever the patterns; name a root beside it.
 This was possible from Phase L until Phase O.
+
+**So is a root inside one.** Below a git directory's top level the walk
+cannot see the four names, and the files there can carry a URL git uses:
+the legacy `remotes/` and `branches/` files a fetch still reads, a linked
+worktree's `config.worktree`, and `logs/`, where git itself records a
+pull's arguments, a list with no fixed end. So before the walk lists
+anything below the root, both doors look above it: from the root's own
+directory handle, one directory at a time through `..`, never by a name,
+up to and including the `BENCH_REPO_ROOTS` entry the root was admitted
+under (recognised by the device and inode read at boot) or the top of
+the filesystem. If any of them holds `HEAD`, `config`, `objects` and
+`refs` together, Compose answers `422` and the listing's `200` stops at
+the root, both in the sentence "the root is inside a git directory,
+whose files can carry a remote URL with sign-in details in them, so it
+is not walked." A normal checkout is not refused: its `.git` sits beside
+its files, not above them, so the directory above `src/` lists `.git`
+and not the four names inside it. The look opens only directories and
+reads no file, and of each directory above it reads only the names, so
+a file beside them that goes while it lists is not a refusal; a
+directory above renamed, moved or replaced by a link while it climbs
+changes nothing it sees, because it climbs by the descriptors that hold
+the root. So a race can refuse a root only by what it does to a
+directory on that chain itself (the four names made to appear in one,
+or one made unreadable), and otherwise gives back at most the walk as it
+was before the look existed. It climbs at most the walk's depth
+ceiling, 128 directories, and refuses a root farther than that below
+its entry, naming the ceiling (a climb whose last step lands on the top
+of the filesystem is walked); it lists at most the walk's twenty
+thousand entries on the way, in all. This was possible from Phase L
+until Phase P.
+
+**An entry inside a git directory is refused at boot.** The look stops
+at a root's entry, so a git directory above an entry is one no request
+looks for, and every root under that entry would be walked. So at boot
+the bench climbs above each `BENCH_REPO_ROOTS` entry in the same way,
+from the entry's own directory handle to the top of the filesystem, and
+refuses to start if one sits inside a git directory, naming the entry,
+as it does for an entry that is not a directory. An entry the climb
+cannot clear (a directory above it unreadable, or past the look's
+depth or width) is refused too, since it could not be checked. An
+entry that is itself a git directory is not refused at boot: every root
+under it is refused at the doors, by the look, which checks the entry,
+or by the walk, when the root is the entry.
 
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app
@@ -1840,8 +1991,8 @@ because the composer skips it: what it names is read only under its own
 path, if a pattern selects that, and never if an exclusion covers it;
 `refused` carries the composer's sentence word for word. A file no
 pattern matches is not a row. A link out of the root, a socket, device
-or pipe, a directory past the depth ceiling, and a git directory refuse
-the snapshot whatever the patterns select, and the line above the table
+or pipe, a directory past the depth ceiling, a git directory, and a root
+inside one refuse the snapshot whatever the patterns select, and the line above the table
 says when the refusal is one of those, which narrowing cannot fix.
 
 `would_compose` is true exactly when the composer's walk would reach
@@ -2351,7 +2502,10 @@ input side. An unpinned model is routed dynamically, so the model-level
 listing is the only thing that can speak for it and is used. A pinned
 model whose listing cannot answer is **unpriced**, never priced from the
 model level: borrowing the aggregate is the substitution the pin exists
-to prevent.
+to prevent. `unpriced` names it with why: "its pinned endpoint published
+no price the bench could read, so the spend ceiling reserves for it at
+the catalog's model rates", since the ceiling, which must reserve
+something for a call it will count, does borrow them (see Setup).
 
 Every figure is `null` when any model in the lineup publishes no price,
 and `unpriced` then names them: a total missing one arm of a comparison
@@ -2507,9 +2661,10 @@ the experiment is still created and can be started with the right one.
 One experiment runs at a time. They share the five upstream slots and the
 spend ceiling, so two at once would interleave through the same queue and
 each would measure the other's waiting; a second start gets a 409 saying
-exactly that. Every trial goes through the same semaphore, the same
-post-admission ceiling recheck, the same settlement inside the held slot
-and the same entry checks as any browser run. The runner creates its
+exactly that. Every trial goes through the same reservation against the
+spend ceiling before it queues, the same semaphore, the same recheck in its
+slot, the same settlement when its call ends and the same entry checks
+as any browser run. The runner creates its
 groups through the normal path with no bypass, so experiment-to-group
 consistency is the law the manifest check already enforces rather than a
 promise the runner makes about itself.
@@ -2674,17 +2829,109 @@ store again):
   stored, is scored through the API with its `dataset_path`, and the
   panel says so.
 
-The pass runs on the server after the door's 202, and no door says when
-it ends or whether it failed, so the report opened then shows what has
-been scored by that moment; select the experiment again to read more.
-Stopping the bench does not wait for a pass: a judge call in flight then
-is paid for and records no score. BACKLOG.md holds both gaps. A pass that
-fails does free the bench's one scoring slot. A refusal, such as
-another pass holding the bench's one scoring slot, is the door's
-sentence, and Score stays live, because the server knows when the other
-pass ends. **Every press scores every trial again**, judged ones
-included; each trial of a judge task that has response text is sent to
-the judge, and each call is paid.
+The pass runs on the server after the door's 202, so the report opened
+then shows what has been scored by that moment; select the experiment
+again to read more. A refusal, such as another pass holding the bench's
+one scoring slot, is the door's sentence, and Score stays live, because
+the server knows when the other pass ends. **Every press scores every
+trial again**, judged ones included; each trial of a judge task that has
+response text is sent to the judge, and each call is paid.
+
+**A scoring pass is a record.** Each pass is a row, written when it
+starts and once more when it ends. `GET /experiments/{id}/scoring`
+lists an experiment's passes newest first, with the one running now as
+`active`, and `GET /experiments` and `GET /experiments/{id}` carry the
+latest as `scoring`: its judge, when it started and ended, how it ended
+(`finished`; `stopped`; `failed`, with the error; or `interrupted`), and
+how many trials it scored, how many it wrote with no score, how many of
+its judge calls went out and got no reply (`unanswered`: timed out, cut
+at shutdown before a reply, or failed after sending with nothing back),
+how many got a reply that could not be used (`unusable`: an error
+status, or a body that could not be read or was cut off), and how many
+have a record that could not be completed and does not say whether they
+went out (`unknown`: found open at boot, or left open by a pass that
+ended without saying why). Each call ended since schema 12 is counted by
+what its record says happened to it, never by the word for how it ended,
+so a call whose ending's write failed is counted where what the pass
+knew of it puts it; one ended before is placed by that word, as below.
+A pass closed before schema 12 carries `unknown` null: its counts were
+made by an outcome list withdrawn then, which put every failed call
+under `unusable` and every interrupted one under `unanswered`, so the
+panel gives its two as one ("N judge calls ended with no usable answer
+on record"), and the report's spend line, which counts the same calls by
+their records, can differ from them. A call ended before schema 12 has
+no record of whether it was sent or whether its reply could be used, so
+the counts place it by the word its record used; a pass left open by an
+older build and closed at boot counts its older calls that way, and its
+line says how many of its `unanswered` and `unusable` do (", N judge
+calls among those that got no answer or an unusable reply ended before
+the bench recorded whether a call was sent and whether its reply could
+be used, so they are counted by the words their records used"). A pass
+that fails
+frees the bench's one scoring slot and stays in the list, and a re-score
+is a new pass beside it. The panel says the latest in a line beside
+Score, in the record's words and stamped in UTC ("scored 2026-09-28
+07:12:30 UTC, judged by ...: 3 trials scored", or "the last scoring pass
+failed ...: " and the error). The line is read with the list, which the
+panel reads again after every answer to Score and to Stop scoring;
+there is no progress stream for a pass, so to see a running pass end,
+read the list again (reopen the panel). An experiment with no recorded
+pass shows no line: its scores, if any, were written before passes were
+recorded, and the panel does not guess.
+
+**Every judge request is recorded before it goes out**, as a row with
+the time it was sent, and once more with how it ended: `answered`;
+`timed_out`; `stopped`, cut at shutdown, before its reply or while its
+reply was arriving; `failed`, sent with no usable reply (a transport
+error after sending, an error status, or a body that could not be read
+or was cut off); `not_sent`, when no connection was made, so nothing
+left; or `interrupted`, which means only that the record of its ending
+could not be completed: by the process ending ("found open at boot"),
+or by the write that should have held it failing, whose detail says
+what happened to the request and that only its record's write failed
+("the answer arrived; its write failed: " and the error). Beside the
+outcome the call records the facts it is counted by: `sent`, whether the
+request left or may have; `answered_at`, when a reply's head arrived,
+set whatever the reply said, an error status and a body that could not
+be read or was cut off included, and empty when nothing came back; and
+`usable`, whether that reply was read as an answer. An interrupted call
+carries what the pass knew of it, the charge and the usage counts
+included, and nothing when it knew nothing. The line between `not_sent`
+and the rest is the connection: anything after one was established
+counts as sent, because money may have moved. The generation id, the
+charge and the two usage counts the reply reported (`prompt_tokens`,
+`completion_tokens`) are on the call, recorded once, and a judged score
+cites its call. No value in either record ever changes once written:
+triggers in the database refuse a change, a second ending, a partial
+ending, an ending whose facts disagree with its outcome, a replacement
+or a delete, from any writer, a second connection or the sqlite3 prompt
+included.
+
+`POST /experiments/{id}/scoring/stop`, with the body `{}`, asks the
+running pass to stop between trials, as the runner's Stop does: a judge
+call already in flight finishes and is recorded, a trial still waiting
+for a slot or for room on the spend ceiling sends nothing, and the pass
+ends `stopped` when a trial is left unscored. A Stop that comes after
+the last trial's judge call has gone out leaves nothing unscored, and
+that pass ends `finished`. It is refused 409
+when no pass for that experiment is running. In the panel it is **Stop
+scoring**, beside Score, present only while the list says that
+experiment's pass runs; pressed, it says the pass was asked to stop and
+greys, and the line beside Score says the pass is stopping until the
+list says it has ended. Shutting the bench down asks
+the same way and waits up to `SCORING_SHUTDOWN_SECONDS`, 30 seconds, then
+cuts the pass, and the call on the wire is recorded `stopped`: still
+recorded as sent, which is the point, and, if its reply had begun to
+arrive, with the time it did, so it is counted among the replies that
+could not be used rather than the calls that got none. The bound sits
+between two numbers on purpose. It is shorter than the judge's own 60 s
+timeout, so a slow judge call is cut and recorded rather than holding
+shutdown for its whole timeout. It is longer than the ten seconds a
+typical supervisor allows between asking a process to stop and killing
+it, so under one of those the kill usually comes first; then the pass
+and its open call are left for the next start, which records them
+`interrupted` ("found open at boot"), with no end time, because none is
+known.
 
 Deterministic scorers (`exact`, `normalized_exact`, `contains`, `regex`)
 are pure functions over the stored response text. `normalized_exact` and
@@ -2735,9 +2982,14 @@ An unparseable verdict has no score and so no pass either, rather than
 counting as a failure. Collapsing the two would put the judge's own
 malfunctions into the model's pass rate.
 
-**Judge calls are spend.** The billed cost is captured in band, recorded
-on the score row, and added to the same accumulator the ceiling reads, so
-a scoring pass cannot run free against the limit. Judges get their own
+**Judge calls are spend.** Each reserves against the ceiling before it
+queues, at `JUDGE_MAX_TOKENS` and the judge's catalog rates, and settles
+like a trial's call: on the billed cost, captured in band and recorded
+on the judge call, or, when the reply carried none, on the catalog
+estimate over the counts the reply reported, which the call's record
+keeps beside the charge. Either goes to the same accumulator the ceiling
+reads, so a scoring pass cannot run free against the limit. Judges get
+their own
 modest completion budget (`JUDGE_MAX_TOKENS`) rather than the
 experiment's tier, because a verdict is a number and a sentence and a
 judge inheriting an extended budget would buy headroom no rubric needs,
@@ -2747,14 +2999,38 @@ every other request. The report carries what the judging cost as
 own line beside the ranking ("judge spend: $X.XXXX over N billed calls",
 or "judge spend: none billed"), never added into a model's cost: that
 is the bench's instrument cost, not what any model under test was paid.
-A judge reply that came back with no price is named as unpriced rather
+A judge answer that came back with no price is named as unpriced rather
 than counted as nothing spent (", K unpriced", or "none billed, K calls
-unpriced"), and when any judge row carries no billing figure the line
-says how many ("; M judge rows carry no billing figure"), whatever the
-reason: a reply with no price, a call that timed out after it was sent,
-a pass with no judge to call. The unpriced calls are among those M. A
-score row does not record whether a call that got no reply was sent, so
-the count cannot be split further; BACKLOG.md says why that waits.
+unpriced"). The line reports what was billed; the ceiling, which has to
+count what it can, counts a reply that carried no billed figure at the
+catalog estimate over the usage counts it reported, so the two figures
+differ by every such reply, whether or not it could be used. After the
+spend the line names each request the figure cannot speak for, as what
+it is: calls that went out and got no reply ("; M judge calls went out
+and got no answer"), calls that got a reply that could not be used ("; M
+judge calls got replies that could not be used"), how many of those two
+ended before schema 12 and are counted by the words their records used
+("; M judge calls among those that got no answer or an unusable reply
+ended before the bench recorded whether a call was sent and whether its
+reply could be used, so this line counts them by the words their records
+used"), calls whose record could not be completed and does not say
+whether they went out ("; M judge calls' records could not be
+completed, so this line cannot say whether they went out": found open at
+boot, or interrupted before schema 12, whose detail, which the count
+does not read, may say more), calls that had not come back when the
+report was read (only while a pass runs), and judge rows written before
+the bench recorded its requests,
+which carry no figure and of which the line cannot say whether their
+request went out. Each call ended since schema 12 is counted by what its
+record says happened to it, never by the word for how it ended; one
+ended before is counted by the word its record used, as the clause above
+says. A request never sent (no judge
+given, the ceiling refusing, a trial with no text, a connection never
+made) is in none of those counts. Until the requests were recorded the
+line could only say how many judge rows carried no billing figure,
+whatever the reason, because a score row could not say whether a call
+that got no reply had been sent; `judge_cost` then had a key for that
+count, `rows_without_figure`, which is gone.
 
 **If the judge model is in the experiment's lineup**, every score it
 produces is flagged `self_judged` and the flag is surfaced in the report.
@@ -3087,7 +3363,9 @@ JSONL. Line one is the manifest: which dataset by digest, which build,
 which catalog, which estimand, which seeds, what the experiment declared
 itself to be. Every following line is one trial with its full provenance,
 including the payload sent, the response, the timings, the token counts,
-both cost figures, the serving provider, and every score row attached.
+both cost figures, the serving provider, every score row attached, and
+every judge request sent for it. The manifest also carries every scoring
+pass over the experiment.
 The last line is a sha256 over the preceding bytes, so a citation can
 name the artifact it cites and anyone can check the name.
 
@@ -3107,8 +3385,10 @@ them in its own autocommit transaction. It reads as the guarantee and
 gives none of it. The writer this defends against is another
 **connection**, not another task: the store's synchronous contract
 already rules out an interleaving on the export's own connection, but
-`python -m bench.reconcile --apply` against a live bench is a second
-connection by design, and is the reason `connect()` turns WAL on.
+another connection can still write, a person at the sqlite3 prompt or a
+script of their own. (`python -m bench.reconcile --apply` was the
+bench's own such writer until it took the server's lock; its dry run
+still reads beside a live bench, which is what WAL is for.)
 
 **Two exports of the same experiment are byte-identical.** Line order is
 task, then repeat, then position; key order within a line is sorted.
@@ -3359,7 +3639,9 @@ Other endpoints:
 - `GET /models` returns the boot-time catalog snapshot as
   `{"models": [...], "fetched": bool}`; `fetched` false means the
   boot fetch failed, which is how the picker tells an offline boot
-  from an empty catalog
+  from an empty catalog. Beside it, `spend` carries the ceiling's live
+  figures for this process: `accumulated_usd` always, and `reserved_usd`
+  and `limit_usd` when a ceiling is set
 - `GET /prompts` lists saved prompts
 - `POST /prompts` with `{"name": ..., "text": ...}` saves one; 409 on
   a duplicate name
@@ -3556,10 +3838,12 @@ picked up without restarts, and verify by eyeball after UI changes:
   shows a visible focus ring.
 - Theme: flip the OS color scheme; the page follows without a
   reload, and both themes keep the state labels readable.
-- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set to a
-  tiny value, run until the session estimate crosses it, then run
-  again: the columns error with the ceiling message spelled out in
-  words, and no new upstream call is made.
+- Spend ceiling: start the app with `BENCH_SPEND_LIMIT_USD` set below
+  what one run reserves (a 16384 completion budget at $2 per million is
+  about $0.033): the column errors with the ceiling message naming its
+  figures, and no upstream call is made. Set it between one and two
+  runs' reservations and run two models at once: one runs and the
+  other's column reads the refusal.
 - Queued state: run six or more models at once; the sixth card reads
   "queued" while five are in flight, then flips to "thinking" when a
   slot frees, and its counter restarts so its ttft excludes the wait.

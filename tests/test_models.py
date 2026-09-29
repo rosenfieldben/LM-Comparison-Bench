@@ -1956,6 +1956,9 @@ async def test_a_malformed_verdict_is_a_scoring_failure_that_still_records_the_c
     assert "no JSON object" in out["error"]
     assert out["billed_cost_usd"] == 0.00004
     assert out["generation_id"] == "gen-judge-1"
+    # Ruling 2 at P1's checkpoint: the reply was read, so it is an answer;
+    # its failure is the score row's (the external review's M6).
+    assert (out["outcome"], out["replied"]) == ("answered", True)
 
 
 @respx.mock
@@ -4553,3 +4556,228 @@ def test_a_non_finite_price_degrades_to_no_figure_rather_than_to_a_nan():
     assert cost["input_usd"] is None
     assert cost["output_usd"] is None
     assert cost["total_usd"] is None
+
+
+@pytest.mark.parametrize(
+    "usage,counts",
+    [
+        ({"prompt_tokens": 40, "completion_tokens": 12}, (40, 12)),
+        ({"prompt_tokens": "n/a", "completion_tokens": -3}, (None, None)),
+        ({"prompt_tokens": True, "completion_tokens": 7}, (None, 7)),
+        ("not a dict", (None, None)),
+        (None, (None, None)),
+    ],
+)
+@respx.mock
+async def test_the_judge_reply_s_usage_counts_are_captured(client, usage, counts):
+    """WINDOW: judge_response over a reply whose usage block reports the
+    two counts, reports junk in them, is not a dict, or is absent.
+
+    Phase P's P2 (the operator's rulings R2 and at P1's checkpoint): the
+    reply's own counts are captured, through the same field-type function
+    run_model applies, so an unbilled judge call can be settled on the
+    catalog's estimate and the call's record can say what the estimate
+    was made from. Junk is None rather than a guess, and a reply without
+    usage has no counts. PRE-STATE: the verdict itself parses in every
+    case, so only the counts vary."""
+    body = judge_body('{"score": 0.5, "reason": "half"}')
+    if usage is None:
+        body.pop("usage")
+    else:
+        body["usage"] = usage
+    respx.post(OPENROUTER_URL).respond(json=body)
+
+    out = await judge_response(client, "judge/one", "the rubric", None, "the answer")
+
+    assert out["score"] == 0.5
+    assert (out["prompt_tokens"], out["completion_tokens"]) == counts
+
+
+@respx.mock
+async def test_a_judge_asked_about_no_text_reports_no_counts(client):
+    """WINDOW: judge_response over a trial with no text, which makes no
+    request, with no route mocked and its sending hook watched.
+
+    No request, no reply, no counts: both are None, the hook is never
+    called and nothing reaches the transport. PRE-STATE: the hook has not
+    been called and no request has been made, so a guard that let the
+    blank text through would be seen here, not only on the wire (the
+    external review's L4: this proof said "PRE-STATE: none")."""
+    sent = []
+    assert (sent, respx.calls.call_count) == ([], 0)
+    out = await judge_response(
+        client,
+        "judge/one",
+        "the rubric",
+        None,
+        "   ",
+        sending=lambda: sent.append(1),
+    )
+    assert (out["prompt_tokens"], out["completion_tokens"]) == (None, None)
+    assert out["outcome"] is None
+    assert (sent, respx.calls.call_count) == ([], 0)
+
+
+# ---- A judge reply is a reply from its head (the operator's ruling H2 on
+# ---- the 1d91670 review: "set whenever bytes came back, a non-200 and
+# ---- an unreadable body included"). Each proof names its window.
+
+import asyncio  # noqa: E402
+import inspect  # noqa: E402
+
+import bench.models as bench_models  # noqa: E402
+
+
+class CutBody(httpx.AsyncByteStream):
+    """A reply body that yields its first bytes and then fails as the
+    connection would, recording whether it was closed."""
+
+    def __init__(self, first, exc):
+        self.first, self.exc, self.closed = first, exc, False
+
+    async def __aiter__(self):
+        yield self.first
+        raise self.exc
+
+    async def aclose(self):
+        self.closed = True
+
+
+class WholeBody(httpx.AsyncByteStream):
+    """A whole reply body that records whether it was closed."""
+
+    def __init__(self, body):
+        self.body, self.closed = body, False
+
+    async def __aiter__(self):
+        yield self.body
+
+    async def aclose(self):
+        self.closed = True
+
+
+async def judged_over(transport):
+    """judge_response over a client with this transport, and how many
+    times its replying hook ran (the hook passed only where it exists, so
+    a tree without it fails on what it does, not on its signature)."""
+    heads = []
+    extra = {}
+    if "replying" in inspect.signature(judge_response).parameters:
+        extra["replying"] = lambda: heads.append(1)
+    async with httpx.AsyncClient(transport=transport, trust_env=False) as c:
+        out = await judge_response(c, "judge/one", "r", None, "a", **extra)
+    return out, len(heads)
+
+
+@pytest.mark.parametrize(
+    ("exc", "name"),
+    [
+        (httpx.RemoteProtocolError("peer closed connection"), "RemoteProtocolError"),
+        (httpx.ReadTimeout("no more bytes"), "ReadTimeout"),
+    ],
+)
+async def test_a_reply_whose_body_is_cut_off_is_a_reply_that_could_not_be_used(
+    exc, name
+):
+    """WINDOW: judge_response over a transport whose 200 reply sends the
+    first bytes of its body and then fails: the connection dropped, or
+    the body stalled past the timeout.
+
+    Bytes came back, so it is a reply (replied True, the hook called once
+    at the head), and one that could not be used: failed, in its own
+    sentence, and the body's stream closed. PRE-STATE: at 1d91670
+    client.post read the whole body before returning, so the cut raised
+    there and was recorded as no reply at all (replied False), and the
+    stall as timed_out."""
+    body = CutBody(b'{"id":"gen-1","usage":{"cost":0.001', exc)
+    out, heads = await judged_over(
+        httpx.MockTransport(lambda request: httpx.Response(200, stream=body))
+    )
+    assert (out["outcome"], out["replied"], heads) == ("failed", True, 1)
+    assert out["error"] == f"judge reply was cut off while it was read: {name}"
+    assert body.closed is True
+
+
+async def test_a_peer_that_closes_before_its_head_is_no_reply():
+    """WINDOW: judge_response over a transport that fails before any reply
+    head, as a server that disconnects without sending a response does.
+
+    Nothing came back: failed (sent, since the connection existed) with
+    no reply, and the hook never called. PRE-STATE: the same outcome
+    before, which this pins beside the cut body above."""
+
+    def refuse(request):
+        raise httpx.RemoteProtocolError(
+            "Server disconnected without sending a response"
+        )
+
+    out, heads = await judged_over(httpx.MockTransport(refuse))
+    assert (out["outcome"], out["replied"], heads) == ("failed", False, 0)
+    assert out["error"] == "judge request failed: RemoteProtocolError"
+
+
+@pytest.mark.parametrize("head", [True, False])
+async def test_on_a_real_socket_a_head_is_where_a_reply_begins(monkeypatch, head):
+    """WINDOW: judge_response over a real client and a loopback server that
+    reads the request and then either writes a 200 head promising 200
+    bytes, sends 35 and closes, or closes having written nothing.
+
+    A MockTransport bypasses httpcore, so this is the same line through
+    the real one: the first case is a reply (failed, replied True, the
+    hook called), the second is not (failed, replied False). PRE-STATE:
+    at 1d91670 both were replied False."""
+
+    async def serve(reader, writer):
+        request = await reader.readuntil(b"\r\n\r\n")
+        length = int(
+            next(
+                line.split(b":")[1]
+                for line in request.split(b"\r\n")
+                if line.lower().startswith(b"content-length")
+            )
+        )
+        await reader.readexactly(length)
+        if head:
+            writer.write(
+                b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 200\r\n\r\n" + b'{"id": "gen-1", "choices": [{"m'
+            )
+            await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(serve, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    monkeypatch.setattr(bench_models, "OPENROUTER_URL", f"http://127.0.0.1:{port}/v1")
+    try:
+        out, heads = await judged_over(httpx.AsyncHTTPTransport())
+    finally:
+        server.close()
+        await server.wait_closed()
+    assert (out["outcome"], out["replied"], heads) == ("failed", head, int(head))
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "outcome"),
+    [
+        (200, json.dumps(judge_body('{"score": 0.5}')).encode(), "answered"),
+        (500, b"{}", "failed"),
+        (200, b"not json", "failed"),
+    ],
+    ids=["answered", "an error status", "an unreadable body"],
+)
+async def test_every_reply_is_closed_and_heard_once(status, body, outcome):
+    """WINDOW: judge_response over replies that are answered, an error
+    status, and an unreadable body, each through a stream that records
+    its close.
+
+    Every reply's stream is closed and every reply calls the hook exactly
+    once, whatever it said. (httpx closes a stream it has read whole, so
+    judge_response's own close is proved by the cut body above, whose
+    read never finishes.) PRE-STATE: each is a reply, so each has a
+    head."""
+    stream = WholeBody(body)
+    out, heads = await judged_over(
+        httpx.MockTransport(lambda request: httpx.Response(status, stream=stream))
+    )
+    assert (out["outcome"], out["replied"], heads) == (outcome, True, 1)
+    assert stream.closed is True

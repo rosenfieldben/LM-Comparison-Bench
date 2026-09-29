@@ -65,6 +65,14 @@ class FakeTree:
     Every open and close is recorded, so a test can assert the walk
     holds one descriptor per level and closes what it opened even when
     it refuses part-way.
+
+    above describes the directories over the root for the look above it
+    (Phase P, P3): a list from the root's parent upward, each the names
+    it holds and optionally its identity. The last one's parent is
+    itself, the top of the filesystem; with none, the root is the top.
+    The climb keeps its own ledger (climb_opened, climb_closed), apart
+    from the walk's, so every ledger the walk was held to before the
+    look existed still holds the walk alone.
     """
 
     def __init__(
@@ -78,8 +86,20 @@ class FakeTree:
         swap_on_open=None,
         grow_on_read=None,
         listing_hook=None,
+        above=(),
     ):
         self.root = root
+        self.above = [
+            {"names": list(level["names"]), "identity": level.get("identity")}
+            if isinstance(level, dict)
+            else {"names": list(level), "identity": None}
+            for level in above
+        ]
+        for depth, level in enumerate(self.above):
+            if level["identity"] is None:
+                level["identity"] = (9, depth)
+        self.climb_opened = []
+        self.climb_closed = []
         self.order = order
         self.swap_on_open = swap_on_open or {}
         self.grow_on_read = grow_on_read or {}
@@ -123,7 +143,29 @@ class FakeTree:
     def open_root(self):
         return self._open("", self.nodes[""], Handle)
 
+    def parent(self, handle):
+        # One level up the modelled chain; the last level's parent, or the
+        # root's with nothing modelled above it, is itself: the top.
+        depth = -1 if handle.path == "" else handle.path.count("..") - 1
+        if depth + 1 < len(self.above):
+            depth += 1
+        identity = self.above[depth]["identity"] if depth >= 0 else (1, 0)
+        path = "/".join([".."] * (depth + 1)) if depth >= 0 else ".."
+        self.climb_opened.append(path)
+        return Handle(path=path, identity=identity, token=path)
+
+    def names(self, handle):
+        # The look's listing of a directory above the root: the names it
+        # holds, and no child described.
+        depth = handle.path.count("..") - 1
+        yield from self.above[depth]["names"]
+
     def entries(self, handle):
+        if handle.path.startswith(".."):
+            depth = handle.path.count("..") - 1
+            for name in self.above[depth]["names"]:
+                yield Entry(name, DIRECTORY, (8, hash(name) % 1000), 0)
+            return
         if self.listing_hook is not None:
             yield from self.listing_hook(handle.path)
             return
@@ -170,6 +212,9 @@ class FakeTree:
         return content[: limit + 1]
 
     def close_handle(self, held):
+        if held.path.startswith(".."):
+            self.climb_closed.append(held.path)
+            return
         self.closed.append(held.path)
 
     def link_target(self, handle, entry):
@@ -1205,3 +1250,240 @@ def test_a_root_through_version_control_is_found_below_its_entry(real, entry, in
 
     assert EXCLUDE_GROUPS[0][1][:3] == VCS_DIRECTORIES == (".git", ".hg", ".svn")
     assert vcs_below(real, entry) is inside
+
+
+# ----- the look above the root (Phase P, P3) -------------------------
+#
+# The fake models the directories over its root as `above`, from the
+# root's parent upward, and keeps the climb's ledger apart from the
+# walk's. Imported here, not at the top, so the file still collects
+# against a tree without the look.
+
+GIT_NAMES = ["HEAD", "config", "objects", "refs", "description"]
+
+
+def look_names():
+    from bench import snapshot as module
+
+    return module
+
+
+def climbed(fake):
+    return (fake.climb_opened, fake.climb_closed)
+
+
+def test_a_root_whose_parent_is_a_git_directory_is_refused_unread():
+    """WINDOW: walk and list_members over a root whose parent holds the
+    four names (the root is a git directory's logs/, say), no entry to
+    stop at.
+
+    The look refuses in the new sentence before anything below the root
+    is opened or read, holding one ancestor, closed; the listing stops
+    at the root with the same sentence. PRE-STATE: before P3 the walk
+    never looked above the root and returned its one member."""
+    snapshot = look_names()
+    fake = FakeTree({"HEAD": b"x"}, above=[GIT_NAMES])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=["**/*"])
+    assert str(refused.value) == snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    assert fake.opened == [""] and fake.reads == []
+    assert climbed(fake) == ([".."], [".."])
+    listed = snapshot.list_members(
+        tree=FakeTree({"HEAD": b"x"}, above=[GIT_NAMES]), patterns=["**/*"]
+    )
+    assert listed["would_compose"] is False
+    assert listed["refusal"] == snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    assert [(m["path"], m["reason"]) for m in listed["members"]] == [
+        ("", snapshot.ROOT_INSIDE_GIT_DIRECTORY)
+    ]
+
+
+def test_the_look_climbs_past_a_plain_directory_to_a_git_directory():
+    """WINDOW: walk over a root two below a git directory (its
+    worktrees/wt, say), the directory between plain.
+
+    One ancestor is held at a time: each is closed before the next is
+    listed, and the last when the look refuses. PRE-STATE: the parent
+    holds no git names, so a look of one step would walk."""
+    fake = FakeTree({"a.py": b"a"}, above=[["wt", "other"], GIT_NAMES])
+    with pytest.raises(SnapshotError, match="^the root is inside a git directory"):
+        walk(tree=fake, patterns=["**/*"])
+    assert climbed(fake) == (["..", "../.."], ["..", "../.."])
+
+
+def test_a_normal_checkout_walks_because_its_dot_git_is_beside_its_files():
+    """WINDOW: walk over src/ of a normal checkout, whose top level holds
+    .git, src and README.md, with the checkout as the entry.
+
+    A normal checkout's .git is a sibling of its files, not their
+    ancestor: the directory above src lists .git, not the four names
+    inside it, so the look passes it and the root is walked. PRE-STATE:
+    .git is one of the parent's names, so a look that refused on seeing
+    .git above the root would refuse here."""
+    fake = FakeTree(
+        {"a.py": b"a"},
+        above=[{"names": [".git", "src", "README.md"], "identity": (5, 1)}],
+    )
+    assert walk(tree=fake, patterns=["**/*"], entry=(5, 1)) == [("a.py", b"a")]
+    assert climbed(fake) == ([".."], [".."])
+
+
+def test_the_look_stops_at_the_entry_and_looks_no_higher():
+    """WINDOW: walk over a root whose parent is its allowlist entry, with a
+    git directory's names one above the entry.
+
+    The entry is where the operator's allowlist ends, so the look stops
+    there, having checked it, and never lists the directory above it.
+    PRE-STATE: the directory above the entry holds the four names, so a
+    look that did not stop at the entry would refuse."""
+    fake = FakeTree(
+        {"a.py": b"a"},
+        above=[{"names": ["repo"], "identity": (5, 1)}, GIT_NAMES],
+    )
+    assert walk(tree=fake, patterns=["**/*"], entry=(5, 1)) == [("a.py", b"a")]
+    assert climbed(fake) == ([".."], [".."])
+
+
+def test_an_entry_that_is_a_git_directory_is_checked_too():
+    """WINDOW: walk over a root whose parent is its allowlist entry, the
+    entry holding the four names.
+
+    A root inside an entry that is itself a git directory is inside one,
+    whoever named it, as a root that is one is refused at its entry.
+    PRE-STATE: the entry is where the look stops, so a look that stopped
+    before checking it would walk."""
+    fake = FakeTree({"a.py": b"a"}, above=[{"names": GIT_NAMES, "identity": (5, 1)}])
+    with pytest.raises(SnapshotError, match="^the root is inside a git directory"):
+        walk(tree=fake, patterns=["**/*"], entry=(5, 1))
+
+
+def test_a_root_that_is_its_entry_climbs_nothing():
+    """WINDOW: walk over a root that is its own allowlist entry, a git
+    directory's names in the directory above it.
+
+    Nothing above the entry is the look's business, and the root is the
+    entry, so no ancestor is opened. PRE-STATE: the directory above holds
+    the four names, so any step up would refuse."""
+    fake = FakeTree({"a.py": b"a"}, above=[GIT_NAMES])
+    assert walk(tree=fake, patterns=["**/*"], entry=(1, 0)) == [("a.py", b"a")]
+    assert climbed(fake) == ([], [])
+
+
+def test_the_look_stops_at_the_top_of_the_filesystem():
+    """WINDOW: walk over a root three plain directories below the top of
+    the filesystem, with no entry to stop at.
+
+    The top is the directory whose parent is itself; the look lists it,
+    finds no git names, and stops there. PRE-STATE: with no entry, only
+    the top ends the climb, and three steps are far under the ceiling."""
+    fake = FakeTree({"a.py": b"a"}, above=[["repo"], ["home"], ["usr", "home"]])
+    assert walk(tree=fake, patterns=["**/*"]) == [("a.py", b"a")]
+    assert climbed(fake)[0] == ["..", "../..", "../../..", "../../.."]
+    assert sorted(climbed(fake)[1]) == sorted(climbed(fake)[0])
+
+
+def test_a_root_that_is_a_git_directory_keeps_its_own_sentence():
+    """WINDOW: walk over a root that holds the four names, inside a
+    directory that holds them too.
+
+    The root's own check comes first, so a root that is a git directory
+    is refused in its own sentence and nothing above it is opened.
+    PRE-STATE: the parent would refuse in the new sentence."""
+    snapshot = look_names()
+    files = {"HEAD": b"x", "config": b"x", "objects/o": b"x", "refs/r": b"x"}
+    fake = FakeTree(files, above=[GIT_NAMES])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=["**/*"])
+    assert str(refused.value) == snapshot.ROOT_IS_GIT_DIRECTORY
+    assert climbed(fake) == ([], [])
+
+
+@pytest.mark.parametrize("levels", [MAX_DEPTH, MAX_DEPTH + 1])
+def test_the_climb_is_bounded_at_max_depth(levels):
+    """WINDOW: walk over a root `levels` plain directories below its
+    allowlist entry, at MAX_DEPTH and one past it.
+
+    A climb that reaches neither the entry nor the top within MAX_DEPTH
+    steps is refused in a sentence naming the ceiling, having taken one
+    more parent to see whether its last step landed on the top (the
+    external review's L17); one that reaches the entry at the ceiling
+    walks. Every ancestor opened is closed. PRE-STATE: no directory on
+    the chain holds a git name, so only the ceiling can refuse the deeper
+    one."""
+    snapshot = look_names()
+    above = [{"names": [f"d{i}"]} for i in range(levels)]
+    above[-1]["identity"] = (7, 7)
+    fake = FakeTree({"a.py": b"a"}, above=above)
+    if levels == MAX_DEPTH:
+        assert walk(tree=fake, patterns=["**/*"], entry=(7, 7)) == [("a.py", b"a")]
+    else:
+        with pytest.raises(SnapshotError) as refused:
+            walk(tree=fake, patterns=["**/*"], entry=(7, 7))
+        assert str(refused.value) == snapshot.LOOK_CEILING
+        assert f"climbed {MAX_DEPTH} directories" in snapshot.LOOK_CEILING
+    assert len(climbed(fake)[0]) == MAX_DEPTH + (levels > MAX_DEPTH)
+    assert sorted(climbed(fake)[1]) == sorted(climbed(fake)[0])
+
+
+def test_a_climb_that_lands_on_the_top_at_its_ceiling_walks():
+    """WINDOW: walk over a root exactly MAX_DEPTH plain directories below
+    the top of the filesystem, with no entry to stop at, and one deeper.
+
+    The top is known only by its parent being itself, so the look's last
+    step lists it (no git names) and takes one more parent to see it is
+    the top: the root is walked. One directory deeper, the ceiling
+    refuses, in its own sentence. Every ancestor opened is closed (the
+    external review's L17). PRE-STATE at 5fd1a3b: the root at exactly
+    MAX_DEPTH was refused with LOOK_CEILING, though the look had listed
+    the top."""
+    snapshot = look_names()
+    at = FakeTree({"a.py": b"a"}, above=[[f"d{i}"] for i in range(MAX_DEPTH)])
+    assert walk(tree=at, patterns=["**/*"]) == [("a.py", b"a")]
+    assert "/".join([".."] * MAX_DEPTH) in climbed(at)[0]
+    assert sorted(climbed(at)[1]) == sorted(climbed(at)[0])
+    past = FakeTree({"a.py": b"a"}, above=[[f"d{i}"] for i in range(MAX_DEPTH + 1)])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=past, patterns=["**/*"])
+    assert str(refused.value) == snapshot.LOOK_CEILING
+    assert sorted(climbed(past)[1]) == sorted(climbed(past)[0])
+
+
+def test_the_look_counts_its_entries_across_every_directory_it_climbs():
+    """WINDOW: walk over a root with two plain directories above it and no
+    entry, their listings each under the walk's entry ceiling and together
+    one past it; and together exactly at it.
+
+    The look's width ceiling is on every entry it lists on the way up, in
+    all, not on each directory (the external review's L16: a count reset
+    for each ancestor survived). PRE-STATE: neither directory alone is
+    past the ceiling, and none of the names is a git name."""
+    snapshot = look_names()
+    half = MAX_WALKED_ENTRIES // 2
+    low = [f"a{i}" for i in range(half)]
+    high = [f"b{i}" for i in range(MAX_WALKED_ENTRIES - half + 1)]
+    assert len(low) < MAX_WALKED_ENTRIES and len(high) < MAX_WALKED_ENTRIES
+    fake = FakeTree({"a.py": b"a"}, above=[low, high])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=["**/*"])
+    assert str(refused.value) == snapshot.LOOK_TOO_WIDE
+    assert climbed(fake) == (["..", "../.."], ["..", "../.."])
+    exact = FakeTree({"a.py": b"a"}, above=[low, high[:-1]])
+    assert walk(tree=exact, patterns=["**/*"]) == [("a.py", b"a")]
+
+
+def test_a_directory_above_too_wide_to_list_is_refused():
+    """WINDOW: walk over a root whose parent holds one more entry than the
+    walk's own entry ceiling, none of them git names.
+
+    The look lists each ancestor to read its names, and stops at the
+    ceiling the walk keeps below the root. PRE-STATE: one entry fewer
+    would be listed whole, and none is a git name."""
+    snapshot = look_names()
+    wide = [f"n{i}" for i in range(MAX_WALKED_ENTRIES + 1)]
+    fake = FakeTree({"a.py": b"a"}, above=[wide])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=["**/*"])
+    assert str(refused.value) == snapshot.LOOK_TOO_WIDE
+    assert climbed(fake) == ([".."], [".."])
+    narrow = FakeTree({"a.py": b"a"}, above=[wide[:-1]])
+    assert walk(tree=narrow, patterns=["**/*"]) == [("a.py", b"a")]

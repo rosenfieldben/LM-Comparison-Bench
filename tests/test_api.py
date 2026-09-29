@@ -8,7 +8,6 @@ import math
 import re
 import sqlite3
 import subprocess
-import threading
 import typing
 from pathlib import Path
 from typing import Literal
@@ -19,6 +18,7 @@ import respx
 from fastapi.testclient import TestClient
 
 from bench import clones, main, report
+from bench import models as bench_models
 from bench.extract import MAX_COMPOSED_CHARS, compose
 from bench.main import MAX_POSITION, app
 from bench.models import (
@@ -29,6 +29,10 @@ from bench.models import (
     provider_preferences,
     token_rates,
 )
+
+# Read through getattr so this file still collects against a tree from
+# before the sentence existed (a pre-state), where it fails on the value.
+UNREAD_ROUTE = getattr(bench_models, "UNREAD_ROUTE", "(no such sentence)")
 
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures" / "openrouter_response.json").read_text()
@@ -958,6 +962,9 @@ def test_lifespan_client_transport_carries_keepalive_options(monkeypatch, tmp_pa
 def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path):
     monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
     monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    # The exact body below holds the ceiling's figures, which a limit set
+    # in the shell running the suite would change.
+    monkeypatch.delenv("BENCH_SPEND_LIMIT_USD", raising=False)
 
     async def offline_catalog(client):
         return {"fetched": False, "models": [], "prices": {}}
@@ -981,6 +988,9 @@ def test_offline_boot_models_empty_and_compare_still_works(monkeypatch, tmp_path
             # BENCH_CLONE_ROOT is unset: its own sentence, verbatim.
             "clones_enabled": False,
             "clones_off_reason": clones.CLONES_OFF,
+            # Phase P, P2: the ceiling's figures, recorded spend alone
+            # with no ceiling set, since blank is not sent.
+            "spend": {"accumulated_usd": 0.0},
         }
 
         with respx.mock:
@@ -1625,7 +1635,12 @@ async def test_review_repro_stream_rechecks_ceiling_after_admission(
     after an earlier one's recorded spend crossed it, bounding overshoot by
     lineup size rather than the semaphore. A run admitted below the ceiling
     must be refused, before spending, if the ceiling is crossed before it
-    acquires its slot."""
+    acquires its slot.
+
+    Since Phase P, P2 the refusal here comes from the stream's own claim,
+    the generator's first step, which sees the ceiling reached between the
+    door and the claim and says so; the recheck in the held slot is
+    restaged by test_a_stream_claimed_and_queued_is_refused_in_its_slot."""
     route = respx.post(OPENROUTER_URL).mock(
         return_value=httpx.Response(200, stream=alpha_stream())
     )
@@ -1646,7 +1661,10 @@ async def test_review_repro_stream_rechecks_ceiling_after_admission(
         assert [f["type"] for f in frames] == ["done"]
         assert frames[0]["run_id"] is None
         result = frames[0]["result"]
-        assert "refused before reaching upstream" in result["error"]
+        assert result["error"] == (
+            "run refused before reaching upstream: recorded spend $1.50 reached "
+            "the $1.00 ceiling (BENCH_SPEND_LIMIT_USD); no upstream call was made"
+        )
         # Shaped like a done result: model and effective budget set, every
         # metric and text field None.
         assert result["model"] == "model/alpha"
@@ -1674,7 +1692,13 @@ def test_review_repro_compare_rechecks_ceiling_mid_batch(monkeypatch, tmp_path):
     admission once at entry, so once spend crossed the ceiling mid-batch
     every already-admitted model still called upstream. The recheck under
     the held slot must refuse the not-yet-started models before they
-    spend, while the batch still persists with the refusal row."""
+    spend, while the batch still persists with the refusal row.
+
+    Since Phase P, P2 the second member is refused at its own claim: the
+    mock does not suspend, so the first member's call and settlement are
+    over before the second claims, and its claim sees the ceiling reached.
+    The recheck in the held slot is restaged by
+    test_compare_releases_at_the_in_slot_recheck."""
     calls = {"n": 0}
 
     def route(request: httpx.Request) -> httpx.Response:
@@ -1702,7 +1726,11 @@ def test_review_repro_compare_rechecks_ceiling_mid_batch(monkeypatch, tmp_path):
         # First ran; second refused before any upstream call.
         assert calls["n"] == 1
         assert results[0]["error"] is None
-        assert "refused before reaching upstream" in results[1]["error"]
+        assert results[1]["error"] == (
+            "run refused before reaching upstream: recorded spend $5.000029 "
+            "reached the $1.00 ceiling (BENCH_SPEND_LIMIT_USD); no upstream "
+            "call was made"
+        )
         # The batch persisted, refusal row and all.
         run_id = resp.json()["run_id"]
         assert run_id is not None
@@ -3582,6 +3610,14 @@ def test_the_seed_bound_is_what_a_browser_can_read_back_exactly(client):
 # ---- Phase H1.1: the ceiling bound holds across concurrent batches.
 
 
+# Five members, each priced so its worst case at the standard budget over
+# the prompt "p", 16384 * 2.5e-7 + 1 * 1e-7 = 0.0040961, is above half the
+# 0.005 limit and within it: one claim fits and two do not. (priced_catalog
+# and the other P2 helpers are defined with the P2 proofs, below.)
+FIVE = ["model/slow", "model/beta", "model/gamma", "model/delta", "model/epsilon"]
+W_FIVE = 16384 * 2.5e-07 + 1 * 1e-07
+
+
 @respx.mock
 def test_review_repro_concurrent_batches_hold_the_ceiling_bound(monkeypatch, tmp_path):
     """Third external review, HIGH: the documented ceiling bound did not
@@ -3589,88 +3625,86 @@ def test_review_repro_concurrent_batches_hold_the_ceiling_bound(monkeypatch, tmp
     the official scripting surface, which is exactly the concurrent-batch
     path.
 
-    The mechanism. /compare acquired one slot per model and rechecked the
+    The history. /compare acquired one slot per model and rechecked the
     ceiling under the held slot, but settlement ran in a loop AFTER
-    asyncio.gather. So a fast member released its slot having recorded
-    nothing, a model from another batch took that slot, and its recheck read
-    a counter that had not moved. The comment inside limited() narrated the
-    same-batch blindness and then reasoned only about a single batch; nobody
-    re-derived it for N batches.
+    asyncio.gather, so a fast member released its slot having recorded
+    nothing and a model from another batch rechecked against a counter that
+    had not moved: eight concurrent five-model batches against a ceiling
+    worth half a result put 23 calls upstream (stable across five runs; the
+    external report said 28). Settling inside the held slot (a300623) made
+    the bound MAX_CONCURRENT_UPSTREAM, the calls already executing when the
+    ceiling tripped, and this test asserted that bound.
 
-    Why the post-fix bound is what it is. Settlement now happens inside the
-    held slot, strictly before release. So a freed slot implies a recorded
-    settlement. Once accumulated spend crosses the ceiling, every subsequent
-    acquisition observes it and refuses without calling upstream. Only calls
-    already executing at the moment the ceiling tripped can overshoot, and
-    the semaphore caps those at MAX_CONCURRENT_UPSTREAM by construction.
-    That is the whole derivation, and it is the bound asserted below.
+    Phase P, P2 makes the bound exact. Every call claims its worst case
+    before it queues, with nothing awaited between the check and the claim,
+    so at half a result one call goes upstream, the one whose claim fit,
+    and every other is refused before it queues.
 
-    The shape is the reviewer's reproduction: eight concurrent five-model
-    batches, one deliberately slow member each so fast members finish and
-    free slots while the batch is still open, a ceiling worth half of one
-    result. Reverting settlement to the post-gather loop makes this measure
-    23 upstream calls against a bound of 5, stable across five runs. The
-    external report said 28; the exact number is scheduling-dependent and
-    the assertion below is on the bound, not on any particular overshoot.
+    WINDOW: eight five-member /compare batches sent at once on the app's
+    loop, every member priced, the first upstream call held at a gate until
+    seven batches have answered, or until MAX_CONCURRENT_UPSTREAM calls have
+    arrived, which is where the pre-state opens it so it fails on the count
+    rather than hanging. PRE-STATE: one worst case fits the limit and two
+    do not; at 1f143e3, settling in the slot, this staging measures 5 calls
+    (3 runs of 3 on each of 3.11 to 3.14 in the design's prototype, and
+    again stash-proven for this commit).
     """
-    slow = threading.Event()
+    limit = 0.005
+    assert limit / 2 < W_FIVE <= limit
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    catalog = priced_catalog(dict.fromkeys(FIVE, (1e-07, 2.5e-07)))
+    with ledger_client(monkeypatch, tmp_path, limit, catalog=catalog) as c:
 
-    async def respond(request):
-        # One slow member per batch, by model id, so each batch has fast
-        # members that finish and release their slots early. That release
-        # is the whole mechanism: pre-fix it carried no settlement with it.
-        if b'"model/slow"' in request.content:
-            await asyncio.sleep(0.25)
-        return httpx.Response(
-            200,
-            json={
-                **FIXTURE,
-                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": 0.01},
-            },
-        )
+        async def staged():
+            gate = asyncio.Event()
 
-    route = respx.post(OPENROUTER_URL).mock(side_effect=respond)
-    lineup = ["model/slow", "model/alpha", "model/beta", "model/gamma", "model/delta"]
+            async def reply(request):
+                model = json.loads(request.content)["model"]
+                calls.append(model)
+                if len(calls) >= main.MAX_CONCURRENT_UPSTREAM:
+                    gate.set()
+                await gate.wait()
+                return httpx.Response(200, json=billed(model, 0.01))
 
-    # Half of one result: the very first settlement must close the gate.
-    with spend_client(monkeypatch, tmp_path, limit=0.005) as c:
-        statuses = []
+            route.mock(side_effect=reply)
+            async with app_client() as r:
+                sends = [
+                    asyncio.ensure_future(
+                        r.post("/compare", json={"prompt": "p", "models": FIVE})
+                    )
+                    for _ in range(8)
+                ]
+                await spin(lambda: sum(s.done() for s in sends) >= 7 or gate.is_set())
+                during = (len(calls), held(), app.state.accumulated_spend_usd)
+                gate.set()
+                return [await s for s in sends], during
 
-        def one_batch():
-            resp = c.post("/compare", json={"prompt": "p", "models": lineup})
-            statuses.append(resp)
-
-        threads = [threading.Thread(target=one_batch) for _ in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=60)
-        slow.set()
-
-        assert all(r.status_code in (200, 402) for r in statuses), [
-            r.status_code for r in statuses
-        ]
-        # The bound, derived above. Pre-fix this was ~28.
-        assert len(route.calls) <= main.MAX_CONCURRENT_UPSTREAM, (
-            f"{len(route.calls)} calls reached upstream, bound is "
-            f"{main.MAX_CONCURRENT_UPSTREAM}"
-        )
+        answers, during = c.portal.call(staged)
+        # The bound: one call, and while it was on the wire its claim was
+        # all that was held and nothing was recorded.
+        assert len(calls) == 1, (len(calls), during)
+        assert during == (1, pytest.approx(W_FIVE), 0.0)
 
         # Nothing vanished: every one of the 40 requested models is
         # accounted for as either an upstream call or a refusal. A bound met
         # by dropping work would be a different defect wearing this test's
         # green.
         refused = 0
-        for resp in statuses:
+        for resp in answers:
+            assert resp.status_code in (200, 402), resp.status_code
             if resp.status_code == 402:
-                refused += len(lineup)
+                refused += len(FIVE)
                 continue
             for result in resp.json()["results"]:
                 if result["error"] and "refused" in result["error"]:
                     refused += 1
-        assert refused + len(route.calls) == 8 * len(lineup), (
-            f"{refused} refused + {len(route.calls)} called != 40"
+        assert refused + len(calls) == 8 * len(FIVE), (
+            f"{refused} refused + {len(calls)} called != 40"
         )
+        # The one call settled at its billed figure, and nothing is held.
+        assert c.app.state.accumulated_spend_usd == 0.01
+        assert c.app.state.spend_reservations == {}
 
 
 # ---- Phase H1.2: the manifest the group declares is enforced.
@@ -5043,8 +5077,30 @@ def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_pat
     assert row["score"] == 0.5
     assert row["detail"] == "partial"
     assert row["judge_model"] == "judge/one"
-    assert row["judge_generation_id"] == "gen-judge-9"
-    assert row["judge_billed_cost_usd"] == 0.00002
+    # RECORDED ONCE, on the call (Phase P, the operator's ruling Q2): the
+    # score row cites the request its verdict came back on, and the
+    # generation id and the charge are that request's, not the row's.
+    # Until Phase P the row held both; its two columns are now what rows
+    # written before it carry.
+    assert (row["judge_generation_id"], row["judge_billed_cost_usd"]) == (None, None)
+    (call,) = client.app.state.db.execute(
+        "SELECT * FROM judge_calls WHERE id = ?", (row["judge_call_id"],)
+    ).fetchall()
+    assert (call["generation_id"], call["billed_cost_usd"], call["outcome"]) == (
+        "gen-judge-9",
+        0.00002,
+        "answered",
+    )
+    # And, since P2, the usage counts the reply reported, on the call and
+    # on the exported call: what the estimate was computed from, though not
+    # the rates it was priced at (BACKLOG, "The catalog a scoring pass
+    # priced against").
+    assert (call["prompt_tokens"], call["completion_tokens"]) == (30, 9)
+    (line,) = [x for x in export_lines(client, eid, path) if x["type"] == "trial"]
+    (exported,) = line["judge_calls"]
+    assert (exported["prompt_tokens"], exported["completion_tokens"]) == (30, 9)
+    assert call["answered_at"] >= call["sent_at"]
+    assert (call["result_id"], call["pass_id"]) == (row["result_id"], row["pass_id"])
     # Judge spend is spend: it moves the same accumulator the ceiling
     # reads, so a scoring pass cannot run for free against the limit.
     assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00002)
@@ -5060,12 +5116,19 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
 
     The spend was the billed call alone, and the line built from it read
     as the whole cost of judging. A reply with no price is an unpriced
-    call, not a free one, and a judge row with no billing figure (the
-    unpriced reply, the timeout, the pass that had no judge to call) is
-    counted whatever the reason, the unpriced call among them. The contains
-    rows carry no figure either and are not judge rows, so they are not
-    counted. PRE-STATE: the three rows the first pass wrote are the three
-    shapes, as stored: a figure; a generation id and no figure; neither.
+    call, not a free one.
+
+    PHASE P'S PROOF. Until it, the timeout left a score row with no
+    generation id and no figure, byte for byte the row a refused
+    connection left, and the report could only count it among
+    rows_without_figure (5 here: the unpriced reply, the timeout, and the
+    three rows of the pass that had no judge to call). That count is
+    retired. The timeout now leaves a judge_calls row written before the
+    request went out, ended timed_out with no answer columns, and the
+    report counts it as unanswered and the no-judge rows as nothing,
+    since no request was made for them. PRE-STATE: the first pass sent
+    three requests and recorded three calls, and its three score rows
+    cite them and carry no figure of their own.
     """
     judged = {"n": 0}
 
@@ -5112,20 +5175,39 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
 
     score_experiment_to_completion(client, eid, path, judge_model="judge/one")
 
+    assert judged["n"] == 3
     judge_rows = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
-    shapes = sorted(
-        (r["judge_generation_id"] is not None, r["judge_billed_cost_usd"] is not None)
+    calls = {
+        c["id"]: dict(c)
+        for c in client.app.state.db.execute("SELECT * FROM judge_calls ORDER BY id")
+    }
+    assert sorted(r["judge_call_id"] for r in judge_rows) == sorted(calls)
+    assert all(
+        r["judge_generation_id"] is None and r["judge_billed_cost_usd"] is None
         for r in judge_rows
     )
-    assert shapes == [(False, False), (True, False), (True, True)], judge_rows
-    timed_out = next(r for r in judge_rows if r["judge_generation_id"] is None)
+    shapes = sorted(
+        (c["outcome"], c["generation_id"], c["billed_cost_usd"]) for c in calls.values()
+    )
+    assert shapes == [
+        ("answered", "gen-judge-1", 0.00002),
+        ("answered", "gen-judge-2", None),
+        ("timed_out", None, None),
+    ]
+    timed_out = next(c for c in calls.values() if c["outcome"] == "timed_out")
+    # Sent, and no answer: the sent time and nothing a reply would have set.
+    assert timed_out["sent_at"] and timed_out["answered_at"] is None
     assert timed_out["detail"] == "judge request failed: ReadTimeout"
+    cited = next(r for r in judge_rows if r["judge_call_id"] == timed_out["id"])
+    assert cited["detail"] == "judge request failed: ReadTimeout"
     score_experiment_to_completion(client, eid, path)
     rows = scores_in(client, eid)
     assert len(rows) == 12
     assert all(
         r["judge_billed_cost_usd"] is None for r in rows if r["scorer"] != "judge"
     )
+    # The pass with no judge sent nothing, and recorded no call.
+    assert len(list(client.app.state.db.execute("SELECT id FROM judge_calls"))) == 3
 
     report = client.get(f"/experiments/{eid}/report").json()
 
@@ -5133,7 +5215,12 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
         "total_usd": pytest.approx(0.00002),
         "billed_calls": 1,
         "unpriced_calls": 1,
-        "rows_without_figure": 5,
+        "unanswered_calls": 1,
+        "unusable_answers": 0,
+        "unknown_calls": 0,
+        "history_counted_calls": 0,
+        "in_flight_calls": 0,
+        "rows_before_call_records": 0,
     }
 
 
@@ -6211,7 +6298,12 @@ def rebuild_from_export(lines, tasks_by_id):
     """
     manifest = lines[0]
     groups, runs_by_group, scores_by_result = [], {}, {}
+    # Phase P's records: every trial line's judge calls, and the passes the
+    # manifest carries, so the rebuilt judge_cost and scoring_passes come
+    # out of the artifact as the served ones come out of the database.
+    judge_calls = []
     for trial in (x for x in lines if x["type"] == "trial"):
+        judge_calls.extend(trial["judge_calls"])
         gid = trial["group_id"]
         if gid not in runs_by_group:
             groups.append(
@@ -6295,6 +6387,8 @@ def rebuild_from_export(lines, tasks_by_id):
         scores_by_result,
         tasks_by_id,
         manifest["report_seed"],
+        judge_calls=judge_calls,
+        scoring_passes=manifest["scoring_passes"],
     )
 
 
@@ -6421,6 +6515,38 @@ def test_the_export_verifies_its_own_digest(client, tmp_path):
     assert trailer["digest"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def test_the_current_note_restates_every_field_the_scoring_records_carry():
+    """WINDOW: report.EXPORT_SCHEMA_NOTES at the current version, the note
+    every export carries.
+
+    The external review's L8: the note is the one place a reader holding
+    the file and an older parser learns what each field means, so it
+    names every field of a pass record and of a judge call, both outcome
+    vocabularies, the order each list is in, how the counts are made now
+    and how a pass sealed before this version was counted. PRE-STATE: the
+    current version is 12, the schema 12 rulings' bump."""
+    assert report.EXPORT_SCHEMA_VERSION == 12
+    note = report.EXPORT_SCHEMA_NOTES[12]
+    for name in (
+        *report.PASS_FIELDS,
+        *report.CALL_FIELDS,
+        *store.PASS_OUTCOMES,
+        *store.CALL_OUTCOMES,
+    ):
+        assert re.search(rf"\b{name}\b", note), name
+    for phrase in (
+        "in the order the passes started",
+        "in the order sent",
+        "never from their outcome",
+        "there a reader takes not_sent as never sent, interrupted as unknown",
+        "its unusable counted every failed call",
+        "a pass closed before version 10 carries unusable null too",
+        "interrupted, which now means only that the record of the call's ending "
+        "could not be completed",
+    ):
+        assert phrase in note, phrase
+
+
 @respx.mock
 def test_the_export_is_ordered_and_manifested(client, tmp_path):
     eid, path = two_axes_experiment(client, tmp_path)
@@ -6431,12 +6557,53 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 8
+    assert manifest["export_schema_version"] == 12
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[8]
-    # Version 8 is Phase O's clone id: each capture record names the
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[12]
+    # Version 12 is the operator's rulings H2 and M1 on the 1d91670 review:
+    # each judge call carries sent and usable, each pass unknown, and the
+    # counts come from the facts.
+    for field in ("sent", "usable", "unknown"):
+        assert re.search(rf"\b{field}\b", manifest["export_schema_change"])
+    # Version 11, carried: each judge call carries its reply's two usage
+    # counts, what an estimate it was settled on was computed from.
+    for field in ("prompt_tokens", "completion_tokens"):
+        assert field in manifest["export_schema_change"]
+    # Version 10, carried: a pass's unanswered count split from its
+    # unusable one, and what a null unusable means.
+    assert "unusable" in manifest["export_schema_change"]
+    assert "carries unusable null" in manifest["export_schema_change"]
+    # Version 9, carried: Phase P's scoring records: the judge calls on each
+    # trial line, the two citations on each score, the passes in the
+    # manifest, and the two old judge columns null on a judged score
+    # whose call carries them.
+    for field in ("judge_calls", "judge_call_id", "pass_id", "scoring_passes"):
+        assert field in manifest["export_schema_change"]
+    assert "the figure is recorded once" in manifest["export_schema_change"]
+    # This experiment was scored once, deterministically: one pass,
+    # finished, cited by every score, and no judge call on any line.
+    (scored,) = manifest["scoring_passes"]
+    assert set(scored) == {
+        "id",
+        "judge_model",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "detail",
+        "scored",
+        "failed",
+        "unanswered",
+        "unusable",
+        "unknown",
+    }
+    assert (scored["outcome"], scored["judge_model"]) == ("finished", None)
+    assert (scored["unanswered"], scored["unusable"], scored["unknown"]) == (0, 0, 0)
+    trials = [line for line in lines if line["type"] == "trial"]
+    assert {s["pass_id"] for line in trials for s in line["scores"]} == {scored["id"]}
+    assert all(line["judge_calls"] == [] for line in trials)
+    # Version 8, carried: Phase O's clone id: each capture record names the
     # clones row its walked root was in, and the URL stays out of the
     # file.
     assert "clone_id" in manifest["export_schema_change"]
@@ -7477,12 +7644,18 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
     # Both were billed a quarter, including the one that failed.
     assert sum(c["total_usd"] for c in totals.values()) == pytest.approx(0.5)
     assert sum(c["billed_trials"] for c in totals.values()) == 2
-    # And judge spend is its own line rather than folded in.
+    # And judge spend is its own line rather than folded in. Phase P
+    # retired rows_without_figure for the three counts that say why.
     assert report["judge_cost"] == {
         "total_usd": 0,
         "billed_calls": 0,
         "unpriced_calls": 0,
-        "rows_without_figure": 0,
+        "unanswered_calls": 0,
+        "unusable_answers": 0,
+        "unknown_calls": 0,
+        "history_counted_calls": 0,
+        "in_flight_calls": 0,
+        "rows_before_call_records": 0,
     }
 
 
@@ -7980,11 +8153,12 @@ def test_review_repro_a_write_landing_mid_export_reaches_neither_export(
     it wrote between the exports, so both reads were already whole.
 
     The write comes from a SECOND CONNECTION, which is the only shape
-    that can reach this window and is a real one: `python -m
-    bench.reconcile --apply` against a live bench is a second connection
-    by design, and is the reason connect() turns WAL on. A write on the
-    export's own connection would join its transaction and be visible to
-    it, which proves nothing about isolation.
+    that can reach this window and is a real one: a person at the sqlite3
+    prompt, or a script, beside a live bench. (`python -m bench.reconcile
+    --apply` was the bench's own such writer until Phase P gave it the
+    server's lock.) A write on the export's own connection would join its
+    transaction and be visible to it, which proves nothing about
+    isolation.
 
     Two exports, each with its own write injected mid-read, and neither
     sees the write injected into it. The second DOES see the first's,
@@ -9354,6 +9528,12 @@ def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
     asked. This is the same asymmetry trial_route already draws for the
     reasoning field: an unanswerable listing is an absence, not a
     licence to use the aggregate.
+
+    Since Phase P (the operator's ruling on the external review's H1) the
+    projection still refuses and now says why, and what the spend
+    ceiling does instead: the trial reserves at the catalog's model
+    rates (models.UNREAD_ROUTE). Before, it named the bare model and the
+    trial reserved nothing.
     """
     respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
         json={
@@ -9380,7 +9560,7 @@ def test_a_pinned_route_that_publishes_no_price_is_unpriced_not_borrowed(
     # the null below is a refusal and not an absence of data.
     assert app.state.prices["model/alpha"]["prompt"] == 1e-06
     assert cost["total_usd"] is None
-    assert cost["unpriced"] == ["model/alpha"]
+    assert cost["unpriced"] == [f"model/alpha ({UNREAD_ROUTE})"]
 
 
 def test_review_repro_a_request_charge_makes_the_projection_null_not_zero(
@@ -10026,8 +10206,9 @@ def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_p
     THREE ANSWERS, NOT TWO. "This route charges something I cannot
     count" and "I know nothing about this route's price" are different
     facts with different remedies, and collapsing them was half of what
-    the finding was about. The bare name is the honest answer to the
-    second and only to the second.
+    the finding was about. The second names no charge; since Phase P it
+    says the price could not be read and what the spend ceiling does
+    instead, where it was the bare name.
     """
     respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
         json={
@@ -10050,7 +10231,7 @@ def test_a_route_whose_listing_cannot_answer_stays_distinguishable(client, tmp_p
         json=strict_body(path, provider_pins={"model/alpha": "together"}),
     ).json()["projected_cost"]
 
-    assert cost["unpriced"] == ["model/alpha"]
+    assert cost["unpriced"] == [f"model/alpha ({UNREAD_ROUTE})"]
     assert "charges" not in cost["unpriced"][0]
 
 
@@ -10110,9 +10291,16 @@ def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
     MEASURED BEFORE THIS TEST EXISTED: the refusal could be deleted
     outright and the suite stayed green at 976 passed.
 
-    ANY MATCHING ENDPOINT POISONS THE PIN, because the router may pick
-    it. Returning the other endpoint's clean rates would be quoting the
-    one route the pin does not guarantee.
+    ANY MATCHING ENDPOINT POISONS THE PIN'S PROJECTION, because the
+    router may pick it. Returning the other endpoint's clean rates as
+    though they were the whole price would be quoting the one route the
+    pin does not guarantee.
+
+    Since Phase P (the external review's H1) the highest rates come back
+    beside the charge's name rather than None: the projection still
+    refuses on the name (asserted below), and the spend ceiling's
+    reservation reads the rates, where None made the trial reserve
+    nothing while its settlement counted it.
     """
     listing = {
         "fetched": True,
@@ -10132,8 +10320,14 @@ def test_review_repro_one_charging_endpoint_makes_the_whole_pin_unpriced():
 
     rates, beyond = endpoint_rates(listing, "together")
 
-    assert rates is None
+    assert rates == {"prompt": 1.0, "completion": 2.0}
     assert beyond == ["request"]
+    from bench.models import projected_cost
+
+    route = {"pin": "together", "rates": rates, "beyond": beyond}
+    priced = main.experiment_prices(["m"], {"m": route}, {})
+    cost = projected_cost(1, None, ["m"], 1, {"m": 10}, priced, chars_per_token=4)
+    assert (cost["total_usd"], cost["unpriced"]) == (None, ["m (charges request)"])
 
 
 # ---- Thirteenth review panel, D: F2 is enforced at four doors, so it
@@ -10361,6 +10555,9 @@ def test_review_repro_the_rebuild_helper_reads_every_field_the_export_emits():
         "repeat_index",
         "rotation_index",
         "scores",
+        # Phase P: gathered across the lines into the one list of calls
+        # build_report takes, rather than set on a result.
+        "judge_calls",
         # Recorded on the trial line for a reader; build_report takes
         # the outcome from the result's own error and response_text, so
         # forwarding it would be handing the function its own answer.
@@ -16173,7 +16370,7 @@ def clone(root: Path, files: dict[str, bytes]) -> Path:
 
 def snapshot_of(client, root, patterns=("**/*.py",)):
     """POST /snapshots against an allowlisted root."""
-    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    allow(client, root)
     return client.post(
         "/snapshots", json={"root": str(root), "patterns": list(patterns)}
     )
@@ -16244,7 +16441,7 @@ def test_the_off_door_touches_no_path_the_caller_named(client, tmp_path, monkeyp
     assert refused.status_code == 403
     assert seen == []
 
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     client.post("/snapshots", json={"root": str(tmp_path), "patterns": ["**/*"]})
     assert seen == [str(tmp_path)]
 
@@ -16261,7 +16458,7 @@ def test_a_root_outside_the_allowlist_is_refused_and_both_are_named(client, tmp_
     """
     allowed = clone(tmp_path / "allowed", {"a.py": b"x = 1\n"})
     other = clone(tmp_path / "elsewhere", {"b.py": b"y = 2\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post("/snapshots", json={"root": str(other), "patterns": ["**/*.py"]})
 
@@ -16280,7 +16477,7 @@ def test_a_directory_under_an_allowed_root_is_allowed(client, tmp_path):
     snapshot any clone inside it without listing each one.
     """
     allowed = clone(tmp_path / "work", {"proj/a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post(
         "/snapshots", json={"root": str(allowed / "proj"), "patterns": ["*.py"]}
@@ -16299,7 +16496,7 @@ def test_a_sibling_root_sharing_a_prefix_is_not_under_the_allowlist(client, tmp_
     """
     allowed = clone(tmp_path / "work", {"a.py": b"x = 1\n"})
     sibling = clone(tmp_path / "work-old", {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post("/snapshots", json={"root": str(sibling), "patterns": ["*.py"]})
 
@@ -16316,7 +16513,7 @@ def test_a_root_that_is_not_a_directory_is_a_422(client, tmp_path):
     tells an outside caller whether it exists.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
 
     resp = client.post(
         "/snapshots", json={"root": str(root / "a.py"), "patterns": ["*"]}
@@ -16793,7 +16990,7 @@ def test_the_snapshot_door_refuses_a_body_it_cannot_read(client, tmp_path):
     whole boundary is built to close.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
 
     unknown = client.post(
         "/snapshots",
@@ -17160,7 +17357,7 @@ def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 8
+    assert manifest["export_schema_version"] == 12
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -17218,6 +17415,17 @@ FILESYSTEM_CALLS = {
     },
     ("main.py", "DescriptorTree.open_member"): {"os.close", "os.fstat", "os.open"},
     ("main.py", "DescriptorTree.read_member"): {"os.read"},
+    # The look's listing above the root: names from readdir, no child
+    # described (the external review's M12).
+    ("main.py", "DescriptorTree.names"): {"os.scandir"},
+    # Boot's climb above each allowlist entry, by the look itself, from
+    # the entry's own handle: it opens the entry, the look does the rest,
+    # and the entry is closed whatever the look says (the operator's
+    # ruling on the external review at 1d91670).
+    ("main.py", "_refuse_entries_inside_git"): {
+        "tree.close_handle",
+        "tree.open_root",
+    },
     ("main.py", "DescriptorTree.close_handle"): {"os.close"},
     ("main.py", "DescriptorTree.link_target"): {"os.path.realpath", "os.readlink"},
     # snapshot.py does no I/O at all: these are the INJECTED operations
@@ -17236,6 +17444,17 @@ FILESYSTEM_CALLS = {
         "tree.root_path",
     },
     ("snapshot.py", "Survey._sightings.listing"): {"tree.entries"},
+    # THE LOOK ABOVE THE ROOT (Phase P, P3): through parent, one directory
+    # at a time from the root's own handle, each listed for the four
+    # names, by name alone (M12), and closed. It opens nothing but
+    # directories and reads no file. DescriptorTree.parent makes no call
+    # of its own here: it is _directory with '..' and the handle's
+    # descriptor.
+    ("snapshot.py", "look_above"): {
+        "tree.close_handle",
+        "tree.names",
+        "tree.parent",
+    },
     # The one place a member is opened and read: the composer's reader,
     # which walk hands the survey and list_members does not. That the
     # listing never reaches it is proved at runtime (the FakeTree ledger
@@ -17284,6 +17503,26 @@ FILESYSTEM_CALLS = {
         "os.stat",
     },
     ("store.py", "connect"): {"sqlite3.connect"},
+    # The database's one-writer lock, Phase P: a file beside the file
+    # BENCH_DB resolves to (lock_path resolves it, so a link to a live
+    # database finds its lock: the external review's M2), its directory
+    # made private if it is not there yet (the lock is taken before
+    # connect, which used to make it: M3), opened, locked without waiting,
+    # and written with this process's id and what it is (a server, or
+    # reconcile --apply); or, when another process holds it, read for
+    # those and closed. Released by closing it.
+    ("store.py", "lock_path"): {"os.path.realpath"},
+    ("store.py", "hold_lock"): {
+        "fcntl.flock",
+        "os.close",
+        "os.ftruncate",
+        "os.makedirs",
+        "os.open",
+        "os.path.isdir",
+        "os.read",
+        "os.write",
+    },
+    ("store.py", "release_lock"): {"os.close"},
     #
     # ---- The clone door. Every path is BENCH_CLONE_ROOT, from the
     # ---- operator's environment at boot, or a name under it the door
@@ -17326,6 +17565,11 @@ FILESYSTEM_CALLS = {
     # Which clone a snapshot root is in, the same way: each clones row's
     # recorded directory, and the root's ancestors, stat'd.
     ("main.py", "_clone_for"): {"os.stat"},
+    # Each BENCH_REPO_ROOTS entry's device and inode, at boot from the
+    # operator's own variable (and, for an allowlist a test set after
+    # boot, when a root is admitted under it): where the look above a
+    # snapshot root stops.
+    ("main.py", "_root_identities"): {"os.stat"},
     # A constant member name inside an uploaded zip. No filesystem is
     # touched at all: this is ZipFile.open over bytes already in memory.
     ("extract.py", "_extract_docx"): {"archive.open"},
@@ -17343,6 +17587,10 @@ FILESYSTEM_TOUCHERS = {
     "os.listdir",
     # F_GETPATH: a directory's spelling read from its descriptor.
     "fcntl.fcntl",
+    # The one-server lock on a descriptor, and the id written into it.
+    "fcntl.flock",
+    "os.ftruncate",
+    "os.write",
     "os.makedirs",
     "os.mkdir",
     "os.open",
@@ -17396,6 +17644,11 @@ FILESYSTEM_TOUCHERS = {
     "close_handle",
     "link_target",
     "root_path",
+    # The ninth, since Phase P (P3): the look above the root.
+    "parent",
+    # The tenth, since the external review's M12: the look's listing of a
+    # directory above the root, names only.
+    "names",
 }
 
 # os calls that compute on strings and touch nothing. A call into os
@@ -17403,6 +17656,8 @@ FILESYSTEM_TOUCHERS = {
 # the os half of the list stays complete without anybody remembering.
 PURE_OS_CALLS = {
     "os.environ.get",
+    # This process's own id, read to be written into the lock file.
+    "os.getpid",
     "os.fsdecode",
     "os.path.basename",
     "os.path.commonpath",
@@ -18032,7 +18287,7 @@ def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
 
 def listing_of(client, root, patterns=("**/*.py",)):
     """POST /snapshots/listing against an allowlisted root."""
-    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    allow(client, root)
     return client.post(
         "/snapshots/listing", json={"root": str(root), "patterns": list(patterns)}
     )
@@ -18232,7 +18487,7 @@ def test_a_refused_request_is_the_same_refusal_at_both_doors(client, tmp_path, c
     good pattern the listing answers 200."""
     root = clone(tmp_path / "clone", {"a.py": b"a\n"})
     elsewhere = clone(tmp_path / "elsewhere", {"b.py": b"b\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
     good = {"root": str(root), "patterns": ["*.py"]}
     assert client.post("/snapshots/listing", json=good).status_code == 200
     body = dict(good)
@@ -18295,7 +18550,7 @@ def test_a_root_resolving_to_a_name_utf8_cannot_spell_is_a_403_at_both_doors(
     resolved = "/elsewhere/caf" + chr(0xDCE9)
     with pytest.raises(UnicodeEncodeError):
         resolved.encode("utf-8")
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
     monkeypatch.setattr(main, "_resolved_directory", lambda path: resolved)
     body = {"root": str(root / "w"), "patterns": ["*.py"]}
     for door in ("/snapshots", "/snapshots/listing"):
@@ -18591,7 +18846,7 @@ def test_a_root_inside_git_is_refused_and_its_token_stays_out(client, tmp_path, 
     copied = repo / "copied"
     copied.mkdir()
     (copied / "config").write_text(config)
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
 
     control = client.post(door, json={"root": str(copied), "patterns": ["config"]})
@@ -18641,7 +18896,7 @@ def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_
     other = tmp_path / "other"
     (other / ".GIT").mkdir(parents=True)
     (repo / "link").symlink_to(repo / ".git")
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
 
     def status(root):
         assert Path(root).is_dir()
@@ -18657,7 +18912,7 @@ def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_
 
     hooks = repo / ".git" / "hooks"
     hooks.mkdir(exist_ok=True)
-    client.app.state.repo_roots = (str(tmp_path.resolve()), str(hooks.resolve()))
+    allow(client, tmp_path, hooks)
     assert status(hooks) == 200
     assert status(repo / ".git") == 403
 
@@ -18784,7 +19039,7 @@ def test_a_git_directory_refuses_at_both_doors_in_one_sentence(
     tree with the bare repository's HEAD removed composes (201) and
     lists would_compose true with its config selected, so the walk of
     that directory reads config when the rule does not stop it."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
     trees = git_directory_trees(tmp_path)
     config = "/".join(filter(None, [trees[(where, False)][1], "config"]))
@@ -18854,7 +19109,7 @@ def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
     recorder is live and the read is where it was: the same tree with
     the bare repository's HEAD removed composes, and the recorder saw
     the composer's `git rev-parse HEAD` in the walked root."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     trees = git_directory_trees(tmp_path)
     ran = []
 
@@ -18892,11 +19147,13 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     inside .git is walked: a .git that is both the entry and the root
     holds the four names, so the walk refuses it, Compose with 422 and
     the listing with its stop row carrying the same sentence, and nothing
-    is stored. PRE-STATE: the entry is honored, since a root below it
-    that is not a git directory (its hooks) lists would_compose true;
-    ROOT_IN_VCS measures only below the entry, so vcs_below is false for
-    a root at its own entry and a 403 is not what refuses it; and git's
-    default configuration names no remote."""
+    is stored. Since Phase P (P3) a root BELOW such an entry (its hooks)
+    is refused too, by the look above the root, which checks the entry
+    it stops at: the root is inside a git directory, whoever named it.
+    Before P3 that root listed would_compose true (measured at 9571082).
+    PRE-STATE: ROOT_IN_VCS measures only below the entry, so vcs_below is
+    false for a root at its own entry and a 403 is not what refuses
+    either; and git's default configuration names no remote."""
     repo = tmp_path / "zqrepo"
     env = {
         "PATH": os.environ["PATH"],
@@ -18909,12 +19166,13 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     assert "url" not in (dot_git / "config").read_text()
     (dot_git / "hooks").mkdir(exist_ok=True)
     (dot_git / "hooks" / "zq.txt").write_text("x\n")
-    client.app.state.repo_roots = (str(dot_git),)
+    allow(client, dot_git, resolve=False)
     db = client.app.state.db
     hooks = client.post(
         "/snapshots/listing", json={"root": str(dot_git / "hooks"), "patterns": ["*"]}
     )
-    assert hooks.status_code == 200 and hooks.json()["would_compose"] is True
+    assert hooks.status_code == 200 and hooks.json()["would_compose"] is False
+    assert hooks.json()["refusal"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
     assert bench_snapshot.vcs_below(str(dot_git), str(dot_git)) is False
 
     stored = db.execute("SELECT count(*) FROM attachments").fetchone()[0]
@@ -18975,7 +19233,7 @@ def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp
     the rule does not fire, the walk reads config, and the sentinel is
     in the stored text word for word. That is the exposure f8bde6b
     closed, shown on the bytes git itself writes."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
     for control in (True, False):
         top = tmp_path / ("zqcontrol" if control else "zqbare")
@@ -19014,12 +19272,14 @@ def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp
 
 
 # The places below a git directory's top level that can carry a URL git
-# uses, each verified on the git named. logs/ is written by git itself
-# (git pull keeps its arguments verbatim in the reflog message; git fetch
-# anonymises them), so the fixture has git write it rather than planting
-# a file: update-ref -m with core.logAllRefUpdates on, which is the
-# reflog line a pull would leave, and the list has no fixed end.
+# uses, each verified on the git named. logs/ leads: it is written by git
+# itself (git pull keeps its arguments verbatim in the reflog message; git
+# fetch anonymises them), so the fixture has git write it rather than
+# planting a file: update-ref -m with core.logAllRefUpdates on, which is
+# the reflog line a pull would leave, and the list has no fixed end.
 BELOW_THE_TOP = [
+    # The reflog, written by git, not planted.
+    ("logs", "reflog"),
     # Legacy remote files git still reads for a fetch (git 2.43.0: `git
     # fetch legacy` resolves the URL they hold with no warning; the review
     # measured 2.50.1 reading them with a removal warning).
@@ -19033,25 +19293,28 @@ BELOW_THE_TOP = [
         "worktrees/wt",
         {"config.worktree": f'[remote "wt"]\n\turl = {SENTINEL_URL}\n'},
     ),
-    # The reflog, written by git, not planted.
-    ("logs", "reflog"),
 ]
 
 
 @pytest.mark.parametrize(("place", "planted"), BELOW_THE_TOP)
-def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
+def test_a_root_below_a_git_directorys_top_level_is_refused_at_both_doors(
     client, tmp_path, place, planted
 ):
-    """WINDOW: POST /snapshots with the root placed INSIDE a git
-    directory, at remotes/, branches/, worktrees/wt/ and logs/, each
-    holding a file git reads or writes a remote URL in, with a sentinel
-    string in the userinfo position.
+    """WINDOW: POST /snapshots and POST /snapshots/listing with the root
+    placed INSIDE a git directory, at logs/, remotes/, branches/ and
+    worktrees/wt/, each holding a file git reads or writes a remote URL
+    in, with a sentinel string in the userinfo position.
 
-    This is the exposure BACKLOG names as open: the walk sees the four
-    names only at the root or below it, never above, so a root below a
-    git directory's top level composes and the sentinel is in the stored
-    text. The test pins the open state; when the ancestor look is built
-    it fails at the status and is rewritten as that commit's pre-state.
+    Phase P (P3) closes the exposure BACKLOG named as open: the look above
+    the root climbs from its handle and finds the four names one or two
+    directories up, so both doors refuse in the new sentence, the listing
+    in its stop row, nothing is stored, and no part of the sentinel is in
+    either answer. PRE-STATE, this test as it stood (the open-state pin,
+    test_below_a_git_directorys_top_level_the_walk_cannot_see_it, written
+    in 7b7241c, its logs/ case added in 48d4c82): the walk saw the four
+    names only at the root or below it, the composer answered 201 and the
+    sentinel was in the stored text; stash-proven against this commit's
+    parent, 201 with the sentinel on all four.
     The places, verified on git 2.43.0 here and by the review on 2.50.1:
     the two legacy files are used by `git fetch` (2.43.0 silently, 2.50.1
     with a removal warning); `git init` still makes an empty branches/
@@ -19061,7 +19324,7 @@ def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
     linked worktree by `git worktree add`; and logs/ is written by git
     itself, here by update-ref -m as a pull would write it, so the
     reachable set has no fixed end."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     env = git_env(tmp_path)
     top = tmp_path / "zqbare"
     subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
@@ -19101,9 +19364,403 @@ def test_below_a_git_directorys_top_level_the_walk_cannot_see_it(
         root.mkdir(parents=True, exist_ok=True)
         for name, text in planted.items():
             (root / name).write_text(text)
-    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    body = {"root": str(root), "patterns": ["**/*"]}
+    stored = client.app.state.db.execute("SELECT count(*) FROM attachments")
+    before = stored.fetchone()[0]
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 422, composed.text
+    assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.status_code == 200
+    assert (listed.json()["would_compose"], listed.json()["complete"]) == (
+        False,
+        False,
+    )
+    assert listed.json()["members"] == [
+        {
+            "path": "",
+            "bytes": None,
+            "kind": "directory",
+            "status": "refused",
+            "reason": bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY,
+        }
+    ]
+    for text in (composed.text, listed.text):
+        assert SENTINEL not in text and "zqsentinel" not in text
+    after = client.app.state.db.execute("SELECT count(*) FROM attachments")
+    assert after.fetchone()[0] == before
+
+
+# ---- Phase P, P3: the look above the root, at the doors.
+
+
+def allow(client, *entries, resolve=True):
+    """Allowlist entries as boot reads BENCH_REPO_ROOTS: each one's
+    resolved spelling (or, with resolve=False, the spelling given, for a
+    proof about spellings), and its device and inode, where the look
+    above a root admitted under it stops. Returns the first's spelling."""
+    named = tuple(str(Path(e).resolve()) if resolve else str(e) for e in entries)
+    client.app.state.repo_roots = named
+    # Read through getattr so a tree without the look (a pre-state) is
+    # allowlisted the same way and differs only in what its doors do.
+    identities = getattr(main, "_root_identities", lambda roots: {})
+    client.app.state.repo_root_identities = identities(named)
+    return named[0] if named else None
+
+
+def test_a_sibling_gone_mid_listing_above_the_root_does_not_refuse(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing and POST /snapshots on entry/a/b,
+    while the entry's listing, the look's second step up, hands over a
+    sibling, zqgone.txt, whose description finds it gone, as a file
+    unlinked between readdir naming it and a stat of it does.
+
+    The look needs only its ancestors' names, so it reads names alone,
+    and a sibling gone mid-listing is no refusal: both doors compose (the
+    external review's M12: at df2c773 the look described every child,
+    and under churn 18 to 50 requests in 400 were refused). PRE-STATE:
+    the sibling is in the entry, and its description's stat raises
+    FileNotFoundError."""
+    entry = tmp_path / "zqentry"
+    (entry / "a" / "b").mkdir(parents=True)
+    (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+    (entry / "zqgone.txt").write_text("gone\n")
+    allow(client, entry)
+    real = os.scandir
+
+    class Gone:
+        def __init__(self, found):
+            self.found, self.name = found, found.name
+
+        def stat(self, *, follow_symlinks=True):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        def __getattr__(self, attribute):
+            return getattr(self.found, attribute)
+
+    class Listing:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def __iter__(self):
+            for found in self.inner:
+                yield Gone(found) if found.name == "zqgone.txt" else found
+
+    def scandir(target=".", *args, **kwargs):
+        return Listing(real(target, *args, **kwargs))
+
+    with scandir(str(entry)) as listing:
+        (gone,) = [found for found in listing if found.name == "zqgone.txt"]
+        with pytest.raises(FileNotFoundError):
+            gone.stat(follow_symlinks=False)
+    monkeypatch.setattr(os, "scandir", scandir)
+    body = {"root": str(entry / "a" / "b"), "patterns": ["*.py"]}
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.status_code == 200
+    assert listed.json()["would_compose"] is True, listed.text
+    composed = client.post("/snapshots", json=body)
     assert composed.status_code == 201, composed.text
-    assert SENTINEL in stored_text(client, composed.json()["digest"])
+
+
+def test_boot_records_where_the_look_stops_and_reads_it_again_nowhere(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a bench booted with BENCH_REPO_ROOTS naming zqparent/zqentry
+    and no allow(); its identity map; then, with zqparent made a bare
+    repository after boot, POST /snapshots/listing and POST /snapshots on
+    zqentry/a/b before and after zqentry is replaced by a new directory
+    of the same name and files.
+
+    Boot records each entry's device and inode, and the look stops at the
+    directory boot described: while it stands, the git directory above
+    it is not the look's business; once it is replaced, the look climbs
+    past the new one, finds the git directory, and refuses (the external
+    review's M13: no proof read boot's map, and an empty one survived
+    every test). PRE-STATE: before the replacement the listing would
+    compose, so the look stops at the booted entry."""
+    parent = tmp_path / "zqparent"
+    entry = parent / "zqentry"
+    (entry / "a" / "b").mkdir(parents=True)
+    (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(entry))
+    body = {"root": str(entry / "a" / "b"), "patterns": ["*.py"]}
+    with boot_against(monkeypatch, tmp_path / "bench.db") as c:
+        assert c.app.state.repo_root_identities == {
+            str(entry.resolve()): identity_of(entry)
+        }
+        bare_repository(parent)
+        before = c.post("/snapshots/listing", json=body)
+        assert before.json()["would_compose"] is True, before.text
+        entry.rename(parent / "zqentry-old")
+        (entry / "a" / "b").mkdir(parents=True)
+        (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+        listed = c.post("/snapshots/listing", json=body)
+        assert listed.json()["would_compose"] is False
+        assert listed.json()["refusal"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+        composed = c.post("/snapshots", json=body)
+        assert composed.status_code == 422, composed.text
+        assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+
+
+def test_no_read_of_an_entry_at_request_time_can_stop_the_climb_short(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on zqentry/zqbare.git/logs/refs, a bare
+    repository inside the entry, with the allowlist set with no identity
+    for the entry, as only a test sets it after boot, and the entry's name
+    swapped for a link to zqbare.git/logs for as long as any read of the
+    entry's identity lasts.
+
+    The look takes the entry's identity from boot and reads none at
+    request time (the external review's L15: a stat by the entry's name,
+    raced, gave the identity of a directory below the git directory, and
+    the look stopped there, short of it). With none recorded the climb
+    goes to the top of the filesystem and refuses. PRE-STATE at df2c773:
+    the raced read stopped the climb at logs/ and the root was composed,
+    201."""
+    entry = tmp_path / "zqentry"
+    entry.mkdir()
+    top = bare_repository(entry / "zqbare.git")
+    root = top / "logs" / "refs"
+    root.mkdir(parents=True)
+    (root / "x.txt").write_text("x\n")
+    client.app.state.repo_roots = (str(entry.resolve()),)
+    client.app.state.repo_root_identities = {}
+    held = tmp_path / "zqentry-held"
+    real = main._root_identities
+    raced = []
+
+    def swapped(roots):
+        entry.rename(held)
+        entry.symlink_to(held / "zqbare.git" / "logs")
+        try:
+            raced.append(roots)
+            return real(roots)
+        finally:
+            entry.unlink()
+            held.rename(entry)
+
+    monkeypatch.setattr(main, "_root_identities", swapped)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    assert composed.status_code == 422, composed.text
+    assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    assert raced == []
+
+
+def test_boot_refuses_an_entry_inside_a_git_directory(monkeypatch, tmp_path):
+    """WINDOW: a bench booted with BENCH_REPO_ROOTS naming a directory
+    inside a bare repository (its logs/); and, as pins, naming the bare
+    repository itself, and a directory of a checkout, beside its .git.
+
+    The look above a root stops at its entry, so a git directory above an
+    entry is one no request would look for, and every root under the
+    entry would be walked. The operator ruled such an entry refused at
+    boot (on the external review at 1d91670): boot climbs above each
+    entry by the look itself and refuses one inside a git directory, in
+    its own sentence, before the lock is taken or anything is written.
+    An entry that is itself a git directory boots, since every root under
+    it is refused at the doors, as does a checkout's directory, whose
+    .git is beside it. PRE-STATE at df2c773: the entry inside the bare
+    repository booted."""
+    top = bare_repository(tmp_path / "zqbare.git")
+    inside = top / "logs"
+    inside.mkdir()
+    db_path = tmp_path / "bench.db"
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(inside))
+    with pytest.raises(RuntimeError) as refused:
+        with boot_against(monkeypatch, db_path):
+            pass
+    assert str(refused.value) == (
+        f"BENCH_REPO_ROOTS entry {str(inside.resolve())!r} "
+        + main.ENTRY_INSIDE_GIT_DIRECTORY
+    )
+    assert not db_path.exists()
+    assert not Path(store.lock_path(str(db_path))).exists()
+    checkout = tmp_path / "zqcheckout"
+    (checkout / "src").mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-q", str(checkout)],
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        },
+        check=True,
+    )
+    for entry in (top, checkout / "src"):
+        monkeypatch.setenv("BENCH_REPO_ROOTS", str(entry))
+        with boot_against(monkeypatch, db_path) as c:
+            assert c.app.state.repo_roots == (str(entry.resolve()),)
+
+
+def on_climb(monkeypatch, step, action):
+    """Run action() on disk the moment the look is about to take its
+    step-th step up (1 is the root's parent), then let the real open of
+    '..' answer; returns the identity each step reached. On a tree with
+    no look there is nothing to hook, and nothing is reached."""
+    original = getattr(main.DescriptorTree, "parent", None)
+    reached = []
+
+    def hooked(self, handle):
+        if len(reached) + 1 == step:
+            action()
+        above = original(self, handle)
+        reached.append(above.identity)
+        return above
+
+    monkeypatch.setattr(main.DescriptorTree, "parent", hooked, raising=False)
+    return reached
+
+
+def identity_of(path):
+    seen = os.stat(path)
+    return (seen.st_dev, seen.st_ino)
+
+
+def test_a_plain_checkouts_subdirectory_still_composes(client, tmp_path):
+    """WINDOW: POST /snapshots and POST /snapshots/listing on src/ of a
+    checkout git made (git init, not bare), the checkout's parent the
+    allowlist entry.
+
+    The look must not refuse a root whose ancestors hold a .git directory
+    beside them, only one whose ancestor is itself a git directory: a
+    normal checkout's .git is a sibling of its files, not their ancestor.
+    PRE-STATE: the checkout's top level holds .git, and .git holds the
+    four names, so a look that took .git's names for the checkout's would
+    refuse. A pin: this composed before P3 too (measured at 9571082)."""
+    env = git_env(tmp_path)
+    repo = tmp_path / "zqrepo"
+    subprocess.run(["git", "init", "-q", str(repo)], env=env, check=True)
+    held = {child.name for child in (repo / ".git").iterdir()}
+    assert {"HEAD", "config", "objects", "refs"} <= held
+    clone(repo, {"src/a.py": b"a = 1\n"})
+    allow(client, tmp_path)
+    body = {"root": str(repo / "src"), "patterns": ["**/*.py"]}
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.json()["would_compose"] is True, listed.text
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 201, composed.text
+
+
+def test_an_ancestor_swapped_for_a_link_mid_climb_is_not_followed(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on entry/a/b, where entry/a is renamed and
+    a symbolic link to an outside bare repository put in its place the
+    moment the look is about to climb from a to the entry.
+
+    The climb opens '..' through the descriptor it holds, so it goes on
+    through the directory that holds b, now named a-moved, to the entry,
+    and reports what that chain shows: no git directory, so the root is
+    walked, as it was before the look existed. PRE-STATE: by name,
+    entry/a is now the outside git directory, so a look that climbed by
+    name would refuse; the swap lands at the second step (before P3
+    there is no climb, so nothing lands and nothing is reached)."""
+    env = git_env(tmp_path)
+    outside = tmp_path / "zqoutside.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(outside)], env=env, check=True)
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+
+    def swap():
+        (entry / "a").rename(entry / "a-moved")
+        (entry / "a").symlink_to(outside)
+
+    reached = on_climb(monkeypatch, 2, swap)
+    composed = client.post(
+        "/snapshots", json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]}
+    )
+    assert (entry / "a").is_symlink()
+    assert reached == [identity_of(entry / "a-moved"), identity_of(entry)]
+    assert composed.status_code == 201, composed.text
+
+
+def test_an_ancestor_renamed_mid_climb_is_climbed_by_what_holds_the_root(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing on entry/a/b, entry/a renamed to
+    entry/z the moment the look is about to climb from a to the entry.
+
+    The chain is the directories that hold the root, whatever they are
+    now called: the look reaches the entry by its identity, stops there,
+    and the root is listed. PRE-STATE: the name the request gave no
+    longer spells the root's parent when the climb goes on."""
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+    reached = on_climb(monkeypatch, 2, lambda: (entry / "a").rename(entry / "z"))
+    listed = client.post(
+        "/snapshots/listing",
+        json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]},
+    )
+    assert not (entry / "a").exists()
+    assert reached == [identity_of(entry / "z"), identity_of(entry)]
+    assert listed.json()["would_compose"] is True, listed.text
+
+
+def test_the_entry_replaced_mid_climb_is_still_where_the_look_stops(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on entry/a/b, the entry renamed and a link
+    to an outside bare repository put under its name the moment the look
+    takes its first step.
+
+    The look stops at the directory boot described, by device and inode,
+    which is the renamed one on the root's own chain; the link now under
+    the entry's name is never opened. PRE-STATE: by name the entry is now
+    a git directory, so a look that stopped at the entry's name would
+    check it and refuse."""
+    env = git_env(tmp_path)
+    outside = tmp_path / "zqoutside.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(outside)], env=env, check=True)
+    entry = clone(tmp_path / "entry", {"a/b/x.py": b"x = 1\n"})
+    allow(client, entry)
+    booted = identity_of(entry)
+
+    def swap():
+        entry.rename(tmp_path / "entry-old")
+        entry.symlink_to(outside)
+
+    reached = on_climb(monkeypatch, 1, swap)
+    composed = client.post(
+        "/snapshots", json={"root": str(entry / "a" / "b"), "patterns": ["**/*.py"]}
+    )
+    assert entry.is_symlink()
+    assert reached == [identity_of(tmp_path / "entry-old" / "a"), booted]
+    assert composed.status_code == 201, composed.text
+
+
+@pytest.mark.parametrize("depth", [128, 129])
+def test_a_root_past_the_climbs_ceiling_below_its_entry_is_refused(
+    client, tmp_path, depth
+):
+    """WINDOW: POST /snapshots on a root `depth` plain directories below
+    its allowlist entry, on disk, at MAX_DEPTH and one past it.
+
+    A climb that reaches neither the entry nor the top within MAX_DEPTH
+    steps is refused in the ceiling's sentence; at the ceiling the entry
+    is reached and the root composes. PRE-STATE: no directory on the
+    chain holds a git name, and before P3 both depths composed (measured
+    at 9571082)."""
+    assert bench_snapshot.MAX_DEPTH == 128
+    entry = tmp_path / "e"
+    root = entry.joinpath(*["d"] * depth)
+    clone(root, {"x.py": b"x = 1\n"})
+    allow(client, entry)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["*.py"]})
+    if depth == 128:
+        assert composed.status_code == 201, composed.text
+    else:
+        assert composed.status_code == 422
+        assert composed.json()["detail"] == bench_snapshot.LOOK_CEILING
 
 
 # =====================================================================
@@ -19229,7 +19886,7 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     head = head_of(repo)
     link = tmp_path.resolve() / "zqlink"
     link.symlink_to(repo)
-    client.app.state.repo_roots = (str(entry),)
+    allow(client, entry, resolve=False)
     body = {"root": str(repo), "patterns": ["*.py"]}
 
     ran = recorded_processes(monkeypatch)
@@ -19293,7 +19950,7 @@ def test_the_snapshot_doors_git_finds_no_repository_above_the_entry(client, tmp_
     assert head_of(inner) == head
 
     def heads(entry):
-        client.app.state.repo_roots = (str(entry),)
+        allow(client, entry, resolve=False)
         out = []
         for root in (inner, inner / "zqsub"):
             resp = client.post(
@@ -19344,7 +20001,7 @@ def test_the_ceiling_is_the_deepest_entry_holding_the_root(
     assert head_of(inner) == head and len(str(other)) > len(str(inner))
 
     def head_at(root, *entries):
-        client.app.state.repo_roots = tuple(str(e) for e in entries)
+        allow(client, *entries, resolve=False)
         resp = client.post(
             "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
         )
@@ -19486,7 +20143,7 @@ def test_an_entry_spelled_unlike_gits_own_reads_no_head_from_above(
     assert found.returncode == 0 and os.path.samefile(found.stdout.strip(), outer)
 
     def head_at(entry):
-        client.app.state.repo_roots = (str(entry),)
+        allow(client, entry, resolve=False)
         resp = client.post(
             "/snapshots", json={"root": str(entry), "patterns": ["*.py"]}
         )
@@ -19558,7 +20215,7 @@ def test_no_process_starts_before_the_walk_refuses_a_git_directory(
     posture walk's to refuse, not this proof's. PRE-STATE: the same tree
     with the bare repository's HEAD removed composes, and the recorder
     saw the head read's git start in the root."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     trees = git_directory_trees(tmp_path)
     ran = recorded_processes(monkeypatch)
     control, _ = trees[(where, True)]
@@ -20180,10 +20837,15 @@ def test_the_strict_declarations_cross_both_doors_unchanged(client, tmp_path):
 def experiment_record(client, eid):
     """An experiment's detail without the three fields two creations can
     never share: its id, its timestamp, and the name its bytes were read
-    under."""
+    under. And, since Phase P, the same three facts of its latest scoring
+    pass: the pass's id and its two times. How it ended, by which judge,
+    and what it counted are compared."""
     detail = client.get(f"/experiments/{eid}").json()
     for key in ("id", "created_at", "dataset_name"):
         detail.pop(key)
+    if detail["scoring"] is not None:
+        for key in ("id", "started_at", "ended_at"):
+            detail["scoring"].pop(key)
     return detail
 
 
@@ -20195,7 +20857,14 @@ def without_identity(value):
     wall-clock VALUES of latency and time to first token, which are facts
     about the network on the day. How many trials each was measured over
     is kept, because that count is a claim. What is left must be
-    identical."""
+    identical.
+
+    Phase P widened it by six, every one an id or a time of the scoring
+    records: judge_call_id and pass_id, which cite rows, and sent_at,
+    answered_at, started_at and ended_at. What each call and pass SAYS
+    (its judge, outcome, figure, generation id, detail and counts) is
+    compared, and that the citations resolve is asserted by the test
+    beside it rather than by equality."""
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
@@ -20207,6 +20876,12 @@ def without_identity(value):
                 "result_id",
                 "created_at",
                 "dataset_name",
+                "judge_call_id",
+                "pass_id",
+                "sent_at",
+                "answered_at",
+                "started_at",
+                "ended_at",
             ):
                 continue
             if k in ("latency_ms", "ttft_ms"):
@@ -20289,6 +20964,19 @@ def test_the_digest_door_records_exactly_what_the_path_door_records(client, tmp_
     assert path_export[0]["dataset_digest"] == stored["digest"]
     assert digest_export[0]["dataset_digest"] == stored["digest"]
     assert without_identity(path_export[:-1]) == without_identity(digest_export[:-1])
+    # The ids set aside above resolve inside each artifact: every score's
+    # call is on its own trial line, every call's and score's pass is in
+    # its own manifest, and the judge scores cite a call each.
+    for artifact in (path_export, digest_export):
+        passes = {p["id"] for p in artifact[0]["scoring_passes"]}
+        assert len(passes) == 1
+        for line in artifact[1:-1]:
+            calls = {c["id"] for c in line["judge_calls"]}
+            assert {c["pass_id"] for c in line["judge_calls"]} <= passes
+            for score in line["scores"]:
+                assert score["pass_id"] in passes
+                if score["scorer"] == "judge":
+                    assert score["judge_call_id"] in calls
 
 
 @respx.mock
@@ -20616,7 +21304,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 8
+    assert manifest["export_schema_version"] == 12
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(
@@ -22302,10 +22990,17 @@ def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
     thing that frees it. A raise the finally does not cover would hold the
     slot for good, and every later Score, on every experiment, would be
     refused "a scoring pass for experiment N is running" until a restart.
-    Wherever the pass raises, the slot frees, the error is recorded where
-    the pass keeps it (no door reads it; BACKLOG.md), and the next Score
-    is taken and scores. PRE-STATE: the first Score was accepted, the
-    read raised exactly once, and that pass wrote no rows."""
+    Wherever the pass raises, the slot frees, the error is recorded, and
+    the next Score is taken and scores.
+
+    AND THE FAILED PASS REACHES A DOOR (Phase P). Until it, the error was
+    kept where only the process could read it and "no door reads it" was
+    this docstring's own words; now the pass is a record: failed, with
+    the error as its detail, in the scoring record and on both
+    experiment doors in the ScoringPass shape, and still there, below the
+    new pass, after the next Score. PRE-STATE: the first Score was
+    accepted, the read raised exactly once, and that pass wrote no
+    rows."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
@@ -22336,12 +23031,47 @@ def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
     assert armed["left"] == 0
     assert client.app.state.scoring_run["error"] == "OperationalError: disk I/O error"
     assert len(scores_in(client, eid)) == before
+    (failed,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (failed["outcome"], failed["detail"]) == (
+        "failed",
+        "OperationalError: disk I/O error",
+    )
+    assert (failed["running"], failed["scored"], failed["failed"]) == (False, 0, 0)
+    assert (
+        set(failed)
+        == set(main.ScoringPass.model_fields)
+        == {
+            "id",
+            "judge_model",
+            "started_at",
+            "ended_at",
+            "outcome",
+            "detail",
+            "scored",
+            "failed",
+            "unanswered",
+            "unusable",
+            "unknown",
+            "history_counted",
+            "running",
+            "stopping",
+        }
+    )
+    listed = client.get("/experiments").json()["experiments"]
+    assert client.get(f"/experiments/{eid}").json()["scoring"] == failed
+    assert next(e for e in listed if e["id"] == eid)["scoring"] == failed
 
     again = client.post(f"/experiments/{eid}/score", json={"dataset_digest": digest})
 
     assert again.status_code == 202, again.text
     wait_scoring_done(client)
     assert [s["scorer"] for s in scores_in(client, eid)[before:]] == ["exact"]
+    passes = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert [(p["outcome"], p["id"]) for p in passes] == [
+        ("finished", again.json()["pass_id"]),
+        ("failed", failed["id"]),
+    ]
+    assert passes[1] == failed
 
 
 @respx.mock
@@ -22451,3 +23181,5057 @@ def test_review_repro_score_refuses_a_forged_stored_copy_by_its_key(client):
         ):
             resp = client.get(url)
             assert (resp.status_code, resp.json()["detail"]) == (422, sentence), url
+
+
+import signal
+import sys
+
+# ===================================================================
+# Phase P, P1: the scoring pass as a record.
+# ===================================================================
+
+
+def judge_answer(gen="g", cost=None, score=0.9):
+    """A judge's reply: a verdict, a generation id, and a charge if given."""
+    body = {
+        "id": gen,
+        "choices": [
+            {
+                "message": {"content": json.dumps({"score": score})},
+                "finish_reason": "stop",
+            }
+        ],
+    }
+    if cost is not None:
+        body["usage"] = {"cost": cost}
+    return body
+
+
+def is_judge(request):
+    return json.loads(request.content)["model"] == "judge/one"
+
+
+JUDGE_TASK = {
+    "id": "j1",
+    "prompt": "be kind",
+    "rubric": "kindness",
+    "scorer": {"kind": "judge"},
+}
+
+THREE_ARMS = ["model/alpha", "model/beta", "model/gamma"]
+
+
+def judged_experiment(client, tmp_path, lineup=("model/alpha",), rows=(JUDGE_TASK,)):
+    """An experiment over judge tasks, run to done. Returns (id, path)."""
+    path = write_dataset(tmp_path, *rows)
+    eid = client.post(
+        "/experiments", json=experiment_body(path, lineup=list(lineup))
+    ).json()["id"]
+    assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+    return eid, path
+
+
+def drive_until(client, predicate, what, timeout_s=20.0):
+    """Keep the app's loop turning until predicate() holds."""
+    deadline = time.monotonic() + timeout_s
+    while not predicate():
+        assert time.monotonic() < deadline, what
+        client.get("/models")
+
+
+def wait_pass_ended(client, timeout_s=20.0):
+    """Wait for the running pass to release the slot, whatever its ending."""
+    drive_until(
+        client,
+        lambda: client.app.state.scoring_run["active"] is None,
+        "the scoring pass did not end",
+        timeout_s,
+    )
+
+
+def calls_of(conn, eid):
+    return [
+        dict(row)
+        for row in conn.execute(
+            "SELECT * FROM judge_calls WHERE experiment_id = ? ORDER BY id", (eid,)
+        )
+    ]
+
+
+def score(client, eid, path, judge_model="judge/one"):
+    body = {"dataset_path": path}
+    if judge_model is not None:
+        body["judge_model"] = judge_model
+    return client.post(f"/experiments/{eid}/score", json=body)
+
+
+@respx.mock
+def test_the_call_is_recorded_before_its_request_leaves(client, tmp_path):
+    """WINDOW: the moment the judge's request reaches the transport, read
+    from inside the route, and the rows after the pass.
+
+    The sent write lands before the request is handed to the client, so
+    by the time anything could leave, the call's row exists with its sent
+    time and no ending. After the reply it holds its answer, and the score
+    row cites it. PRE-STATE: no call is recorded before the Score."""
+    seen = []
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        seen.append(
+            [
+                (row["outcome"], row["answered_at"], bool(row["sent_at"]))
+                for row in client.app.state.db.execute("SELECT * FROM judge_calls")
+            ]
+        )
+        return httpx.Response(200, json=judge_answer(gen="gen-1", cost=0.00003))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert calls_of(client.app.state.db, eid) == []
+
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    assert seen == [[(None, None, True)]]
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["generation_id"], call["billed_cost_usd"]) == (
+        "answered",
+        "gen-1",
+        0.00003,
+    )
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["judge_call_id"] == call["id"]
+
+
+@respx.mock
+def test_a_call_that_cannot_be_recorded_is_never_sent(client, tmp_path, monkeypatch):
+    """WINDOW: record_judge_call_sent raising at the first judged trial,
+    the transport, and the pass's record.
+
+    A request whose record cannot be written is not made: nothing reaches
+    the judge, no call row exists, the pass ends failed with the error as
+    its detail, and the slot is free. PRE-STATE: the trials themselves
+    reached the transport, so the route is live."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert respx.calls.call_count == 1
+
+    def refusing(*args, **kwargs):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "record_judge_call_sent", refusing)
+    assert score(client, eid, path).status_code == 202
+    wait_pass_ended(client)
+
+    assert judged == []
+    assert calls_of(client.app.state.db, eid) == []
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"]) == (
+        "failed",
+        "OperationalError: disk I/O error",
+    )
+    assert client.app.state.scoring_run["active"] is None
+
+
+class CutReply(httpx.AsyncByteStream):
+    """A 200's body that yields its first bytes and then fails as the
+    connection would: the reply's head arrived, and its body did not."""
+
+    def __init__(self, exc):
+        self.exc = exc
+
+    async def __aiter__(self):
+        yield b'{"id":"gen-cut","usage":{"cost":0.001'
+        raise self.exc
+
+    async def aclose(self):
+        pass
+
+
+NO_REPLY = (1, False, None)
+UNUSABLE_REPLY = (1, True, 0)
+
+
+@pytest.mark.parametrize(
+    "ending,outcome,facts,counts,detail",
+    [
+        (
+            httpx.ConnectError,
+            "not_sent",
+            (0, False, None),
+            (0, 0, 0),
+            "judge request failed: ConnectError",
+        ),
+        (
+            httpx.ConnectTimeout,
+            "not_sent",
+            (0, False, None),
+            (0, 0, 0),
+            "judge request failed: ConnectTimeout",
+        ),
+        (
+            httpx.PoolTimeout,
+            "not_sent",
+            (0, False, None),
+            (0, 0, 0),
+            "judge request failed: PoolTimeout",
+        ),
+        (
+            httpx.ReadTimeout,
+            "timed_out",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: ReadTimeout",
+        ),
+        (
+            httpx.WriteTimeout,
+            "failed",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: WriteTimeout",
+        ),
+        (
+            httpx.ReadError,
+            "failed",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: ReadError",
+        ),
+        (
+            httpx.RemoteProtocolError,
+            "failed",
+            NO_REPLY,
+            (1, 0, 0),
+            "judge request failed: RemoteProtocolError",
+        ),
+        (500, "failed", UNUSABLE_REPLY, (0, 1, 0), "judge returned HTTP 500"),
+        (
+            "not json",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge returned a malformed body",
+        ),
+        (
+            "charged, no choices",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge returned a malformed body",
+        ),
+        (
+            "cut mid-body",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge reply was cut off while it was read: RemoteProtocolError",
+        ),
+        (
+            "stalled mid-body",
+            "failed",
+            UNUSABLE_REPLY,
+            (0, 1, 0),
+            "judge reply was cut off while it was read: ReadTimeout",
+        ),
+        ("a verdict", "answered", (1, True, 1), (0, 0, 0), None),
+        ("no verdict", "answered", (1, True, 1), (0, 0, 0), None),
+    ],
+)
+@respx.mock
+def test_how_a_judge_request_ended_is_read_from_what_came_back(
+    client, tmp_path, ending, outcome, facts, counts, detail
+):
+    """WINDOW: one judged trial whose judge request ends one way, the
+    call's row, the pass's sealed counts, and the report's.
+
+    THE LINE IS THE CONNECTION (the operator's Q1). A failure raised while
+    a connection was being made left nothing: the call says not_sent,
+    records sent 0, and is counted nowhere. Anything after the connection
+    counts as sent, because money may have moved.
+
+    THE COUNTS COME FROM THE FACTS, NEVER THE OUTCOME (the operator's
+    ruling H2 on the 1d91670 review, schema 12). answered_at is set
+    whenever a reply's head arrived, an error status, a body that could
+    not be read and a body cut off while it was read (by the connection
+    dropping or stalling) included, and usable says whether that reply
+    was read as an answer, a verdict that does not parse included (ruling
+    2: that is the score row's failure). So a read timeout, a write
+    timeout, a broken read and a protocol error before any reply are
+    unanswered; the error status, the unreadable body, the reply that
+    charged and carried no choices, and the two bodies cut off are
+    unusable; the class decides, never the detail string. The report
+    counts each call where the pass sealed it, by the same arms
+    (store.call_ending), with an answer and no figure unpriced and a
+    charged reply billed whether or not it could be used.
+    PRE-STATE: no call is recorded before the Score, and the call's row
+    exists, with no ending, when its request reaches the transport, in
+    every shape (read in the route, asserted after the pass; the external
+    review's L4). At b3b4e48 the pass counted by b6c088c's outcome list,
+    so the write timeout, the broken read and the protocol error were
+    unusable, and no call carried sent or usable; at 4c193b4 the pass
+    counted by the facts and the report still by that list."""
+    seen = []
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        seen.append(
+            [
+                (row["outcome"], row["answered_at"], bool(row["sent_at"]))
+                for row in client.app.state.db.execute("SELECT * FROM judge_calls")
+            ]
+        )
+        if ending == 500:
+            return httpx.Response(500, json={"error": "upstream"})
+        if ending == "not json":
+            return httpx.Response(200, content=b"not json")
+        if ending == "charged, no choices":
+            return httpx.Response(200, json={"id": "gen-c", "usage": {"cost": 0.0002}})
+        if ending == "cut mid-body":
+            return httpx.Response(
+                200, stream=CutReply(httpx.RemoteProtocolError("peer closed"))
+            )
+        if ending == "stalled mid-body":
+            return httpx.Response(200, stream=CutReply(httpx.ReadTimeout("stalled")))
+        if ending == "a verdict":
+            return httpx.Response(200, json=judge_answer())
+        if ending == "no verdict":
+            body = judge_answer()
+            body["choices"][0]["message"]["content"] = "no verdict here"
+            return httpx.Response(200, json=body)
+        raise ending("the judge request ended", request=request)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert calls_of(client.app.state.db, eid) == []
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    assert seen == [[(None, None, True)]]
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"]) == (outcome, detail)
+    sent, replied, usable = facts
+    assert (call["sent"], call["answered_at"] is not None, call["usable"]) == (
+        sent,
+        replied,
+        usable,
+    )
+    assert call["sent_at"]
+    if ending == "charged, no choices":
+        assert (call["generation_id"], call["billed_cost_usd"]) == ("gen-c", 0.0002)
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "finished"
+    sealed = client.app.state.db.execute(
+        "SELECT unanswered, unusable, unknown FROM scoring_passes WHERE id = ?",
+        (made["id"],),
+    ).fetchone()
+    assert tuple(sealed) == counts
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == counts
+    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == counts
+    assert cost["in_flight_calls"] == 0
+    assert cost["billed_calls"] == (1 if ending == "charged, no choices" else 0)
+    assert cost["unpriced_calls"] == (1 if outcome == "answered" else 0)
+
+
+@respx.mock
+def test_a_closed_client_sends_nothing_and_the_call_says_so(client, tmp_path):
+    """WINDOW: the bench's HTTP client closed after the run and before the
+    Score, then a judged pass.
+
+    httpx refuses a closed client before any connection, so nothing left:
+    the call is recorded not_sent in its own sentence, counted nowhere,
+    and the pass goes on to finish rather than failing on a raise the
+    judge never saw. PRE-STATE: the client is closed and the judge has
+    had no request."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    client.portal.call(client.app.state.client.aclose)
+    assert client.app.state.client.is_closed and judged == []
+
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    assert judged == []
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["answered_at"], call["detail"]) == (
+        "not_sent",
+        None,
+        "judge request not sent: the bench's HTTP client was closed",
+    )
+    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert cost["unanswered_calls"] == cost["in_flight_calls"] == 0
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "finished"
+
+
+def stepping_clock(monkeypatch):
+    """The store's clock, one microsecond further on at every read, so no
+    two stamps can be equal, and a spy on store.now: the times the scoring
+    pass took when a judge reply's head arrived, in order."""
+    ticks = iter(range(10**6))
+    monkeypatch.setattr(
+        store, "_now", lambda: f"2026-09-28T00:00:00.{next(ticks):06d}+00:00"
+    )
+    taken = []
+
+    def now():
+        taken.append(store._now())
+        return taken[-1]
+
+    monkeypatch.setattr(store, "now", now, raising=False)
+    return taken
+
+
+LOCKED = "; its write failed: OperationalError: database is locked"
+CALL_FACTS = (
+    "sent",
+    "answered_at",
+    "usable",
+    "generation_id",
+    "billed_cost_usd",
+    "prompt_tokens",
+    "completion_tokens",
+)
+
+
+@pytest.mark.parametrize(
+    "shape,happened,facts,counts",
+    [
+        (
+            "a charged answer",
+            "the answer arrived",
+            (1, True, 1, "gen-1", 0.00004, 30, 9),
+            (0, 0, 0),
+        ),
+        (
+            "an answer with no figure",
+            "the answer arrived",
+            (1, True, 1, "gen-2", None, None, None),
+            (0, 0, 0),
+        ),
+        (
+            "an error status",
+            "a reply arrived and could not be used",
+            (1, True, 0, None, None, None, None),
+            (0, 1, 0),
+        ),
+        (
+            "no reply",
+            "it failed after it was sent",
+            (1, False, None, None, None, None, None),
+            (1, 0, 0),
+        ),
+        (
+            "no connection",
+            "it was never sent",
+            (0, False, None, None, None, None, None),
+            (0, 0, 0),
+        ),
+    ],
+)
+@respx.mock
+def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
+    client, tmp_path, monkeypatch, shape, happened, facts, counts
+):
+    """WINDOW: a judge request that ends one way, record_judge_call_answer
+    raising on that ending, the spend counter, and the records after.
+
+    The charge is counted before the answer is written, so a failed write
+    never un-counts money that left. The pass fails with the error as its
+    detail, and its close finds the call still open and ends it as
+    interrupted, so nothing reads as still in flight. What was interrupted
+    is the record and not the request (the operator's ruling at P1's
+    checkpoint), and the detail says what happened and that its write
+    failed, with the error, which no reader can take for the boot sweep's
+    "found open at boot". THE CLOSE RECORDS WHAT THE PASS KNEW (the
+    operator's ruling M1 on the 1d91670 review): whether it was sent,
+    whether a reply arrived and when its head did (the time the pass took
+    then, not the close's), whether it could be used, and the charge and
+    the two counts when it had them; so the counts place the call by what
+    happened to it, an answer that arrived as answered and not unanswered,
+    and the report counts it the same, the charged answer billed and the
+    answer with no figure unpriced.
+    PRE-STATE at b3b4e48: the close wrote the sentence and no fact, so
+    every shape was counted unanswered, and no call carried its answer
+    time, its generation id or its charge; at 4c193b4 the report still
+    counted every interrupted call unanswered."""
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        if shape == "a charged answer":
+            body = judge_answer(gen="gen-1", cost=0.00004)
+            body["usage"].update(prompt_tokens=30, completion_tokens=9)
+            return httpx.Response(200, json=body)
+        if shape == "an answer with no figure":
+            return httpx.Response(200, json=judge_answer(gen="gen-2"))
+        if shape == "an error status":
+            return httpx.Response(500, json={"error": "upstream"})
+        if shape == "no reply":
+            raise httpx.ReadError("the judge request ended", request=request)
+        raise httpx.ConnectError("the judge request ended", request=request)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    before = client.app.state.accumulated_spend_usd
+    taken = stepping_clock(monkeypatch)
+    seen = []
+
+    def refusing(conn, call_id, *args, **kwargs):
+        seen.append(
+            conn.execute(
+                "SELECT outcome FROM judge_calls WHERE id = ?", (call_id,)
+            ).fetchone()[0]
+        )
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(store, "record_judge_call_answer", refusing)
+    assert score(client, eid, path).status_code == 202
+    wait_pass_ended(client)
+
+    assert seen == [None]
+    if shape == "a charged answer":
+        assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00004)
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"]) == ("interrupted", happened + LOCKED)
+    sent, replied, *rest = facts
+    assert [call[k] for k in CALL_FACTS] == [
+        sent,
+        taken[0] if replied else None,
+        *rest,
+    ]
+    assert taken == ([call["answered_at"]] if replied else [])
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"]) == (
+        "failed",
+        "OperationalError: database is locked",
+    )
+    sealed = client.app.state.db.execute(
+        "SELECT unanswered, unusable, unknown, ended_at FROM scoring_passes"
+    ).fetchone()
+    assert tuple(sealed)[:3] == counts
+    if replied:
+        assert call["answered_at"] < sealed["ended_at"]
+    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == counts
+    assert (cost["billed_calls"], cost["unpriced_calls"]) == {
+        "a charged answer": (1, 0),
+        "an answer with no figure": (0, 1),
+    }.get(shape, (0, 0))
+
+
+class HeldReply(httpx.AsyncByteStream):
+    """A 200's body that yields its first bytes and then waits, as a reply
+    stalled mid-body does, until the bench's shutdown cuts it."""
+
+    async def __aiter__(self):
+        yield b'{"id":"gen-held"'
+        await asyncio.sleep(60)
+
+    async def aclose(self):
+        pass
+
+
+@pytest.mark.parametrize("written", [True, False], ids=["its own write", "the close"])
+@pytest.mark.parametrize(
+    "head", [False, True], ids=["before its reply", "while replying"]
+)
+@respx.mock
+def test_a_call_cut_at_shutdown_records_whether_its_reply_had_begun(
+    monkeypatch, tmp_path, head, written
+):
+    """WINDOW: a judge call on the wire when the bench shuts down with the
+    bound shortened to 0.2 s, its reply not yet begun or begun and stalled
+    mid-body, its ending written by its own write or, when that write
+    fails, by the pass's close; and the records read by a fresh
+    connection after.
+
+    The call is stopped either way: the outcome says who ended it. The
+    facts say whether a reply had begun (the operator's rulings H2 and M1
+    on the 1d91670 review): cut before its reply, it has no answer time
+    and is counted unanswered; cut while its reply arrived, it carries the
+    time the reply's head arrived, in its own sentence, and is counted
+    unusable, a reply that could not be used. The close records the same
+    facts when the call's own write fails. PRE-STATE at the parent
+    (b3b4e48): a call cut while its reply arrived had no answer time, the
+    before-the-reply sentence, and was counted unanswered."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        if head:
+            return httpx.Response(200, stream=HeldReply())
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        taken = stepping_clock(monkeypatch)
+        if not written:
+
+            def refusing(*args, **kwargs):
+                raise sqlite3.OperationalError("database is locked")
+
+            monkeypatch.setattr(store, "record_judge_call_answer", refusing)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        if head:
+            drive_until(c, lambda: taken, "the judge reply's head never arrived")
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+
+    (made,), (call,) = pass_rows(db_path, eid)
+    cut = main.CALL_CUT_WHILE_REPLYING if head else main.CALL_CUT_AT_SHUTDOWN
+    said = (
+        "it was cut off at shutdown while its reply was arriving"
+        if head
+        else "it was cut off at shutdown"
+    ) + LOCKED
+    assert (call["outcome"], call["detail"]) == (
+        ("stopped", cut) if written else ("interrupted", said)
+    )
+    assert (call["sent"], call["answered_at"], call["usable"]) == (
+        (1, taken[0], 0) if head else (1, None, None)
+    )
+    assert made["outcome"] == "stopped"
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == (
+        (0, 1, 0) if head else (1, 0, 0)
+    )
+    with boot_against(monkeypatch, db_path) as c:
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == ((0, 1, 0) if head else (1, 0, 0))
+
+
+@respx.mock
+def test_an_unexplained_runtime_error_fails_the_call_and_the_pass(client, tmp_path):
+    """WINDOW: a scoring pass whose judge request raises a RuntimeError
+    with the bench's client still open, and the records after.
+
+    The closed-client refusal is the one RuntimeError judge_response
+    explains (not_sent); any other is not guessed at and propagates, so
+    the call is recorded failed, sent, in the pass's sentence for a
+    request that raised, and the pass fails (the external review's M7:
+    mutants C6 and M5 survived, one reading every RuntimeError as a
+    closed client). PRE-STATE: the client is open when the request is
+    made."""
+
+    def route(request):
+        if is_judge(request):
+            raise RuntimeError("an error that is not the closed client's")
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert client.app.state.client.is_closed is False
+    assert score(client, eid, path).status_code == 202
+    wait_pass_ended(client)
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"]) == (
+        "failed",
+        "judge request failed: RuntimeError",
+    )
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "failed"
+
+
+@respx.mock
+def test_a_trial_whose_text_is_whitespace_is_never_sent_to_the_judge(client, tmp_path):
+    """WINDOW: a judged pass over a trial whose stored response text is
+    whitespace, planted in the row (a model that streams only whitespace
+    stores none, so no route reaches this shape).
+
+    Whitespace is not an answer: no request, no call recorded, no claim
+    on the spend ceiling, the no-text score, and the pass finished (the
+    external review's M7: mutant C10, sending whitespace, survived).
+    PRE-STATE: the row holds text, so a test of None alone would send it."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    with client.app.state.db:
+        client.app.state.db.execute("UPDATE results SET response_text = '  \n '")
+    assert (
+        client.app.state.db.execute("SELECT response_text FROM results").fetchone()[0]
+        == "  \n "
+    )
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+    assert judged == []
+    assert calls_of(client.app.state.db, eid) == []
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["detail"] == "no response text: the trial did not complete"
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert made["outcome"] == "finished"
+
+
+def gated_judge(gate, judged, answer=None):
+    """A route whose judge requests wait on gate, recording each arrival."""
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await gate.wait()
+        return httpx.Response(200, json=answer or judge_answer())
+
+    return route
+
+
+@respx.mock
+def test_a_stop_from_the_door_lets_the_call_in_flight_finish(client, tmp_path):
+    """WINDOW: a pass over three judged trials, POST
+    /experiments/{id}/scoring/stop while the first trial's judge call is
+    held open, the doors while it stops, and the records after.
+
+    A Stop is taken between trials and never inside one (the operator's
+    Q3, the runner's rule): the call already sent finishes and is recorded
+    answered, no further request is made, and the pass ends stopped with
+    the sentence saying it was asked to, one trial scored and nothing
+    unanswered. While it stops, both doors say running and stopping. Once
+    it has ended a second Stop is refused in the door's words. PRE-STATE:
+    exactly one judge request is in flight when the Stop is sent."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(gate, judged))
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS)
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the first judge call never left")
+
+    stopped = client.post(f"/experiments/{eid}/scoring/stop", json={})
+
+    pass_id = client.app.state.scoring_run["pass_id"]
+    assert (stopped.status_code, stopped.json()) == (
+        202,
+        {"id": eid, "pass_id": pass_id, "status": "stopping"},
+    )
+    record = client.get(f"/experiments/{eid}/scoring").json()
+    assert (record["active"]["running"], record["active"]["stopping"]) == (True, True)
+    listed = next(
+        e for e in client.get("/experiments").json()["experiments"] if e["id"] == eid
+    )
+    assert listed["scoring"] == record["active"]
+    client.portal.call(gate.set)
+    wait_scoring_done(client)
+
+    assert judged == [1]
+    (call,) = calls_of(client.app.state.db, eid)
+    assert call["outcome"] == "answered"
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"]) == (
+        "stopped",
+        main.PASS_STOPPED_ON_REQUEST,
+    )
+    assert (made["scored"], made["failed"], made["unanswered"]) == (1, 0, 0)
+    assert (made["running"], made["stopping"]) == (False, False)
+    assert len([r for r in scores_in(client, eid) if r["scorer"] == "judge"]) == 1
+    again = client.post(f"/experiments/{eid}/scoring/stop", json={})
+    assert (again.status_code, again.json()["detail"]) == (
+        409,
+        f"no scoring pass for experiment {eid} is running",
+    )
+
+
+@respx.mock
+def test_a_stop_during_the_last_trial_is_a_finished_pass(client, tmp_path):
+    """WINDOW: a pass over one judged trial, Stop sent while its call is
+    held, and the pass's ending.
+
+    stopped means a stop was found with a trial still to score. A Stop
+    that arrives during the last trial leaves nothing unscored, so the
+    pass is finished, and every trial has its row. PRE-STATE: the one
+    call is in flight when the Stop is taken."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(gate, judged))
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    assert client.post(f"/experiments/{eid}/scoring/stop", json={}).status_code == 202
+    client.portal.call(gate.set)
+    wait_scoring_done(client)
+
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"], made["scored"]) == ("finished", None, 1)
+
+
+@respx.mock
+def test_a_stop_while_a_trial_waits_for_a_slot_sends_nothing(client, tmp_path):
+    """WINDOW: every upstream slot held, a pass whose first judged trial
+    queues for one, Stop, and the slots released.
+
+    The stop is checked again inside the held slot, before the call is
+    recorded: a trial that was waiting has sent nothing, so honouring the
+    Stop costs nothing, and no request is made, no call recorded and no
+    row written for it. PRE-STATE: all five slots are held and the pass
+    is running when the Stop is sent."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    semaphore = client.app.state.upstream_semaphore
+
+    async def hold_all():
+        for _ in range(main.MAX_CONCURRENT_UPSTREAM):
+            await semaphore.acquire()
+
+    client.portal.call(hold_all)
+    assert semaphore.locked()
+    assert score(client, eid, path).status_code == 202
+    # Queued AT the slot, past the between-trials check, so only the
+    # check inside the slot can honour the Stop. asyncio keeps a
+    # semaphore's waiters in _waiters (CPython 3.11 to 3.14).
+    drive_until(client, lambda: semaphore._waiters, "the trial never queued")
+    assert client.post(f"/experiments/{eid}/scoring/stop", json={}).status_code == 202
+
+    async def release_all():
+        for _ in range(main.MAX_CONCURRENT_UPSTREAM):
+            semaphore.release()
+
+    client.portal.call(release_all)
+    wait_scoring_done(client)
+
+    assert judged == []
+    assert calls_of(client.app.state.db, eid) == []
+    assert [r for r in scores_in(client, eid) if r["scorer"] == "judge"] == []
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["scored"]) == ("stopped", 0)
+
+
+@respx.mock
+def test_the_stop_door_refuses_what_is_not_a_running_pass(client, tmp_path):
+    """WINDOW: POST /experiments/{id}/scoring/stop sent for an experiment
+    never scored, for one whose pass has finished, for one whose TRIALS
+    are running, and for one while ANOTHER experiment's pass runs, with
+    the doors read after each.
+
+    The door that the page hides unless a pass runs refuses the request
+    sent anyway, in its own words, and changes nothing: the finished
+    pass reads as it did, the trial runner, which has its own Stop, goes
+    on to done, and the pass that is running, being another
+    experiment's, is not asked to stop and scores every trial.
+    PRE-STATE: no pass runs for the experiment named, and in the last
+    case one runs for another."""
+    gate = asyncio.Event()
+
+    async def route(request):
+        if is_judge(request):
+            return httpx.Response(200, json=judge_answer())
+        await gate.wait()
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    client.portal.call(gate.set)
+    eid, path = judged_experiment(client, tmp_path)
+    assert client.app.state.scoring_run["active"] is None
+
+    def refused(experiment_id):
+        answer = client.post(f"/experiments/{experiment_id}/scoring/stop", json={})
+        assert (answer.status_code, answer.json()["detail"]) == (
+            409,
+            f"no scoring pass for experiment {experiment_id} is running",
+        )
+
+    refused(eid)
+    assert client.get(f"/experiments/{eid}/scoring").json()["passes"] == []
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+    finished = client.get(f"/experiments/{eid}/scoring").json()
+    refused(eid)
+    assert client.get(f"/experiments/{eid}/scoring").json() == finished
+
+    client.portal.call(gate.clear)
+    running = client.post("/experiments", json=experiment_body(path)).json()["id"]
+    assert (
+        client.post(
+            f"/experiments/{running}/start", json={"dataset_path": path}
+        ).status_code
+        == 202
+    )
+    assert client.app.state.experiment_run["active"] == running
+    refused(running)
+    assert not client.app.state.experiment_run["stop"].is_set()
+    client.portal.call(gate.set)
+    assert drain_progress(client, running)["status"] == "done"
+
+    held = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(held, judged))
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    refused(running)
+    assert not client.app.state.scoring_run["stop"].is_set()
+    client.portal.call(held.set)
+    wait_scoring_done(client)
+    newest = client.get(f"/experiments/{eid}/scoring").json()["passes"][0]
+    assert (newest["outcome"], newest["scored"]) == ("finished", 1)
+
+
+@respx.mock
+def test_the_scoring_door_reads_the_record_newest_first(client, tmp_path):
+    """WINDOW: GET /experiments/{id}/scoring for an unknown experiment,
+    for one never scored, while a pass runs, and after two passes; and
+    the list and detail doors' scoring field at each step.
+
+    The record is the passes, newest first, and the running one as
+    active in the same shape; the detail and the list carry the latest
+    pass with the same keys, and null before any pass (a null says
+    nothing about scores from before Phase P). PRE-STATE: the experiment
+    has scores from no pass."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(gate, judged))
+    assert client.get("/experiments/999/scoring").status_code == 404
+    eid, path = judged_experiment(client, tmp_path)
+    assert scores_in(client, eid) == []
+    assert client.get(f"/experiments/{eid}/scoring").json() == {
+        "experiment_id": eid,
+        "active": None,
+        "passes": [],
+    }
+    assert client.get(f"/experiments/{eid}").json()["scoring"] is None
+
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    running = client.get(f"/experiments/{eid}/scoring").json()
+    first, second = running["passes"][1], running["passes"][0]
+    assert running["active"] == second
+    assert (second["running"], second["stopping"], second["outcome"]) == (
+        True,
+        False,
+        None,
+    )
+    assert (first["running"], first["outcome"], first["judge_model"]) == (
+        False,
+        "finished",
+        None,
+    )
+    assert set(second) == set(main.ScoringPass.model_fields)
+    detail = client.get(f"/experiments/{eid}").json()["scoring"]
+    listed = next(
+        e for e in client.get("/experiments").json()["experiments"] if e["id"] == eid
+    )
+    assert detail == listed["scoring"] == second
+    client.portal.call(gate.set)
+    wait_scoring_done(client)
+
+    ended = client.get(f"/experiments/{eid}/scoring").json()
+    assert ended["active"] is None
+    assert [p["id"] for p in ended["passes"]] == [second["id"], first["id"]]
+    assert ended["passes"][0]["outcome"] == "finished"
+    assert client.get(f"/experiments/{eid}").json()["scoring"] == ended["passes"][0]
+
+
+def pass_rows(db_path, eid):
+    conn = store.connect(str(db_path))
+    try:
+        return store.scoring_passes_for(conn, eid), calls_of(conn, eid)
+    finally:
+        conn.close()
+
+
+@respx.mock
+def test_shutdown_cuts_a_pass_past_its_bound_and_records_the_call_stopped(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judge call that never answers, the bench shut down while
+    it is on the wire, with the bound shortened to 0.2 s, and the records
+    read by a fresh connection after.
+
+    The lifespan asks the pass to stop and waits for it under
+    SCORING_SHUTDOWN_SECONDS; past that it cuts it, and the cut is
+    recorded before the database closes: the call stopped, with no
+    answer, in its own sentence, and the pass stopped, saying the bound
+    ran out. The call stays recorded as sent, which is the point: a paid
+    request that never came back is on the record. PRE-STATE: the call is
+    open when the shutdown begins."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+        began = time.monotonic()
+    assert time.monotonic() - began < 10
+
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "stopped",
+        main.CALL_CUT_AT_SHUTDOWN,
+        None,
+    )
+    assert (made["outcome"], made["unanswered"]) == ("stopped", 1)
+    assert made["detail"] == (
+        "cut off because the bench was shutting down and the trial in hand "
+        "had not finished within 0.2 seconds"
+    )
+    assert made["ended_at"] is not None
+
+
+@respx.mock
+def test_shutdown_stops_a_pass_between_trials_within_its_bound(monkeypatch, tmp_path):
+    """WINDOW: a pass over three judged trials whose judge answers after a
+    short wait, the bench shut down while the first call is out, and the
+    records after.
+
+    Inside the bound the pass is asked, not cut: the call in flight
+    finishes and is recorded answered, no second request is made, and
+    the pass ends stopped in the shutdown's own sentence, which is not
+    the Stop door's. PRE-STATE: one judge request is in flight when the
+    shutdown begins."""
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json=judge_answer())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path, lineup=THREE_ARMS)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+
+    assert judged == [1]
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert call["outcome"] == "answered"
+    assert (made["outcome"], made["detail"], made["scored"]) == (
+        "stopped",
+        main.PASS_STOPPED_AT_SHUTDOWN,
+        1,
+    )
+    assert main.PASS_STOPPED_AT_SHUTDOWN != main.PASS_STOPPED_ON_REQUEST
+
+
+@respx.mock
+def test_shutdown_closes_the_client_only_after_the_pass_has_ended(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a pass over three judged trials whose first judge call
+    answers after 0.3 s, the bench shut down while it is out, and the
+    order of three events: the call sent, the pass's close written, the
+    bench's HTTP client closed.
+
+    Shutdown waits for the pass, inside its bound, before it closes the
+    client, so the call in flight finishes on an open client and is
+    recorded answered. respx completes a request on a closed client, so
+    no proof could fail if the client were closed first, and over a real
+    transport that order records the answer as a ReadError failure (the
+    external review's M5; 74ca55b's body cited two shutdown proofs as the
+    evidence, and neither could see it). PRE-STATE: inside the bench,
+    only the call has been sent."""
+    order = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        order.append("judge call sent")
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json=judge_answer())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    real_close = store.close_scoring_pass
+
+    def closing(*args, **kwargs):
+        order.append("pass closed")
+        return real_close(*args, **kwargs)
+
+    real_aclose = httpx.AsyncClient.aclose
+
+    async def aclose(self):
+        order.append("client closed")
+        await real_aclose(self)
+
+    monkeypatch.setattr(store, "close_scoring_pass", closing)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path, lineup=THREE_ARMS)
+        monkeypatch.setattr(httpx.AsyncClient, "aclose", aclose)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: order == ["judge call sent"], "no judge call left")
+        assert order == ["judge call sent"]
+    assert order == ["judge call sent", "pass closed", "client closed"]
+    (made,), (call, *_) = pass_rows(db_path, eid)
+    assert (call["outcome"], made["outcome"]) == ("answered", "stopped")
+
+
+def test_the_shutdown_bound_is_the_readmes_and_sits_between_its_two_facts():
+    """WINDOW: SCORING_SHUTDOWN_SECONDS, and the README's sentence naming it.
+
+    The bound is 30 seconds, the README's number, and sits between the
+    two facts that place it: longer than the ten seconds a typical
+    supervisor allows before it kills, shorter than the judge's own
+    timeout, so a slow call is cut and recorded (the external review's
+    L6: every proof shortens it, and a bound of 3 survived them all).
+    PRE-STATE: the README names the constant with a number."""
+    said = re.findall(
+        r"`SCORING_SHUTDOWN_SECONDS`, (\d+) seconds",
+        " ".join((Path(__file__).parent.parent / "README.md").read_text().split()),
+    )
+    assert said, "the README's shutdown sentence moved"
+    assert {float(n) for n in said} == {main.SCORING_SHUTDOWN_SECONDS} == {30.0}
+    assert 10 < main.SCORING_SHUTDOWN_SECONDS < bench_models.JUDGE_TIMEOUT_S
+
+
+@respx.mock
+def test_a_door_stop_then_shutdown_keeps_the_doors_reason(monkeypatch, tmp_path):
+    """WINDOW: a pass over three judged trials, Stop pressed at the door
+    while the first judge call is out, then the bench shut down before it
+    answers, inside the bound; the records after.
+
+    The first stopper's reason is kept: the call finishes and is recorded
+    answered, no second request is made, and the pass ends stopped in
+    the Stop door's sentence, not shutdown's (the external review's L6:
+    a shutdown that overwrote the reason survived every proof).
+    PRE-STATE: one call open, and the reason the door's."""
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(0.5)
+        return httpx.Response(200, json=judge_answer())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path, lineup=THREE_ARMS)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        stopped = c.post(f"/experiments/{eid}/scoring/stop", json={})
+        assert stopped.status_code == 202
+        assert c.app.state.scoring_run["stop_reason"] == "request"
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+    assert judged == [1]
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert call["outcome"] == "answered"
+    assert (made["outcome"], made["detail"]) == (
+        "stopped",
+        main.PASS_STOPPED_ON_REQUEST,
+    )
+
+
+@respx.mock
+def test_an_answer_that_lands_with_the_cut_is_kept(client, tmp_path, monkeypatch):
+    """WINDOW: the judge's reply and shutdown's cancellation delivered in
+    the same turn of the loop, and the records after.
+
+    The call is shielded, so a reply that is already in hand when the cut
+    lands is recorded as the answer it is, with its charge counted and its
+    score row written; only a call still on the wire is abandoned as
+    stopped. The pass itself is cut. PRE-STATE: the call is open, and
+    the reply is released in the same step as the cancel."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=gated_judge(gate, judged, judge_answer(gen="gen-7", cost=0.00005))
+    )
+    eid, path = judged_experiment(client, tmp_path)
+    before = client.app.state.accumulated_spend_usd
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    assert calls_of(client.app.state.db, eid)[0]["outcome"] is None
+    task = client.app.state.scoring_run["task"]
+
+    def release_and_cut():
+        gate.set()
+        task.cancel()
+
+    client.portal.call(release_and_cut)
+    wait_pass_ended(client)
+
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["generation_id"]) == ("answered", "gen-7")
+    assert client.app.state.accumulated_spend_usd == pytest.approx(before + 0.00005)
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["judge_call_id"] == call["id"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["unanswered"]) == ("stopped", 0)
+    assert made["detail"].startswith("cut off because the bench was shutting down")
+
+
+@respx.mock
+def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_path):
+    """WINDOW: a database holding a pass and a sent call with no ending,
+    as a killed process leaves them, booted, and the doors after.
+
+    The next boot closes both as interrupted, "found open at boot", with
+    no end time because none is known; the doors show the pass as ended
+    and not running. Nothing is known of the call, so it carries no facts
+    and the pass and the report count it unknown, the one call the counts
+    cannot place (the operator's ruling M1 on the 1d91670 review), neither
+    unanswered nor in flight. PRE-STATE: the pass and the call are open
+    when the database is booted."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, _ = judged_experiment(c, tmp_path)
+        (rid,) = [r["id"] for r in c.app.state.db.execute("SELECT id FROM results")]
+    conn = store.connect(str(db_path))
+    pass_id = store.open_scoring_pass(conn, eid, "judge/one")
+    store.record_judge_call_sent(conn, pass_id, rid, "judge/one")
+    conn.close()
+    (left,), (sent,) = pass_rows(db_path, eid)
+    assert (left["outcome"], sent["outcome"]) == (None, None)
+
+    with boot_against(monkeypatch, db_path) as c:
+        (made,) = c.get(f"/experiments/{eid}/scoring").json()["passes"]
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
+        (call,) = calls_of(c.app.state.db, eid)
+
+    assert (made["outcome"], made["detail"], made["ended_at"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+        None,
+    )
+    assert made["running"] is False
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == (0, 0, 1)
+    (swept,), _ = pass_rows(db_path, eid)
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+    assert (
+        cost["unanswered_calls"],
+        cost["unknown_calls"],
+        cost["in_flight_calls"],
+    ) == (0, 1, 0)
+    assert (call["outcome"], call["detail"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert [call[k] for k in CALL_FACTS] == [None] * 7
+
+
+@respx.mock
+def test_a_call_whose_pass_could_not_close_is_unknown_at_the_next_boot(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a pass whose answer write fails and whose close then fails
+    too, so the call and the pass stay open and what the pass knew of the
+    call ends with its process; the next boot; and the records after.
+
+    The sweep knows nothing of the call, so it records none of what the
+    pass knew: interrupted, "found open at boot", no facts, and counted
+    unknown, though its answer had arrived (the operator's ruling M1 on
+    the 1d91670 review: the one call the counts cannot place). PRE-STATE:
+    the pass and the call are open when the first bench has stopped."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(200, json=judge_answer(gen="gen-1", cost=0.00004))
+            if is_judge(request)
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    db_path = tmp_path / "bench.db"
+
+    def refusing(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        with monkeypatch.context() as m:
+            m.setattr(store, "record_judge_call_answer", refusing)
+            m.setattr(store, "close_scoring_pass", refusing)
+            assert score(c, eid, path).status_code == 202
+            wait_pass_ended(c)
+    (left,), (open_call,) = pass_rows(db_path, eid)
+    assert (left["outcome"], open_call["outcome"]) == (None, None)
+
+    with boot_against(monkeypatch, db_path) as c:
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["billed_calls"],
+        cost["unanswered_calls"],
+        cost["unknown_calls"],
+    ) == (0, 0, 1)
+    (swept,), (call,) = pass_rows(db_path, eid)
+    assert (call["outcome"], call["detail"]) == (
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert [call[k] for k in CALL_FACTS] == [None] * 7
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("cost", [0.00004, None], ids=["charged", "no figure"])
+@respx.mock
+def test_a_verdict_that_does_not_parse_is_an_answer_and_its_score_says_why(
+    client, tmp_path, cost
+):
+    """WINDOW: a judge that answers 200 with a message holding no verdict,
+    with the usage its reply reported and a charge or none; the call, the
+    score row, the pass and the report after.
+
+    Ruling 2 at P1's checkpoint: a reply whose verdict does not parse is
+    answered. A reply came and was read, and the transport's work is
+    done; the score row is where the failure is recorded ("no JSON
+    object"). So the call is answered, with its answer time and no
+    detail, its generation id, its charge and its counts, and usable; the
+    pass counts its score row failed and the call in neither unanswered
+    nor unusable; and the report counts it billed, or unpriced when it
+    carried no figure. The behaviour held at 4c193b4, where this proof is
+    red only on the pass door's unknown, served from this commit; it is
+    proven by mutation (the external review's M6: mutants C11 and M2
+    survived the suite). PRE-STATE: the reply's content holds no JSON."""
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        body = judge_answer(gen="gen-nv")
+        body["choices"][0]["message"]["content"] = "no idea, honestly"
+        body["usage"] = {"prompt_tokens": 30, "completion_tokens": 9}
+        if cost is not None:
+            body["usage"]["cost"] = cost
+        assert "{" not in body["choices"][0]["message"]["content"]
+        return httpx.Response(200, json=body)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"], call["generation_id"]) == (
+        "answered",
+        None,
+        "gen-nv",
+    )
+    assert call["answered_at"] is not None
+    assert (
+        call["billed_cost_usd"],
+        call["prompt_tokens"],
+        call["completion_tokens"],
+    ) == (
+        cost,
+        30,
+        9,
+    )
+    assert (call["sent"], call["usable"]) == (1, 1)
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["score"] is None and "no JSON object" in row["detail"]
+    assert row["judge_call_id"] == call["id"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (
+        made["scored"],
+        made["failed"],
+        made["unanswered"],
+        made["unusable"],
+        made["unknown"],
+    ) == (0, 1, 0, 0, 0)
+    judged = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (judged["unanswered_calls"], judged["unusable_answers"]) == (0, 0)
+    assert (judged["billed_calls"], judged["unpriced_calls"]) == (
+        (1, 0) if cost is not None else (0, 1)
+    )
+
+
+def test_ruling_4s_outcome_list_is_gone():
+    """WINDOW: bench.store and bench.report as imported.
+
+    The operator's ruling H2 on the 1d91670 review withdrew ruling 4's
+    outcome list ("the definition wins and the list was my error.
+    Tombstone it."): b6c088c's two tuples, by which a call was counted
+    from its outcome word, are deleted, and neither module holds them.
+    PRE-STATE: store.call_ending, which counts by the facts in their
+    place, is there."""
+    assert callable(store.call_ending)
+    for name in ("UNANSWERED_CALL_OUTCOMES", "UNUSABLE_CALL_OUTCOMES"):
+        assert not hasattr(store, name)
+        assert not hasattr(report, name)
+
+
+@respx.mock
+def test_every_door_serves_a_pass_as_its_record_holds_it(client, tmp_path):
+    """WINDOW: a pass whose one call it left open, closed through the
+    store, and the three doors that serve a pass: the list, the
+    experiment and its scoring record; and the two tables' columns.
+
+    unknown reaches the page through ScoringPass and _pass_view, on every
+    door, with the record's value. The served pass is the scoring_passes
+    row less its experiment id, plus this process's running and stopping;
+    the export's pass record is the row less its experiment id; and its
+    call record is the judge_calls row less its experiment and result
+    ids, which the trial line it rides on carries. Each list is held to
+    the table's own columns, so a column added later reaches every door
+    or fails here; beside the record the pass door serves history_counted,
+    read from the pass's calls, as it serves running and stopping.
+    PRE-STATE: the pass is closed with unknown 1."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    eid, _ = judged_experiment(client, tmp_path)
+    db = client.app.state.db
+    (rid,) = [r[0] for r in db.execute("SELECT id FROM results")]
+    pass_id = store.open_scoring_pass(db, eid, "judge/one")
+    store.record_judge_call_sent(db, pass_id, rid, "judge/one")
+    store.close_scoring_pass(db, pass_id, "stopped", "x")
+    assert db.execute("SELECT unknown FROM scoring_passes").fetchone()[0] == 1
+
+    listed = next(
+        e for e in client.get("/experiments").json()["experiments"] if e["id"] == eid
+    )
+    served = [
+        listed["scoring"],
+        client.get(f"/experiments/{eid}").json()["scoring"],
+        *client.get(f"/experiments/{eid}/scoring").json()["passes"],
+    ]
+    assert [p["unknown"] for p in served] == [1, 1, 1]
+    assert [p["history_counted"] for p in served] == [0, 0, 0]
+    passes = {r[1] for r in db.execute("PRAGMA table_info(scoring_passes)")}
+    calls = {r[1] for r in db.execute("PRAGMA table_info(judge_calls)")}
+    assert set(served[0]) == set(main.ScoringPass.model_fields)
+    assert set(main.ScoringPass.model_fields) == passes - {"experiment_id"} | {
+        "history_counted",
+        "running",
+        "stopping",
+    }
+    assert set(report.PASS_FIELDS) == passes - {"experiment_id"}
+    assert set(report.CALL_FIELDS) == calls - {"experiment_id", "result_id"}
+
+
+def seed_a_live_older_database(path):
+    """A database as b6c088c left it (tests/fixtures/pre_p2_schema.sql,
+    before P2's two usage-count columns), holding what a live bench has
+    open: an experiment running, a scoring pass open, and a judge call
+    sent with no ending. Returns its bytes' digest."""
+    fixture = (Path(__file__).parent / "fixtures" / "pre_p2_schema.sql").read_text()
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('live', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["m/a"]', 'standard', 1, 'routed_service', 1, 'running',
+                   1, 1, 0, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute("INSERT INTO runs (prompt_text, created_at) VALUES ('p', 'x')")
+    legacy.execute(
+        "INSERT INTO results (run_id, model, response_text) VALUES (1, 'm/a', 'r')"
+    )
+    legacy.execute(
+        """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+           VALUES (1, 'j/x', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+               judge_model, sent_at)
+           VALUES (1, 1, 1, 'j/x', '2026-09-28T00:00:01+00:00')"""
+    )
+    legacy.commit()
+    legacy.close()
+    return hashlib.sha256(Path(path).read_bytes()).hexdigest()
+
+
+def live_triple(path):
+    """The seeded pass's ending, its call's ending, and the experiment's
+    status, read without connect (which would migrate)."""
+    conn = sqlite3.connect(str(path))
+    try:
+        return (
+            conn.execute("SELECT outcome FROM scoring_passes").fetchone()[0],
+            conn.execute("SELECT outcome FROM judge_calls").fetchone()[0],
+            conn.execute("SELECT status FROM experiments").fetchone()[0],
+        )
+    finally:
+        conn.close()
+
+
+def test_a_second_server_on_one_database_refuses_to_start(monkeypatch, tmp_path):
+    """WINDOW: a lifespan over a database whose lock a live server holds
+    (its record, held on its own descriptor here): a database an older
+    bench wrote, with an experiment running, a scoring pass open and a
+    judge call sent, and a clone root holding a clone's work directory.
+
+    One server per database, and a refused server writes nothing (the
+    external review's M3, M4): it refuses in a sentence naming the lock
+    and what holds it before it connects, so the older database is not
+    migrated, its bytes are as they were, the live rows are not swept,
+    and the clone's work directory is not removed. PRE-STATE: the three
+    rows are open and running, and before this series the refused boot
+    connected (migrating the database) and swept the clone root first;
+    the old proof booted a first bench in this process, whose app.state
+    the second boot then overwrote, and could not see either."""
+    db_path = tmp_path / "bench.db"
+    before = seed_a_live_older_database(db_path)
+    assert live_triple(db_path) == (None, None, "running")
+    clones = tmp_path / "clones"
+    work = clones / ".0123456789abcdef.partial"
+    work.mkdir(parents=True)
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(clones.resolve()))
+    monkeypatch.setenv("BENCH_CLONE_ROOT", str(clones.resolve()))
+    lock = store.lock_path(str(db_path))
+    held = store.hold_lock(str(db_path), "server")
+    try:
+        with pytest.raises(store.LockHeld) as refused:
+            with boot_against(monkeypatch, db_path):
+                pass
+    finally:
+        store.release_lock(held)
+    assert str(refused.value) == (
+        f"{lock} is held by process {os.getpid()}, a bench server, which is "
+        "using this database, and one process writes to a bench database at "
+        "a time, so this server will not start: its startup records as "
+        "interrupted whatever the database says is running, which is true "
+        "only when nothing else is writing to it. Stop that process first."
+    )
+    assert hashlib.sha256(db_path.read_bytes()).hexdigest() == before
+    assert live_triple(db_path) == (None, None, "running")
+    assert work.is_dir()
+
+
+def test_a_link_to_a_live_database_finds_its_lock(monkeypatch, tmp_path):
+    """WINDOW: a lifespan whose BENCH_DB is a symbolic link to a database
+    whose lock a live server holds under the database's own name, with a
+    pass open and a call sent in it.
+
+    The lock is named by the file the path resolves to (the external
+    review's M2), so the link finds the one lock and the boot is refused,
+    and the live rows are not swept. PRE-STATE: the rows are open; before
+    this series the lock was named by the path as given, so the boot
+    through the link took a lock of its own and swept the live pass and
+    call as interrupted."""
+    real = tmp_path / "real" / "bench.db"
+    real.parent.mkdir()
+    seed_a_live_older_database(real)
+    link = tmp_path / "link.db"
+    link.symlink_to(real)
+    assert store.lock_path(str(link)) == store.lock_path(str(real))
+    held = store.hold_lock(str(real), "server")
+    try:
+        with pytest.raises(store.LockHeld):
+            with boot_against(monkeypatch, link):
+                pass
+    finally:
+        store.release_lock(held)
+    assert live_triple(real) == (None, None, "running")
+
+
+def test_a_boot_that_fails_after_its_lock_gives_the_lock_back(monkeypatch, tmp_path):
+    """WINDOW: a lifespan whose connect raises, after the lock is taken,
+    and the lock asked for after.
+
+    The lock comes first now (the external review's M3), so a boot that
+    fails later must give it back, or the next start would be refused by
+    a process that never started. PRE-STATE: connect raises inside the
+    boot, and the lock is free before it."""
+    db_path = tmp_path / "bench.db"
+    store.release_lock(store.hold_lock(str(db_path), "server"))
+
+    def refuse(path):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(main.store, "connect", refuse)
+    with pytest.raises(sqlite3.OperationalError):
+        with boot_against(monkeypatch, db_path):
+            pass
+    store.release_lock(store.hold_lock(str(db_path), "server"))
+
+
+def test_a_database_in_a_directory_not_yet_made_boots_under_its_lock(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a lifespan whose BENCH_DB names a file two directories that
+    do not exist yet below tmp, and the lock and directory after.
+
+    The lock is taken before connect, which used to make the directory,
+    so the lock makes it, private as connect makes it, and the boot goes
+    on. PRE-STATE: neither directory exists."""
+    db_path = tmp_path / "made" / "here" / "bench.db"
+    assert not db_path.parent.parent.exists()
+    with boot_against(monkeypatch, db_path) as c:
+        assert c.get("/models").status_code == 200
+        assert Path(store.lock_path(str(db_path))).read_text().split() == [
+            str(os.getpid()),
+            "server",
+        ]
+    assert stat_module.S_IMODE(db_path.parent.stat().st_mode) == 0o700
+
+
+def test_the_lock_dies_with_the_process_that_held_it(monkeypatch, tmp_path):
+    """WINDOW: the lock held by another process, a boot refused naming
+    it, that process killed, and a boot after.
+
+    flock belongs to the open file, so the kernel lets it go when its
+    holder dies however it dies: a kill -9 leaves no lock behind for the
+    next boot to trip over. PRE-STATE: the other process holds the lock
+    and has written its id."""
+    db_path = tmp_path / "bench.db"
+    store.connect(str(db_path)).close()
+    lock = store.lock_path(str(db_path))
+    holder = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import fcntl, os, sys, time\n"
+            "fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)\n"
+            "fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "os.write(fd, f'{os.getpid()}\\n'.encode())\n"
+            "print('held', flush=True)\n"
+            "time.sleep(60)\n",
+            lock,
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(RuntimeError, match=f"held by process {holder.pid},"):
+            with boot_against(monkeypatch, db_path):
+                pass
+    finally:
+        holder.kill()
+        holder.wait()
+    assert holder.returncode == -signal.SIGKILL
+
+    with boot_against(monkeypatch, db_path) as c:
+        assert c.get("/models").status_code == 200
+        assert Path(lock).read_text().strip() == f"{os.getpid()} server"
+
+
+def test_a_memory_database_takes_no_lock():
+    """WINDOW: store.lock_path over each spelling of a database.
+
+    A file has its lock beside it; a memory database, which no other
+    process can open, has none. PRE-STATE: the two file spellings each
+    name a lock (the first two assertions), so the None for the memory
+    spellings is the function telling the two apart, not one that names
+    none (the external review's L4: this proof said "PRE-STATE: none")."""
+    assert store.lock_path("/x/bench.db") == "/x/bench.db.lock"
+    assert store.lock_path("file:/x/b.db?cache=private") == "/x/b.db.lock"
+    assert store.lock_path(":memory:") is None
+    assert store.lock_path("file:m?mode=memory&cache=shared") is None
+
+
+def results_in_order(client, eid):
+    """An experiment's result ids in trial order: task, repeat, position."""
+    return [
+        row[0]
+        for row in client.app.state.db.execute(
+            """SELECT r.id FROM results r JOIN runs ru ON ru.id = r.run_id
+               JOIN groups g ON g.id = ru.group_id WHERE g.experiment_id = ?
+               ORDER BY g.task_id, g.repeat_index, r.position, r.id""",
+            (eid,),
+        )
+    ]
+
+
+PRE_P_SCHEMA_TEXT = (
+    Path(__file__).parent / "fixtures" / "pre_p_schema.sql"
+).read_text()
+
+# The judge rows a pass at ed00174 wrote, one of each shape it could
+# write, as (score, detail, judge_model, generation id, billed figure).
+PRE_P_JUDGE_ROWS = [
+    (0.5, "fine", "judge/one", "gen-old-1", 0.002),
+    (1.0, "good", "judge/one", "gen-old-2", None),
+    (None, "judge request failed: ReadTimeout", "judge/one", None, None),
+    (
+        None,
+        "the per-boot spend ceiling was reached before this result could be "
+        "judged; re-run the scoring pass to fill it in",
+        "judge/one",
+        None,
+        None,
+    ),
+    (None, "no judge model was given for this scoring pass", None, None, None),
+    (0.0, "no response text: the trial did not complete", "judge/one", None, None),
+]
+
+
+def pre_p_scored_database(path):
+    """A database as ed00174 left it, holding one experiment that ran one
+    trial and was scored before Phase P: the six judge row shapes above
+    and a deterministic row, and no record of any pass or request."""
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(PRE_P_SCHEMA_TEXT)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('old', '2026-09-01T00:00:00+00:00', 'd.jsonl', ?,
+                   '["model/alpha"]', 'standard', 1, 'routed_service', 1,
+                   'done', 1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO groups (created_at, prompt_text, models_json, budget,
+               experiment_id, task_id, repeat_index, rotation_index)
+           VALUES ('2026-09-01T00:00:00+00:00', 'be kind', '["model/alpha"]',
+                   'standard', 1, 'j1', 0, 0)"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (group_id, prompt_text, created_at)
+           VALUES (1, 'be kind', '2026-09-01T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, position)
+           VALUES (1, 'model/alpha', 'kindly', 0)"""
+    )
+    for score_value, detail, judge, gen, billed in PRE_P_JUDGE_ROWS:
+        legacy.execute(
+            """INSERT INTO scores (result_id, scorer, score, detail, judge_model,
+                   judge_generation_id, judge_billed_cost_usd, created_at)
+               VALUES (1, 'judge', ?, ?, ?, ?, ?, '2026-09-01T00:00:00+00:00')""",
+            (score_value, detail, judge, gen, billed),
+        )
+    legacy.execute(
+        """INSERT INTO scores (result_id, scorer, score, passed, detail, created_at)
+           VALUES (1, 'exact', 1.0, 1, 'matched', '2026-09-01T00:00:00+00:00')"""
+    )
+    legacy.commit()
+    legacy.close()
+
+
+def test_the_report_over_a_pre_p_database_shows_what_its_rows_support(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a database whose schema is ed00174's, holding an experiment
+    scored before Phase P, booted, and its report, its scoring record and
+    its list entry read.
+
+    The old rows carry no pass and no call, so everything the report says
+    about them comes from what they hold. The billed figure, the billed
+    count and the unpriced count are the ones ed00174's report gave. Of
+    the five rows that report counted as rows_without_figure, the
+    unpriced one is counted as unpriced, the three whose own sentence
+    says no request was made are counted nowhere, and the one that
+    cannot say whether its request went out (the timeout, whose row is
+    the same as a refused connection's) is rows_before_call_records.
+    Nothing is unanswered or in flight, because no row says a request
+    went out without an answer. PRE-STATE: rows_without_figure as
+    ed00174 computed it, from the rows themselves, is 5."""
+    db_path = tmp_path / "bench.db"
+    pre_p_scored_database(db_path)
+    legacy = sqlite3.connect(str(db_path))
+    judge_rows = legacy.execute(
+        "SELECT judge_billed_cost_usd FROM scores WHERE scorer = 'judge'"
+    ).fetchall()
+    legacy.close()
+    assert sum(1 for (billed,) in judge_rows if billed is None) == 5
+
+    with boot_against(monkeypatch, db_path) as c:
+        cost = c.get("/experiments/1/report").json()["judge_cost"]
+        record = c.get("/experiments/1/scoring").json()
+        listed = c.get("/experiments").json()["experiments"]
+
+    assert cost == {
+        "total_usd": 0.002,
+        "billed_calls": 1,
+        "unpriced_calls": 1,
+        "unanswered_calls": 0,
+        "unusable_answers": 0,
+        "unknown_calls": 0,
+        "history_counted_calls": 0,
+        "in_flight_calls": 0,
+        "rows_before_call_records": 1,
+    }
+    never_sent = sum(1 for row in PRE_P_JUDGE_ROWS if row[1] in report.PRE_P_NEVER_SENT)
+    assert never_sent == 3
+    assert 5 == cost["unpriced_calls"] + cost["rows_before_call_records"] + never_sent
+    assert record == {"experiment_id": 1, "active": None, "passes": []}
+    assert [e["scoring"] for e in listed] == [None]
+
+
+def p2_left_open_database(path):
+    """A database as P2's builds left it (tests/fixtures/p2_schema.sql,
+    2e8bd02 to b3b4e48), holding an experiment of one trial and two scoring
+    passes: pass 1, sealed by that build over a call that timed out and one
+    that failed with an error status, its counts by the outcome list then
+    in force; and pass 2, left open, with one call answered and charged,
+    one timed out, one failed with an error status, one failed with no
+    reply, and one still open. Every ending was written before schema 12
+    recorded whether a call was sent or its reply could be used."""
+    fixture = (Path(__file__).parent / "fixtures" / "p2_schema.sql").read_text()
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p2', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["model/alpha"]', 'standard', 1, 'routed_service', 1,
+                   'done', 1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO groups (created_at, prompt_text, models_json, budget,
+               experiment_id, task_id, repeat_index, rotation_index)
+           VALUES ('2026-09-28T00:00:00+00:00', 'be kind', '["model/alpha"]',
+                   'standard', 1, 'j1', 0, 0)"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (group_id, prompt_text, created_at)
+           VALUES (1, 'be kind', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, position)
+           VALUES (1, 'model/alpha', 'kindly', 0)"""
+    )
+    for _ in range(2):
+        legacy.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+               VALUES (1, 'judge/one', '2026-09-28T00:00:00+00:00')"""
+        )
+    endings = [
+        (1, "timed_out", None, None, None, "judge request failed: ReadTimeout"),
+        (
+            1,
+            "failed",
+            "2026-09-28T00:00:02+00:00",
+            None,
+            None,
+            "judge returned HTTP 500",
+        ),
+        (2, "answered", "2026-09-28T00:00:02+00:00", "gen-old", 0.002, None),
+        (2, "timed_out", None, None, None, "judge request failed: ReadTimeout"),
+        (
+            2,
+            "failed",
+            "2026-09-28T00:00:02+00:00",
+            None,
+            None,
+            "judge returned HTTP 500",
+        ),
+        (2, "failed", None, None, None, "judge request failed: RemoteProtocolError"),
+        (2, None, None, None, None, None),
+    ]
+    for pass_id, outcome, answered_at, gen, billed, detail in endings:
+        cur = legacy.execute(
+            """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                   judge_model, sent_at)
+               VALUES (?, 1, 1, 'judge/one', '2026-09-28T00:00:01+00:00')""",
+            (pass_id,),
+        )
+        if outcome is not None:
+            legacy.execute(
+                """UPDATE judge_calls SET answered_at = ?, generation_id = ?,
+                       billed_cost_usd = ?, outcome = ?, detail = ?
+                    WHERE id = ?""",
+                (answered_at, gen, billed, outcome, detail, cur.lastrowid),
+            )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 0, failed = 0, unanswered = 1,
+               unusable = 1
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.close()
+
+
+HISTORY_CLAUSE = (
+    "ended before the bench recorded whether a call was sent and whether its "
+    "reply could be used"
+)
+
+
+def test_a_pass_an_older_build_left_open_says_which_counts_rest_on_old_words(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a database a build from before schema 12 left with one pass
+    sealed and one open (p2_left_open_database), booted, so the boot sweep
+    seals the open pass in schema 12's form; its three doors, its report
+    and the report rebuilt from its export, and the page's two lines over
+    what the doors serve, executed in node.
+
+    The older calls carry no record of whether they were sent or whether a
+    reply could be used, so the counts place them by the words their
+    records used (the history rules). The operator's second pass at
+    3a9f3e6 ratified those rules provided the page says when a pass's
+    counts rest on them. The pass sealed before schema 12 says so in its
+    one clause, and is served no count of its own (null, as its unknown
+    is), since its counts rest on the withdrawn list. The swept pass,
+    whose unknown is a number, says how many of its unanswered and
+    unusable rest on the old words, naming those calls; the spend line
+    says it for every older call it counts; and the report rebuilt from
+    the export says the same, the export carrying what the count reads
+    and no pass record carrying the count. PRE-STATE at 3a9f3e6: no door
+    served the count, and both lines were silent about it."""
+    db_path = tmp_path / "bench.db"
+    p2_left_open_database(db_path)
+    with boot_against(monkeypatch, db_path) as c:
+        record = c.get("/experiments/1/scoring").json()
+        listed = next(
+            e for e in c.get("/experiments").json()["experiments"] if e["id"] == 1
+        )
+        detail = c.get("/experiments/1").json()
+        served = c.get("/experiments/1/report").json()
+        exported = export_lines(c, 1)
+    swept, sealed_before = record["passes"]
+    assert (swept["id"], swept["outcome"], swept["detail"]) == (
+        2,
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (2, 1, 1)
+    assert [
+        p["history_counted"] for p in (swept, listed["scoring"], detail["scoring"])
+    ] == [3, 3, 3]
+    assert (
+        sealed_before["unanswered"],
+        sealed_before["unusable"],
+        sealed_before["unknown"],
+        sealed_before["history_counted"],
+    ) == (1, 1, None, None)
+    spend = served["judge_cost"]
+    assert (
+        spend["unanswered_calls"],
+        spend["unusable_answers"],
+        spend["unknown_calls"],
+        spend["history_counted_calls"],
+        spend["billed_calls"],
+    ) == (3, 2, 1, 5, 1)
+    lines = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(["
+        "l.scoringPassLine(INPUT.swept), l.scoringPassLine(INPUT.before),"
+        " l.judgeSpendLine(INPUT.spend)]));",
+        {"swept": swept, "before": sealed_before, "spend": spend},
+    )
+    assert lines == [
+        "the last scoring pass was interrupted (started 2026-09-28 00:00:00 UTC, "
+        "judged by judge/one): found open at boot; 0 trials scored, 2 judge "
+        "calls got no answer, 1 judge reply could not be used, 3 judge calls "
+        "among those that got no answer or an unusable reply "
+        + HISTORY_CLAUSE
+        + ", so they are counted by the words their records used, 1 judge "
+        "call's record could not be completed, so this line cannot say whether "
+        "it went out",
+        "scored 2026-09-28 00:00:03 UTC, judged by judge/one: 0 trials scored, "
+        "2 judge calls ended with no usable answer on record",
+        "judge spend: $0.0020 over 1 billed call; 3 judge calls went out and got "
+        "no answer; 2 judge calls got replies that could not be used; 5 judge "
+        "calls among those that got no answer or an unusable reply "
+        + HISTORY_CLAUSE
+        + ", so this line counts them by the words their records used; 1 judge "
+        "call's record could not be completed, so this line cannot say whether "
+        "it went out",
+    ]
+    rebuilt = rebuild_from_export(exported, tasks_from_manifest(exported[0]))
+    assert rebuilt["judge_cost"] == spend
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    assert all("history_counted" not in p for p in exported[0]["scoring_passes"])
+
+
+@respx.mock
+def test_the_never_sent_sentences_are_the_ones_the_pass_writes(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: the three rows a pass writes without making a request (no
+    judge given, the ceiling refusing, a trial with no text), read back.
+
+    report.PRE_P_NEVER_SENT is history: the sentences those rows carried
+    from 58b6346 to ed00174, by which an old row says it never sent. The
+    live writers still use them word for word, which this holds; a
+    rewording must add to the set rather than change it. PRE-STATE: the
+    set has exactly three sentences."""
+    assert len(report.PRE_P_NEVER_SENT) == 3
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+    monkeypatch.setattr(main, "spend_ceiling_reached", lambda: True)
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+    written = {r["detail"] for r in scores_in(client, eid) if r["scorer"] == "judge"}
+
+    async def blank():
+        async with httpx.AsyncClient(trust_env=False) as unused:
+            return await main.judge_response(unused, "judge/one", "kind", None, "  ")
+
+    assert written | {asyncio.run(blank())["detail"]} == report.PRE_P_NEVER_SENT
+
+
+@respx.mock
+def test_a_mixed_era_experiment_reports_each_request_once(client, tmp_path):
+    """WINDOW: one experiment holding judge rows from before Phase P (pass_id
+    NULL, the figure on the row) and a post-P pass's calls, the served
+    report, and the report rebuilt from the export.
+
+    ONE SOURCE PER ERA (the operator's Q2): the calls for the post-P pass,
+    the rows for the old ones, and a post-P row never read for money. The
+    total is both eras' figures, summed with fsum, so the served report
+    and the rebuilt one, which meet the figures in different orders, agree
+    to the bit. PRE-STATE: the old rows hold a figure and a generation id
+    of their own; the post-P judge rows hold neither and cite a call."""
+    tasks = [dict(JUDGE_TASK, id=f"j{n}") for n in range(1, 6)]
+    answers = {"n": 0}
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        answers["n"] += 1
+        n = answers["n"]
+        if n == 1:
+            return httpx.Response(200, json=judge_answer(gen="gen-new-1", cost=0.003))
+        if n == 2:
+            return httpx.Response(200, json=judge_answer(gen="gen-new-2"))
+        if n == 3:
+            raise httpx.ReadTimeout("sent", request=request)
+        if n == 4:
+            raise httpx.ConnectError("refused", request=request)
+        return httpx.Response(500, json={"error": "upstream"})
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path, rows=tasks)
+    rid = results_in_order(client, eid)[0]
+    for score_value, detail, judge, gen, billed in PRE_P_JUDGE_ROWS:
+        store.add_score(
+            client.app.state.db,
+            rid,
+            {
+                "scorer": "judge",
+                "score": score_value,
+                "detail": detail,
+                "judge_model": judge,
+                "judge_generation_id": gen,
+                "judge_billed_cost_usd": billed,
+            },
+        )
+    old = [r for r in scores_in(client, eid) if r["result_id"] == rid]
+    assert [r["pass_id"] for r in old] == [None] * 6
+    assert [r["judge_billed_cost_usd"] for r in old][0] == 0.002
+
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+    new = [r for r in scores_in(client, eid) if r["pass_id"] is not None]
+    assert len(new) == 5
+    assert all(r["judge_billed_cost_usd"] is None for r in new)
+    assert all(r["judge_generation_id"] is None for r in new)
+    assert all(r["judge_call_id"] is not None for r in new)
+
+    served = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    lines = export_lines(client, eid, path)
+    rebuilt = rebuild_from_export(lines, tasks_from_manifest(lines[0]))
+
+    assert served["judge_cost"] == {
+        "total_usd": math.fsum([0.002, 0.003]),
+        "billed_calls": 2,
+        "unpriced_calls": 2,
+        "unanswered_calls": 1,
+        "unusable_answers": 1,
+        "unknown_calls": 0,
+        "history_counted_calls": 0,
+        "in_flight_calls": 0,
+        "rows_before_call_records": 1,
+    }
+    assert rebuilt["judge_cost"] == served["judge_cost"]
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    (made,) = served["scoring_passes"]
+    assert (made["outcome"], made["scored"]) == ("finished", 2)
+    assert (made["unanswered"], made["unusable"]) == (1, 1)
+    # THE FIGURE IS IN THE FILE ONCE (the external review's M9): every
+    # figure the file holds, on a score or on a call, sums to the total,
+    # so a call's figure copied onto the score that cites it would count
+    # it twice.
+    trials = [x for x in lines if x["type"] == "trial"]
+    figures = [
+        s["judge_billed_cost_usd"]
+        for t in trials
+        for s in t["scores"]
+        if s["judge_billed_cost_usd"] is not None
+    ] + [
+        c["billed_cost_usd"]
+        for t in trials
+        for c in t["judge_calls"]
+        if c["billed_cost_usd"] is not None
+    ]
+    assert math.fsum(figures) == served["judge_cost"]["total_usd"]
+
+
+PASS_RECORD_FIELDS = {
+    "id",
+    "judge_model",
+    "started_at",
+    "ended_at",
+    "outcome",
+    "detail",
+    "scored",
+    "failed",
+    "unanswered",
+    "unusable",
+    "unknown",
+}
+CALL_RECORD_FIELDS = {
+    "id",
+    "pass_id",
+    "judge_model",
+    "sent_at",
+    "answered_at",
+    "generation_id",
+    "billed_cost_usd",
+    "outcome",
+    "detail",
+    "prompt_tokens",
+    "completion_tokens",
+    "sent",
+    "usable",
+}
+
+
+def as_exported(row, fields):
+    """A database row as the export states it: the named fields, with the
+    two facts as true, false or null."""
+    out = {k: row[k] for k in fields}
+    for flag in {"sent", "usable"} & fields:
+        if out[flag] is not None:
+            out[flag] = bool(out[flag])
+    return out
+
+
+@respx.mock
+def test_the_export_carries_every_scoring_record_as_the_database_holds_it(
+    client, tmp_path
+):
+    """WINDOW: three judged trials scored by a pass whose calls got no reply,
+    no reply and an error status, and by a second whose calls were
+    answered and charged; a third pass, closed through the store, that
+    left its one call open; and a pass and call planted as a draft build
+    before schema 12 left them (only a migrated database holds one);
+    then the export, the database and the two reports.
+
+    The external review's M8: every exported pass and call is its row key
+    for key, in the order written, each call on the line of the trial it
+    judged, the two facts as true, false or null. The report rebuilt from
+    the file equals the served one. Each pass sealed since schema 12 has
+    the counts call_ending recounts from its exported calls. The planted
+    call is exported with sent and usable null, the record as it is; the
+    history reading is the reader's (note 12). PRE-STATE: the first pass's
+    counts differ from each other and from the other passes', so a swap
+    or a dropped field shows."""
+    replies = {"n": 0}
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        replies["n"] += 1
+        n = replies["n"]
+        if n in (1, 2):
+            raise httpx.ReadTimeout("no reply", request=request)
+        if n == 3:
+            return httpx.Response(500, json={"error": "upstream"})
+        return httpx.Response(200, json=judge_answer(gen=f"gen-{n}", cost=n / 10**4))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS)
+    for _ in range(2):
+        assert score(client, eid, path).status_code == 202
+        wait_scoring_done(client)
+    db = client.app.state.db
+    rids = results_in_order(client, eid)
+    left = store.open_scoring_pass(db, eid, "judge/one")
+    store.record_judge_call_sent(db, left, rids[0], "judge/one")
+    store.close_scoring_pass(db, left, "stopped", "x")
+    with db:
+        planted = db.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model,
+                   started_at, ended_at, outcome, scored, failed,
+                   unanswered, unusable)
+               VALUES (?, 'judge/one', 't0', 't1', 'finished', 1, 0, 0, 0)""",
+            (eid,),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                   judge_model, sent_at, answered_at, generation_id, outcome)
+               VALUES (?, ?, ?, 'judge/one', 't0', 't1', 'gen-old', 'answered')""",
+            (planted, eid, rids[1]),
+        )
+    rows = [
+        dict(r)
+        for r in db.execute(
+            "SELECT * FROM scoring_passes WHERE experiment_id = ? ORDER BY id", (eid,)
+        )
+    ]
+    assert [(r["unanswered"], r["unusable"], r["unknown"]) for r in rows] == [
+        (2, 1, 0),
+        (0, 0, 0),
+        (0, 0, 1),
+        (0, 0, None),
+    ]
+
+    lines = export_lines(client, eid, path)
+    manifest, trials = lines[0], [x for x in lines if x["type"] == "trial"]
+    assert manifest["scoring_passes"] == [
+        as_exported(r, PASS_RECORD_FIELDS) for r in rows
+    ]
+    for trial in trials:
+        held = db.execute(
+            "SELECT * FROM judge_calls WHERE result_id = ? ORDER BY id",
+            (trial["result_id"],),
+        ).fetchall()
+        assert trial["judge_calls"] == [
+            as_exported(dict(r), CALL_RECORD_FIELDS) for r in held
+        ]
+    exported = [c for t in trials for c in t["judge_calls"]]
+    assert len(exported) == 8
+    # True, false or null, not sqlite's 1 and 0, which compare equal to the
+    # first two in Python and would pass the comparison above.
+    assert {type(c["sent"]) for c in exported} == {bool, type(None)}
+    assert {type(c["usable"]) for c in exported} == {bool, type(None)}
+    assert {c["usable"] for c in exported} == {True, False, None}
+    (old,) = [c for c in exported if c["generation_id"] == "gen-old"]
+    assert (old["sent"], old["usable"], old["outcome"]) == (None, None, "answered")
+
+    served = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    rebuilt = rebuild_from_export(lines, tasks_from_manifest(lines[0]))
+    assert rebuilt["judge_cost"] == served["judge_cost"]
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    assert (
+        served["judge_cost"]["unanswered_calls"],
+        served["judge_cost"]["unusable_answers"],
+        served["judge_cost"]["unknown_calls"],
+        served["judge_cost"]["billed_calls"],
+        served["judge_cost"]["unpriced_calls"],
+    ) == (2, 1, 1, 3, 1)
+    for sealed in manifest["scoring_passes"]:
+        if sealed["unknown"] is None:
+            continue
+        words = [store.call_ending(c) for c in exported if c["pass_id"] == sealed["id"]]
+        assert (sealed["unanswered"], sealed["unusable"], sealed["unknown"]) == (
+            words.count("unanswered"),
+            words.count("unusable"),
+            words.count("unknown"),
+        )
+
+
+@respx.mock
+def test_a_call_in_flight_is_exported_and_counted_as_in_flight(client, tmp_path):
+    """WINDOW: a judged pass whose one call is held on the wire, the report
+    and the export read while it is, and the pass after the call is let
+    go.
+
+    The external review's M8: a call not yet ended is counted in flight and
+    in nothing else, its exported record has no outcome and no facts, and
+    the report rebuilt from that file equals the served one, the running
+    pass's null counts included. PRE-STATE: the call is open when both
+    are read."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(gate, judged))
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    assert calls_of(client.app.state.db, eid)[0]["outcome"] is None
+
+    served = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    lines = export_lines(client, eid, path)
+    rebuilt = rebuild_from_export(lines, tasks_from_manifest(lines[0]))
+    client.portal.call(gate.set)
+    wait_scoring_done(client)
+
+    cost = served["judge_cost"]
+    assert (
+        cost["in_flight_calls"],
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == (1, 0, 0, 0)
+    ((call,),) = [x["judge_calls"] for x in lines if x["type"] == "trial"]
+    assert (call["outcome"], call["answered_at"], call["sent"], call["usable"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert rebuilt["judge_cost"] == served["judge_cost"]
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    (running,) = served["scoring_passes"]
+    assert (running["outcome"], running["unknown"]) == (None, None)
+
+
+def lift_to_pre_p(lines):
+    """An export's lines as a pre-P pass would have left them for the
+    same answers: each judge score's figure and generation id moved back
+    from its call onto the row, and the scoring records set aside."""
+    lifted = json.loads(json.dumps(lines))
+    lifted[0]["scoring_passes"] = []
+    for line in lifted[1:-1]:
+        calls = {call["id"]: call for call in line["judge_calls"]}
+        for s in line["scores"]:
+            call = calls.get(s["judge_call_id"])
+            if call is not None:
+                s["judge_generation_id"] = call["generation_id"]
+                s["judge_billed_cost_usd"] = call["billed_cost_usd"]
+        line["judge_calls"] = []
+    return lifted
+
+
+@respx.mock
+def test_a_pre_p_and_a_post_p_export_differ_only_in_the_scoring_records(
+    client, tmp_path
+):
+    """WINDOW: two experiments of one declaration, run against the same
+    replies; one scored by a post-P pass, the other given the rows ed00174's
+    pass wrote for the same answers (the figure and generation id on each
+    judge row, no pass, no call); both exported and reported.
+
+    DECLARATION TRANSPORT (the commission's house law). judge_call_id and
+    the pass travel to the export as judge_generation_id always has, and
+    nothing else moves: once each export's own ids and times are set
+    aside, the two differ, and moving each call's figure and generation id
+    back onto the row that cites it and setting the records aside makes
+    them identical. The judge spend both reports state is the same.
+    PRE-STATE: the two exports do differ, in exactly those places, so
+    the equality after the lift is not vacuous."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: (
+            httpx.Response(200, json=judge_answer(gen="gen-t", cost=0.00002))
+            if is_judge(request)
+            else httpx.Response(200, stream=alpha_stream())
+        )
+    )
+    path = write_dataset(tmp_path, *THREE_KINDS)
+    ids = []
+    for _ in range(2):
+        eid = client.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+        assert run_experiment_to_completion(client, eid, path)["status"] == "done"
+        ids.append(eid)
+    old_eid, new_eid = ids
+    assert score(client, new_eid, path).status_code == 202
+    wait_scoring_done(client)
+    new_rows = scores_in(client, new_eid)
+    calls = {c["id"]: c for c in calls_of(client.app.state.db, new_eid)}
+    twin = dict(
+        zip(
+            results_in_order(client, new_eid),
+            results_in_order(client, old_eid),
+            strict=True,
+        )
+    )
+    for row in new_rows:
+        call = calls.get(row["judge_call_id"])
+        store.add_score(
+            client.app.state.db,
+            twin[row["result_id"]],
+            {
+                "scorer": row["scorer"],
+                "score": row["score"],
+                "passed": row["passed"],
+                "detail": row["detail"],
+                "judge_model": row["judge_model"],
+                "judge_generation_id": call["generation_id"] if call else None,
+                "judge_billed_cost_usd": call["billed_cost_usd"] if call else None,
+                "blind": row["blind"],
+                "self_judged": row["self_judged"],
+            },
+        )
+
+    # On the raw files (the external review's M9): every score that cites a
+    # call carries neither the figure nor the generation id, and the old
+    # export's twin row carries both, so the lift below is not vacuous.
+    raw_new = export_lines(client, new_eid, path)
+    cited = [
+        s
+        for x in raw_new
+        if x["type"] == "trial"
+        for s in x["scores"]
+        if s["judge_call_id"] is not None
+    ]
+    assert cited
+    assert all(
+        (s["judge_generation_id"], s["judge_billed_cost_usd"]) == (None, None)
+        for s in cited
+    )
+    raw_old = export_lines(client, old_eid, path)
+    (twin_row,) = [
+        s
+        for x in raw_old
+        if x["type"] == "trial"
+        for s in x["scores"]
+        if s["scorer"] == "judge"
+    ]
+    assert (twin_row["judge_generation_id"], twin_row["judge_billed_cost_usd"]) == (
+        "gen-t",
+        0.00002,
+    )
+    old_export = without_identity(export_lines(client, old_eid, path)[:-1])
+    new_export = without_identity(export_lines(client, new_eid, path)[:-1])
+    assert old_export != new_export
+    assert new_export[0]["scoring_passes"] and not old_export[0]["scoring_passes"]
+    judged_lines = [line for line in new_export[1:] if line["judge_calls"]]
+    assert len(judged_lines) == 1
+    assert all(line["judge_calls"] == [] for line in old_export[1:])
+    assert without_identity(
+        lift_to_pre_p(export_lines(client, new_eid, path)[:-1])
+    ) == (old_export)
+
+    old_report = client.get(
+        f"/experiments/{old_eid}/report", params={"dataset_path": path}
+    ).json()
+    new_report = client.get(
+        f"/experiments/{new_eid}/report", params={"dataset_path": path}
+    ).json()
+    assert old_report["judge_cost"] == new_report["judge_cost"]
+    assert old_report["judge_cost"]["billed_calls"] == 1
+    assert (len(old_report["scoring_passes"]), len(new_report["scoring_passes"])) == (
+        0,
+        1,
+    )
+
+
+def test_the_spend_line_reads_exactly_the_keys_the_report_writes():
+    """WINDOW: judgeSpendLine executed in node over a judge_cost in which
+    every count is nonzero, with every key it reads recorded, against
+    the keys report._judge_cost writes.
+
+    The page's line and the report's counts are one vocabulary. A key the
+    report dropped would read as undefined and its clause would vanish
+    without a word, which is how rows_without_figure's retirement would
+    have gone unseen; a key the report added and the line never reads is
+    a count the page does not say. PRE-STATE: every branch of the line is
+    taken, so every key it can read is read."""
+    written = report._judge_cost({}, ())
+    spend = {key: 1 for key in written} | {"total_usd": 0.001}
+    read = run_lib(
+        "const l = require(process.argv[1]);"
+        "const seen = new Set();"
+        "const spend = new Proxy(INPUT, {get(t, k) { seen.add(k); return t[k]; }});"
+        "const line = l.judgeSpendLine(spend);"
+        "process.stdout.write(JSON.stringify([[...seen].sort(), line]));",
+        spend,
+    )
+    keys, line = read
+    assert line.count(";") == 6 and ", 1 unpriced" in line
+    assert keys == sorted(written)
+
+
+@respx.mock
+def test_a_pass_whose_ending_cannot_be_written_still_frees_the_slot(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: a deterministic pass whose close_scoring_pass raises, the
+    slot and the doors after, and the next Score.
+
+    The ending is written once, in the pass's finally, and a failure to
+    write it must not keep the slot: that would be L8's defect a line
+    later. The slot frees, the record keeps the pass with no ending and
+    the doors say it is not running (a pass with no recorded end, which
+    the next boot's sweep closes), and the next Score is taken.
+    PRE-STATE: the write raised, once."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    eid, path = judged_experiment(
+        client,
+        tmp_path,
+        rows=(
+            {"id": "e1", "prompt": "p", "reference": "x", "scorer": {"kind": "exact"}},
+        ),
+    )
+    real = store.close_scoring_pass
+    armed = {"left": 1}
+
+    def refusing(*args, **kwargs):
+        if armed["left"]:
+            armed["left"] -= 1
+            raise sqlite3.OperationalError("disk I/O error")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(store, "close_scoring_pass", refusing)
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+
+    assert armed["left"] == 0
+    assert client.app.state.scoring_run["pass_id"] is None
+    (left,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (left["outcome"], left["running"], left["ended_at"]) == (None, False, None)
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+    newest = client.get(f"/experiments/{eid}/scoring").json()["passes"][0]
+    assert newest["outcome"] == "finished"
+
+
+import functools
+import operator
+
+
+def test_the_judge_total_does_not_depend_on_the_order_of_the_calls():
+    """WINDOW: report._judge_cost over the same three billed calls in two
+    orders.
+
+    A served report meets the calls by id and one rebuilt from its export
+    meets them in trial order, so the total must not depend on order:
+    fsum, not a running sum, whose rounding does. Python's own sum()
+    compensates since 3.12, and CI's 3.11 leg's does not, which is why
+    the pre-state is a plain running sum rather than sum(). PRE-STATE: a
+    running sum of these three figures differs by order."""
+    figures = [0.1, 0.2, 0.3]
+    running = functools.partial(functools.reduce, operator.add)
+    assert running(figures) != running(list(reversed(figures)))
+    calls = [
+        {
+            "id": n,
+            "outcome": "answered",
+            "sent": True,
+            "answered_at": "t",
+            "usable": True,
+            "billed_cost_usd": figure,
+        }
+        for n, figure in enumerate(figures)
+    ]
+    forward = report._judge_cost({}, calls)
+    backward = report._judge_cost({}, list(reversed(calls)))
+    assert forward == backward
+    assert forward["total_usd"] == math.fsum(figures)
+
+
+def test_a_score_citing_a_call_the_report_was_not_given_is_refused():
+    """WINDOW: report._judge_cost handed a post-P judge score whose call is
+    not among the calls it was given.
+
+    The counts would be short by a request nobody could see missing, so
+    the report refuses rather than reads around it; a call no score cites
+    is fine (a threshold helper deletes scores and leaves calls).
+    PRE-STATE: with the call handed in, the same rows report."""
+    row = {"id": 7, "scorer": "judge", "judge_call_id": 3, "pass_id": 1}
+    call = {
+        "id": 3,
+        "outcome": "answered",
+        "sent": True,
+        "answered_at": "t",
+        "usable": True,
+        "billed_cost_usd": None,
+    }
+    assert report._judge_cost({1: [row]}, [call])["unpriced_calls"] == 1
+    assert report._judge_cost({}, [call])["unpriced_calls"] == 1
+    with pytest.raises(ValueError, match="score row 7 cites judge call 3"):
+        report._judge_cost({1: [row]}, [])
+
+
+def test_the_pages_pass_vocabulary_and_keys_are_the_servers():
+    """WINDOW: static/lib.js executed in node: PASS_OUTCOMES, and every key
+    scoringPassLine reads from a pass over each ending and each running
+    state, against store.PASS_OUTCOMES and ScoringPass's fields.
+
+    The Score row's line is the list's pass in words, so it reads only
+    what the server sends and words every ending the store can record; a
+    key the line read and the server dropped would vanish from the line
+    without a word. PRE-STATE: every branch of the line is taken."""
+    fields = sorted(main.ScoringPass.model_fields)
+    got = run_lib(
+        "const l = require(process.argv[1]);"
+        "const seen = new Set();"
+        "const base = {id: 1, judge_model: 'j/x', started_at: '2026-09-28T07:10:00',"
+        " ended_at: '2026-09-28T07:11:00', outcome: 'finished', detail: 'd',"
+        " scored: 1, failed: 1, unanswered: 1, unusable: 1, unknown: 1,"
+        " history_counted: 1, running: false, stopping: false};"
+        "const read = (p) => l.scoringPassLine(new Proxy(p,"
+        " {get(t, k) { seen.add(k); return t[k]; }}));"
+        "const lines = l.PASS_OUTCOMES.map((o) => read({...base, outcome: o}));"
+        "lines.push(read({...base, outcome: null, running: true}));"
+        "lines.push(read({...base, outcome: null, running: true, stopping: true}));"
+        "lines.push(read({...base, outcome: null}));"
+        "lines.push(read({...base, unknown: null}));"
+        "process.stdout.write(JSON.stringify([l.PASS_OUTCOMES, [...seen].sort(), lines]));",
+    )
+    outcomes, keys, lines = got
+    assert tuple(outcomes) == store.PASS_OUTCOMES
+    assert set(keys) <= set(fields)
+    assert set(keys) == set(fields) - {"id"}
+    assert len(set(lines)) == len(lines) and all(lines)
+
+
+# ---- The rulings at P1's checkpoint.
+
+
+def test_a_server_will_not_start_while_reconcile_writes(monkeypatch, tmp_path):
+    """WINDOW: a lifespan over a database whose lock reconcile --apply
+    holds (its record, held on its own descriptor here), and a boot after
+    it lets go.
+
+    One process writes to a bench database at a time, so a server does
+    not start while reconcile --apply writes, and its sentence names
+    reconcile rather than calling it another server. PRE-STATE: the lock
+    holds reconcile's record."""
+    db_path = tmp_path / "bench.db"
+    store.connect(str(db_path)).close()
+    lock = store.lock_path(str(db_path))
+    held = store.hold_lock(str(db_path), "reconcile")
+    try:
+        assert Path(lock).read_text().split() == [str(os.getpid()), "reconcile"]
+        with pytest.raises(store.LockHeld) as refused:
+            with boot_against(monkeypatch, db_path):
+                pass
+    finally:
+        store.release_lock(held)
+    assert str(refused.value).startswith(
+        f"{lock} is held by process {os.getpid()}, python -m bench.reconcile "
+        "--apply, which is using this database, and one process writes to a "
+        "bench database at a time, so this server will not start"
+    )
+    with boot_against(monkeypatch, db_path) as c:
+        assert c.get("/models").status_code == 200
+
+
+@respx.mock
+def test_a_cut_whose_ending_cannot_be_written_says_so(monkeypatch, tmp_path):
+    """WINDOW: shutdown's cut of a judge call on the wire, with the write
+    of its stopped ending raising, and the records read after.
+
+    The call's ending could not be written, so the pass's close ends it
+    as interrupted, and its detail says what happened to the request and
+    that only its record was cut off: "it was cut off at shutdown; its
+    write failed: <error>" (the operator's ruling at P1's checkpoint),
+    not the generic sentence and not the boot sweep's. PRE-STATE: the
+    call is open when shutdown begins, and the write raises once."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+
+    def refusing(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+        monkeypatch.setattr(store, "record_judge_call_answer", refusing)
+
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert (call["outcome"], call["detail"], call["answered_at"]) == (
+        "interrupted",
+        "it was cut off at shutdown; its write failed: OperationalError: "
+        "database is locked",
+        None,
+    )
+    assert made["outcome"] == "stopped"
+
+
+@respx.mock
+def test_after_a_call_that_was_never_sent_the_stop_is_read_before_the_next(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: a pass over three judged trials with the bench's client
+    closed, a stop set the moment the first call's not_sent ending is
+    written, and the records after.
+
+    The operator's condition on a closed client at P1's checkpoint: a
+    pass that meets one must not march through every trial writing
+    not_sent once it has been asked to stop. It was already so: the loop
+    reads the stop before every trial, and again inside the slot, so the
+    next trial after a not_sent is not sent; and shutdown closes the
+    client only after its wait for the pass, so a pass never meets a
+    client shutdown closed. Here the stop lands after the first not_sent
+    and the pass ends stopped with that one call. PRE-STATE: the client
+    is closed and no stop is set when the pass starts."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS)
+    client.portal.call(client.app.state.client.aclose)
+    real = store.record_judge_call_answer
+
+    def and_stop(conn, call_id, outcome, **kwargs):
+        real(conn, call_id, outcome, **kwargs)
+        if outcome == "not_sent":
+            main._ask_scoring_to_stop("shutdown")
+
+    monkeypatch.setattr(store, "record_judge_call_answer", and_stop)
+    assert not client.app.state.scoring_run["stop"].is_set()
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    assert judged == []
+    assert [c["outcome"] for c in calls_of(client.app.state.db, eid)] == ["not_sent"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["detail"]) == (
+        "stopped",
+        main.PASS_STOPPED_AT_SHUTDOWN,
+    )
+
+
+SLOT_WAIT_PROOFS = (
+    "test_a_stop_while_a_trial_waits_for_a_slot_sends_nothing",
+    "test_compare_releases_at_the_in_slot_recheck",
+    "test_a_trial_releases_at_the_in_slot_recheck",
+    "test_a_judge_stopped_in_its_slot_releases",
+)
+
+
+def test_the_semaphore_attribute_the_slot_proof_reads_is_there():
+    """WINDOW: an asyncio.Semaphore with its one slot taken and one waiter
+    queued, read the way the slot-wait proofs read it.
+
+    The proofs named in SLOT_WAIT_PROOFS hold a call at the upstream slot
+    by reading asyncio.Semaphore._waiters, a private attribute; the first
+    is P1's, the other three P2's. This is their guard (the operator's
+    ruling at P1's checkpoint): if an interpreter changes the attribute,
+    it fails here, in one line naming the Python the proofs were written
+    for and each proof that reads it, rather than as a timing failure in
+    one of them. PRE-STATE: the waiter is queued, and every proof named
+    reads the attribute (checked against this file's own text)."""
+    text = Path(__file__).read_text()
+    lines = text.splitlines()
+    readers = {
+        node.name
+        for node in ast.parse(text).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name != "test_the_semaphore_attribute_the_slot_proof_reads_is_there"
+        and any(
+            "._waiters" in line for line in lines[node.lineno - 1 : node.end_lineno]
+        )
+    }
+    assert readers == set(SLOT_WAIT_PROOFS)
+
+    async def probe():
+        semaphore = asyncio.Semaphore(1)
+        await semaphore.acquire()
+        waiter = asyncio.ensure_future(semaphore.acquire())
+        await asyncio.sleep(0)
+        waiters = getattr(semaphore, "_waiters", "absent")
+        shape = (type(waiters).__name__, len(waiters) if waiters != "absent" else None)
+        waiter.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await waiter
+        return shape
+
+    shape = asyncio.run(probe())
+    assert shape == ("deque", 1), (
+        f"asyncio.Semaphore._waiters is {shape} on Python "
+        f"{sys.version.split()[0]}; the slot-wait proofs "
+        f"({', '.join(SLOT_WAIT_PROOFS)}) read it as a deque of queued "
+        "waiters, as CPython 3.11 to 3.14 keep it, the versions the CI matrix "
+        "pins (.github/workflows/tests.yml)"
+    )
+
+
+@respx.mock
+def test_a_stop_is_read_between_trials_that_take_no_slot(client, tmp_path, monkeypatch):
+    """WINDOW: a pass over three deterministic trials, a stop set the
+    moment the first trial's score row is written, and the rows after.
+
+    A deterministic trial takes no upstream slot, so the check inside the
+    slot never sees it: the check between trials is the one that stops
+    it. The second and third trials are not scored and the pass ends
+    stopped. PRE-STATE: no stop is set when the pass starts."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    exact = {"id": "e1", "prompt": "p", "reference": "x", "scorer": {"kind": "exact"}}
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS, rows=(exact,))
+    real = store.add_score
+
+    def and_stop(conn, result_id, record):
+        made = real(conn, result_id, record)
+        main._ask_scoring_to_stop("request")
+        return made
+
+    monkeypatch.setattr(store, "add_score", and_stop)
+    assert not client.app.state.scoring_run["stop"].is_set()
+    assert score(client, eid, path, judge_model=None).status_code == 202
+    wait_scoring_done(client)
+
+    assert [r["scorer"] for r in scores_in(client, eid)] == ["exact"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (made["outcome"], made["scored"]) == ("stopped", 1)
+
+
+# ===================================================================
+# Phase P, P2: atomic admission for the spend ceiling.
+# ===================================================================
+
+from bench.models import judge_messages  # noqa: E402
+
+# model/alpha's worst case at the standard budget over the prompt "hi",
+# at its catalog rates: the 16384 completion budget at 2e-6, and two
+# characters of input, one unit at four characters each, at 1e-6.
+W_ALPHA = 16384 * 2e-06 + 1 * 1e-06
+
+
+def priced_catalog(prices):
+    """TEST_CATALOG with each named model priced (prompt, completion),
+    replacing an entry of that id or adding one."""
+    catalog = json.loads(json.dumps(TEST_CATALOG))
+    base = catalog["models"][0]
+    for model, (prompt, completion) in prices.items():
+        entry = dict(
+            base, id=model, name=model, prompt_price=prompt, completion_price=completion
+        )
+        catalog["models"] = [m for m in catalog["models"] if m["id"] != model]
+        catalog["models"].append(entry)
+        catalog["prices"][model] = {"prompt": prompt, "completion": completion}
+    return catalog
+
+
+def ledger_client(monkeypatch, tmp_path, limit, catalog=TEST_CATALOG, slots=None):
+    """spend_client with a catalog, a slot count, and the server's own
+    exceptions answered as they would be to a caller."""
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setenv("BENCH_DB", str(tmp_path / "bench.db"))
+    if limit is None:
+        monkeypatch.delenv("BENCH_SPEND_LIMIT_USD", raising=False)
+    else:
+        monkeypatch.setenv("BENCH_SPEND_LIMIT_USD", repr(limit))
+
+    async def fake_fetch_catalog(client):
+        return json.loads(json.dumps(catalog))
+
+    monkeypatch.setattr("bench.main.fetch_catalog", fake_fetch_catalog)
+    if slots is not None:
+        monkeypatch.setattr("bench.main.MAX_CONCURRENT_UPSTREAM", slots)
+    return TestClient(app, base_url="http://localhost", raise_server_exceptions=False)
+
+
+def billed(model, cost):
+    """A reply charging cost."""
+    return {
+        **FIXTURE,
+        "model": model,
+        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "cost": cost},
+    }
+
+
+def app_client():
+    """A client for requests sent on the app's own loop, from inside the
+    test client's portal, so each handler is scheduled against the others."""
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://localhost",
+        trust_env=False,
+    )
+
+
+async def spin(done, turns=100_000):
+    """Turn the app's loop until done() holds, and fail rather than hang
+    if it never does."""
+    for _ in range(turns):
+        if done():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("the loop never reached the staged state")
+
+
+def held():
+    """What the ledger holds, read so that a tree without one reads 0.0
+    and its pre-state fails on the figure rather than on a missing name."""
+    return math.fsum(getattr(app.state, "spend_reservations", {}).values())
+
+
+def frame(text):
+    return json.loads(text.removeprefix("data: "))
+
+
+async def opened_stream(model="model/alpha", prompt="hi"):
+    """A /compare/stream response past its door, not yet iterated."""
+    response = await compare_stream(StreamCompareRequest(prompt=prompt, model=model))
+    return response.body_iterator
+
+
+# ---- The worst case a call is admitted against.
+
+
+def test_a_calls_worst_case_is_projected_costs_figure_for_that_one_call():
+    """WINDOW: call_worst_case for one call, beside projected_cost asked
+    about the same call. PRE-STATE: the commission's words, "the same
+    figure projected_cost uses", so the two are compared with ==, and the
+    call weighs both of its messages (a system of 9 characters is 3 units
+    at four characters each, the prompt of 5 is 2)."""
+    from bench.models import projected_cost
+
+    prices = {"a": {"prompt": 1e-06, "completion": 2e-06}}
+    chars = {"prompt": 5, "system": 9}
+    whole = projected_cost(
+        1, {"call": chars}, ["a"], 1, {"a": 100}, prices, chars_per_token=4
+    )
+    assert main.CHARS_PER_TOKEN == 4
+    assert main.call_worst_case("a", 100, chars, prices) == whole["total_usd"]
+    assert whole["total_usd"] == 100 * 2e-06 + (2 + 3) * 1e-06
+    # Native: the documents go as images, so only the completion half is
+    # counted, as projected_cost counts it.
+    native = projected_cost(1, None, ["a"], 1, {"a": 100}, prices, chars_per_token=4)
+    assert main.call_worst_case("a", 100, None, prices) == native["output_usd"]
+    assert native["output_usd"] == 100 * 2e-06
+
+
+def test_a_call_is_claimed_at_its_two_rates_as_its_settlement_counts_it():
+    """WINDOW: call_worst_case for a price that also names a charge the
+    two rates cannot count, for no price, for a price missing a rate, and
+    for a rate that is not finite. PRE-STATE: projected_cost refuses the
+    first, naming the dimension, while cost_usd's estimate, which a
+    settlement counts, reads its two rates; so it is claimed at them. The
+    others the catalog cannot price, and they claim nothing."""
+    from bench.models import projected_cost
+
+    prices = {
+        "odd": {"prompt": 1e-06, "completion": 2e-06, "beyond": ["request"]},
+        "half": {"completion": 2e-06},
+        "nan": {"prompt": float("nan"), "completion": 2e-06},
+    }
+    chars = {"prompt": 5, "system": 0}
+    refused = projected_cost(
+        1, {"call": chars}, ["odd"], 1, {"odd": 100}, prices, chars_per_token=4
+    )
+    assert refused["total_usd"] is None and refused["unpriced"]
+    assert main.call_worst_case("odd", 100, chars, prices) == (100 * 2e-06 + 2 * 1e-06)
+    for model in ("absent", "half", "nan"):
+        assert main.call_worst_case(model, 100, chars, prices) is None, model
+
+
+def test_the_ledger_and_the_projection_disagree_about_one_price_shape_only(
+    monkeypatch,
+):
+    """WINDOW: what the ledger reserves for one call beside what the
+    projection (projected_cost over experiment_prices, as the 201 builds
+    it) quotes for the same call, over every shape a price can take: an
+    unpinned model's two rates; its two rates and a charge beyond them; a
+    pinned route's two rates; a pinned route's two rates and a charge
+    beyond them; a pinned route whose endpoint published no price the
+    bench could read; a model the catalog has no entry for; rates at
+    zero; and, though the catalog's token_rates never yields them, a
+    rate missing and a rate not finite, the two functions' own contract.
+
+    The operator's rulings: the two must not disagree silently. They
+    agree on every shape but a charge beyond the two rates, pinned or
+    not, and a pinned route whose price could not be read, and where both
+    price the figure is equal. The first is on BACKLOG ("The projection
+    and the ledger disagree about a model with charges beyond its two
+    rates", the 131 of 396 measurement its reason); the second is the
+    ruling on the external review's H1, and the projection says so in
+    its sentence (models.UNREAD_ROUTE). The name of this proof keeps the
+    words 1d91670 gave it; the shapes are what it holds. PRE-STATE: before
+    the H1 fix the pinned shapes reserved nothing (both disagreements
+    were silent, in the ceiling's unsafe direction)."""
+    from bench.models import projected_cost
+
+    rates = {"prompt": 1e-06, "completion": 2e-06}
+    catalog = {"m": {**rates, "beyond": []}}
+    unpinned = {
+        "two rates": {**rates, "beyond": []},
+        "two rates and a charge beyond": {**rates, "beyond": ["web_search"]},
+        "no entry": None,
+        "a rate missing": {"completion": 2e-06},
+        "a rate not finite": {"prompt": float("nan"), "completion": 2e-06},
+        "rates at zero": {"prompt": 0.0, "completion": 0.0, "beyond": []},
+    }
+    pinned = {
+        "a pinned route's two rates": {"rates": rates, "beyond": []},
+        "a pinned route's two rates and a charge beyond": {
+            "rates": rates,
+            "beyond": ["input_cache_read"],
+        },
+        "a pinned route whose price could not be read": {"rates": None, "beyond": []},
+    }
+    chars = {"prompt": 5, "system": 9}
+
+    def projected(prices):
+        try:
+            return projected_cost(
+                1, {"call": chars}, ["m"], 1, {"m": 100}, prices, chars_per_token=4
+            )["total_usd"]
+        except (KeyError, TypeError):
+            return None
+
+    disagree = []
+    for name, price in unpinned.items():
+        prices = {} if price is None else {"m": price}
+        quoted, reserved = (
+            projected(prices),
+            main.call_worst_case("m", 100, chars, prices),
+        )
+        if (quoted is None) != (reserved is None):
+            disagree.append(name)
+        elif reserved is not None:
+            assert reserved == quoted, name
+    monkeypatch.setattr(main.app.state, "prices", catalog, raising=False)
+    for name, route in pinned.items():
+        route = {"pin": "together", **route}
+        quoted = projected(main.experiment_prices(["m"], {"m": route}, catalog))
+        reserved = main.trial_worst_case("m", 100, chars, route)
+        if (quoted is None) != (reserved is None):
+            disagree.append(name)
+        elif reserved is not None:
+            assert reserved == quoted, name
+    assert disagree == [
+        "two rates and a charge beyond",
+        "a pinned route's two rates and a charge beyond",
+        "a pinned route whose price could not be read",
+    ]
+    # What the unread route reserves is the catalog's figure for the call.
+    unread = {"pin": "together", "rates": None, "beyond": []}
+    assert main.trial_worst_case("m", 100, chars, unread) == projected(catalog)
+
+
+# ---- The window: two claims racing the last dollar.
+
+
+@respx.mock
+def test_two_members_of_one_batch_race_the_last_dollar(monkeypatch, tmp_path):
+    """WINDOW: one /compare naming model/alpha twice, both members past the
+    door, the first member's reply held at a gate on the app's loop while
+    the second claims. PRE-STATE: the limit (0.05) holds one worst case
+    (0.032769) and not two, so both pass the door, and before P2 both were
+    sent (measured at 1f143e3: 2 calls)."""
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        assert W_ALPHA <= 0.05 < 2 * W_ALPHA
+
+        async def staged():
+            gate = asyncio.Event()
+
+            async def reply(request):
+                calls.append(json.loads(request.content)["model"])
+                if len(calls) > 1:
+                    gate.set()
+                await gate.wait()
+                return httpx.Response(200, json=billed("model/alpha", 0.001))
+
+            route.mock(side_effect=reply)
+            async with app_client() as r:
+                sent = asyncio.ensure_future(
+                    r.post(
+                        "/compare",
+                        json={"prompt": "hi", "models": ["model/alpha", "model/alpha"]},
+                    )
+                )
+                await spin(lambda: calls)
+                during = held()
+                gate.set()
+                return await sent, during
+
+        resp, during = c.portal.call(staged)
+        assert resp.status_code == 200
+        first, second = resp.json()["results"]
+        assert len(calls) == 1
+        assert during == pytest.approx(W_ALPHA)
+        assert first["error"] is None
+        # The sentence carries the evidence: the second was refused while
+        # the first held its claim.
+        assert second["error"] == (
+            "run refused before reaching upstream: recorded $0.00 of $0.05 "
+            "limit (BENCH_SPEND_LIMIT_USD) and $0.032769 reserved by calls not "
+            "yet settled leave no room for the $0.032769 this run reserves; "
+            "no upstream call was made"
+        )
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_two_streams_past_their_doors_race_the_last_dollar(monkeypatch, tmp_path):
+    """WINDOW: two /compare/stream requests both past their doors with
+    nothing reserved, then driven on the app's loop: the first to its held
+    upstream call, the second to its end. PRE-STATE: both doors passed
+    with nothing reserved, and before P2 the second streamed a whole
+    answer (measured at 1f143e3: started, delta, delta, done)."""
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gate = asyncio.Event()
+
+            async def reply(request):
+                calls.append(1)
+                if len(calls) > 1:
+                    gate.set()
+                await gate.wait()
+                return httpx.Response(200, stream=alpha_stream())
+
+            route.mock(side_effect=reply)
+            a = await opened_stream()
+            b = await opened_stream()
+            before = held()
+            first_a = frame(await a.__anext__())
+            pending = asyncio.ensure_future(a.__anext__())
+            await spin(lambda: calls)
+            frames_b = [frame(f) async for f in b]
+            during = held()
+            gate.set()
+            rest = [await pending] + [f async for f in a]
+            return before, first_a, frames_b, during, rest
+
+        before, first_a, frames_b, during, rest = c.portal.call(staged)
+        assert before == 0.0
+        assert first_a["type"] == "started"
+        assert [f["type"] for f in frames_b] == ["done"]
+        refusal = frames_b[0]["result"]
+        assert frames_b[0]["run_id"] is None
+        assert refusal["spend_refused"] is True
+        assert "$0.032769 reserved by calls not yet settled" in refusal["error"]
+        assert during == pytest.approx(W_ALPHA)
+        assert frame(rest[-1])["type"] == "done"
+        assert len(calls) == 1
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_two_streams_claim_the_last_dollar_in_the_same_turns(monkeypatch, tmp_path):
+    """WINDOW: two /compare/stream requests past their doors with nothing
+    reserved, their first steps driven together by asyncio.gather, so each
+    runs its check and its claim in the same turns of the loop as the
+    other.
+
+    The room holds one claim: one stream starts holding W_ALPHA, and the
+    other is refused in its first frame. A door's check and its claim are
+    one synchronous step (the external review's M11: the proof above
+    drives the first stream to its started frame before the second runs,
+    so a claim split from its check by an await passed it). PRE-STATE:
+    both doors passed with nothing reserved."""
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gate = asyncio.Event()
+
+            async def reply(request):
+                calls.append(1)
+                await gate.wait()
+                return httpx.Response(200, stream=alpha_stream())
+
+            route.mock(side_effect=reply)
+            a = await opened_stream()
+            b = await opened_stream()
+            before = held()
+            firsts = await asyncio.gather(a.__anext__(), b.__anext__())
+            during = held()
+            gate.set()
+            rests = [[f async for f in stream] for stream in (a, b)]
+            return before, [frame(f) for f in firsts], during, rests
+
+        before, firsts, during, rests = c.portal.call(staged)
+        assert before == 0.0
+        assert sorted(f["type"] for f in firsts) == ["done", "started"]
+        (refused,) = [f for f in firsts if f["type"] == "done"]
+        assert refused["result"]["spend_refused"] is True
+        assert during == pytest.approx(W_ALPHA)
+        assert len(calls) == 1
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_the_door_refuses_what_a_call_in_flight_has_reserved(monkeypatch, tmp_path):
+    """WINDOW: a /compare held at its upstream call, then a second /compare
+    and a /compare/stream at their doors. PRE-STATE: nothing recorded and
+    one claim held, so before P2 both doors admitted (measured at 1f143e3:
+    200 and 200)."""
+    calls = []
+    route = respx.post(OPENROUTER_URL)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gate = asyncio.Event()
+
+            async def reply(request):
+                calls.append(1)
+                if len(calls) > 1:
+                    gate.set()
+                await gate.wait()
+                return httpx.Response(200, json=billed("model/alpha", 0.001))
+
+            route.mock(side_effect=reply)
+            async with app_client() as r:
+                a = asyncio.ensure_future(
+                    r.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+                )
+                await spin(lambda: calls)
+                recorded = app.state.accumulated_spend_usd
+                b = await r.post(
+                    "/compare", json={"prompt": "hi", "models": ["model/alpha"]}
+                )
+                s = await r.post(
+                    "/compare/stream", json={"prompt": "hi", "model": "model/alpha"}
+                )
+                gate.set()
+                return await a, b, s, recorded
+
+        a, b, s, recorded = c.portal.call(staged)
+        assert recorded == 0.0
+        assert a.status_code == 200
+        for resp in (b, s):
+            assert resp.status_code == 402
+            assert resp.json()["detail"] == (
+                "spend ceiling: recorded $0.00 of $0.05 limit "
+                "(BENCH_SPEND_LIMIT_USD) and $0.032769 reserved by calls not yet "
+                "settled leave no room for the $0.032769 this run reserves; "
+                "recorded spend leaves out what could not be priced"
+            )
+        assert len(calls) == 1
+
+
+@respx.mock
+def test_a_batch_none_of_whose_calls_fit_is_refused_at_its_door(monkeypatch, tmp_path):
+    """WINDOW: POST /compare for a batch whose every member's worst case
+    passes the room left, priced and then with a member the catalog cannot
+    price, and last with the claims already past the limit, as a
+    settlement above its claim leaves them. PRE-STATE: recorded spend is
+    under the limit throughout, so the ceiling is not reached, and before
+    P2 every batch was admitted (measured at 1f143e3: 200, 200, 200)."""
+    up = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    catalog = priced_catalog({"model/dear": (1e-06, 4e-06)})
+    with ledger_client(monkeypatch, tmp_path, 0.03, catalog=catalog) as c:
+        assert not main.spend_ceiling_reached()
+        priced = c.post(
+            "/compare", json={"prompt": "hi", "models": ["model/dear", "model/alpha"]}
+        )
+        assert priced.status_code == 402
+        assert priced.json()["detail"] == (
+            "spend ceiling: recorded $0.00 of $0.03 limit (BENCH_SPEND_LIMIT_USD) "
+            "and $0.00 reserved by calls not yet settled leave no room for any "
+            "of this batch's calls, the least of which reserves $0.032769; "
+            "recorded spend leaves out what could not be priced"
+        )
+        # A member the catalog cannot price claims nothing, so it fits
+        # until recorded spend reaches the limit, and the batch runs it.
+        mixed = c.post(
+            "/compare", json={"prompt": "hi", "models": ["model/alpha", "model/bare"]}
+        )
+        assert mixed.status_code == 200
+        first, second = mixed.json()["results"]
+        assert "leave no room for the $0.032769 this run reserves" in first["error"]
+        assert second["error"] is None
+        assert up.call_count == 1
+        # A claim held while recorded spend rose past what it left room
+        # for: the limit is not reached, and nothing fits beside them.
+        c.app.state.accumulated_spend_usd = 0.029
+        c.app.state.spend_reservations[object()] = 0.002
+        assert not main.spend_ceiling_reached()
+        full = c.post(
+            "/compare", json={"prompt": "hi", "models": ["model/alpha", "model/bare"]}
+        )
+        assert full.status_code == 402
+        assert full.json()["detail"] == (
+            "spend ceiling: recorded $0.029 of $0.03 limit (BENCH_SPEND_LIMIT_USD) "
+            "and $0.002 reserved by calls not yet settled leave no room for any "
+            "of this batch's calls, even one the catalog cannot price; recorded "
+            "spend leaves out what could not be priced"
+        )
+        assert up.call_count == 1
+
+
+@respx.mock
+def test_a_queued_stream_holds_its_claim_and_a_cancel_returns_it(monkeypatch, tmp_path):
+    """WINDOW: the one slot held by hand; a stream parked at its queued
+    frame; a second stream past its door; GET /models; the first closed at
+    the queued yield. PRE-STATE: the semaphore is locked, so the first
+    queues, and before P2 the second queued too (measured at 1f143e3: its
+    first frame was queued)."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.05, slots=1) as c:
+
+        async def staged():
+            await app.state.upstream_semaphore.acquire()
+            assert app.state.upstream_semaphore.locked()
+            a = await opened_stream()
+            b = await opened_stream()
+            first = frame(await a.__anext__())
+            queued = held()
+            first_b = frame(await b.__anext__())
+            await b.aclose()
+            async with app_client() as r:
+                figures = (await r.get("/models")).json().get("spend")
+            await a.aclose()
+            after = held()
+            app.state.upstream_semaphore.release()
+            return first, queued, first_b, figures, after
+
+        first, queued, first_b, figures, after = c.portal.call(staged)
+        assert first["type"] == "queued"
+        assert queued == pytest.approx(W_ALPHA)
+        assert first_b["type"] == "done"
+        assert first_b["result"]["spend_refused"] is True
+        assert figures == {
+            "accumulated_usd": 0.0,
+            "limit_usd": 0.05,
+            "reserved_usd": pytest.approx(W_ALPHA),
+        }
+        assert after == 0.0
+        assert route.call_count == 0
+
+
+def test_a_stream_never_iterated_holds_nothing(monkeypatch, tmp_path):
+    """WINDOW: a /compare/stream response past its door and dropped without
+    being iterated, as a client that never reads it leaves it. PRE-STATE: a
+    generator that never starts runs no finally, so a claim taken at the
+    door would be held for the life of the process; the stream takes its
+    claim as its generator's first step, and so holds nothing here. A pin:
+    green before P2, which had no claims (measured at 1f143e3), and red
+    under a claim taken at the door (the battery's D5)."""
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gen = await opened_stream()
+            during = held()
+            del gen
+            return during
+
+        assert c.portal.call(staged) == 0.0
+        assert held() == 0.0
+
+
+@respx.mock
+def test_a_claim_weighs_the_system_message_as_the_projection_does(
+    monkeypatch, tmp_path
+):
+    """WINDOW: POST /compare carrying a 40 character system message, the
+    limit between the call's worst case without it and with it. PRE-STATE:
+    the system message is ten units at four characters each, $0.00001 at
+    alpha's prompt rate, and without it the call would fit (before P2 the
+    door admitted it: 200)."""
+    up = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with_system = W_ALPHA + 10 * 1e-06
+    limit = 0.03277
+    assert W_ALPHA <= limit < with_system
+    with ledger_client(monkeypatch, tmp_path, limit) as c:
+        resp = c.post(
+            "/compare",
+            json={
+                "prompt": "hi",
+                "models": ["model/alpha"],
+                "params": {"system": "s" * 40},
+            },
+        )
+        assert resp.status_code == 402
+        assert resp.json()["detail"].endswith(
+            "leave no room for the $0.032779 this run reserves; recorded "
+            "spend leaves out what could not be priced"
+        )
+        assert up.call_count == 0
+
+
+@respx.mock
+def test_calls_that_reserve_nothing_keep_the_older_bound(monkeypatch, tmp_path):
+    """WINDOW: the reviewer's original lineup, eight five-member /compare
+    batches sent at once on the app's loop, one slow member each and only
+    model/alpha priced, against a ceiling worth half a result.
+
+    PRE-STATE: alpha's reservation (0.032769) passes the 0.005 limit, so
+    it is refused at its reservation; the other four members reserve
+    nothing and are admitted, so for them the bound is the older one, the
+    recheck in the slot after the first settlement: at most
+    MAX_CONCURRENT_UPSTREAM calls. This is the test a300623 wrote, moved
+    from eight threads to the app's own loop, kept beside its rewrite
+    because it is the proof of the bound for calls that reserve nothing. A
+    pin: within the bound at 1f143e3 too, and red without the recheck in
+    the slot (the battery's R1 sends every call admitted before the first
+    settlement)."""
+
+    async def respond(request):
+        if b'"model/slow"' in request.content:
+            await asyncio.sleep(0.25)
+        return httpx.Response(200, json=billed("model/any", 0.01))
+
+    route = respx.post(OPENROUTER_URL).mock(side_effect=respond)
+    lineup = ["model/slow", "model/alpha", "model/beta", "model/gamma", "model/delta"]
+    with ledger_client(monkeypatch, tmp_path, 0.005) as c:
+
+        async def staged():
+            async with app_client() as r:
+                return await asyncio.gather(
+                    *(
+                        r.post("/compare", json={"prompt": "p", "models": lineup})
+                        for _ in range(8)
+                    )
+                )
+
+        answers = c.portal.call(staged)
+        assert 1 <= len(route.calls) <= main.MAX_CONCURRENT_UPSTREAM, len(route.calls)
+        refused = 0
+        for resp in answers:
+            assert resp.status_code in (200, 402), resp.status_code
+            if resp.status_code == 402:
+                refused += len(lineup)
+                continue
+            for result in resp.json()["results"]:
+                if result["error"] and "refused" in result["error"]:
+                    refused += 1
+        assert refused + len(route.calls) == 8 * len(lineup)
+        assert held() == 0.0
+
+
+@respx.mock
+def test_a_stream_whose_settlement_raises_gives_its_reservation_back(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a /compare/stream run whose settlement raises (pricing the
+    result fails) after its answer streamed, read at its first delta and
+    after it ends. PRE-STATE: the reservation is held at the delta (before
+    P2: 0.0); the answer is still delivered with run_id null, as for any
+    failure after the money moved, nothing is counted, and the stream ends
+    normally, so only its finally, not an exception, gives the reservation
+    back."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+
+    def boom(*args, **kwargs):
+        raise ValueError("pricing failed")
+
+    monkeypatch.setattr(main, "cost_usd", boom)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gen = await opened_stream()
+            during = None
+            frames = []
+            async for text in gen:
+                frames.append(frame(text))
+                if frames[-1]["type"] == "delta" and during is None:
+                    during = held()
+            return during, frames, held(), app.state.accumulated_spend_usd
+
+        during, frames, after, recorded = c.portal.call(staged)
+        assert during == pytest.approx(W_ALPHA)
+        assert frames[-1]["type"] == "done"
+        assert frames[-1]["run_id"] is None
+        assert frames[-1]["result"]["response_text"] == "Hello"
+        assert (after, recorded) == (0.0, 0.0)
+
+
+# ---- Settlement arithmetic.
+
+# Dyadic, so every sum below is exact: the 16384 completion budget at
+# 2**-20 is 2**-6, and one unit of input at 2**-20.
+DYADIC = {"model/dyad": (2.0**-20, 2.0**-20)}
+W_DYADIC = 2.0**-6 + 2.0**-20
+
+
+@respx.mock
+def test_settlement_replaces_each_claim_with_what_was_recorded(monkeypatch, tmp_path):
+    """WINDOW: two calls in flight on one /compare, each held at its own
+    gate on the app's loop; the first settled below its worst case, then
+    the second above it. PRE-STATE: both claims are held and nothing is
+    recorded (before P2 there was no ledger to read: 0.0 held)."""
+    lower, higher = 2.0**-8, 2.0**-5
+    assert lower < W_DYADIC < higher
+    gates = {}
+    route = respx.post(OPENROUTER_URL)
+    catalog = priced_catalog(DYADIC)
+    with ledger_client(monkeypatch, tmp_path, 2.0**-3, catalog=catalog) as c:
+
+        async def staged():
+            order = []
+
+            async def reply(request):
+                n = len(order)
+                order.append(n)
+                gates[n] = asyncio.Event()
+                await gates[n].wait()
+                cost = (lower, higher)[n]
+                return httpx.Response(200, json=billed("model/dyad", cost))
+
+            route.mock(side_effect=reply)
+            snaps = []
+            async with app_client() as r:
+                sent = asyncio.ensure_future(
+                    r.post(
+                        "/compare",
+                        json={"prompt": "hi", "models": ["model/dyad", "model/dyad"]},
+                    )
+                )
+                await spin(lambda: len(order) == 2)
+                snaps.append((app.state.accumulated_spend_usd, held()))
+                gates[0].set()
+                await spin(lambda: len(app.state.spend_reservations) == 1)
+                snaps.append((app.state.accumulated_spend_usd, held()))
+                gates[1].set()
+                resp = await sent
+                snaps.append((app.state.accumulated_spend_usd, held()))
+                return resp, snaps
+
+        resp, snaps = c.portal.call(staged)
+        assert resp.status_code == 200
+        assert snaps[0] == (0.0, 2 * W_DYADIC)
+        # Settled below its claim: the figure falls by the difference.
+        assert snaps[1] == (lower, W_DYADIC)
+        # Settled above it: the figure rises by the difference.
+        assert snaps[2] == (lower + higher, 0.0)
+        recorded = [
+            row["billed_cost_usd"]
+            for row in c.app.state.db.execute("SELECT billed_cost_usd FROM results")
+        ]
+        assert math.fsum(recorded) == snaps[2][0] + snaps[2][1]
+
+
+@respx.mock
+def test_a_streamed_settlement_is_whole_by_the_done_frame(monkeypatch, tmp_path):
+    """WINDOW: a /compare/stream run suspended at its done frame, after
+    settlement and before its generator's finally. PRE-STATE: its claim
+    was held when its first delta arrived (before P2: 0.0)."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gen = await opened_stream()
+            seen = {}
+            async for text in gen:
+                event = frame(text)
+                if event["type"] == "delta" and "during" not in seen:
+                    seen["during"] = held()
+                if event["type"] == "done":
+                    seen["done"] = (
+                        app.state.accumulated_spend_usd,
+                        held(),
+                        event["result"]["cost_usd"],
+                    )
+                    await gen.aclose()
+                    break
+            return seen
+
+        seen = c.portal.call(staged)
+        assert seen["during"] == pytest.approx(W_ALPHA)
+        # 13 in and 8 out at alpha's catalog rates, no billed figure: the
+        # claim left and the cost arrived in one step.
+        assert seen["done"] == (2.9e-05, 0.0, 2.9e-05)
+
+
+def test_the_boundary_admits_at_equality_and_the_reached_rule_stands(
+    monkeypatch, tmp_path
+):
+    """WINDOW: reserve_spend on a booted app, the figures dyadic so every
+    sum is exact. PRE-STATE: recorded spend is below the limit by exactly
+    two claims."""
+    with ledger_client(monkeypatch, tmp_path, 2.0**-2) as c:
+        c.app.state.accumulated_spend_usd = 2.0**-3
+        first = main.reserve_spend(2.0**-4)
+        second = main.reserve_spend(2.0**-4)
+        assert first is not None and second is not None and first != second
+        assert c.app.state.accumulated_spend_usd + main.spend_reserved_usd() == 2.0**-2
+        assert main.reserve_spend(2.0**-20) is None
+        # A call the catalog cannot price claims nothing: admitted while
+        # the claims leave the limit unpassed, refused once recorded spend
+        # reaches it, the rule the entry check always had, >= at equality.
+        assert main.reserve_spend(None) is not None
+        main.release_spend(first)
+        main.release_spend(second)
+        c.app.state.accumulated_spend_usd = 2.0**-2
+        assert main.reserve_spend(None) is None
+        assert main.spend_reserved_usd() == 0.0
+
+
+def test_releases_in_any_order_leave_exactly_nothing_reserved(monkeypatch, tmp_path):
+    """WINDOW: three claims released out of order. PRE-STATE: a running
+    float over the same figures leaves a residue, so an exact zero is a
+    property of the ledger's shape, not of the numbers."""
+    running = 0.0
+    for worst in (0.1, 0.2, 0.3):
+        running += worst
+    for worst in (0.2, 0.1, 0.3):
+        running -= worst
+    assert running != 0.0
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        keys = [main.reserve_spend(worst) for worst in (0.1, 0.2, 0.3)]
+        for i in (1, 0, 2):
+            main.release_spend(keys[i])
+        assert main.spend_reserved_usd() == 0.0
+        assert c.get("/models").json()["spend"]["reserved_usd"] == 0.0
+
+
+@respx.mock
+def test_an_unpriced_run_is_refused_once_the_claims_pass_the_limit(
+    monkeypatch, tmp_path
+):
+    """WINDOW: POST /compare for a model the catalog cannot price, with a
+    claim held whose room recorded spend has since grown into, as a
+    settlement above its claim leaves the ledger; then with recorded spend
+    at the limit. PRE-STATE: the figures are dyadic, recorded spend is
+    under the limit in the first case, so the ceiling is not reached and
+    before P2 the run was admitted (measured at 1f143e3: 200); in the
+    second the ceiling is reached, which the entry check answers in its
+    own words, as it did before P2."""
+    up = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with ledger_client(monkeypatch, tmp_path, 0.5) as c:
+        c.app.state.accumulated_spend_usd = 0.4375
+        c.app.state.spend_reservations[object()] = 0.125
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/bare"]})
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == (
+            "spend ceiling: recorded $0.4375 of $0.50 limit "
+            "(BENCH_SPEND_LIMIT_USD) and $0.125 reserved by calls not yet "
+            "settled leave no room for this run, which the catalog cannot "
+            "price; recorded spend leaves out what could not be priced"
+        )
+        c.app.state.spend_reservations.clear()
+        c.app.state.accumulated_spend_usd = 0.5
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/bare"]})
+        assert resp.status_code == 402
+        assert resp.json()["detail"] == (
+            "spend ceiling reached: recorded $0.50 of $0.50 limit "
+            "(BENCH_SPEND_LIMIT_USD); unpriced runs do not count against it"
+        )
+        assert up.call_count == 0
+
+
+def test_models_reports_reserved_only_under_a_ceiling(monkeypatch, tmp_path):
+    """WINDOW: GET /models on a boot without a ceiling and on one with.
+    PRE-STATE: the environment's limit is cleared for the first; before P2
+    the body carried no spend at all."""
+    with ledger_client(monkeypatch, tmp_path, None) as c:
+        assert c.app.state.spend_limit_usd is None
+        assert c.get("/models").json()["spend"] == {"accumulated_usd": 0.0}
+    with ledger_client(monkeypatch, tmp_path, 0.5) as c:
+        main.reserve_spend(0.125)
+        assert c.get("/models").json()["spend"] == {
+            "accumulated_usd": 0.0,
+            "limit_usd": 0.5,
+            "reserved_usd": 0.125,
+        }
+
+
+# ---- Release on every exit, door by door.
+
+
+def raising_stream(seen):
+    async def boom(*args, **kwargs):
+        seen.append(held())
+        raise RuntimeError("raised before the request went out")
+        yield  # pragma: no cover
+
+    return boom
+
+
+def test_compare_releases_on_a_raise_before_the_request(monkeypatch, tmp_path):
+    """WINDOW: /compare whose client call raises before any request is
+    built. PRE-STATE: the claim is held at the moment of the raise (before
+    P2: 0.0)."""
+    seen = []
+
+    async def boom(*args, **kwargs):
+        seen.append(held())
+        raise RuntimeError("raised before the request went out")
+
+    monkeypatch.setattr(main, "run_model", boom)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        resp = c.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+        assert resp.status_code == 500
+        assert seen == [pytest.approx(W_ALPHA)]
+        assert c.app.state.spend_reservations == {}
+
+
+def test_stream_releases_on_a_raise_before_the_request(monkeypatch, tmp_path):
+    """WINDOW: /compare/stream whose client generator raises before its
+    first event. PRE-STATE: the claim is held at the raise (before P2:
+    0.0)."""
+    seen = []
+    monkeypatch.setattr(main, "stream_model", raising_stream(seen))
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gen = await opened_stream()
+            with pytest.raises(RuntimeError):
+                async for _ in gen:
+                    pass
+            return held()
+
+        assert c.portal.call(staged) == 0.0
+        assert seen == [pytest.approx(W_ALPHA)]
+
+
+def test_a_trial_releases_on_a_raise_before_the_request(monkeypatch, tmp_path):
+    """WINDOW: an experiment's first trial, whose client generator raises
+    before its first event. PRE-STATE: the claim is held at the raise
+    (before P2: 0.0), and the experiment records the failure."""
+    seen = []
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+        monkeypatch.setattr(main, "stream_model", raising_stream(seen))
+        final = run_experiment_to_completion(c, eid, path)
+        assert final["status"] == "failed"
+        assert seen == [pytest.approx(W_ALPHA)]
+        assert c.app.state.spend_reservations == {}
+
+
+JUDGE_PRICES = {"judge/one": (1e-06, 2e-06)}
+
+
+def judge_worst(rubric, text, reference=None):
+    """The judge's worst case, weighed from the messages it sends."""
+    system, user = judge_messages(rubric, reference, text)
+    units = -(-len(user["content"]) // 4) + -(-len(system["content"]) // 4)
+    return JUDGE_MAX_TOKENS * 2e-06 + units * 1e-06
+
+
+@respx.mock
+def test_the_judge_releases_on_a_raise_before_the_request(monkeypatch, tmp_path):
+    """WINDOW: a scoring pass whose sent-record write raises, so the
+    request is never made. PRE-STATE: the judge's claim is held at the
+    raise (before P2: 0.0)."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    seen = []
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+
+        def refuse(*args, **kwargs):
+            seen.append(held())
+            raise sqlite3.OperationalError("disk I/O error")
+
+        monkeypatch.setattr(main.store, "record_judge_call_sent", refuse)
+        assert score(c, eid, path).status_code == 202
+        wait_pass_ended(c)
+        assert c.app.state.scoring_run["error"] is not None
+        assert seen == [pytest.approx(judge_worst("kindness", "Hello"))]
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_compare_releases_at_the_in_slot_recheck(monkeypatch, tmp_path):
+    """WINDOW: a /compare member queued behind a held slot while recorded
+    spend is carried to the limit, then the slot freed. PRE-STATE: the
+    member holds its claim while it waits (before P2: 0.0)."""
+    up = respx.post(OPENROUTER_URL).respond(json=FIXTURE)
+    with ledger_client(monkeypatch, tmp_path, 0.05, slots=1) as c:
+
+        async def staged():
+            sem = app.state.upstream_semaphore
+            await sem.acquire()
+            async with app_client() as r:
+                sent = asyncio.ensure_future(
+                    r.post("/compare", json={"prompt": "hi", "models": ["model/alpha"]})
+                )
+                await spin(lambda: sem._waiters)
+                queued = held()
+                app.state.accumulated_spend_usd = 0.05
+                sem.release()
+                return await sent, queued
+
+        resp, queued = c.portal.call(staged)
+        assert queued == pytest.approx(W_ALPHA)
+        assert resp.json()["results"][0]["error"] == (
+            "run refused before reaching upstream: recorded spend $0.05 reached "
+            "the $0.05 ceiling (BENCH_SPEND_LIMIT_USD); no upstream call was made"
+        )
+        assert up.call_count == 0
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_stream_claimed_and_queued_is_refused_in_its_slot(monkeypatch, tmp_path):
+    """WINDOW: a /compare/stream run claimed and parked at its queued frame
+    behind a held slot, recorded spend then carried to the limit, and the
+    slot freed; the ledger read while the generator is suspended on its
+    refusal frame. PRE-STATE: the run holds its claim while it waits
+    (before P2: 0.0), so the refusal can only come from the check in the
+    slot, and the slot and the claim are both given back before the frame
+    is yielded."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.05, slots=1) as c:
+
+        async def staged():
+            sem = app.state.upstream_semaphore
+            await sem.acquire()
+            gen = await opened_stream()
+            first = frame(await gen.__anext__())
+            queued = held()
+            app.state.accumulated_spend_usd = 0.05
+            sem.release()
+            rest = []
+            async for text in gen:
+                # Read at the frame, while the generator is suspended on
+                # it: a reader slow to take the refusal holds nothing.
+                rest.append(frame(text))
+                at_frame = held()
+            return first, queued, rest, at_frame, sem._value
+
+        first, queued, rest, at_frame, value = c.portal.call(staged)
+        assert first["type"] == "queued"
+        assert queued == pytest.approx(W_ALPHA)
+        assert [f["type"] for f in rest] == ["done"]
+        assert at_frame == 0.0
+        assert rest[0]["result"]["error"] == (
+            "run refused before reaching upstream: recorded spend $0.05 reached "
+            "the $0.05 ceiling (BENCH_SPEND_LIMIT_USD); no upstream call was made"
+        )
+        assert value == 1
+        assert route.call_count == 0
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_trial_releases_at_the_in_slot_recheck(monkeypatch, tmp_path):
+    """WINDOW: an experiment's first trial queued behind the held slot
+    while recorded spend is carried to the limit, then the slot freed.
+    PRE-STATE: the trial holds its claim while it waits (before P2: 0.0)."""
+    up = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.05, slots=1) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+        sem = c.app.state.upstream_semaphore
+        c.portal.call(sem.acquire)
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        drive_until(c, lambda: sem._waiters, "the trial never queued")
+        queued = held()
+        c.app.state.accumulated_spend_usd = 0.05
+
+        async def free():
+            sem.release()
+
+        c.portal.call(free)
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "the run")
+        assert queued == pytest.approx(W_ALPHA)
+        assert up.call_count == 0
+        assert c.app.state.spend_reservations == {}
+        final = c.get(f"/experiments/{eid}").json()
+        assert final["status"] == "halted_on_refusal"
+        assert final["status_detail"] == (
+            "the per-boot spend ceiling refused model/alpha on task t1 before "
+            "it reached upstream; the trial's row names the figures"
+        )
+
+
+@respx.mock
+def test_a_stream_cut_mid_answer_releases_and_counts_nothing(monkeypatch, tmp_path):
+    """WINDOW: a /compare/stream run closed at its first delta, the way a
+    disconnect lands it. PRE-STATE: the claim is held at the delta (before
+    P2: 0.0)."""
+    respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+
+        async def staged():
+            gen = await opened_stream()
+            async for text in gen:
+                if frame(text)["type"] == "delta":
+                    break
+            during = held()
+            await gen.aclose()
+            return during, held(), app.state.accumulated_spend_usd
+
+        during, after, recorded = c.portal.call(staged)
+        assert during == pytest.approx(W_ALPHA)
+        assert (after, recorded) == (0.0, 0.0)
+        (run,) = c.get("/runs").json()["runs"]
+        detail = c.get(f"/runs/{run['id']}").json()
+        assert detail["results"][0]["error"] == "stream aborted before completion"
+
+
+@respx.mock
+def test_a_judge_call_cut_at_shutdown_releases(monkeypatch, tmp_path):
+    """WINDOW: a judge call that never answers, the bench shut down with
+    the bound at 0.2 s. PRE-STATE: the call's claim is held while it is on
+    the wire (before P2: 0.0)."""
+    monkeypatch.setattr(main, "SCORING_SHUTDOWN_SECONDS", 0.2)
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(held())
+        await asyncio.sleep(60)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        recorded = c.app.state.accumulated_spend_usd
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged, "the judge call never left")
+    assert judged == [pytest.approx(judge_worst("kindness", "Hello"))]
+    assert app.state.spend_reservations == {}
+    assert app.state.accumulated_spend_usd == recorded
+
+
+@respx.mock
+def test_a_judge_stopped_in_its_slot_releases(monkeypatch, tmp_path):
+    """WINDOW: every slot held, a pass whose judge call queues, Stop, the
+    slots freed. PRE-STATE: the queued call holds its claim (before P2:
+    0.0)."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        sem = c.app.state.upstream_semaphore
+
+        async def hold_all():
+            for _ in range(main.MAX_CONCURRENT_UPSTREAM):
+                await sem.acquire()
+
+        async def free_all():
+            for _ in range(main.MAX_CONCURRENT_UPSTREAM):
+                sem.release()
+
+        c.portal.call(hold_all)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: sem._waiters, "the judge call never queued")
+        queued = held()
+        stop = c.post(f"/experiments/{eid}/scoring/stop", json={})
+        assert stop.status_code == 202
+        c.portal.call(free_all)
+        wait_pass_ended(c)
+        assert queued == pytest.approx(judge_worst("kindness", "Hello"))
+        assert judged == []
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_judge_call_that_times_out_releases_and_counts_nothing(monkeypatch, tmp_path):
+    """WINDOW: a judge call that times out after sending. PRE-STATE: the
+    claim is held when the timeout is raised (before P2: 0.0)."""
+    seen = []
+
+    def route(request):
+        if is_judge(request):
+            seen.append(held())
+            raise httpx.ReadTimeout("sent", request=request)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        recorded = c.app.state.accumulated_spend_usd
+        assert score(c, eid, path).status_code == 202
+        wait_scoring_done(c)
+        assert seen == [pytest.approx(judge_worst("kindness", "Hello"))]
+        assert c.app.state.spend_reservations == {}
+        assert c.app.state.accumulated_spend_usd == recorded
+        (call,) = calls_of(c.app.state.db, eid)
+        assert (call["outcome"], call["prompt_tokens"]) == ("timed_out", None)
+
+
+# ---- The judge reserves and settles like a trial (ruling R2).
+
+
+@respx.mock
+def test_a_judge_call_claims_its_worst_case_and_settles_on_its_counts(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judged pass whose judge the catalog prices; the reply
+    carries its counts and no charge. PRE-STATE: during the call the claim
+    is the judge's worst case at its own completion budget, and before P2
+    nothing was claimed and an unbilled reply counted nothing (measured at
+    1f143e3: 0.0 held, recorded spend unmoved)."""
+    during = []
+
+    def route(request):
+        body = json.loads(request.content)
+        if body["model"] != "judge/one":
+            return httpx.Response(200, stream=alpha_stream())
+        during.append((held(), body["max_tokens"]))
+        answer = judge_answer(gen="gj")
+        answer["usage"] = {"prompt_tokens": 30, "completion_tokens": 9}
+        return httpx.Response(200, json=answer)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        before = c.app.state.accumulated_spend_usd
+        assert score(c, eid, path).status_code == 202
+        wait_scoring_done(c)
+        worst = judge_worst("kindness", "Hello")
+        assert during == [(pytest.approx(worst), JUDGE_MAX_TOKENS)]
+        # The catalog estimate over the reply's own counts, since the reply
+        # carried no charge: what ceiling_cost decides for a trial.
+        assert c.app.state.accumulated_spend_usd == pytest.approx(
+            before + 30 * 1e-06 + 9 * 2e-06
+        )
+        (call,) = calls_of(c.app.state.db, eid)
+        counts = (call["prompt_tokens"], call["completion_tokens"])
+        assert counts + (call["billed_cost_usd"],) == (30, 9, None)
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_judge_call_with_no_room_is_the_results_scoring_failure(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judged pass with the ceiling short of one judge call's
+    worst case but not reached. PRE-STATE: recorded spend is under the
+    limit, so the reached check passes, and before P2 the judge was sent
+    (measured at 1f143e3: one judge call)."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        recorded = c.app.state.accumulated_spend_usd
+        assert recorded == pytest.approx(2.9e-05)
+        c.app.state.spend_limit_usd = 0.001
+        assert not main.spend_ceiling_reached()
+        assert score(c, eid, path).status_code == 202
+        wait_scoring_done(c)
+        (row,) = [r for r in scores_in(c, eid) if r["scorer"] == "judge"]
+        assert judged == []
+        assert calls_of(c.app.state.db, eid) == []
+        assert row["score"] is None
+        assert row["detail"] == (
+            "the per-boot spend ceiling had no room for this judge call before "
+            "this result could be judged: recorded $0.000029 of $0.001 limit "
+            "(BENCH_SPEND_LIMIT_USD) and $0.00 reserved by calls not yet settled "
+            f"leave no room for the {main.format_usd(judge_worst('kindness', 'Hello'))}"
+            " this call reserves; re-run the "
+            "scoring pass to fill it in"
+        )
+
+
+@respx.mock
+def test_a_trial_the_judge_will_not_be_sent_claims_nothing(monkeypatch, tmp_path):
+    """WINDOW: a judged pass over a trial with no text, the ceiling with no
+    room for a judge call's worst case. PRE-STATE: the limit is above
+    recorded spend by less than that worst case, which a claim taken for a
+    call never sent would be refused against."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(
+            200,
+            stream=ChunkStream(
+                [
+                    sse({"choices": [{"delta": {}, "finish_reason": "stop"}]}),
+                    DONE_MARKER,
+                ]
+            ),
+        )
+    )
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        c.app.state.spend_limit_usd = c.app.state.accumulated_spend_usd + 0.0001
+        assert score(c, eid, path).status_code == 202
+        wait_scoring_done(c)
+        (row,) = [r for r in scores_in(c, eid) if r["scorer"] == "judge"]
+        assert row["detail"] == "no response text: the trial did not complete"
+
+
+@respx.mock
+def test_a_pinned_trial_claims_the_figure_its_experiment_projected(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a strict experiment pinned to an endpoint whose rates are a
+    thousand times the catalog's, its one trial's claim read at its
+    upstream call. PRE-STATE: the 201's projected total is the endpoint's
+    figure, not the catalog's (before P2 the claim read 0.0)."""
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={
+            "data": {
+                "endpoints": [
+                    {
+                        "provider_name": "Together",
+                        "tag": "together",
+                        "max_completion_tokens": 100,
+                        "supported_parameters": ["max_tokens"],
+                        "pricing": {"prompt": "0.001", "completion": "0.002"},
+                    }
+                ]
+            }
+        }
+    )
+    during = []
+
+    def reply(request):
+        during.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        assert created.status_code == 201, created.text
+        projected = created.json()["projected_cost"]["total_usd"]
+        # The 100 completion cap at 0.002 and one unit of input at 0.001.
+        assert projected == pytest.approx(0.201)
+        run_experiment_to_completion(c, created.json()["id"], path)
+        assert during == [projected]
+
+
+# ---- Room another call holds is waited for by a trial and a judge call.
+
+
+def watched_waits(monkeypatch):
+    """Record the ledger's figure each time a trial or judge call begins to
+    wait for room, and then wait as it would have."""
+    waits = []
+    real = getattr(main, "wait_for_spend_room", None)
+
+    async def watched(stop):
+        waits.append(held())
+        await real(stop)
+
+    monkeypatch.setattr(main, "wait_for_spend_room", watched, raising=False)
+    return waits
+
+
+def stand(worst):
+    """A claim standing for a call not yet settled, taken on a tree with a
+    ledger, and nothing on one without, so a pre-state fails on what the
+    calls do rather than on a missing name."""
+    claim = getattr(main, "reserve_spend", None)
+    return claim(worst) if claim else None
+
+
+def give_back(key):
+    release = getattr(main, "release_spend", None)
+    if release:
+        release(key)
+
+
+async def turns(n=200):
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+@respx.mock
+def test_a_trial_waits_for_room_other_calls_hold_and_then_runs(monkeypatch, tmp_path):
+    """WINDOW: two claims held, standing in for calls not yet settled, and
+    an experiment's one trial whose worst case fits beside recorded spend
+    but not beside either claim; the first claim given back, then the
+    second. PRE-STATE: 0.05 holds both claims (0.02 each) and holds the
+    trial's 0.032769 alone, but not beside one of them, so the claim is
+    refused for room others hold. Refused, the trial would have halted the
+    experiment though its money had not run out (the battery's W1, the
+    wait removed: halted_on_refusal); before P2, with no claims to stand,
+    it went upstream at once (measured at 1f143e3)."""
+    calls = []
+
+    def reply(request):
+        calls.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+
+        async def staged():
+            first, second = stand(0.02), stand(0.02)
+            async with app_client() as r:
+                started = await r.post(
+                    f"/experiments/{eid}/start", json={"dataset_path": path}
+                )
+            await spin(lambda: waits or calls)
+            before = (list(waits), list(calls))
+            give_back(first)
+            # Woken with room still short: it waits again, once, rather
+            # than spinning on the loop while the second claim stands.
+            await turns()
+            between = (list(waits), list(calls))
+            give_back(second)
+            await spin(lambda: calls)
+            return started.status_code, before, between
+
+        status, before, between = c.portal.call(staged)
+        assert status == 202
+        assert before == ([pytest.approx(0.04)], [])
+        assert between == ([pytest.approx(0.04), pytest.approx(0.02)], [])
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "run")
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["trials_done"]) == ("done", 1)
+        assert calls == [pytest.approx(W_ALPHA)]
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_waiting_trial_wakes_when_the_call_it_waited_on_settles(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a /compare/stream run held on the wire with its claim, an
+    experiment's trial waiting for the room it holds, and the stream's
+    answer then let through to its end.
+
+    The trial is woken by the stream's SETTLEMENT (its claim replaced by
+    what it cost), not by a claim handed back uncounted: the stream's
+    finally then finds nothing left to give back, so the settlement is
+    the only thing that can wake it. The trial runs, waiting once, and
+    recorded spend is the two results'. PRE-STATE: 0.05 holds one
+    reservation of 0.032769 and not two, so the trial cannot claim while
+    the stream is in flight (before P2 it was sent beside it, with no
+    claim to wait on)."""
+    calls = []
+
+    async def reply(request):
+        calls.append(held())
+        if len(calls) == 1:
+            await gate.wait()
+        return httpx.Response(200, stream=alpha_stream())
+
+    gate = None
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+
+        async def staged():
+            nonlocal gate
+            gate = asyncio.Event()
+            stream = await opened_stream()
+            started = frame(await stream.__anext__())
+            assert started["type"] == "started"
+            first = asyncio.ensure_future(stream.__anext__())
+            await spin(lambda: calls)
+            async with app_client() as r:
+                await r.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+            await spin(lambda: waits or len(calls) > 1)
+            before = (list(waits), len(calls))
+            gate.set()
+            frames = [frame(await first)] + [frame(f) async for f in stream]
+            await spin(lambda: len(calls) > 1)
+            return before, frames
+
+        before, frames = c.portal.call(staged)
+        assert before == ([pytest.approx(W_ALPHA)], 1)
+        assert frames[-1]["type"] == "done" and frames[-1]["run_id"] is not None
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "run")
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["trials_done"]) == ("done", 1)
+        assert len(waits) == 1
+        # The trial claimed once the stream had settled: nothing else held.
+        assert calls == [pytest.approx(W_ALPHA), pytest.approx(W_ALPHA)]
+        assert c.app.state.accumulated_spend_usd == pytest.approx(2 * 2.9e-05)
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_trial_stopped_while_it_waits_for_room_never_ran(monkeypatch, tmp_path):
+    """WINDOW: an experiment's one trial waiting for room a claim holds,
+    and Stop. PRE-STATE: the trial is waiting when the Stop is sent (before
+    P2 it ran at once: measured at 1f143e3, one upstream call), so it has
+    claimed nothing and sent nothing, and it is a trial the run never
+    reached: no row, no counter."""
+    calls = []
+
+    def reply(request):
+        calls.append(1)
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+
+        async def staged():
+            standing = stand(0.02)
+            try:
+                async with app_client() as r:
+                    await r.post(
+                        f"/experiments/{eid}/start", json={"dataset_path": path}
+                    )
+                    await spin(lambda: waits or calls)
+                    stopped = await r.post(f"/experiments/{eid}/stop", json={})
+                await spin(lambda: app.state.experiment_run["active"] is None)
+            finally:
+                # Given back whatever happened above, so a trial that did
+                # not hear the Stop fails this proof rather than holding
+                # the bench's shutdown open.
+                give_back(standing)
+            return stopped.status_code
+
+        assert c.portal.call(staged) == 202
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["status_detail"]) == (
+            "stopped",
+            "stopped between trials",
+        )
+        counters = ("trials_done", "trials_refused", "trials_failed")
+        assert [final[k] for k in counters] == [0, 0, 0]
+        assert calls == []
+        assert c.get("/runs").json()["runs"] == []
+
+
+@respx.mock
+def test_a_trial_that_cannot_fit_beside_recorded_spend_is_refused_at_once(
+    monkeypatch, tmp_path
+):
+    """WINDOW: an experiment's one trial whose worst case (0.032769) passes
+    the 0.03 limit beside recorded spend alone. PRE-STATE: nothing is
+    claimed and the ceiling is not reached, so no room can come back and
+    nothing is waited for; before P2 the trial ran (measured at 1f143e3:
+    done, one upstream call)."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.03) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+        # Driven with a bound rather than drained, so a trial that waited
+        # for room that never comes fails here instead of hanging.
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        drive_until(
+            c,
+            lambda: c.app.state.experiment_run["active"] is None,
+            "the trial waited for room that cannot come",
+            timeout_s=5.0,
+        )
+        final = c.get(f"/experiments/{eid}").json()
+        assert final["status"] == "halted_on_refusal"
+        assert (final["trials_done"], final["trials_refused"]) == (0, 1)
+        assert waits == []
+        assert route.call_count == 0
+        (run,) = c.get("/runs").json()["runs"]
+        (row,) = c.get(f"/runs/{run['id']}").json()["results"]
+        assert row["error"] == (
+            "run refused before reaching upstream: recorded $0.00 of $0.03 "
+            "limit (BENCH_SPEND_LIMIT_USD) and $0.00 reserved by calls not yet "
+            "settled leave no room for the $0.032769 this run reserves; no "
+            "upstream call was made"
+        )
+
+
+def test_a_call_that_would_fit_exactly_waits_for_room_rather_than_refusing(
+    monkeypatch, tmp_path
+):
+    """WINDOW: reserve_spend and spend_room_held_by_others at a 2**-2 limit
+    with 2**-3 recorded and a rival claim of 2**-4 held, asked about a call
+    whose worst case is 2**-3.
+
+    A call that fits exactly is admitted (spend_admits), so one that would
+    fit exactly beside recorded spend alone is refused only for the room
+    the rival holds, and waits for it rather than being refused for good
+    (the external review's L11: the boundary as a strict inequality
+    survived every proof). Dyadic figures, so every sum is exact.
+    PRE-STATE: the call is refused while the rival holds its claim, and
+    recorded spend and its worst case sum to the limit exactly."""
+    with ledger_client(monkeypatch, tmp_path, 2.0**-2) as c:
+        c.app.state.accumulated_spend_usd = 2.0**-3
+        rival = main.reserve_spend(2.0**-4)
+        assert rival is not None
+        assert main.reserve_spend(2.0**-3) is None
+        assert math.fsum((2.0**-3, 2.0**-3)) == 2.0**-2
+        assert main.spend_room_held_by_others(2.0**-3) is True
+        main.release_spend(rival)
+        assert main.reserve_spend(2.0**-3) is not None
+
+
+@respx.mock
+def test_an_unpriced_trial_at_the_reached_limit_is_refused_at_once(
+    monkeypatch, tmp_path
+):
+    """WINDOW: an experiment's one trial on a model the catalog cannot
+    price, with recorded spend exactly at the limit, started and driven
+    under a 5 s bound.
+
+    A reached limit refuses every call, the unpriced among them, and room
+    never comes back to it, so the trial is refused at once and does not
+    wait (the external review's L11: without the reached guard it waited
+    for room that cannot come, with nothing held). PRE-STATE: nothing is
+    reserved, and recorded spend is the limit."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.5) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/bare"])
+        ).json()["id"]
+        c.app.state.accumulated_spend_usd = 0.5
+        assert main.spend_reserved_usd() == 0.0
+        assert main.spend_room_held_by_others(None) is False
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        try:
+            drive_until(
+                c,
+                lambda: c.app.state.experiment_run["active"] is None,
+                "the trial waited for room that cannot come",
+                timeout_s=5.0,
+            )
+        finally:
+            if c.app.state.experiment_run["active"] is not None:
+                c.post(f"/experiments/{eid}/stop", json={})
+        final = c.get(f"/experiments/{eid}").json()
+        assert final["status"] == "halted_on_refusal"
+        assert waits == []
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_the_served_reserved_figure_is_the_exact_sum_of_the_claims(
+    monkeypatch, tmp_path
+):
+    """WINDOW: three live claims of 2**-2, 2**-55 and 2**-108 under a limit
+    of 1, read by spend_reserved_usd and GET /models.
+
+    The live claims are summed with fsum, so both read their correctly
+    rounded sum, 2**-2 + 2**-54 (the external review's L11: the comment's
+    claim had no proof, and 0.1, 0.2 and 0.3 cannot tell fsum from sum()
+    on Python 3.12 and later, which compensates). PRE-STATE: a running sum
+    and sum() of the three read 2**-2, fsum reads 0.25000000000000006, and
+    nothing is reserved before the claims."""
+    claims = (2.0**-2, 2.0**-55, 2.0**-108)
+    running = 0.0
+    for claim in claims:
+        running += claim
+    assert running == sum(claims) == 0.25
+    assert math.fsum(claims) == 0.25000000000000006
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        assert main.spend_reserved_usd() == 0.0
+        keys = [main.reserve_spend(w) for w in claims]
+        assert None not in keys
+        assert main.spend_reserved_usd() == 0.25000000000000006
+        assert c.get("/models").json()["spend"]["reserved_usd"] == 0.25000000000000006
+        for key in keys:
+            main.release_spend(key)
+
+
+@respx.mock
+def test_shutdown_ends_a_trial_waiting_for_room_as_interrupted(monkeypatch, tmp_path):
+    """WINDOW: an experiment's one trial waiting for room a claim holds,
+    and the bench shut down, the runner's shutdown under a 5 s bound.
+
+    Only the stop shutdown sets can end the wait, and the run is
+    interrupted with no row, in a sentence of its own that says the trial
+    was never sent (the external review's M10: the sentence for a trial
+    that went upstream, "settled and persisted", was written here). A
+    trial deaf to the stop fails this proof when the bound runs out, and
+    the claim is then given back so the lifespan can end, rather than
+    hanging it (the review's L12: without the bound this proof, the only
+    one of shutdown's stop for a waiting trial, could only hang).
+    PRE-STATE: the trial is waiting when the lifespan ends, and nothing
+    gives the claim back within the bound; at 5fd1a3b the detail was the
+    persisted sentence."""
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    waits = watched_waits(monkeypatch)
+    real_shutdown = main._shutdown_runner
+    standing, deaf = [], []
+
+    async def bounded_shutdown():
+        inner = asyncio.ensure_future(real_shutdown())
+        done, _ = await asyncio.wait({inner}, timeout=5.0)
+        if not done:
+            deaf.append(True)
+            give_back(standing[0])
+            await inner
+
+    monkeypatch.setattr(main, "_shutdown_runner", bounded_shutdown)
+    db_path = tmp_path / "bench.db"
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "hi"})
+        eid = c.post(
+            "/experiments", json=experiment_body(path, lineup=["model/alpha"])
+        ).json()["id"]
+
+        async def staged():
+            standing.append(stand(0.02))
+            async with app_client() as r:
+                await r.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+            await spin(lambda: waits)
+
+        c.portal.call(staged)
+    assert deaf == [], "shutdown's stop did not end the wait within 5 s"
+    with store.connect(str(db_path)) as conn:
+        final = store.get_experiment(conn, eid)
+        assert (final["status"], final["status_detail"]) == (
+            "interrupted",
+            "this process shut down while the experiment was running, while a "
+            "trial waited for room on the spend ceiling; that trial was never "
+            "sent and has no row, and the remaining trials never ran",
+        )
+        assert final["trials_done"] + final["trials_refused"] == 0
+        assert conn.execute("SELECT COUNT(*) FROM results").fetchone()[0] == 0
+    assert route.call_count == 0
+
+
+# The judge's worst case beside the trial's recorded 2.9e-5 fits a 0.002
+# limit, and two claims of 0.0009 fit it too, but one of them beside the
+# judge's does not.
+JUDGE_ROOM_LIMIT = 0.002
+JUDGE_ROOM_CLAIM = 0.0009
+
+
+@respx.mock
+def test_a_judge_call_waits_for_room_other_calls_hold_and_then_is_sent(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judged pass whose one call's worst case fits beside
+    recorded spend but not beside either of two claims held; the first
+    given back, then the second. PRE-STATE: refused, the call would have
+    been a gap row, and a pass over more trials would have written every
+    one of them as a gap in one step of the loop; before P2, with no
+    claims to stand, the call went out at once (measured at 1f143e3)."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(held())
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        recorded = c.app.state.accumulated_spend_usd
+        worst = judge_worst("kindness", "Hello")
+        limit, claim = JUDGE_ROOM_LIMIT, JUDGE_ROOM_CLAIM
+        assert recorded + 2 * claim <= limit < recorded + claim + worst
+        c.app.state.spend_limit_usd = limit
+        waits = watched_waits(monkeypatch)
+
+        async def staged():
+            first, second = stand(claim), stand(claim)
+            async with app_client() as r:
+                started = await r.post(
+                    f"/experiments/{eid}/score",
+                    json={"dataset_path": path, "judge_model": "judge/one"},
+                )
+            await spin(lambda: waits or judged)
+            before = (list(waits), list(judged))
+            give_back(first)
+            await turns()
+            between = (list(waits), list(judged))
+            give_back(second)
+            await spin(lambda: judged)
+            return started.status_code, before, between
+
+        status, before, between = c.portal.call(staged)
+        assert status == 202
+        assert before == ([pytest.approx(2 * claim)], [])
+        assert between == ([pytest.approx(2 * claim), pytest.approx(claim)], [])
+        wait_scoring_done(c)
+        assert judged == [pytest.approx(worst)]
+        (row,) = [r for r in scores_in(c, eid) if r["scorer"] == "judge"]
+        assert row["score"] == 0.9
+        assert c.app.state.spend_reservations == {}
+
+
+@respx.mock
+def test_a_judge_call_that_waited_and_found_the_ceiling_reached_says_so(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judged pass whose one call waits for room a claim holds;
+    recorded spend reaches the limit while it waits, and the claim is given
+    back. PRE-STATE: the call is waiting when the limit is reached, so the
+    claim it retries on waking is refused with no room left to wait for,
+    and the row says the ceiling was reached, in the sentence the pass
+    writes for that (before P2 the call was sent at once)."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        c.app.state.spend_limit_usd = JUDGE_ROOM_LIMIT
+        waits = watched_waits(monkeypatch)
+
+        async def staged():
+            standing = stand(2 * JUDGE_ROOM_CLAIM)
+            async with app_client() as r:
+                await r.post(
+                    f"/experiments/{eid}/score",
+                    json={"dataset_path": path, "judge_model": "judge/one"},
+                )
+            await spin(lambda: waits or judged)
+            app.state.accumulated_spend_usd = JUDGE_ROOM_LIMIT
+            give_back(standing)
+            await spin(lambda: app.state.scoring_run["active"] is None)
+
+        c.portal.call(staged)
+        assert judged == []
+        (row,) = [r for r in scores_in(c, eid) if r["scorer"] == "judge"]
+        assert row["detail"] == (
+            "the per-boot spend ceiling was reached before this result could "
+            "be judged; re-run the scoring pass to fill it in"
+        )
+
+
+@respx.mock
+def test_a_judge_call_stopped_while_it_waits_for_room_is_never_sent(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a judged pass whose one call waits for room a claim holds,
+    and Stop. PRE-STATE: the call is waiting when the Stop is sent (before
+    P2 it was sent at once: measured at 1f143e3, one judge call), so the
+    pass ends stopped with nothing sent, no call recorded and no row."""
+    judged = []
+
+    def route(request):
+        if is_judge(request):
+            judged.append(1)
+            return httpx.Response(200, json=judge_answer())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    catalog = priced_catalog(JUDGE_PRICES)
+    with ledger_client(monkeypatch, tmp_path, 1.0, catalog=catalog) as c:
+        eid, path = judged_experiment(c, tmp_path)
+        c.app.state.spend_limit_usd = JUDGE_ROOM_LIMIT
+        waits = watched_waits(monkeypatch)
+
+        async def staged():
+            standing = stand(2 * JUDGE_ROOM_CLAIM)
+            try:
+                async with app_client() as r:
+                    await r.post(
+                        f"/experiments/{eid}/score",
+                        json={"dataset_path": path, "judge_model": "judge/one"},
+                    )
+                    await spin(lambda: waits or judged)
+                    stopped = await r.post(f"/experiments/{eid}/scoring/stop", json={})
+                await spin(lambda: app.state.scoring_run["active"] is None)
+            finally:
+                give_back(standing)
+            return stopped.status_code
+
+        assert c.portal.call(staged) == 202
+        assert judged == []
+        assert calls_of(c.app.state.db, eid) == []
+        assert [r for r in scores_in(c, eid) if r["scorer"] == "judge"] == []
+        (made,) = c.get(f"/experiments/{eid}/scoring").json()["passes"]
+        assert (made["outcome"], made["scored"]) == ("stopped", 0)
+
+
+def pinned_listing(pricing):
+    """An endpoint listing for model/alpha with one Together endpoint
+    capped at 100 completion units, priced as given (None: no pricing
+    object at all)."""
+    endpoint = {
+        "provider_name": "Together",
+        "tag": "together",
+        "max_completion_tokens": 100,
+        "supported_parameters": ["max_tokens"],
+    }
+    if pricing is not None:
+        endpoint["pricing"] = pricing
+    respx.get(ENDPOINTS_URL.format(model="model/alpha")).respond(
+        json={"data": {"endpoints": [endpoint]}}
+    )
+
+
+@respx.mock
+def test_a_pinned_trial_whose_endpoint_charges_beyond_reserves_its_two_rates(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a strict experiment pinned to an endpoint publishing its two
+    rates and a cache-read rate, its one trial's claim read at its
+    upstream call, and the 201's projection.
+
+    The projection refuses and names the charge, as before; the trial
+    reserves at the endpoint's two rates (the 100 completion cap at 0.002
+    and one unit of input at 0.001), the same rule as an unpinned model's.
+    PRE-STATE, the external review's H1: at 1d91670 endpoint_rates
+    dropped the rates when a charge beyond them was named, so the claim
+    was 0.0 while the settlement still counted the call."""
+    pinned_listing(
+        {"prompt": "0.001", "completion": "0.002", "input_cache_read": "0.0001"}
+    )
+    during = []
+
+    def reply(request):
+        during.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        assert created.status_code == 201, created.text
+        cost = created.json()["projected_cost"]
+        assert cost["total_usd"] is None
+        assert cost["unpriced"] == ["model/alpha (charges input_cache_read)"]
+        run_experiment_to_completion(c, created.json()["id"], path)
+        assert during == [pytest.approx(0.201)]
+
+
+@respx.mock
+def test_a_pinned_trial_past_the_limit_alone_is_refused_before_it_is_sent(
+    monkeypatch, tmp_path
+):
+    """WINDOW: the same pinned trial, reserving 0.201 at its endpoint's two
+    rates, under a 0.1 limit with nothing else in flight.
+
+    Its reservation cannot fit beside recorded spend alone, so it is
+    refused at once, a refusal row, the experiment halted, and nothing
+    sent. PRE-STATE: at 1d91670 it reserved nothing and was sent (one
+    upstream call here, settled at the catalog's rates; the external
+    review, with the reply billed at the endpoint's rates, measured 0.201
+    recorded against the 0.1 limit)."""
+    pinned_listing(
+        {"prompt": "0.001", "completion": "0.002", "input_cache_read": "0.0001"}
+    )
+    route = respx.post(OPENROUTER_URL).mock(
+        return_value=httpx.Response(200, stream=alpha_stream())
+    )
+    with ledger_client(monkeypatch, tmp_path, 0.1) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        eid = created.json()["id"]
+        started = c.post(f"/experiments/{eid}/start", json={"dataset_path": path})
+        assert started.status_code == 202
+        drive_until(
+            c,
+            lambda: c.app.state.experiment_run["active"] is None,
+            "the run",
+            timeout_s=5.0,
+        )
+        final = c.get(f"/experiments/{eid}").json()
+        assert (final["status"], final["trials_refused"]) == ("halted_on_refusal", 1)
+        assert route.call_count == 0
+
+
+@respx.mock
+def test_a_pinned_trial_waits_for_room_another_call_holds(monkeypatch, tmp_path):
+    """WINDOW: a claim of 0.032769 standing, and a trial pinned to an
+    endpoint charging beyond its two rates whose reservation (the 100
+    completion cap at 0.0002 and one unit at 0.0001, 0.0201) fits the 0.05
+    limit alone and not beside it; then the claim given back.
+
+    The pinned trial waits as any trial does, and goes once the room is
+    back. PRE-STATE: at 1d91670 it reserved nothing and went upstream
+    beside the standing claim (the review measured two calls on the wire
+    against a limit with room for one)."""
+    pinned_listing(
+        {"prompt": "0.0001", "completion": "0.0002", "input_cache_read": "0.00001"}
+    )
+    calls = []
+
+    def reply(request):
+        calls.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    waits = watched_waits(monkeypatch)
+    with ledger_client(monkeypatch, tmp_path, 0.05) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        eid = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        ).json()["id"]
+
+        async def staged():
+            standing = stand(W_ALPHA)
+            try:
+                async with app_client() as r:
+                    await r.post(
+                        f"/experiments/{eid}/start", json={"dataset_path": path}
+                    )
+                await spin(lambda: waits or calls)
+                before = (list(waits), list(calls))
+            finally:
+                give_back(standing)
+            await spin(lambda: calls)
+            return before
+
+        before = c.portal.call(staged)
+        assert before == ([pytest.approx(W_ALPHA)], [])
+        drive_until(c, lambda: c.app.state.experiment_run["active"] is None, "run")
+        assert calls == [pytest.approx(0.0201)]
+
+
+@respx.mock
+def test_a_pinned_trial_whose_endpoint_price_cannot_be_read_reserves_at_the_catalogs(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a strict experiment pinned to an endpoint whose listing
+    carries no pricing object, its one trial's claim read at its upstream
+    call, and the 201's projection.
+
+    The operator's ruling on the external review's H1: the trial reserves
+    at the catalog's model rates (the 100 completion cap at alpha's 2e-6
+    and one unit at 1e-6), the rates its settlement will count, and the
+    projection still refuses and says so. PRE-STATE: at 1d91670 the claim
+    was 0.0 and the projection named the bare model."""
+    pinned_listing(None)
+    during = []
+
+    def reply(request):
+        during.append(held())
+        return httpx.Response(200, stream=alpha_stream())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=reply)
+    with ledger_client(monkeypatch, tmp_path, 1.0) as c:
+        path = write_dataset(tmp_path, {"id": "t1", "prompt": "ask"})
+        created = c.post(
+            "/experiments",
+            json=strict_body(path, provider_pins={"model/alpha": "together"}),
+        )
+        assert created.status_code == 201, created.text
+        assert created.json()["projected_cost"]["unpriced"] == [
+            f"model/alpha ({UNREAD_ROUTE})"
+        ]
+        run_experiment_to_completion(c, created.json()["id"], path)
+        assert during == [pytest.approx(100 * 2e-06 + 1 * 1e-06)]
+
+
+# ---- The census: every paid call is claimed, and released in a finally.
+
+PAID_CALLS = {"run_model", "stream_model", "judge_response"}
+PAID_DOORS = {
+    ("main.py", "compare.limited"),
+    ("main.py", "compare_stream.events"),
+    ("main.py", "run_one_trial"),
+    ("main.py", "score_one_result"),
+}
+
+
+def called_name(call):
+    func = call.func
+    return func.id if isinstance(func, ast.Name) else getattr(func, "attr", None)
+
+
+def paid_call_sites():
+    """Every call of a client function that can spend, by the function
+    that makes it, across bench/*.py."""
+    found = {}
+    for path in sorted((Path(main.__file__).parent).glob("*.py")):
+        tree = ast.parse(path.read_text())
+
+        def visit(node, scope, path=path):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                    visit(child, [*scope, child.name])
+                    continue
+                if (
+                    isinstance(child, ast.Call)
+                    and called_name(child) in PAID_CALLS
+                    and scope
+                ):
+                    key = (path.name, ".".join(scope))
+                    found.setdefault(key, (tree, []))[1].append(child)
+                visit(child, scope)
+
+        visit(tree, [])
+    return found
+
+
+LEDGER_OWNERS = {"lifespan", "spend_reserved_usd", "reserve_spend", "release_spend"}
+LEDGER_FUNCTIONS = (
+    "spend_reserved_usd",
+    "spend_admits",
+    "reserve_spend",
+    "release_spend",
+    "settle_spend",
+    "spend_room_held_by_others",
+)
+
+
+def test_only_the_ledger_touches_the_ledger():
+    """WINDOW: bench/*.py as parsed: every function that names
+    app.state.spend_reservations, and how the ledger's functions are
+    defined.
+
+    One step of the event loop is the ledger's whole locking, so the dict
+    is named only where it is made (the lifespan) and by the three
+    functions that read it, claim in it and give back from it, and those
+    and the functions they are used through are plain defs, which cannot
+    await. A door that claimed around them, or a ledger function that
+    awaited, is found here (the external review's M11: an await between
+    the check and the claim at the stream, the trial and the judge call
+    survived every proof but /compare's). PRE-STATE: the walk finds the
+    four owners, so it reads the tree."""
+    owners, defined = set(), {}
+    for path in sorted(Path(main.__file__).parent.glob("*.py")):
+
+        def visit(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef):
+                    defined[child.name] = type(child).__name__
+                    visit(child, [*scope, child.name])
+                    continue
+                if (
+                    isinstance(child, ast.Attribute)
+                    and child.attr == "spend_reservations"
+                ):
+                    owners.add(scope[-1] if scope else "<module>")
+                visit(child, scope)
+
+        visit(ast.parse(path.read_text()), [])
+    assert owners == LEDGER_OWNERS, owners
+    for name in LEDGER_FUNCTIONS:
+        assert defined[name] == "FunctionDef", name
+
+
+def test_every_paid_call_is_claimed_and_released_in_a_finally():
+    """WINDOW: bench/*.py as parsed. Every call of the three client
+    functions that can spend sits in one of the four doors, after a
+    reserve_spend in the same function, and it and every reserve_spend
+    there sit inside a try whose finally calls release_spend, so a claim
+    is never held outside the block that gives it back. Each door's first
+    claim is itself a reserve_spend call (the external review's M11: the
+    wait loop's retry satisfied this census for a first claim written
+    inline). PRE-STATE: the census finds exactly the four doors the
+    network posture walk names, and before P2 none of them claimed
+    (measured at 1f143e3: compare.limited has no reserve_spend)."""
+    sites = paid_call_sites()
+    assert set(sites) == PAID_DOORS
+    for key, (tree, calls) in sites.items():
+        node = tree
+        for name in key[1].split("."):
+            node = next(
+                n
+                for n in ast.walk(node)
+                if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+                and n.name == name
+            )
+        claims = [
+            n.lineno
+            for n in ast.walk(node)
+            if isinstance(n, ast.Call) and called_name(n) == "reserve_spend"
+        ]
+        assert claims, f"{key}: no claim"
+        taken = sorted(
+            (
+                n
+                for n in ast.walk(node)
+                if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "held" for t in n.targets)
+                and not (isinstance(n.value, ast.Constant) and n.value.value is None)
+            ),
+            key=lambda n: n.lineno,
+        )
+        assert taken, f"{key}: no claim held"
+        first = taken[0].value
+        assert isinstance(first, ast.Call) and called_name(first) == "reserve_spend", (
+            key
+        )
+        releasing = [
+            t
+            for t in ast.walk(node)
+            if isinstance(t, ast.Try)
+            and any(
+                isinstance(n, ast.Call) and called_name(n) == "release_spend"
+                for statement in t.finalbody
+                for n in ast.walk(statement)
+            )
+        ]
+        for call in calls:
+            assert min(claims) < call.lineno, (key, call.lineno)
+        for line in [call.lineno for call in calls] + claims:
+            assert any(
+                t.body[0].lineno <= line <= t.body[-1].end_lineno for t in releasing
+            ), (key, line)

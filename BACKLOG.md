@@ -42,16 +42,6 @@ a23b257).
   deferred"), commit bd00ab9; the note moved to requirements-dev.in in
   commit d835c04 (Phase F.3), where it stands now.
 
-## Atomic admission for the spend ceiling
-
-- **What:** a full reservation ledger, so admitting an upstream call
-  atomically reserves its worst-case cost against the ceiling.
-- **Deferred by:** Phase F.1, and restated when Phase H.1 rewrote the
-  paragraph.
-- **Reason:** no reason was written.
-- **First written:** README, Setup ("A full reservation ledger (atomic
-  admission) is deliberately deferred"), commit 095e293.
-
 ## Pairwise judging with position swapping
 
 - **What:** a judge that compares two responses side by side, run in both
@@ -105,8 +95,9 @@ a23b257).
 
 ## Parquet export
 
-- **What:** an export format beside `export.jsonl`, which stays at schema
-  7 by the N2 checkpoint ruling.
+- **What:** an export format beside `export.jsonl`, which the N2
+  checkpoint ruling kept at schema 7 then (it has moved since, and is 12
+  at Phase P's schema 12; pre-existing since 44bb6b2 made it 8).
 - **Deferred by:** Phase N (non-goals).
 - **Reason:** no reason was written.
 - **First written:** docs/phases/phase-n-prompt.md, "Non-goals".
@@ -169,7 +160,8 @@ a23b257).
 
 ## Which figure a thresholded judge series ranks on
 
-- **What:** the ranking at bench/report.py:744 orders on `score.mean`. A
+- **What:** the ranking in bench/report.py's `build_report` (its
+  `min_ranks` over each model's score) orders on `score.mean`. A
   judge series with a declared pass threshold publishes both a mean and
   a pass rate, and the ranking uses the mean whether or not a threshold
   was declared. Since f6d3f92, `ranking.reason` says so ("ordered on the
@@ -197,67 +189,6 @@ a23b257).
   the rule is 'enforced where it lives' was false; N4 tombstoned it.
 - **First written:** the question in the N4 commit body, 7c19c2b
   (restatement 5); the reason in the operator's words at the N4 pass.
-
-## Recording that a judge request went out
-
-- **What:** a judge score row holds a generation id only when a reply
-  came back, so a judge call that timed out after it was sent leaves a
-  row that cannot be told from one never sent. The review's M3 finding
-  on draft PR #74 at 0abbb99: "The judge-spend line says 'none billed'
-  for judge calls that went out and came back without a billed figure",
-  with "Transport errors after the request was sent can be covered too
-  if the row records that the call went out." The report now counts
-  what the rows support: `unpriced_calls` (a generation id and no
-  figure) and `rows_without_figure` (every judge row with no figure,
-  whatever the reason). Recording the fact would split the second count
-  into unpriced versus unsent. Not to be guessed from the detail string.
-- **Deferred by:** Phase N, at the merge-readiness review's fixes, ruled
-  by the operator.
-- **Reason:** recording a "the request went out" fact on the score row
-  is the change that would split that count into unpriced versus
-  unsent, and it is a stored-schema change with a hash-pinned migration
-  and an era fixture. It is not done inside a medium fix at the end of a
-  phase with no external re-round, because an additive migration landing
-  without a review lens on it is exactly the shape L's INSERT OR IGNORE
-  defect took.
-- **First written:** no commit to cite. The finding is the review's M3;
-  the reason is the operator's ruling on it.
-
-## Stopping a scoring pass at shutdown
-
-- **What:** the lifespan stops and awaits the trial runner and nothing
-  else. A scoring pass is neither asked to stop nor awaited, so teardown
-  cancels it wherever it is: a judge call already sent is paid for and
-  writes no score row, and `judge_cost` cannot see it. Nothing sets
-  `scoring_run["stop"]`, so the pass's check of it never fires. Present
-  at f3eeebc, before Phase N. A judge call sent at shutdown with no row
-  and a judge call that timed out after it was sent are the same missing
-  fact, "the request went out", and the schema change that records it
-  ("Recording that a judge request went out", above) closes both.
-- **Deferred by:** Phase N, N4, where it was found outside N4's scope;
-  put on this list at the merge-readiness review.
-- **Reason:** one reason, two entries pointing at it: the row a stopped
-  call would write needs the fact "Recording that a judge request went
-  out" defers, for that entry's reason.
-- **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)";
-  the cross-link is the operator's ruling at the merge-readiness review.
-
-## Reporting a failed scoring pass
-
-- **What:** a pass that raises records the error in `scoring_run["error"]`
-  and the server log, and no door reads either: the page and curl see a
-  pass that ended, and on a re-score a failed pass cannot be told from a
-  finished one (a first pass's unscored trials do show in the report's
-  coverage). The slot itself is freed wherever the pass raises: its
-  finally clears `scoring_run["active"]`, and since the review's L8 fix
-  that covers the pass's first read too. Present at f3eeebc, before
-  Phase N.
-- **Deferred by:** Phase N, N4, where it was found outside N4's scope;
-  put on this list at the merge-readiness review.
-- **Reason:** the error reaches no door because no door reports a pass
-  at all, its end included; the error is one field of the read door
-  that would, and that door was outside N4's scope.
-- **First written:** 7c19c2b, "FOUND, NOT FIXED (outside N4's scope)".
 
 ## Private repositories and tokens
 
@@ -301,61 +232,6 @@ a23b257).
 - **First written:** the operator's ruling at the O2 checkpoint, in
   those words; recorded in the commit that adds this entry.
 
-## A snapshot root inside a git directory
-
-- **What:** refusing a snapshot root that sits below a git directory's
-  top level (a directory holding `HEAD`, `config`, `objects` and `refs`
-  together, whatever it is named). Today the walk refuses a root, or a
-  directory it reaches, that is one itself, and never looks above the
-  root. Refusing a root inside one needs a look at the root's ancestors,
-  by path (as `refuse_while_cloning` already looks at both doors, and
-  `_clone_for` at the composer) or anchored on the root's directory
-  handle; a look that only refuses opens nothing, so a race against it
-  can at worst give back today's walked state, and if it is built it
-  gets the walk's race proofs. A submodule's `modules/<name>` holds the
-  four names itself (as git 2.50.1 lays it out), so the walk already
-  refuses one wherever it reaches it.
-- **Deferred by:** Phase O, ruled by the operator on the bare-repository
-  readings after the operator's pass at 9c920e5.
-- **Reason:** `config` at the top level is where git itself writes a
-  remote URL (`git remote add`, measured on git 2.43.0), and a root
-  below the top cannot reach it; the known exception, `modules/*/config`
-  in a repository with submodules, the walk already refuses by its own
-  signature. Three files below the top level can carry a URL git uses,
-  verified on git 2.43.0 by tests/test_api.py
-  (`test_below_a_git_directorys_top_level_the_walk_cannot_see_it`):
-  the legacy `remotes/<name>` and `branches/<name>` files, which
-  `git fetch` still resolves, and a linked worktree's
-  `worktrees/<name>/config.worktree`, which `git config --worktree`
-  writes under `extensions.worktreeConfig`. A root placed at any of
-  those composes with the URL in the text today; the test pins that
-  open state. On git 2.50.1 (measured): `git worktree add` copies the
-  main worktree's `config.worktree` into `worktrees/<id>/config.worktree`,
-  a second writer beside `git config --worktree`; `git init` makes no
-  `branches/`; and the legacy `remotes/` and `branches/` files are
-  still read, with the warning that they are "nominated for removal".
-  And `logs/` is a fourth place, written by git itself on ordinary
-  commands: `git pull` and `git fetch` record their arguments there, a
-  repository's path verbatim (measured on git 2.50.1 with local paths;
-  whether a URL's userinfo survives is what the open-state pin's `logs/`
-  case measures), beside the committer's identity on every ref update.
-  The list of such files has no fixed end. The Phase O external review,
-  at db08aca (CI run 36338955465), answered that this stays open for
-  v0.6.0 and that the ancestor look is next-phase work: cheaper than
-  recorded, because a look that only refuses opens nothing (its L6), and
-  needed because the reachable set has no end, since `git pull` writes
-  into `logs/` below the top (its L14). It is to be built anchored on
-  the root's directory handle, with race proofs, and with 7b7241c's pins
-  plus a `logs/` case as its pre-states.
-- **First written:** the operator's ruling on the bare-repository
-  readings after the pass at 9c920e5; the reason in the operator's words
-  as given for f8bde6b ("only config at the top level carries anything
-  sensitive and a root below the top cannot reach it"); the reason
-  restated in 7b7241c on git 2.43.0's measurements (the three files
-  below the top level), with its hand-off to the external review; the
-  review's answer and the operator's ruling on it recorded in the
-  commit that adds this sentence.
-
 ## Filter drivers in the snapshot's dirty read
 
 - **What:** a filter driver named in the configuration of a checkout the
@@ -376,3 +252,156 @@ a23b257).
   its own phase.
 - **First written:** the operator's ruling on 94e70ee's open items, in
   those words; recorded in the commit that adds this entry.
+
+## The page shows money in flight
+
+- **What:** the page's spend indicator reads the ceiling's figures from
+  `GET /models` (`spend`: `accumulated_usd`, and `reserved_usd` and
+  `limit_usd` under a ceiling) and shows what calls not yet settled have
+  claimed beside what has been recorded.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the page fetches `/models` once, at boot, and its spend
+  figure is its own sum of the composer's runs, so showing a live,
+  process-wide figure needs a refresh the page does not make, and that
+  page work was not sized in P2, which built the figures it would read.
+- **First written:** the commission's P2 ("so the page's spend indicator
+  can show money in flight"); deferred in the commit that adds this
+  entry.
+
+## A rerun on a card refused for room
+
+- **What:** the rerun control on a streamed card refused because the
+  claims of calls not yet settled left no room for its worst case, a
+  refusal that can clear as those calls settle.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the card cannot tell that refusal from one because the
+  ceiling was reached, since both arrive as `spend_refused`, and a rerun
+  of the second can only be refused again; telling them apart is a field
+  on the frame and a page change P2 did not make.
+- **First written:** the comment on the rerun control in
+  `static/stream.js`, in the commit that adds this entry.
+
+## The catalog a scoring pass priced against
+
+- **What:** a scoring pass records the digest of the catalog whose rates
+  settled its unbilled judge calls, so that the estimate each such call
+  counted can be derived again from the record alone.
+- **Deferred by:** Phase P, P2.
+- **Reason:** the operator's ruling at P1's checkpoint asked for the
+  counts, which the judge call's record keeps (2e8bd02); the rates are
+  the booted process's catalog, which the pass does not name, and naming
+  it is a third column and a seal change the ruling did not ask for.
+- **First written:** the commit that adds this entry.
+
+## The projection and the ledger disagree about a model with charges beyond its two rates
+
+- **What:** for a model whose listing publishes a nonzero charge beyond
+  its prompt and completion rates (a cache-read rate, a web search, an
+  overrides object), an experiment's projection (`projected_cost`)
+  refuses to price it and names the charge, while the spend ceiling's
+  reservation (`call_worst_case`) reserves for it at the two rates, the
+  same arithmetic, since `cost_usd`'s estimate will settle it at those
+  rates. The same holds for a pinned route whose endpoint names such a
+  charge (its endpoint's two rates, since the external review's H1),
+  and a pinned route whose endpoint published no price the bench could
+  read is refused by the projection while its trial reserves at the
+  catalog's model rates, by the operator's ruling on H1, which the
+  projection says in naming it. On every other shape of price the two
+  agree, and on the figure
+  (`test_the_ledger_and_the_projection_disagree_about_one_price_shape_only`).
+- **Deferred by:** Phase P, ruled by the operator after the pass at
+  f123525.
+- **Reason:** 131 of the 396 models in the pinned measurement
+  (`TOKEN_PRICE_DIMENSIONS`, read 2026-08-30) publish no nonzero charge
+  beyond the two rates, so the projection's rule would leave 265 of 396
+  reserving nothing, and the ledger's rule would give the projection an
+  "at most" that leaves out a charge it cannot count, the confident
+  understatement the projection was made to refuse.
+- **First written:** the commit that adds this entry, on the operator's
+  ruling that the disagreement be surfaced rather than reconciled
+  silently.
+
+## A reconcile dry run migrates an older database
+
+- **What:** `python -m bench.reconcile` without `--apply` opens the
+  database through `store.connect`, which lays any column, index,
+  trigger or seal a database written by an older bench lacks and drops
+  the retired seals, so a dry run against such a database migrates it.
+  On a database this build has already opened it writes nothing, and it
+  never writes a row. Pre-existing since the dry run arrived (9c695c5).
+- **Deferred by:** Phase P, ruled by the operator after the pass at
+  f123525.
+- **Reason:** a dry run that writes is not a dry run.
+- **First written:** 9571082's body, as a reading noted and not
+  changed; the operator ruled it an entry here instead.
+
+## A database reached through a hard link
+
+- **What:** the one-writer lock (`store.lock_path`) is named by the file
+  `BENCH_DB` resolves to, so a symbolic link to a live database finds
+  its lock (the external review's M2, fixed); a hard link is a second
+  name for the same file that resolving a path cannot join, so a server
+  started through one takes a lock of its own. Locking the database file
+  itself, which every name shares, was measured and not used: on macOS
+  an exclusive flock on a file conflicts with sqlite's own locks on it,
+  and a process could not take one on its own database in WAL mode.
+- **Deferred by:** Phase P, ruled by the operator on the external review
+  at 1d91670.
+- **Reason:** in the operator's words, "the lock keys by identity after
+  this series and a hard link is the operator's own act on their own
+  file."
+- **First written:** the commit that adds this entry.
+
+## The clone root has no lock of its own
+
+- **What:** the one-writer lock is the database's. Two servers on two
+  databases that share a `BENCH_CLONE_ROOT` each remove the other's
+  clone work directories at boot (`_sweep_clone_work`), and each can
+  clone into the root while the other does.
+- **Deferred by:** Phase P, found by the external review at 1d91670
+  beside M3; the entry ratified by the operator.
+- **Reason:** the database's lock is what M3 needed: a server refused it
+  now removes nothing. A lock of the clone root's own is a second lock,
+  with its own refusal and its own proofs, for a sharing no single
+  database's lock can see.
+- **First written:** the commit that adds this entry.
+
+## An insert that fills a scoring record's ending
+
+- **What:** the seals on `scoring_passes` and `judge_calls` refuse a
+  change to a written value, a second ending, a partial ending, a
+  replacement and a delete, but not an insert that names an ending
+  column. A call inserted by direct SQL with `sent` 0 and `usable` 1
+  has its true ending refused, and a pass inserted with a count already
+  filled makes the boot sweep raise, so the server will not start until
+  the row is dealt with by hand (both measured on schema 12). Only a
+  writer going around the store reaches it: the store's own inserts name
+  the first write's columns alone. Pre-existing since the seals arrived
+  (1e6f2ab): a pass inserted with `scored` filled does the same.
+- **Deferred by:** Phase P, in the design of schema 12, found by its
+  critique of the record; the entry ratified by the operator at the
+  second pass at 3a9f3e6.
+- **Reason:** it predates the series, and the bench's own writer never
+  inserts an ending, so the gap is open only to direct SQL; the fix, an
+  insert seal that also refuses a row naming an ending column, is a seal
+  of its own with a versioned name, and a seal on insert needs its own
+  proofs.
+- **First written:** 4c193b4; the reason as the operator's second pass
+  at 3a9f3e6 asked it be said.
+
+## A run cut off before a trial went out says one was persisted
+
+- **What:** `run_experiment`'s outer cancellation handler, for a cancel
+  that lands outside the shielded trial (while the lineup's routes are
+  resolved, before the first trial, is the reachable case), writes
+  `INTERRUPTED_BY_SHUTDOWN`, whose sentence says the trial in flight was
+  settled and persisted; no trial was in flight. Pre-existing since the
+  sentence arrived (cfe368e) and the route resolution before the first
+  trial (9096856). The case new in Phase P, a trial waiting for room on
+  the spend ceiling when shutdown's stop came, has a sentence of its own
+  since the external review's M10.
+- **Deferred by:** Phase P, found by the external review at 1d91670
+  beside M10; the entry ratified by the operator with the series.
+- **Reason:** it predates the phase, and the review asked for it here
+  marked pre-existing.
+- **First written:** the commit that adds this entry.

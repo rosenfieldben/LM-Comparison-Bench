@@ -204,10 +204,13 @@
             // Only this streaming path offers a rerun; historical replays go
             // through fillColumn and never get one. A stopped run has no
             // error, so it gets no rerun control, and neither does a
-            // refusal: the ceiling holds for the life of the process, so a
-            // rerun could only ever be refused again, and offering it would
+            // refusal. A ceiling reached holds for the life of the process,
+            // so a rerun could only be refused again, and offering it would
             // turn the honest refused card into a red error card on the
-            // first click.
+            // first click. A refusal for room that other calls had claimed
+            // can clear as they settle, but it arrives as the same
+            // spend_refused, so the card cannot tell them apart and offers
+            // neither a rerun (BACKLOG: a rerun on a card refused for room).
             retry:
               result.error != null && !refused
                 ? {

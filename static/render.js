@@ -716,8 +716,9 @@
     // refusal is neither of those nor a failure of any kind: the ceiling
     // worked. Each gets its own state so a card never implies the model
     // finished, errored, or lost its history. The refusal's message (which
-    // names both the accumulated spend and the ceiling) still renders
-    // through applyError above; only the framing differs.
+    // names the ceiling's figures: recorded spend, the limit, what calls
+    // not yet settled have reserved, and this run's worst case) still
+    // renders through applyError above; only the framing differs.
     setState(
       ui,
       opts.stopped

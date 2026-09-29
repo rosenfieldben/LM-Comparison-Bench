@@ -47,6 +47,7 @@
     scoreBody,
     scoreNudge,
     scoreLabel,
+    scoringPassLine,
   } = window.BenchLib;
 
   const detailsEl = document.getElementById("experiments");
@@ -91,6 +92,8 @@
   const retryEl = document.getElementById("experiment-score-retry");
   const judgeNoteEl = document.getElementById("experiment-judge-note");
   const scoreNoteEl = document.getElementById("experiment-score-note");
+  const scoreStopEl = document.getElementById("experiment-score-stop");
+  const scorePassEl = document.getElementById("experiment-score-pass");
 
   // The experiments as the list last loaded them, newest first, and the
   // one selected, by id.
@@ -129,6 +132,11 @@
   // Experiments whose Score request is out: one press, one POST, and
   // another experiment's Score is not greyed by it.
   const scoring = new Set();
+  // The scoring Stop's own flag and memory, apart from the trial Stop's:
+  // whether its request is out, and the passes this tab has asked to
+  // stop, which keep Stop greyed until the list says the pass has ended.
+  let passStopping = false;
+  const stopAsked = new Set();
   // The catalog state and ids the judge select was last built from, so it
   // is rebuilt when those change and not on every composer keystroke.
   let judgeOptionsKey = null;
@@ -169,6 +177,17 @@
       held.state === "stopping" &&
       shown !== null &&
       experimentFinished(shown.status)
+    ) {
+      actionMessages.delete(selectedId);
+    }
+    // The scoring Stop's word is its own state, since every experiment
+    // with a pass is finished and the rule above would drop it at once;
+    // it is done with once the list says the pass no longer runs.
+    if (
+      held &&
+      held.state === "pass-stopping" &&
+      shown !== null &&
+      !shown.scoring?.running
     ) {
       actionMessages.delete(selectedId);
     }
@@ -536,6 +555,14 @@
     scoreEl.disabled = scoring.has(experiment.id) || reason !== null;
     setText(scoreEl, scoreLabel(summary));
     setText(scoreNudgeEl, reason === null ? "" : "Score waits: " + reason);
+    // The latest pass, as the list last read it, and its Stop while it
+    // runs. Score stays live beside a running pass: the door refuses a
+    // second one in its own words, which say whose pass holds the slot.
+    const pass = experiment.scoring;
+    setText(scorePassEl, scoringPassLine(pass));
+    scoreStopEl.hidden = !pass?.running;
+    scoreStopEl.disabled =
+      passStopping || !pass || pass.stopping || stopAsked.has(pass.id);
     // Retry only while the read has failed and nothing is being asked.
     retryEl.hidden = summary !== undefined;
     setText(judgeNoteEl, judged ? judgeNote() : "");
@@ -810,6 +837,62 @@
     }
   }
 
+  // The scoring Stop: the pass stops between trials, so the judge call in
+  // flight finishes and is recorded; the line says stopping, and the
+  // list read after the answer says what the server holds.
+  async function scoringStop() {
+    const experiment = selectedExperiment();
+    const pass = experiment === null ? null : experiment.scoring;
+    if (experiment === null || !pass || passStopping) return;
+    const id = experiment.id;
+    const hadFocus = document.activeElement === scoreStopEl;
+    const selectedAtPress = selections;
+    passStopping = true;
+    renderExperiment();
+    try {
+      // {} with the JSON type, as every POST the bench takes.
+      const resp = await fetch("/experiments/" + id + "/scoring/stop", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: "{}",
+      });
+      const data = await jsonOf(resp);
+      if (!resp.ok) {
+        saidAbout(
+          id,
+          "not stopped at " + utcTime() + ": " + refusalOf(resp, data, "stop"),
+          "refused",
+        );
+      } else {
+        stopAsked.add(pass.id);
+        saidAbout(
+          id,
+          "the scoring pass was asked to stop at " +
+            utcTime() +
+            "; it stops after the trial being scored",
+          "pass-stopping",
+        );
+      }
+      await loadList();
+    } catch (err) {
+      console.error("bench: stopping a scoring pass failed", err);
+      saidAbout(
+        id,
+        "no answer came back at " +
+          utcTime() +
+          " (" +
+          err.message +
+          "); the line beside Score says whether the pass is stopping",
+        "",
+      );
+      await loadList();
+    } finally {
+      passStopping = false;
+      renderExperiment();
+      if (hadFocus && selections === selectedAtPress) focusRow(id);
+    }
+  }
+
   // Retry beside "its dataset could not be read": the same question the
   // selection asked, asked again. Retry hides while it is out, so a
   // keyboard user's focus is put on the experiment's row rather than
@@ -825,7 +908,7 @@
   }
 
   // The clock time of an answer, in UTC and saying so: Score's words
-  // describe a pass on the server that no door reports on, so they are
+  // describe a pass on the server that goes on after them, so they are
   // stamped rather than worded as if still current.
   function utcTime() {
     return new Date().toISOString().slice(11, 19) + " UTC";
@@ -870,19 +953,22 @@
           "not scored at " + utcTime() + ": " + refusalOf(resp, data, "score"),
           "refused",
         );
+        // The list again, so the line beside Score says whose pass runs.
+        await loadList();
         return;
       }
       saidAbout(
         id,
         "a scoring pass was started at " +
           utcTime() +
-          "; no door says when it ends or whether it failed, so select the " +
-          "experiment again to " +
-          "read what it has scored since",
+          "; select the experiment again to read what it has scored since",
         "",
       );
       // After scoring, the report opens: read now, while the pass runs.
       showReport(id);
+      // And the list, whose record of the pass is the line beside Score
+      // and its Stop. It is read now, and again whenever the list is.
+      await loadList();
     } catch (err) {
       console.error("bench: scoring an experiment failed", err);
       saidAbout(
@@ -891,10 +977,11 @@
           utcTime() +
           " (" +
           err.message +
-          "); no door says whether a pass started",
+          "); the line beside Score says whether a pass started",
         "",
       );
       showReport(id);
+      await loadList();
     } finally {
       scoring.delete(id);
       renderExperiment();
@@ -1071,6 +1158,9 @@
     scoreEl.addEventListener("click", (event) => {
       if (event.detail > 1) return;
       void score();
+    });
+    scoreStopEl.addEventListener("click", () => {
+      void scoringStop();
     });
     judgeEl.addEventListener("change", renderExperiment);
     retryEl.addEventListener("click", retryDatasetRead);

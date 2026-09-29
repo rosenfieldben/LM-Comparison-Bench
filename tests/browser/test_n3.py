@@ -81,10 +81,12 @@ def drain(page, bench_url, eid):
         page.wait_for_timeout(100)
 
 
-# THE BENCH HAS ONE SCORING SLOT AND NO DOOR SAYS WHEN A PASS ENDS, nor
-# can any door stop one. A test that scores waits for the slot to be free
-# by asking the Score door itself, with a body that can never start a
-# pass: a digest no experiment records, sent to a finished experiment.
+# THE BENCH HAS ONE SCORING SLOT. Since Phase P GET
+# /experiments/{id}/scoring says when a pass ends, but it answers for one
+# experiment and the slot is the bench's, so a test that scores waits for
+# the slot to be free by asking the Score door itself, with a body that
+# can never start a pass: a digest no experiment records, sent to a
+# finished experiment.
 # The door checks the slot before the dataset, so a busy slot answers
 # 409 with its sentence and a free one 422 naming the probe's digest
 # (enforce_recorded_digest's, or stored_dataset's if that check were
