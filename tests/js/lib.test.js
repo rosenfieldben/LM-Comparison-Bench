@@ -1438,13 +1438,14 @@ test("a clone answer is readable only with an outcome and a root", () => {
   assert.equal(readableClone(null), false);
 });
 
-// Phase P: the judge spend line over report.judge_cost's six keys.
+// Phase P: the judge spend line over report.judge_cost's keys.
 const NO_SPEND = {
   total_usd: 0,
   billed_calls: 0,
   unpriced_calls: 0,
   unanswered_calls: 0,
   unusable_answers: 0,
+  unknown_calls: 0,
   in_flight_calls: 0,
   rows_before_call_records: 0,
 };
@@ -1499,10 +1500,31 @@ test("judgeSpendLine names unanswered, in-flight and older rows each in its own 
     "judge spend: none billed; 1 judge call had not come back when this " +
       "report was read",
   );
+  // The operator's ruling M1 on the 1d91670 review: a call whose record
+  // could not be completed, with nothing known of it, in words of its own.
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unknown_calls: 1 }),
+    "judge spend: none billed; 1 judge call's record could not be " +
+      "completed, so this line cannot say whether it went out",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, unknown_calls: 2 }),
+    "judge spend: none billed; 2 judge calls' records could not be " +
+      "completed, so this line cannot say whether they went out",
+  );
+  // The external review's L10: the line does not read an old row's detail,
+  // which may say more, so it says what the line cannot say.
   assert.equal(
     judgeSpendLine({ ...NO_SPEND, rows_before_call_records: 2 }),
     "judge spend: none billed; 2 judge rows written before the bench " +
-      "recorded its requests cannot say whether their requests went out",
+      "recorded its requests have no figure, and this line cannot say " +
+      "whether their requests went out",
+  );
+  assert.equal(
+    judgeSpendLine({ ...NO_SPEND, rows_before_call_records: 1 }),
+    "judge spend: none billed; 1 judge row written before the bench " +
+      "recorded its requests has no figure, and this line cannot say " +
+      "whether its request went out",
   );
   assert.equal(
     judgeSpendLine({
@@ -1511,15 +1533,27 @@ test("judgeSpendLine names unanswered, in-flight and older rows each in its own 
       unpriced_calls: 2,
       unanswered_calls: 2,
       unusable_answers: 1,
+      unknown_calls: 1,
       in_flight_calls: 2,
       rows_before_call_records: 1,
     }),
     "judge spend: $0.0050 over 2 billed calls, 2 unpriced; 2 judge calls " +
       "went out and got no answer; 1 judge call got a reply that could not " +
-      "be used; 2 judge calls had not come back when this report was read; " +
-      "1 judge row written before the bench recorded its requests cannot " +
-      "say whether its request went out",
+      "be used; 1 judge call's record could not be completed, so this line " +
+      "cannot say whether it went out; 2 judge calls had not come back when " +
+      "this report was read; 1 judge row written before the bench recorded " +
+      "its requests has no figure, and this line cannot say whether its " +
+      "request went out",
   );
+  // No clause over calls no reply came back for speaks of a reply.
+  const noReply = judgeSpendLine({
+    ...NO_SPEND,
+    unanswered_calls: 2,
+    unknown_calls: 2,
+    in_flight_calls: 2,
+    rows_before_call_records: 2,
+  });
+  assert.doesNotMatch(noReply, /repl/);
 });
 
 // Phase P: the Score row's line about the latest scoring pass.
@@ -1534,6 +1568,7 @@ const A_PASS = {
   failed: 0,
   unanswered: 0,
   unusable: 0,
+  unknown: 0,
   running: false,
   stopping: false,
 };
@@ -1565,12 +1600,54 @@ test("scoringPassLine says how the last pass ended, with its counts", () => {
       "2 with no score, 1 judge call got no answer, 2 judge replies could " +
       "not be used",
   );
-  // A pass closed before the split has no unusable count, and its
-  // unanswered held both, so the line keeps the wording true of both.
+  // The operator's ruling M1 on the 1d91670 review: the calls whose
+  // record could not be completed, in words of their own.
   assert.equal(
-    scoringPassLine({ ...A_PASS, unanswered: 2, unusable: null }),
+    scoringPassLine({ ...A_PASS, unknown: 1 }),
     "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
-      "2 judge calls got no usable answer",
+      "1 judge call's record could not be completed, so this line cannot " +
+      "say whether it went out",
+  );
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unanswered: 1, unusable: 1, unknown: 2 }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "1 judge call got no answer, 1 judge reply could not be used, 2 judge " +
+      "calls' records could not be completed, so this line cannot say " +
+      "whether they went out",
+  );
+  // A pass closed before schema 12 (unknown null) was counted by the
+  // outcome list the operator withdrew then, and one closed before the
+  // split (unusable null too) by the one count that held both: either
+  // way the line gives the calls with no usable answer as one count, in
+  // words true of every call the counts held.
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      unanswered: 2,
+      unusable: null,
+      unknown: null,
+    }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "2 judge calls ended with no usable answer on record",
+  );
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unanswered: 1, unusable: 2, unknown: null }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "3 judge calls ended with no usable answer on record",
+  );
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unanswered: 0, unusable: 1, unknown: null }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "1 judge call ended with no usable answer on record",
+  );
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unanswered: 0, unusable: 0, unknown: null }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored",
+  );
+  // No clause over calls no reply came back for speaks of a reply.
+  assert.doesNotMatch(
+    scoringPassLine({ ...A_PASS, unanswered: 2, unknown: 2 }),
+    /repl/,
   );
   assert.equal(
     scoringPassLine({

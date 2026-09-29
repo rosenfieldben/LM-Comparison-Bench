@@ -5092,7 +5092,9 @@ def test_a_judge_pass_records_the_verdict_its_cost_and_its_model(client, tmp_pat
         "answered",
     )
     # And, since P2, the usage counts the reply reported, on the call and
-    # on the exported call, so the estimate can be derived from the file.
+    # on the exported call: what the estimate was computed from, though not
+    # the rates it was priced at (BACKLOG, "The catalog a scoring pass
+    # priced against").
     assert (call["prompt_tokens"], call["completion_tokens"]) == (30, 9)
     (line,) = [x for x in export_lines(client, eid, path) if x["type"] == "trial"]
     (exported,) = line["judge_calls"]
@@ -5215,6 +5217,7 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
         "unpriced_calls": 1,
         "unanswered_calls": 1,
         "unusable_answers": 0,
+        "unknown_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -6511,6 +6514,38 @@ def test_the_export_verifies_its_own_digest(client, tmp_path):
     assert trailer["digest"] == hashlib.sha256(body.encode("utf-8")).hexdigest()
 
 
+def test_the_current_note_restates_every_field_the_scoring_records_carry():
+    """WINDOW: report.EXPORT_SCHEMA_NOTES at the current version, the note
+    every export carries.
+
+    The external review's L8: the note is the one place a reader holding
+    the file and an older parser learns what each field means, so it
+    names every field of a pass record and of a judge call, both outcome
+    vocabularies, the order each list is in, how the counts are made now
+    and how a pass sealed before this version was counted. PRE-STATE: the
+    current version is 12, the schema 12 rulings' bump."""
+    assert report.EXPORT_SCHEMA_VERSION == 12
+    note = report.EXPORT_SCHEMA_NOTES[12]
+    for name in (
+        *report.PASS_FIELDS,
+        *report.CALL_FIELDS,
+        *store.PASS_OUTCOMES,
+        *store.CALL_OUTCOMES,
+    ):
+        assert re.search(rf"\b{name}\b", note), name
+    for phrase in (
+        "in the order the passes started",
+        "in the order sent",
+        "never from their outcome",
+        "there a reader takes not_sent as never sent, interrupted as unknown",
+        "its unusable counted every failed call",
+        "a pass closed before version 10 carries unusable null too",
+        "interrupted, which now means only that the record of the call's ending "
+        "could not be completed",
+    ):
+        assert phrase in note, phrase
+
+
 @respx.mock
 def test_the_export_is_ordered_and_manifested(client, tmp_path):
     eid, path = two_axes_experiment(client, tmp_path)
@@ -6521,13 +6556,18 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
 
     manifest = lines[0]
     assert manifest["type"] == "manifest"
-    assert manifest["export_schema_version"] == 11
+    assert manifest["export_schema_version"] == 12
     # The bump is acknowledged here rather than only in the constant, and
     # the artifact carries its own reason: a reader with an older parser
     # can find out what moved without a changelog.
-    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[11]
-    # Version 11 is P2's: each judge call carries its reply's two usage
-    # counts, so an estimate it was settled on can be derived again.
+    assert manifest["export_schema_change"] == report.EXPORT_SCHEMA_NOTES[12]
+    # Version 12 is the operator's rulings H2 and M1 on the 1d91670 review:
+    # each judge call carries sent and usable, each pass unknown, and the
+    # counts come from the facts.
+    for field in ("sent", "usable", "unknown"):
+        assert re.search(rf"\b{field}\b", manifest["export_schema_change"])
+    # Version 11, carried: each judge call carries its reply's two usage
+    # counts, what an estimate it was settled on was computed from.
     for field in ("prompt_tokens", "completion_tokens"):
         assert field in manifest["export_schema_change"]
     # Version 10, carried: a pass's unanswered count split from its
@@ -6544,9 +6584,21 @@ def test_the_export_is_ordered_and_manifested(client, tmp_path):
     # This experiment was scored once, deterministically: one pass,
     # finished, cited by every score, and no judge call on any line.
     (scored,) = manifest["scoring_passes"]
-    assert set(scored) == set(report.PASS_FIELDS) >= {"unanswered", "unusable"}
+    assert set(scored) == {
+        "id",
+        "judge_model",
+        "started_at",
+        "ended_at",
+        "outcome",
+        "detail",
+        "scored",
+        "failed",
+        "unanswered",
+        "unusable",
+        "unknown",
+    }
     assert (scored["outcome"], scored["judge_model"]) == ("finished", None)
-    assert (scored["unanswered"], scored["unusable"]) == (0, 0)
+    assert (scored["unanswered"], scored["unusable"], scored["unknown"]) == (0, 0, 0)
     trials = [line for line in lines if line["type"] == "trial"]
     assert {s["pass_id"] for line in trials for s in line["scores"]} == {scored["id"]}
     assert all(line["judge_calls"] == [] for line in trials)
@@ -7599,6 +7651,7 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
         "unpriced_calls": 0,
         "unanswered_calls": 0,
         "unusable_answers": 0,
+        "unknown_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -17302,7 +17355,7 @@ def test_the_export_carries_the_snapshot_pin_and_its_capture(client, tmp_path):
         json.loads(x) for x in read_export(client, eid).decode().strip().split("\n")
     ]
     manifest = lines[0]
-    assert manifest["export_schema_version"] == 11
+    assert manifest["export_schema_version"] == 12
     assert "capture_id" in manifest["export_schema_change"]
     pin = {
         "digest": built["digest"],
@@ -21039,7 +21092,7 @@ def test_the_export_reads_the_store_and_says_it_is_complete(client, tmp_path):
     manifest = json.loads(pathless.decode().splitlines()[0])
     assert manifest["thresholds_included"] is True
     assert set(manifest["thresholds"]) == {"t1", "t2", "t3"}
-    assert manifest["export_schema_version"] == 11
+    assert manifest["export_schema_version"] == 12
 
     other = store_dataset(client, "other", {"id": "t1", "prompt": "x"}).json()["digest"]
     refused = client.get(
@@ -22786,6 +22839,7 @@ def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
             "failed",
             "unanswered",
             "unusable",
+            "unknown",
             "running",
             "stopping",
         }
@@ -23185,7 +23239,7 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
     client, tmp_path, ending, outcome, facts, counts, detail
 ):
     """WINDOW: one judged trial whose judge request ends one way, the
-    call's row, and the pass's sealed counts.
+    call's row, the pass's sealed counts, and the report's.
 
     THE LINE IS THE CONNECTION (the operator's Q1). A failure raised while
     a connection was being made left nothing: the call says not_sent,
@@ -23202,10 +23256,14 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
     timeout, a broken read and a protocol error before any reply are
     unanswered; the error status, the unreadable body, the reply that
     charged and carried no choices, and the two bodies cut off are
-    unusable; the class decides, never the detail string.
-    PRE-STATE at the parent (b3b4e48): the pass counted by b6c088c's
-    outcome list, so the write timeout, the broken read and the protocol
-    error were unusable, and no call carried sent or usable."""
+    unusable; the class decides, never the detail string. The report
+    counts each call where the pass sealed it, by the same arms
+    (store.call_ending), with an answer and no figure unpriced and a
+    charged reply billed whether or not it could be used.
+    PRE-STATE at b3b4e48: the pass counted by b6c088c's outcome list, so
+    the write timeout, the broken read and the protocol error were
+    unusable, and no call carried sent or usable; at 4c193b4 the pass
+    counted by the facts and the report still by that list."""
 
     def route(request):
         if not is_judge(request):
@@ -23253,6 +23311,16 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
         (made["id"],),
     ).fetchone()
     assert tuple(sealed) == counts
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == counts
+    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == counts
+    assert cost["in_flight_calls"] == 0
+    assert cost["billed_calls"] == (1 if ending == "charged, no choices" else 0)
+    assert cost["unpriced_calls"] == (1 if outcome == "answered" else 0)
 
 
 @respx.mock
@@ -23377,10 +23445,13 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     whether a reply arrived and when its head did (the time the pass took
     then, not the close's), whether it could be used, and the charge and
     the two counts when it had them; so the counts place the call by what
-    happened to it, an answer that arrived as answered and not unanswered.
-    PRE-STATE at the parent (b3b4e48): the close wrote the sentence and no
-    fact, so every shape was counted unanswered, and no call carried its
-    answer time, its generation id or its charge."""
+    happened to it, an answer that arrived as answered and not unanswered,
+    and the report counts it the same, the charged answer billed and the
+    answer with no figure unpriced.
+    PRE-STATE at b3b4e48: the close wrote the sentence and no fact, so
+    every shape was counted unanswered, and no call carried its answer
+    time, its generation id or its charge; at 4c193b4 the report still
+    counted every interrupted call unanswered."""
 
     def route(request):
         if not is_judge(request):
@@ -23438,6 +23509,16 @@ def test_an_answer_that_cannot_be_recorded_fails_the_pass_and_closes_its_call(
     assert tuple(sealed)[:3] == counts
     if replied:
         assert call["answered_at"] < sealed["ended_at"]
+    cost = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == counts
+    assert (cost["billed_calls"], cost["unpriced_calls"]) == {
+        "a charged answer": (1, 0),
+        "an answer with no figure": (0, 1),
+    }.get(shape, (0, 0))
 
 
 class HeldReply(httpx.AsyncByteStream):
@@ -23520,6 +23601,13 @@ def test_a_call_cut_at_shutdown_records_whether_its_reply_had_begun(
     assert (made["unanswered"], made["unusable"], made["unknown"]) == (
         (0, 1, 0) if head else (1, 0, 0)
     )
+    with boot_against(monkeypatch, db_path) as c:
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == ((0, 1, 0) if head else (1, 0, 0))
 
 
 @respx.mock
@@ -23996,10 +24084,10 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
     The next boot closes both as interrupted, "found open at boot", with
     no end time because none is known; the doors show the pass as ended
     and not running. Nothing is known of the call, so it carries no facts
-    and the pass counts it unknown, the one call the counts cannot place
-    (the operator's ruling M1 on the 1d91670 review), neither unanswered
-    nor in flight. PRE-STATE: the pass and the call are open when the
-    database is booted."""
+    and the pass and the report count it unknown, the one call the counts
+    cannot place (the operator's ruling M1 on the 1d91670 review), neither
+    unanswered nor in flight. PRE-STATE: the pass and the call are open
+    when the database is booted."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
@@ -24016,6 +24104,7 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
 
     with boot_against(monkeypatch, db_path) as c:
         (made,) = c.get(f"/experiments/{eid}/scoring").json()["passes"]
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
         (call,) = calls_of(c.app.state.db, eid)
 
     assert (made["outcome"], made["detail"], made["ended_at"]) == (
@@ -24024,8 +24113,14 @@ def test_the_boot_sweep_records_what_a_dead_process_left_open(monkeypatch, tmp_p
         None,
     )
     assert made["running"] is False
+    assert (made["unanswered"], made["unusable"], made["unknown"]) == (0, 0, 1)
     (swept,), _ = pass_rows(db_path, eid)
     assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+    assert (
+        cost["unanswered_calls"],
+        cost["unknown_calls"],
+        cost["in_flight_calls"],
+    ) == (0, 1, 0)
     assert (call["outcome"], call["detail"]) == (
         "interrupted",
         store.FOUND_OPEN_AT_BOOT,
@@ -24068,8 +24163,13 @@ def test_a_call_whose_pass_could_not_close_is_unknown_at_the_next_boot(
     (left,), (open_call,) = pass_rows(db_path, eid)
     assert (left["outcome"], open_call["outcome"]) == (None, None)
 
-    with boot_against(monkeypatch, db_path):
-        pass
+    with boot_against(monkeypatch, db_path) as c:
+        cost = c.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (
+        cost["billed_calls"],
+        cost["unanswered_calls"],
+        cost["unknown_calls"],
+    ) == (0, 0, 1)
     (swept,), (call,) = pass_rows(db_path, eid)
     assert (call["outcome"], call["detail"]) == (
         "interrupted",
@@ -24077,6 +24177,138 @@ def test_a_call_whose_pass_could_not_close_is_unknown_at_the_next_boot(
     )
     assert [call[k] for k in CALL_FACTS] == [None] * 7
     assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (0, 0, 1)
+
+
+@pytest.mark.parametrize("cost", [0.00004, None], ids=["charged", "no figure"])
+@respx.mock
+def test_a_verdict_that_does_not_parse_is_an_answer_and_its_score_says_why(
+    client, tmp_path, cost
+):
+    """WINDOW: a judge that answers 200 with a message holding no verdict,
+    with the usage its reply reported and a charge or none; the call, the
+    score row, the pass and the report after.
+
+    Ruling 2 at P1's checkpoint: a reply whose verdict does not parse is
+    answered. A reply came and was read, and the transport's work is
+    done; the score row is where the failure is recorded ("no JSON
+    object"). So the call is answered, with its answer time and no
+    detail, its generation id, its charge and its counts, and usable; the
+    pass counts its score row failed and the call in neither unanswered
+    nor unusable; and the report counts it billed, or unpriced when it
+    carried no figure. The behaviour held at 4c193b4, where this proof is
+    red only on the pass door's unknown, served from this commit; it is
+    proven by mutation (the external review's M6: mutants C11 and M2
+    survived the suite). PRE-STATE: the reply's content holds no JSON."""
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        body = judge_answer(gen="gen-nv")
+        body["choices"][0]["message"]["content"] = "no idea, honestly"
+        body["usage"] = {"prompt_tokens": 30, "completion_tokens": 9}
+        if cost is not None:
+            body["usage"]["cost"] = cost
+        assert "{" not in body["choices"][0]["message"]["content"]
+        return httpx.Response(200, json=body)
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path).status_code == 202
+    wait_scoring_done(client)
+
+    (call,) = calls_of(client.app.state.db, eid)
+    assert (call["outcome"], call["detail"], call["generation_id"]) == (
+        "answered",
+        None,
+        "gen-nv",
+    )
+    assert call["answered_at"] is not None
+    assert (
+        call["billed_cost_usd"],
+        call["prompt_tokens"],
+        call["completion_tokens"],
+    ) == (
+        cost,
+        30,
+        9,
+    )
+    assert (call["sent"], call["usable"]) == (1, 1)
+    (row,) = [r for r in scores_in(client, eid) if r["scorer"] == "judge"]
+    assert row["score"] is None and "no JSON object" in row["detail"]
+    assert row["judge_call_id"] == call["id"]
+    (made,) = client.get(f"/experiments/{eid}/scoring").json()["passes"]
+    assert (
+        made["scored"],
+        made["failed"],
+        made["unanswered"],
+        made["unusable"],
+        made["unknown"],
+    ) == (0, 1, 0, 0, 0)
+    judged = client.get(f"/experiments/{eid}/report").json()["judge_cost"]
+    assert (judged["unanswered_calls"], judged["unusable_answers"]) == (0, 0)
+    assert (judged["billed_calls"], judged["unpriced_calls"]) == (
+        (1, 0) if cost is not None else (0, 1)
+    )
+
+
+def test_ruling_4s_outcome_list_is_gone():
+    """WINDOW: bench.store and bench.report as imported.
+
+    The operator's ruling H2 on the 1d91670 review withdrew ruling 4's
+    outcome list ("the definition wins and the list was my error.
+    Tombstone it."): b6c088c's two tuples, by which a call was counted
+    from its outcome word, are deleted, and neither module holds them.
+    PRE-STATE: store.call_ending, which counts by the facts in their
+    place, is there."""
+    assert callable(store.call_ending)
+    for name in ("UNANSWERED_CALL_OUTCOMES", "UNUSABLE_CALL_OUTCOMES"):
+        assert not hasattr(store, name)
+        assert not hasattr(report, name)
+
+
+@respx.mock
+def test_every_door_serves_a_pass_as_its_record_holds_it(client, tmp_path):
+    """WINDOW: a pass whose one call it left open, closed through the
+    store, and the three doors that serve a pass: the list, the
+    experiment and its scoring record; and the two tables' columns.
+
+    unknown reaches the page through ScoringPass and _pass_view, on every
+    door, with the record's value. The served pass is the scoring_passes
+    row less its experiment id, plus this process's running and stopping;
+    the export's pass record is the row less its experiment id; and its
+    call record is the judge_calls row less its experiment and result
+    ids, which the trial line it rides on carries. Each list is held to
+    the table's own columns, so a column added later reaches every door
+    or fails here. PRE-STATE: the pass is closed with unknown 1."""
+    respx.post(OPENROUTER_URL).mock(
+        side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
+    )
+    eid, _ = judged_experiment(client, tmp_path)
+    db = client.app.state.db
+    (rid,) = [r[0] for r in db.execute("SELECT id FROM results")]
+    pass_id = store.open_scoring_pass(db, eid, "judge/one")
+    store.record_judge_call_sent(db, pass_id, rid, "judge/one")
+    store.close_scoring_pass(db, pass_id, "stopped", "x")
+    assert db.execute("SELECT unknown FROM scoring_passes").fetchone()[0] == 1
+
+    listed = next(
+        e for e in client.get("/experiments").json()["experiments"] if e["id"] == eid
+    )
+    served = [
+        listed["scoring"],
+        client.get(f"/experiments/{eid}").json()["scoring"],
+        *client.get(f"/experiments/{eid}/scoring").json()["passes"],
+    ]
+    assert [p["unknown"] for p in served] == [1, 1, 1]
+    passes = {r[1] for r in db.execute("PRAGMA table_info(scoring_passes)")}
+    calls = {r[1] for r in db.execute("PRAGMA table_info(judge_calls)")}
+    assert set(served[0]) == set(main.ScoringPass.model_fields)
+    assert set(main.ScoringPass.model_fields) == passes - {"experiment_id"} | {
+        "running",
+        "stopping",
+    }
+    assert set(report.PASS_FIELDS) == passes - {"experiment_id"}
+    assert set(report.CALL_FIELDS) == calls - {"experiment_id", "result_id"}
 
 
 def seed_a_live_older_database(path):
@@ -24415,6 +24647,7 @@ def test_the_report_over_a_pre_p_database_shows_what_its_rows_support(
         "unpriced_calls": 1,
         "unanswered_calls": 0,
         "unusable_answers": 0,
+        "unknown_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
@@ -24526,6 +24759,7 @@ def test_a_mixed_era_experiment_reports_each_request_once(client, tmp_path):
         "unpriced_calls": 2,
         "unanswered_calls": 1,
         "unusable_answers": 1,
+        "unknown_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
@@ -24534,6 +24768,227 @@ def test_a_mixed_era_experiment_reports_each_request_once(client, tmp_path):
     (made,) = served["scoring_passes"]
     assert (made["outcome"], made["scored"]) == ("finished", 2)
     assert (made["unanswered"], made["unusable"]) == (1, 1)
+    # THE FIGURE IS IN THE FILE ONCE (the external review's M9): every
+    # figure the file holds, on a score or on a call, sums to the total,
+    # so a call's figure copied onto the score that cites it would count
+    # it twice.
+    trials = [x for x in lines if x["type"] == "trial"]
+    figures = [
+        s["judge_billed_cost_usd"]
+        for t in trials
+        for s in t["scores"]
+        if s["judge_billed_cost_usd"] is not None
+    ] + [
+        c["billed_cost_usd"]
+        for t in trials
+        for c in t["judge_calls"]
+        if c["billed_cost_usd"] is not None
+    ]
+    assert math.fsum(figures) == served["judge_cost"]["total_usd"]
+
+
+PASS_RECORD_FIELDS = {
+    "id",
+    "judge_model",
+    "started_at",
+    "ended_at",
+    "outcome",
+    "detail",
+    "scored",
+    "failed",
+    "unanswered",
+    "unusable",
+    "unknown",
+}
+CALL_RECORD_FIELDS = {
+    "id",
+    "pass_id",
+    "judge_model",
+    "sent_at",
+    "answered_at",
+    "generation_id",
+    "billed_cost_usd",
+    "outcome",
+    "detail",
+    "prompt_tokens",
+    "completion_tokens",
+    "sent",
+    "usable",
+}
+
+
+def as_exported(row, fields):
+    """A database row as the export states it: the named fields, with the
+    two facts as true, false or null."""
+    out = {k: row[k] for k in fields}
+    for flag in {"sent", "usable"} & fields:
+        if out[flag] is not None:
+            out[flag] = bool(out[flag])
+    return out
+
+
+@respx.mock
+def test_the_export_carries_every_scoring_record_as_the_database_holds_it(
+    client, tmp_path
+):
+    """WINDOW: three judged trials scored by a pass whose calls got no reply,
+    no reply and an error status, and by a second whose calls were
+    answered and charged; a third pass, closed through the store, that
+    left its one call open; and a pass and call planted as a draft build
+    before schema 12 left them (only a migrated database holds one);
+    then the export, the database and the two reports.
+
+    The external review's M8: every exported pass and call is its row key
+    for key, in the order written, each call on the line of the trial it
+    judged, the two facts as true, false or null. The report rebuilt from
+    the file equals the served one. Each pass sealed since schema 12 has
+    the counts call_ending recounts from its exported calls. The planted
+    call is exported with sent and usable null, the record as it is; the
+    history reading is the reader's (note 12). PRE-STATE: the first pass's
+    counts differ from each other and from the other passes', so a swap
+    or a dropped field shows."""
+    replies = {"n": 0}
+
+    def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        replies["n"] += 1
+        n = replies["n"]
+        if n in (1, 2):
+            raise httpx.ReadTimeout("no reply", request=request)
+        if n == 3:
+            return httpx.Response(500, json={"error": "upstream"})
+        return httpx.Response(200, json=judge_answer(gen=f"gen-{n}", cost=n / 10**4))
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    eid, path = judged_experiment(client, tmp_path, lineup=THREE_ARMS)
+    for _ in range(2):
+        assert score(client, eid, path).status_code == 202
+        wait_scoring_done(client)
+    db = client.app.state.db
+    rids = results_in_order(client, eid)
+    left = store.open_scoring_pass(db, eid, "judge/one")
+    store.record_judge_call_sent(db, left, rids[0], "judge/one")
+    store.close_scoring_pass(db, left, "stopped", "x")
+    with db:
+        planted = db.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model,
+                   started_at, ended_at, outcome, scored, failed,
+                   unanswered, unusable)
+               VALUES (?, 'judge/one', 't0', 't1', 'finished', 1, 0, 0, 0)""",
+            (eid,),
+        ).lastrowid
+        db.execute(
+            """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                   judge_model, sent_at, answered_at, generation_id, outcome)
+               VALUES (?, ?, ?, 'judge/one', 't0', 't1', 'gen-old', 'answered')""",
+            (planted, eid, rids[1]),
+        )
+    rows = [
+        dict(r)
+        for r in db.execute(
+            "SELECT * FROM scoring_passes WHERE experiment_id = ? ORDER BY id", (eid,)
+        )
+    ]
+    assert [(r["unanswered"], r["unusable"], r["unknown"]) for r in rows] == [
+        (2, 1, 0),
+        (0, 0, 0),
+        (0, 0, 1),
+        (0, 0, None),
+    ]
+
+    lines = export_lines(client, eid, path)
+    manifest, trials = lines[0], [x for x in lines if x["type"] == "trial"]
+    assert manifest["scoring_passes"] == [
+        as_exported(r, PASS_RECORD_FIELDS) for r in rows
+    ]
+    for trial in trials:
+        held = db.execute(
+            "SELECT * FROM judge_calls WHERE result_id = ? ORDER BY id",
+            (trial["result_id"],),
+        ).fetchall()
+        assert trial["judge_calls"] == [
+            as_exported(dict(r), CALL_RECORD_FIELDS) for r in held
+        ]
+    exported = [c for t in trials for c in t["judge_calls"]]
+    assert len(exported) == 8
+    # True, false or null, not sqlite's 1 and 0, which compare equal to the
+    # first two in Python and would pass the comparison above.
+    assert {type(c["sent"]) for c in exported} == {bool, type(None)}
+    assert {type(c["usable"]) for c in exported} == {bool, type(None)}
+    assert {c["usable"] for c in exported} == {True, False, None}
+    (old,) = [c for c in exported if c["generation_id"] == "gen-old"]
+    assert (old["sent"], old["usable"], old["outcome"]) == (None, None, "answered")
+
+    served = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    rebuilt = rebuild_from_export(lines, tasks_from_manifest(lines[0]))
+    assert rebuilt["judge_cost"] == served["judge_cost"]
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    assert (
+        served["judge_cost"]["unanswered_calls"],
+        served["judge_cost"]["unusable_answers"],
+        served["judge_cost"]["unknown_calls"],
+        served["judge_cost"]["billed_calls"],
+        served["judge_cost"]["unpriced_calls"],
+    ) == (2, 1, 1, 3, 1)
+    for sealed in manifest["scoring_passes"]:
+        if sealed["unknown"] is None:
+            continue
+        words = [store.call_ending(c) for c in exported if c["pass_id"] == sealed["id"]]
+        assert (sealed["unanswered"], sealed["unusable"], sealed["unknown"]) == (
+            words.count("unanswered"),
+            words.count("unusable"),
+            words.count("unknown"),
+        )
+
+
+@respx.mock
+def test_a_call_in_flight_is_exported_and_counted_as_in_flight(client, tmp_path):
+    """WINDOW: a judged pass whose one call is held on the wire, the report
+    and the export read while it is, and the pass after the call is let
+    go.
+
+    The external review's M8: a call not yet ended is counted in flight and
+    in nothing else, its exported record has no outcome and no facts, and
+    the report rebuilt from that file equals the served one, the running
+    pass's null counts included. PRE-STATE: the call is open when both
+    are read."""
+    gate = asyncio.Event()
+    judged = []
+    respx.post(OPENROUTER_URL).mock(side_effect=gated_judge(gate, judged))
+    eid, path = judged_experiment(client, tmp_path)
+    assert score(client, eid, path).status_code == 202
+    drive_until(client, lambda: judged == [1], "the judge call never left")
+    assert calls_of(client.app.state.db, eid)[0]["outcome"] is None
+
+    served = client.get(
+        f"/experiments/{eid}/report", params={"dataset_path": path}
+    ).json()
+    lines = export_lines(client, eid, path)
+    rebuilt = rebuild_from_export(lines, tasks_from_manifest(lines[0]))
+    client.portal.call(gate.set)
+    wait_scoring_done(client)
+
+    cost = served["judge_cost"]
+    assert (
+        cost["in_flight_calls"],
+        cost["unanswered_calls"],
+        cost["unusable_answers"],
+        cost["unknown_calls"],
+    ) == (1, 0, 0, 0)
+    ((call,),) = [x["judge_calls"] for x in lines if x["type"] == "trial"]
+    assert (call["outcome"], call["answered_at"], call["sent"], call["usable"]) == (
+        None,
+        None,
+        None,
+        None,
+    )
+    assert rebuilt["judge_cost"] == served["judge_cost"]
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    (running,) = served["scoring_passes"]
+    assert (running["outcome"], running["unknown"]) == (None, None)
 
 
 def lift_to_pre_p(lines):
@@ -24615,6 +25070,34 @@ def test_a_pre_p_and_a_post_p_export_differ_only_in_the_scoring_records(
             },
         )
 
+    # On the raw files (the external review's M9): every score that cites a
+    # call carries neither the figure nor the generation id, and the old
+    # export's twin row carries both, so the lift below is not vacuous.
+    raw_new = export_lines(client, new_eid, path)
+    cited = [
+        s
+        for x in raw_new
+        if x["type"] == "trial"
+        for s in x["scores"]
+        if s["judge_call_id"] is not None
+    ]
+    assert cited
+    assert all(
+        (s["judge_generation_id"], s["judge_billed_cost_usd"]) == (None, None)
+        for s in cited
+    )
+    raw_old = export_lines(client, old_eid, path)
+    (twin_row,) = [
+        s
+        for x in raw_old
+        if x["type"] == "trial"
+        for s in x["scores"]
+        if s["scorer"] == "judge"
+    ]
+    assert (twin_row["judge_generation_id"], twin_row["judge_billed_cost_usd"]) == (
+        "gen-t",
+        0.00002,
+    )
     old_export = without_identity(export_lines(client, old_eid, path)[:-1])
     new_export = without_identity(export_lines(client, new_eid, path)[:-1])
     assert old_export != new_export
@@ -24662,7 +25145,7 @@ def test_the_spend_line_reads_exactly_the_keys_the_report_writes():
         spend,
     )
     keys, line = read
-    assert line.count(";") == 4 and ", 1 unpriced" in line
+    assert line.count(";") == 5 and ", 1 unpriced" in line
     assert keys == sorted(written)
 
 
@@ -24730,7 +25213,14 @@ def test_the_judge_total_does_not_depend_on_the_order_of_the_calls():
     running = functools.partial(functools.reduce, operator.add)
     assert running(figures) != running(list(reversed(figures)))
     calls = [
-        {"id": n, "outcome": "answered", "billed_cost_usd": figure}
+        {
+            "id": n,
+            "outcome": "answered",
+            "sent": True,
+            "answered_at": "t",
+            "usable": True,
+            "billed_cost_usd": figure,
+        }
         for n, figure in enumerate(figures)
     ]
     forward = report._judge_cost({}, calls)
@@ -24748,7 +25238,14 @@ def test_a_score_citing_a_call_the_report_was_not_given_is_refused():
     is fine (a threshold helper deletes scores and leaves calls).
     PRE-STATE: with the call handed in, the same rows report."""
     row = {"id": 7, "scorer": "judge", "judge_call_id": 3, "pass_id": 1}
-    call = {"id": 3, "outcome": "answered", "billed_cost_usd": None}
+    call = {
+        "id": 3,
+        "outcome": "answered",
+        "sent": True,
+        "answered_at": "t",
+        "usable": True,
+        "billed_cost_usd": None,
+    }
     assert report._judge_cost({1: [row]}, [call])["unpriced_calls"] == 1
     assert report._judge_cost({}, [call])["unpriced_calls"] == 1
     with pytest.raises(ValueError, match="score row 7 cites judge call 3"):
@@ -24770,13 +25267,15 @@ def test_the_pages_pass_vocabulary_and_keys_are_the_servers():
         "const seen = new Set();"
         "const base = {id: 1, judge_model: 'j/x', started_at: '2026-09-28T07:10:00',"
         " ended_at: '2026-09-28T07:11:00', outcome: 'finished', detail: 'd',"
-        " scored: 1, failed: 1, unanswered: 1, running: false, stopping: false};"
+        " scored: 1, failed: 1, unanswered: 1, unusable: 1, unknown: 1,"
+        " running: false, stopping: false};"
         "const read = (p) => l.scoringPassLine(new Proxy(p,"
         " {get(t, k) { seen.add(k); return t[k]; }}));"
         "const lines = l.PASS_OUTCOMES.map((o) => read({...base, outcome: o}));"
         "lines.push(read({...base, outcome: null, running: true}));"
         "lines.push(read({...base, outcome: null, running: true, stopping: true}));"
         "lines.push(read({...base, outcome: null}));"
+        "lines.push(read({...base, unknown: null}));"
         "process.stdout.write(JSON.stringify([l.PASS_OUTCOMES, [...seen].sort(), lines]));",
     )
     outcomes, keys, lines = got

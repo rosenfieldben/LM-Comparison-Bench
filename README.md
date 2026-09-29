@@ -1497,7 +1497,7 @@ restaged reference looked like a `.txt`. A run cut short by a
 disconnect records its pin like any other, since an aborted run is the
 one whose billing most needs reconstructing later.
 
-An **export is schema version 11**. Each trial line carries the ordered
+An **export is schema version 12**. Each trial line carries the ordered
 pins, so a reader holding only the artifact can say which *reading* of a
 document was sent and not merely which bytes; that arrived in version 3.
 Version 4 added the manifest's `token_counts` sentence and each trial's
@@ -1521,11 +1521,21 @@ null, because its call carries them: the figure is recorded once.
 Version 10 splits a pass's count of requests with no usable answer in
 two: `unanswered`, the requests nothing came back for, and `unusable`,
 the ones that got something back that could not be used. Version 11
-gives each judge call the two usage counts its reply reported, so the
-estimate a call with no billed figure was counted at can be derived
-again from the file. The manifest states the reason for the current bump
-in the file itself, and it names every field the earlier versions added,
-because a reader holding a v11 artifact and a v2 parser needs the whole
+gives each judge call the two usage counts its reply reported, the
+counts the estimate a call with no billed figure was counted at was
+computed from; the rates it was priced at are not in the file (see
+BACKLOG, "The catalog a scoring pass priced against"). Version 12
+records the facts a scoring pass counts its judge calls by, and counts
+by nothing else: each call's `sent` (whether the request left, or may
+have) and `usable` (whether its reply could be used), beside
+`answered_at`, now set whenever a reply's head arrived, a body cut off
+included; and each pass's `unknown`, the calls whose record could not be
+completed and does not say whether they went out. `interrupted` now
+means only that. A pass closed before version 12 keeps the counts it was
+sealed with, made by an outcome list withdrawn then, and carries
+`unknown` null. The manifest states the reason for the current bump in
+the file itself, and it names every field the earlier versions added,
+because a reader holding a v12 artifact and a v2 parser needs the whole
 list from the file in their hand.
 
 Content dedupes by digest; the EXTRACTION dedupes by digest **and** parser
@@ -2813,10 +2823,21 @@ lists an experiment's passes newest first, with the one running now as
 latest as `scoring`: its judge, when it started and ended, how it ended
 (`finished`; `stopped`; `failed`, with the error; or `interrupted`), and
 how many trials it scored, how many it wrote with no score, how many of
-its judge calls went out and got nothing back (`unanswered`: timed out,
-cut at shutdown, or its record cut off), and how many got a reply that
-could not be used (`unusable`: an error status, a body that could not be
-read, or a failure after sending). A pass that fails
+its judge calls went out and got no reply (`unanswered`: timed out, cut
+at shutdown before a reply, or failed after sending with nothing back),
+how many got a reply that could not be used (`unusable`: an error
+status, or a body that could not be read or was cut off), and how many
+have a record that could not be completed and does not say whether they
+went out (`unknown`: found open at boot, or left open by a pass that
+ended without saying why). Each call is counted by what its record says
+happened to it, never by the word for how it ended, so a call whose
+ending's write failed is counted where what the pass knew of it puts it.
+A pass closed before schema 12 carries `unknown` null: its counts were
+made by an outcome list withdrawn then, which put every failed call
+under `unusable` and every interrupted one under `unanswered`, so the
+panel gives its two as one ("N judge calls ended with no usable answer
+on record"), and the report's spend line, which counts the same calls by
+their records, can differ from them. A pass that fails
 frees the bench's one scoring slot and stays in the list, and a re-score
 is a new pass beside it. The panel says the latest in a line beside
 Score, in the record's words and stamped in UTC ("scored 2026-09-28
@@ -2830,21 +2851,31 @@ recorded, and the panel does not guess.
 
 **Every judge request is recorded before it goes out**, as a row with
 the time it was sent, and once more with how it ended: `answered`;
-`timed_out`; `stopped`, cut at shutdown; `failed`, sent with no usable
-reply (a transport error after sending, an error status, or a body that
-could not be read); `not_sent`, when no connection was made, so nothing
-left; or `interrupted`, when the record of its ending was cut off: by
-the process ending ("found open at boot"), or by the write that should
-have held it failing, whose detail says what happened to the request
-and that only its record's write failed ("the answer arrived; its write
-failed: " and the error). The line between `not_sent` and the rest is the
-connection: anything after one was established counts as sent, because
-money may have moved. The generation id, the charge and the two usage
-counts the reply reported (`prompt_tokens`, `completion_tokens`) are on
-the call, recorded once, and a judged score cites its call. No value in either
-record ever changes once written: triggers in the database refuse a
-change, a second ending, a replacement or a delete, from any writer, a
-second connection or the sqlite3 prompt included.
+`timed_out`; `stopped`, cut at shutdown, before its reply or while its
+reply was arriving; `failed`, sent with no usable reply (a transport
+error after sending, an error status, or a body that could not be read
+or was cut off); `not_sent`, when no connection was made, so nothing
+left; or `interrupted`, which means only that the record of its ending
+could not be completed: by the process ending ("found open at boot"),
+or by the write that should have held it failing, whose detail says
+what happened to the request and that only its record's write failed
+("the answer arrived; its write failed: " and the error). Beside the
+outcome the call records the facts it is counted by: `sent`, whether the
+request left or may have; `answered_at`, when a reply's head arrived,
+set whatever the reply said, an error status and a body that could not
+be read or was cut off included, and empty when nothing came back; and
+`usable`, whether that reply was read as an answer. An interrupted call
+carries what the pass knew of it, the charge and the usage counts
+included, and nothing when it knew nothing. The line between `not_sent`
+and the rest is the connection: anything after one was established
+counts as sent, because money may have moved. The generation id, the
+charge and the two usage counts the reply reported (`prompt_tokens`,
+`completion_tokens`) are on the call, recorded once, and a judged score
+cites its call. No value in either record ever changes once written:
+triggers in the database refuse a change, a second ending, a partial
+ending, an ending whose facts disagree with its outcome, a replacement
+or a delete, from any writer, a second connection or the sqlite3 prompt
+included.
 
 `POST /experiments/{id}/scoring/stop`, with the body `{}`, asks the
 running pass to stop between trials, as the runner's Stop does: a judge
@@ -2857,7 +2888,9 @@ greys, and the line beside Score says the pass is stopping until the
 list says it has ended. Shutting the bench down asks
 the same way and waits up to `SCORING_SHUTDOWN_SECONDS`, 30 seconds, then
 cuts the pass, and the call on the wire is recorded `stopped`: still
-recorded as sent, with no answer, which is the point. The bound sits
+recorded as sent, which is the point, and, if its reply had begun to
+arrive, with the time it did, so it is counted among the replies that
+could not be used rather than the calls that got none. The bound sits
 between two numbers on purpose. It is shorter than the judge's own 60 s
 timeout, so a slow judge call is cut and recorded rather than holding
 shutdown for its whole timeout. It is longer than the ten seconds a
@@ -2933,18 +2966,25 @@ every other request. The report carries what the judging cost as
 own line beside the ranking ("judge spend: $X.XXXX over N billed calls",
 or "judge spend: none billed"), never added into a model's cost: that
 is the bench's instrument cost, not what any model under test was paid.
-A judge reply that came back with no price is named as unpriced rather
+A judge answer that came back with no price is named as unpriced rather
 than counted as nothing spent (", K unpriced", or "none billed, K calls
 unpriced"). The line reports what was billed; the ceiling, which has to
-count what it can, counts such a reply at the catalog estimate over its
-counts, so the two figures differ by exactly those replies. After the spend the line names each request the figure
-cannot speak for, as what it is: calls that went out and got nothing
-back ("; M judge calls went out and got no answer"), calls that got a
-reply that could not be used ("; M judge calls got replies that could
-not be used"), calls that had not come back when the report was read
-(only while a pass runs), and
-judge rows written before the bench recorded its requests, which cannot
-say whether their request went out. A request never sent (no judge
+count what it can, counts a reply that carried no billed figure at the
+catalog estimate over the usage counts it reported, so the two figures
+differ by every such reply, whether or not it could be used. After the
+spend the line names each request the figure cannot speak for, as what
+it is: calls that went out and got no reply ("; M judge calls went out
+and got no answer"), calls that got a reply that could not be used ("; M
+judge calls got replies that could not be used"), calls whose record
+could not be completed and does not say whether they went out ("; M
+judge calls' records could not be completed, so this line cannot say
+whether they went out": found open at boot, or interrupted before schema
+12, whose detail, which the count does not read, may say more), calls
+that had not come back when the report was read (only while a pass
+runs), and judge rows written before the bench recorded its requests,
+which carry no figure and of which the line cannot say whether their
+request went out. Each call is counted by what its record says happened
+to it, never by the word for how it ended. A request never sent (no judge
 given, the ceiling refusing, a trial with no text, a connection never
 made) is in none of those counts. Until the requests were recorded the
 line could only say how many judge rows carried no billing figure,

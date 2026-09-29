@@ -40,7 +40,7 @@ from typing import Any
 from bench.datasets import JUDGE_SCORER
 from bench.models import as_flag
 from bench.scoring import latest_per_key
-from bench.store import UNANSWERED_CALL_OUTCOMES, UNUSABLE_CALL_OUTCOMES
+from bench.store import call_ending
 
 # The message the disconnect path writes, shared rather than duplicated.
 # A reader matching this literal on its own would be matching prose that
@@ -1714,28 +1714,34 @@ def _judge_cost(
 
     THE COUNTS:
       billed_calls        a request with a billed figure, in either era.
-      unpriced_calls      answered and no figure; before Phase P, a row
-                          with a generation id and no figure.
-      unanswered_calls    sent, and nothing came back: timed out, cut at
-                          shutdown, or its record cut off (interrupted).
-      unusable_answers    sent, and something came back that could not
-                          be used: an error status, a body that could not
-                          be read, or a transport failure after sending
-                          (failed). Two counts and two words, by the
-                          operator's ruling 4 at P1's checkpoint; until it
-                          one count, unanswered_calls, held both.
-                          A request never sent is in neither.
+      unpriced_calls      a call placed answered with no figure; before
+                          Phase P, a row with a generation id and no
+                          figure.
+      unanswered_calls    sent, and no reply came back.
+      unusable_answers    a reply came back and could not be used: an
+                          error status, or a body that could not be read
+                          or was cut off.
+      unknown_calls       a call whose record could not be completed and
+                          does not say whether its request went out: found
+                          open at boot, left open by its pass, or
+                          interrupted before schema 12.
       in_flight_calls     sent and not yet ended, when the report was
                           read; only a running pass has any, since the
                           boot sweep ends what a dead process left.
+                          Each call is in exactly one of these, or never
+                          sent and in none, by store.call_ending, from its
+                          facts (the operator's ruling H2 on the 1d91670
+                          review withdrew ruling 4's outcome list).
       rows_before_call_records
                           a judge row from before Phase P with neither a
-                          figure nor a generation id, which cannot say
-                          whether its request went out: a timeout after
-                          sending and a refused connection wrote the same
-                          row. The old rows that say they never sent
-                          (PRE_P_NEVER_SENT) are counted nowhere, as
-                          their post-P equivalents have no call.
+                          figure nor a generation id. The counts do not
+                          read its detail (the operator's ruling on the
+                          1d91670 review: pre-P rows say what they say),
+                          so the line cannot say whether its request went
+                          out; the detail may. The old rows that say they
+                          never sent (PRE_P_NEVER_SENT) are counted
+                          nowhere, as their post-P equivalents have no
+                          call.
 
     A post-P row citing a call the report was not handed is refused
     rather than read around, because the counts would then be short by
@@ -1768,6 +1774,7 @@ def _judge_cost(
         if row.get("judge_billed_cost_usd") is not None
     ]
     unpriced_old = [row for row in old if row.get("judge_billed_cost_usd") is None]
+    placed = [call_ending(call) for call in judge_calls]
     return {
         # fsum, so the total does not depend on the order the figures
         # arrive in: a served report and one rebuilt from its export
@@ -1776,17 +1783,14 @@ def _judge_cost(
         "billed_calls": len(figures),
         "unpriced_calls": sum(
             1
-            for call in judge_calls
-            if call["outcome"] == "answered" and call.get("billed_cost_usd") is None
+            for call, ending in zip(judge_calls, placed, strict=True)
+            if ending == "answered" and call.get("billed_cost_usd") is None
         )
         + sum(1 for row in unpriced_old if row.get("judge_generation_id") is not None),
-        "unanswered_calls": sum(
-            1 for call in judge_calls if call["outcome"] in UNANSWERED_CALL_OUTCOMES
-        ),
-        "unusable_answers": sum(
-            1 for call in judge_calls if call["outcome"] in UNUSABLE_CALL_OUTCOMES
-        ),
-        "in_flight_calls": sum(1 for call in judge_calls if call["outcome"] is None),
+        "unanswered_calls": placed.count("unanswered"),
+        "unusable_answers": placed.count("unusable"),
+        "unknown_calls": placed.count("unknown"),
+        "in_flight_calls": placed.count("in_flight"),
         "rows_before_call_records": sum(
             1 for row in unpriced_old if row.get("judge_generation_id") is None
         ),
@@ -1807,6 +1811,7 @@ PASS_FIELDS = (
     "failed",
     "unanswered",
     "unusable",
+    "unknown",
 )
 
 CALL_FIELDS = (
@@ -1821,6 +1826,8 @@ CALL_FIELDS = (
     "detail",
     "prompt_tokens",
     "completion_tokens",
+    "sent",
+    "usable",
 )
 
 
@@ -1845,7 +1852,7 @@ def _provider_counts(results: list[dict[str, Any]]) -> dict[str, int]:
 # a way a reader could not absorb. Not the app's version and not the
 # dataset's: a citation names an artifact, and the artifact has to say
 # which format it is in without anyone consulting a changelog.
-EXPORT_SCHEMA_VERSION = 11
+EXPORT_SCHEMA_VERSION = 12
 
 
 # WHY EACH VERSION IS THE NUMBER IT IS, carried IN the artifact rather
@@ -1986,9 +1993,18 @@ def _manifest_token_note() -> str:
 # and its unanswered counts its failed calls too.
 #
 # Version 11 is Phase P's P2: each judge call on a trial line gains the
-# two usage counts its reply reported, so the catalog estimate a call
-# with no billed figure was settled on against the spend ceiling can be
-# rederived from the artifact. A field addition, the first limb.
+# two usage counts its reply reported, the counts the catalog estimate a
+# call with no billed figure was settled on against the spend ceiling
+# was computed from. The rates it was priced at are not in the file: they
+# are the booted process's catalog, which a pass does not name (BACKLOG,
+# "The catalog a scoring pass priced against"). A field addition, the
+# first limb.
+#
+# Version 12 is the operator's rulings H2 and M1 on the 1d91670 review:
+# each judge call gains sent and usable, each pass gains unknown,
+# interrupted narrows to a record that could not be completed, and the
+# counts come from the facts. Both limbs: a field addition, and keys
+# whose meaning changed.
 EXPORT_SCHEMA_NOTES = {
     1: "the original export shape",
     2: (
@@ -2205,6 +2221,85 @@ EXPORT_SCHEMA_NOTES = {
         "artifact; capture_id on pins and captures in the manifest, with "
         "head, dirty, patterns, excludes and captured_at for each, from "
         "version 7; attachments and attachments_mode on each trial line and "
+        "attachments_referenced in the manifest from version 2, whose truth "
+        "conditions widened at version 5 because the manifest itself now "
+        "cites digests; renditions, the ordered pins each with digest, "
+        "extractor, extractor_version and kind, from version 3, and kind may "
+        "be snapshot from version 6; token_counts in the manifest and "
+        "is_byok on each trial line from version 4; task_attachments and "
+        "attachments_mode in the manifest from version 5."
+    ),
+    12: (
+        "each judge call on a trial line carries sent and usable, each record "
+        "in the manifest's scoring_passes carries unknown, and a pass's counts "
+        "now come from its calls' facts, never from their outcome: both a "
+        "field addition and a changed meaning. sent is true when a connection "
+        "was established for the request, or when its leaving cannot be ruled "
+        "out, and false when no connection was made, so nothing left. From "
+        "this version answered_at is set whenever a reply's head arrived, "
+        "whatever the reply said, an error status, a body that could not be "
+        "read and a body cut off while it was read included, and is the time "
+        "that head arrived; it is null when nothing came back. usable is true "
+        "when the reply was read as an answer, a verdict that does not parse "
+        "included, whose score says why it has none, false when a reply "
+        "arrived and could not be used, and null when no reply arrived. "
+        "outcome keeps its words: answered, timed_out, stopped (cut at "
+        "shutdown, before its reply or while it arrived), failed (sent, and no "
+        "usable reply), not_sent (no connection was made, so nothing left) and "
+        "interrupted, which now means only that the record of the call's "
+        "ending could not be completed; sent, answered_at and usable then say "
+        "what the scoring pass knew, with generation_id, billed_cost_usd, "
+        "prompt_tokens and completion_tokens when it had them, and all are "
+        "null when it knew nothing, as for a call found open at boot. outcome "
+        "is null on a call in flight when the file was written. Of the calls "
+        "that ended, one with sent false is in no count; unanswered counts "
+        "those sent with answered_at null; "
+        "unusable those with answered_at set and usable false; unknown those "
+        "with sent null that ended as interrupted, whose record does not say "
+        "whether they went out; the rest were answered. sent and usable are "
+        "null on every call ended before this version, which recorded these "
+        "facts only in its outcome and answered_at: there a reader takes "
+        "not_sent as never sent, interrupted as unknown, and any other outcome "
+        "as sent, with a reply usable exactly when answered_at is set and the "
+        "outcome is answered; answered_at on such a call is the time its "
+        "ending was written, and a reply cut off while its body was read may "
+        "show none. Each record in scoring_passes carries, in the order the "
+        "passes started, id, judge_model (null for a pass given no judge), "
+        "started_at, ended_at, outcome (finished, stopped, failed, or "
+        "interrupted when a pass was found open at boot, whose ended_at is "
+        "then null), detail, and the counts sealed when it ended: scored, "
+        "failed, unanswered, unusable and unknown. A pass closed before this "
+        "version carries unknown null and was counted by an outcome list "
+        "withdrawn at this version: from version 10 its unusable counted "
+        "every failed call, whether or not a reply came, and its unanswered "
+        "every timed_out, stopped and interrupted call, the interrupted calls "
+        "never sent and those whose answer arrived included; a pass closed "
+        "before version 10 carries unusable null too, and its unanswered "
+        "counts its failed calls as well. Those counts stand as sealed, so a "
+        "recount of such a pass's calls by the rule above can differ from "
+        "them. Every field the earlier versions added is carried with its "
+        "meaning intact except where this note says otherwise: prompt_tokens "
+        "and completion_tokens on each judge call from version 11, the counts "
+        "the judge's reply reported, null when no reply arrived, when the "
+        "reply did not report them, and on every call ended before version "
+        "11, and present on an interrupted call when the pass had them; "
+        "unusable on each record in the manifest's scoring_passes from "
+        "version 10; judge_calls on each trial line, every judge request sent "
+        "while scoring that trial in the order sent, each with id, pass_id, "
+        "judge_model, sent_at, answered_at, generation_id, billed_cost_usd, "
+        "outcome and detail, judge_call_id and pass_id on each score, and "
+        "scoring_passes in the manifest, from version 9, where sent_at is "
+        "written before the request goes out and the rest once, when it ends, "
+        "and a judged score written from then on has judge_generation_id and "
+        "judge_billed_cost_usd null because its call carries them, so the "
+        "figure is recorded once and a reader summing judge spend reads the "
+        "calls, plus the scores whose pass_id is null; pass_id is null on a "
+        "judge or deterministic score written before version 9 and on every "
+        "human rating; clone_id on each record in the manifest's captures from "
+        "version 8, and the URL is deliberately not in the artifact; "
+        "capture_id on pins and captures in the manifest, with head, dirty, "
+        "patterns, excludes and captured_at for each, from version 7; "
+        "attachments and attachments_mode on each trial line and "
         "attachments_referenced in the manifest from version 2, whose truth "
         "conditions widened at version 5 because the manifest itself now "
         "cites digests; renditions, the ordered pins each with digest, "

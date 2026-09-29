@@ -1956,6 +1956,9 @@ async def test_a_malformed_verdict_is_a_scoring_failure_that_still_records_the_c
     assert "no JSON object" in out["error"]
     assert out["billed_cost_usd"] == 0.00004
     assert out["generation_id"] == "gen-judge-1"
+    # Ruling 2 at P1's checkpoint: the reply was read, so it is an answer;
+    # its failure is the score row's (the external review's M6).
+    assert (out["outcome"], out["replied"]) == ("answered", True)
 
 
 @respx.mock

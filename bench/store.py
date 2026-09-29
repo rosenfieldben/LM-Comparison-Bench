@@ -3729,15 +3729,6 @@ CALL_OUTCOMES = (
     "interrupted",
 )
 
-# WITHDRAWN (the operator's ruling H2 on the 1d91670 review): ruling 4's
-# outcome list, made by b6c088c, which counted every failed call as
-# unusable whether or not a reply came, and every interrupted one as
-# unanswered. No count in the store reads it now; CALL_ENDING_SQL below
-# places a call by its facts. report._judge_cost still reads it, and
-# moves onto call_ending with the doors that read schema 12.
-UNANSWERED_CALL_OUTCOMES = ("timed_out", "stopped", "interrupted")
-UNUSABLE_CALL_OUTCOMES = ("failed",)
-
 FOUND_OPEN_AT_BOOT = "found open at boot"
 
 # A call a pass's close finds open, when the pass said nothing of why:
@@ -4113,8 +4104,12 @@ def sweep_open_scoring_records(conn: sqlite3.Connection) -> tuple[int, int]:
 
 def _call_row(row: sqlite3.Row) -> dict[str, Any]:
     item = dict(row)
-    # Repair on read, as scores_for_results does for the judge figure.
+    # Repair on read, as scores_for_results does for the judge figure, and
+    # the two facts as the flags they are, as is_byok is read, so the
+    # export carries true and false rather than sqlite's 1 and 0.
     item["billed_cost_usd"] = as_money(item["billed_cost_usd"])
+    item["sent"] = as_flag(item["sent"])
+    item["usable"] = as_flag(item["usable"])
     return item
 
 

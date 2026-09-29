@@ -255,8 +255,8 @@ HELD_JUDGE = "stub/judge-held"
 JUDGE_GATE_CAP_S = 20
 
 # A judge that answers every call with HTTP 500: a request that went out
-# and got no usable answer, which the report counts as unanswered. Off
-# the catalog like the held judge.
+# and got a reply that could not be used, which the report counts as
+# unusable. Off the catalog like the held judge.
 FAILING_JUDGE = "stub/judge-500"
 
 

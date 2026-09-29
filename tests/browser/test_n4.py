@@ -1245,9 +1245,10 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
     as unpriced rather than reading "none billed" as if nothing had been
     spent. Since Phase P each request the figure cannot speak for is
     named for what it is: the judge's 500 as a call that got a reply that
-    could not be used (an unusable answer, by the operator's ruling 4 at
-    P1's checkpoint; it was counted with the unanswered until then), the
-    old row as one that cannot say whether its request went out, and the
+    could not be used (counted with the unanswered until the operator's
+    ruling 4 at P1's checkpoint, and placed by its facts since schema
+    12), the old row as one with no figure of which the line cannot say
+    whether its request went out (the external review's L10), and the
     pass with no judge as nothing, since it sent nothing. Until then the line counted every judge row with no
     figure together ("judge rows carry no billing figure"), the unpriced
     call and the no-judge rows among them. The expected text is built
@@ -1296,6 +1297,7 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         "unpriced_calls": 2,
         "unanswered_calls": 0,
         "unusable_answers": 0,
+        "unknown_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }, a_spend
@@ -1304,9 +1306,10 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         b_spend["unpriced_calls"],
         b_spend["unanswered_calls"],
         b_spend["unusable_answers"],
+        b_spend["unknown_calls"],
         b_spend["in_flight_calls"],
         b_spend["rows_before_call_records"],
-    ) == (1, 1, 0, 1, 0, 1), b_spend
+    ) == (1, 1, 0, 1, 0, 0, 1), b_spend
     bench(["stub/fast"])
     open_experiments(page)
     line = page.get_by_test_id("report-judge-spend")
@@ -1324,7 +1327,8 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         f"{b_spend['unusable_answers']} judge call got a reply that could not "
         "be used; "
         f"{b_spend['rows_before_call_records']} judge row written before the "
-        "bench recorded its requests cannot say whether its request went out"
+        "bench recorded its requests has no figure, and this line cannot say "
+        "whether its request went out"
     )
 
 
