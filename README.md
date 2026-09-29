@@ -469,7 +469,7 @@ completion budget to be left for the visible answer, sending
 tier's 16384, 32768 of extended's 65536.
 
 **The judge sends no reasoning reservation**, and the arithmetic is why.
-Its budget is 512 tokens. Half of that is 256, which the contract's
+Its budget is `JUDGE_MAX_TOKENS`, 512. Half is 256, which the contract's
 Anthropic minimum raises to 1024 (*"that value is used directly with a
 minimum of 1024 tokens"*), and the contract also requires that
 *"`max_tokens` must be strictly higher than the reasoning budget"*. 512
@@ -1820,9 +1820,10 @@ refuse, with `403`, any root whose path below its `BENCH_REPO_ROOTS`
 entry passes through `.git`, `.hg` or `.svn` (compared without regard to
 case, since a disk that folds case reaches `.git` as `.GIT` too); the
 refusal names the rule and not the path. It is measured from the deepest
-entry holding the root, so an entry you name inside `.git` yourself is
-walked, unless the root is itself a git directory or inside one (below).
-This was possible from Phase L until Phase O.
+entry holding the root, so an entry you name inside `.hg` or `.svn`
+yourself is walked; one inside `.git` sits inside a git directory, and
+the bench refuses to start with it (below). This was possible from
+Phase L until Phase O.
 
 **A git directory is refused wherever the walk meets it.** A bare
 repository (`repo.git`), a mirror, a `--separate-git-dir` and a
@@ -1856,15 +1857,33 @@ the root, both in the sentence "the root is inside a git directory,
 whose files can carry a remote URL with sign-in details in them, so it
 is not walked." A normal checkout is not refused: its `.git` sits beside
 its files, not above them, so the directory above `src/` lists `.git`
-and not the four names inside it. The look opens only directories, reads
-no file and only refuses; a directory above renamed, moved or replaced
-by a link while it climbs changes nothing it sees, because it climbs by
-the descriptors that hold the root, and the most such a race can give
-back is the walk as it was before the look existed. It climbs at most
-the walk's depth ceiling, 128 directories, and refuses a root farther
-than that below its entry, naming the ceiling; it lists at most the
-walk's twenty thousand entries on the way. This was possible from
-Phase L until Phase P.
+and not the four names inside it. The look opens only directories and
+reads no file, and of each directory above it reads only the names, so
+a file beside them that goes while it lists is not a refusal; a
+directory above renamed, moved or replaced by a link while it climbs
+changes nothing it sees, because it climbs by the descriptors that hold
+the root. So a race can refuse a root only by what it does to a
+directory on that chain itself (the four names made to appear in one,
+or one made unreadable), and otherwise gives back at most the walk as it
+was before the look existed. It climbs at most the walk's depth
+ceiling, 128 directories, and refuses a root farther than that below
+its entry, naming the ceiling (a climb whose last step lands on the top
+of the filesystem is walked); it lists at most the walk's twenty
+thousand entries on the way, in all. This was possible from Phase L
+until Phase P.
+
+**An entry inside a git directory is refused at boot.** The look stops
+at a root's entry, so a git directory above an entry is one no request
+looks for, and every root under that entry would be walked. So at boot
+the bench climbs above each `BENCH_REPO_ROOTS` entry in the same way,
+from the entry's own directory handle to the top of the filesystem, and
+refuses to start if one sits inside a git directory, naming the entry,
+as it does for an entry that is not a directory. An entry the climb
+cannot clear (a directory above it unreadable, or past the look's
+depth or width) is refused too, since it could not be checked. An
+entry that is itself a git directory is not refused at boot: every root
+under it is refused at the doors, by the look, which checks the entry,
+or by the walk, when the root is the entry.
 
 ```sh
 BENCH_REPO_ROOTS=/home/you/code uvicorn bench.main:app

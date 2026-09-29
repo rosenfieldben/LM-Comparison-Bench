@@ -584,13 +584,15 @@ def vcs_below(real: str, entry: str) -> bool:
     secrets group exists to keep out of a prompt. Found in Phase O; the
     door has allowed it since Phase L.
 
-    ONLY BELOW THE ENTRY. An entry the operator named inside .git is
-    their explicit choice and is walked; a root at the entry itself is
-    never refused by this rule. The walk's own rule is another matter:
-    a root that IS a git directory by what it holds (the entry's .git
-    itself, or its modules/<name>) is refused by carries_git_directory
-    wherever the entry is, since the ruling for that shape says any
-    root.
+    ONLY BELOW THE ENTRY. An entry the operator named inside .hg or .svn
+    is their explicit choice and is walked; one inside .git sits inside a
+    git directory, which boot refuses since the operator's ruling on the
+    external review at 1d91670 (main._refuse_entries_inside_git). A root
+    at the entry itself is never refused by this rule. The walk's own
+    rule is another matter: a root that IS a git directory by what it
+    holds (the entry's .git itself, or its modules/<name>) is refused by
+    carries_git_directory wherever the entry is, since the ruling for
+    that shape says any root.
 
     FOLDED FOR CASE: on a disk that folds case, <repo>/.GIT is the same
     directory as <repo>/.git and a realpath keeps the spelling it was
@@ -693,7 +695,7 @@ class Opened:
 
 
 class Tree(Protocol):
-    """The filesystem as the walk sees it: nine operations, no names.
+    """The filesystem as the walk sees it: ten operations, no names.
 
     EVERY OPERATION AFTER open_root TAKES A HANDLE OR AN OPENED, never a
     path. That is the containment: a directory is descended through the
@@ -752,6 +754,14 @@ class Tree(Protocol):
         look_above and nothing else.)"""
         ...
 
+    def names(self, handle: Handle) -> Iterator[str]:
+        """The names of an open directory's children, one at a time, and
+        nothing else: no child is described, so one that goes between the
+        listing and a description of it cannot fail the listing. An
+        iterator, for the reason entries is one. (Phase P, the external
+        review's M12; used by look_above and nothing else.)"""
+        ...
+
 
 # THE LOOK ABOVE THE ROOT (Phase P, P3). A root below a git directory's
 # top level is inside one, and the walk, which sees names at the root
@@ -761,9 +771,13 @@ class Tree(Protocol):
 # four names, up to and including the allowlist entry the root was
 # admitted under, which it recognises by the device and inode recorded
 # at boot, or up to the top of the filesystem when there is no entry to
-# stop at. It opens nothing but directories, reads no file, and only
-# refuses, so a race against it can at worst give back the walk as it
-# was before the look existed.
+# stop at. It opens nothing but directories, reads no file and no
+# child's description (names alone, since the external review's M12: a
+# sibling that went mid-listing refused the snapshot), and only refuses.
+# So a race against it can refuse a root only by what it does to a
+# directory on the chain itself (the four names made to appear in one,
+# or one made unreadable), and otherwise at worst gives back the walk
+# as it was before the look existed.
 #
 # How many directories the climb may pass, from the root: the walk's
 # own depth bound, for the same reason (one descriptor at a time here,
@@ -802,7 +816,10 @@ def look_above(tree: Tree, root: Handle, entry: Identity | None) -> None:
     WHERE IT STOPS: at the entry, which is checked too (a root inside an
     entry that is itself a git directory is inside one), or at the top of
     the filesystem, whose parent is itself; and it is refused at
-    MAX_DEPTH steps without either. entry None stops only at the top.
+    MAX_DEPTH steps without either. entry None stops only at the top. A
+    climb whose last step lands on the top takes one more parent to see
+    that it is the top, and lists nothing more (the external review's
+    L17: it was refused, in a sentence saying the top was not reached).
     """
     held: Handle | None = None
     current = root
@@ -818,15 +835,21 @@ def look_above(tree: Tree, root: Handle, entry: Identity | None) -> None:
             if above.identity == current.identity:
                 return
             names: list[str] = []
-            for child in tree.entries(above):
+            for name in tree.names(above):
                 listed += 1
                 if listed > MAX_WALKED_ENTRIES:
                     raise SnapshotError(LOOK_TOO_WIDE)
-                names.append(child.name)
+                names.append(name)
             if carries_git_directory(names):
                 raise SnapshotError(ROOT_INSIDE_GIT_DIRECTORY)
             current = above
-        if current.identity != entry:
+        if current.identity == entry:
+            return
+        above = tree.parent(current)
+        if held is not None:
+            tree.close_handle(held)
+        held = above
+        if above.identity != current.identity:
             raise SnapshotError(LOOK_CEILING)
     finally:
         if held is not None:

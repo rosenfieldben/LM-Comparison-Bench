@@ -154,6 +154,12 @@ class FakeTree:
         self.climb_opened.append(path)
         return Handle(path=path, identity=identity, token=path)
 
+    def names(self, handle):
+        # The look's listing of a directory above the root: the names it
+        # holds, and no child described.
+        depth = handle.path.count("..") - 1
+        yield from self.above[depth]["names"]
+
     def entries(self, handle):
         if handle.path.startswith(".."):
             depth = handle.path.count("..") - 1
@@ -1398,10 +1404,12 @@ def test_the_climb_is_bounded_at_max_depth(levels):
     allowlist entry, at MAX_DEPTH and one past it.
 
     A climb that reaches neither the entry nor the top within MAX_DEPTH
-    steps is refused in a sentence naming the ceiling; one that reaches
-    the entry at the ceiling walks. Every ancestor opened is closed.
-    PRE-STATE: no directory on the chain holds a git name, so only the
-    ceiling can refuse the deeper one."""
+    steps is refused in a sentence naming the ceiling, having taken one
+    more parent to see whether its last step landed on the top (the
+    external review's L17); one that reaches the entry at the ceiling
+    walks. Every ancestor opened is closed. PRE-STATE: no directory on
+    the chain holds a git name, so only the ceiling can refuse the deeper
+    one."""
     snapshot = look_names()
     above = [{"names": [f"d{i}"]} for i in range(levels)]
     above[-1]["identity"] = (7, 7)
@@ -1413,8 +1421,54 @@ def test_the_climb_is_bounded_at_max_depth(levels):
             walk(tree=fake, patterns=["**/*"], entry=(7, 7))
         assert str(refused.value) == snapshot.LOOK_CEILING
         assert f"climbed {MAX_DEPTH} directories" in snapshot.LOOK_CEILING
-    assert len(climbed(fake)[0]) == MAX_DEPTH
+    assert len(climbed(fake)[0]) == MAX_DEPTH + (levels > MAX_DEPTH)
     assert sorted(climbed(fake)[1]) == sorted(climbed(fake)[0])
+
+
+def test_a_climb_that_lands_on_the_top_at_its_ceiling_walks():
+    """WINDOW: walk over a root exactly MAX_DEPTH plain directories below
+    the top of the filesystem, with no entry to stop at, and one deeper.
+
+    The top is known only by its parent being itself, so the look's last
+    step lists it (no git names) and takes one more parent to see it is
+    the top: the root is walked. One directory deeper, the ceiling
+    refuses, in its own sentence. Every ancestor opened is closed (the
+    external review's L17). PRE-STATE at 5fd1a3b: the root at exactly
+    MAX_DEPTH was refused with LOOK_CEILING, though the look had listed
+    the top."""
+    snapshot = look_names()
+    at = FakeTree({"a.py": b"a"}, above=[[f"d{i}"] for i in range(MAX_DEPTH)])
+    assert walk(tree=at, patterns=["**/*"]) == [("a.py", b"a")]
+    assert "/".join([".."] * MAX_DEPTH) in climbed(at)[0]
+    assert sorted(climbed(at)[1]) == sorted(climbed(at)[0])
+    past = FakeTree({"a.py": b"a"}, above=[[f"d{i}"] for i in range(MAX_DEPTH + 1)])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=past, patterns=["**/*"])
+    assert str(refused.value) == snapshot.LOOK_CEILING
+    assert sorted(climbed(past)[1]) == sorted(climbed(past)[0])
+
+
+def test_the_look_counts_its_entries_across_every_directory_it_climbs():
+    """WINDOW: walk over a root with two plain directories above it and no
+    entry, their listings each under the walk's entry ceiling and together
+    one past it; and together exactly at it.
+
+    The look's width ceiling is on every entry it lists on the way up, in
+    all, not on each directory (the external review's L16: a count reset
+    for each ancestor survived). PRE-STATE: neither directory alone is
+    past the ceiling, and none of the names is a git name."""
+    snapshot = look_names()
+    half = MAX_WALKED_ENTRIES // 2
+    low = [f"a{i}" for i in range(half)]
+    high = [f"b{i}" for i in range(MAX_WALKED_ENTRIES - half + 1)]
+    assert len(low) < MAX_WALKED_ENTRIES and len(high) < MAX_WALKED_ENTRIES
+    fake = FakeTree({"a.py": b"a"}, above=[low, high])
+    with pytest.raises(SnapshotError) as refused:
+        walk(tree=fake, patterns=["**/*"])
+    assert str(refused.value) == snapshot.LOOK_TOO_WIDE
+    assert climbed(fake) == (["..", "../.."], ["..", "../.."])
+    exact = FakeTree({"a.py": b"a"}, above=[low, high[:-1]])
+    assert walk(tree=exact, patterns=["**/*"]) == [("a.py", b"a")]
 
 
 def test_a_directory_above_too_wide_to_list_is_refused():

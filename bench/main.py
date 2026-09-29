@@ -1619,12 +1619,16 @@ def _git_argv(args: Sequence[str]) -> list[str]:
       root ("/post-index-change", asked of `git rev-parse --git-path`);
     - no helper git would ask for sign-in details, from any source (an
       empty helper clears the list), as the clone runner has;
-    - no bare repository found by searching (safe.bareRepository), so a
-      directory inside a bare repository, which the walk does not refuse
-      (BACKLOG, "A snapshot root inside a git directory"), is not a
-      repository git will read. A command-line setting is protected
-      configuration, which a repository's own cannot override; git
-      older than 2.38 ignores the setting.
+    - no bare repository found by searching (safe.bareRepository). Since
+      f123525 both snapshot doors refuse a root inside a git directory, a
+      bare repository among them, up to and including its allowlist
+      entry (snapshot.look_above, ROOT_INSIDE_GIT_DIRECTORY), and boot
+      refuses an entry that sits inside one (_refuse_entries_inside_git);
+      this setting is git's own second guard behind those, so a directory
+      inside a bare repository is not a repository git will read. A
+      command-line setting is protected configuration, which a
+      repository's own cannot override; git older than 2.38 ignores the
+      setting.
 
     WHAT THEY DO NOT TURN OFF: a filter driver a repository's own
     configuration names, which status runs on a file whose stat data
@@ -1993,6 +1997,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.repo_roots = _parse_repo_roots(
         os.environ.get("BENCH_REPO_ROOTS"), resolved=_resolved_directory
     )
+    # An entry inside a git directory is refused here, since the doors'
+    # look above a root stops at its entry and so never sees one above it.
+    _refuse_entries_inside_git(app.state.repo_roots)
     # Each entry's device and inode, read once here: where the snapshot
     # doors' look above a root stops (snapshot.look_above). Read at boot,
     # as the clone root's identity is (_clone_root_as_entry), so an entry
@@ -8422,7 +8429,8 @@ def enforce_snapshot_root(
             "rather than whatever path a request names.",
         )
     # Below the deepest entry holding it, which is the one the operator
-    # named most exactly: an entry named inside .git is theirs to walk.
+    # named most exactly: an entry named inside .hg or .svn is theirs to
+    # walk, and one inside .git never booted (_refuse_entries_inside_git).
     if snapshot.vcs_below(real, snapshot_entry(real, holding)):
         raise HTTPException(403, ROOT_IN_VCS)
     return real
@@ -8444,21 +8452,73 @@ def _root_identities(roots: Sequence[str]) -> dict[str, snapshot.Identity]:
     return identities
 
 
+# What boot says of an entry the climb above it refuses or cannot
+# finish. The first is the operator's ruling on the external review at
+# 1d91670; the others follow the look's rule that what it cannot clear
+# it refuses, never walks.
+ENTRY_INSIDE_GIT_DIRECTORY = (
+    "sits inside a git directory: a directory above it holds HEAD, config, "
+    "objects and refs, so every root under it would be inside one, and the "
+    "snapshot doors look above a root only as far as its entry. Name a "
+    "directory that is not inside a repository's git directory."
+)
+ENTRY_NOT_CLEARED = (
+    "could not be checked for a git directory above it, so it is not allowed unchecked"
+)
+
+
+def _refuse_entries_inside_git(roots: Sequence[str]) -> None:
+    """Refuse at boot an allowlist entry that sits inside a git directory.
+
+    The look above a snapshot root (snapshot.look_above) stops at the
+    root's entry, as the commission asked, so a git directory above an
+    entry is one no request looks for: every root under that entry would
+    be walked, git's own files among them. The operator ruled such an
+    entry refused at boot (on the external review at 1d91670), so each
+    entry is climbed once here, by the look itself, from the entry's own
+    handle to the top of the filesystem. An entry that is itself a git
+    directory is not refused here: the look checks the entry, and the
+    walk refuses a root that is one, so every root under it is refused
+    at the doors. A climb that cannot finish (a directory above
+    unreadable, or past the look's width or depth) refuses the entry
+    too, in ENTRY_NOT_CLEARED's words and the look's own.
+    """
+    for entry in roots:
+        tree = DescriptorTree(entry)
+        try:
+            handle = tree.open_root()
+        except snapshot.SnapshotError as exc:
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_NOT_CLEARED}: {exc}"
+            ) from None
+        try:
+            snapshot.look_above(tree, handle, None)
+        except snapshot.SnapshotError as exc:
+            if str(exc) == snapshot.ROOT_INSIDE_GIT_DIRECTORY:
+                raise RuntimeError(
+                    f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_INSIDE_GIT_DIRECTORY}"
+                ) from None
+            raise RuntimeError(
+                f"BENCH_REPO_ROOTS entry {entry!r} {ENTRY_NOT_CLEARED}: {exc}"
+            ) from None
+        finally:
+            tree.close_handle(handle)
+
+
 def entry_identity(root: str) -> snapshot.Identity | None:
     """The identity of the entry a resolved root was admitted under, where
-    the look above it stops: boot's, and only for an entry boot did not
-    see (an allowlist set after boot, which a test does) described now.
-    None when neither can be read, and the look climbs to the top. A
-    wrong identity can only make the climb go further, never stop it
-    short of the entry, since the entry's own directory has the identity
-    boot recorded or no directory on the chain has it."""
+    the look above it stops: boot's, and nothing read now. None when boot
+    did not record the entry (an allowlist set after boot, which only a
+    test does, or an entry boot could not describe), and the look then
+    climbs to the top of the filesystem, which refuses more and never
+    less. A read made here, by the entry's name, could be raced into
+    stopping the climb short of a git directory above the root (the
+    external review's L15), which is why there is none."""
     entry = snapshot_entry(root, app.state.repo_roots)
     identities: dict[str, snapshot.Identity] = getattr(
         app.state, "repo_root_identities", {}
     )
-    if entry in identities:
-        return identities[entry]
-    return _root_identities([entry]).get(entry)
+    return identities.get(entry)
 
 
 def snapshot_entry(real: str, roots: Sequence[str]) -> str:
@@ -8576,6 +8636,18 @@ class DescriptorTree:
                     yield snapshot.Entry(
                         entry.name, kind, (info.st_dev, info.st_ino), info.st_size
                     )
+        except OSError as exc:
+            raise self._could_not(handle.path, "listed", exc) from None
+
+    def names(self, handle: snapshot.Handle) -> Iterator[str]:
+        # The look's listing: names from readdir, and no child described,
+        # so a sibling gone between the two is not the look's refusal (the
+        # external review's M12). scandir rather than listdir, so a
+        # directory too wide is refused before it is materialised.
+        try:
+            with os.scandir(handle.token) as listing:
+                for entry in listing:
+                    yield entry.name
         except OSError as exc:
             raise self._could_not(handle.path, "listed", exc) from None
 

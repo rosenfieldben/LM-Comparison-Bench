@@ -16368,7 +16368,7 @@ def clone(root: Path, files: dict[str, bytes]) -> Path:
 
 def snapshot_of(client, root, patterns=("**/*.py",)):
     """POST /snapshots against an allowlisted root."""
-    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    allow(client, root)
     return client.post(
         "/snapshots", json={"root": str(root), "patterns": list(patterns)}
     )
@@ -16439,7 +16439,7 @@ def test_the_off_door_touches_no_path_the_caller_named(client, tmp_path, monkeyp
     assert refused.status_code == 403
     assert seen == []
 
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     client.post("/snapshots", json={"root": str(tmp_path), "patterns": ["**/*"]})
     assert seen == [str(tmp_path)]
 
@@ -16456,7 +16456,7 @@ def test_a_root_outside_the_allowlist_is_refused_and_both_are_named(client, tmp_
     """
     allowed = clone(tmp_path / "allowed", {"a.py": b"x = 1\n"})
     other = clone(tmp_path / "elsewhere", {"b.py": b"y = 2\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post("/snapshots", json={"root": str(other), "patterns": ["**/*.py"]})
 
@@ -16475,7 +16475,7 @@ def test_a_directory_under_an_allowed_root_is_allowed(client, tmp_path):
     snapshot any clone inside it without listing each one.
     """
     allowed = clone(tmp_path / "work", {"proj/a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post(
         "/snapshots", json={"root": str(allowed / "proj"), "patterns": ["*.py"]}
@@ -16494,7 +16494,7 @@ def test_a_sibling_root_sharing_a_prefix_is_not_under_the_allowlist(client, tmp_
     """
     allowed = clone(tmp_path / "work", {"a.py": b"x = 1\n"})
     sibling = clone(tmp_path / "work-old", {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(allowed.resolve()),)
+    allow(client, allowed)
 
     resp = client.post("/snapshots", json={"root": str(sibling), "patterns": ["*.py"]})
 
@@ -16511,7 +16511,7 @@ def test_a_root_that_is_not_a_directory_is_a_422(client, tmp_path):
     tells an outside caller whether it exists.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
 
     resp = client.post(
         "/snapshots", json={"root": str(root / "a.py"), "patterns": ["*"]}
@@ -16988,7 +16988,7 @@ def test_the_snapshot_door_refuses_a_body_it_cannot_read(client, tmp_path):
     whole boundary is built to close.
     """
     root = clone(tmp_path, {"a.py": b"x = 1\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
 
     unknown = client.post(
         "/snapshots",
@@ -17413,6 +17413,17 @@ FILESYSTEM_CALLS = {
     },
     ("main.py", "DescriptorTree.open_member"): {"os.close", "os.fstat", "os.open"},
     ("main.py", "DescriptorTree.read_member"): {"os.read"},
+    # The look's listing above the root: names from readdir, no child
+    # described (the external review's M12).
+    ("main.py", "DescriptorTree.names"): {"os.scandir"},
+    # Boot's climb above each allowlist entry, by the look itself, from
+    # the entry's own handle: it opens the entry, the look does the rest,
+    # and the entry is closed whatever the look says (the operator's
+    # ruling on the external review at 1d91670).
+    ("main.py", "_refuse_entries_inside_git"): {
+        "tree.close_handle",
+        "tree.open_root",
+    },
     ("main.py", "DescriptorTree.close_handle"): {"os.close"},
     ("main.py", "DescriptorTree.link_target"): {"os.path.realpath", "os.readlink"},
     # snapshot.py does no I/O at all: these are the INJECTED operations
@@ -17433,12 +17444,13 @@ FILESYSTEM_CALLS = {
     ("snapshot.py", "Survey._sightings.listing"): {"tree.entries"},
     # THE LOOK ABOVE THE ROOT (Phase P, P3): through parent, one directory
     # at a time from the root's own handle, each listed for the four
-    # names and closed. It opens nothing but directories and reads no
-    # file. DescriptorTree.parent makes no call of its own here: it is
-    # _directory with '..' and the handle's descriptor.
+    # names, by name alone (M12), and closed. It opens nothing but
+    # directories and reads no file. DescriptorTree.parent makes no call
+    # of its own here: it is _directory with '..' and the handle's
+    # descriptor.
     ("snapshot.py", "look_above"): {
         "tree.close_handle",
-        "tree.entries",
+        "tree.names",
         "tree.parent",
     },
     # The one place a member is opened and read: the composer's reader,
@@ -17632,6 +17644,9 @@ FILESYSTEM_TOUCHERS = {
     "root_path",
     # The ninth, since Phase P (P3): the look above the root.
     "parent",
+    # The tenth, since the external review's M12: the look's listing of a
+    # directory above the root, names only.
+    "names",
 }
 
 # os calls that compute on strings and touch nothing. A call into os
@@ -18270,7 +18285,7 @@ def test_review_repro_a_mixed_image_and_snapshot_set_under_inline_names_no_mode(
 
 def listing_of(client, root, patterns=("**/*.py",)):
     """POST /snapshots/listing against an allowlisted root."""
-    client.app.state.repo_roots = (str(Path(root).resolve()),)
+    allow(client, root)
     return client.post(
         "/snapshots/listing", json={"root": str(root), "patterns": list(patterns)}
     )
@@ -18470,7 +18485,7 @@ def test_a_refused_request_is_the_same_refusal_at_both_doors(client, tmp_path, c
     good pattern the listing answers 200."""
     root = clone(tmp_path / "clone", {"a.py": b"a\n"})
     elsewhere = clone(tmp_path / "elsewhere", {"b.py": b"b\n"})
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
     good = {"root": str(root), "patterns": ["*.py"]}
     assert client.post("/snapshots/listing", json=good).status_code == 200
     body = dict(good)
@@ -18533,7 +18548,7 @@ def test_a_root_resolving_to_a_name_utf8_cannot_spell_is_a_403_at_both_doors(
     resolved = "/elsewhere/caf" + chr(0xDCE9)
     with pytest.raises(UnicodeEncodeError):
         resolved.encode("utf-8")
-    client.app.state.repo_roots = (str(root.resolve()),)
+    allow(client, root)
     monkeypatch.setattr(main, "_resolved_directory", lambda path: resolved)
     body = {"root": str(root / "w"), "patterns": ["*.py"]}
     for door in ("/snapshots", "/snapshots/listing"):
@@ -18829,7 +18844,7 @@ def test_a_root_inside_git_is_refused_and_its_token_stays_out(client, tmp_path, 
     copied = repo / "copied"
     copied.mkdir()
     (copied / "config").write_text(config)
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
 
     control = client.post(door, json={"root": str(copied), "patterns": ["config"]})
@@ -18879,7 +18894,7 @@ def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_
     other = tmp_path / "other"
     (other / ".GIT").mkdir(parents=True)
     (repo / "link").symlink_to(repo / ".git")
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
 
     def status(root):
         assert Path(root).is_dir()
@@ -18895,7 +18910,7 @@ def test_every_root_through_version_control_is_refused_and_no_other(client, tmp_
 
     hooks = repo / ".git" / "hooks"
     hooks.mkdir(exist_ok=True)
-    client.app.state.repo_roots = (str(tmp_path.resolve()), str(hooks.resolve()))
+    allow(client, tmp_path, hooks)
     assert status(hooks) == 200
     assert status(repo / ".git") == 403
 
@@ -19022,7 +19037,7 @@ def test_a_git_directory_refuses_at_both_doors_in_one_sentence(
     tree with the bare repository's HEAD removed composes (201) and
     lists would_compose true with its config selected, so the walk of
     that directory reads config when the rule does not stop it."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
     trees = git_directory_trees(tmp_path)
     config = "/".join(filter(None, [trees[(where, False)][1], "config"]))
@@ -19092,7 +19107,7 @@ def test_the_git_directory_refusal_comes_before_the_head_and_dirty_read(
     recorder is live and the read is where it was: the same tree with
     the bare repository's HEAD removed composes, and the recorder saw
     the composer's `git rev-parse HEAD` in the walked root."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     trees = git_directory_trees(tmp_path)
     ran = []
 
@@ -19149,7 +19164,7 @@ def test_a_dot_git_named_as_both_entry_and_root_is_refused_by_the_walk(
     assert "url" not in (dot_git / "config").read_text()
     (dot_git / "hooks").mkdir(exist_ok=True)
     (dot_git / "hooks" / "zq.txt").write_text("x\n")
-    client.app.state.repo_roots = (str(dot_git),)
+    allow(client, dot_git, resolve=False)
     db = client.app.state.db
     hooks = client.post(
         "/snapshots/listing", json={"root": str(dot_git / "hooks"), "patterns": ["*"]}
@@ -19216,7 +19231,7 @@ def test_a_sentinel_in_a_bare_repositorys_config_reaches_no_snapshot(client, tmp
     the rule does not fire, the walk reads config, and the sentinel is
     in the stored text word for word. That is the exposure f8bde6b
     closed, shown on the bytes git itself writes."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     db = client.app.state.db
     for control in (True, False):
         top = tmp_path / ("zqcontrol" if control else "zqbare")
@@ -19307,7 +19322,7 @@ def test_a_root_below_a_git_directorys_top_level_is_refused_at_both_doors(
     linked worktree by `git worktree add`; and logs/ is written by git
     itself, here by update-ref -m as a pull would write it, so the
     reachable set has no fixed end."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     env = git_env(tmp_path)
     top = tmp_path / "zqbare"
     subprocess.run(["git", "init", "-q", "--bare", str(top)], env=env, check=True)
@@ -19377,17 +19392,212 @@ def test_a_root_below_a_git_directorys_top_level_is_refused_at_both_doors(
 # ---- Phase P, P3: the look above the root, at the doors.
 
 
-def allow(client, entry):
-    """Allowlist one entry as boot reads BENCH_REPO_ROOTS: its resolved
-    spelling, and its device and inode, where the look above a root
-    admitted under it stops."""
-    entry = str(Path(entry).resolve())
-    client.app.state.repo_roots = (entry,)
+def allow(client, *entries, resolve=True):
+    """Allowlist entries as boot reads BENCH_REPO_ROOTS: each one's
+    resolved spelling (or, with resolve=False, the spelling given, for a
+    proof about spellings), and its device and inode, where the look
+    above a root admitted under it stops. Returns the first's spelling."""
+    named = tuple(str(Path(e).resolve()) if resolve else str(e) for e in entries)
+    client.app.state.repo_roots = named
     # Read through getattr so a tree without the look (a pre-state) is
     # allowlisted the same way and differs only in what its doors do.
     identities = getattr(main, "_root_identities", lambda roots: {})
-    client.app.state.repo_root_identities = identities([entry])
-    return entry
+    client.app.state.repo_root_identities = identities(named)
+    return named[0] if named else None
+
+
+def test_a_sibling_gone_mid_listing_above_the_root_does_not_refuse(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots/listing and POST /snapshots on entry/a/b,
+    while the entry's listing, the look's second step up, hands over a
+    sibling, zqgone.txt, whose description finds it gone, as a file
+    unlinked between readdir naming it and a stat of it does.
+
+    The look needs only its ancestors' names, so it reads names alone,
+    and a sibling gone mid-listing is no refusal: both doors compose (the
+    external review's M12: at df2c773 the look described every child,
+    and under churn 18 to 50 requests in 400 were refused). PRE-STATE:
+    the sibling is in the entry, and its description's stat raises
+    FileNotFoundError."""
+    entry = tmp_path / "zqentry"
+    (entry / "a" / "b").mkdir(parents=True)
+    (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+    (entry / "zqgone.txt").write_text("gone\n")
+    allow(client, entry)
+    real = os.scandir
+
+    class Gone:
+        def __init__(self, found):
+            self.found, self.name = found, found.name
+
+        def stat(self, *, follow_symlinks=True):
+            raise FileNotFoundError(2, "No such file or directory")
+
+        def __getattr__(self, attribute):
+            return getattr(self.found, attribute)
+
+    class Listing:
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __enter__(self):
+            self.inner.__enter__()
+            return self
+
+        def __exit__(self, *exc):
+            return self.inner.__exit__(*exc)
+
+        def __iter__(self):
+            for found in self.inner:
+                yield Gone(found) if found.name == "zqgone.txt" else found
+
+    def scandir(target=".", *args, **kwargs):
+        return Listing(real(target, *args, **kwargs))
+
+    with scandir(str(entry)) as listing:
+        (gone,) = [found for found in listing if found.name == "zqgone.txt"]
+        with pytest.raises(FileNotFoundError):
+            gone.stat(follow_symlinks=False)
+    monkeypatch.setattr(os, "scandir", scandir)
+    body = {"root": str(entry / "a" / "b"), "patterns": ["*.py"]}
+    listed = client.post("/snapshots/listing", json=body)
+    assert listed.status_code == 200
+    assert listed.json()["would_compose"] is True, listed.text
+    composed = client.post("/snapshots", json=body)
+    assert composed.status_code == 201, composed.text
+
+
+def test_boot_records_where_the_look_stops_and_reads_it_again_nowhere(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a bench booted with BENCH_REPO_ROOTS naming zqparent/zqentry
+    and no allow(); its identity map; then, with zqparent made a bare
+    repository after boot, POST /snapshots/listing and POST /snapshots on
+    zqentry/a/b before and after zqentry is replaced by a new directory
+    of the same name and files.
+
+    Boot records each entry's device and inode, and the look stops at the
+    directory boot described: while it stands, the git directory above
+    it is not the look's business; once it is replaced, the look climbs
+    past the new one, finds the git directory, and refuses (the external
+    review's M13: no proof read boot's map, and an empty one survived
+    every test). PRE-STATE: before the replacement the listing would
+    compose, so the look stops at the booted entry."""
+    parent = tmp_path / "zqparent"
+    entry = parent / "zqentry"
+    (entry / "a" / "b").mkdir(parents=True)
+    (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(entry))
+    body = {"root": str(entry / "a" / "b"), "patterns": ["*.py"]}
+    with boot_against(monkeypatch, tmp_path / "bench.db") as c:
+        assert c.app.state.repo_root_identities == {
+            str(entry.resolve()): identity_of(entry)
+        }
+        bare_repository(parent)
+        before = c.post("/snapshots/listing", json=body)
+        assert before.json()["would_compose"] is True, before.text
+        entry.rename(parent / "zqentry-old")
+        (entry / "a" / "b").mkdir(parents=True)
+        (entry / "a" / "b" / "x.py").write_text("X = 1\n")
+        listed = c.post("/snapshots/listing", json=body)
+        assert listed.json()["would_compose"] is False
+        assert listed.json()["refusal"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+        composed = c.post("/snapshots", json=body)
+        assert composed.status_code == 422, composed.text
+        assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+
+
+def test_no_read_of_an_entry_at_request_time_can_stop_the_climb_short(
+    client, tmp_path, monkeypatch
+):
+    """WINDOW: POST /snapshots on zqentry/zqbare.git/logs/refs, a bare
+    repository inside the entry, with the allowlist set with no identity
+    for the entry, as only a test sets it after boot, and the entry's name
+    swapped for a link to zqbare.git/logs for as long as any read of the
+    entry's identity lasts.
+
+    The look takes the entry's identity from boot and reads none at
+    request time (the external review's L15: a stat by the entry's name,
+    raced, gave the identity of a directory below the git directory, and
+    the look stopped there, short of it). With none recorded the climb
+    goes to the top of the filesystem and refuses. PRE-STATE at df2c773:
+    the raced read stopped the climb at logs/ and the root was composed,
+    201."""
+    entry = tmp_path / "zqentry"
+    entry.mkdir()
+    top = bare_repository(entry / "zqbare.git")
+    root = top / "logs" / "refs"
+    root.mkdir(parents=True)
+    (root / "x.txt").write_text("x\n")
+    client.app.state.repo_roots = (str(entry.resolve()),)
+    client.app.state.repo_root_identities = {}
+    held = tmp_path / "zqentry-held"
+    real = main._root_identities
+    raced = []
+
+    def swapped(roots):
+        entry.rename(held)
+        entry.symlink_to(held / "zqbare.git" / "logs")
+        try:
+            raced.append(roots)
+            return real(roots)
+        finally:
+            entry.unlink()
+            held.rename(entry)
+
+    monkeypatch.setattr(main, "_root_identities", swapped)
+    composed = client.post("/snapshots", json={"root": str(root), "patterns": ["**/*"]})
+    assert composed.status_code == 422, composed.text
+    assert composed.json()["detail"] == bench_snapshot.ROOT_INSIDE_GIT_DIRECTORY
+    assert raced == []
+
+
+def test_boot_refuses_an_entry_inside_a_git_directory(monkeypatch, tmp_path):
+    """WINDOW: a bench booted with BENCH_REPO_ROOTS naming a directory
+    inside a bare repository (its logs/); and, as pins, naming the bare
+    repository itself, and a directory of a checkout, beside its .git.
+
+    The look above a root stops at its entry, so a git directory above an
+    entry is one no request would look for, and every root under the
+    entry would be walked. The operator ruled such an entry refused at
+    boot (on the external review at 1d91670): boot climbs above each
+    entry by the look itself and refuses one inside a git directory, in
+    its own sentence, before the lock is taken or anything is written.
+    An entry that is itself a git directory boots, since every root under
+    it is refused at the doors, as does a checkout's directory, whose
+    .git is beside it. PRE-STATE at df2c773: the entry inside the bare
+    repository booted."""
+    top = bare_repository(tmp_path / "zqbare.git")
+    inside = top / "logs"
+    inside.mkdir()
+    db_path = tmp_path / "bench.db"
+    monkeypatch.setenv("BENCH_REPO_ROOTS", str(inside))
+    with pytest.raises(RuntimeError) as refused:
+        with boot_against(monkeypatch, db_path):
+            pass
+    assert str(refused.value) == (
+        f"BENCH_REPO_ROOTS entry {str(inside.resolve())!r} "
+        + main.ENTRY_INSIDE_GIT_DIRECTORY
+    )
+    assert not db_path.exists()
+    assert not Path(store.lock_path(str(db_path))).exists()
+    checkout = tmp_path / "zqcheckout"
+    (checkout / "src").mkdir(parents=True)
+    subprocess.run(
+        ["git", "init", "-q", str(checkout)],
+        env={
+            "PATH": os.environ["PATH"],
+            "HOME": str(tmp_path),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+        },
+        check=True,
+    )
+    for entry in (top, checkout / "src"):
+        monkeypatch.setenv("BENCH_REPO_ROOTS", str(entry))
+        with boot_against(monkeypatch, db_path) as c:
+            assert c.app.state.repo_roots == (str(entry.resolve()),)
 
 
 def on_climb(monkeypatch, step, action):
@@ -19674,7 +19884,7 @@ def test_the_snapshot_doors_git_runs_pinned_in_a_built_environment(
     head = head_of(repo)
     link = tmp_path.resolve() / "zqlink"
     link.symlink_to(repo)
-    client.app.state.repo_roots = (str(entry),)
+    allow(client, entry, resolve=False)
     body = {"root": str(repo), "patterns": ["*.py"]}
 
     ran = recorded_processes(monkeypatch)
@@ -19738,7 +19948,7 @@ def test_the_snapshot_doors_git_finds_no_repository_above_the_entry(client, tmp_
     assert head_of(inner) == head
 
     def heads(entry):
-        client.app.state.repo_roots = (str(entry),)
+        allow(client, entry, resolve=False)
         out = []
         for root in (inner, inner / "zqsub"):
             resp = client.post(
@@ -19789,7 +19999,7 @@ def test_the_ceiling_is_the_deepest_entry_holding_the_root(
     assert head_of(inner) == head and len(str(other)) > len(str(inner))
 
     def head_at(root, *entries):
-        client.app.state.repo_roots = tuple(str(e) for e in entries)
+        allow(client, *entries, resolve=False)
         resp = client.post(
             "/snapshots", json={"root": str(root), "patterns": ["**/*.py"]}
         )
@@ -19931,7 +20141,7 @@ def test_an_entry_spelled_unlike_gits_own_reads_no_head_from_above(
     assert found.returncode == 0 and os.path.samefile(found.stdout.strip(), outer)
 
     def head_at(entry):
-        client.app.state.repo_roots = (str(entry),)
+        allow(client, entry, resolve=False)
         resp = client.post(
             "/snapshots", json={"root": str(entry), "patterns": ["*.py"]}
         )
@@ -20003,7 +20213,7 @@ def test_no_process_starts_before_the_walk_refuses_a_git_directory(
     posture walk's to refuse, not this proof's. PRE-STATE: the same tree
     with the bare repository's HEAD removed composes, and the recorder
     saw the head read's git start in the root."""
-    client.app.state.repo_roots = (str(tmp_path.resolve()),)
+    allow(client, tmp_path)
     trees = git_directory_trees(tmp_path)
     ran = recorded_processes(monkeypatch)
     control, _ = trees[(where, True)]
