@@ -4593,14 +4593,29 @@ async def test_the_judge_reply_s_usage_counts_are_captured(client, usage, counts
     assert (out["prompt_tokens"], out["completion_tokens"]) == counts
 
 
+@respx.mock
 async def test_a_judge_asked_about_no_text_reports_no_counts(client):
     """WINDOW: judge_response over a trial with no text, which makes no
-    request.
+    request, with no route mocked and its sending hook watched.
 
-    No request, no reply, no counts: both are None. PRE-STATE: none."""
-    out = await judge_response(client, "judge/one", "the rubric", None, "   ")
+    No request, no reply, no counts: both are None, the hook is never
+    called and nothing reaches the transport. PRE-STATE: the hook has not
+    been called and no request has been made, so a guard that let the
+    blank text through would be seen here, not only on the wire (the
+    external review's L4: this proof said "PRE-STATE: none")."""
+    sent = []
+    assert (sent, respx.calls.call_count) == ([], 0)
+    out = await judge_response(
+        client,
+        "judge/one",
+        "the rubric",
+        None,
+        "   ",
+        sending=lambda: sent.append(1),
+    )
     assert (out["prompt_tokens"], out["completion_tokens"]) == (None, None)
     assert out["outcome"] is None
+    assert (sent, respx.calls.call_count) == ([], 0)
 
 
 # ---- A judge reply is a reply from its head (the operator's ruling H2 on

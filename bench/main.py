@@ -2163,7 +2163,8 @@ async def _serve(app: FastAPI, db_path: str, api_key: str) -> AsyncIterator[None
                 "remaining trials never ran",
             )
     # The same correction for scoring: a pass and its calls have rows now,
-    # and a crash or a kill leaves them with no ending. Closed as
+    # and a crash or a kill leaves them with no ending, as does a pass
+    # whose own ending write failed (score_experiment's finally). Closed as
     # interrupted, "found open at boot", safe for the reason the sweep
     # above is and only because the lock is held.
     swept_passes, swept_calls = store.sweep_open_scoring_records(app.state.db)
@@ -7782,8 +7783,11 @@ async def stop_scoring(experiment_id: int) -> dict[str, Any]:
     Between trials, never inside one, as the runner's Stop is: a judge
     call already sent has already cost money, and abandoning it would
     throw away a verdict that was paid for. A trial still waiting for a
-    slot sends nothing. The pass then ends as stopped, and the record says
-    it was asked to.
+    slot, or for room on the spend ceiling, sends nothing. If a trial is
+    left unscored, the pass then ends as stopped, and the record says it
+    was asked to. A Stop that comes after the last trial's call was sent
+    leaves nothing unscored, and the pass ends as finished, as
+    score_experiment's docstring says (the external review's L5).
     """
     ensure_rowid(experiment_id)
     state = app.state.scoring_run

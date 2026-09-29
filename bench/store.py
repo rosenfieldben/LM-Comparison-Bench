@@ -3696,10 +3696,14 @@ def scores_for_results(
 
 # THE SCORING RECORDS, Phase P: a pass, and every judge request it sent.
 #
-# How a pass ended. "interrupted" is the process ending rather than the
-# pass, as it is for an experiment: a pass the boot sweep finds with no
-# ending was cut off by a crash or a kill, and nothing about the pass
-# itself went wrong. Only the sweep writes it.
+# How a pass ended. "interrupted" is the record of the pass's ending cut
+# off rather than the pass ending: a pass the boot sweep finds with no
+# ending was either left open by a process that ended (a crash or a
+# kill), or had its own ending write fail while the process ran on
+# (score_experiment's finally frees the slot and leaves it for the
+# sweep; the external review's L7). In the second case what the pass knew
+# of its ending, its error included, is in the log and not the record.
+# Only the sweep writes it.
 PASS_OUTCOMES = ("finished", "stopped", "failed", "interrupted")
 
 # How one judge request ended. The line between not_sent and the rest is

@@ -95,8 +95,9 @@ a23b257).
 
 ## Parquet export
 
-- **What:** an export format beside `export.jsonl`, which stays at schema
-  7 by the N2 checkpoint ruling.
+- **What:** an export format beside `export.jsonl`, which the N2
+  checkpoint ruling kept at schema 7 then (it has moved since, and is 12
+  at Phase P's schema 12; pre-existing since 44bb6b2 made it 8).
 - **Deferred by:** Phase N (non-goals).
 - **Reason:** no reason was written.
 - **First written:** docs/phases/phase-n-prompt.md, "Non-goals".
@@ -159,7 +160,8 @@ a23b257).
 
 ## Which figure a thresholded judge series ranks on
 
-- **What:** the ranking at bench/report.py:744 orders on `score.mean`. A
+- **What:** the ranking in bench/report.py's `build_report` (its
+  `min_ranks` over each model's score) orders on `score.mean`. A
   judge series with a declared pass threshold publishes both a mean and
   a pass rate, and the ranking uses the mean whether or not a threshold
   was declared. Since f6d3f92, `ranking.reason` says so ("ordered on the

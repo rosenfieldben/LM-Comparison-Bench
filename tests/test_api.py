@@ -23470,14 +23470,24 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
     counts each call where the pass sealed it, by the same arms
     (store.call_ending), with an answer and no figure unpriced and a
     charged reply billed whether or not it could be used.
-    PRE-STATE at b3b4e48: the pass counted by b6c088c's outcome list, so
-    the write timeout, the broken read and the protocol error were
+    PRE-STATE: no call is recorded before the Score, and the call's row
+    exists, with no ending, when its request reaches the transport, in
+    every shape (read in the route, asserted after the pass; the external
+    review's L4). At b3b4e48 the pass counted by b6c088c's outcome list,
+    so the write timeout, the broken read and the protocol error were
     unusable, and no call carried sent or usable; at 4c193b4 the pass
     counted by the facts and the report still by that list."""
+    seen = []
 
     def route(request):
         if not is_judge(request):
             return httpx.Response(200, stream=alpha_stream())
+        seen.append(
+            [
+                (row["outcome"], row["answered_at"], bool(row["sent_at"]))
+                for row in client.app.state.db.execute("SELECT * FROM judge_calls")
+            ]
+        )
         if ending == 500:
             return httpx.Response(500, json={"error": "upstream"})
         if ending == "not json":
@@ -23500,9 +23510,11 @@ def test_how_a_judge_request_ended_is_read_from_what_came_back(
 
     respx.post(OPENROUTER_URL).mock(side_effect=route)
     eid, path = judged_experiment(client, tmp_path)
+    assert calls_of(client.app.state.db, eid) == []
     assert score(client, eid, path).status_code == 202
     wait_scoring_done(client)
 
+    assert seen == [[(None, None, True)]]
     (call,) = calls_of(client.app.state.db, eid)
     assert (call["outcome"], call["detail"]) == (outcome, detail)
     sent, replied, usable = facts
@@ -24248,6 +24260,115 @@ def test_shutdown_stops_a_pass_between_trials_within_its_bound(monkeypatch, tmp_
 
 
 @respx.mock
+def test_shutdown_closes_the_client_only_after_the_pass_has_ended(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a pass over three judged trials whose first judge call
+    answers after 0.3 s, the bench shut down while it is out, and the
+    order of three events: the call sent, the pass's close written, the
+    bench's HTTP client closed.
+
+    Shutdown waits for the pass, inside its bound, before it closes the
+    client, so the call in flight finishes on an open client and is
+    recorded answered. respx completes a request on a closed client, so
+    no proof could fail if the client were closed first, and over a real
+    transport that order records the answer as a ReadError failure (the
+    external review's M5; 74ca55b's body cited two shutdown proofs as the
+    evidence, and neither could see it). PRE-STATE: inside the bench,
+    only the call has been sent."""
+    order = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        order.append("judge call sent")
+        await asyncio.sleep(0.3)
+        return httpx.Response(200, json=judge_answer())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    real_close = store.close_scoring_pass
+
+    def closing(*args, **kwargs):
+        order.append("pass closed")
+        return real_close(*args, **kwargs)
+
+    real_aclose = httpx.AsyncClient.aclose
+
+    async def aclose(self):
+        order.append("client closed")
+        await real_aclose(self)
+
+    monkeypatch.setattr(store, "close_scoring_pass", closing)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path, lineup=THREE_ARMS)
+        monkeypatch.setattr(httpx.AsyncClient, "aclose", aclose)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: order == ["judge call sent"], "no judge call left")
+        assert order == ["judge call sent"]
+    assert order == ["judge call sent", "pass closed", "client closed"]
+    (made,), (call, *_) = pass_rows(db_path, eid)
+    assert (call["outcome"], made["outcome"]) == ("answered", "stopped")
+
+
+def test_the_shutdown_bound_is_the_readmes_and_sits_between_its_two_facts():
+    """WINDOW: SCORING_SHUTDOWN_SECONDS, and the README's sentence naming it.
+
+    The bound is 30 seconds, the README's number, and sits between the
+    two facts that place it: longer than the ten seconds a typical
+    supervisor allows before it kills, shorter than the judge's own
+    timeout, so a slow call is cut and recorded (the external review's
+    L6: every proof shortens it, and a bound of 3 survived them all).
+    PRE-STATE: the README names the constant with a number."""
+    said = re.findall(
+        r"`SCORING_SHUTDOWN_SECONDS`, (\d+) seconds",
+        " ".join((Path(__file__).parent.parent / "README.md").read_text().split()),
+    )
+    assert said, "the README's shutdown sentence moved"
+    assert {float(n) for n in said} == {main.SCORING_SHUTDOWN_SECONDS} == {30.0}
+    assert 10 < main.SCORING_SHUTDOWN_SECONDS < bench_models.JUDGE_TIMEOUT_S
+
+
+@respx.mock
+def test_a_door_stop_then_shutdown_keeps_the_doors_reason(monkeypatch, tmp_path):
+    """WINDOW: a pass over three judged trials, Stop pressed at the door
+    while the first judge call is out, then the bench shut down before it
+    answers, inside the bound; the records after.
+
+    The first stopper's reason is kept: the call finishes and is recorded
+    answered, no second request is made, and the pass ends stopped in
+    the Stop door's sentence, not shutdown's (the external review's L6:
+    a shutdown that overwrote the reason survived every proof).
+    PRE-STATE: one call open, and the reason the door's."""
+    judged = []
+
+    async def route(request):
+        if not is_judge(request):
+            return httpx.Response(200, stream=alpha_stream())
+        judged.append(1)
+        await asyncio.sleep(0.5)
+        return httpx.Response(200, json=judge_answer())
+
+    respx.post(OPENROUTER_URL).mock(side_effect=route)
+    db_path = tmp_path / "bench.db"
+    with boot_against(monkeypatch, db_path) as c:
+        eid, path = judged_experiment(c, tmp_path, lineup=THREE_ARMS)
+        assert score(c, eid, path).status_code == 202
+        drive_until(c, lambda: judged == [1], "the judge call never left")
+        stopped = c.post(f"/experiments/{eid}/scoring/stop", json={})
+        assert stopped.status_code == 202
+        assert c.app.state.scoring_run["stop_reason"] == "request"
+        assert calls_of(c.app.state.db, eid)[0]["outcome"] is None
+    assert judged == [1]
+    (made,), (call,) = pass_rows(db_path, eid)
+    assert call["outcome"] == "answered"
+    assert (made["outcome"], made["detail"]) == (
+        "stopped",
+        main.PASS_STOPPED_ON_REQUEST,
+    )
+
+
+@respx.mock
 def test_an_answer_that_lands_with_the_cut_is_kept(client, tmp_path, monkeypatch):
     """WINDOW: the judge's reply and shutdown's cancellation delivered in
     the same turn of the loop, and the records after.
@@ -24729,7 +24850,10 @@ def test_a_memory_database_takes_no_lock():
     """WINDOW: store.lock_path over each spelling of a database.
 
     A file has its lock beside it; a memory database, which no other
-    process can open, has none. PRE-STATE: none; a pure function."""
+    process can open, has none. PRE-STATE: the two file spellings each
+    name a lock (the first two assertions), so the None for the memory
+    spellings is the function telling the two apart, not one that names
+    none (the external review's L4: this proof said "PRE-STATE: none")."""
     assert store.lock_path("/x/bench.db") == "/x/bench.db.lock"
     assert store.lock_path("file:/x/b.db?cache=private") == "/x/b.db.lock"
     assert store.lock_path(":memory:") is None

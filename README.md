@@ -2900,7 +2900,10 @@ included.
 `POST /experiments/{id}/scoring/stop`, with the body `{}`, asks the
 running pass to stop between trials, as the runner's Stop does: a judge
 call already in flight finishes and is recorded, a trial still waiting
-for a slot sends nothing, and the pass ends `stopped`. It is refused 409
+for a slot or for room on the spend ceiling sends nothing, and the pass
+ends `stopped` when a trial is left unscored. A Stop that comes after
+the last trial's judge call has gone out leaves nothing unscored, and
+that pass ends `finished`. It is refused 409
 when no pass for that experiment is running. In the panel it is **Stop
 scoring**, beside Score, present only while the list says that
 experiment's pass runs; pressed, it says the pass was asked to stop and
