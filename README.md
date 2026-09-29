@@ -1527,8 +1527,9 @@ counts the estimate a call with no billed figure was counted at was
 computed from; the rates it was priced at are not in the file (see
 BACKLOG, "The catalog a scoring pass priced against"). Version 12
 records the facts a scoring pass counts its judge calls by, and counts
-by nothing else: each call's `sent` (whether the request left, or may
-have) and `usable` (whether its reply could be used), beside
+every call ended since by nothing else: each call's `sent` (whether the
+request left, or may have) and `usable` (whether its reply could be
+used), beside
 `answered_at`, now set whenever a reply's head arrived, a body cut off
 included; and each pass's `unknown`, the calls whose record could not be
 completed and does not say whether they went out. `interrupted` now
@@ -2849,15 +2850,24 @@ how many got a reply that could not be used (`unusable`: an error
 status, or a body that could not be read or was cut off), and how many
 have a record that could not be completed and does not say whether they
 went out (`unknown`: found open at boot, or left open by a pass that
-ended without saying why). Each call is counted by what its record says
-happened to it, never by the word for how it ended, so a call whose
-ending's write failed is counted where what the pass knew of it puts it.
+ended without saying why). Each call ended since schema 12 is counted by
+what its record says happened to it, never by the word for how it ended,
+so a call whose ending's write failed is counted where what the pass
+knew of it puts it; one ended before is placed by that word, as below.
 A pass closed before schema 12 carries `unknown` null: its counts were
 made by an outcome list withdrawn then, which put every failed call
 under `unusable` and every interrupted one under `unanswered`, so the
 panel gives its two as one ("N judge calls ended with no usable answer
 on record"), and the report's spend line, which counts the same calls by
-their records, can differ from them. A pass that fails
+their records, can differ from them. A call ended before schema 12 has
+no record of whether it was sent or whether its reply could be used, so
+the counts place it by the word its record used; a pass left open by an
+older build and closed at boot counts its older calls that way, and its
+line says how many of its `unanswered` and `unusable` do (", N judge
+calls among those that got no answer or an unusable reply ended before
+the bench recorded whether a call was sent and whether its reply could
+be used, so they are counted by the words their records used"). A pass
+that fails
 frees the bench's one scoring slot and stays in the list, and a re-score
 is a new pass beside it. The panel says the latest in a line beside
 Score, in the record's words and stamped in UTC ("scored 2026-09-28
@@ -2998,16 +3008,23 @@ differ by every such reply, whether or not it could be used. After the
 spend the line names each request the figure cannot speak for, as what
 it is: calls that went out and got no reply ("; M judge calls went out
 and got no answer"), calls that got a reply that could not be used ("; M
-judge calls got replies that could not be used"), calls whose record
-could not be completed and does not say whether they went out ("; M
-judge calls' records could not be completed, so this line cannot say
-whether they went out": found open at boot, or interrupted before schema
-12, whose detail, which the count does not read, may say more), calls
-that had not come back when the report was read (only while a pass
-runs), and judge rows written before the bench recorded its requests,
+judge calls got replies that could not be used"), how many of those two
+ended before schema 12 and are counted by the words their records used
+("; M judge calls among those that got no answer or an unusable reply
+ended before the bench recorded whether a call was sent and whether its
+reply could be used, so this line counts them by the words their records
+used"), calls whose record could not be completed and does not say
+whether they went out ("; M judge calls' records could not be
+completed, so this line cannot say whether they went out": found open at
+boot, or interrupted before schema 12, whose detail, which the count
+does not read, may say more), calls that had not come back when the
+report was read (only while a pass runs), and judge rows written before
+the bench recorded its requests,
 which carry no figure and of which the line cannot say whether their
-request went out. Each call is counted by what its record says happened
-to it, never by the word for how it ended. A request never sent (no judge
+request went out. Each call ended since schema 12 is counted by what its
+record says happened to it, never by the word for how it ended; one
+ended before is counted by the word its record used, as the clause above
+says. A request never sent (no judge
 given, the ceiling refusing, a trial with no text, a connection never
 made) is in none of those counts. Until the requests were recorded the
 line could only say how many judge rows carried no billing figure,

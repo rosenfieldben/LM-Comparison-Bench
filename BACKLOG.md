@@ -379,12 +379,15 @@ a23b257).
   the first write's columns alone. Pre-existing since the seals arrived
   (1e6f2ab): a pass inserted with `scored` filled does the same.
 - **Deferred by:** Phase P, in the design of schema 12, found by its
-  critique of the record; not ruled by the operator.
-- **Reason:** it predates the series and no writer of the bench's own
-  can reach it; the fix, an insert seal that also refuses a row naming
-  an ending column, is a seal of its own with a versioned name and
+  critique of the record; the entry ratified by the operator at the
+  second pass at 3a9f3e6.
+- **Reason:** it predates the series, and the bench's own writer never
+  inserts an ending, so the gap is open only to direct SQL; the fix, an
+  insert seal that also refuses a row naming an ending column, is a seal
+  of its own with a versioned name, and a seal on insert needs its own
   proofs.
-- **First written:** the commit that adds this entry.
+- **First written:** 4c193b4; the reason as the operator's second pass
+  at 3a9f3e6 asked it be said.
 
 ## A run cut off before a trial went out says one was persisted
 

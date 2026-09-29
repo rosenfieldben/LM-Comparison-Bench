@@ -1393,6 +1393,13 @@ class ScoringPass(BaseModel):
     # unusable were counted by the outcome list withdrawn then; see
     # store.MIGRATIONS.
     unknown: int | None
+    # Not the record's: how many of the calls behind unanswered and
+    # unusable those counts place by the rules for a call ended before
+    # schema 12 (store.HISTORY_COUNTED_SQL), read from the pass's sealed
+    # calls, so the page can say when its counts rest on them. Null where
+    # unknown is null: a pass not yet ended, and one sealed before schema
+    # 12, whose counts rest on the withdrawn list and not these rules.
+    history_counted: int | None
     running: bool
     stopping: bool
 
@@ -7274,6 +7281,7 @@ def _pass_view(row: dict[str, Any]) -> dict[str, Any]:
         "unanswered": row["unanswered"],
         "unusable": row["unusable"],
         "unknown": row["unknown"],
+        "history_counted": row["history_counted"],
         "running": running,
         "stopping": running and state["stop"].is_set(),
     }

@@ -40,7 +40,7 @@ from typing import Any
 from bench.datasets import JUDGE_SCORER
 from bench.models import as_flag
 from bench.scoring import latest_per_key
-from bench.store import call_ending
+from bench.store import call_ending, history_counted
 
 # The message the disconnect path writes, shared rather than duplicated.
 # A reader matching this literal on its own would be matching prose that
@@ -1732,6 +1732,13 @@ def _judge_cost(
                           sent and in none, by store.call_ending, from its
                           facts (the operator's ruling H2 on the 1d91670
                           review withdrew ruling 4's outcome list).
+      history_counted_calls
+                          of the unanswered and unusable calls, those
+                          ended before schema 12, which the counts place
+                          by the words their records used
+                          (store.history_counted), so the line can say
+                          when its counts rest on those rules (the
+                          operator's second pass at 3a9f3e6).
       rows_before_call_records
                           a judge row from before Phase P with neither a
                           figure nor a generation id. The counts do not
@@ -1790,6 +1797,9 @@ def _judge_cost(
         "unanswered_calls": placed.count("unanswered"),
         "unusable_answers": placed.count("unusable"),
         "unknown_calls": placed.count("unknown"),
+        "history_counted_calls": sum(
+            1 for call in judge_calls if history_counted(call)
+        ),
         "in_flight_calls": placed.count("in_flight"),
         "rows_before_call_records": sum(
             1 for row in unpriced_old if row.get("judge_generation_id") is None

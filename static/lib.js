@@ -994,7 +994,12 @@
   // schema 12 (unknown null) was counted by the outcome list the operator
   // withdrew then, so its two counts are shown as one, in words true of
   // every call either held; one closed before schema 10 has no unusable,
-  // and its unanswered held both.
+  // and its unanswered held both. Any other pass whose unanswered and
+  // unusable place calls ended before schema 12 by the words their records
+  // used (a pass an older build left open, closed at boot) says how many
+  // of those calls do, right after them, naming them (the operator's
+  // second pass at 3a9f3e6: the page says when a pass's counts rest on
+  // those rules).
   function callCounts(pass) {
     const counted = (n, one, many) => n + (n === 1 ? one : many);
     if (pass.unknown === null) {
@@ -1023,6 +1028,20 @@
             pass.unusable,
             " judge reply could not be used",
             " judge replies could not be used",
+          )
+        : "") +
+      (pass.history_counted > 0
+        ? ", " +
+          counted(
+            pass.history_counted,
+            " judge call among those that got no answer or an unusable " +
+              "reply ended before the bench recorded whether a call was sent " +
+              "and whether its reply could be used, so it is counted by the " +
+              "word its record used",
+            " judge calls among those that got no answer or an unusable " +
+              "reply ended before the bench recorded whether a call was sent " +
+              "and whether its reply could be used, so they are counted by " +
+              "the words their records used",
           )
         : "") +
       (pass.unknown > 0
@@ -1107,19 +1126,21 @@
     );
   }
 
-  // The report's judge spend as one line, from report.judge_cost. What
-  // the judging cost first, then each request it cannot speak for, each
-  // count in words true of every request counted: an unpriced call came
-  // back with an answer and no price; an unanswered one went out and no
-  // reply came back; an unusable one got a reply that could not be used
-  // (an error status, a body that could not be read or was cut off); an
-  // unknown one's record could not be completed and does not say whether
-  // it went out (the operator's ruling M1 on the 1d91670 review gives it
-  // its own clause); one in flight had not come back when the report was
-  // read; and a judge row written before the bench recorded its requests
-  // has no figure, and this line cannot say whether its request went
-  // out. A request never sent is in none of them. Every key it reads is
-  // a key of the report's judge_cost, which a test holds.
+  // The report's judge spend as one line, from report.judge_cost. What the
+  // judging cost first, then each request it cannot speak for, each count in
+  // words true of every request counted: an unpriced call came back with an
+  // answer and no price; an unanswered one went out and no reply came back;
+  // an unusable one got a reply that could not be used (an error status, a
+  // body that could not be read or was cut off); how many of those that got
+  // no answer or an unusable reply ended before schema 12 and are counted by
+  // the words their records used (the operator's second pass at 3a9f3e6); an
+  // unknown one's record could not be completed and does not say whether it
+  // went out (the operator's ruling M1 on the 1d91670 review gives it its
+  // own clause); one in flight had not come back when the report was read;
+  // and a judge row written before the bench recorded its requests has no
+  // figure, and this line cannot say whether its request went out. A request
+  // never sent is in none of them. Every key it reads is a key of the
+  // report's judge_cost, which a test holds.
   function judgeSpendLine(spend) {
     const counted = (n, one, many) => n + (n === 1 ? one : many);
     const unpriced = spend.unpriced_calls;
@@ -1150,6 +1171,21 @@
           spend.unusable_answers,
           " judge call got a reply that could not be used",
           " judge calls got replies that could not be used",
+        );
+    }
+    if (spend.history_counted_calls > 0) {
+      line +=
+        "; " +
+        counted(
+          spend.history_counted_calls,
+          " judge call among those that got no answer or an unusable reply " +
+            "ended before the bench recorded whether a call was sent and " +
+            "whether its reply could be used, so this line counts it by the " +
+            "word its record used",
+          " judge calls among those that got no answer or an unusable reply " +
+            "ended before the bench recorded whether a call was sent and " +
+            "whether its reply could be used, so this line counts them by " +
+            "the words their records used",
         );
     }
     if (spend.unknown_calls > 0) {

@@ -1298,6 +1298,7 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         "unanswered_calls": 0,
         "unusable_answers": 0,
         "unknown_calls": 0,
+        "history_counted_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }, a_spend
@@ -1307,9 +1308,10 @@ def test_the_judge_spend_line_counts_what_it_cannot_price(
         b_spend["unanswered_calls"],
         b_spend["unusable_answers"],
         b_spend["unknown_calls"],
+        b_spend["history_counted_calls"],
         b_spend["in_flight_calls"],
         b_spend["rows_before_call_records"],
-    ) == (1, 1, 0, 1, 0, 0, 1), b_spend
+    ) == (1, 1, 0, 1, 0, 0, 0, 1), b_spend
     bench(["stub/fast"])
     open_experiments(page)
     line = page.get_by_test_id("report-judge-spend")

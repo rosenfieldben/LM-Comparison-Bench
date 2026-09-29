@@ -5218,6 +5218,7 @@ def test_review_repro_judge_spend_counts_what_it_cannot_price(client, tmp_path):
         "unanswered_calls": 1,
         "unusable_answers": 0,
         "unknown_calls": 0,
+        "history_counted_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -7652,6 +7653,7 @@ def test_review_repro_the_cost_total_includes_billed_failures(client, tmp_path):
         "unanswered_calls": 0,
         "unusable_answers": 0,
         "unknown_calls": 0,
+        "history_counted_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 0,
     }
@@ -23050,6 +23052,7 @@ def test_a_pass_that_raises_frees_the_slot_for_the_next_score(
             "unanswered",
             "unusable",
             "unknown",
+            "history_counted",
             "running",
             "stopping",
         }
@@ -24610,7 +24613,9 @@ def test_every_door_serves_a_pass_as_its_record_holds_it(client, tmp_path):
     call record is the judge_calls row less its experiment and result
     ids, which the trial line it rides on carries. Each list is held to
     the table's own columns, so a column added later reaches every door
-    or fails here. PRE-STATE: the pass is closed with unknown 1."""
+    or fails here; beside the record the pass door serves history_counted,
+    read from the pass's calls, as it serves running and stopping.
+    PRE-STATE: the pass is closed with unknown 1."""
     respx.post(OPENROUTER_URL).mock(
         side_effect=lambda request: httpx.Response(200, stream=alpha_stream())
     )
@@ -24631,10 +24636,12 @@ def test_every_door_serves_a_pass_as_its_record_holds_it(client, tmp_path):
         *client.get(f"/experiments/{eid}/scoring").json()["passes"],
     ]
     assert [p["unknown"] for p in served] == [1, 1, 1]
+    assert [p["history_counted"] for p in served] == [0, 0, 0]
     passes = {r[1] for r in db.execute("PRAGMA table_info(scoring_passes)")}
     calls = {r[1] for r in db.execute("PRAGMA table_info(judge_calls)")}
     assert set(served[0]) == set(main.ScoringPass.model_fields)
     assert set(main.ScoringPass.model_fields) == passes - {"experiment_id"} | {
+        "history_counted",
         "running",
         "stopping",
     }
@@ -24982,6 +24989,7 @@ def test_the_report_over_a_pre_p_database_shows_what_its_rows_support(
         "unanswered_calls": 0,
         "unusable_answers": 0,
         "unknown_calls": 0,
+        "history_counted_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
@@ -24990,6 +24998,190 @@ def test_the_report_over_a_pre_p_database_shows_what_its_rows_support(
     assert 5 == cost["unpriced_calls"] + cost["rows_before_call_records"] + never_sent
     assert record == {"experiment_id": 1, "active": None, "passes": []}
     assert [e["scoring"] for e in listed] == [None]
+
+
+def p2_left_open_database(path):
+    """A database as P2's builds left it (tests/fixtures/p2_schema.sql,
+    2e8bd02 to b3b4e48), holding an experiment of one trial and two scoring
+    passes: pass 1, sealed by that build over a call that timed out and one
+    that failed with an error status, its counts by the outcome list then
+    in force; and pass 2, left open, with one call answered and charged,
+    one timed out, one failed with an error status, one failed with no
+    reply, and one still open. Every ending was written before schema 12
+    recorded whether a call was sent or its reply could be used."""
+    fixture = (Path(__file__).parent / "fixtures" / "p2_schema.sql").read_text()
+    legacy = sqlite3.connect(str(path))
+    legacy.executescript(fixture)
+    legacy.execute("ALTER TABLE attachment_extractions ADD COLUMN manifest_json TEXT")
+    legacy.execute("ALTER TABLE groups ADD COLUMN renditions_json TEXT")
+    legacy.execute(
+        """INSERT INTO experiments (name, created_at, dataset_name,
+               dataset_digest, lineup_json, budget, repeats, estimand_mode,
+               halt_on_refusal, status, tasks_total, trials_total,
+               trials_done, trials_refused, trials_failed)
+           VALUES ('p2', '2026-09-28T00:00:00+00:00', 'd.jsonl', ?,
+                   '["model/alpha"]', 'standard', 1, 'routed_service', 1,
+                   'done', 1, 1, 1, 0, 0)""",
+        ("ab" * 32,),
+    )
+    legacy.execute(
+        """INSERT INTO groups (created_at, prompt_text, models_json, budget,
+               experiment_id, task_id, repeat_index, rotation_index)
+           VALUES ('2026-09-28T00:00:00+00:00', 'be kind', '["model/alpha"]',
+                   'standard', 1, 'j1', 0, 0)"""
+    )
+    legacy.execute(
+        """INSERT INTO runs (group_id, prompt_text, created_at)
+           VALUES (1, 'be kind', '2026-09-28T00:00:00+00:00')"""
+    )
+    legacy.execute(
+        """INSERT INTO results (run_id, model, response_text, position)
+           VALUES (1, 'model/alpha', 'kindly', 0)"""
+    )
+    for _ in range(2):
+        legacy.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at)
+               VALUES (1, 'judge/one', '2026-09-28T00:00:00+00:00')"""
+        )
+    endings = [
+        (1, "timed_out", None, None, None, "judge request failed: ReadTimeout"),
+        (
+            1,
+            "failed",
+            "2026-09-28T00:00:02+00:00",
+            None,
+            None,
+            "judge returned HTTP 500",
+        ),
+        (2, "answered", "2026-09-28T00:00:02+00:00", "gen-old", 0.002, None),
+        (2, "timed_out", None, None, None, "judge request failed: ReadTimeout"),
+        (
+            2,
+            "failed",
+            "2026-09-28T00:00:02+00:00",
+            None,
+            None,
+            "judge returned HTTP 500",
+        ),
+        (2, "failed", None, None, None, "judge request failed: RemoteProtocolError"),
+        (2, None, None, None, None, None),
+    ]
+    for pass_id, outcome, answered_at, gen, billed, detail in endings:
+        cur = legacy.execute(
+            """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                   judge_model, sent_at)
+               VALUES (?, 1, 1, 'judge/one', '2026-09-28T00:00:01+00:00')""",
+            (pass_id,),
+        )
+        if outcome is not None:
+            legacy.execute(
+                """UPDATE judge_calls SET answered_at = ?, generation_id = ?,
+                       billed_cost_usd = ?, outcome = ?, detail = ?
+                    WHERE id = ?""",
+                (answered_at, gen, billed, outcome, detail, cur.lastrowid),
+            )
+    legacy.execute(
+        """UPDATE scoring_passes SET ended_at = '2026-09-28T00:00:03+00:00',
+               outcome = 'finished', scored = 0, failed = 0, unanswered = 1,
+               unusable = 1
+            WHERE id = 1"""
+    )
+    legacy.commit()
+    legacy.close()
+
+
+HISTORY_CLAUSE = (
+    "ended before the bench recorded whether a call was sent and whether its "
+    "reply could be used"
+)
+
+
+def test_a_pass_an_older_build_left_open_says_which_counts_rest_on_old_words(
+    monkeypatch, tmp_path
+):
+    """WINDOW: a database a build from before schema 12 left with one pass
+    sealed and one open (p2_left_open_database), booted, so the boot sweep
+    seals the open pass in schema 12's form; its three doors, its report
+    and the report rebuilt from its export, and the page's two lines over
+    what the doors serve, executed in node.
+
+    The older calls carry no record of whether they were sent or whether a
+    reply could be used, so the counts place them by the words their
+    records used (the history rules). The operator's second pass at
+    3a9f3e6 ratified those rules provided the page says when a pass's
+    counts rest on them. The pass sealed before schema 12 says so in its
+    one clause, and is served no count of its own (null, as its unknown
+    is), since its counts rest on the withdrawn list. The swept pass,
+    whose unknown is a number, says how many of its unanswered and
+    unusable rest on the old words, naming those calls; the spend line
+    says it for every older call it counts; and the report rebuilt from
+    the export says the same, the export carrying what the count reads
+    and no pass record carrying the count. PRE-STATE at 3a9f3e6: no door
+    served the count, and both lines were silent about it."""
+    db_path = tmp_path / "bench.db"
+    p2_left_open_database(db_path)
+    with boot_against(monkeypatch, db_path) as c:
+        record = c.get("/experiments/1/scoring").json()
+        listed = next(
+            e for e in c.get("/experiments").json()["experiments"] if e["id"] == 1
+        )
+        detail = c.get("/experiments/1").json()
+        served = c.get("/experiments/1/report").json()
+        exported = export_lines(c, 1)
+    swept, sealed_before = record["passes"]
+    assert (swept["id"], swept["outcome"], swept["detail"]) == (
+        2,
+        "interrupted",
+        store.FOUND_OPEN_AT_BOOT,
+    )
+    assert (swept["unanswered"], swept["unusable"], swept["unknown"]) == (2, 1, 1)
+    assert [
+        p["history_counted"] for p in (swept, listed["scoring"], detail["scoring"])
+    ] == [3, 3, 3]
+    assert (
+        sealed_before["unanswered"],
+        sealed_before["unusable"],
+        sealed_before["unknown"],
+        sealed_before["history_counted"],
+    ) == (1, 1, None, None)
+    spend = served["judge_cost"]
+    assert (
+        spend["unanswered_calls"],
+        spend["unusable_answers"],
+        spend["unknown_calls"],
+        spend["history_counted_calls"],
+        spend["billed_calls"],
+    ) == (3, 2, 1, 5, 1)
+    lines = run_lib(
+        "const l = require(process.argv[1]);"
+        "process.stdout.write(JSON.stringify(["
+        "l.scoringPassLine(INPUT.swept), l.scoringPassLine(INPUT.before),"
+        " l.judgeSpendLine(INPUT.spend)]));",
+        {"swept": swept, "before": sealed_before, "spend": spend},
+    )
+    assert lines == [
+        "the last scoring pass was interrupted (started 2026-09-28 00:00:00 UTC, "
+        "judged by judge/one): found open at boot; 0 trials scored, 2 judge "
+        "calls got no answer, 1 judge reply could not be used, 3 judge calls "
+        "among those that got no answer or an unusable reply "
+        + HISTORY_CLAUSE
+        + ", so they are counted by the words their records used, 1 judge "
+        "call's record could not be completed, so this line cannot say whether "
+        "it went out",
+        "scored 2026-09-28 00:00:03 UTC, judged by judge/one: 0 trials scored, "
+        "2 judge calls ended with no usable answer on record",
+        "judge spend: $0.0020 over 1 billed call; 3 judge calls went out and got "
+        "no answer; 2 judge calls got replies that could not be used; 5 judge "
+        "calls among those that got no answer or an unusable reply "
+        + HISTORY_CLAUSE
+        + ", so this line counts them by the words their records used; 1 judge "
+        "call's record could not be completed, so this line cannot say whether "
+        "it went out",
+    ]
+    rebuilt = rebuild_from_export(exported, tasks_from_manifest(exported[0]))
+    assert rebuilt["judge_cost"] == spend
+    assert rebuilt["scoring_passes"] == served["scoring_passes"]
+    assert all("history_counted" not in p for p in exported[0]["scoring_passes"])
 
 
 @respx.mock
@@ -25094,6 +25286,7 @@ def test_a_mixed_era_experiment_reports_each_request_once(client, tmp_path):
         "unanswered_calls": 1,
         "unusable_answers": 1,
         "unknown_calls": 0,
+        "history_counted_calls": 0,
         "in_flight_calls": 0,
         "rows_before_call_records": 1,
     }
@@ -25479,7 +25672,7 @@ def test_the_spend_line_reads_exactly_the_keys_the_report_writes():
         spend,
     )
     keys, line = read
-    assert line.count(";") == 5 and ", 1 unpriced" in line
+    assert line.count(";") == 6 and ", 1 unpriced" in line
     assert keys == sorted(written)
 
 
@@ -25602,7 +25795,7 @@ def test_the_pages_pass_vocabulary_and_keys_are_the_servers():
         "const base = {id: 1, judge_model: 'j/x', started_at: '2026-09-28T07:10:00',"
         " ended_at: '2026-09-28T07:11:00', outcome: 'finished', detail: 'd',"
         " scored: 1, failed: 1, unanswered: 1, unusable: 1, unknown: 1,"
-        " running: false, stopping: false};"
+        " history_counted: 1, running: false, stopping: false};"
         "const read = (p) => l.scoringPassLine(new Proxy(p,"
         " {get(t, k) { seen.add(k); return t[k]; }}));"
         "const lines = l.PASS_OUTCOMES.map((o) => read({...base, outcome: o}));"

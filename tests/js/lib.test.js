@@ -1446,6 +1446,7 @@ const NO_SPEND = {
   unanswered_calls: 0,
   unusable_answers: 0,
   unknown_calls: 0,
+  history_counted_calls: 0,
   in_flight_calls: 0,
   rows_before_call_records: 0,
 };
@@ -1545,6 +1546,49 @@ test("judgeSpendLine names unanswered, in-flight and older rows each in its own 
       "its requests has no figure, and this line cannot say whether its " +
       "request went out",
   );
+  // The operator's second pass at 3a9f3e6: the line says how many of the
+  // calls it counts unanswered or unusable ended before schema 12 and are
+  // counted by the words their records used, naming those calls, whichever
+  // of the two counts they are in.
+  const older =
+    "ended before the bench recorded whether a call was sent and whether " +
+    "its reply could be used";
+  assert.equal(
+    judgeSpendLine({
+      ...NO_SPEND,
+      unanswered_calls: 5,
+      unusable_answers: 2,
+      history_counted_calls: 2,
+    }),
+    "judge spend: none billed; 5 judge calls went out and got no answer; " +
+      "2 judge calls got replies that could not be used; 2 judge calls " +
+      "among those that got no answer or an unusable reply " +
+      older +
+      ", so this line counts them by the words their records used",
+  );
+  assert.equal(
+    judgeSpendLine({
+      ...NO_SPEND,
+      unanswered_calls: 1,
+      history_counted_calls: 1,
+    }),
+    "judge spend: none billed; 1 judge call went out and got no answer; " +
+      "1 judge call among those that got no answer or an unusable reply " +
+      older +
+      ", so this line counts it by the word its record used",
+  );
+  assert.equal(
+    judgeSpendLine({
+      ...NO_SPEND,
+      unusable_answers: 1,
+      history_counted_calls: 1,
+    }),
+    "judge spend: none billed; 1 judge call got a reply that could not be " +
+      "used; 1 judge call among those that got no answer or an unusable " +
+      "reply " +
+      older +
+      ", so this line counts it by the word its record used",
+  );
   // No clause over calls no reply came back for speaks of a reply.
   const noReply = judgeSpendLine({
     ...NO_SPEND,
@@ -1569,6 +1613,7 @@ const A_PASS = {
   unanswered: 0,
   unusable: 0,
   unknown: 0,
+  history_counted: 0,
   running: false,
   stopping: false,
 };
@@ -1649,39 +1694,73 @@ test("scoringPassLine says how the last pass ended, with its counts", () => {
     scoringPassLine({ ...A_PASS, unanswered: 2, unknown: 2 }),
     /repl/,
   );
+  // The operator's second pass at 3a9f3e6: a pass whose unanswered and
+  // unusable place calls ended before schema 12 by the words their records
+  // used (one an older build left open, closed at boot) says how many,
+  // right after those counts, naming them, whichever count they are in.
+  const older =
+    "ended before the bench recorded whether a call was sent and whether " +
+    "its reply could be used";
   assert.equal(
     scoringPassLine({
       ...A_PASS,
-      outcome: "failed",
-      detail: "OperationalError: disk I/O error",
-    }),
-    "the last scoring pass failed 2026-09-28 07:12:30 UTC: " +
-      "OperationalError: disk I/O error",
-  );
-  assert.equal(
-    scoringPassLine({
-      ...A_PASS,
-      outcome: "stopped",
-      detail: "stopped on request, between trials",
-      scored: 1,
       unanswered: 2,
+      unusable: 1,
+      history_counted: 3,
     }),
-    "the last scoring pass stopped (2026-09-28 07:12:30 UTC, judged by " +
-      "judge/one): stopped on request, between trials; 1 trial scored, " +
-      "2 judge calls got no answer",
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "2 judge calls got no answer, 1 judge reply could not be used, 3 judge " +
+      "calls among those that got no answer or an unusable reply " +
+      older +
+      ", so they are counted by the words their records used",
   );
   assert.equal(
     scoringPassLine({
       ...A_PASS,
-      outcome: "interrupted",
-      ended_at: null,
-      detail: "found open at boot",
-      scored: 0,
       unanswered: 1,
+      history_counted: 1,
+      unknown: 1,
     }),
-    "the last scoring pass was interrupted (started 2026-09-28 07:10:00 " +
-      "UTC, judged by judge/one): found open at boot; 0 trials scored, " +
-      "1 judge call got no answer",
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "1 judge call got no answer, 1 judge call among those that got no " +
+      "answer or an unusable reply " +
+      older +
+      ", so it is counted by the word its record used, 1 judge call's " +
+      "record could not be completed, so this line cannot say whether it " +
+      "went out",
+  );
+  assert.equal(
+    scoringPassLine({ ...A_PASS, unusable: 2, history_counted: 2 }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "2 judge replies could not be used, 2 judge calls among those that got " +
+      "no answer or an unusable reply " +
+      older +
+      ", so they are counted by the words their records used",
+  );
+  // A pass sealed before schema 12 already says so in its one clause, the
+  // one the operator ruled right, and adds nothing to it whatever count it
+  // is served; the server serves it none (null, as its unknown is).
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      unanswered: 1,
+      unusable: 2,
+      unknown: null,
+      history_counted: 3,
+    }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "3 judge calls ended with no usable answer on record",
+  );
+  assert.equal(
+    scoringPassLine({
+      ...A_PASS,
+      unanswered: 1,
+      unusable: 2,
+      unknown: null,
+      history_counted: null,
+    }),
+    "scored 2026-09-28 07:12:30 UTC, judged by judge/one: 3 trials scored, " +
+      "3 judge calls ended with no usable answer on record",
   );
 });
 

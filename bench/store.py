@@ -3874,6 +3874,37 @@ def call_ending(call: Mapping[str, Any]) -> str:
     return "answered" if usable is True else "unusable"
 
 
+# THE CALLS A COUNT PLACES BY THE HISTORY ARMS INTO WHAT CAME BACK: ended
+# before schema 12 (sent NULL) and placed unanswered or unusable. The
+# operator's second pass at 3a9f3e6 ratified the history arms provided the
+# page says when a pass's counts rest on them. A pass sealed before schema
+# 12 says so in its one clause ("ended with no usable answer on record");
+# this count says it for a pass an older build left open and the boot
+# sweep sealed, and for the report's spend line, which counts every call.
+# A later ending leaves sent NULL only as interrupted (judge_calls_sealed_v3),
+# so no call ended since is one of these. Not counted here: answered and
+# never_sent, whose old words say what the facts would; and unknown, which
+# the arms also give every call interrupted before schema 12, including a
+# close whose write failed over an answer, a failure, a timeout, a stop or
+# a call never sent (its detail, which no count reads, may say more). The
+# page's own words for unknown, "cannot say whether it went out", are
+# true of those calls as they stand, and sent and usable could not tell
+# them from a later call interrupted with nothing known in any case.
+# history_counted is the same test in Python; a test holds the two equal
+# for every sent a seal admits (NULL, 0 and 1).
+HISTORY_COUNTED_SQL = f"""(judge_calls.sent IS NULL
+        AND {CALL_ENDING_SQL} IN ('unanswered', 'unusable'))"""
+
+
+def history_counted(call: Mapping[str, Any]) -> bool:
+    """Whether a count places this call by the history arms: ended before
+    schema 12 and placed unanswered or unusable (HISTORY_COUNTED_SQL)."""
+    return as_flag(call["sent"]) is None and call_ending(call) in (
+        "unanswered",
+        "unusable",
+    )
+
+
 def _placed(ending: str) -> str:
     """The count of a pass's calls CALL_ENDING_SQL places at ending."""
     return f"""(SELECT COUNT(*) FROM judge_calls
@@ -4117,12 +4148,30 @@ def _call_row(row: sqlite3.Row) -> dict[str, Any]:
     return item
 
 
+# A pass as the readers give it: the record, and beside it how many of its
+# calls its counts place by the history arms (HISTORY_COUNTED_SQL), read
+# from its sealed calls. NULL where unknown is NULL: a pass not yet ended,
+# whose counts are not made, and a pass sealed before schema 12, whose
+# counts were made by the outcome list withdrawn then and place nothing by
+# these arms (its page clause says so). Not a column: nothing writes it,
+# so it cannot drift from the calls, and the report and the export, which
+# take a pass's fields by name (report.PASS_FIELDS), never carry it.
+_PASS_ROWS = f"""SELECT scoring_passes.*,
+       CASE WHEN scoring_passes.unknown IS NULL THEN NULL
+            ELSE (SELECT COUNT(*) FROM judge_calls
+                   WHERE judge_calls.pass_id = scoring_passes.id
+                     AND {HISTORY_COUNTED_SQL})
+       END AS history_counted
+  FROM scoring_passes"""
+
+
 def scoring_passes_for(
     conn: sqlite3.Connection, experiment_id: int
 ) -> list[dict[str, Any]]:
-    """Every pass over one experiment, oldest first."""
+    """Every pass over one experiment, oldest first, each with its
+    history_counted (see _PASS_ROWS)."""
     rows = conn.execute(
-        "SELECT * FROM scoring_passes WHERE experiment_id = ? ORDER BY id",
+        f"{_PASS_ROWS} WHERE experiment_id = ? ORDER BY id",
         (experiment_id,),
     ).fetchall()
     return [dict(r) for r in rows]
@@ -4132,12 +4181,13 @@ def latest_scoring_passes(
     conn: sqlite3.Connection, experiment_ids: list[int]
 ) -> dict[int, dict[str, Any]]:
     """The newest pass of each experiment that has one, keyed by
-    experiment id: one query for a whole list page."""
+    experiment id: one query for a whole list page. Each carries its
+    history_counted (see _PASS_ROWS)."""
     if not experiment_ids:
         return {}
     marks = ",".join("?" for _ in experiment_ids)
     rows = conn.execute(
-        f"""SELECT * FROM scoring_passes WHERE id IN (
+        f"""{_PASS_ROWS} WHERE id IN (
                 SELECT MAX(id) FROM scoring_passes
                  WHERE experiment_id IN ({marks})
                  GROUP BY experiment_id)""",

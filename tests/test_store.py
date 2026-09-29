@@ -5127,6 +5127,132 @@ def test_once_a_call_records_its_facts_its_outcome_word_changes_no_count():
     assert all(len(found) == 1 for found in words.values())
 
 
+# The classifier's shapes a count places by the history arms, among the
+# unanswered and unusable: pinned by name, not derived.
+HISTORY_COUNTED_SHAPES = {
+    "before 12: an error status",
+    "before 12: failed with none",
+    "before 12: timed out",
+    "before 12: stopped",
+}
+
+
+def test_the_calls_counted_by_the_history_rules_are_one_test_in_sql_and_python():
+    """WINDOW: HISTORY_COUNTED_SQL and store.history_counted over every
+    shape a call can be in, and over every combination of outcome, sent,
+    answer time and usable, read from a database holding no seal.
+
+    One test in both, the SQL the pass door reads a pass's count by and
+    the Python the report counts by: a call ended before schema 12 and
+    placed unanswered or unusable, and nothing else, so no call ended
+    since, no call answered, never sent or unknown, and no call in flight
+    is counted (the operator's second pass at 3a9f3e6: the page says when
+    a pass's counts rest on the history rules). PRE-STATE: four of the
+    classifier's shapes are such calls, and the 126 combinations hold
+    calls of every word."""
+    assert HISTORY_COUNTED_SHAPES <= {shape[0] for shape in CLASSIFIER_SHAPES}
+    conn = _unsealed_calls([shape[1:5] for shape in CLASSIFIER_SHAPES])
+    by_sql = dict(
+        conn.execute(
+            f"SELECT id, {store.HISTORY_COUNTED_SQL} FROM judge_calls ORDER BY id"
+        ).fetchall()
+    )
+    by_python = {
+        r["id"]: store.history_counted(dict(r))
+        for r in conn.execute("SELECT * FROM judge_calls ORDER BY id")
+    }
+    assert {i: bool(v) for i, v in by_sql.items()} == by_python
+    assert [
+        shape[0] for i, shape in enumerate(CLASSIFIER_SHAPES) if by_python[i + 1]
+    ] == sorted(
+        HISTORY_COUNTED_SHAPES,
+        key=[shape[0] for shape in CLASSIFIER_SHAPES].index,
+    )
+    rows = list(
+        itertools.product(
+            [None, *store.CALL_OUTCOMES], [None, 0, 1], [None, REPLY], [None, 0, 1]
+        )
+    )
+    assert len(rows) == 126
+    everything = _unsealed_calls(rows)
+    assert {
+        store.call_ending(dict(r))
+        for r in everything.execute("SELECT * FROM judge_calls")
+    } == set(store.CALL_ENDINGS)
+    by_sql = dict(
+        everything.execute(
+            f"SELECT id, {store.HISTORY_COUNTED_SQL} FROM judge_calls ORDER BY id"
+        ).fetchall()
+    )
+    for i, row in enumerate(
+        everything.execute("SELECT * FROM judge_calls ORDER BY id")
+    ):
+        expected = row["sent"] is None and store.call_ending(dict(row)) in (
+            "unanswered",
+            "unusable",
+        )
+        assert bool(by_sql[i + 1]) is store.history_counted(dict(row)) is expected
+    assert sum(bool(v) for v in by_sql.values()) == 21
+
+
+def test_each_pass_is_served_the_count_of_its_own_calls_the_old_words_place():
+    """WINDOW: store.scoring_passes_for and store.latest_scoring_passes over
+    five passes across three experiments, holding between them calls of
+    the classifier's shapes, read from a database holding no seal.
+
+    Each pass ended in schema 12's form is served the count of its own
+    calls HISTORY_COUNTED_SQL takes: by pass, not by experiment or
+    database. A pass sealed before schema 12 and a pass not yet ended
+    (unknown NULL) are served NULL, since their counts rest on nothing
+    these rules placed (the external review of this change: three wrong
+    correlations passed every proof). PRE-STATE: pass 1 holds every
+    history-counted shape and pass 2, in the same experiment, none; pass 3
+    is sealed before schema 12 and pass 4, in the same experiment, holds
+    two; pass 5 has not ended."""
+    shape = {name: rest for name, *rest in CLASSIFIER_SHAPES}
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(store.SCHEMA)
+    passes = [(1, "finished", 0), (1, "finished", 0), (2, "finished", None)]
+    passes += [(2, "finished", 0), (3, None, None)]
+    for experiment, outcome, unknown in passes:
+        conn.execute(
+            """INSERT INTO scoring_passes (experiment_id, judge_model, started_at,
+                   outcome, unknown) VALUES (?, 'j/x', 't', ?, ?)""",
+            (experiment, outcome, unknown),
+        )
+    held = {
+        1: [*sorted(HISTORY_COUNTED_SHAPES), "before 12: answered", "before 12: swept"],
+        2: [n for n, rest in shape.items() if rest[1] is not None],
+        3: ["before 12: failed with none", "before 12: an error status"],
+        4: ["before 12: timed out", "before 12: stopped", "found open at boot"],
+        5: ["in flight"],
+    }
+    for pass_id, names in held.items():
+        for name in names:
+            outcome, sent, answered_at, usable, _ = shape[name]
+            conn.execute(
+                """INSERT INTO judge_calls (pass_id, experiment_id, result_id,
+                       judge_model, sent_at, outcome, sent, answered_at, usable)
+                   VALUES (?, 0, 1, 'j/x', 't', ?, ?, ?, ?)""",
+                (pass_id, outcome, sent, answered_at, usable),
+            )
+    calls = [dict(r) for r in conn.execute("SELECT * FROM judge_calls")]
+    assert sum(1 for c in calls if c["pass_id"] == 1 and store.history_counted(c)) == 4
+    assert not any(store.history_counted(c) for c in calls if c["pass_id"] == 2)
+    served = {
+        e: [p["history_counted"] for p in store.scoring_passes_for(conn, e)]
+        for e in (1, 2, 3)
+    }
+    assert served == {1: [4, 0], 2: [None, 2], 3: [None]}
+    latest = store.latest_scoring_passes(conn, [1, 2, 3])
+    assert {e: p["history_counted"] for e, p in latest.items()} == {
+        1: 0,
+        2: 2,
+        3: None,
+    }
+
+
 def test_a_pass_seals_the_counts_its_calls_recount_to(db):
     """WINDOW: a pass holding a call of every shape a pass can leave, its
     own endings and the close's, closed, and a recount of its calls read
